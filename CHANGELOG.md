@@ -874,6 +874,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Internal
 - Planning docs for the ORM-on-state migration land under `docs/planning/`: an inventory of every raw-SQL callsite (`agnes-orm-rawsql-audit.md` + per-subsystem inventories for `app`, `src`, `cli/conn/svc`), a phased migration plan (`orm-state-migration.md`), and three rounds of Codex adversary review (`orm-migration-adversary-review.md` → v2 → v3) that progressively patched factual errors and tightened the cut/rollback plan. No code change — pure planning artifact, locks the scope before any callsite is touched. (#555)
 
+- `app/plugins.py`: generic extension points (`load_routers`, `extra_template_dirs`) to mount deployment-specific admin routers + Jinja template dirs from `instance.yaml` `plugins.*` config, without forking the app. (Wiring into `app.main`/`app.web.router` follows.)
+
 ## [0.67.2] — 2026-06-05
 
 ### Changed
