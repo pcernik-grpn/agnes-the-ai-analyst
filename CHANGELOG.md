@@ -20,6 +20,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- `app/plugins.py`: generic extension points (`load_routers`, `extra_template_dirs`) to mount deployment-specific admin routers + Jinja template dirs from `instance.yaml` `plugins.*` config, without forking the app. (Wiring into `app.main`/`app.web.router` follows.)
+
 ## [0.67.2] — 2026-06-05
 
 ### Changed
