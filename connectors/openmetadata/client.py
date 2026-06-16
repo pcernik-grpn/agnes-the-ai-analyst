@@ -198,6 +198,59 @@ class OpenMetadataClient:
         )
         return filtered
 
+    def search_data_products_by_tag(
+        self, tag_fqn: str, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Reverse-search data products carrying a classification tag.
+
+        Uses the search index's queryFilter on ``tags.tagFQN`` (reliable for the
+        tag field, unlike the dataProducts membership filter). Returns the raw
+        ``_source`` dicts.
+        """
+        query_filter = json.dumps(
+            {"query": {"bool": {"must": [{"term": {"tags.tagFQN": tag_fqn}}]}}}
+        )
+        response = self._client.get(
+            "/api/v1/search/query",
+            params={
+                "q": "*",
+                "index": "data_product_search_index",
+                "size": limit,
+                "query_filter": query_filter,
+            },
+        )
+        response.raise_for_status()
+        hits = response.json().get("hits", {}).get("hits", [])
+        return [hit.get("_source", {}) for hit in hits]
+
+    def search_tables_by_data_product(
+        self, dp_fqn: str, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Reverse-search the BigQuery tables linked to a data product.
+
+        A data product's ``assets`` array is not reliably populated, so membership
+        is read from the table search index by ``dataProducts.fullyQualifiedName``.
+        Filtered to the ``bigquery`` service so duplicate non-BQ index entries
+        (e.g. an upstream extract) don't double-count.
+        """
+        query_filter = json.dumps(
+            {"query": {"bool": {"must": [
+                {"term": {"dataProducts.fullyQualifiedName": dp_fqn}}]}}}
+        )
+        response = self._client.get(
+            "/api/v1/search/query",
+            params={
+                "q": "*",
+                "index": "table_search_index",
+                "size": limit,
+                "query_filter": query_filter,
+            },
+        )
+        response.raise_for_status()
+        hits = response.json().get("hits", {}).get("hits", [])
+        sources = [hit.get("_source", {}) for hit in hits]
+        return [t for t in sources if str(t.get("serviceType", "")).lower() == "bigquery"]
+
     def close(self):
         """Close HTTP client session."""
         self._client.close()

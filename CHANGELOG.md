@@ -20,6 +20,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- OpenMetadata connector: added `search_data_products_by_tag` and `search_tables_by_data_product` reverse-search methods (query-filter by `tags.tagFQN` / `dataProducts.fullyQualifiedName`) for catalog-driven data-product onboarding.
+
 ## [0.67.2] — 2026-06-05
 
 ### Changed
