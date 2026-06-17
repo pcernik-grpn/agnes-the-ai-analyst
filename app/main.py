@@ -1451,6 +1451,17 @@ def create_app() -> FastAPI:
     async def openapi_spec(user: dict = Depends(_get_current_user)):
         return app.openapi()
 
+    # Deployment-specific plugin admin routers (generic hook — see app/plugins.py).
+    # Mounted before the web_router catch-all so their API paths win. The configured
+    # specs come from the operator's instance.yaml; nothing deployment-specific lives here.
+    from app.instance_config import get_value as _get_value
+    from app.plugins import load_routers as _load_plugin_routers
+
+    for _plugin_router in _load_plugin_routers(
+        _get_value("plugins", "admin_routers", default=[]) or []
+    ):
+        app.include_router(_plugin_router)
+
     # Web UI router (must be last — has catch-all routes)
     app.include_router(web_router)
 

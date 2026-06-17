@@ -94,9 +94,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["web"])
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
+def _template_directories() -> list[str]:
+    """Built-in templates first, then any deployment plugin template dirs (app/plugins.py).
+
+    The configured dirs come from the operator's instance.yaml; missing ones are dropped.
+    Defensive: a config-read failure falls back to the built-in dir only — this runs at
+    import time, so it must never break app bootstrap.
+    """
+    from app.instance_config import get_value
+    from app.plugins import extra_template_dirs
+
+    try:
+        extra = extra_template_dirs(get_value("plugins", "template_dirs", default=[]) or [])
+    except Exception:
+        extra = []
+    return [str(TEMPLATES_DIR), *(str(d) for d in extra)]
+
+
+templates = Jinja2Templates(directory=_template_directories())
 # Make templates tolerant of missing variables (renders empty string instead of error)
 class _SilentUndefined(jinja2.Undefined):
     """Silently handle any access on undefined variables — returns empty/falsy."""
