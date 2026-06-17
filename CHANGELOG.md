@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.71.54] - 2026-06-17
+
 ### Internal
 - OpenMetadata connector: added `search_data_products_by_tag` and `search_tables_by_data_product` reverse-search methods (query-filter by `tags.tagFQN` / `dataProducts.fullyQualifiedName`) for catalog-driven data-product onboarding.
 - `app/plugins.py`: generic extension points (`load_routers`, `extra_template_dirs`) to mount deployment-specific admin routers + Jinja template dirs from `instance.yaml` `plugins.*` config, without forking the app. Wired into bootstrap: `app.main.create_app` includes configured `plugins.admin_routers` before the web catch-all, and `app.web.router` adds `plugins.template_dirs` to the Jinja loader (built-in templates first; missing dirs dropped; config-read failure falls back to built-in only).
