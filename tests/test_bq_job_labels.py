@@ -11,7 +11,7 @@ def test_workload_type_is_constant():
 
 
 def test_user_id_is_email_local_part():
-    labels = build_bq_job_labels({"email": "pcernik@groupon.com"}, "query", "dev")
+    labels = build_bq_job_labels({"email": "pcernik@example.com"}, "query", "dev")
     assert labels["user_id"] == "pcernik"
 
 
@@ -58,4 +58,16 @@ def test_all_values_match_bq_grammar():
 
 def test_never_raises_on_bad_user():
     labels = build_bq_job_labels({"id": None}, "query", "dev")
+    assert labels["workload_type"] == "foundryai"
+
+
+def test_returns_empty_dict_when_user_is_not_a_dict():
+    # A non-dict user makes client_kind_from_user / .get() raise internally;
+    # the totality guard must swallow it and return {}.
+    assert build_bq_job_labels(["not", "a", "dict"], "query", "dev") == {}
+
+
+def test_environment_none_is_omitted():
+    labels = build_bq_job_labels({"email": "a@b.com"}, "query", None)
+    assert "environment" not in labels
     assert labels["workload_type"] == "foundryai"

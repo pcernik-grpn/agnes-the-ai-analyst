@@ -61,7 +61,7 @@ def test_workload_type_is_constant():
 
 
 def test_user_id_is_email_local_part():
-    labels = build_bq_job_labels({"email": "pcernik@groupon.com"}, "query", "dev")
+    labels = build_bq_job_labels({"email": "pcernik@example.com"}, "query", "dev")
     assert labels["user_id"] == "pcernik"
 
 
@@ -233,7 +233,7 @@ from connectors.bigquery.labels import job_labels_for
 
 def test_job_labels_for_reads_environment(monkeypatch):
     monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "production")
-    labels = job_labels_for({"email": "pcernik@groupon.com"}, "query")
+    labels = job_labels_for({"email": "pcernik@example.com"}, "query")
     assert labels["environment"] == "production"
     assert labels["user_id"] == "pcernik"
     assert labels["agent_name"] == "query"
@@ -428,7 +428,7 @@ def test_dry_run_bytes_applies_scan_labels(monkeypatch):
 
     bq = MagicMock()
     bq.client.return_value = _Client()
-    v2_scan._bq_dry_run_bytes(bq, "SELECT 1", user={"email": "pcernik@groupon.com"})
+    v2_scan._bq_dry_run_bytes(bq, "SELECT 1", user={"email": "pcernik@example.com"})
 
     jc = captured["job_config"]
     assert jc.dry_run is True
@@ -515,7 +515,7 @@ def test_run_remote_select_applies_query_labels(monkeypatch):
     monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "dev")
     from connectors.bigquery.labels import job_labels_for
 
-    labels = job_labels_for({"email": "pcernik@groupon.com"}, "query")
+    labels = job_labels_for({"email": "pcernik@example.com"}, "query")
     assert labels == {
         "workload_type": "foundryai",
         "agent_name": "query",

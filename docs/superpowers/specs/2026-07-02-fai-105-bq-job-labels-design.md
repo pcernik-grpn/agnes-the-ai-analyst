@@ -98,7 +98,7 @@ Labels apply to the paths that use the `google-cloud-bigquery` `client.query()` 
 ## Testing (TDD)
 
 **Unit — `build_bq_job_labels` (the sanitization is where all the risk lives):**
-- `pcernik@groupon.com` → `user_id="pcernik"`.
+- `pcernik@example.com` → `user_id="pcernik"`.
 - Values with `.`, `+`, uppercase, spaces → sanitized to `[a-z0-9_-]`.
 - Value > 63 chars → truncated to 63.
 - `user=None` and scheduler user → `user_id` omitted.
