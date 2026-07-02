@@ -653,6 +653,8 @@ def _init_extract_locked(
     try:
         # Install and load BigQuery extension
         try:
+            # FAI-105: BQ jobs issued via the DuckDB bigquery extension cannot
+            # carry job labels (DuckDB owns the job config). See CHANGELOG.
             conn.execute("INSTALL bigquery FROM community; LOAD bigquery;")
             # session-scoped DuckDB secret with the metadata token
             escaped_token = token.replace("'", "''")
