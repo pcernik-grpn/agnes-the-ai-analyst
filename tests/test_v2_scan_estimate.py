@@ -52,7 +52,7 @@ class TestScanEstimate:
         from app.api import v2_scan
         monkeypatch.setattr(
             v2_scan, "_bq_dry_run_bytes",
-            lambda bq, sql: 4_400_000_000,
+            lambda bq, sql, **kw: 4_400_000_000,
         )
         # Stub the schema fetch the validator uses
         monkeypatch.setattr(

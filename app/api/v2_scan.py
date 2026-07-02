@@ -30,6 +30,7 @@ from app.api.v2_schema import build_schema  # reused for column resolution
 from app.api.v2_arrow import CONTENT_TYPE, arrow_to_ipc_bytes_capped
 from app.api.v2_quota import QuotaTracker, QuotaExceededError
 from connectors.bigquery.access import BqAccess, BqAccessError, get_bq_access
+from connectors.bigquery.labels import job_labels_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v2", tags=["v2"])
@@ -49,7 +50,7 @@ def _resolve_schema(conn, user, table_id: str, bq: BqAccess) -> dict:
     return {c["name"]: c["type"] for c in s.get("columns", [])}
 
 
-def _bq_dry_run_bytes(bq: BqAccess, sql: str) -> int:
+def _bq_dry_run_bytes(bq: BqAccess, sql: str, *, user: dict | None = None) -> int:
     """Run a BQ dry-run via the google-cloud-bigquery client and return totalBytesProcessed.
 
     SQL here is user-derived (built from req.select/where/order_by), so BadRequest → 400
@@ -62,7 +63,11 @@ def _bq_dry_run_bytes(bq: BqAccess, sql: str) -> int:
     try:
         job = client.query(
             sql,
-            job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+            job_config=bigquery.QueryJobConfig(
+                dry_run=True,
+                use_query_cache=False,
+                labels=job_labels_for(user, "scan"),
+            ),
         )
         return int(job.total_bytes_processed or 0)
     except Exception as e:
@@ -186,7 +191,7 @@ def estimate(conn, user, raw_request: dict, *, bq: BqAccess) -> dict:
         }
 
     bq_sql = _build_bq_sql(row, bq.projects.data, req, safe_where=safe_where)
-    scan_bytes = _bq_dry_run_bytes(bq, bq_sql)
+    scan_bytes = _bq_dry_run_bytes(bq, bq_sql, user=user)
 
     cost_per_tb = float(get_value("api", "scan", "bq_cost_per_tb_usd", default=5.0) or 5.0)
     cost = (scan_bytes / 1_099_511_627_776) * cost_per_tb  # 1 TiB = 2^40
