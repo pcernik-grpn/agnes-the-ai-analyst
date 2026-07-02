@@ -531,6 +531,7 @@ def execute_query(
         guard = (
             _bq_quota_and_cap_guard(
                 user_id=user_id,
+                user=user,
                 dry_run_set=dry_run_set,
                 name_lookups=name_lookups,
                 sql=request.sql,
@@ -1331,6 +1332,7 @@ def _view_targets_in(dry_run_set: list) -> list[str]:
 def _bq_quota_and_cap_guard(
     *,
     user_id: str,
+    user: dict | None = None,
     dry_run_set: list,
     name_lookups: list,
     sql: str,
@@ -1376,6 +1378,10 @@ def _bq_quota_and_cap_guard(
     ``Syntax error`` diagnostic from the rewritten attempt. The
     second-attempt message is preserved as `underlying_original` for
     operator visibility.
+
+    `user` (the full dict, distinct from `user_id`) is threaded through only
+    to label the dry-run BQ jobs via `job_labels_for(user, "query")` — the
+    quota/cap logic itself keys exclusively on `user_id`.
 
     Flow:
     1. `check_daily_budget` — over-cap users get 429 BEFORE any BQ work.
@@ -1448,7 +1454,7 @@ def _bq_quota_and_cap_guard(
             # All other BQ errors (forbidden, upstream) propagate as 502.
             total_bytes = 0
             try:
-                total_bytes = _bq_dry_run_bytes(bq, rewritten_sql)
+                total_bytes = _bq_dry_run_bytes(bq, rewritten_sql, user=user, agent_name="query")
             except BqAccessError as exc:
                 if exc.kind != "bq_bad_request":
                     raise HTTPException(status_code=502, detail={
@@ -1463,7 +1469,7 @@ def _bq_quota_and_cap_guard(
                     exc.kind, exc.message,
                 )
                 try:
-                    total_bytes = _bq_dry_run_bytes(bq, sql)
+                    total_bytes = _bq_dry_run_bytes(bq, sql, user=user, agent_name="query")
                 except BqAccessError as exc2:
                     if exc2.kind != "bq_bad_request":
                         raise HTTPException(status_code=502, detail={
@@ -1628,7 +1634,7 @@ def run_remote_select_to_arrow(conn, user, sql, bq, quota):
                     rewritten = _rewrite_user_sql_for_bq_dry_run(
                         sql, name_lookups, project,
                     )
-                    total_bq_bytes = _bq_dry_run_bytes(bq, rewritten)
+                    total_bq_bytes = _bq_dry_run_bytes(bq, rewritten, user=user, agent_name="query")
                 except HTTPException:
                     raise
                 except Exception as exc:

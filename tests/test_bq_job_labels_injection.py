@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 import pyarrow as pa
 from src.remote_query import RemoteQueryEngine
 from app.api import v2_scan
+from app.api import query as query_module
 
 
 def _fake_job(value=0):
@@ -47,3 +48,56 @@ def test_dry_run_bytes_applies_scan_labels(monkeypatch):
     assert jc.labels.get("workload_type") == "foundryai"
     assert jc.labels.get("agent_name") == "scan"
     assert jc.labels.get("user_id") == "pcernik"
+
+
+def test_bq_quota_and_cap_guard_applies_query_labels(monkeypatch):
+    """The real /api/query dry-run callsite (`_bq_quota_and_cap_guard`) must
+    label its BQ job ``agent_name="query"`` — not `_bq_dry_run_bytes`'s
+    ``agent_name="scan"`` default. Drives the actual production code path
+    (through the real `job_labels_for` call and a captured `job_config`, not
+    just an assertion on `job_labels_for`'s output) so a callsite that
+    forgets to pass `agent_name="query"` regresses here.
+    """
+    import app.api.v2_quota as v2_quota
+
+    # Fresh quota state — avoid bleed from other tests' daily-byte usage.
+    monkeypatch.setattr(v2_quota, "_quota_singleton", None, raising=False)
+    monkeypatch.setattr(
+        "app.instance_config.get_value",
+        lambda *keys, default=None: "dev" if keys == ("instance", "environment") else default,
+    )
+
+    captured = {}
+
+    class _Client:
+        def query(self, sql, job_config=None):
+            captured["job_config"] = job_config
+            job = MagicMock()
+            job.total_bytes_processed = 777
+            return job
+
+    class _Projects:
+        data = "test-data-project"
+        billing = "test-billing-project"
+
+    class _FakeBq:
+        projects = _Projects()
+
+        def client(self):
+            return _Client()
+
+    monkeypatch.setattr(query_module, "get_bq_access", lambda: _FakeBq())
+
+    with query_module._bq_quota_and_cap_guard(
+        user_id="pcernik",
+        user={"email": "pcernik@example.com"},
+        dry_run_set=[("bucket", "table", 0)],
+        name_lookups=[],
+        sql="SELECT 1",
+    ):
+        pass
+
+    jc = captured["job_config"]
+    assert jc.dry_run is True
+    assert jc.labels["agent_name"] == "query"
+    assert jc.labels["user_id"] == "pcernik"

@@ -203,7 +203,7 @@ def test_guardrail_dry_runs_rewritten_user_sql_not_synthetic_select_star(
     _register_bq_remote_row("ue", "finance", "ue")
     captured = {"sql": None}
 
-    def capturing_fake(_bq, sql):
+    def capturing_fake(_bq, sql, **_kwargs):
         captured["sql"] = sql
         return 1024  # tiny — pass the cap
 
@@ -254,7 +254,7 @@ def test_guardrail_invokes_dry_run_exactly_once_per_request(
 
     state = {"call_count": 0, "last_sql": None}
 
-    def counting_fake(_bq, sql):
+    def counting_fake(_bq, sql, **_kwargs):
         state["call_count"] += 1
         state["last_sql"] = sql
         return 100  # tiny
@@ -300,7 +300,7 @@ def test_fallback_tries_original_sql_first(
 
     state = {"calls": []}
 
-    def fake_dry_run(_bq, sql):
+    def fake_dry_run(_bq, sql, **_kwargs):
         state["calls"].append(sql)
         # First call (rewritten SQL) → BQ parse error.
         if len(state["calls"]) == 1:
@@ -348,7 +348,7 @@ def test_fallback_fails_fast_on_pure_duckdb_syntax(
 
     state = {"calls": []}
 
-    def always_parse_error(_bq, sql):
+    def always_parse_error(_bq, sql, **_kwargs):
         state["calls"].append(sql)
         raise BqAccessError("bq_bad_request", "Syntax error: unexpected '::'")
 
@@ -405,7 +405,7 @@ def test_remote_estimate_failed_surfaces_first_error_when_attempts_differ(
 
     state = {"calls": 0}
 
-    def two_different_errors(_bq, _sql):
+    def two_different_errors(_bq, _sql, **_kwargs):
         state["calls"] += 1
         if state["calls"] == 1:
             raise BqAccessError(
@@ -464,7 +464,7 @@ def test_guardrail_propagates_502_on_non_parse_bq_errors(
 
     _register_bq_remote_row("ue", "finance", "ue")
 
-    def always_forbidden(_bq, _sql):
+    def always_forbidden(_bq, _sql, **_kwargs):
         raise BqAccessError("bq_forbidden", "Permission denied", details={})
 
     monkeypatch.setattr(
@@ -662,7 +662,7 @@ def test_guardrail_skips_bare_name_match_inside_backticks(
 
     captured = {"sql": None}
 
-    def capturing_fake(_bq, sql):
+    def capturing_fake(_bq, sql, **_kwargs):
         captured["sql"] = sql
         return 1024
 
@@ -760,7 +760,7 @@ def test_full_backtick_path_registered_admin_passes(
 
     captured = {"sql": None}
 
-    def capturing_fake(_bq, sql):
+    def capturing_fake(_bq, sql, **_kwargs):
         captured["sql"] = sql
         return 1024  # tiny — pass cap
 
