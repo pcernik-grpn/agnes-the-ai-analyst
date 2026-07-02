@@ -76,3 +76,18 @@ def build_bq_job_labels(
     except Exception:  # totality: labeling must never break a query
         logger.warning("build_bq_job_labels failed; proceeding unlabeled", exc_info=True)
         return {}
+
+
+def job_labels_for(user: dict | None, agent_name: str) -> dict[str, str]:
+    """Read ``instance.environment`` from config and build the label dict.
+
+    Defensive — returns {} on any failure so a labeling problem can never
+    block a query. This is the entry point callsites use.
+    """
+    try:
+        from app.instance_config import get_value
+
+        environment = get_value("instance", "environment", default="") or ""
+    except Exception:
+        environment = ""
+    return build_bq_job_labels(user, agent_name, environment)

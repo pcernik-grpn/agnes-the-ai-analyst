@@ -1,5 +1,5 @@
 import re
-from connectors.bigquery.labels import build_bq_job_labels
+from connectors.bigquery.labels import build_bq_job_labels, job_labels_for
 from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
 
 _LABEL_VALUE_RE = re.compile(r"^[a-z0-9_-]{0,63}$")
@@ -71,3 +71,21 @@ def test_environment_none_is_omitted():
     labels = build_bq_job_labels({"email": "a@b.com"}, "query", None)
     assert "environment" not in labels
     assert labels["workload_type"] == "foundryai"
+
+
+def test_job_labels_for_reads_environment(monkeypatch):
+    monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "production")
+    labels = job_labels_for({"email": "pcernik@example.com"}, "query")
+    assert labels["environment"] == "production"
+    assert labels["user_id"] == "pcernik"
+    assert labels["agent_name"] == "query"
+
+
+def test_job_labels_for_defensive_on_config_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("config down")
+
+    monkeypatch.setattr("app.instance_config.get_value", boom)
+    labels = job_labels_for({"email": "a@b.com"}, "scan")
+    assert labels["workload_type"] == "foundryai"
+    assert "environment" not in labels
