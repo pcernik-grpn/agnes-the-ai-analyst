@@ -267,7 +267,9 @@ class RemoteQueryEngine:
     # Phase 1
     # ------------------------------------------------------------------
 
-    def register_bq(self, alias: str, bq_sql: str) -> Dict[str, Any]:
+    def register_bq(
+        self, alias: str, bq_sql: str, *, job_labels: dict[str, str] | None = None
+    ) -> Dict[str, Any]:
         """Register a BigQuery query result as a DuckDB view.
 
         Steps:
@@ -280,6 +282,7 @@ class RemoteQueryEngine:
         Args:
             alias: DuckDB view name to register (e.g. ``"bq_orders"``).
             bq_sql: SQL query to execute on BigQuery.
+            job_labels: Optional BQ job labels for cost attribution.
 
         Returns:
             ``{alias, rows, columns, memory_mb}``
@@ -303,10 +306,15 @@ class RemoteQueryEngine:
 
         client = self._get_bq_client()
 
+        # FAI-105: tag the BQ jobs for per-user/workload cost attribution.
+        from google.cloud import bigquery
+
+        job_config = bigquery.QueryJobConfig(labels=job_labels) if job_labels else None
+
         # --- Phase 1a: COUNT(*) pre-check ---
         count_sql = f"SELECT COUNT(*) FROM ({bq_sql}) AS _cnt"
         try:
-            count_job = client.query(count_sql)
+            count_job = client.query(count_sql, job_config=job_config)
             count_arrow = count_job.to_arrow()
             count_value = int(count_arrow.column(0)[0].as_py())
         except RemoteQueryError:
@@ -331,7 +339,7 @@ class RemoteQueryEngine:
 
         # --- Phase 1b: Fetch actual data ---
         try:
-            data_job = client.query(bq_sql)
+            data_job = client.query(bq_sql, job_config=job_config)
             try:
                 arrow_table = data_job.to_arrow()
             except Exception as storage_exc:

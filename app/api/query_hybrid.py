@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
+from connectors.bigquery.labels import job_labels_for
 from src.audit_helpers import client_kind_from_user
 from src.db import get_analytics_db_readonly
 from src.remote_query import RemoteQueryEngine, RemoteQueryError, load_config
@@ -49,7 +50,7 @@ async def hybrid_query(
         )
         for alias, bq_sql in request.register_bq.items():
             try:
-                engine.register_bq(alias, bq_sql)
+                engine.register_bq(alias, bq_sql, job_labels=job_labels_for(user, "hybrid"))
             except RemoteQueryError as e:
                 try:
                     audit_repo().log(
