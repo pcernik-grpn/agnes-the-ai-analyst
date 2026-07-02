@@ -5,8 +5,13 @@ from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
 _LABEL_VALUE_RE = re.compile(r"^[a-z0-9_-]{0,63}$")
 
 
-def test_workload_type_is_constant():
+def test_workload_type_defaults_to_agnes():
     labels = build_bq_job_labels({"email": "a@b.com"}, "query", "dev")
+    assert labels["workload_type"] == "agnes"
+
+
+def test_workload_type_passed_through_and_sanitized():
+    labels = build_bq_job_labels({"email": "a@b.com"}, "query", "dev", workload_type="FoundryAI!")
     assert labels["workload_type"] == "foundryai"
 
 
@@ -35,7 +40,7 @@ def test_long_value_truncated_to_63():
 def test_no_user_omits_user_id():
     labels = build_bq_job_labels(None, "scan", "dev")
     assert "user_id" not in labels
-    assert labels["workload_type"] == "foundryai"
+    assert labels["workload_type"] == "agnes"
 
 
 def test_scheduler_user_omits_user_id():
@@ -58,7 +63,7 @@ def test_all_values_match_bq_grammar():
 
 def test_never_raises_on_bad_user():
     labels = build_bq_job_labels({"id": None}, "query", "dev")
-    assert labels["workload_type"] == "foundryai"
+    assert labels["workload_type"] == "agnes"
 
 
 def test_returns_empty_dict_when_user_is_not_a_dict():
@@ -70,7 +75,7 @@ def test_returns_empty_dict_when_user_is_not_a_dict():
 def test_environment_none_is_omitted():
     labels = build_bq_job_labels({"email": "a@b.com"}, "query", None)
     assert "environment" not in labels
-    assert labels["workload_type"] == "foundryai"
+    assert labels["workload_type"] == "agnes"
 
 
 def test_job_labels_for_reads_environment(monkeypatch):
@@ -87,5 +92,5 @@ def test_job_labels_for_defensive_on_config_error(monkeypatch):
 
     monkeypatch.setattr("app.instance_config.get_value", boom)
     labels = job_labels_for({"email": "a@b.com"}, "scan")
-    assert labels["workload_type"] == "foundryai"
+    assert labels["workload_type"] == "agnes"
     assert "environment" not in labels

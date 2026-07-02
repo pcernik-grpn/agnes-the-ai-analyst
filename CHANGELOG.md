@@ -11,7 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
-- BigQuery job labels (`workload_type`, `agent_name`, `environment`, `user_id`) on Foundry-issued BQ jobs (remote select, `/api/v2/scan`, hybrid) for per-user/workload cost attribution in `INFORMATION_SCHEMA.JOBS` / the Cloud Billing export (FAI-105). The DuckDB BigQuery-extension path (sync/snapshot) is not labeled — DuckDB owns the job config.
+- BigQuery job labels (`workload_type`, `agent_name`, `environment`, `user_id`) on Foundry-issued BQ jobs. The **hybrid** path labels its billable jobs; the `/api/v2/scan` and remote-`/api/query` paths label only the dry-run cost estimate — their billable execution runs through the DuckDB BigQuery extension, which (like sync/snapshot) cannot carry job labels. Full billable-job attribution for those paths is a follow-up slice (bytes/slot capture). (FAI-105)
 
 ### Changed
 

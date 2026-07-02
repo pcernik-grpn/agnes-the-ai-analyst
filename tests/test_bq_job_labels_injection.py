@@ -18,7 +18,7 @@ def test_register_bq_applies_labels_to_both_jobs():
     engine = RemoteQueryEngine(MagicMock(), bq_access=MagicMock())
     engine._get_bq_client = lambda: client  # bypass real BQ client resolution
 
-    labels = {"workload_type": "foundryai", "agent_name": "hybrid", "user_id": "pcernik"}
+    labels = {"workload_type": "agnes", "agent_name": "hybrid", "user_id": "pcernik"}
     engine.register_bq("bq_x", "SELECT 1", job_labels=labels)
 
     assert client.query.call_count == 2
@@ -29,7 +29,10 @@ def test_register_bq_applies_labels_to_both_jobs():
 
 
 def test_dry_run_bytes_applies_scan_labels(monkeypatch):
-    monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "dev")
+    def fake_get_value(*keys, default=None):
+        return {"environment": "dev", "workload_type": "agnes"}.get(keys[-1], default)
+
+    monkeypatch.setattr("app.instance_config.get_value", fake_get_value)
     captured = {}
 
     class _Client:
@@ -45,7 +48,7 @@ def test_dry_run_bytes_applies_scan_labels(monkeypatch):
 
     jc = captured["job_config"]
     assert jc.dry_run is True
-    assert jc.labels.get("workload_type") == "foundryai"
+    assert jc.labels.get("workload_type") == "agnes"
     assert jc.labels.get("agent_name") == "scan"
     assert jc.labels.get("user_id") == "pcernik"
 

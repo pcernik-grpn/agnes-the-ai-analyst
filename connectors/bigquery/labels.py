@@ -1,4 +1,4 @@
-"""BigQuery job labels for Foundry cost attribution (FAI-105).
+"""BigQuery job labels for cost attribution (FAI-105).
 
 Every Foundry-issued BQ job we control is tagged with a small, consistent
 label set so usage is groupable per user / workload in
@@ -15,7 +15,8 @@ import re
 
 logger = logging.getLogger(__name__)
 
-_WORKLOAD_TYPE = "foundryai"
+# Neutral default; deployments override via instance.yaml `instance.workload_type`.
+_WORKLOAD_TYPE = "agnes"
 # Any run of chars outside the BQ-allowed set collapses to a single '_'.
 _INVALID = re.compile(r"[^a-z0-9_-]+")
 
@@ -55,14 +56,18 @@ def build_bq_job_labels(
     user: dict | None,
     agent_name: str,
     environment: str | None,
+    workload_type: str = _WORKLOAD_TYPE,
 ) -> dict[str, str]:
     """Build the BQ job-label dict for a Foundry-issued query.
 
     Pure + total: never raises. Applies BQ label rules and drops any
-    label whose value is empty after sanitization.
+    label whose value is empty after sanitization. ``workload_type`` is
+    passed in by the caller (see ``job_labels_for``) rather than read from
+    config here, so this function stays a pure mapping of its arguments.
     """
     try:
-        labels: dict[str, str] = {"workload_type": _WORKLOAD_TYPE}
+        wt = _sanitize_label_value(workload_type) or _WORKLOAD_TYPE
+        labels: dict[str, str] = {"workload_type": wt}
         agent = _sanitize_label_value(agent_name)
         if agent:
             labels["agent_name"] = agent
@@ -79,7 +84,8 @@ def build_bq_job_labels(
 
 
 def job_labels_for(user: dict | None, agent_name: str) -> dict[str, str]:
-    """Read ``instance.environment`` from config and build the label dict.
+    """Read ``instance.environment`` / ``instance.workload_type`` from config
+    and build the label dict.
 
     Defensive — returns {} on any failure so a labeling problem can never
     block a query. This is the entry point callsites use.
@@ -88,6 +94,8 @@ def job_labels_for(user: dict | None, agent_name: str) -> dict[str, str]:
         from app.instance_config import get_value
 
         environment = get_value("instance", "environment", default="") or ""
+        workload_type = get_value("instance", "workload_type", default="agnes") or "agnes"
     except Exception:
         environment = ""
-    return build_bq_job_labels(user, agent_name, environment)
+        workload_type = "agnes"
+    return build_bq_job_labels(user, agent_name, environment, workload_type=workload_type)
