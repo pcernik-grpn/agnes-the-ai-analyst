@@ -1,6 +1,6 @@
-"""BigQuery job labels for cost attribution (FAI-105).
+"""BigQuery job labels for cost attribution.
 
-Every Foundry-issued BQ job we control is tagged with a small, consistent
+Every agent-issued BQ job we control is tagged with a small, consistent
 label set so usage is groupable per user / workload in
 INFORMATION_SCHEMA.JOBS and the Cloud Billing export.
 
@@ -58,7 +58,7 @@ def build_bq_job_labels(
     environment: str | None,
     workload_type: str = _WORKLOAD_TYPE,
 ) -> dict[str, str]:
-    """Build the BQ job-label dict for a Foundry-issued query.
+    """Build the BQ job-label dict for an agent-issued query.
 
     Pure + total: never raises. Applies BQ label rules and drops any
     label whose value is empty after sanitization. ``workload_type`` is

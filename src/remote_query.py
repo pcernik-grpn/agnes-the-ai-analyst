@@ -306,7 +306,7 @@ class RemoteQueryEngine:
 
         client = self._get_bq_client()
 
-        # FAI-105: tag the BQ jobs for per-user/workload cost attribution.
+        # Tag the BQ jobs for per-user/workload cost attribution.
         from google.cloud import bigquery
 
         job_config = bigquery.QueryJobConfig(labels=job_labels) if job_labels else None

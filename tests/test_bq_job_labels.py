@@ -11,8 +11,8 @@ def test_workload_type_defaults_to_agnes():
 
 
 def test_workload_type_passed_through_and_sanitized():
-    labels = build_bq_job_labels({"email": "a@b.com"}, "query", "dev", workload_type="FoundryAI!")
-    assert labels["workload_type"] == "foundryai"
+    labels = build_bq_job_labels({"email": "a@b.com"}, "query", "dev", workload_type="MixedCase!")
+    assert labels["workload_type"] == "mixedcase"
 
 
 def test_user_id_is_email_local_part():
