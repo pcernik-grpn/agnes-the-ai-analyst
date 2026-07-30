@@ -494,15 +494,94 @@ def _run_internal_query(
     )
 
 
-def _first_table_from_sql(sql: str) -> Optional[str]:
-    """Extract the first identifier after FROM or JOIN for audit resource tagging.
+# Functions that take `FROM` as an *argument separator* rather than a clause
+# keyword: `EXTRACT(YEAR FROM ts)`, `SUBSTRING(s FROM 2)`, `TRIM(… FROM s)`.
+# The identifier following that FROM is a column, not a table.
+_FROM_AS_ARGUMENT_FUNCS = frozenset({
+    "extract", "substring", "substr", "trim", "overlay", "position",
+})
 
-    Regex-based; best-effort. Returns None when no table reference is found.
-    Does not need to be accurate — it's only for audit diagnostics.
+# One dotted-path segment: bare, double-quoted, or backticked. A backticked
+# segment may itself contain dots, since a whole quoted FQN is a single token.
+_SQL_IDENT_SEGMENT = r'(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w$-]*)'
+_SQL_IDENT_PATH = re.compile(
+    rf"\b(?:from|join)\s+({_SQL_IDENT_SEGMENT}(?:\s*\.\s*{_SQL_IDENT_SEGMENT})*)",
+    re.IGNORECASE,
+)
+
+
+def _enclosing_call_name(sql: str, pos: int) -> Optional[str]:
+    """Name of the function whose argument list encloses `pos`, if any.
+
+    Walks left counting parens; on the first unmatched `(` it reads the
+    identifier immediately preceding it. Returns None at top level.
     """
-    m = re.search(r'\b(?:from|join)\s+(["\`]?[\w.]+["\`]?)', sql, re.IGNORECASE)
-    if m:
-        return m.group(1).strip("\"'`")[:200]
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        char = sql[i]
+        if char == ")":
+            depth += 1
+        elif char == "(":
+            if depth == 0:
+                end = i
+                while end > 0 and sql[end - 1].isspace():
+                    end -= 1
+                start = end
+                while start > 0 and (sql[start - 1].isalnum() or sql[start - 1] == "_"):
+                    start -= 1
+                return sql[start:end].lower() or None
+            depth -= 1
+        i -= 1
+    return None
+
+
+def _normalize_table_path(raw: str) -> Optional[str]:
+    """Reduce a matched identifier path to the table id used for tagging.
+
+    Quotes are stripped per segment. Three or more segments means a fully
+    qualified reference (`project.dataset.table`, `catalog.schema.table`)
+    whose leading segments name the *source* rather than the table, so only
+    the tail is kept. Two-part `schema.table` names stay qualified.
+    """
+    parts: list[str] = []
+    for segment in re.findall(_SQL_IDENT_SEGMENT, raw):
+        inner = segment.strip('`"')
+        parts.extend(piece for piece in inner.split(".") if piece)
+    if not parts:
+        return None
+    return parts[-1] if len(parts) >= 3 else ".".join(parts)
+
+
+def _first_table_from_sql(sql: str) -> Optional[str]:
+    """Extract the first table reference after FROM or JOIN, for audit tagging.
+
+    Regex-based and still best-effort, but the result is the group-by key of
+    the query-telemetry top-tables ranking, so a non-table identifier does not
+    merely pollute one audit row — it surfaces on a dashboard as usage of a
+    table that does not exist. Three classes are therefore filtered out
+    rather than tolerated:
+
+    * `FROM` used as a function argument separator (`EXTRACT(… FROM col)`),
+      which would otherwise tag the *column*;
+    * table-valued functions (`FROM UNNEST([…])`), which are inline values;
+    * the leading segments of a qualified path, which name the source rather
+      than the table (and previously truncated the id at the first `-`).
+
+    Returns None when no table reference is found.
+    """
+    if not sql:
+        return None
+    for match in _SQL_IDENT_PATH.finditer(sql):
+        if _enclosing_call_name(sql, match.start()) in _FROM_AS_ARGUMENT_FUNCS:
+            continue
+        if sql[match.end():].lstrip().startswith("("):
+            # `FROM unnest(...)` / `FROM generate_series(...)`: a function
+            # call producing inline rows, not a relation.
+            continue
+        table = _normalize_table_path(match.group(1))
+        if table:
+            return table[:200]
     return None
 
 

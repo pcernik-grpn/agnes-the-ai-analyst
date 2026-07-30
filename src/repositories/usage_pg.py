@@ -205,27 +205,46 @@ class UsagePgRepository:
         PG mirror of UsageRepository.summary_query_telemetry — same output
         shape. ``resource`` is ``table:<id>`` or ``table:<id>:as:<snapshot>``;
         ``scan_bytes`` comes from the JSONB ``params->>'bytes_scanned'``.
+        Like the DuckDB sibling, rows are joined against ``table_registry``
+        (``registered``), split by outcome (``failed``), and ranked by
+        successful queries.
         """
         # ``table:<id>[:as:<name>]`` → <id>: strip the 6-char "table:" prefix,
         # then cut any ":as:" suffix. PG substring is 1-indexed (from 7).
         table_id_expr = "split_part(substring(resource from 7), ':as:', 1)"
         # JSONB text extraction → numeric. NULLIF guards empty strings.
         bytes_expr = "NULLIF(params->>'bytes_scanned', '')::bigint"
+        # `result` is 'success' or an 'error.<code>' string; NULL on rows
+        # written before the column existed, which count as neither.
+        failed_expr = "SUM(CASE WHEN result LIKE 'error%' THEN 1 ELSE 0 END)"
 
         with self._engine.connect() as conn:
             top_rows = conn.execute(
                 sa.text(
-                    f"""SELECT {table_id_expr} AS table_id,
-                               COUNT(*) AS queries,
-                               COALESCE(SUM({bytes_expr}), 0) AS scan_bytes,
-                               SUM(CASE WHEN action = 'query.remote' THEN 1 ELSE 0 END) AS remote,
-                               SUM(CASE WHEN action = 'query.local'  THEN 1 ELSE 0 END) AS local
-                        FROM audit_log
-                        WHERE timestamp >= :cutoff
-                          AND action IN ('query.remote', 'query.local', 'snapshot.create')
-                          AND resource LIKE 'table:%'
-                        GROUP BY {table_id_expr}
-                        ORDER BY queries DESC, scan_bytes DESC
+                    f"""SELECT agg.table_id,
+                               agg.queries,
+                               agg.failed,
+                               agg.scan_bytes,
+                               agg.remote,
+                               agg.local,
+                               (reg.id IS NOT NULL) AS registered
+                        FROM (
+                            SELECT {table_id_expr} AS table_id,
+                                   COUNT(*) AS queries,
+                                   {failed_expr} AS failed,
+                                   COALESCE(SUM({bytes_expr}), 0) AS scan_bytes,
+                                   SUM(CASE WHEN action = 'query.remote' THEN 1 ELSE 0 END) AS remote,
+                                   SUM(CASE WHEN action = 'query.local'  THEN 1 ELSE 0 END) AS local
+                            FROM audit_log
+                            WHERE timestamp >= :cutoff
+                              AND action IN ('query.remote', 'query.local', 'snapshot.create')
+                              AND resource LIKE 'table:%'
+                            GROUP BY {table_id_expr}
+                        ) agg
+                        LEFT JOIN table_registry reg ON reg.id = agg.table_id
+                        ORDER BY (agg.queries - agg.failed) DESC,
+                                 agg.queries DESC,
+                                 agg.scan_bytes DESC
                         LIMIT :lim"""
                 ),
                 {"cutoff": cutoff, "lim": limit},
@@ -264,9 +283,11 @@ class UsagePgRepository:
             {
                 "table_id": r[0],
                 "queries": int(r[1]),
-                "scan_bytes": int(r[2] or 0),
-                "remote": int(r[3] or 0),
-                "local": int(r[4] or 0),
+                "failed": int(r[2] or 0),
+                "scan_bytes": int(r[3] or 0),
+                "remote": int(r[4] or 0),
+                "local": int(r[5] or 0),
+                "registered": bool(r[6]),
             }
             for r in top_rows
         ]

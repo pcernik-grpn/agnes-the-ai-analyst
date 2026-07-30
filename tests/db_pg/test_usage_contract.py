@@ -1174,3 +1174,115 @@ def test_session_file_basenames_since_windows_on_arrival(usage_repo):
     )
     got = repo.session_file_basenames_since(now - timedelta(days=1))
     assert got == {"new1.jsonl", "new2.jsonl"}
+
+
+# ---------------------------------------------------------------------------
+# query telemetry: registered-table join + success/failure split
+# ---------------------------------------------------------------------------
+
+
+def _seed_query_audit(repo, backend, conn, rows):
+    """Insert raw audit_log query rows through whichever engine is under test."""
+    stmt = (
+        "INSERT INTO audit_log (id, timestamp, user_id, action, resource, result) "
+        "VALUES (:id, :ts, 'uid', :action, :resource, :result)"
+    )
+    if backend == "duckdb":
+        for r in rows:
+            conn.execute(
+                stmt.replace(":id", "?").replace(":ts", "?").replace(":action", "?")
+                    .replace(":resource", "?").replace(":result", "?"),
+                [r["id"], r["ts"], r["action"], r["resource"], r["result"]],
+            )
+    else:
+        with repo._engine.begin() as c:
+            for r in rows:
+                c.execute(sa.text(stmt), r)
+
+
+def _seed_registered_table(repo, backend, conn, table_id):
+    stmt = (
+        "INSERT INTO table_registry (id, name, source_type, query_mode) "
+        "VALUES (:id, :name, 'bigquery', 'remote')"
+    )
+    if backend == "duckdb":
+        conn.execute(
+            stmt.replace(":id", "?").replace(":name", "?"), [table_id, table_id]
+        )
+    else:
+        with repo._engine.begin() as c:
+            c.execute(sa.text(stmt), {"id": table_id, "name": table_id})
+
+
+def test_query_telemetry_flags_unregistered_table_names(usage_repo):
+    """A parsed name absent from table_registry must be marked, not silently
+    presented as a real table. Both backends."""
+    from datetime import datetime, timedelta, timezone
+
+    repo, conn, backend = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_registered_table(repo, backend, conn, "orders")
+    _seed_query_audit(repo, backend, conn, [
+        {"id": "q1", "ts": now, "action": "query.remote",
+         "resource": "table:orders", "result": "success"},
+        {"id": "q2", "ts": now, "action": "query.remote",
+         "resource": "table:not_a_table", "result": "success"},
+    ])
+
+    out = repo.summary_query_telemetry(cutoff=now - timedelta(days=1))
+    by_id = {r["table_id"]: r for r in out["top_tables"]}
+
+    assert by_id["orders"]["registered"] is True
+    assert by_id["not_a_table"]["registered"] is False
+
+
+def test_query_telemetry_counts_failures_per_table(usage_repo):
+    """`failed` must be reported alongside `queries` so a name that never
+    succeeded is distinguishable from real usage. Both backends."""
+    from datetime import datetime, timedelta, timezone
+
+    repo, conn, backend = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_query_audit(repo, backend, conn, [
+        {"id": "f1", "ts": now, "action": "query.local",
+         "resource": "table:ghost", "result": "error.400"},
+        {"id": "f2", "ts": now, "action": "query.local",
+         "resource": "table:ghost", "result": "error.400"},
+        {"id": "s1", "ts": now, "action": "query.local",
+         "resource": "table:real_one", "result": "success"},
+    ])
+
+    out = repo.summary_query_telemetry(cutoff=now - timedelta(days=1))
+    by_id = {r["table_id"]: r for r in out["top_tables"]}
+
+    assert by_id["ghost"]["queries"] == 2
+    assert by_id["ghost"]["failed"] == 2
+    assert by_id["real_one"]["queries"] == 1
+    assert by_id["real_one"]["failed"] == 0
+
+
+def test_query_telemetry_ranks_by_successful_queries(usage_repo):
+    """A name that failed every time must not outrank a table with genuine
+    usage, even when its raw attempt count is higher. Both backends.
+
+    The motivating shape: a scheduled job retrying a deleted local snapshot
+    every few minutes put a table that does not exist at the top of the
+    ranking, above every table anyone actually queried.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    repo, conn, backend = usage_repo
+    now = datetime.now(timezone.utc)
+    rows = [
+        {"id": f"g{i}", "ts": now, "action": "query.local",
+         "resource": "table:ghost", "result": "error.400"}
+        for i in range(3)
+    ]
+    rows.append({"id": "r1", "ts": now, "action": "query.local",
+                 "resource": "table:real_one", "result": "success"})
+    _seed_query_audit(repo, backend, conn, rows)
+
+    out = repo.summary_query_telemetry(cutoff=now - timedelta(days=1))
+    ranked = [r["table_id"] for r in out["top_tables"]]
+
+    assert ranked.index("real_one") < ranked.index("ghost")

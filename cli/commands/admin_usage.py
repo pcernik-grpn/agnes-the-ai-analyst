@@ -133,13 +133,25 @@ def summary(
         typer.echo("  (no query activity in this window)")
         return
     typer.echo("")
-    typer.echo(f"  {'table':<40} {'queries':>8} {'remote':>7} {'local':>6} {'scan_bytes':>14}")
+    typer.echo(
+        f"  {'table':<40} {'queries':>8} {'failed':>7} {'remote':>7} "
+        f"{'local':>6} {'scan_bytes':>14}"
+    )
     for t in tables:
+        # A `*` marks an id that is not in the table registry: it was parsed
+        # out of query SQL and may not name a real table.
+        label = str(t.get("table_id", ""))[:39]
+        if t.get("registered") is False:
+            label = f"{label}*"
         typer.echo(
-            f"  {str(t.get('table_id', ''))[:40]:<40} "
-            f"{t.get('queries', 0):>8} {t.get('remote', 0):>7} "
+            f"  {label:<40} "
+            f"{t.get('queries', 0):>8} {t.get('failed', 0):>7} "
+            f"{t.get('remote', 0):>7} "
             f"{t.get('local', 0):>6} {t.get('scan_bytes', 0):>14,}"
         )
+    if any(t.get("registered") is False for t in tables):
+        typer.echo("")
+        typer.echo("  * not in the table registry (parsed from query SQL)")
 
 
 @app.command()

@@ -194,6 +194,7 @@
         <tr>
           <th>Table</th>
           <th class="obs-num">Queries</th>
+          <th class="obs-num">Failed</th>
           <th class="obs-num">Remote</th>
           <th class="obs-num">Local</th>
           <th class="obs-num">Scan bytes</th>
@@ -358,7 +359,7 @@
     try {
       d = await get('/api/admin/telemetry/summary?window=' + summaryWindow(state.window));
     } catch (e) {
-      qtRows.innerHTML = '<tr><td colspan="5" class="obs-empty">Failed to load query telemetry.</td></tr>';
+      qtRows.innerHTML = '<tr><td colspan="6" class="obs-empty">Failed to load query telemetry.</td></tr>';
       return;
     }
     const qt = d.query_telemetry || {};
@@ -369,15 +370,23 @@
       fmtN(qt.snapshot_creates) + ' snapshots';
     const rows = qt.top_tables || [];
     if (!rows.length) {
-      qtRows.innerHTML = '<tr><td colspan="5" class="obs-empty">No query activity in this window.</td></tr>';
+      qtRows.innerHTML = '<tr><td colspan="6" class="obs-empty">No query activity in this window.</td></tr>';
       return;
     }
     qtRows.innerHTML = '';
     rows.forEach(r => {
       const tr = document.createElement('tr');
+      // The table id is parsed from SQL, so it may not name a registered
+      // table. Say so rather than presenting it as real usage.
+      const unregistered = r.registered === false;
+      const label = escapeHtml(r.table_id == null ? '—' : r.table_id) +
+        (unregistered
+          ? ' <span class="obs-source-pill" title="Not in the table registry — parsed from query SQL">unregistered</span>'
+          : '');
       tr.innerHTML =
-        '<td>' + escapeHtml(r.table_id == null ? '—' : r.table_id) + '</td>' +
+        '<td>' + label + '</td>' +
         '<td class="obs-num">' + fmtN(r.queries) + '</td>' +
+        '<td class="obs-num">' + fmtN(r.failed) + '</td>' +
         '<td class="obs-num">' + fmtN(r.remote) + '</td>' +
         '<td class="obs-num">' + fmtN(r.local) + '</td>' +
         '<td class="obs-num">' + fmtBytes(r.scan_bytes) + '</td>';

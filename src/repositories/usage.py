@@ -160,8 +160,15 @@ class UsageRepository:
         count toward totals but not the per-table ranking. ``scan_bytes`` is
         summed from ``params.$.bytes_scanned`` (NULL on the local path).
 
+        The parsed id comes from a best-effort SQL regex, so it is not
+        guaranteed to name a real table. Rows are therefore joined against
+        ``table_registry`` (``registered``) and split by outcome (``failed``),
+        and the ranking is by *successful* queries: an id that never resolved
+        cannot outrank a table with genuine usage just by being retried.
+
         Returns:
-            top_tables: [{table_id, queries, scan_bytes, remote, local}]
+            top_tables: [{table_id, queries, failed, registered, scan_bytes,
+                          remote, local}]
             frequency:  [{day, table_id, remote, local}]
             total_scan_bytes, remote_queries, local_queries, snapshot_creates
         """
@@ -169,20 +176,36 @@ class UsageRepository:
         # 4-char-stripped tail (drop the leading "table:") then cut any ":as:".
         table_id_expr = "split_part(substr(resource, 7), ':as:', 1)"
         bytes_expr = "TRY_CAST(json_extract_string(params, '$.bytes_scanned') AS BIGINT)"
+        # `result` is 'success' or an 'error.<code>' string; NULL on rows
+        # written before the column existed, which count as neither.
+        failed_expr = "SUM(CASE WHEN result LIKE 'error%' THEN 1 ELSE 0 END)"
 
         # Per-table ranking (only rows that carry a table resource).
         top_rows = self.conn.execute(
-            f"""SELECT {table_id_expr} AS table_id,
-                       COUNT(*) AS queries,
-                       COALESCE(SUM({bytes_expr}), 0) AS scan_bytes,
-                       SUM(CASE WHEN action = 'query.remote' THEN 1 ELSE 0 END) AS remote,
-                       SUM(CASE WHEN action = 'query.local'  THEN 1 ELSE 0 END) AS local
-                FROM audit_log
-                WHERE timestamp >= ?
-                  AND action IN ('query.remote', 'query.local', 'snapshot.create')
-                  AND resource LIKE 'table:%'
-                GROUP BY table_id
-                ORDER BY queries DESC, scan_bytes DESC
+            f"""SELECT agg.table_id,
+                       agg.queries,
+                       agg.failed,
+                       agg.scan_bytes,
+                       agg.remote,
+                       agg.local,
+                       CASE WHEN reg.id IS NULL THEN false ELSE true END AS registered
+                FROM (
+                    SELECT {table_id_expr} AS table_id,
+                           COUNT(*) AS queries,
+                           {failed_expr} AS failed,
+                           COALESCE(SUM({bytes_expr}), 0) AS scan_bytes,
+                           SUM(CASE WHEN action = 'query.remote' THEN 1 ELSE 0 END) AS remote,
+                           SUM(CASE WHEN action = 'query.local'  THEN 1 ELSE 0 END) AS local
+                    FROM audit_log
+                    WHERE timestamp >= ?
+                      AND action IN ('query.remote', 'query.local', 'snapshot.create')
+                      AND resource LIKE 'table:%'
+                    GROUP BY table_id
+                ) agg
+                LEFT JOIN table_registry reg ON reg.id = agg.table_id
+                ORDER BY (agg.queries - agg.failed) DESC,
+                         agg.queries DESC,
+                         agg.scan_bytes DESC
                 LIMIT ?""",
             [cutoff, limit],
         ).fetchall()
@@ -190,9 +213,11 @@ class UsageRepository:
             {
                 "table_id": r[0],
                 "queries": int(r[1]),
-                "scan_bytes": int(r[2] or 0),
-                "remote": int(r[3] or 0),
-                "local": int(r[4] or 0),
+                "failed": int(r[2] or 0),
+                "scan_bytes": int(r[3] or 0),
+                "remote": int(r[4] or 0),
+                "local": int(r[5] or 0),
+                "registered": bool(r[6]),
             }
             for r in top_rows
         ]
