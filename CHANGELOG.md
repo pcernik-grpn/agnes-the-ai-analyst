@@ -12,6 +12,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+### Security
+
+## [0.77.29] - 2026-07-30
+
+### Added
+
 - Query telemetry now reports `failed` (queries that errored) and `registered` (whether the id exists in `table_registry`) per table, on both the `/admin/usage` top-tables panel and `agnes admin usage summary` (unregistered ids marked `*`). An id parsed out of SQL is not proof a table exists, and the dashboard now says so instead of implying it.
 
 ### Changed
