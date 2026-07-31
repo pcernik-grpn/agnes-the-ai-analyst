@@ -1447,8 +1447,62 @@ def _rebuild_duckdb_views(workspace: Path, parquet_dir: Path) -> None:
                         conn.execute(f"CREATE VIEW \"{view_name}\" AS SELECT * FROM read_parquet('{abs_path}')")
                     except duckdb.Error:
                         continue
+
+        _register_snapshot_views(conn, workspace)
     finally:
         conn.close()
+
+
+def _quote_ident(name: str) -> str:
+    """Quote a SQL identifier, doubling embedded double-quotes.
+
+    Mirrors `src.profiler.quote_ident`, re-stated here rather than imported:
+    that module pulls in `src.db`, and this path runs on the analyst's laptop
+    at every session start. A snapshot name is validated at creation time, but
+    the name used here comes from a *filename on disk*, which nothing stops a
+    user (or another tool) from writing directly.
+    """
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _register_snapshot_views(conn, workspace: Path) -> None:
+    """Re-register views over local snapshots after the clean-slate drop.
+
+    `agnes snapshot create` writes `user/snapshots/<name>.parquet` and
+    registers a view named `<name>`. That tree is outside `parquet_dir`, so
+    the drop-all above takes those views with it and the server loop cannot
+    put them back: every pull silently removed every snapshot, while
+    `agnes snapshot list` (which reads the meta sidecars off disk) kept
+    reporting them as present.
+
+    Runs last so a registered table always wins a name collision, and is
+    self-healing: a workspace whose snapshot views were already destroyed
+    gets them back on the next pull with no user action.
+    """
+    import duckdb  # noqa: F401  (duckdb.Error below)
+
+    snapshots_dir = workspace / "user" / "snapshots"
+    if not snapshots_dir.exists():
+        return
+
+    # Everything already registered by this rebuild — base tables the user
+    # created plus the views just built from `parquet_dir`.
+    try:
+        taken = {row[0] for row in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()}
+    except Exception:
+        return
+
+    for entry in sorted(snapshots_dir.glob("*.parquet")):
+        view_name = entry.stem
+        if view_name in taken:
+            continue
+        if not _is_valid_parquet(entry):
+            continue
+        abs_path = str(entry.resolve()).replace("'", "''")
+        try:
+            conn.execute(f"CREATE VIEW {_quote_ident(view_name)} AS SELECT * FROM read_parquet('{abs_path}')")
+        except duckdb.Error:
+            continue
 
 
 def _item_to_md(item: dict) -> str:
