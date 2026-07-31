@@ -16,6 +16,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+### Removed
+
+### Internal
+
+### Security
+
+## [0.77.33] - 2026-07-31
+
+### Added
+
+### Changed
+
+### Fixed
+
 - Local snapshots no longer stop resolving after a pull. `_rebuild_duckdb_views` drops every view and re-created only those backed by a parquet under `server/parquet`; snapshots live in `user/snapshots`, so `agnes pull` destroyed their views and nothing put them back. Because the SessionStart hook runs a pull, a snapshot became unqueryable at the start of the next Claude Code session, reporting `Table with name <snapshot> does not exist` while `agnes snapshot list` (which reads the meta sidecars off disk) still listed it as present. Snapshot views are now re-registered as part of the rebuild, after the server-parquet loop so a registered table still wins a name collision. The fix is self-healing: a workspace whose snapshot views were already destroyed gets them back on the next pull, with no user action.
 
 ### Removed
