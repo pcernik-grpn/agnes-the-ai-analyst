@@ -166,15 +166,59 @@ def _looks_like_bq_rewrite_parse_error(exc: BaseException) -> bool:
 _SQL_LOG_PREVIEW_CHARS = 200
 
 
-def _sql_log_preview(sql: str) -> str:
+def _bq_error_offset(message: str, sql: str) -> Optional[int]:
+    """Absolute offset into ``sql`` for a BigQuery ``at [line:col]`` suffix.
+
+    BigQuery reports where it stopped parsing, and for the ROLLUP rejection this
+    module logs it is well past any sane preview cap — the motivating message
+    ends ``other grouping elements at [1:657]``. Returns ``None`` when the
+    message carries no position or the position does not exist in ``sql``, so
+    callers fall back to a head preview rather than to a wrong window.
+
+    Both coordinates are 1-based.
+    """
+    m = re.search(r"\[(\d+):(\d+)\]", message or "")
+    if not m:
+        return None
+    line, col = int(m.group(1)), int(m.group(2))
+    lines = (sql or "").splitlines()
+    if line < 1 or line > len(lines) or col < 1:
+        return None
+    # +1 per preceding line for the newline that `splitlines` consumed.
+    offset = sum(len(prev) + 1 for prev in lines[: line - 1]) + (col - 1)
+    return offset if offset <= len(sql or "") else None
+
+
+def _sql_log_preview(sql: str, *, around: Optional[int] = None) -> str:
     """Truncate SQL for logging. Query literals can carry sensitive values,
     so the log must never become the one place a full query body lands
     unbounded.
+
+    ``around`` centers the window on a character offset the engine complained
+    about instead of taking it from the head. Without it, logging a rejected
+    query is self-defeating for exactly the case it was added for: BigQuery
+    rejected at character 657 and the head-200 preview stops long before the
+    clause the operator needs to see. The cap itself is unchanged, so the
+    sensitive-value bound this function exists for still holds — the window
+    moves, it does not grow.
+
+    Whitespace is collapsed AFTER windowing, never before: ``around`` indexes
+    the raw SQL the engine parsed, and collapsing first would shift every offset
+    past the first run of whitespace.
     """
-    text = " ".join((sql or "").split())
+    raw = sql or ""
+    text = " ".join(raw.split())
     if len(text) <= _SQL_LOG_PREVIEW_CHARS:
         return text
-    return text[:_SQL_LOG_PREVIEW_CHARS] + "... [truncated]"
+    if around is None:
+        return text[:_SQL_LOG_PREVIEW_CHARS] + "... [truncated]"
+
+    half = _SQL_LOG_PREVIEW_CHARS // 2
+    start = max(0, min(around - half, max(0, len(raw) - _SQL_LOG_PREVIEW_CHARS)))
+    window = " ".join(raw[start : start + _SQL_LOG_PREVIEW_CHARS].split())
+    lead = "[truncated] ..." if start > 0 else ""
+    tail = "... [truncated]" if start + _SQL_LOG_PREVIEW_CHARS < len(raw) else ""
+    return f"{lead}{window}{tail}"
 
 
 def _hint_for_bq_bad_request(message: str) -> str:
@@ -2076,7 +2120,7 @@ def _bq_quota_and_cap_guard(
                     "original SQL. rewritten_sql_preview=%r",
                     exc.kind,
                     exc.message,
-                    _sql_log_preview(rewritten_sql),
+                    _sql_log_preview(rewritten_sql, around=_bq_error_offset(exc.message, rewritten_sql)),
                 )
                 try:
                     total_bytes = _bq_dry_run_bytes(bq, sql, user=user, agent_name="query")

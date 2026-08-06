@@ -1043,3 +1043,77 @@ class TestDryRunRejectionIsDiagnosable:
         assert needle not in warnings, (
             "full SQL body reached the log un-truncated"
         )
+
+
+class TestRejectedSqlPreviewShowsTheRejectedClause:
+    """The warning exists so an operator can see WHICH clause BigQuery refused.
+
+    A head-anchored 200-char preview cannot do that for the case this hint was
+    written for: the motivating message ends `other grouping elements at
+    [1:657]`, so the offending `GROUP BY ROLLUP(...)` sits ~450 characters past
+    where the preview stops. The window now centers on the reported offset; the
+    cap is unchanged, so the sensitive-value bound the truncation exists for
+    still holds (Devin Review on #1188).
+    """
+
+    _MSG = "ROLLUP must be the only grouping element ... other grouping elements at [1:657]"
+
+    def _long_sql(self) -> str:
+        head = "SELECT " + ", ".join(f"col_{i}" for i in range(60))
+        return head.ljust(650) + " GROUP BY ROLLUP(a), b ORDER BY 1"
+
+    def test_offset_resolves_from_the_bq_message(self):
+        from app.api.query import _bq_error_offset
+
+        sql = self._long_sql()
+        assert _bq_error_offset(self._MSG, sql) == 656  # [1:657] is 1-based
+
+    def test_offset_is_none_without_a_position(self):
+        from app.api.query import _bq_error_offset
+
+        assert _bq_error_offset("Syntax error: something", "SELECT 1") is None
+        assert _bq_error_offset("", "SELECT 1") is None
+
+    def test_offset_is_none_when_the_position_is_not_in_the_sql(self):
+        """A truncated or rewritten body must not produce a bogus window."""
+        from app.api.query import _bq_error_offset
+
+        assert _bq_error_offset("at [9:1]", "SELECT 1") is None
+        assert _bq_error_offset("at [1:900]", "SELECT 1") is None
+
+    def test_offset_resolves_across_lines(self):
+        from app.api.query import _bq_error_offset
+
+        # "SELECT"(6) + \n + "a,"(2) + \n = 10, and sql[10] == "b"
+        assert _bq_error_offset("at [3:1]", "SELECT\na,\nb") == 10
+
+    def test_window_contains_the_rejected_clause_and_the_head_preview_does_not(self):
+        from app.api.query import _bq_error_offset, _sql_log_preview
+
+        sql = self._long_sql()
+        head = _sql_log_preview(sql)
+        windowed = _sql_log_preview(sql, around=_bq_error_offset(self._MSG, sql))
+
+        assert "ROLLUP" not in head, "precondition: the old preview misses the clause"
+        assert "ROLLUP" in windowed, "the window must show what BigQuery rejected"
+
+    def test_the_window_does_not_widen_the_exposure(self):
+        from app.api.query import _SQL_LOG_PREVIEW_CHARS, _bq_error_offset, _sql_log_preview
+
+        sql = self._long_sql()
+        windowed = _sql_log_preview(sql, around=_bq_error_offset(self._MSG, sql))
+        body = windowed.replace("[truncated] ...", "").replace("... [truncated]", "")
+        assert len(body) <= _SQL_LOG_PREVIEW_CHARS
+
+    def test_no_offset_keeps_the_previous_behaviour(self):
+        from app.api.query import _sql_log_preview
+
+        sql = self._long_sql()
+        assert _sql_log_preview(sql, around=None) == _sql_log_preview(sql)
+
+    def test_short_sql_is_never_truncated_either_way(self):
+        from app.api.query import _sql_log_preview
+
+        sql = "SELECT 1"
+        assert _sql_log_preview(sql) == sql
+        assert _sql_log_preview(sql, around=3) == sql
