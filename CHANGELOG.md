@@ -223,6 +223,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   silently disabled tool-call approvals and saving the Studio section disabled
   the Studio surface. The bool branch now falls back to the declared default when
   the value is unset, which is what the text branch beside it already did.
+- The warning that logs a BigQuery-rejected query now shows the clause BigQuery
+  actually refused. The preview was anchored at the head and capped at 200
+  characters, but the rejection this hint was written for reports its position at
+  `[1:657]` — so the `GROUP BY ROLLUP(...)` the operator needed to see sat past
+  the cut, and the log line could not support the diagnosis it was added for. The
+  window now centers on the offset parsed out of the BigQuery message, falling
+  back to the head preview when the message carries no position. The cap is
+  unchanged, so the sensitive-value bound the truncation exists for still holds —
+  the window moves rather than grows. Whitespace is collapsed after windowing,
+  since the offset indexes the raw SQL the engine parsed.
+
 - `/api/query` now returns an accurate hint when BigQuery rejects a query for combining `ROLLUP` with other grouping elements in a `GROUP BY`. DuckDB accepts `GROUP BY a, ROLLUP(b)` and BigQuery does not, so a query that runs fine locally is rejected during cost estimation with a `remote_estimate_failed` 400. The hint previously fell through to the generic branch, which sent analysts hunting through columns, aliases and table paths, none of which were the cause. It now names the dialect divergence and gives the faithful `GROUPING SETS` rewrite, explicitly noting that `GROUP BY ROLLUP(a, b)` is *not* an equivalent query (it adds a grand-total row).
 
 ### Removed
