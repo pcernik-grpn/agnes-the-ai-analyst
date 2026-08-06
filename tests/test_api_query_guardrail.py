@@ -909,3 +909,137 @@ class TestHintForBqBadRequest:
         # has somewhere to start
         assert "schema" in hint.lower()
         assert "underlying" in hint.lower()
+
+    def test_mixed_rollup_hint_names_the_dialect_divergence(self):
+        # FAI-137. DuckDB accepts `GROUP BY a, ROLLUP(b)`; BigQuery requires
+        # ROLLUP to be the only grouping element. The query is well-formed
+        # DuckDB, so the analyst has no reason to suspect their GROUP BY —
+        # the hint must name the divergence and the exact rewrite.
+        from app.api.query import _hint_for_bq_bad_request
+
+        hint = _hint_for_bq_bad_request(
+            "The GROUP BY clause only supports ROLLUP when there are no "
+            "other grouping elements at [1:657]"
+        )
+        assert "grouping sets" in hint.lower(), hint
+        # Must point at the GROUP BY, not send the analyst hunting through
+        # columns / aliases / table paths like the generic hint does.
+        assert "group by" in hint.lower(), hint
+        assert "verify with" not in hint.lower(), hint
+
+    def test_mixed_rollup_hint_does_not_suggest_a_lossy_rewrite(self):
+        # `GROUP BY a, ROLLUP(b)` is NOT equivalent to `GROUP BY ROLLUP(a, b)`
+        # — the latter adds a grand-total row. Recommending it would silently
+        # change the analyst's result shape. The GROUPING SETS form is the
+        # faithful translation and is what the hint must lead with.
+        from app.api.query import _hint_for_bq_bad_request
+
+        hint = _hint_for_bq_bad_request(
+            "The GROUP BY clause only supports ROLLUP when there are no "
+            "other grouping elements at [1:657]"
+        )
+        idx_sets = hint.lower().find("grouping sets")
+        assert idx_sets != -1, hint
+        idx_rollup_all = hint.lower().find("rollup(country, brand)")
+        if idx_rollup_all != -1:
+            assert idx_sets < idx_rollup_all, (
+                "hint leads with the lossy ROLLUP-everything rewrite: " + hint
+            )
+
+
+class TestDryRunRejectionIsDiagnosable:
+    """FAI-137: when BQ rejects the rewritten SQL, the rewritten SQL text is
+    the single most useful artifact for diagnosing why — and nothing logged
+    it. Dry-run BQ jobs are not retained, so once the request is over the
+    evidence is gone for good.
+    """
+
+    def test_dry_run_rejection_logs_the_rejected_sql(
+        self, seeded_app, mock_dry_run, monkeypatch, caplog,
+    ):
+        import logging
+
+        from connectors.bigquery.access import BqAccessError
+
+        _register_bq_remote_row("ue", "finance", "ue")
+
+        def always_parse_error(_bq, sql, **_kwargs):
+            raise BqAccessError(
+                "bq_bad_request",
+                "The GROUP BY clause only supports ROLLUP when there are "
+                "no other grouping elements at [1:657]",
+            )
+
+        monkeypatch.setattr(
+            "app.api.query._bq_dry_run_bytes", always_parse_error,
+            raising=False,
+        )
+
+        c = seeded_app["client"]
+        with caplog.at_level(logging.WARNING, logger="app.api.query"):
+            c.post(
+                "/api/query",
+                json={
+                    "sql": (
+                        "SELECT country, SUM(margin) FROM ue "
+                        "GROUP BY country, ROLLUP(brand)"
+                    )
+                },
+                headers=_auth(seeded_app["admin_token"]),
+            )
+
+        warnings = "\n".join(
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+        # The rewritten SQL that BQ actually rejected must appear in the log,
+        # with the table reference resolved to its BQ-native path — that is
+        # what distinguishes a rewriter bug from user-side dialect drift.
+        assert "ROLLUP" in warnings, warnings
+        assert "test-data-prj.finance.ue" in warnings, warnings
+
+    def test_logged_sql_is_truncated(
+        self, seeded_app, mock_dry_run, monkeypatch, caplog,
+    ):
+        # SQL literals can carry sensitive values. The audit log already
+        # caps `sql_preview` at 200 chars; the WARNING must not become the
+        # one place a full query body lands in log storage unbounded.
+        import logging
+
+        from connectors.bigquery.access import BqAccessError
+
+        _register_bq_remote_row("ue", "finance", "ue")
+
+        def always_parse_error(_bq, sql, **_kwargs):
+            raise BqAccessError("bq_bad_request", "Syntax error: whatever")
+
+        monkeypatch.setattr(
+            "app.api.query._bq_dry_run_bytes", always_parse_error,
+            raising=False,
+        )
+
+        needle = "SUPER_SECRET_VALUE_THAT_IS_PAST_THE_TRUNCATION_LIMIT"
+        long_sql = (
+            "SELECT country, " + ", ".join(f"col_{i}" for i in range(60))
+            + f" FROM ue WHERE token = '{needle}'"
+        )
+        assert len(long_sql) > 400, "test SQL must exceed the truncation cap"
+
+        c = seeded_app["client"]
+        with caplog.at_level(logging.WARNING, logger="app.api.query"):
+            c.post(
+                "/api/query",
+                json={"sql": long_sql},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+
+        warnings = "\n".join(
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+        # A preview must actually be emitted — otherwise this test passes
+        # simply because nothing is logged, which is the bug it guards.
+        assert "rewritten_sql_preview=" in warnings, warnings
+        assert needle not in warnings, (
+            "full SQL body reached the log un-truncated"
+        )

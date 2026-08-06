@@ -115,6 +115,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - Admin "Browse & register tables" now works with bucket-scoped (custom access) Keboola tokens: when the project-wide `/buckets` + `/tables` listings are refused, the endpoint falls back to enumerating the token's own `bucketPermissions` per bucket, so the picker shows exactly the buckets the token can read. The response carries a `scope` field (`"project"` or `"token_buckets"`) and the picker renders a note when the listing is token-limited. Upstream listing failures are logged with the connection id, and network-level errors (DNS, refused connection, TLS) surface as a clean 502 `keboola_storage_api_error` detail instead of a generic 500.
 
+## [0.81.1] - 2026-08-06
+
+### Added
+
 ### Changed
 
 ### Fixed
@@ -222,6 +226,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   silently disabled tool-call approvals and saving the Studio section disabled
   the Studio surface. The bool branch now falls back to the declared default when
   the value is unset, which is what the text branch beside it already did.
+- `/api/query` now returns an accurate hint when BigQuery rejects a query for combining `ROLLUP` with other grouping elements in a `GROUP BY`. DuckDB accepts `GROUP BY a, ROLLUP(b)` and BigQuery does not, so a query that runs fine locally is rejected during cost estimation with a `remote_estimate_failed` 400. The hint previously fell through to the generic branch, which sent analysts hunting through columns, aliases and table paths, none of which were the cause. It now names the dialect divergence and gives the faithful `GROUPING SETS` rewrite, explicitly noting that `GROUP BY ROLLUP(a, b)` is *not* an equivalent query (it adds a grand-total row).
 
 ### Removed
 
@@ -570,6 +575,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   since this is what materializes "locked, can't uninstall" for a required store
   entity.
 - **Contract guard against the light-only-tint bug class** (`tests/test_design_system_contract.py`): every `--ds-*-soft` token is declared once in the global `:root` with no `data-theme="dark"` override, so filling with one and inking with `--ds-text-*` yields invisible text under dark — the connect-banner bug fixed above. The guard parses every shipped stylesheet plus each template's inline `<style>` (flattening `@media` wrappers), and fails when a rule fills with a light-only `-soft` tint, ink that flips with the theme is drawn on that element or a descendant/BEM child of it, and the same stylesheet ships no `[data-theme="dark"]` override for it. Correct pairings stay quiet by construction: a tint inked with a deep accent (`.ag-instack` → `--ds-agnes`), `--ds-text-inverse` on a solid fill, and rules already scoped to any `[data-theme="…"]`. Four unit tests pin the detector against synthetic CSS — including the exact pre-fix `.cbn` shape — so it can't rot into a vacuous pass; removing the shipped fix makes it fail with `.cbn (fill --ds-agnes-soft; ink from .cbn-title)`.
+
+- The BQ dry-run rejection WARNING now includes a truncated preview of the rewritten SQL that BigQuery rejected. Dry-run BQ jobs are not retained, so this line is the only surviving evidence of what BQ was asked to parse; without it triage cannot distinguish a rewriter bug from user-side dialect drift. Capped at 200 characters, matching the existing audit-log `sql_preview` limit, so query literals are not written to log storage unbounded.
+
+### Security
 
 ## [0.81.0] - 2026-08-06
 
