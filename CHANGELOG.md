@@ -22,6 +22,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Security
 
+## [0.81.1] - 2026-08-06
+
+### Added
+
+### Changed
+
+### Fixed
+
+- `/api/query` now returns an accurate hint when BigQuery rejects a query for combining `ROLLUP` with other grouping elements in a `GROUP BY`. DuckDB accepts `GROUP BY a, ROLLUP(b)` and BigQuery does not, so a query that runs fine locally is rejected during cost estimation with a `remote_estimate_failed` 400. The hint previously fell through to the generic branch, which sent analysts hunting through columns, aliases and table paths, none of which were the cause. It now names the dialect divergence and gives the faithful `GROUPING SETS` rewrite, explicitly noting that `GROUP BY ROLLUP(a, b)` is *not* an equivalent query (it adds a grand-total row).
+
+### Removed
+
+### Internal
+
+- The BQ dry-run rejection WARNING now includes a truncated preview of the rewritten SQL that BigQuery rejected. Dry-run BQ jobs are not retained, so this line is the only surviving evidence of what BQ was asked to parse; without it triage cannot distinguish a rewriter bug from user-side dialect drift. Capped at 200 characters, matching the existing audit-log `sql_preview` limit, so query literals are not written to log storage unbounded.
+
+### Security
+
 ## [0.81.0] - 2026-08-06
 
 ### Added
