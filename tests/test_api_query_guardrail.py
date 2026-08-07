@@ -8,6 +8,7 @@ estimated scan exceeds the configured cap, reject with 400 +
 Default cap: 5 GiB per request. Configurable via
 `api.query.bq_max_scan_bytes` in /admin/server-config (#160 §4.4).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -20,6 +21,7 @@ def _auth(token: str) -> dict:
 def _register_bq_remote_row(name: str, bucket: str, source_table: str) -> None:
     from src.db import get_system_db
     from src.repositories.table_registry import TableRegistryRepository
+
     sys_conn = get_system_db()
     try:
         TableRegistryRepository(sys_conn).register(
@@ -85,8 +87,9 @@ def test_query_under_cap_calls_dry_run(seeded_app, mock_dry_run, monkeypatch):
         json={"sql": "SELECT count(*) FROM ue"},
         headers=_auth(token),
     )
-    assert state["call_count"] >= 1, \
+    assert state["call_count"] >= 1, (
         "guardrail must invoke _bq_dry_run_bytes when SQL references a registered remote BQ row"
+    )
 
 
 def test_query_over_cap_rejected_400(seeded_app, mock_dry_run, monkeypatch):
@@ -111,8 +114,7 @@ def test_query_over_cap_rejected_400(seeded_app, mock_dry_run, monkeypatch):
         # → `agnes snapshot create`). Accept the new shape.
         suggestion = detail.get("suggestion", "").lower()
         assert "agnes snapshot create" in suggestion or "snapshot create" in suggestion
-        assert "ue" in detail.get("tables", []) or \
-               any("ue" in t for t in detail.get("tables", []))
+        assert "ue" in detail.get("tables", []) or any("ue" in t for t in detail.get("tables", []))
 
 
 def test_query_over_cap_against_view_includes_view_hint(seeded_app, mock_dry_run, monkeypatch):
@@ -130,9 +132,13 @@ def test_query_over_cap_against_view_includes_view_hint(seeded_app, mock_dry_run
     conn = get_system_db()
     try:
         BqMetadataCacheRepository(conn).upsert_success(
-            cached_id, rows=None, size_bytes=None,
-            partition_by=None, clustered_by=None,
-            entity_type="VIEW", known_columns=["event_date"],
+            cached_id,
+            rows=None,
+            size_bytes=None,
+            partition_by=None,
+            clustered_by=None,
+            entity_type="VIEW",
+            known_columns=["event_date"],
         )
     finally:
         conn.close()
@@ -175,8 +181,7 @@ def test_no_bq_row_reference_skips_dry_run(seeded_app, monkeypatch):
         json={"sql": "SELECT 1 AS x"},
         headers=_auth(token),
     )
-    assert state["calls"] == 0, \
-        f"guardrail must skip dry-run on non-BQ queries; got {state['calls']} calls"
+    assert state["calls"] == 0, f"guardrail must skip dry-run on non-BQ queries; got {state['calls']} calls"
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +195,9 @@ def test_no_bq_row_reference_skips_dry_run(seeded_app, monkeypatch):
 
 
 def test_guardrail_dry_runs_rewritten_user_sql_not_synthetic_select_star(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """The dry-run must receive the USER's SQL with bare table names rewritten
     to backticked paths — not a synthetic ``SELECT * FROM <table>``.
@@ -208,15 +215,14 @@ def test_guardrail_dry_runs_rewritten_user_sql_not_synthetic_select_star(
         return 1024  # tiny — pass the cap
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", capturing_fake, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        capturing_fake,
+        raising=False,
     )
 
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
-    user_sql = (
-        "SELECT order_id FROM ue "
-        "WHERE event_date = DATE '2026-04-30' AND country = 'CZ'"
-    )
+    user_sql = "SELECT order_id FROM ue WHERE event_date = DATE '2026-04-30' AND country = 'CZ'"
     c.post("/api/query", json={"sql": user_sql}, headers=_auth(token))
 
     sent = captured["sql"]
@@ -229,18 +235,16 @@ def test_guardrail_dry_runs_rewritten_user_sql_not_synthetic_select_star(
     # Bare name `ue` must have been rewritten to a backticked
     # `<project>.finance.ue` path (project comes from the test stub
     # `_FakeProjects.data = "test-data-prj"`).
-    assert "`test-data-prj.finance.ue`" in sent, (
-        f"bare-name rewrite failed; sent SQL: {sent!r}"
-    )
+    assert "`test-data-prj.finance.ue`" in sent, f"bare-name rewrite failed; sent SQL: {sent!r}"
     # Pre-#171 path emitted `SELECT * FROM`; the new path forwards the
     # user SELECT clause untouched.
-    assert "SELECT order_id" in sent, (
-        f"pre-check is still using synthetic SELECT *; sent SQL: {sent!r}"
-    )
+    assert "SELECT order_id" in sent, f"pre-check is still using synthetic SELECT *; sent SQL: {sent!r}"
 
 
 def test_guardrail_invokes_dry_run_exactly_once_per_request(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """Single dry-run path: even when the user references multiple registered
     tables in one query (a JOIN, a UNION, …), only ONE dry-run fires.
@@ -260,7 +264,9 @@ def test_guardrail_invokes_dry_run_exactly_once_per_request(
         return 100  # tiny
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", counting_fake, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        counting_fake,
+        raising=False,
     )
 
     c = seeded_app["client"]
@@ -268,23 +274,20 @@ def test_guardrail_invokes_dry_run_exactly_once_per_request(
     c.post(
         "/api/query",
         json={
-            "sql": (
-                "SELECT o.id, t.views FROM orders o "
-                "JOIN traffic t ON o.date = t.date"
-            ),
+            "sql": ("SELECT o.id, t.views FROM orders o JOIN traffic t ON o.date = t.date"),
         },
         headers=_auth(token),
     )
-    assert state["call_count"] == 1, (
-        f"single-dry-run path expected; got {state['call_count']} calls"
-    )
+    assert state["call_count"] == 1, f"single-dry-run path expected; got {state['call_count']} calls"
     # Both bare names rewritten in the same SQL.
     assert "`test-data-prj.finance.orders`" in state["last_sql"]
     assert "`test-data-prj.marketing.traffic`" in state["last_sql"]
 
 
 def test_fallback_tries_original_sql_first(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """Issue #201 — when the rewriter produces SQL that BQ rejects with
     `bq_bad_request` but the user's ORIGINAL SQL dry-runs cleanly, the
@@ -309,7 +312,9 @@ def test_fallback_tries_original_sql_first(
         return 4096
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", fake_dry_run, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        fake_dry_run,
+        raising=False,
     )
 
     c = seeded_app["client"]
@@ -320,13 +325,9 @@ def test_fallback_tries_original_sql_first(
     # Two dry-runs: rewritten then original. No third synthetic-SELECT-*
     # call.
     assert len(state["calls"]) == 2, (
-        f"expected rewritten + original-SQL retry, got "
-        f"{len(state['calls'])}: {state['calls']}"
+        f"expected rewritten + original-SQL retry, got {len(state['calls'])}: {state['calls']}"
     )
-    assert state["calls"][1] == user_sql, (
-        f"second call must be the user's ORIGINAL SQL, got "
-        f"{state['calls'][1]!r}"
-    )
+    assert state["calls"][1] == user_sql, f"second call must be the user's ORIGINAL SQL, got {state['calls'][1]!r}"
     # The response must NOT be remote_scan_too_large from a synthetic
     # over-estimate — 4096 bytes is well under the 5 GiB cap.
     if r.status_code == 400:
@@ -336,7 +337,9 @@ def test_fallback_tries_original_sql_first(
 
 
 def test_fallback_fails_fast_on_pure_duckdb_syntax(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """When BOTH the rewritten and original SQL fail with `bq_bad_request`
     (true DuckDB-only syntax like `::INT`), return HTTP 400
@@ -353,7 +356,9 @@ def test_fallback_fails_fast_on_pure_duckdb_syntax(
         raise BqAccessError("bq_bad_request", "Syntax error: unexpected '::'")
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", always_parse_error, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        always_parse_error,
+        raising=False,
     )
 
     c = seeded_app["client"]
@@ -366,8 +371,7 @@ def test_fallback_fails_fast_on_pure_duckdb_syntax(
 
     # Two dry-runs (rewritten + original retry). NO synthetic SELECT * fallback.
     assert len(state["calls"]) == 2, (
-        f"expected 1 rewritten + 1 original-retry, got "
-        f"{len(state['calls'])}: {state['calls']}"
+        f"expected 1 rewritten + 1 original-retry, got {len(state['calls'])}: {state['calls']}"
     )
     # No call should be a synthetic ``SELECT * FROM `<project>...```. The
     # original-SQL retry contains the user's SELECT clause.
@@ -375,21 +379,20 @@ def test_fallback_fails_fast_on_pure_duckdb_syntax(
         # If a call is just a synthetic ``SELECT * FROM `<project>.<bucket>.<table>```
         # the user's `WHERE country = 'CZ'` would be missing.
         if c_sql.startswith("SELECT * FROM `") and "WHERE" not in c_sql:
-            raise AssertionError(
-                f"synthetic SELECT * fallback was used: {c_sql!r}"
-            )
+            raise AssertionError(f"synthetic SELECT * fallback was used: {c_sql!r}")
 
     assert r.status_code == 400, r.json()
     detail = r.json().get("detail", {})
     assert isinstance(detail, dict), detail
     assert detail.get("kind") == "remote_estimate_failed", detail
     assert "underlying" in detail, detail
-    assert "agnes catalog" in detail.get("hint", "").lower() or \
-           "backtick" in detail.get("hint", "").lower(), detail
+    assert "agnes catalog" in detail.get("hint", "").lower() or "backtick" in detail.get("hint", "").lower(), detail
 
 
 def test_remote_estimate_failed_surfaces_first_error_when_attempts_differ(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """When the rewritten-SQL dry-run fails with a column-not-found /
     syntax error and the original-SQL retry fails with the unhelpful
@@ -414,12 +417,12 @@ def test_remote_estimate_failed_surfaces_first_error_when_attempts_differ(
             )
         raise BqAccessError(
             "bq_bad_request",
-            "Table 'unit_economics' must be qualified with a dataset "
-            "(e.g. dataset.table)",
+            "Table 'unit_economics' must be qualified with a dataset (e.g. dataset.table)",
         )
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", two_different_errors,
+        "app.api.query._bq_dry_run_bytes",
+        two_different_errors,
         raising=False,
     )
 
@@ -428,18 +431,12 @@ def test_remote_estimate_failed_surfaces_first_error_when_attempts_differ(
     r = c.post(
         "/api/query",
         json={
-            "sql": (
-                "SELECT COUNT(*) FROM ue "
-                "WHERE authorize_date = DATE '2025-05-06'"
-            ),
+            "sql": ("SELECT COUNT(*) FROM ue WHERE authorize_date = DATE '2025-05-06'"),
         },
         headers=_auth(token),
     )
 
-    assert state["calls"] == 2, (
-        f"expected rewritten + original-retry = 2 dry-runs, got "
-        f"{state['calls']}"
-    )
+    assert state["calls"] == 2, f"expected rewritten + original-retry = 2 dry-runs, got {state['calls']}"
     assert r.status_code == 400, r.json()
     detail = r.json().get("detail", {})
     assert isinstance(detail, dict), detail
@@ -447,15 +444,16 @@ def test_remote_estimate_failed_surfaces_first_error_when_attempts_differ(
     # The FIRST attempt's diagnostic — the actually-useful one — wins.
     assert "authorize_date" in detail.get("underlying", ""), detail
     # The second attempt's context is preserved for operator visibility.
-    assert "must be qualified" in detail.get("underlying_original", ""), \
-        detail
+    assert "must be qualified" in detail.get("underlying_original", ""), detail
     # Hint now points at `agnes schema` first — the typical cause is a
     # typo'd column name on the FROM table.
     assert "agnes schema" in detail.get("hint", "").lower(), detail
 
 
 def test_guardrail_propagates_502_on_non_parse_bq_errors(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """Forbidden / upstream-error from BQ on the dry-run still maps to 502;
     fallback only kicks in for parse errors. Important so a misconfigured
@@ -468,7 +466,9 @@ def test_guardrail_propagates_502_on_non_parse_bq_errors(
         raise BqAccessError("bq_forbidden", "Permission denied", details={})
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", always_forbidden, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        always_forbidden,
+        raising=False,
     )
 
     c = seeded_app["client"]
@@ -492,10 +492,7 @@ def test_rewrite_helper_handles_bare_name_and_bq_path_in_same_sql():
     from app.api.query import _rewrite_user_sql_for_bq_dry_run
 
     rewritten = _rewrite_user_sql_for_bq_dry_run(
-        sql=(
-            'SELECT a.id, b.col '
-            'FROM ue a JOIN bq."finance"."traffic" b ON a.date = b.date'
-        ),
+        sql=('SELECT a.id, b.col FROM ue a JOIN bq."finance"."traffic" b ON a.date = b.date'),
         name_lookups=[("ue", "finance", "ue")],
         project="data-prj",
     )
@@ -572,6 +569,7 @@ def test_rewrite_helper_does_not_corrupt_when_project_id_contains_registered_nam
     # The 2nd `ue.id` was already rewritten by the same single-pass call.
     # No `\\bue\\b` survives outside backticks.
     import re as _re
+
     bare_ue_matches = _re.findall(r"(?<!\\.)\\bue\\b(?![.`])", rewritten)
     assert not bare_ue_matches, f"unrewritten bare `ue` left: {bare_ue_matches!r}"
 
@@ -589,8 +587,7 @@ def test_rewrite_helper_is_case_insensitive_on_bare_names():
         name_lookups=[("ue", "fin", "ue")],
         project="p",
     )
-    assert "`p.fin.ue` WHERE `p.fin.ue`.id" in rewritten or \
-           rewritten.lower().count("`p.fin.ue`") == 2
+    assert "`p.fin.ue` WHERE `p.fin.ue`.id" in rewritten or rewritten.lower().count("`p.fin.ue`") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -607,19 +604,14 @@ def test_rewrite_skips_inside_backtick_path():
     final segment matches a registered bare-name alias."""
     from app.api.query import _rewrite_user_sql_for_bq_dry_run
 
-    sql = (
-        "SELECT * FROM `my-prj.finance.unit_economics` "
-        "WHERE country = 'CZ'"
-    )
+    sql = "SELECT * FROM `my-prj.finance.unit_economics` WHERE country = 'CZ'"
     rewritten = _rewrite_user_sql_for_bq_dry_run(
         sql=sql,
         name_lookups=[("unit_economics", "finance", "unit_economics")],
         project="my-prj",
     )
     # No corruption — input is already BQ-native, rewriter is a no-op here.
-    assert rewritten == sql, (
-        f"backtick path was rewritten:\n  in : {sql!r}\n  out: {rewritten!r}"
-    )
+    assert rewritten == sql, f"backtick path was rewritten:\n  in : {sql!r}\n  out: {rewritten!r}"
     # Sanity: the malformed nested form must NOT appear.
     assert "`my-prj.finance.`my-prj" not in rewritten
 
@@ -630,10 +622,7 @@ def test_rewrite_skips_inside_backtick_with_outside_bare_name():
     alone."""
     from app.api.query import _rewrite_user_sql_for_bq_dry_run
 
-    sql = (
-        "SELECT a.id, b.col FROM ue a "
-        "JOIN `my-prj.finance.ue` b ON a.id = b.id"
-    )
+    sql = "SELECT a.id, b.col FROM ue a JOIN `my-prj.finance.ue` b ON a.id = b.id"
     rewritten = _rewrite_user_sql_for_bq_dry_run(
         sql=sql,
         name_lookups=[("ue", "fin_alias", "ue_alias")],
@@ -648,7 +637,9 @@ def test_rewrite_skips_inside_backtick_with_outside_bare_name():
 
 
 def test_guardrail_skips_bare_name_match_inside_backticks(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """The `name_lookups` collection populated by `_bq_guardrail_inputs`
     must not include a registered name when the only place that name
@@ -667,15 +658,14 @@ def test_guardrail_skips_bare_name_match_inside_backticks(
         return 1024
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", capturing_fake, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        capturing_fake,
+        raising=False,
     )
 
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
-    user_sql = (
-        "SELECT * FROM `test-data-prj.finance.unit_economics` "
-        "WHERE country = 'CZ'"
-    )
+    user_sql = "SELECT * FROM `test-data-prj.finance.unit_economics` WHERE country = 'CZ'"
     c.post("/api/query", json={"sql": user_sql}, headers=_auth(token))
 
     sent = captured["sql"]
@@ -687,9 +677,7 @@ def test_guardrail_skips_bare_name_match_inside_backticks(
         return
     # The user's exact backtick path must survive verbatim — no nested
     # backticks introduced by a stray bare-name rewrite.
-    assert "`test-data-prj.finance.unit_economics`" in sent, (
-        f"backtick path corrupted by guardrail:\n  out: {sent!r}"
-    )
+    assert "`test-data-prj.finance.unit_economics`" in sent, f"backtick path corrupted by guardrail:\n  out: {sent!r}"
     assert "`test-data-prj.finance.`test-data-prj" not in sent, (
         f"nested-backtick corruption signature present: {sent!r}"
     )
@@ -712,10 +700,7 @@ def test_full_backtick_path_unregistered_denied(seeded_app, mock_dry_run):
     r = c.post(
         "/api/query",
         json={
-            "sql": (
-                "SELECT * FROM `test-data-prj.secret_ds.secret_tbl` "
-                "WHERE country = 'CZ'"
-            ),
+            "sql": ("SELECT * FROM `test-data-prj.secret_ds.secret_tbl` WHERE country = 'CZ'"),
         },
         headers=_auth(token),
     )
@@ -751,7 +736,9 @@ def test_full_backtick_path_cross_project_denied(seeded_app, mock_dry_run):
 
 
 def test_full_backtick_path_registered_admin_passes(
-    seeded_app, mock_dry_run, monkeypatch,
+    seeded_app,
+    mock_dry_run,
+    monkeypatch,
 ):
     """Admin caller + registered path + matching project → no RBAC
     rejection. The dry-run fires (we can capture the SQL the guardrail
@@ -765,7 +752,9 @@ def test_full_backtick_path_registered_admin_passes(
         return 1024  # tiny — pass cap
 
     monkeypatch.setattr(
-        "app.api.query._bq_dry_run_bytes", capturing_fake, raising=False,
+        "app.api.query._bq_dry_run_bytes",
+        capturing_fake,
+        raising=False,
     )
 
     c = seeded_app["client"]
@@ -789,15 +778,14 @@ def test_full_backtick_path_registered_admin_passes(
     # The dry-run was invoked, meaning Pass 3 added the path to dry_run_set
     # and the cap-guard fired. The user's WHERE clause must still be in
     # the dry-run SQL (validates Layer 1 — backtick-aware rewrite).
-    assert captured["sql"] is not None, (
-        "dry-run never fired — Pass 3 may not have registered the path"
-    )
+    assert captured["sql"] is not None, "dry-run never fired — Pass 3 may not have registered the path"
     assert "`test-data-prj.finance.ue`" in captured["sql"], captured["sql"]
     assert "WHERE id = 1" in captured["sql"], captured["sql"]
 
 
 def test_full_backtick_path_inside_string_literal_not_gated(
-    seeded_app, mock_dry_run,
+    seeded_app,
+    mock_dry_run,
 ):
     """Defensive case: a backtick path appearing inside a SQL string
     literal (rare but possible) should not trigger Pass 3. Practically
@@ -815,9 +803,7 @@ def test_full_backtick_path_inside_string_literal_not_gated(
     r = c.post(
         "/api/query",
         json={
-            "sql": (
-                "SELECT 'matches `test-data-prj.x.y`' AS lit"
-            ),
+            "sql": ("SELECT 'matches `test-data-prj.x.y`' AS lit"),
         },
         headers=_auth(token),
     )
@@ -847,9 +833,7 @@ class TestHintForBqBadRequest:
         from app.api.query import _hint_for_bq_bad_request
 
         # Sub-agent-reported actual case from the v0.53.4 smoke test
-        hint = _hint_for_bq_bad_request(
-            "Syntax error: Unexpected keyword ROWS at [1:20]"
-        )
+        hint = _hint_for_bq_bad_request("Syntax error: Unexpected keyword ROWS at [1:20]")
         assert "syntax" in hint.lower()
         assert "reserved" in hint.lower() or "rows" in hint.lower()
         # Must NOT lead with the misleading column-not-found hint
@@ -873,53 +857,40 @@ class TestHintForBqBadRequest:
         ]
         for msg in cases:
             hint = _hint_for_bq_bad_request(msg)
-            assert "\\`" not in hint, (
-                f"hint for {msg!r} contains literal backslash-backtick: "
-                f"{hint!r}"
-            )
-            assert "\\\\" not in hint, (
-                f"hint for {msg!r} contains literal double-backslash: "
-                f"{hint!r}"
-            )
+            assert "\\`" not in hint, f"hint for {msg!r} contains literal backslash-backtick: {hint!r}"
+            assert "\\\\" not in hint, f"hint for {msg!r} contains literal double-backslash: {hint!r}"
 
     def test_unrecognized_name_hint_points_at_agnes_schema(self):
         from app.api.query import _hint_for_bq_bad_request
 
-        hint = _hint_for_bq_bad_request(
-            "Unrecognized name: authorize_date at [1:88]"
-        )
+        hint = _hint_for_bq_bad_request("Unrecognized name: authorize_date at [1:88]")
         assert "agnes schema" in hint.lower()
         assert "doesn't exist" in hint.lower() or "column" in hint.lower()
 
     def test_table_not_found_hint_points_at_agnes_catalog(self):
         from app.api.query import _hint_for_bq_bad_request
 
-        hint = _hint_for_bq_bad_request(
-            "Table not found: my-project.dataset.tbl"
-        )
+        hint = _hint_for_bq_bad_request("Table not found: my-project.dataset.tbl")
         assert "agnes catalog" in hint.lower()
 
     def test_unknown_error_falls_back_to_generic_hint(self):
         from app.api.query import _hint_for_bq_bad_request
 
-        hint = _hint_for_bq_bad_request(
-            "Some unfamiliar BigQuery diagnostic we don't classify yet"
-        )
+        hint = _hint_for_bq_bad_request("Some unfamiliar BigQuery diagnostic we don't classify yet")
         # Generic hint mentions all three common causes so the analyst
         # has somewhere to start
         assert "schema" in hint.lower()
         assert "underlying" in hint.lower()
 
     def test_mixed_rollup_hint_names_the_dialect_divergence(self):
-        # FAI-137. DuckDB accepts `GROUP BY a, ROLLUP(b)`; BigQuery requires
+        # DuckDB accepts `GROUP BY a, ROLLUP(b)`; BigQuery requires
         # ROLLUP to be the only grouping element. The query is well-formed
         # DuckDB, so the analyst has no reason to suspect their GROUP BY —
         # the hint must name the divergence and the exact rewrite.
         from app.api.query import _hint_for_bq_bad_request
 
         hint = _hint_for_bq_bad_request(
-            "The GROUP BY clause only supports ROLLUP when there are no "
-            "other grouping elements at [1:657]"
+            "The GROUP BY clause only supports ROLLUP when there are no other grouping elements at [1:657]"
         )
         assert "grouping sets" in hint.lower(), hint
         # Must point at the GROUP BY, not send the analyst hunting through
@@ -935,27 +906,28 @@ class TestHintForBqBadRequest:
         from app.api.query import _hint_for_bq_bad_request
 
         hint = _hint_for_bq_bad_request(
-            "The GROUP BY clause only supports ROLLUP when there are no "
-            "other grouping elements at [1:657]"
+            "The GROUP BY clause only supports ROLLUP when there are no other grouping elements at [1:657]"
         )
         idx_sets = hint.lower().find("grouping sets")
         assert idx_sets != -1, hint
         idx_rollup_all = hint.lower().find("rollup(country, brand)")
         if idx_rollup_all != -1:
-            assert idx_sets < idx_rollup_all, (
-                "hint leads with the lossy ROLLUP-everything rewrite: " + hint
-            )
+            assert idx_sets < idx_rollup_all, "hint leads with the lossy ROLLUP-everything rewrite: " + hint
 
 
 class TestDryRunRejectionIsDiagnosable:
-    """FAI-137: when BQ rejects the rewritten SQL, the rewritten SQL text is
+    """When BQ rejects the rewritten SQL, the rewritten SQL text is
     the single most useful artifact for diagnosing why — and nothing logged
     it. Dry-run BQ jobs are not retained, so once the request is over the
     evidence is gone for good.
     """
 
     def test_dry_run_rejection_logs_the_rejected_sql(
-        self, seeded_app, mock_dry_run, monkeypatch, caplog,
+        self,
+        seeded_app,
+        mock_dry_run,
+        monkeypatch,
+        caplog,
     ):
         import logging
 
@@ -966,12 +938,12 @@ class TestDryRunRejectionIsDiagnosable:
         def always_parse_error(_bq, sql, **_kwargs):
             raise BqAccessError(
                 "bq_bad_request",
-                "The GROUP BY clause only supports ROLLUP when there are "
-                "no other grouping elements at [1:657]",
+                "The GROUP BY clause only supports ROLLUP when there are no other grouping elements at [1:657]",
             )
 
         monkeypatch.setattr(
-            "app.api.query._bq_dry_run_bytes", always_parse_error,
+            "app.api.query._bq_dry_run_bytes",
+            always_parse_error,
             raising=False,
         )
 
@@ -979,19 +951,11 @@ class TestDryRunRejectionIsDiagnosable:
         with caplog.at_level(logging.WARNING, logger="app.api.query"):
             c.post(
                 "/api/query",
-                json={
-                    "sql": (
-                        "SELECT country, SUM(margin) FROM ue "
-                        "GROUP BY country, ROLLUP(brand)"
-                    )
-                },
+                json={"sql": ("SELECT country, SUM(margin) FROM ue GROUP BY country, ROLLUP(brand)")},
                 headers=_auth(seeded_app["admin_token"]),
             )
 
-        warnings = "\n".join(
-            r.getMessage() for r in caplog.records
-            if r.levelno >= logging.WARNING
-        )
+        warnings = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
         # The rewritten SQL that BQ actually rejected must appear in the log,
         # with the table reference resolved to its BQ-native path — that is
         # what distinguishes a rewriter bug from user-side dialect drift.
@@ -999,7 +963,11 @@ class TestDryRunRejectionIsDiagnosable:
         assert "test-data-prj.finance.ue" in warnings, warnings
 
     def test_logged_sql_is_truncated(
-        self, seeded_app, mock_dry_run, monkeypatch, caplog,
+        self,
+        seeded_app,
+        mock_dry_run,
+        monkeypatch,
+        caplog,
     ):
         # SQL literals can carry sensitive values. The audit log already
         # caps `sql_preview` at 200 chars; the WARNING must not become the
@@ -1014,15 +982,13 @@ class TestDryRunRejectionIsDiagnosable:
             raise BqAccessError("bq_bad_request", "Syntax error: whatever")
 
         monkeypatch.setattr(
-            "app.api.query._bq_dry_run_bytes", always_parse_error,
+            "app.api.query._bq_dry_run_bytes",
+            always_parse_error,
             raising=False,
         )
 
         needle = "SUPER_SECRET_VALUE_THAT_IS_PAST_THE_TRUNCATION_LIMIT"
-        long_sql = (
-            "SELECT country, " + ", ".join(f"col_{i}" for i in range(60))
-            + f" FROM ue WHERE token = '{needle}'"
-        )
+        long_sql = "SELECT country, " + ", ".join(f"col_{i}" for i in range(60)) + f" FROM ue WHERE token = '{needle}'"
         assert len(long_sql) > 400, "test SQL must exceed the truncation cap"
 
         c = seeded_app["client"]
@@ -1033,16 +999,11 @@ class TestDryRunRejectionIsDiagnosable:
                 headers=_auth(seeded_app["admin_token"]),
             )
 
-        warnings = "\n".join(
-            r.getMessage() for r in caplog.records
-            if r.levelno >= logging.WARNING
-        )
+        warnings = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
         # A preview must actually be emitted — otherwise this test passes
         # simply because nothing is logged, which is the bug it guards.
         assert "rewritten_sql_preview=" in warnings, warnings
-        assert needle not in warnings, (
-            "full SQL body reached the log un-truncated"
-        )
+        assert needle not in warnings, "full SQL body reached the log un-truncated"
 
 
 class TestRejectedSqlPreviewShowsTheRejectedClause:
