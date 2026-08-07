@@ -1048,6 +1048,31 @@ class TestRejectedSqlPreviewShowsTheRejectedClause:
         # "SELECT"(6) + \n + "a,"(2) + \n = 10, and sql[10] == "b"
         assert _bq_error_offset("at [3:1]", "SELECT\na,\nb") == 10
 
+    def test_offset_resolves_across_crlf_lines(self):
+        """A query submitted with Windows line endings must not drift.
+
+        `splitlines()` drops the `\\r` of a CRLF, so reconstructing the offset
+        as "sum of line lengths + 1 per break" under-counts by one character
+        per preceding line and the window lands off the clause BigQuery named
+        (Devin Review on #1188). Indices have to come from the raw string the
+        engine actually parsed.
+        """
+        from app.api.query import _bq_error_offset
+
+        sql = "SELECT\r\na,\r\nb"
+        # "SELECT"(6) + "\r\n"(2) + "a,"(2) + "\r\n"(2) = 12, and sql[12] == "b"
+        assert sql[12] == "b"
+        assert _bq_error_offset("at [3:1]", sql) == 12
+
+    def test_offset_ignores_separators_bigquery_does_not_count(self):
+        """`splitlines()` also breaks on `\\x0b`, `\\x0c`, `\\x1c` and friends,
+        which BigQuery does not treat as line ends — a query merely containing
+        one would have mis-split and shifted every subsequent line."""
+        from app.api.query import _bq_error_offset
+
+        sql = "SELECT 'a\x0bb'\nFROM t"
+        assert _bq_error_offset("at [2:1]", sql) == sql.index("FROM")
+
     def test_window_contains_the_rejected_clause_and_the_head_preview_does_not(self):
         from app.api.query import _bq_error_offset, _sql_log_preview
 

@@ -181,12 +181,25 @@ def _bq_error_offset(message: str, sql: str) -> Optional[int]:
     if not m:
         return None
     line, col = int(m.group(1)), int(m.group(2))
-    lines = (sql or "").splitlines()
-    if line < 1 or line > len(lines) or col < 1:
+    raw = sql or ""
+    if line < 1 or col < 1:
         return None
-    # +1 per preceding line for the newline that `splitlines` consumed.
-    offset = sum(len(prev) + 1 for prev in lines[: line - 1]) + (col - 1)
-    return offset if offset <= len(sql or "") else None
+    # Walk the RAW string counting only `\n`, rather than `splitlines()` plus
+    # one character per break. `splitlines()` gets this wrong twice: it drops
+    # the `\r` of a CRLF, so the reconstructed offset under-counts by one per
+    # preceding line and the window drifts off the clause BigQuery named; and
+    # it also breaks on separators BigQuery does not treat as line ends
+    # (`\v`, `\f`, `\x1c`, ` `, …), which would mis-split a query that
+    # merely contains one. Real indices into the string the engine parsed are
+    # the only thing `around` can be applied to (Devin Review on #1188).
+    start = 0
+    for _ in range(line - 1):
+        nl = raw.find("\n", start)
+        if nl == -1:
+            return None
+        start = nl + 1
+    offset = start + (col - 1)
+    return offset if offset <= len(raw) else None
 
 
 def _sql_log_preview(sql: str, *, around: Optional[int] = None) -> str:
