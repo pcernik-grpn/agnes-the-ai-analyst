@@ -25,6 +25,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - The frozen pre-redesign marketplace detail pages carry the Private-entity fixes. Freezing a copy forks the page permanently, and these copies were snapshotted before #1177/#1178 landed — so on a DEFAULT instance (which is exactly what renders them) the author of a Private plugin, skill or agent lost both the Archive control and the install button again, while redesigned instances kept them. Both gates are carried over, and `tests/test_ui_layout_theme.py::TestDetailPageParity` now pins the load-bearing predicates on both halves of each pair, so a fix that reaches only the redesigned template fails rather than silently reverting itself.
 - The frozen pre-redesign data-package page keeps its original badge order. The page a default instance now serves renders `badges` in list order, and recomputing that list appended `Curated` after `New` where the page it freezes had always appended it before — so a recently created organization package rendered "New Curated" instead of "Curated New" on a page this change set otherwise leaves byte-identical.
+- The warning that logs a BigQuery-rejected query now shows the clause BigQuery
+  actually refused. The preview was anchored at the head and capped at 200
+  characters, but the rejection this hint was written for reports its position at
+  `[1:657]` — so the `GROUP BY ROLLUP(...)` the operator needed to see sat past
+  the cut, and the log line could not support the diagnosis it was added for. The
+  window now centers on the offset parsed out of the BigQuery message, falling
+  back to the head preview when the message carries no position. The cap is
+  unchanged, so the sensitive-value bound the truncation exists for still holds —
+  the window moves rather than grows. Whitespace is collapsed after windowing,
+  since the offset indexes the raw SQL the engine parsed.
+
+- `/api/query` now returns an accurate hint when BigQuery rejects a query for combining `ROLLUP` with other grouping elements in a `GROUP BY`. DuckDB accepts `GROUP BY a, ROLLUP(b)` and BigQuery does not, so a query that runs fine locally is rejected during cost estimation with a `remote_estimate_failed` 400. The hint previously fell through to the generic branch, which sent analysts hunting through columns, aliases and table paths, none of which were the cause. It now names the dialect divergence and gives the faithful `GROUPING SETS` rewrite, explicitly noting that `GROUP BY ROLLUP(a, b)` is *not* an equivalent query (it adds a grand-total row).
+
 - The builder's Check panel no longer keeps faulting a name or category the author has already replaced. Editing the field cleared the inline alert but not the stored check result the panel re-renders from, so a red "fail" line about the old value stayed up with nothing to say it was stale short of re-running Check. A metadata edit now drops its own row from that result — the bundle's component and lint findings beside it survive, since only the edited field's verdict went out of date.
 - **The author of a Private plugin can delete it, and add it to their own stack.** Choosing Private writes `visibility_status='hidden'` and nothing ever promotes it — but `hidden` is also what guardrail quarantine writes, and two gates read it as quarantine unconditionally. `DELETE /api/store/entities/{id}` therefore refused the owner with `quarantined_owner_cannot_delete` **permanently**, so a plugin nobody else could even see could never be deleted by the person who made it; and the marketplace detail page rendered "+ Add to my stack" disabled with "unavailable while under review", a state that would never end, even though the install endpoint already had the right exemption and would have accepted the request. Both now share one predicate — `is_own_unflagged_private`: owner, `hidden`, and no submission the review has rejected — so the evidence-preservation the delete gate exists for is unchanged (a genuinely quarantined entity still refuses its submitter), while the author's own Private row behaves like what it is. The detail feed carries the verdict as a new `installable` field rather than letting the front-end re-derive the rule from `visibility_status`, which is how button and endpoint came to disagree in the first place; `installable` defaults to `true`, so curated entries and older payloads are unaffected. The unlock lands on both looks: the two legacy templates carry their own button ladder, but the redesigned page draws the shared `detail.store_menu()` macro, which held a third copy of the gate still pinned to `approved` — so on a paper-theme instance the author saw a permanently greyed-out Delete while the API would have accepted the archive. Two more surfaces follow from letting a `hidden` row be archived at all. **The archive rollback no longer publishes what it was archiving**: when the on-disk rename fails, `delete_entity` reverts the row — and that revert hardcoded `approved`, which was accurate while only an approved row could reach it and would have flipped a Private entity to organization-wide visibility off a disk error the author only ever sees as a 500. It now restores the status the row actually had. And **the quarantine banner stands down for the author's own Private row**: it fell to the "Hidden" fallback, whose copy says "nobody can install it" — false since #1178, and rendered directly above the now-enabled "+ Add to my stack". A genuinely quarantined entity keeps its banner. Closes #1177, #1178.
 - **"Check bundle" now checks the metadata too, not just the ZIP.** `POST /api/store/entities/preview` never declared the `name` / `description` / `category` form fields the builder had been posting all along, so FastAPI dropped them and the pre-flight validated strictly less than the save it was a pre-flight for: a check could come back clean and the very next click 409 on a name the author already owned. Preview now reports what `POST /entities` would refuse — `missing_name`, `invalid_name_format`, `conflict_owner_name`, `conflict_global_suffix`, `invalid_category` — as a new `field_issues` list, using the same precedence as the create endpoint (a typed name wins, the manifest's is the fallback) so it judges the name the save would actually use. The builder marks the offending field and lists the reason in the check panel. The guardrail pipeline and the per-submitter quota are deliberately not previewed: the first runs against the baked tree, the second is transient and not a property of what the author typed. Closes #1176.
@@ -80,6 +93,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Internal
 
 - **Deflaked `tests/test_orchestrator.py::TestBQMetadataAuth::test_bq_metadata_failure_logs_and_skips`** (seen on CI shard 6/8, xdist worker gw1, on a PR touching no orchestrator or BigQuery code). The test asserted "some ERROR record mentions metadata", but reached that branch only after the orchestrator ran a real `INSTALL bigquery FROM community` — a 55 MB download from the community-extension repository, executed for real because, unlike its sibling in the same class, this test never stubbed the BQ-extension SQL. On a cold `~/.duckdb` cache with eight parallel shards that outran pytest.ini's 60 s `--timeout`, and pytest-timeout's SIGALRM landed *inside* the DuckDB call: DuckDB answers a tripped signal by throwing `RuntimeError("Query interrupted")`, which clobbers the pending `Failed`, so a hard timeout arrived at `_attach_remote_extensions`' `except Exception` as an ordinary error, was logged as `Failed to attach remote source bq: …`, and the test ran to completion having never called `get_metadata_token`. The BQ-extension stub is now a shared helper both tests in the class use (no network on either path), and the assertion pins the specific exception path instead of grepping rendered log text: the metadata callable was invoked exactly once, the `logger.error` call site is matched by format string with the caught `BQMetadataAuthError` identity-checked in its args, the generic attach-failure handler did *not* fire, and no SECRET/ATTACH was issued. Verified by mutation (re-injecting the interrupt fails the test on the "not reached" guard) and by repeated `-n auto` runs under full CPU saturation.
+- The BQ dry-run rejection WARNING now includes a truncated preview of the rewritten SQL that BigQuery rejected. Dry-run BQ jobs are not retained, so this line is the only surviving evidence of what BQ was asked to parse; without it triage cannot distinguish a rewriter bug from user-side dialect drift. Capped at 200 characters, matching the existing audit-log `sql_preview` limit, so query literals are not written to log storage unbounded.
 
 ### Security
 
@@ -116,10 +130,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Added
 
 - Admin "Browse & register tables" now works with bucket-scoped (custom access) Keboola tokens: when the project-wide `/buckets` + `/tables` listings are refused, the endpoint falls back to enumerating the token's own `bucketPermissions` per bucket, so the picker shows exactly the buckets the token can read. The response carries a `scope` field (`"project"` or `"token_buckets"`) and the picker renders a note when the listing is token-limited. Upstream listing failures are logged with the connection id, and network-level errors (DNS, refused connection, TLS) surface as a clean 502 `keboola_storage_api_error` detail instead of a generic 500.
-
-## [0.81.1] - 2026-08-06
-
-### Added
 
 ### Changed
 
@@ -228,18 +238,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   silently disabled tool-call approvals and saving the Studio section disabled
   the Studio surface. The bool branch now falls back to the declared default when
   the value is unset, which is what the text branch beside it already did.
-- The warning that logs a BigQuery-rejected query now shows the clause BigQuery
-  actually refused. The preview was anchored at the head and capped at 200
-  characters, but the rejection this hint was written for reports its position at
-  `[1:657]` — so the `GROUP BY ROLLUP(...)` the operator needed to see sat past
-  the cut, and the log line could not support the diagnosis it was added for. The
-  window now centers on the offset parsed out of the BigQuery message, falling
-  back to the head preview when the message carries no position. The cap is
-  unchanged, so the sensitive-value bound the truncation exists for still holds —
-  the window moves rather than grows. Whitespace is collapsed after windowing,
-  since the offset indexes the raw SQL the engine parsed.
-
-- `/api/query` now returns an accurate hint when BigQuery rejects a query for combining `ROLLUP` with other grouping elements in a `GROUP BY`. DuckDB accepts `GROUP BY a, ROLLUP(b)` and BigQuery does not, so a query that runs fine locally is rejected during cost estimation with a `remote_estimate_failed` 400. The hint previously fell through to the generic branch, which sent analysts hunting through columns, aliases and table paths, none of which were the cause. It now names the dialect divergence and gives the faithful `GROUPING SETS` rewrite, explicitly noting that `GROUP BY ROLLUP(a, b)` is *not* an equivalent query (it adds a grand-total row).
 
 ### Removed
 
@@ -588,10 +586,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   since this is what materializes "locked, can't uninstall" for a required store
   entity.
 - **Contract guard against the light-only-tint bug class** (`tests/test_design_system_contract.py`): every `--ds-*-soft` token is declared once in the global `:root` with no `data-theme="dark"` override, so filling with one and inking with `--ds-text-*` yields invisible text under dark — the connect-banner bug fixed above. The guard parses every shipped stylesheet plus each template's inline `<style>` (flattening `@media` wrappers), and fails when a rule fills with a light-only `-soft` tint, ink that flips with the theme is drawn on that element or a descendant/BEM child of it, and the same stylesheet ships no `[data-theme="dark"]` override for it. Correct pairings stay quiet by construction: a tint inked with a deep accent (`.ag-instack` → `--ds-agnes`), `--ds-text-inverse` on a solid fill, and rules already scoped to any `[data-theme="…"]`. Four unit tests pin the detector against synthetic CSS — including the exact pre-fix `.cbn` shape — so it can't rot into a vacuous pass; removing the shipped fix makes it fail with `.cbn (fill --ds-agnes-soft; ink from .cbn-title)`.
-
-- The BQ dry-run rejection WARNING now includes a truncated preview of the rewritten SQL that BigQuery rejected. Dry-run BQ jobs are not retained, so this line is the only surviving evidence of what BQ was asked to parse; without it triage cannot distinguish a rewriter bug from user-side dialect drift. Capped at 200 characters, matching the existing audit-log `sql_preview` limit, so query literals are not written to log storage unbounded.
-
-### Security
 
 ## [0.81.0] - 2026-08-06
 
