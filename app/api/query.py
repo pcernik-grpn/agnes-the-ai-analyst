@@ -2111,9 +2111,9 @@ def _bq_quota_and_cap_guard(
                 # retained by BigQuery, so once the request is over this
                 # WARNING is the ONLY surviving evidence of what BQ was
                 # actually asked to parse. Without it, triage cannot
-                # distinguish a rewriter bug from user-side dialect drift
-                # (FAI-137 burned a full investigation on exactly that
-                # ambiguity). Truncated: see `_sql_log_preview`.
+                # distinguish a rewriter bug from user-side dialect drift —
+                # an ambiguity that has cost a full investigation before.
+                # Truncated: see `_sql_log_preview`.
                 logger.warning(
                     "BQ dry-run rejected the rewritten SQL "
                     "(kind=%s, message=%s). Retrying with the user's "
