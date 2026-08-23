@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import duckdb  # noqa: E402
 
+from src.duckdb_conn import _open_duckdb  # noqa: E402
 from src.ingest.retrieval import rank_chunks  # noqa: E402
 
 _EMBED_DIM = 384
@@ -232,7 +233,11 @@ def bench_scale(
     rng = random.Random(99)
     tmp = Path(tempfile.mkdtemp(prefix="agnes-bench-"))
     try:
-        conn = duckdb.connect(str(tmp / "bench.duckdb"))
+        # `_open_duckdb`, not `duckdb.connect`: the bench database should
+        # behave like a production one (UTC-pinned session timezone), and the
+        # repo guard in tests/test_duckdb_session_tz.py exists to keep every
+        # call site funnelling through here.
+        conn = _open_duckdb(str(tmp / "bench.duckdb"))
         rss_before = _rss_mb()
         t0 = time.perf_counter()
         corpus_id = seed_corpus(conn, n_chunks, with_embeddings=with_embeddings)
