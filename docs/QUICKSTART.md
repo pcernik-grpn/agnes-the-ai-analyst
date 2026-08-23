@@ -101,6 +101,20 @@ setup instructions.
 2. Open Claude Code in your workspace directory
 3. Ask Claude to analyze your data using DuckDB
 
+### When something goes wrong
+
+Run `agnes doctor`. It writes one redacted file (`agnes-doctor-<timestamp>.md`)
+holding what a support request needs answered up front: CLI version, server and
+auth state, workspace and last-pull state, recent client errors — plus, when an
+admin runs it, the server side (image tag, migration verdict, per-source sync
+failures, disk, whether retrieval has silently degraded to lexical-only). Secret
+values are never collected, only whether each one is set, so the file is safe to
+attach as-is.
+
+It always produces the file: run it offline, or without admin rights, and the
+parts it could not reach say so explicitly rather than going quiet. Use
+`agnes diagnose` when you want live checks and a verdict instead of an artifact.
+
 ## Hackathon
 
 See [`archive/HACKATHON.md`](archive/HACKATHON.md) for the deploy-and-develop playbook (archived event runbook). Per-developer dev VMs are the supported pattern — point your VM at your branch image with `gcloud compute ssh <vm> --command "sudo sed -i 's/^AGNES_TAG=.*/AGNES_TAG=dev-<slug>/' /opt/agnes/.env && sudo /usr/local/bin/agnes-auto-upgrade.sh"`.
