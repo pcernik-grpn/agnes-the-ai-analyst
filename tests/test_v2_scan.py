@@ -614,6 +614,47 @@ class TestMaterializedScanServedLocally:
         assert got.column_names == ["v"]
         assert sorted(got.column("v").to_pylist()) == [1, 2, 3, 4, 5]
 
+    def test_scan_resolves_parquet_keyed_by_registry_name(self, reload_db, tmp_path, monkeypatch):
+        """The materialized sync keys the parquet filename by registry `name`
+        (`_run_materialized_pass` convention) while /scan receives the `id`;
+        the register handler slugifies the id from the name (lower +
+        spaces→underscores), so the two routinely differ and the id-keyed
+        lookup 404-ed a healthy, fully-synced table."""
+        import pyarrow.parquet as pq
+
+        from app.api import v2_scan
+
+        self._patch_no_bq(monkeypatch)
+        data_dir = tmp_path / "extracts" / "keboola" / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"v": [1, 2, 3]}), data_dir / "Mat Orders 90d.parquet")
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            from src.repositories.table_registry import TableRegistryRepository
+
+            TableRegistryRepository(conn).register(
+                id="mat_orders_90d",
+                name="Mat Orders 90d",
+                source_type="keboola",
+                bucket="in.c-main",
+                source_table="MAT_ORDERS_90D",
+                query_mode="materialized",
+            )
+            user = {"id": "admin1", "email": "a@x.com"}
+            ipc = v2_scan.run_scan(
+                conn,
+                user,
+                {"table_id": "mat_orders_90d", "select": ["v"]},
+                bq=_bq(data="proj"),
+                quota=v2_scan._build_quota_tracker(),
+            )
+        finally:
+            conn.close()
+        got = parse_ipc_bytes(ipc)
+        assert sorted(got.column("v").to_pylist()) == [1, 2, 3]
+
     def test_applies_select_where_limit_order(self, reload_db, tmp_path, monkeypatch):
         self._write_parquet(tmp_path)
         ipc = self._run(

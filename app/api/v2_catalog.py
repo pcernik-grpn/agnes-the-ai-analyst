@@ -141,6 +141,8 @@ def _materialized_parquet_size_bucket(
     table_id: str,
     source_type: str,
     query_mode: str,
+    *,
+    registry_name: str | None = None,
 ) -> str | None:
     """Size hint for rows whose data is on the server filesystem
     (``local`` or ``materialized``). Cheap ``Path.stat()``; never blocks.
@@ -156,13 +158,18 @@ def _materialized_parquet_size_bucket(
     state already record for it. Before that it had no hint at all, and an
     analyst-facing agent reading the catalog saw a fully-synced table as
     sizeless (Devin Review on #1189).
+
+    ``registry_name`` is the row's ``name`` — the key the sync actually files
+    the parquet under. Without it the hint was null for every row whose id was
+    slugified from a differing name, while ``/schema``, ``/scan`` and
+    ``/sample`` resolved those rows fine (Devin Review on #1516).
     """
     if not source_type:
         return None
     try:
         from app.utils import local_parquet_size_bytes
 
-        size = local_parquet_size_bytes(table_id, source_type)
+        size = local_parquet_size_bytes(table_id, source_type, registry_name=registry_name)
         if size is None:
             return None
         return _bucket_size(size)
@@ -198,6 +205,7 @@ def _hint_for_row(
                 table_id,
                 source_type,
                 query_mode,
+                registry_name=row.get("name"),
             ),
             "entity_type": None,
             "known_columns": [],

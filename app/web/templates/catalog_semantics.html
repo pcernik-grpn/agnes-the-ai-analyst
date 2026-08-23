@@ -72,6 +72,18 @@
     margin: 0;
     max-width: 60ch;
 }
+/* The door to /semantic-layer — this page is the flat projection, that one is
+   the stored document. Both are titled "Semantic layer". */
+.sl-page-head__door {
+    font-size: 13px;
+    margin: 8px 0 0;
+}
+.sl-page-head__door a {
+    color: var(--ds-primary);
+    text-decoration: none;
+    font-weight: 500;
+}
+.sl-page-head__door a:hover { text-decoration: underline; }
 .sl-page-head__stats {
     display: flex;
     gap: var(--space-5);
@@ -460,6 +472,11 @@
     <p class="sl-page-head__eyebrow">Data</p>
     <h1>Semantic layer</h1>
     <p class="sl-page-head__sub">Business metrics and the glossary — the shared vocabulary your team's queries and dashboards should agree on.</p>
+    {% if has_semantic_models %}
+    <p class="sl-page-head__door">
+      <a href="/semantic-layer">Browse the full semantic layer — datasets, relationships and constraints →</a>
+    </p>
+    {% endif %}
   </div>
   <div class="sl-page-head__stats">
     <div class="sl-stat">
@@ -583,7 +600,17 @@
           {% endfor %}
         {% else %}
         <div class="sl-empty">
+          {% if has_semantic_models %}
+          {# Zero metrics is the DEFAULT state of an imported document that
+             declares datasets and relationships but no aggregations, so the
+             empty state has to explain the split — otherwise the page reads as
+             "nothing was imported" while the document sits next door. #}
+          No metrics registered yet — but this instance has a semantic model.<br>
+          <a href="/semantic-layer">Browse its datasets and relationships →</a><br>
+          Metrics are a separate projection; import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
+          {% else %}
           No metrics registered yet.<br>Import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
+          {% endif %}
         </div>
         {% endif %}
       </div>
