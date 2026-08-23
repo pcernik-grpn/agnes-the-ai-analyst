@@ -1,8 +1,14 @@
 """Keboola legacy client (`connectors/keboola/client.py`) gs:// sliced-export
-URL rewrite — the kbcstorage-SDK-based counterpart to storage_api.py's
-`_gs_to_https`. Previously zero coverage: `_export_table_with_filters`'s
-sliced branch does a simpler string-replace rewrite (not the JSON-API media
-URL storage_api.py builds), and that divergence had never been exercised.
+URL rewrite.
+
+This file used to pin a divergence rather than a contract: the legacy client
+did its own string-replace rewrite while storage_api.py built a JSON-API
+media URL, and the assertion below froze that difference in place. The
+second scheme chain that difference lived in is also what left the legacy
+path without an `azure://` arm long after the other path had one. Both paths
+now share `KeboolaStorageClient._prepare_slice_request`, so what this
+asserts is the shared rewrite — see
+tests/test_keboola_slice_scheme_dispatch.py for the dispatch contract.
 """
 
 from unittest.mock import MagicMock
@@ -68,12 +74,11 @@ def test_sliced_gcs_slice_url_rewritten_with_bearer_token(tmp_path, monkeypatch)
     dest = tmp_path / "out.csv"
     client._export_table_with_filters("in.c-x.t", dest, where_filters=[])
 
-    # Last GET call is the slice download — verify the gs:// URI got
-    # rewritten to a plain https://storage.googleapis.com path (client.py's
-    # simpler rewrite, distinct from storage_api.py's JSON-API media URL)
-    # and that the OAuth bearer token was attached.
+    # Last GET call is the slice download — the gs:// URI must be rewritten
+    # through the shared dispatch (JSON-API media URL, object name escaped
+    # as one path segment) with the OAuth bearer attached.
     slice_call = get_mock.call_args_list[-1]
-    assert slice_call.args[0] == "https://storage.googleapis.com/bkt/exp/slice-0"
+    assert slice_call.args[0] == "https://storage.googleapis.com/storage/v1/b/bkt/o/exp%2Fslice-0?alt=media"
     assert slice_call.kwargs["headers"] == {"Authorization": "Bearer gcs-bearer-tok"}
 
     # Header line synthesized from table metadata (sliced files carry no

@@ -40,8 +40,9 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, assert_never
 
 import requests
 
@@ -55,6 +56,28 @@ except ImportError:  # pragma: no cover - boto3 is a declared dependency
     Credentials = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+class SliceScheme(StrEnum):
+    """The URI schemes a sliced-export manifest can hand back.
+
+    Declared as a closed set so `_prepare_slice_request` can dispatch over
+    it exhaustively. The alternative — an open `if startswith(...)` chain
+    ending in a pass-through — is what let AWS-staged exports ship a raw
+    `s3://` URI to `requests` until #1418: the unknown scheme was indistin-
+    guishable from an already-signed URL, so the failure surfaced as "No
+    connection adapters were found" instead of naming the scheme.
+
+    Adding a member here without giving it an arm is a type error at the
+    `assert_never` below, not a runtime surprise on a customer's stack.
+    """
+
+    GS = "gs"
+    AZURE = "azure"
+    S3 = "s3"
+    # Backends that hand back a URL already carrying its own signature.
+    HTTPS_PRESIGNED = "https"
+
 
 # Storage API guarantees export jobs are created small and finish in seconds
 # to a few minutes for typical bucket-table sizes; the absolute upper bound
@@ -850,8 +873,34 @@ class KeboolaStorageClient:
         ).add_auth(request)
         return dict(request.headers)
 
+    @staticmethod
+    def _slice_scheme(slice_url: str, index: int) -> SliceScheme:
+        """Classify one manifest entry, refusing anything not declared.
+
+        Refusing here is the point: an unrecognized scheme reaching
+        ``requests`` dies as "No connection adapters were found" with no
+        mention of the URI, several layers from the manifest that carried
+        it.
+        """
+        scheme, separator, _rest = slice_url.partition("://")
+        if not separator:
+            raise StorageApiError(f"slice {index} URL has no scheme, cannot be fetched: {slice_url!r}")
+        # Plain http is treated as presigned too: some stacks front their
+        # object store with an internal endpoint, and rejecting it here
+        # would break a path that works today.
+        if scheme in ("http", "https"):
+            return SliceScheme.HTTPS_PRESIGNED
+        try:
+            return SliceScheme(scheme)
+        except ValueError:
+            raise StorageApiError(
+                f"slice {index} uses unsupported scheme {scheme + '://'!r}; "
+                f"this build handles {', '.join(s.value + '://' for s in SliceScheme)}"
+            ) from None
+
+    @classmethod
     def _prepare_slice_request(
-        self,
+        cls,
         slice_url: str,
         index: int,
         *,
@@ -861,24 +910,31 @@ class KeboolaStorageClient:
     ) -> tuple[str, Optional[dict]]:
         """Map one manifest entry onto ``(url, extra_headers)`` to fetch.
 
-        Backend-specific rewriting, shared by both sliced entry points so a
-        backend fixed in one is fixed in the other:
+        The single scheme dispatch for both sliced entry points *and* the
+        legacy SDK client, so a backend fixed in one is fixed in all three:
         - GCP: ``gs://`` → GCS REST + OAuth bearer from ``gcsCredentials``
         - Azure: ``azure://`` → HTTPS + SAS token from ``absCredentials``
         - AWS: ``s3://`` → virtual-hosted HTTPS + SigV4 headers from
           ``credentials``; already-signed HTTPS passes through untouched.
+
+        A classmethod because the legacy client reaches it without holding a
+        Storage API client of its own.
         """
-        if slice_url.startswith("gs://"):
+        scheme = cls._slice_scheme(slice_url, index)
+        if scheme is SliceScheme.GS:
             if not gcs_token:
                 raise StorageApiError(
                     f"slice {index} URL is gs:// but no gcs_token provided in file_detail.gcsCredentials"
                 )
-            return self._gs_to_https(slice_url), {"Authorization": f"Bearer {gcs_token}"}
-        if slice_url.startswith("azure://"):
-            return self._azure_to_https(slice_url, abs_credentials), None
-        if slice_url.startswith("s3://"):
-            return self._s3_slice_request(slice_url, index, s3_context)
-        return slice_url, None
+            return cls._gs_to_https(slice_url), {"Authorization": f"Bearer {gcs_token}"}
+        elif scheme is SliceScheme.AZURE:
+            return cls._azure_to_https(slice_url, abs_credentials), None
+        elif scheme is SliceScheme.S3:
+            return cls._s3_slice_request(slice_url, index, s3_context)
+        elif scheme is SliceScheme.HTTPS_PRESIGNED:
+            return slice_url, None
+        else:
+            assert_never(scheme)
 
     @classmethod
     def _s3_slice_request(cls, s3_url: str, index: int, s3_context: dict) -> tuple[str, dict]:

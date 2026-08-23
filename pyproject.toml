@@ -365,6 +365,12 @@ dev = [
     # extra exists to prevent goes untested in CI. Same reasoning, and the same
     # mirroring, as the boto3 entry above.
     "aiohttp>=3.14.3",
+    # mypy — required, not optional tooling: tests/test_exhaustiveness_gate.py
+    # runs it over the typed core (scripts/typecheck-core.sh) so that
+    # `typing.assert_never` blocks a dropped dispatch arm in CI instead of
+    # only tripping if the missing arm is reached at runtime. The repo-wide
+    # mypy step in ci.yml stays advisory; this is the part that gates.
+    "mypy>=1.11",
 ]
 
 [project.scripts]

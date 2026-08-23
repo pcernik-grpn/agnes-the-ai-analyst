@@ -106,6 +106,12 @@ jobs:
     # Advisory only (continue-on-error) — ruff + mypy surface issues but
     # never gate. Split out of release.yml's old test job; runs without the
     # full dependency install since neither tool needs it.
+    #
+    # The mypy step below is NOT a gate and cannot be made one without
+    # clearing years of backlog first. Type checking that *does* block runs
+    # over a curated typed core (scripts/typecheck-core.sh), driven from the
+    # test suite by tests/test_exhaustiveness_gate.py so it rides the
+    # already-required `test` check. Tighten that list, not this step.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
