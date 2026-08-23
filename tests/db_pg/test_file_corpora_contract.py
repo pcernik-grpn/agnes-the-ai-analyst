@@ -183,3 +183,39 @@ def test_list_search_filters_by_name(repo):
     names = {r["name"] for r in rows}
     assert "Finance Data" in names
     assert "Marketing Stuff" not in names
+
+
+def test_list_all_returns_rows_past_the_list_default_cap(repo):
+    """``list_all()`` is unbounded where ``list()`` stops at its default cap.
+
+    ``list()`` defaults to ``limit=200``; callers that feed an authorization
+    decision or a full listing need every live row, so a 201st corpus must
+    still come back. Names sort the target *after* the filler so it is the row
+    a ``ORDER BY name LIMIT 200`` would drop.
+    """
+    for i in range(200):
+        repo.create(name=f"coll-{i:03d}", slug=f"coll-{i:03d}", description=None, created_by="u")
+    target = repo.create(name="zzz-past-the-cap", slug="zzz-past-the-cap", description=None, created_by="u")
+
+    assert len(repo.list()) == 200, "precondition: list() is capped at its default"
+    rows = repo.list_all()
+    assert len(rows) == 201
+    assert target in {r["id"] for r in rows}
+
+
+def test_list_all_excludes_soft_deleted(repo):
+    live = repo.create(name="Live", slug="live-all", description=None, created_by="u")
+    dead = repo.create(name="Dead", slug="dead-all", description=None, created_by="u")
+    repo.soft_delete(dead)
+    ids = {r["id"] for r in repo.list_all()}
+    assert live in ids
+    assert dead not in ids
+
+
+def test_list_all_row_shape_matches_list(repo):
+    """Same projection as ``list()`` — callers swap one for the other."""
+    repo.create(name="Shape", slug="shape-all", description="d", created_by="u")
+    listed = repo.list()[0]
+    all_row = repo.list_all()[0]
+    assert set(all_row) == set(listed)
+    assert all_row == listed

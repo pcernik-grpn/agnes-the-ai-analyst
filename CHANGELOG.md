@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **An instance with more than 200 Collections no longer hides the tail — including from its own access check.** `file_corpora_repo().list()` defaults to `limit=200` on both backends, and six callers read it meaning "every live corpus". The worst of them was an authorization *input*: `accessible_collection_ids` builds the owned half of a caller's reachable set from that list, so past 200 rows the owner of a Collection was told they could not reach it — a truncation that fails **closed** and reads as "the grant is broken" rather than "the list was cut off". The same cap silently trimmed `GET /api/collections` and the search surface's accessible-id set (no pagination signal to the caller), the `/agents` builder's knowledge-source picker, the id→name map behind the knowledge-artifact listing, and the corpora enumerated for knowledge packaging — so a Collection past the cap was also never packaged. The five that genuinely need every row now call a new unbounded `list_all()`, added to the DuckDB and Postgres repositories together and covered by the cross-engine contract test, mirroring `table_registry.list_all()`. The access check instead uses the `created_by` SQL predicate with an explicit high cap, so the fix does not put a whole-table read on the authorization path — the same reasoning `_owned_collection_ids` already applies in `src/agent_scope_intersection.py`. `app/resource_types.py` was already explicit about this with `_GRANT_PROJECTION_LIMIT` and is unchanged.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added
