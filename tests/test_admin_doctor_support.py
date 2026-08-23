@@ -112,6 +112,35 @@ class TestSupportDoctorSync:
         assert failing and failing[0]["table_id"] == "events"
         assert "connection reset" in failing[0]["error"]
 
+    def test_sync_state_is_keyed_by_name_not_id(self, seeded_app):
+        """`sync_state.table_id` mirrors `table_registry.name`, never `id`.
+
+        The convention is documented at `app/api/sync.py`'s manifest builder
+        and `app/api/admin.py`'s registry join, and every writer obeys it
+        (`_meta.table_name` → `update_sync`/`set_error`). Nothing enforces
+        disjoint id/name namespaces, though: a PUT-rename leaves `id` fixed
+        while `name` moves, so one table's `id` can equal another's `name`.
+        An id-keyed lookup then returns a truthy but WRONG row and silently
+        reports one source's failure against a different source — the worst
+        failure mode for an artifact whose whole job is to be trusted in a
+        support ticket.
+        """
+        from src.repositories import sync_state_repo, table_registry_repo
+
+        registry = table_registry_repo()
+        # `collide` is the *id* of a bigquery table that never synced, and
+        # also the *name* of a keboola table that failed.
+        registry.register(id="collide", name="Renamed BQ Table", source_type="bigquery")
+        registry.register(id="kbc_row", name="collide", source_type="keboola")
+        sync_state_repo().set_error("collide", "keboola extract failed")
+
+        sync = _run(seeded_app["client"], seeded_app["admin_token"])["sync"]
+        assert sync["sources"]["keboola"]["errors"] == 1
+        # The bigquery table must NOT inherit keboola's failure.
+        assert sync["sources"]["bigquery"]["errors"] == 0
+        assert sync["sources"]["bigquery"]["never_synced"] == 1
+        assert sync["sources"]["bigquery"]["last_errors"] == []
+
     def test_registered_but_never_synced_table_still_counts(self, seeded_app):
         from src.repositories import table_registry_repo
 
@@ -148,6 +177,22 @@ class TestSupportDoctorRedaction:
         assert "s3cr3tpw" not in resp.text
         # The rest of the message survives — it is the diagnostic value.
         assert "10.0.0.1:5432" in resp.text
+
+    def test_a_crashing_collector_cannot_leak_a_credential_either(self, seeded_app):
+        """The containment path is a credential route, not just an error path.
+
+        Every collector's exception funnels through one wrapper, and
+        ``_collect_schema`` reaches the PG engine — whose driver exceptions
+        are known to quote the connection URL. Scrubbing only the one field
+        with a reproducing test would leave the generic path open, including
+        for collectors added later.
+        """
+        boom = RuntimeError("could not connect: postgres://agnes:s3cr3tpw@10.0.0.1:5432/db")
+        with patch("app.services.support_bundle._collect_schema", side_effect=boom):
+            resp = seeded_app["client"].get("/api/admin/doctor/support", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        assert "s3cr3tpw" not in resp.text
+        assert resp.json()["schema"]["status"] == "error"
 
     def test_secrets_section_reports_presence_only(self, seeded_app, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", self.SENTINEL)

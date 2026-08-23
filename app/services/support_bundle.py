@@ -35,16 +35,17 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# A connector's own failure text is the one field here that is not ours: it
-# comes from an upstream driver and routinely quotes the connection URL,
-# password and all. The CLI scrubs the bundle it writes, but this endpoint
-# must not hand a credential to ANY consumer — an admin UI panel added later
-# would not know to scrub. Linear-time by construction (negated classes, no
-# nested quantifiers); the input is untrusted text.
+# Text that reaches this bundle from outside our own code — an upstream
+# driver's failure string, or any exception a collector raises — routinely
+# quotes a connection URL, password and all. The CLI scrubs the bundle it
+# writes, but this endpoint must not hand a credential to ANY consumer: an
+# admin UI panel added later would not know to scrub. Linear-time by
+# construction (negated classes, no nested quantifiers), since the input is
+# untrusted text.
 _URL_CREDENTIALS_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^:@/\s\"']+):[^@/\s\"']+@")
 
 
-def _redact_error(text: Optional[str]) -> Optional[str]:
+def _redact_secrets(text: Optional[str]) -> Optional[str]:
     if not text:
         return text
     return _URL_CREDENTIALS_RE.sub(r"\g<1>:<redacted>@", text)
@@ -177,7 +178,18 @@ def _collect_sync() -> dict:
         )
         agg["tables"] += 1
 
-        state = states.get(row["id"]) or states.get(row.get("name", ""))
+        # Keyed on NAME, never id: `sync_state.table_id` is sourced from
+        # `_meta.table_name`, which equals `table_registry.name` — the same
+        # convention `app/api/sync.py`'s manifest builder and
+        # `app/api/admin.py`'s registry join document, and every writer obeys
+        # (`update_sync`/`set_error`/`set_skipped` are all called with a name).
+        # An id-keyed lookup has no legitimate hit target, and because nothing
+        # keeps the id and name namespaces disjoint — a PUT-rename leaves `id`
+        # fixed while `name` moves — it can return a truthy row belonging to a
+        # DIFFERENT table, reporting one source's failure against another. A
+        # support artifact that misattributes is worse than one that says
+        # nothing.
+        state = states.get(row.get("name", ""))
         if not state:
             agg["never_synced"] += 1
             continue
@@ -201,7 +213,7 @@ def _collect_sync() -> dict:
                 agg["last_errors"].append(
                     {
                         "table_id": row["id"],
-                        "error": _redact_error(state.get("error")),
+                        "error": _redact_secrets(state.get("error")),
                         "last_sync": _iso(last_sync),
                     }
                 )
@@ -264,7 +276,12 @@ def _isolated(name: str, fn: Callable[[], dict]) -> dict:
         return fn()
     except Exception as e:  # noqa: BLE001 — containment is the point
         logger.exception("support doctor section %s crashed", name)
-        return {"status": "error", "detail": f"section crashed: {e}"}
+        # Scrubbed like any other foreign text: this is the single funnel every
+        # collector's crash message passes through, including ones added later.
+        # `_collect_schema` reaches the PG engine, and driver exceptions are
+        # known to quote the connection URL — so the containment path is a
+        # credential route, not just an error path.
+        return {"status": "error", "detail": _redact_secrets(f"section crashed: {e}")}
 
 
 def build_support_bundle() -> dict:

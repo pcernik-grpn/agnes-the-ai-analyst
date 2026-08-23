@@ -1044,9 +1044,13 @@ class TestAdminDoctorSmoke:
         from src.repositories import sync_state_repo, table_registry_repo
 
         table_registry_repo().register(id="doctor_ok", name="doctor_ok", source_type="keboola")
-        table_registry_repo().register(id="doctor_bad", name="doctor_bad", source_type="keboola")
+        # id != name on purpose: sync_state is keyed on NAME (table_id is
+        # sourced from _meta.table_name), so a row whose registry id differs
+        # is exactly what an id-keyed lookup would silently miss — and the
+        # keying lives in the repo read, so it is worth pinning per backend.
+        table_registry_repo().register(id="doctor_bad", name="Doctor Bad", source_type="keboola")
         sync_state_repo().update_sync("doctor_ok", rows=1, file_size_bytes=10, hash="h")
-        sync_state_repo().set_error("doctor_bad", "sync failed on both backends alike")
+        sync_state_repo().set_error("Doctor Bad", "sync failed on both backends alike")
 
         r = seeded_app_both["client"].get("/api/admin/doctor/support", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200, r.text
@@ -1063,6 +1067,9 @@ class TestAdminDoctorSmoke:
         keboola = body["sync"]["sources"]["keboola"]
         assert keboola["tables"] >= 2
         assert keboola["errors"] >= 1
+        # Found by name, reported by registry id — the id is what an operator
+        # types into `agnes catalog`/`agnes schema`, so that is what the
+        # bundle names.
         failing = {e["table_id"] for e in keboola["last_errors"]}
         assert "doctor_bad" in failing, keboola
 
