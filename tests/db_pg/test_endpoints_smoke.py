@@ -999,6 +999,7 @@ class TestAdminRegistrySmoke:
 class TestAdminDoctorSmoke:
     COVERED_ROUTES = {
         "POST /api/admin/doctor/new-instance",
+        "GET /api/admin/doctor/support",
     }
 
     def test_new_instance_doctor_report_shape(self, seeded_app_both):
@@ -1027,6 +1028,46 @@ class TestAdminDoctorSmoke:
             headers=_analyst_headers(seeded_app_both),
             json={},
         )
+        assert r.status_code == 403
+
+    def test_support_bundle_sections_resolve_on_both_backends(self, seeded_app_both):
+        """The support doctor's two backend-sensitive collectors, proven live.
+
+        ``schema`` takes an entirely different branch per backend (PG compares
+        ``alembic_version`` against the migration head, DuckDB the
+        ``schema_version`` table), and ``sync`` reads sync_state ×
+        table_registry through the repo factories — where PG hands back
+        tz-aware timestamps and DuckDB naive ones. Either divergence would
+        show up here as a crashed section on one backend only, which is
+        exactly what a section-isolated collector would otherwise hide.
+        """
+        from src.repositories import sync_state_repo, table_registry_repo
+
+        table_registry_repo().register(id="doctor_ok", name="doctor_ok", source_type="keboola")
+        table_registry_repo().register(id="doctor_bad", name="doctor_bad", source_type="keboola")
+        sync_state_repo().update_sync("doctor_ok", rows=1, file_size_bytes=10, hash="h")
+        sync_state_repo().set_error("doctor_bad", "sync failed on both backends alike")
+
+        r = seeded_app_both["client"].get("/api/admin/doctor/support", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        for section in ("build", "schema", "retrieval", "sync", "disk", "process", "secrets"):
+            assert section in body, sorted(body)
+            detail = body[section].get("detail", "") if isinstance(body[section], dict) else ""
+            assert "section crashed" not in detail, (section, detail)
+
+        assert body["schema"]["backend"] in ("duckdb", "postgres")
+        assert body["schema"]["status"] == "ok", body["schema"]
+
+        keboola = body["sync"]["sources"]["keboola"]
+        assert keboola["tables"] >= 2
+        assert keboola["errors"] >= 1
+        failing = {e["table_id"] for e in keboola["last_errors"]}
+        assert "doctor_bad" in failing, keboola
+
+    def test_support_bundle_non_admin_is_403(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/api/admin/doctor/support", headers=_analyst_headers(seeded_app_both))
         assert r.status_code == 403
 
 
