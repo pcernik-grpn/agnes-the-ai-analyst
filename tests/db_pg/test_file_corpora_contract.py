@@ -135,6 +135,23 @@ def test_list_returns_all_live_corpora(repo):
     assert {"aa", "bb"} <= slugs
 
 
+def test_list_filters_by_created_by(repo):
+    """The agent-scope intersection asks for one creator's collections on every
+    brokered request; without this predicate it read the whole table and
+    filtered in Python, on the authorization path."""
+    mine = repo.create(name="Mine", slug="mine", description=None, created_by="owner-1")
+    theirs = repo.create(name="Theirs", slug="theirs", description=None, created_by="owner-2")
+
+    ids = {r["id"] for r in repo.list(created_by="owner-1")}
+    assert mine in ids
+    assert theirs not in ids
+
+    # Soft-deleted rows stay excluded, and an unknown creator yields nothing.
+    repo.soft_delete(mine)
+    assert repo.list(created_by="owner-1") == []
+    assert repo.list(created_by="nobody") == []
+
+
 def test_list_excludes_soft_deleted(repo):
     id1 = repo.create(name="Live", slug="live", description=None, created_by="u")
     id2 = repo.create(name="Dead", slug="dead", description=None, created_by="u")

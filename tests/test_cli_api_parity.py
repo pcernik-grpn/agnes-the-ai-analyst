@@ -294,6 +294,7 @@ def parity_env(seeded_app, monkeypatch):
             "cli.commands.stack",
             "cli.commands.admin",
             "cli.commands.admin_jobs",
+            "cli.commands.admin_marketplace",
             "cli.commands.admin_mcp",
             "cli.commands.admin_connection",
             "cli.commands.mcp",
@@ -1832,9 +1833,9 @@ class TestMCPSourceBulkGrantParity:
         client, token = parity_env["client"], parity_env["admin_token"]
 
         client.post(f"/api/admin/mcp-sources/{source_id}/grants", json={"group_id": gid}, headers=_auth(token))
-        assert client.delete(
-            f"/api/admin/mcp-sources/{source_id}/grants/{gid}", headers=_auth(token)
-        ).status_code == 204
+        assert (
+            client.delete(f"/api/admin/mcp-sources/{source_id}/grants/{gid}", headers=_auth(token)).status_code == 204
+        )
         api_state = self._snapshot(source_id, gid)
 
         client.post(f"/api/admin/mcp-sources/{source_id}/grants", json={"group_id": gid}, headers=_auth(token))
@@ -1859,9 +1860,12 @@ class TestMcpToolGrantParity:
         gid = _seed_group_with_user(conn, name=gname, user_id="analyst1")
         MCPSourceRepository(conn).upsert(id="src_parity", name="parity-src", transport="stdio", command="/bin/true")
         ToolRegistryRepository(conn).upsert(
-            tool_id=tool_id, source_id="src_parity",
-            original_name="write_thing", exposed_name="write_thing",
-            mode=PASSTHROUGH, mutating=True,
+            tool_id=tool_id,
+            source_id="src_parity",
+            original_name="write_thing",
+            exposed_name="write_thing",
+            mode=PASSTHROUGH,
+            mutating=True,
         )
         return gid
 
@@ -1890,9 +1894,7 @@ class TestMcpToolGrantParity:
         conn.execute("DELETE FROM tool_grants WHERE tool_id = 'tg.parity'")
         conn.close()
 
-        parity_env["run_cli"](
-            ["admin", "mcp", "tool", "grant", "tg.parity", "--group", gid, "--allow-mutating"]
-        )
+        parity_env["run_cli"](["admin", "mcp", "tool", "grant", "tg.parity", "--group", gid, "--allow-mutating"])
 
         conn = get_system_db()
         delta_cli = self._grants_snapshot(conn)
@@ -1930,3 +1932,124 @@ class TestMcpToolGrantParity:
             snap = self._grants_snapshot(conn, "tg.parity2")
             conn.close()
             assert snap == [("tg.parity2", gid, False)], f"path={path}"
+
+
+# ---------------------------------------------------------------------------
+# Marketplace plugin disable / enable (agnes admin marketplace)
+# ---------------------------------------------------------------------------
+
+
+class TestMarketplacePluginDisableParity:
+    """``POST /api/marketplaces/{id}/plugins/{name}/disable`` (with
+    ``revoke_grants``) ↔ ``agnes admin marketplace disable-plugin <ref>
+    --revoke-grants`` — and the enable direction. Same admin_disabled flip,
+    same grant deletion, same audit rows."""
+
+    MKT = "parity-mkt"
+    PLUGIN = "p1"
+
+    def _seed(self):
+        from datetime import datetime, timezone
+
+        conn = get_system_db()
+        _reset_audit_log(conn)
+        conn.execute("DELETE FROM resource_grants WHERE resource_id = ?", [f"{self.MKT}/{self.PLUGIN}"])
+        conn.execute(
+            "INSERT INTO marketplace_registry (id, name, url, registered_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            [self.MKT, "Parity MKT", "https://example.test/parity.git", datetime.now(timezone.utc)],
+        )
+        conn.execute(
+            "INSERT INTO marketplace_plugins (marketplace_id, name, raw, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (marketplace_id, name) "
+            "DO UPDATE SET admin_disabled = FALSE",
+            [self.MKT, self.PLUGIN, json.dumps({"name": self.PLUGIN}), datetime.now(timezone.utc)],
+        )
+        gid = _seed_group_with_user(conn, name=f"parity_mkt_{uuid.uuid4().hex[:6]}", user_id="analyst1")
+        _seed_grant_for(conn, gid, "marketplace_plugin", f"{self.MKT}/{self.PLUGIN}")
+        conn.close()
+        return gid
+
+    def _snapshot(self, conn):
+        state = _snapshot_table(
+            conn,
+            "SELECT admin_disabled FROM marketplace_plugins WHERE marketplace_id = ? AND name = ?",
+            [self.MKT, self.PLUGIN],
+        )
+        grants = _snapshot_table(
+            conn,
+            "SELECT resource_type, resource_id FROM resource_grants WHERE resource_id = ?",
+            [f"{self.MKT}/{self.PLUGIN}"],
+        )
+        audit = _snapshot_table(
+            conn,
+            "SELECT action, resource, params FROM audit_log "
+            "WHERE action LIKE 'marketplace.plugin.%' ORDER BY id",
+        )
+        return (state, grants, audit)
+
+    def test_disable_with_revoke_parity(self, parity_env):
+        ref = f"{self.MKT}/{self.PLUGIN}"
+
+        # API path
+        self._seed()
+        r = parity_env["client"].post(
+            f"/api/marketplaces/{self.MKT}/plugins/{self.PLUGIN}/disable",
+            json={"revoke_grants": True},
+            headers=_auth(parity_env["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["revoked_grants"] == 1
+        conn = get_system_db()
+        delta_api = self._snapshot(conn)
+        conn.close()
+
+        # CLI path (fresh seed resets flag + grant + audit)
+        self._seed()
+        parity_env["run_cli"](["admin", "marketplace", "disable-plugin", ref, "--revoke-grants"])
+        conn = get_system_db()
+        delta_cli = self._snapshot(conn)
+        conn.close()
+
+        assert delta_api == delta_cli
+        state, grants, audit = delta_api
+        assert state == [(True,)]
+        assert grants == []
+        assert len(audit) == 1
+
+    def test_enable_parity(self, parity_env):
+        ref = f"{self.MKT}/{self.PLUGIN}"
+
+        def _disable_first():
+            self._seed()
+            conn = get_system_db()
+            conn.execute(
+                "UPDATE marketplace_plugins SET admin_disabled = TRUE "
+                "WHERE marketplace_id = ? AND name = ?",
+                [self.MKT, self.PLUGIN],
+            )
+            _reset_audit_log(conn)
+            conn.close()
+
+        # API path
+        _disable_first()
+        r = parity_env["client"].post(
+            f"/api/marketplaces/{self.MKT}/plugins/{self.PLUGIN}/enable",
+            headers=_auth(parity_env["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        conn = get_system_db()
+        delta_api = self._snapshot(conn)
+        conn.close()
+
+        # CLI path
+        _disable_first()
+        parity_env["run_cli"](["admin", "marketplace", "enable-plugin", ref])
+        conn = get_system_db()
+        delta_cli = self._snapshot(conn)
+        conn.close()
+
+        assert delta_api == delta_cli
+        state, grants, _ = delta_api
+        assert state == [(False,)]
+        assert grants != [], "enable must NOT touch grants"

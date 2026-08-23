@@ -6,13 +6,31 @@ Mirrors ``src/grant_intersection.py``'s shape (fail-closed, builds on
 on ``conn``) but for a *single* owner narrowed by a *single* agent's four
 ``*_mode`` columns instead of N co-session participants.
 
+``tables_mode`` governs the whole DATA axis — ``TABLE`` plus
+``DATA_PACKAGE`` and ``COLLECTION`` (``TABLES_MODE_EXTRA_TYPES``). That is
+what the ``/agents`` builder actually declares: its Knowledge section offers
+data packages, memory domains and file collections, never bare table ids. A
+declared package therefore also stands for its member tables, expanded LIVE
+per request (``_package_table_ids``) so a package edit reaches every agent
+scoped to it without a re-save.
+
+The OWNER side of two axes is wider than raw ``resource_grants``, because
+that is how owners really hold access (``_owner_ids_for_type``):
+``TABLE`` adds the member tables of the owner's granted data packages (the
+unified-stack model routes analyst table access through packages, so a
+grants-only owner set denied an agent every table its owner reached through
+a package), and ``COLLECTION`` adds collections the owner created (ownership
+grants access, mirroring ``accessible_collection_ids``). Both derivations
+stay god-mode-free: an admin owner contributes their explicit grants, never
+the short-circuit.
+
 Fail-closed contract (spec §2, normative):
   - Missing/empty ``owner_user_id`` or ``agent_row`` -> ``{}`` (deny
     everything).
   - Mode ``'all'`` (or a ``ResourceType`` the agent does not model at all,
-    e.g. ``DATA_PACKAGE``/``RECIPE``/``COLLECTION``/...) -> the owner's set,
-    unchanged. The agent narrows only what it declares; every resource type
-    it stays silent on passes through as the owner's authority.
+    e.g. ``RECIPE``/``CHAT``/...) -> the owner's set, unchanged. The agent
+    narrows only what it declares; every resource type it stays silent on
+    passes through as the owner's authority.
   - Mode ``'selected'`` -> ``owner_set & agent_scope_set`` for that type. A
     scope row naming a resource the owner does NOT hold is silently
     dropped, never surfaced — an agent can never widen beyond its owner.
@@ -48,6 +66,27 @@ MODE_TO_RESOURCE_TYPE: dict[str, tuple[str, str]] = {
     "memory_mode": ("memory_domain", "memory_domain"),
 }
 
+# ``tables_mode`` governs the whole DATA axis, not just bare table ids: the
+# builder's "Knowledge" section declares data packages and file collections,
+# so those two ResourceTypes narrow (and fail closed) together with TABLE
+# under the same mode column. Kept OUT of ``MODE_TO_RESOURCE_TYPE`` so the
+# seams consuming that map (one item_type per mode axis) are unaffected.
+TABLES_MODE_EXTRA_TYPES: dict[str, str] = {
+    # agent_scope.item_type -> ResourceType.value
+    "data_package": ResourceType.DATA_PACKAGE.value,
+    "collection": ResourceType.COLLECTION.value,
+}
+
+# Cap for the owned-collections scan below — see ``_owned_collection_ids``.
+_COLLECTION_SCAN_LIMIT = 100_000
+
+# ResourceType.value -> (mode column, agent_scope.item_type) for every axis
+# ``compute_agent_intersection`` narrows.
+_RT_TO_AXIS: dict[str, tuple[str, str]] = {
+    **{rt: (mf, it) for mf, (it, rt) in MODE_TO_RESOURCE_TYPE.items()},
+    **{rt: ("tables_mode", it) for it, rt in TABLES_MODE_EXTRA_TYPES.items()},
+}
+
 
 def _allowed_ids_for_user(
     user_id: str,
@@ -77,6 +116,137 @@ def _agent_scope_ids(
 
     items = agents_repo().get_scope(agent_id)
     return frozenset(item["item_id"] for item in items if item.get("item_type") == item_type)
+
+
+def _package_table_ids(
+    package_ids: frozenset[str],
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> frozenset[str]:
+    """Member-table ids of ``package_ids``, expanded LIVE through the repo
+    factory — a package edit flows into every agent's effective scope on the
+    next request, instead of freezing membership at scope-save time.
+
+    Fail-SAFE per package: a lookup error contributes nothing (narrower is
+    the safe direction on both the owner and the agent side). ``conn`` is
+    accepted for signature symmetry only.
+    """
+    if not package_ids:
+        return frozenset()
+    out: set[str] = set()
+    try:
+        from src.repositories import data_packages_repo
+
+        repo = data_packages_repo()
+        for pkg_id in package_ids:
+            try:
+                out.update(t["id"] for t in repo.list_tables(pkg_id))
+            except Exception:
+                continue
+    except Exception:
+        return frozenset()
+    return frozenset(out)
+
+
+def _owner_package_ids(
+    owner_user_id: str,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> frozenset[str]:
+    """Data packages the owner **actually holds**, as the table-authorization
+    boundary defines it — bounded from both sides on purpose:
+
+    - ``⊆`` the owner's raw group grants (``_allowed_ids_for_user``, which
+      never applies the Admin short-circuit), so an admin owner contributes
+      only explicit grants. ``StackResolver.stack`` alone would breach this:
+      for an admin it also surfaces raw subscriptions with no backing grant.
+    - ``⊆`` the owner's effective stack (``StackResolver.stack``), which is
+      what ``src/rbac.py::can_access_table`` authorizes a table read against.
+      Raw grants alone would breach THIS one: the classic membership formula
+      (``features.stack_auto_membership: false``) is
+      ``required ∪ (subscribed ∩ available)``, so an *available* package the
+      owner never subscribed to is not in their stack and its tables 403 for
+      them — while raw grants would still hand those tables to their agent.
+
+    The intersection of the two is therefore the only set that cannot exceed
+    the owner on either axis. Fail-safe: any resolver error narrows to the
+    raw-grant set intersected with nothing, i.e. empty.
+    """
+    granted = _allowed_ids_for_user(owner_user_id, ResourceType.DATA_PACKAGE.value, conn)
+    if not granted:
+        return frozenset()
+    try:
+        from app.resource_types import ResourceType as _RT
+        from app.services.stack_resolver import StackResolver
+
+        in_stack = {e.id for e in StackResolver(conn).stack(owner_user_id, _RT.DATA_PACKAGE)}
+    except Exception:
+        return frozenset()
+    return granted & frozenset(in_stack)
+
+
+def _owned_collection_ids(owner_user_id: str) -> frozenset[str]:
+    """Collections the owner CREATED — ownership grants access without a
+    group grant (mirrors ``app.auth.access.accessible_collection_ids``), so
+    the owner side of the COLLECTION axis must include them or an agent
+    could never be scoped to its owner's own uploads. Fail-safe: an error
+    reads as "owns nothing" (narrower)."""
+    if not owner_user_id:
+        return frozenset()
+    try:
+        from src.repositories import file_corpora_repo
+
+        # Filter in SQL, not in Python. This runs once per brokered request
+        # (``compute_agent_intersection`` from ``app/auth/pat_resolver.py``),
+        # and reading the whole table to keep one creator's rows put a
+        # table-sized scan on the authorization path (Devin Review on #1515).
+        #
+        # The cap stays explicit and high: ``list()`` defaults to 200, and a
+        # silent truncation inside an authorization input would deny an agent
+        # its owner's own uploads with no signal. Same reasoning as
+        # ``_GRANT_PROJECTION_LIMIT`` in app/resource_types.py — it now bounds
+        # one creator's collections rather than the whole table, so it is far
+        # further from ever binding.
+        rows = file_corpora_repo().list(created_by=owner_user_id, limit=_COLLECTION_SCAN_LIMIT)
+        return frozenset(r["id"] for r in rows)
+    except Exception:
+        return frozenset()
+
+
+def _owner_ids_for_type(
+    owner_user_id: str,
+    rt_value: str,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+    owner_pkgs: Optional[frozenset[str]] = None,
+) -> frozenset[str]:
+    """The OWNER side of one axis. Plain group grants for every type, plus
+    the two derivations that reflect how owners actually hold data access —
+    both deliberately god-mode-free (SR-1: an admin owner's agent gets the
+    admin's *explicit* grants, never the short-circuit):
+
+    - TABLE: per-table grants ∪ member tables of the owner's granted data
+      packages. The unified-stack model routes analyst table access through
+      packages (``src/rbac.py::can_access_table``), so grants-only here
+      denied every table to an agent whose owner had a package-shaped stack.
+    - COLLECTION: group grants ∪ collections the owner created (ownership
+      grants access — ``accessible_collection_ids``).
+
+    ``owner_pkgs`` lets the caller pass the owner's package set in when it has
+    already resolved it. :func:`compute_agent_intersection` walks every
+    ``ResourceType`` and needed it on three of them, so leaving each to
+    re-derive it ran the grant read + ``StackResolver`` three times per
+    brokered request (Devin Review on #1515). Omitted, it is resolved here
+    exactly as before.
+    """
+    base = _allowed_ids_for_user(owner_user_id, rt_value, conn)
+    if rt_value == ResourceType.TABLE.value:
+        pkgs = _owner_package_ids(owner_user_id, conn) if owner_pkgs is None else owner_pkgs
+        return base | _package_table_ids(pkgs, conn)
+    if rt_value == ResourceType.DATA_PACKAGE.value:
+        # Narrowed the same way, so the agent's own package list cannot show
+        # (or authorize) a package its owner does not effectively hold.
+        return _owner_package_ids(owner_user_id, conn) if owner_pkgs is None else owner_pkgs
+    if rt_value == ResourceType.COLLECTION.value:
+        return base | _owned_collection_ids(owner_user_id)
+    return base
 
 
 def agent_scope_filter(
@@ -168,28 +338,41 @@ def compute_agent_intersection(
 
     agent_id = agent_row.get("id")
 
+    # Resolved ONCE per call: three axes below need it, and each derivation
+    # is a grant read plus a StackResolver pass. This runs on every brokered
+    # request (app/auth/pat_resolver.py).
+    owner_pkgs = _owner_package_ids(owner_user_id, conn)
+
     result: dict[str, frozenset[str]] = {}
     for rt in ResourceType:
-        owner_set = _allowed_ids_for_user(owner_user_id, rt.value, conn)
+        owner_set = _owner_ids_for_type(owner_user_id, rt.value, conn, owner_pkgs=owner_pkgs)
 
-        mode_field = next(
-            (mf for mf, (_item_type, rt_value) in MODE_TO_RESOURCE_TYPE.items() if rt_value == rt.value),
-            None,
-        )
-        if mode_field is None:
+        axis = _RT_TO_AXIS.get(rt.value)
+        if axis is None:
             # Resource type the agent does not model at all -> pass through
             # the owner's set verbatim (narrows only what it declares).
             if owner_set:
                 result[rt.value] = owner_set
             continue
 
-        item_type, _rt_value = MODE_TO_RESOURCE_TYPE[mode_field]
+        mode_field, item_type = axis
         mode = agent_row.get(mode_field)
         if mode == "all":
             if owner_set:
                 result[rt.value] = owner_set
         elif mode == "selected":
             agent_set = _agent_scope_ids(agent_id, item_type, conn)
+            if rt.value == ResourceType.TABLE.value:
+                # A declared data package stands for its member tables: the
+                # builder's Knowledge section offers packages and collections,
+                # not raw table ids, so an agent scoped to a package must be
+                # able to read the tables in it. Expanded live and intersected
+                # with the owner's own reach, so neither a package edit nor a
+                # revoked owner grant can widen the agent.
+                declared_pkgs = _agent_scope_ids(agent_id, "data_package", conn)
+                agent_set = agent_set | _package_table_ids(
+                    declared_pkgs & owner_pkgs, conn
+                )
             narrowed = owner_set & agent_set
             if narrowed:
                 result[rt.value] = narrowed

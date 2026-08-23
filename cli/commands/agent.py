@@ -241,6 +241,12 @@ def scope_set(
     slug: str = typer.Argument(..., help="Agent slug"),
     plugin: list[str] = typer.Option([], "--plugin", help="Plugin id to grant (repeatable)"),
     table: list[str] = typer.Option([], "--table", help="Table id to grant (repeatable)"),
+    data_package: list[str] = typer.Option(
+        [],
+        "--data-package",
+        help="Data package id to grant (repeatable); also grants the tables in it",
+    ),
+    collection: list[str] = typer.Option([], "--collection", help="File collection id to grant (repeatable)"),
     connection: list[str] = typer.Option([], "--connection", help="Connection id to grant (repeatable)"),
     memory_domain: list[str] = typer.Option([], "--memory-domain", help="Memory domain id to grant (repeatable)"),
     slack_channel: list[str] = typer.Option(
@@ -260,12 +266,15 @@ def scope_set(
     items: list[dict] = []
     items += [{"item_type": "plugin", "item_id": v} for v in plugin]
     items += [{"item_type": "table", "item_id": v} for v in table]
+    items += [{"item_type": "data_package", "item_id": v} for v in data_package]
+    items += [{"item_type": "collection", "item_id": v} for v in collection]
     items += [{"item_type": "connection", "item_id": v} for v in connection]
     items += [{"item_type": "memory_domain", "item_id": v} for v in memory_domain]
     items += [{"item_type": "slack_channel", "item_id": v} for v in slack_channel]
     if not items:
         typer.echo(
-            "Error: at least one of --plugin/--table/--connection/--memory-domain/--slack-channel is required.",
+            "Error: at least one of --plugin/--table/--data-package/--collection/--connection/"
+            "--memory-domain/--slack-channel is required.",
             err=True,
         )
         raise typer.Exit(2)

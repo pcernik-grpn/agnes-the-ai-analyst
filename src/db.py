@@ -70,8 +70,13 @@ _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 # 121 adds tool_grants.allow_mutating — per-group opt-in that lets a
 # non-admin caller (including an agent riding its owner's groups) invoke a
 # mutating passthrough tool, replacing the admin-or-bust mutating gate (see
-# `_v120_to_v121`).
-SCHEMA_VERSION = 121
+# `_v120_to_v121`),
+# 122 backfills enforced scope onto pre-existing `/agents` builder agents —
+# their knowledge/plugins declaration becomes `agent_scope` rows and the four
+# `*_mode` columns flip off the all-'all' passthrough shape, so the narrowing
+# the builder UI showed is the narrowing the runtime applies (see
+# `_v121_to_v122`).
+SCHEMA_VERSION = 122
 
 # v96: data_apps registry (hosted user web apps). Extracted as a shared
 # module-level constant so the fresh-install DDL (appended to
@@ -7638,6 +7643,143 @@ def _v120_to_v121(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("UPDATE schema_version SET version = 121")
 
 
+def _v121_to_v122(conn: duckdb.DuckDBPyConnection) -> None:
+    """v121→v122: make pre-existing builder agents enforce what their UI
+    already showed.
+
+    A ``/agents`` builder row (``agt_`` id prefix — see ``_v114_to_v115`` for
+    why the prefix, not the slug, is the discriminator) recorded the user's
+    picks in the ``knowledge``/``plugins`` JSON columns but left all four
+    ``*_mode`` columns at the repository default ``'all'``. All-``'all'`` is
+    the passthrough shape (``agent_is_passthrough``), so such an agent ran
+    with its owner's ENTIRE stack regardless of what the page showed — the
+    UI promised a narrowing the runtime never applied. ``POST``/``PATCH``
+    ``/api/agents`` now derive ``agent_scope`` from those columns and set the
+    modes to ``'selected'``; this step does the same for rows created before
+    that fix.
+
+    Two things happen per row, in one transaction:
+
+    1. ``knowledge`` ids become ``agent_scope`` rows, typed by which registry
+       the id resolves in (data package / memory domain / collection), and
+       ``plugins`` ids become ``('plugin', id)`` rows. Ids that resolve
+       nowhere are skipped: an enforced-scope row that can never resolve is
+       indistinguishable from a typo and would only widen the diff an
+       operator has to audit.
+    2. The four modes flip to ``'selected'``.
+
+    A row with an empty declaration therefore ends up enforcing an EMPTY
+    scope. That is the honest reading of a builder agent showing
+    "0 sources · 0 tools", and it is the fail-closed direction; the owner
+    widens it by picking sources in the builder, which now writes scope.
+
+    Excluded: ``is_default`` (the seeded per-owner agent web chat is
+    attributed to — it is infrastructure and must keep passing the owner's
+    own authority through), and any row whose modes are already not all
+    ``'all'`` (a governance-API agent, or a builder agent already fixed by
+    ``agnes agent scope set``) — touching those would overwrite a
+    deliberately-set scope with a re-derivation from columns the governance
+    surface never wrote.
+
+    Idempotent: after the flip the ``all four modes = 'all'`` predicate no
+    longer matches, so a re-run (or a fresh install's ladder walk) is a
+    no-op. Guarded on the modern ``agents`` shape for the same reason
+    ``_v114_to_v115`` is — a database still in the pre-merge paper-theme
+    shape reaches this step before ``_heal_legacy_agents_table`` runs, and
+    an unguarded statement would abort startup with a Binder Error.
+
+    Wrapped in an explicit transaction, like the other multi-row data
+    backfills (``_v12_to_v13_finalize``, ``_v13_to_v14_finalize``): DuckDB
+    autocommits per statement, so without it a crash mid-loop would leave
+    some agents flipped and others not, while the Postgres sibling — whose
+    whole Alembic run is one transaction — would roll back. The step is
+    retry-safe either way (an unflipped agent still matches the cohort
+    predicate next boot), but the two backends should not differ in their
+    crash-window guarantee.
+    """
+    import json as _json
+
+    cols = {
+        r[0]
+        for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'agents'"
+        ).fetchall()
+    }
+    required = {"knowledge", "plugins", "is_default", "tables_mode", "plugins_mode", "memory_mode", "connections_mode"}
+    tables_present = {r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()}
+    # ``agent_scope`` mirrors the Alembic guard's table check. Inert today
+    # (_SYSTEM_SCHEMA creates it unconditionally before this step runs), but
+    # without it a reordering there would crash DuckDB where PG no-ops.
+    if required <= cols and "agent_scope" in tables_present:
+        rows = conn.execute(r"""
+            SELECT id, knowledge, plugins
+              FROM agents
+             WHERE id LIKE 'agt\_%' ESCAPE '\'
+               AND NOT COALESCE(is_default, FALSE)
+               AND COALESCE(tables_mode, 'all') = 'all'
+               AND COALESCE(plugins_mode, 'all') = 'all'
+               AND COALESCE(connections_mode, 'all') = 'all'
+               AND COALESCE(memory_mode, 'all') = 'all'
+        """).fetchall()
+
+        def _ids(raw) -> list:
+            """The JSON id-list column as a clean list of non-blank strings."""
+            try:
+                val = _json.loads(raw) if isinstance(raw, str) else (raw or [])
+            except (ValueError, TypeError):
+                return []
+            return [v.strip() for v in val if isinstance(v, str) and v.strip()] if isinstance(val, list) else []
+
+        # Registries a knowledge id may resolve in, probed in this order —
+        # the same three the builder's Knowledge section is populated from.
+        registries = [
+            (item_type, table)
+            for item_type, table in (
+                ("data_package", "data_packages"),
+                ("memory_domain", "memory_domains"),
+                ("collection", "file_corpora"),
+            )
+            if table in tables_present
+        ]
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            _backfill_builder_scope_rows(conn, rows, registries, _ids)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    conn.execute("UPDATE schema_version SET version = 122")
+
+
+def _backfill_builder_scope_rows(conn, rows, registries, _ids) -> None:
+    """The per-agent write half of :func:`_v121_to_v122`, extracted so the
+    transaction wrapper there reads as one unit."""
+    for agent_id, knowledge_json, plugins_json in rows:
+        pairs: list = []
+        for item_id in _ids(knowledge_json):
+            for item_type, table in registries:
+                if conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", [item_id]).fetchone():
+                    pairs.append((item_type, item_id))
+                    break
+        pairs += [("plugin", p) for p in _ids(plugins_json)]
+        for item_type, item_id in pairs:
+            try:
+                conn.execute(
+                    "INSERT INTO agent_scope (agent_id, item_type, item_id) VALUES (?, ?, ?)",
+                    [agent_id, item_type, item_id],
+                )
+            except duckdb.ConstraintException:
+                pass  # already scoped — the composite PK, not an error
+        conn.execute(
+            """UPDATE agents
+                  SET tables_mode = 'selected', plugins_mode = 'selected',
+                      connections_mode = 'selected', memory_mode = 'selected',
+                      updated_at = current_timestamp
+                WHERE id = ?""",
+            [agent_id],
+        )
+
+
 def _add_store_entity_trust_columns(conn: duckdb.DuckDBPyConnection) -> None:
     """The v111 column DDL on its own, with no version stamp.
 
@@ -8683,6 +8825,10 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             # by the ladder (_v63_to_v64), not _SYSTEM_SCHEMA, so this ALTER
             # does real work on fresh installs too.
             _v120_to_v121(conn)
+            # v121→v122: builder-agent scope backfill. Selects nothing on a
+            # fresh install (no agents yet) — called for its version stamp,
+            # which on this branch is what leaves the DB at SCHEMA_VERSION.
+            _v121_to_v122(conn)
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still
@@ -8978,6 +9124,8 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
                 _v119_to_v120(conn)
             if current < 121:
                 _v120_to_v121(conn)
+            if current < 122:
+                _v121_to_v122(conn)
             conn.execute(
                 "UPDATE schema_version SET version = ?, applied_at = current_timestamp",
                 [SCHEMA_VERSION],
