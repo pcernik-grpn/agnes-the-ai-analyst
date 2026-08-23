@@ -316,7 +316,11 @@ def build_schema_uncached(
         # extractor's own master view over the partition dir does.
         from app.utils import LOCAL_PARQUET_READ_EXPR, resolve_local_parquet_glob
 
-        parquet = resolve_local_parquet_glob(table_id, source_type)
+        # `registry_name`: the write side keys the parquet filename by the
+        # row's `name`, not its `id` — see `_physical_key_candidates` in
+        # app/utils.py. Without it, any row whose id was slugified from the
+        # name 404-ed here while fully synced.
+        parquet = resolve_local_parquet_glob(table_id, source_type, registry_name=row.get("name"))
         if parquet is None:
             raise NotFound(table_id)
         local_conn = _open_duckdb(":memory:")

@@ -2124,6 +2124,34 @@ def _library_row_base(
     }
 
 
+def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
+    """Whether to offer this caller the ``/semantic-layer`` browse pages.
+
+    The same ``_can_read_model`` gate those pages apply, so a caller who can
+    read nothing is never sent to an empty page. Deliberately NOT gated on the
+    flat projection's counts: a model with no metrics or glossary terms
+    projected yet — the default state of an upstream document that declares
+    datasets and relationships but no aggregations — still counts, because
+    those objects are the one thing the browse UI exists to show.
+
+    Best-effort by contract: every caller renders a LINK off this, so a
+    ``semantic_models`` read failure must degrade to "no link" and leave the
+    rest of the page intact rather than 500 it. ``surface`` only labels the log.
+
+    Shared by ``/library``'s Definitions footer and ``/catalog/semantics``'
+    header + empty state. One reader, because the two disagreeing is exactly
+    how the standalone page came to claim "no metrics registered yet" on an
+    instance whose Library was already offering the document next door.
+    """
+    try:
+        from app.api.semantic_models import _can_read_model
+
+        return any(_can_read_model(user, row, conn) for row in semantic_model_repo().list_all())
+    except Exception as e:  # noqa: BLE001 - the link is best-effort
+        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
+        return False
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -2838,6 +2866,13 @@ async def library_page(
 
             plugin_in_stack, plugin_required = _curated_stack_sets(None, uid)
             for pl in marketplace_plugins_repo().list_all():
+                # Admin-disabled is instance-wide "does not exist" for every
+                # user-facing surface, grants notwithstanding — same
+                # post-filter as the v2 /skills admin branch
+                # (app/api/v2_marketplace.py). Without it the Library kept
+                # rendering the card with a working "+ Add to stack" button.
+                if pl.get("admin_disabled"):
+                    continue
                 mid, pname = pl.get("marketplace_id"), pl.get("name")
                 path = f"{mid}/{pname}"
                 if path not in plugin_paths:
@@ -3126,16 +3161,7 @@ async def library_page(
         # hide the one thing this UI exists to browse. Read in its own guard so
         # a semantic_models failure leaves the metric/glossary footer already
         # computed above intact instead of suppressing it.
-        _has_readable_model = False
-        try:
-            from app.api.semantic_models import _can_read_model
-
-            for _sm_row in semantic_model_repo().list_all():
-                if _can_read_model(user, _sm_row, conn):
-                    _has_readable_model = True
-                    break
-        except Exception as e:  # noqa: BLE001 - footer link is best-effort
-            logger.warning("/library: semantic-model existence check failed: %s", e)
+        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
 
         if _visible_metrics or _glossary_terms or _has_readable_model:
             definitions_footer = {
@@ -3650,6 +3676,12 @@ async def catalog_semantics(
         metric_categories=metric_categories,
         metric_count=len(metrics),
         glossary_count=glossary_count,
+        # The door to /semantic-layer. Both pages are titled "Semantic layer"
+        # and this is the reachable one, so without the link a document with
+        # datasets and relationships but no metrics rendered as "there is no
+        # semantic layer here". Same gate /library's Definitions footer uses —
+        # a readable document, never this page's own metric/glossary counts.
+        has_semantic_models=_has_readable_semantic_model(user, conn, surface="/catalog/semantics"),
     )
     return templates.TemplateResponse(request, "catalog_semantics.html", ctx)
 

@@ -295,6 +295,64 @@ class TestCatalogSizeHint:
         assert v2_catalog._materialized_parquet_size_bucket("kbc_empty", "keboola", "local") is None
 
 
+    def test_hint_follows_the_registry_name_like_the_read_surfaces(self, tmp_path, monkeypatch):
+        """A row whose parquet is filed under its `name`, not its slugified `id`.
+
+        `resolve_local_parquet_glob` takes `registry_name` so /schema, /scan
+        and /sample resolve these rows. Its size counterpart must follow the
+        same name-first ordering, or the catalog publishes `rough_size_hint:
+        null` for a table those three surfaces serve happily — the mirror of
+        the disagreement `resolve_local_parquet_glob`'s own docstring records
+        (a hint for a table /schema then 404-ed on).
+        """
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        data = tmp_path / "extracts" / "keboola" / "data"
+        data.mkdir(parents=True)
+        # The exact pair the register handler's slugify produces.
+        table_id, registry_name = "orders_90d", "Orders 90d"
+        (data / f"{registry_name}.parquet").write_bytes(b"x" * 4096)
+
+        from app.api import v2_catalog
+
+        seen: list[int] = []
+        monkeypatch.setattr(v2_catalog, "_bucket_size", lambda n: seen.append(n) or "small")
+
+        hint = v2_catalog._materialized_parquet_size_bucket(
+            table_id, "keboola", "local", registry_name=registry_name
+        )
+
+        assert hint == "small", "the name-keyed parquet must be found"
+        assert seen == [4096]
+
+    def test_hint_for_row_passes_the_registry_name_through(self, tmp_path, monkeypatch):
+        """The catalog row carries `name`; `_hint_for_row` must forward it.
+
+        Threading the keyword only as far as the helper would leave the real
+        call path — the one the catalog response actually uses — still keyed
+        by id alone.
+        """
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        data = tmp_path / "extracts" / "keboola" / "data"
+        data.mkdir(parents=True)
+        (data / "Orders 90d.parquet").write_bytes(b"x" * 4096)
+
+        from app.api import v2_catalog
+
+        hint = v2_catalog._hint_for_row(
+            {
+                "id": "orders_90d",
+                "name": "Orders 90d",
+                "source_type": "keboola",
+                "query_mode": "local",
+            },
+            {},
+        )
+
+        assert hint["rough_size_hint"] is not None, (
+            "catalog hint must agree with the read surfaces for a name-keyed row"
+        )
+
+
 class TestProfileRefreshSurface:
     """``POST /api/catalog/profile/{table}/refresh``. The profiler itself has
     always understood a directory of parts (``src/profiler.py`` globs ``**``,

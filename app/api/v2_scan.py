@@ -916,7 +916,11 @@ def run_scan(
             # #1189). DuckDB expands the `<dir>/*.parquet` glob it returns.
             from app.utils import LOCAL_PARQUET_READ_EXPR, resolve_local_parquet_glob
 
-            parquet = resolve_local_parquet_glob(req.table_id, source_type)
+            # `registry_name`: the write side keys the parquet filename by the
+            # row's `name`, not its `id` — see `_physical_key_candidates` in
+            # app/utils.py. Without it, any row whose id was slugified from
+            # the name 404-ed here while fully synced.
+            parquet = resolve_local_parquet_glob(req.table_id, source_type, registry_name=row.get("name"))
             if parquet is None:
                 raise FileNotFoundError(req.table_id)
 

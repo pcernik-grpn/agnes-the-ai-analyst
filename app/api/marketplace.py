@@ -1672,6 +1672,31 @@ def _get_plugin_row(
     return None
 
 
+def _require_visible_plugin(
+    marketplace_id: str,
+    plugin_name: str,
+    *,
+    detail: str = "plugin_not_found",
+) -> dict:
+    """Return the plugin row, 404ing when it is absent or admin-disabled.
+
+    An admin-disabled plugin must be indistinguishable from a nonexistent one
+    on every user-facing curated surface — for admins too (docs/marketplace.md:
+    the only surface that still shows it is the /admin/marketplaces Details
+    modal, served by app/api/marketplaces.py). The listing paths already
+    filter ``admin_disabled`` in SQL (``list_with_filters`` /
+    ``list_granted_for_groups``); this is the same rule for the single-plugin
+    endpoints, which a caller holding a still-live ``resource_grants`` row
+    could otherwise keep reading and installing from. ``detail`` lets each
+    endpoint keep its own 404 vocabulary so the disabled case reads exactly
+    like the nonexistent case on that endpoint.
+    """
+    row = marketplace_plugins_repo().get(marketplace_id, plugin_name)
+    if row is None or row.get("admin_disabled"):
+        raise HTTPException(status_code=404, detail=detail)
+    return row
+
+
 def _curated_plugin_root(
     marketplace_id: str,
     plugin_name: str,
@@ -1716,9 +1741,7 @@ async def curated_detail(
     A second ``get_current_user`` dependency is included so we still have the
     caller's user dict for the ``installed`` flag.
     """
-    plugin_row = _get_plugin_row(conn, marketplace_id, plugin_name)
-    if plugin_row is None:
-        raise HTTPException(status_code=404, detail="plugin_not_found")
+    plugin_row = _require_visible_plugin(marketplace_id, plugin_name)
 
     _reject_unsafe_segment(marketplace_id, plugin_name)
     plugin_root = _curated_plugin_root(marketplace_id, plugin_name, plugin_row)
@@ -2063,9 +2086,9 @@ async def curated_install(
     """
     # Backend-aware: marketplace_plugins lives in Postgres on a PG-backed
     # instance; a raw DuckDB read here would 404 every plugin that exists.
-    exists = marketplace_plugins_repo().get(marketplace_id, plugin_name)
-    if not exists:
-        raise HTTPException(status_code=404, detail="plugin_not_found")
+    # Admin-disabled plugins are uninstallable for everyone — the RBAC guard
+    # can pass (grants survive a disable) but the plugin must act nonexistent.
+    _require_visible_plugin(marketplace_id, plugin_name)
     inserted = user_curated_subscriptions_repo().subscribe(
         user["id"],
         marketplace_id,
@@ -2682,6 +2705,7 @@ async def curated_skill_detail(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     _reject_unsafe_segment(marketplace_id, plugin_name)
+    _require_visible_plugin(marketplace_id, plugin_name, detail="skill_not_found")
     plugin_root = _curated_plugin_root(marketplace_id, plugin_name)
     if plugin_root is None:
         raise HTTPException(status_code=404, detail="skill_not_found")
@@ -2752,6 +2776,7 @@ async def curated_agent_detail(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     _reject_unsafe_segment(marketplace_id, plugin_name)
+    _require_visible_plugin(marketplace_id, plugin_name, detail="agent_not_found")
     plugin_root = _curated_plugin_root(marketplace_id, plugin_name)
     if plugin_root is None:
         raise HTTPException(status_code=404, detail="agent_not_found")
@@ -3041,6 +3066,19 @@ async def curated_asset(
     from src.marketplace_asset_validation import IMAGE_EXTENSIONS
 
     _reject_unsafe_segment(marketplace_id)
+    # NOT gated on ``admin_disabled`` — deliberately. This endpoint carries no
+    # per-plugin RBAC at all (see the auth model above): every logged-in caller
+    # can already fetch any plugin's cover art, grant or no grant, because the
+    # content is curator-designed marketing visuals with no PII / source /
+    # secrets. A disabled-plugin check would therefore hide nothing an
+    # unauthorized viewer could not already read, while costing one serialized
+    # DuckDB round-trip per image on a render-blocking path this endpoint was
+    # explicitly stripped of DB work for (12-20 covers per /marketplace grid).
+    # Disabled plugins appear on no listing, so the URL is only reachable by a
+    # caller who already knows it. The surfaces that serve plugin CONTENT or
+    # STATE — detail, install, skill/agent detail, doc — are gated; see
+    # ``_require_visible_plugin``. Pinned by
+    # tests/test_admin_disabled_curated_surfaces.py.
     repo_root = Path(get_marketplaces_dir()) / marketplace_id
     if not repo_root.exists():
         raise HTTPException(status_code=404, detail="marketplace_not_synced")
@@ -3090,6 +3128,7 @@ async def curated_doc(
     from src.marketplace_asset_validation import DOC_EXTENSIONS
 
     _reject_unsafe_segment(marketplace_id, plugin_name)
+    _require_visible_plugin(marketplace_id, plugin_name, detail="doc_not_found")
     repo_root = Path(get_marketplaces_dir()) / marketplace_id
     if not repo_root.exists():
         raise HTTPException(status_code=404, detail="marketplace_not_synced")
@@ -3144,6 +3183,9 @@ async def curated_mirrored(
     ``curated_doc`` endpoint which retains ``require_resource_access``.
     """
     _reject_unsafe_segment(marketplace_id, plugin_name)
+    # Not gated on ``admin_disabled``, for the same reason as ``curated_asset``
+    # — this is that endpoint's mirrored-cache complement and serves the same
+    # grid cover photos under the same login-only, no-RBAC model.
     cache_root = get_marketplace_cache_dir() / marketplace_id / plugin_name
     if not cache_root.exists():
         raise HTTPException(status_code=404, detail="mirror_cache_missing")
