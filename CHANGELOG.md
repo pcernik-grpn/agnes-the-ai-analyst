@@ -20,6 +20,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Sliced-export URI schemes are a declared closed set (`SliceScheme`) dispatched exhaustively via `typing.assert_never`, so a backend added without an arm is a type error rather than a runtime discovery. The legacy client's second scheme chain is gone; a guard fails if one reappears.
 - Type checking now blocks over a curated "typed core" (`scripts/typecheck-core.sh`, driven by `tests/test_exhaustiveness_gate.py` so it rides the required `test` check). The repo-wide mypy step stays advisory — it never gated, and mypy was not installed locally either, so the post-edit hook skipped it silently and an `assert_never` would only have tripped if the missing arm was reached in production. mypy is now a declared `[dev]` dependency, the gate fails loudly rather than skipping in CI, and it self-tests by mutating a dispatch to confirm it still rejects one.
 - `tests/test_keboola_client_gcs_slice.py` asserted the divergence between the two `gs://` rewrites rather than a contract; it now covers the shared rewrite. The legacy path's GCS slice URL changes to the JSON-API media form already used on the primary path.
+
 ## [0.84.9] - 2026-08-23
 
 ### Fixed
