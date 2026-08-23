@@ -39,7 +39,10 @@ contents are likewise separate gates, which is why canary text is searched
 rather than inferred from the listing.
 
 Every request is a `GET`, or a `POST /api/query` whose body is a
-`SELECT … LIMIT 1`. The sweep never writes anything.
+`SELECT … LIMIT 1`. The sweep never writes anything. Table names come from a
+catalog *response*, so they are quoted through the repo's `quote_ident` like
+any other untrusted identifier — run the script from the checkout (it needs
+no venv, only `src/sql_ident.py`).
 
 ## Findings
 

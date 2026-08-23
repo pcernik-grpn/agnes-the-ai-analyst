@@ -85,7 +85,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# The repo's single SQL-identifier quoter. Table names in the probe below come
+# from a catalog RESPONSE — data, from this script's point of view — so they get
+# the same treatment as any other untrusted identifier
+# (``tests/test_security_audit_20260805.py`` enforces this repo-wide). The
+# module has no imports of its own, so depending on it costs the script
+# nothing: it stays stdlib-only, it just has to be run from the checkout.
+from src.sql_ident import quote_ident  # noqa: E402
 
 LEAK = "LEAK"
 WRONGLY_DENIED = "WRONGLY-DENIED"
@@ -278,7 +289,8 @@ def sweep_persona(client: Client, p: Persona, canaries: list, findings: list) ->
         for table in sorted(set(p.saw_tables) | set(p.expect_tables)):
             if _is_internal(table):
                 continue
-            status, body = client.call("POST", "/api/query", p.token, {"sql": f'SELECT * FROM "{table}" LIMIT 1'})
+            sql = f"SELECT * FROM {quote_ident(table)} LIMIT 1"
+            status, body = client.call("POST", "/api/query", p.token, {"sql": sql})
             allowed = status == 200
             if allowed:
                 p.queryable.append(table)
