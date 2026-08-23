@@ -27,12 +27,28 @@ Design: docs/superpowers/specs/2026-08-23-support-bundle-doctor-design.md.
 import logging
 import os
 import platform
+import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# A connector's own failure text is the one field here that is not ours: it
+# comes from an upstream driver and routinely quotes the connection URL,
+# password and all. The CLI scrubs the bundle it writes, but this endpoint
+# must not hand a credential to ANY consumer — an admin UI panel added later
+# would not know to scrub. Linear-time by construction (negated classes, no
+# nested quantifiers); the input is untrusted text.
+_URL_CREDENTIALS_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^:@/\s\"']+):[^@/\s\"']+@")
+
+
+def _redact_error(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    return _URL_CREDENTIALS_RE.sub(r"\g<1>:<redacted>@", text)
+
 
 _STALE_AFTER = timedelta(hours=24)  # same threshold /api/health/detailed uses
 _MAX_ERRORS_PER_SOURCE = 5
@@ -185,7 +201,7 @@ def _collect_sync() -> dict:
                 agg["last_errors"].append(
                     {
                         "table_id": row["id"],
-                        "error": state.get("error"),
+                        "error": _redact_error(state.get("error")),
                         "last_sync": _iso(last_sync),
                     }
                 )

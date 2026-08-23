@@ -40,11 +40,21 @@ _ERROR_LOG_TAIL_LINES = 80
 
 _SCRUB_REPLACEMENT = "<redacted>"
 # Ordered: literal token replacement happens first (strongest guarantee),
-# then pattern scrubs for credential shapes the error-log tail may quote.
+# then pattern scrubs for credential shapes the collected text may quote.
+# Every pattern is linear-time — negated character classes with no nested
+# quantifiers — because the error-log tail and a connector's own error
+# strings are arbitrary untrusted text (see the security playbook's ReDoS
+# rule).
 _SCRUB_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[^\s\"']+"),
     re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*)[^\s\"']+"),
     re.compile(r"(?i)\b(token|api[_-]?key|secret|password)=([^&\s\"']+)"),
+    # Credentials in URL userinfo — `scheme://user:password@host`. The
+    # sneakiest path out: an upstream connector failure quotes its own
+    # connection URL into `sync_state.error`, which the server hands over
+    # verbatim, and no header/query-param shape matches it. Keeps the
+    # scheme, user and host (the diagnostic content), drops the password.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^:@/\s\"']+):[^@/\s\"']+@"),
 )
 
 
@@ -57,6 +67,7 @@ def _scrub(text: str, literals: tuple[str, ...]) -> str:
     text = _SCRUB_PATTERNS[0].sub(rf"\g<1>{_SCRUB_REPLACEMENT}", text)
     text = _SCRUB_PATTERNS[1].sub(rf"\g<1>{_SCRUB_REPLACEMENT}", text)
     text = _SCRUB_PATTERNS[2].sub(rf"\g<1>={_SCRUB_REPLACEMENT}", text)
+    text = _SCRUB_PATTERNS[3].sub(rf"\g<1>:{_SCRUB_REPLACEMENT}@", text)
     return text
 
 

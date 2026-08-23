@@ -186,6 +186,42 @@ class TestRedaction:
         # The error-log tail itself is still there — only secrets go.
         assert "Traceback" in content
 
+    def test_credentials_in_a_connection_url_are_scrubbed(self, tmp_env):
+        """A connector's own error text is the sneakiest way a secret travels.
+
+        Upstream failures routinely quote the connection URL, which carries
+        the password in the userinfo position — a shape none of the
+        header/query-param patterns match. The bundle exists to be pasted
+        into a support channel, so this has to be caught.
+        """
+        from cli.commands.doctor import _scrub
+
+        scrubbed = _scrub("connection failed: postgres://agnes:s3cr3tpw@10.0.0.1:5432/db", ())
+        assert "s3cr3tpw" not in scrubbed
+        # The rest of the URL must survive — it is the diagnostic content.
+        assert "10.0.0.1:5432" in scrubbed
+        assert "agnes" in scrubbed
+
+    def test_server_side_sync_errors_are_scrubbed_before_rendering(self, tmp_env):
+        payload = json.loads(json.dumps(SUPPORT_PAYLOAD))
+        payload["sync"]["sources"]["keboola"]["last_errors"][0]["error"] = (
+            "snowflake://svc:Passw0rd123@acct.snowflakecomputing.com refused"
+        )
+
+        def route(path, **kwargs):
+            if path == "/api/health/detailed":
+                return _resp(200, {"status": "healthy", "caller_role": "admin"})
+            if path == "/api/admin/doctor/support":
+                return _resp(200, payload)
+            return _resp(404, {})
+
+        with patch("cli.commands.doctor.api_get", side_effect=route):
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        content = _bundle_file(tmp_env).read_text()
+        assert "Passw0rd123" not in content
+        assert "acct.snowflakecomputing.com" in content
+
     def test_json_mode_is_scrubbed_too(self, tmp_env):
         (tmp_env / "config" / "last-error.log").write_text(f"Bearer {SENTINEL_TOKEN}\n")
         with patch("cli.commands.doctor.api_get", side_effect=_route()):

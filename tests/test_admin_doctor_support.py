@@ -130,6 +130,25 @@ class TestSupportDoctorRedaction:
         assert resp.status_code == 200
         assert self.SENTINEL not in resp.text
 
+    def test_upstream_error_text_cannot_smuggle_a_password_out(self, seeded_app):
+        """The one field here that is not ours: a driver's own error string.
+
+        An upstream failure routinely quotes the connection URL with the
+        password in the userinfo position. The CLI scrubs the bundle it
+        writes, but the endpoint must not hand a credential to any consumer
+        — a later admin UI panel would not know to scrub.
+        """
+        from src.repositories import sync_state_repo, table_registry_repo
+
+        table_registry_repo().register(id="leaky", name="leaky", source_type="keboola")
+        sync_state_repo().set_error("leaky", "could not connect: postgres://agnes:s3cr3tpw@10.0.0.1:5432/db")
+
+        resp = seeded_app["client"].get("/api/admin/doctor/support", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        assert "s3cr3tpw" not in resp.text
+        # The rest of the message survives — it is the diagnostic value.
+        assert "10.0.0.1:5432" in resp.text
+
     def test_secrets_section_reports_presence_only(self, seeded_app, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", self.SENTINEL)
         monkeypatch.delenv("SENDGRID_API_KEY", raising=False)
