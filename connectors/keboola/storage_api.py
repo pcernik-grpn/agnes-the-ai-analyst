@@ -970,6 +970,21 @@ class KeboolaStorageClient:
             "credentials": file_info.get("credentials") or {},
         }
 
+    @staticmethod
+    def _slice_is_gzipped(slice_url: str) -> bool:
+        """True when a (possibly rewritten) slice URL names a ``.gz`` object.
+
+        Query-aware on purpose: ``_prepare_slice_request`` rewrites ``gs://``
+        slices to ``…/o/<encoded_key>?alt=media`` and Azure slices carry a SAS
+        query string, so a bare ``endswith(".gz")`` on the full URL never
+        matches a rewritten URL. The GCS key is percent-encoded into a single
+        path segment (dots survive quoting), so checking the last path segment
+        before the query string covers every backend. Shared by both sliced
+        entry points here *and* the legacy SDK client
+        (``connectors/keboola/client.py``) — keep it the single detector.
+        """
+        return ".gz" in slice_url.split("?")[0].rsplit("/", 1)[-1]
+
     def _download_sliced(
         self,
         manifest_url: str,
@@ -1036,7 +1051,7 @@ class KeboolaStorageClient:
                 # Slices may individually be gzipped — same heuristic as
                 # single-file: if the slice URL's path ends in `.gz`, gunzip
                 # after download.
-                gz = ".gz" in surl.split("?")[0].rsplit("/", 1)[-1]
+                gz = self._slice_is_gzipped(surl)
                 self._download_single(
                     surl,
                     sp,
@@ -1148,7 +1163,7 @@ class KeboolaStorageClient:
                 abs_credentials=abs_credentials,
                 s3_context=self._s3_context(file_info),
             )
-            gz = ".gz" in surl.split("?")[0].rsplit("/", 1)[-1]
+            gz = self._slice_is_gzipped(surl)
             sp = dest_dir / f"slice-{i:05d}"
             self._download_single(
                 surl,

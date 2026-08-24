@@ -669,8 +669,12 @@ class KeboolaClient:
                         slice_response = requests.get(slice_url, headers=slice_headers)
                         slice_response.raise_for_status()
 
-                        # Check if slice is gzipped
-                        if slice_url.endswith(".gz"):
+                        # Check if slice is gzipped. Query-aware via the shared
+                        # detector: the rewrite above appends `?alt=media` (GCS)
+                        # or a SAS query (Azure), so a bare endswith(".gz") on
+                        # the full URL never matches and gzipped bytes would be
+                        # written raw into the CSV.
+                        if KeboolaStorageClient._slice_is_gzipped(slice_url):
                             import gzip
                             import io
 

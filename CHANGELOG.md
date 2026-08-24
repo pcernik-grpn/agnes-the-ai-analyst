@@ -18,6 +18,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - Keboola sliced exports on Azure-backed stacks now download through the legacy SDK client path (incremental + partitioned syncs). That path carried its own scheme chain which handled `gs://` and `s3://` but had no `azure://` arm, so an Azure slice reached `requests` as a raw `azure://` URI and failed the same way AWS slices did before the `s3://` fix ("No connection adapters were found"). Both paths now share one dispatch.
 - A sliced-export URI in a scheme this build does not handle is refused where the manifest is read, naming the scheme, instead of being passed through as if it were an already-signed URL and failing several layers down.
+- Gzip detection on the legacy SDK client's sliced-download path is now query-aware: it inspects the URL's last path segment instead of the full URL. A presigned HTTPS slice URL carries a query string after the `.gz` name (S3 signature, Azure SAS), and the shared `gs://` rewrite above appends `?alt=media`, so the old `endswith(".gz")` check never matched and gzipped slice bytes were written raw into the CSV. The primary path already checked the path segment; both now share one detector.
 
 ### Internal
 
