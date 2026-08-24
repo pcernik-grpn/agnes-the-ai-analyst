@@ -1,5 +1,6 @@
 """Skills command — agnes skills. Knowledge base for AI agents."""
 
+import json
 from pathlib import Path
 
 import typer
@@ -10,16 +11,25 @@ SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 
 @skills_app.command("list")
-def list_skills():
+def list_skills(as_json: bool = typer.Option(False, "--json", help="Output as JSON")):
     """List available skills."""
     if not SKILLS_DIR.exists():
+        if as_json:
+            typer.echo(json.dumps([]))
+            return
         typer.echo("No skills directory found.")
         return
+    rows = []
     for f in sorted(SKILLS_DIR.glob("*.md")):
         name = f.stem
         # Read first line as description
         first_line = f.read_text(encoding="utf-8").split("\n")[0].strip("# ").strip()
-        typer.echo(f"  {name:25s} {first_line}")
+        rows.append({"name": name, "description": first_line})
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    for row in rows:
+        typer.echo(f"  {row['name']:25s} {row['description']}")
 
 
 @skills_app.command("show")

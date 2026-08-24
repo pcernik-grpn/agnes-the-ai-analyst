@@ -10,6 +10,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agnes agent list`/`show`/`schedule list`/`memory list` now work with a plain PAT, not just a fresh interactive session.** Every `/api/v1/agents*` route ran through `require_session_token`, which rejects every PAT flavor outright — so a normally-logged-in analyst holding only a PAT (no fresh browser session) could never even list their own agents, even though `agnes chat`'s own error text points them at `agnes agent list` for discovery. The four READ-only routes (`GET /api/v1/agents`, `GET /api/v1/agents/{id}`, `GET /api/v1/agents/{slug}/schedules`, `GET /api/v1/agents/{id}/memories`) now also accept a full-surface user PAT (new `require_session_or_user_pat` dependency); every mutating route (create/update/delete/scope/token issuance/memory writes) stays session-token-only. An agent-scoped PAT and a `surface='stack'`-narrowed PAT (the `agnes login`/`agnes init` default) are still denied on these routes.
+
+### Changed
+
+- **`agnes explore` now follows the command-UX scope standard.** Replaced the boolean `--remote` (local-only default) with `--scope auto|local|server` (default `auto`: look locally first, fall back to the server when there's no local data or the table isn't resolvable locally, printing a `[scope]` note — same behavior as `agnes query`). `--remote` is kept as a frozen alias for `--scope server`.
+- **`--json` added to more read commands:** `agnes skills list`, `agnes store mine`, `agnes store status`, `agnes admin news versions`, `agnes admin news show` (the "current published version" read) now support `--json` for machine-readable output.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added

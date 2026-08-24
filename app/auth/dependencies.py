@@ -478,6 +478,88 @@ def require_session_token(request: Request, user: dict = Depends(get_current_use
     return user
 
 
+def require_session_or_user_pat(request: Request, user: dict = Depends(get_current_user)) -> dict:
+    """Like ``require_session_token``, but ALSO accepts a full-surface user
+    PAT (``typ="pat"``, ``credential_surface == "all"``) — for READ-ONLY
+    agent-management endpoints only (`GET /api/v1/agents`,
+    `GET /api/v1/agents/{id}`, `GET /api/v1/agents/{slug}/schedules`,
+    `GET /api/v1/agents/{id}/memories`). Mutating agent-management routes
+    (create/update/delete/scope/token issuance/memory writes) keep using
+    ``require_session_token`` unchanged.
+
+    Motivation: ``agnes agent list`` — the very command `agnes chat`'s own
+    error text points a caller at — must work for a normally-logged-in
+    analyst's own PAT, not force a fresh interactive session just to
+    discover which agents exist.
+
+    Still rejects, fail-closed:
+
+    1. **Every restricted principal** (``SessionPrincipal`` / ``AgentPrincipal``,
+       ``PRINCIPAL_TYPES``) — neither carries a single owner identity these
+       owner-scoped reads can run against, and an ``AgentPrincipal`` is the
+       sandbox's own narrowed credential, which must never drive the
+       owner-facing agent API.
+    2. **An agent-scoped PAT** (``typ="agent_pat"``) — an agent must never
+       enumerate or read its OWNER's *other* agents just because it holds a
+       PAT.
+    3. **A ``surface='stack'``-narrowed PAT** (``credential_surface ==
+       "stack"``, the ``agnes init`` / browser-login default) — that
+       credential is scoped to the data-read stack surface only, not agent
+       management. Only a full-surface (``surface="all"``) PAT, minted e.g.
+       via ``POST /auth/tokens``, qualifies.
+    4. **Scheduler shared secret / ``X-StorageApi-Token`` header credential**
+       — same non-interactive-service exclusions as ``require_session_token``.
+
+    Any token kind not explicitly recognized as a qualifying full-surface
+    PAT above is treated exactly like ``require_session_token`` treats it
+    (i.e. accepted only if it is not one of the non-interactive kinds it
+    already excludes) — this dependency only ever *widens* access for the
+    one narrow case (2)-(3) above rule out, never for anything else.
+
+    Plain ``def`` — same Tier 1 threadpool convention as
+    ``require_session_token`` (PR #188).
+    """
+    from app.auth.session_principal import PRINCIPAL_TYPES
+
+    if isinstance(user, PRINCIPAL_TYPES):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint requires an interactive session or a user PAT",
+        )
+
+    auth = request.headers.get("authorization", "")
+    token = None
+    if auth.startswith("Bearer "):
+        token = auth.removeprefix("Bearer ")
+    if not token and request:
+        token = request.cookies.get("access_token")
+    if not token and request.headers.get("x-storageapi-token"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint requires an interactive session or a user PAT, not a Storage API token",
+        )
+    if token:
+        from app.auth.scheduler_token import is_scheduler_token
+
+        if is_scheduler_token(token):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint requires an interactive session or a user PAT, not a service token",
+            )
+        from app.auth.jwt import verify_token
+        from app.auth.pat_resolver import _PAT_LIKE_TYPES
+
+        payload = verify_token(token) or {}
+        typ = payload.get("typ")
+        if typ in _PAT_LIKE_TYPES:
+            if typ == "agent_pat" or user.get("credential_surface") != "all":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This endpoint requires an interactive session or a full-surface user PAT",
+                )
+    return user
+
+
 def reject_keboola_header_credential(user: dict = Depends(get_current_user)) -> dict:
     """Block the X-StorageApi-Token header credential from routes that mint
     durable follow-on credentials — a Cowork setup bundle (setup token +

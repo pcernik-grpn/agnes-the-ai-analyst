@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import is_user_admin, require_agent_profiles_enabled
-from app.auth.dependencies import _get_db, require_session_token
+from app.auth.dependencies import _get_db, require_session_or_user_pat, require_session_token
 from app.auth.jwt import create_access_token
 from src.object_store import object_store
 from src.repositories import (
@@ -295,7 +295,7 @@ async def create_agent(
 
 
 @router.get("")
-async def list_agents(user: dict = Depends(require_session_token)):
+async def list_agents(user: dict = Depends(require_session_or_user_pat)):
     rows = agents_repo().list_for_user(user["id"])
     return {"data": [_serialize(r) for r in rows], "has_more": False, "next_cursor": None}
 
@@ -303,7 +303,7 @@ async def list_agents(user: dict = Depends(require_session_token)):
 @router.get("/{agent_id}")
 async def get_agent(
     agent_id: str,
-    user: dict = Depends(require_session_token),
+    user: dict = Depends(require_session_or_user_pat),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     row = _load_agent(agent_id, user, conn, require_owner=False)
@@ -648,7 +648,7 @@ def _load_agent_memory(agent_id: str, memory_id: str) -> Dict[str, Any]:
 async def list_agent_memories(
     agent_id: str,
     status: Optional[str] = None,
-    user: dict = Depends(require_session_token),
+    user: dict = Depends(require_session_or_user_pat),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     # Read-only — admins may inspect (require_owner=False), mirrors get_agent.

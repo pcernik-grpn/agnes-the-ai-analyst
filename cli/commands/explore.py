@@ -9,21 +9,71 @@ from src.sql_ident import quote_ident
 
 explore_app = typer.Typer(help="Explore data tables")
 
+_VALID_SCOPES = ("auto", "local", "server")
+
+
+class _LocalDbMissing(Exception):
+    """Raised by `_run_explore_local` when there's no local DuckDB file yet."""
+
+
+class _LocalTableMiss(Exception):
+    """Raised by `_run_explore_local` when `table` isn't in the local
+    DuckDB — possibly a `query_mode='remote'` or `server_only` table, which
+    by design has no local view (#607)."""
+
+    def __init__(self, table: str, available: list[str]):
+        super().__init__(f"Table '{table}' not found")
+        self.table = table
+        self.available = available
+
 
 @explore_app.callback(invoke_without_command=True)
 def explore(
     table: str = typer.Argument(..., help="Table name to explore"),
     remote: bool = typer.Option(False, "--remote", help="Fetch from server"),
+    scope: str = typer.Option(
+        None,
+        "--scope",
+        help="Where to look: auto (local first, fall back to server), local, server [default: auto]",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Show profile and sample data for a table."""
-    if remote:
+    if scope is not None and scope not in _VALID_SCOPES:
+        typer.echo(
+            f"Error: --scope must be one of {', '.join(_VALID_SCOPES)} (got {scope!r}).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # `None` means --scope was not given (defaults to auto) — same sentinel
+    # convention as `agnes query` so an explicit `--scope local` isn't
+    # rejected as conflicting with the (harmless) default.
+    scope_explicit = scope is not None
+    scope = scope or "auto"
+
+    if remote and scope_explicit and scope == "local":
+        typer.echo("Error: --remote and --scope local are mutually exclusive.", err=True)
+        raise typer.Exit(1)
+
+    effective_scope = "server" if remote else scope
+
+    if effective_scope == "server":
         _explore_remote(table, as_json)
-    else:
+    elif effective_scope == "local":
         _explore_local(table, as_json)
+    else:
+        _explore_auto(table, as_json)
 
 
-def _explore_local(table: str, as_json: bool):
+def _run_explore_local(table: str, as_json: bool):
+    """Execute the local-DuckDB profile lookup for `table`.
+
+    Raises `_LocalDbMissing` if there's no local DB yet, `_LocalTableMiss`
+    if `table` doesn't resolve to a table or view. Callers decide how to
+    present each case (scope=local prints today's guidance and exits;
+    scope=auto falls back to the server).
+    """
     from src.duckdb_conn import _open_duckdb
 
     from cli.lib.workspace_resolve import resolve_data_workspace
@@ -31,8 +81,7 @@ def _explore_local(table: str, as_json: bool):
     local_dir = resolve_data_workspace() or Path.cwd().resolve()
     db_path = local_dir / "user" / "duckdb" / "analytics.duckdb"
     if not db_path.exists():
-        typer.echo("Local DuckDB not found. Run: agnes pull", err=True)
-        raise typer.Exit(1)
+        raise _LocalDbMissing()
 
     conn = _open_duckdb(str(db_path), read_only=True)
     try:
@@ -53,10 +102,11 @@ def _explore_local(table: str, as_json: bool):
                 ).fetchall()
             ]
         if not tables:
-            typer.echo(f"Table '{table}' not found. Available:", err=True)
-            for r in conn.execute("SELECT table_name FROM information_schema.tables ORDER BY table_name").fetchall():
-                typer.echo(f"  {r[0]}")
-            raise typer.Exit(1)
+            available = [
+                r[0]
+                for r in conn.execute("SELECT table_name FROM information_schema.tables ORDER BY table_name").fetchall()
+            ]
+            raise _LocalTableMiss(table, available)
 
         # Row count
         count = conn.execute(f"SELECT count(*) FROM {quote_ident(table)}").fetchone()[0]
@@ -97,6 +147,35 @@ def _explore_local(table: str, as_json: bool):
             console.print(t)
     finally:
         conn.close()
+
+
+def _explore_local(table: str, as_json: bool):
+    """`--scope local` behavior: today's guidance messages on failure, no
+    server-side fallback."""
+    try:
+        _run_explore_local(table, as_json)
+    except _LocalDbMissing:
+        typer.echo("Local DuckDB not found. Run: agnes pull", err=True)
+        raise typer.Exit(1)
+    except _LocalTableMiss as miss:
+        typer.echo(f"Table '{miss.table}' not found. Available:", err=True)
+        for name in miss.available:
+            typer.echo(f"  {name}")
+        raise typer.Exit(1)
+
+
+def _explore_auto(table: str, as_json: bool):
+    """`--scope auto` (default): look locally first, falling back to
+    server-side execution when there's no local data yet or `table` isn't
+    resolvable locally (possibly `remote`/`server_only`)."""
+    try:
+        _run_explore_local(table, as_json)
+    except _LocalDbMissing:
+        typer.echo("[scope] no local data yet — running server-side", err=True)
+        _explore_remote(table, as_json)
+    except _LocalTableMiss as miss:
+        typer.echo(f"[scope] '{miss.table}' not found locally — running server-side", err=True)
+        _explore_remote(table, as_json)
 
 
 def _explore_remote(table: str, as_json: bool):
