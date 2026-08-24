@@ -2055,22 +2055,15 @@ function renderMessage(m) {
       // A row can carry no `tool` name at all — the cancelled/interrupted
       // markers manager.py stores in place of a real tool call. Rendering
       // those unconditionally produced `tool: undefined` and an empty fence.
-      const call = formatToolCall(tc);
-      if (!call) continue;
-      const det = document.createElement("details");
-      // F3: build via textContent, not innerHTML — tc.tool / tc.args are
-      // untrusted and were previously interpolated into innerHTML unescaped.
-      const summary = document.createElement("summary");
-      summary.textContent = `tool: ${call.label}`;
-      summary.title = call.tool;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      code.textContent = call.argsJson;
-      pre.appendChild(code);
-      det.appendChild(summary);
-      det.appendChild(pre);
-      bubble.appendChild(det);
-      enhanceCodeBlocks(det);
+      if (!formatToolCall(tc)) continue;
+      // The SAME card the live stream renders, so a refresh doesn't downgrade
+      // the answer's evidence to a flat grey `tool: …` box. `is-replayed`:
+      // the persisted row is `{tool, args}` only, so there is no result body,
+      // no timing and no status icon to show. Position isn't persisted either
+      // — the cards still land after the bubble rather than inline where they
+      // ran (#1504 part 2 needs an ordered `parts` structure on the row).
+      // Built via textContent throughout (F3): tc.tool / tc.args are untrusted.
+      bubble.appendChild(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
     }
   }
 
@@ -2345,9 +2338,16 @@ function clearThinkingPlaceholder() {
 
 // Streaming state — captured per turn so finalize knows what to
 // re-render and what raw text to hand the copy button.
+// `currentAssistantText` holds the CURRENT SEGMENT only: a tool/approval/
+// question block seals the streaming bubble (#1504 — the transcript must
+// keep the frame order, text → block → text, instead of one pre-block
+// bubble swallowing everything), and the sealed segments accumulate in
+// `_turnSealedText` so finalize can subtract what is already on screen.
 let currentAssistantArticle = null;
 let currentAssistantBody = null;
 let currentAssistantText = "";
+let _turnSealedText = "";
+let _turnSealedArticles = [];
 
 // ---------- Streaming markdown ---------------------------------------------
 // Tokens used to append as plain textContent, so the reader watched raw
@@ -2473,6 +2473,11 @@ function _resetStreamingState() {
   currentAssistantArticle = null;
   currentAssistantBody = null;
   currentAssistantText = "";
+  // Sealed segments are already finished on screen — an orphan turn keeps
+  // them as they stand; only the bookkeeping resets so the next turn's
+  // finalize doesn't subtract THIS turn's text.
+  _turnSealedText = "";
+  _turnSealedArticles = [];
   if (!article || !body) return;
   article.classList.remove("is-streaming");
   if (!text.trim()) return; // an empty bubble has nothing to finish
@@ -2483,6 +2488,37 @@ function _resetStreamingState() {
   attachMessageActions(article, stripNextActionsFence(text));
   _markLatestAssistant(article);
   maybeMakeCollapsible(article);
+}
+
+/** Seal the streaming bubble at an inline block boundary (tool card,
+ *  approval card, question card). The block is about to be appended AFTER
+ *  the bubble, and any text still to come belongs BELOW the block — so the
+ *  bubble is finished as it stands (full segment flush + the light
+ *  enhancement passes; no actions row, chips or latest-marking — those
+ *  belong to the turn's LAST bubble, at finalize) and the pointers drop so
+ *  the next token opens a fresh bubble under the block. Frame order IS the
+ *  turn order (#1504); this keeps the transcript telling it. No-op when
+ *  nothing has streamed yet, so back-to-back tool calls seal once. */
+function _sealStreamingSegment() {
+  if (!currentAssistantArticle || !currentAssistantBody) return;
+  if (!currentAssistantText.trim()) {
+    // An empty bubble (token frame raced ahead with only whitespace) —
+    // drop it rather than sealing a blank paragraph above the block.
+    currentAssistantArticle.remove();
+  } else {
+    _flushStreamingTail();
+    currentAssistantArticle.classList.remove("is-streaming");
+    enhanceCodeBlocks(currentAssistantBody);
+    enhanceTables(currentAssistantBody);
+    renderMermaidBlocks(currentAssistantBody);
+    // Exact concatenation, no separator: finalize's content is the plain
+    // join of every streamed delta, and the subtraction below relies on it.
+    _turnSealedText += currentAssistantText;
+    _turnSealedArticles.push(currentAssistantArticle);
+  }
+  currentAssistantArticle = null;
+  currentAssistantBody = null;
+  currentAssistantText = "";
 }
 
 function appendToken(text) {
@@ -2510,10 +2546,42 @@ function finalizeAssistantMessage(frame) {
   // A completed assistant message is a successful answer — advance the
   // journey counter (errors arrive on the separate "error" frame).
   onboardingNoteAnswered();
-  const content = (frame && frame.content) || currentAssistantText;
+  const content = (frame && frame.content) || _turnSealedText + currentAssistantText;
+  // Segmented turn (#1504): the bubbles sealed at each inline block already
+  // show the turn's earlier text IN ORDER — only what follows the last seal
+  // belongs in the final bubble. The frame's content is the WHOLE turn, so
+  // subtract the sealed prefix. If the server's content disagrees with the
+  // streamed deltas (it is the authoritative record), the subtraction is
+  // meaningless: drop the sealed bubbles and render the content whole rather
+  // than duplicate or lose text — order degrades, the transcript does not.
+  let tail = content;
+  if (_turnSealedText) {
+    if (content.startsWith(_turnSealedText)) {
+      tail = content.slice(_turnSealedText.length);
+    } else {
+      for (const el of _turnSealedArticles) el.remove();
+    }
+  }
+  // No trailing text after the last block, but sealed text exists: the last
+  // sealed bubble is the answer's end — chips, sources and the copy row
+  // (carrying the FULL content) land there instead of on a phantom bubble.
+  if (!currentAssistantArticle && !tail.trim() && _turnSealedArticles.length) {
+    const article = _turnSealedArticles[_turnSealedArticles.length - 1];
+    const bubble = article.querySelector(".msg-bubble");
+    renderSourcesChips(bubble, frame && frame.sources);
+    renderNextActions(bubble, extractNextActions(content).actions);
+    attachMessageActions(article, stripNextActionsFence(content));
+    _markLatestAssistant(article);
+    _turnSealedText = "";
+    _turnSealedArticles = [];
+    maybeScrollToBottom();
+    return;
+  }
+  _turnSealedText = "";
+  _turnSealedArticles = [];
   if (currentAssistantArticle && currentAssistantBody) {
     currentAssistantArticle.classList.remove("is-streaming");
-    currentAssistantBody.innerHTML = renderAnswerMarkdown(content);
+    currentAssistantBody.innerHTML = renderAnswerMarkdown(tail);
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
     renderMermaidBlocks(currentAssistantBody);
@@ -2522,6 +2590,8 @@ function finalizeAssistantMessage(frame) {
     // identically by GET /sessions/{id}/messages.
     renderSourcesChips(currentAssistantBody.closest(".msg-bubble"), frame && frame.sources);
     renderNextActions(currentAssistantBody.closest(".msg-bubble"), extractNextActions(content).actions);
+    // The copy row hands over the WHOLE answer — the bubble shows the tail,
+    // but nobody copying "the answer" wants it cut at the last tool card.
     attachMessageActions(currentAssistantArticle, stripNextActionsFence(content));
     _markLatestAssistant(currentAssistantArticle);
     maybeMakeCollapsible(currentAssistantArticle);
@@ -2532,7 +2602,9 @@ function finalizeAssistantMessage(frame) {
   } else {
     renderMessage({
       role: "assistant",
-      content,
+      // `tail`, not `content` — with sealed segments on screen the full
+      // content would render them a second time (tail === content otherwise).
+      content: tail,
       tool_calls: frame && frame.tool_calls,
       sources: frame && frame.sources,
       created_at: new Date().toISOString(),
@@ -2550,19 +2622,26 @@ function finalizeAssistantMessage(frame) {
 }
 
 // ---------- Inline tool-call blocks --------------------------------------
-// Each tool call renders as a self-contained block in the message stream:
+// Each tool call renders as a self-contained block in the message stream,
+// COLLAPSED to its header line by default:
 //
-//   ┌─ ⏳ run_query ························ args ─┐    while running
-//   ├─ ✓ run_query · 1.2s ······························┤    once result arrives
-//   │   <result preview — first N rows as a table, or  │
-//   │    a short text snippet, or a JSON code block>    │
-//   └────────────────────────────────────────────────────┘
+//   ┌─ ⏳ run_query ························ args · running… ›┐   header only
+//   ┌─ ✓ run_query ····························· args · 1.2s ›┐   header only
 //
-// Args + full result are always reachable behind "Show args" / "Show
-// full result" toggles so power users can dig in. Tabular results
-// (the most common — `agnes catalog`, `agnes query`, `agnes describe`)
-// get a real <table> preview so the user sees what came back without
-// having to expand.
+// Clicking the header expands the card:
+//
+//   ├─ ✓ run_query · 1.2s ······································┤
+//   │   ARGS    <formatted, highlighted JSON>                   │
+//   │   RESULT  <first N rows as a real table, markdown, or     │
+//   │            formatted, highlighted JSON>                   │
+//   └────────────────────────────────────────────────────────────┘
+//
+// The card header is the one click — args and result render directly in
+// the body, no nested toggles (only oversize payloads keep a "show all"
+// route). Tabular results (`agnes catalog`, `agnes query`,
+// `agnes describe`) get a real <table>; markdown-ish strings render as
+// markdown; everything else is pretty-printed JSON. A FAILED call opens
+// itself — its output is the diagnosis.
 //
 // Status icons: ⏳ = running, ✓ = done, ⚠ = error, ⊘ = cancelled. The
 // status class on the wrapper tints the left border accordingly so a
@@ -2570,6 +2649,51 @@ function finalizeAssistantMessage(frame) {
 
 const _TOOL_RESULT_PREVIEW_ROWS = 5;
 const _TOOL_RESULT_TEXT_PREVIEW_CHARS = 280;
+const _TOOL_JSON_PREVIEW_CHARS = 4000;
+
+/** A labeled, syntax-highlighted JSON block for a card body. `language-json`
+ *  pins hljs's detection — auto-detect misreads short payloads — and the
+ *  shared enhanceCodeBlocks pass adds the dark chrome + copy button.
+ *  Payloads over _TOOL_JSON_PREVIEW_CHARS render capped, with the whole
+ *  thing one toggle away, filled lazily on first open (same idiom as the
+ *  table preview's raw-JSON route). */
+function _jsonPanel(label, value, className) {
+  const panel = document.createElement("div");
+  panel.className = className;
+  const lab = document.createElement("div");
+  lab.className = "cloud-chat-tool-panel-label";
+  lab.textContent = label;
+  panel.appendChild(lab);
+  const text = JSON.stringify(value, null, 2) ?? String(value);
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.className = "language-json";
+  code.textContent = text.length > _TOOL_JSON_PREVIEW_CHARS
+    ? text.slice(0, _TOOL_JSON_PREVIEW_CHARS) + "\n…"
+    : text;
+  pre.appendChild(code);
+  panel.appendChild(pre);
+  if (text.length > _TOOL_JSON_PREVIEW_CHARS) {
+    const det = document.createElement("details");
+    det.className = "cloud-chat-tool-result-full";
+    const sum = document.createElement("summary");
+    sum.textContent = `Show all (${text.length.toLocaleString()} chars)`;
+    det.appendChild(sum);
+    const fullPre = document.createElement("pre");
+    const fullCode = document.createElement("code");
+    fullPre.appendChild(fullCode);
+    det.appendChild(fullPre);
+    let filled = false;
+    det.addEventListener("toggle", () => {
+      if (!det.open || filled) return;
+      filled = true;
+      fullCode.textContent = text;
+    });
+    panel.appendChild(det);
+  }
+  enhanceCodeBlocks(panel);
+  return panel;
+}
 
 function _toolCallId(frame) {
   // Pair tool_call ↔ tool_result via the runner's dedicated tool_use_id:
@@ -2672,6 +2796,7 @@ function renderApprovalRequest(frame) {
   if (document.querySelector(`[data-approval-id="${CSS.escape(frame.request_id)}"]`)) return;
   pendingApprovalFrames.set(frame.request_id, frame);
   clearThinkingPlaceholder();
+  _sealStreamingSegment();
   const wrap = document.createElement("section");
   wrap.className = "cloud-chat-tool cloud-chat-approval is-running";
   wrap.dataset.approvalId = frame.request_id;
@@ -2778,6 +2903,7 @@ function renderQuestionRequest(frame) {
   if (!questions.length) return;
   pendingQuestionFrames.set(frame.request_id, frame);
   clearThinkingPlaceholder();
+  _sealStreamingSegment();
 
   const wrap = document.createElement("section");
   wrap.className = "cloud-chat-tool cloud-chat-question is-running";
@@ -2999,30 +3125,37 @@ function resolveQuestionCard(frame) {
   }
 }
 
-function renderToolCallStart(frame) {
-  clearThinkingPlaceholder();
-  // <details>/<summary> — same collapsible idiom as the args/result panels
-  // below, but for the whole card. Open by default so a running (and just-
-  // finished) call stays visible; _collapseFinishedToolCalls folds it once
-  // the turn ends, leaving just this header line as the trail for the rest
-  // of the session. Not a persisted record: cards are built only from live
-  // `tool_call` frames and `loadAndRenderHistory` does not replay them, so a
-  // reload leaves no card at all.
+/** The tool card, shared by the live stream and the reload path so a
+ *  refresh cannot silently downgrade to a different-looking block (it used
+ *  to render a flat grey `tool: <label>` box instead — same information,
+ *  none of the design).
+ *
+ *  `status`: "running" (live, awaiting its result) or "replayed" (rebuilt
+ *  from a persisted `{tool, args}` row). A replayed card carries no status
+ *  icon, timing or result: persistence stores neither the outcome nor the
+ *  duration, and inventing a ✓ would claim a success the row cannot
+ *  evidence. Args are all it can honestly show, so they are all it shows.
+ *
+ *  <details>/<summary> — COLLAPSED by default: the header line (status,
+ *  name, args summary, timing) is the transcript trail; one click opens the
+ *  formatted args + result. A FAILED live call opens itself in
+ *  renderToolCallEnd. */
+function _buildToolCard({ tool, args, status }) {
   const wrap = document.createElement("details");
-  wrap.className = "cloud-chat-tool is-running";
-  wrap.open = true;
-  wrap.dataset.tool = frame.tool;
-  wrap.dataset.startedAt = String(performance.now());
+  wrap.className = status === "running" ? "cloud-chat-tool is-running" : "cloud-chat-tool is-replayed";
+  wrap.dataset.tool = tool || "";
 
-  // Header line — icon + tool name + args summary. Always visible, even
+  // Header line — status + tool name + args summary. Always visible, even
   // collapsed: it's a <summary>, not a body element.
   const head = document.createElement("summary");
   head.className = "cloud-chat-tool-head";
-  const icon = document.createElement("span");
-  icon.className = "cloud-chat-tool-icon";
-  icon.setAttribute("aria-hidden", "true");
-  icon.textContent = "⏳";
-  head.appendChild(icon);
+  if (status === "running") {
+    const icon = document.createElement("span");
+    icon.className = "cloud-chat-tool-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "⏳";
+    head.appendChild(icon);
+  }
 
   // A semantic-layer lookup is the one tool call that is PROVENANCE rather
   // than plumbing: it says the answer you are reading was built on the
@@ -3030,7 +3163,7 @@ function renderToolCallStart(frame) {
   // "revenue" means. Rendered as a plain-language link to the definition
   // instead of a raw tool id, so the reader can check the wording without
   // leaving the conversation to go hunting for it.
-  const definition = _definitionLookupLabel(frame.tool);
+  const definition = _definitionLookupLabel(tool);
   let name;
   if (definition) {
     name = document.createElement("a");
@@ -3041,20 +3174,22 @@ function renderToolCallStart(frame) {
   } else {
     name = document.createElement("span");
     name.className = "cloud-chat-tool-name";
-    name.textContent = _toolLabel(frame.tool, frame.args);
-    name.title = frame.tool || "";
+    name.textContent = _toolLabel(tool, args);
+    name.title = tool || "";
   }
   head.appendChild(name);
 
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
-  summary.textContent = _summarizeArgs(frame.args);
+  summary.textContent = _summarizeArgs(args);
   head.appendChild(summary);
 
-  const meta = document.createElement("span");
-  meta.className = "cloud-chat-tool-meta";
-  meta.textContent = "running…";
-  head.appendChild(meta);
+  if (status === "running") {
+    const meta = document.createElement("span");
+    meta.className = "cloud-chat-tool-meta";
+    meta.textContent = "running…";
+    head.appendChild(meta);
+  }
 
   // Chevron — the only visual cue once collapsed that this header still
   // hides a body. .cloud-chat-tool-head sets display:flex, which drops the
@@ -3067,23 +3202,23 @@ function renderToolCallStart(frame) {
 
   wrap.appendChild(head);
 
-  // Args panel — collapsed by default. Surfaced as a small <details>
-  // so the noise is one click away when needed.
-  if (frame.args && Object.keys(frame.args).length > 0) {
-    const argsDet = document.createElement("details");
-    argsDet.className = "cloud-chat-tool-args";
-    const argsSum = document.createElement("summary");
-    argsSum.textContent = "Show args";
-    argsDet.appendChild(argsSum);
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    code.textContent = JSON.stringify(frame.args, null, 2);
-    pre.appendChild(code);
-    argsDet.appendChild(pre);
-    wrap.appendChild(argsDet);
-    enhanceCodeBlocks(argsDet);
+  // Args — formatted JSON, visible the moment the card is expanded. The
+  // card header is the one click now; the old nested args toggle inside a
+  // collapsed card was two clicks to see what a tool was asked to do.
+  if (args && Object.keys(args).length > 0) {
+    wrap.appendChild(_jsonPanel("Args", args, "cloud-chat-tool-args"));
   }
+  return wrap;
+}
 
+function renderToolCallStart(frame) {
+  clearThinkingPlaceholder();
+  // The card lands AFTER the streamed text so far and any further text
+  // belongs below it — seal the streaming bubble first (#1504: the
+  // transcript keeps the frame order, text → card → text).
+  _sealStreamingSegment();
+  const wrap = _buildToolCard({ tool: frame.tool, args: frame.args, status: "running" });
+  wrap.dataset.startedAt = String(performance.now());
   $("chat-messages").appendChild(wrap);
   inFlightToolCalls.set(_toolCallId(frame), wrap);
   _currentTurnToolCards.push(wrap);
@@ -3102,6 +3237,9 @@ function renderToolCallEnd(frame) {
   const isError = _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
+  // A FAILED call opens itself: cards start collapsed, and the error text
+  // is the one body a reader must not have to know to click for.
+  if (isError) wrap.open = true;
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
   if (icon) icon.textContent = isError ? "⚠" : "✓";
 
@@ -3129,13 +3267,15 @@ function renderToolCallEnd(frame) {
   maybeScrollToBottom();
 }
 
-/** Fold every tool-call card opened during the turn that just ended back down
- *  to its header line. Called once per turn, from each of handleFrame's
- *  terminal cases (done / cancelled / error / confirmation_required) — a
- *  turn that stops for any reason leaves behind the same settled transcript:
- *  the answer (or note) plus a scannable trail of "what ran", not an
- *  expanded dump of every stdout/stderr sitting under the finished answer.
- *  Each card's own <details> toggle still opens it back up on click.
+/** Fold every tool-call card of the turn that just ended back down to its
+ *  header line. Cards start collapsed now, so this mostly restores the ones
+ *  the user (or an error) expanded mid-turn. Called once per turn, from each
+ *  of handleFrame's terminal cases (done / cancelled / error /
+ *  confirmation_required) — a turn that stops for any reason leaves behind
+ *  the same settled transcript: the answer (or note) plus a scannable trail
+ *  of "what ran", not an expanded dump of every stdout/stderr sitting under
+ *  the finished answer. Each card's own <details> toggle still opens it
+ *  back up on click.
  *
  *  A FAILED card is left open. `renderToolCallEnd` marks it `is-error` (red
  *  border, warning icon) precisely because its output is the thing the reader
@@ -3168,22 +3308,58 @@ function _looksLikeToolError(result) {
   return false;
 }
 
+/** {content: [{type:"text", text}, …]} — the MCP result envelope
+ *  (the kai-agent provider delivers it verbatim; the sandbox runner
+ *  usually pre-joins). The reader cares about the payload, not the
+ *  envelope: join the text blocks, and if the joined text is itself
+ *  JSON hand back the parsed value, so it renders as formatted JSON —
+ *  or even a table — instead of a string-in-a-string with escaped
+ *  newlines. A result that arrives as a JSON *string* is parsed first
+ *  — handleFrame's parse is a local for the preview-directive check
+ *  and never reaches this layer — while a non-JSON string (markdown
+ *  from the agnes CLI) passes through untouched, as does anything
+ *  that isn't a pure text-block envelope. */
+function _unwrapMcpEnvelope(result) {
+  if (typeof result === "string") {
+    try {
+      result = JSON.parse(result);
+    } catch (_e) {
+      return result;
+    }
+  }
+  if (!result || typeof result !== "object" || !Array.isArray(result.content)) return result;
+  if (result.content.length === 0) return result;
+  if (!result.content.every((b) => b && b.type === "text" && typeof b.text === "string")) {
+    return result;
+  }
+  const text = result.content.map((b) => b.text).join("\n");
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    return text;
+  }
+}
+
 /** Build the preview block for a tool result. The CLI tools route
  *  most JSON / table output via agnes which speaks Markdown — so
  *  result strings often contain `|---|---|` table markup that
  *  marked.parse() can render natively. We:
  *
- *  1. attempt to extract a tabular preview from a parsed JSON result
+ *  1. unwrap an MCP text envelope down to its payload;
+ *  2. attempt to extract a tabular preview from a parsed JSON result
  *     (array of objects, or a {columns, rows} shape);
- *  2. fall back to running ``marked.parse`` over a string result so
+ *  3. fall back to running ``marked.parse`` over a string result so
  *     embedded Markdown tables get rendered as real <table>s with the
  *     `.ds-table` sort+sticky-header enhancement; and
- *  3. fall back to a JSON code block for everything else.
+ *  4. render everything else as a formatted, highlighted JSON block —
+ *     shown directly: the collapsed card's header is the one click.
  *
  *  Returns a DOM element ready to append, or null if the result is
  *  empty.
  */
 function _renderToolResultPreview(result) {
+  if (result == null || result === "") return null;
+  result = _unwrapMcpEnvelope(result);
   if (result == null || result === "") return null;
 
   // Already-tabular JSON shapes — render a real <table> preview.
@@ -3234,29 +3410,13 @@ function _renderToolResultPreview(result) {
     return wrap;
   }
 
-  // Everything else — a one-line summary with the raw JSON one click away.
-  // A pretty-printed payload as the primary rendering is exactly the thing
-  // this function exists to avoid.
+  // Everything else — formatted, highlighted JSON, rendered directly. The
+  // card itself starts collapsed, so its header is already the "one click
+  // away" that a nested Structured-result toggle used to provide; opening
+  // the card must show what the tool returned, not offer a second click.
   const wrap = document.createElement("div");
   wrap.className = "cloud-chat-tool-result is-json";
-  const det = document.createElement("details");
-  det.className = "cloud-chat-tool-result-full";
-  const sum = document.createElement("summary");
-  const fieldCount =
-    result && typeof result === "object" && !Array.isArray(result)
-      ? Object.keys(result).length
-      : 0;
-  sum.textContent = fieldCount > 0
-    ? `Structured result · ${fieldCount} field${fieldCount === 1 ? "" : "s"} — show raw JSON`
-    : "Structured result — show raw JSON";
-  det.appendChild(sum);
-  const pre = document.createElement("pre");
-  const code = document.createElement("code");
-  code.textContent = JSON.stringify(result, null, 2).slice(0, 4000);
-  pre.appendChild(code);
-  det.appendChild(pre);
-  wrap.appendChild(det);
-  enhanceCodeBlocks(wrap);
+  wrap.appendChild(_jsonPanel("Result", result, "cloud-chat-tool-json"));
   return wrap;
 }
 

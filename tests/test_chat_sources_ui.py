@@ -71,7 +71,9 @@ def test_both_render_paths_strip_the_fence():
         "renderAnswerMarkdown must strip sources first, then next_actions"
     )
     assert "renderAnswerMarkdown(m.content)" in js, "renderMessage must use the helper"
-    assert "renderAnswerMarkdown(content)" in js, "finalizeAssistantMessage must use the helper"
+    assert "renderAnswerMarkdown(tail)" in js, (
+        "finalizeAssistantMessage must use the helper (on the post-seal tail — #1504 segmentation)"
+    )
 
 
 def test_the_clipboard_keeps_the_fence():

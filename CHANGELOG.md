@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Changed
+
+- **Web chat: tool cards render inline at their position in the turn, collapsed to a header line, one click from the formatted JSON.** Four fixes to how a turn reads (#1504): *(1) order* — every inline block (tool card, approval card, question card) now seals the streaming bubble, so a turn that goes text → tool → text displays in exactly that order instead of one pre-tool bubble swallowing all the text with the cards appended at the bottom; *(2) default* — a tool card starts as just its header line (status icon, humanized name, args summary, timing) and expands on click to formatted, syntax-highlighted JSON of the args and result — MCP `{content:[{type:"text",…}]}` envelopes are unwrapped to their payload (no more escaped-newline string-in-a-string), tabular results keep their real-table preview, markdown strings keep rendering as markdown, and a failed call opens itself; *(3) styling* — the legacy `.cloud-chat-messages details` rule outranked the whole card family once the collapse work made cards `<details>` elements, flattening them left-aligned with a 1px border, and is now gone entirely; *(4) reload parity* — a refresh used to downgrade an answer's evidence to a flat grey `tool: <label>` box, because `renderMessage` built its own block; both paths now share one card constructor, with the replayed card marked `is-replayed` and deliberately carrying no status icon, timing or result panel, since the persisted `{tool, args}` row evidences none of them. Most visible with `chat.provider: kai-agent`, whose interleaved turns surface tool cards mid-answer. Persisting the *position* of each block (so a reload shows them inline rather than after the bubble) still needs the ordered-`parts` migration tracked in #1504.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added
