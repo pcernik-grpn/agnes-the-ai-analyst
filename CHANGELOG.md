@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Changed
+
+- On the legacy Keboola SDK download path (incremental + partitioned syncs), a `gs://` slice that arrives without GCS credentials is now refused by name instead of being fetched unauthenticated. That fetch could only ever have 403'd several layers later — sliced-export GCS URLs are not pre-signed — so this surfaces the same failure at the manifest, where it says which credential is missing. The primary path has enforced this since the GCS slice support landed; only the legacy path was lenient.
+
 ### Fixed
 
 - Keboola sliced exports on Azure-backed stacks now download through the legacy SDK client path (incremental + partitioned syncs). That path carried its own scheme chain which handled `gs://` and `s3://` but had no `azure://` arm, so an Azure slice reached `requests` as a raw `azure://` URI and failed the same way AWS slices did before the `s3://` fix ("No connection adapters were found"). Both paths now share one dispatch.
@@ -19,6 +23,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - Sliced-export URI schemes are a declared closed set (`SliceScheme`) dispatched exhaustively via `typing.assert_never`, so a backend added without an arm is a type error rather than a runtime discovery. The legacy client's second scheme chain is gone; a guard fails if one reappears.
 - Type checking now blocks over a curated "typed core" (`scripts/typecheck-core.sh`, driven by `tests/test_exhaustiveness_gate.py` so it rides the required `test` check). The repo-wide mypy step stays advisory — it never gated, and mypy was not installed locally either, so the post-edit hook skipped it silently and an `assert_never` would only have tripped if the missing arm was reached in production. mypy is now a declared `[dev]` dependency, the gate fails loudly rather than skipping in CI, and it self-tests by mutating a dispatch to confirm it still rejects one.
+- The exhaustiveness gate guards its own call sites: a `# type: ignore` on an `assert_never`, or a file-wide `# mypy: ignore-errors` in a typed-core module, is refused. Both keep the typed core mypy-clean while enforcing nothing, and neither was visible to the other checks.
 - `tests/test_keboola_client_gcs_slice.py` asserted the divergence between the two `gs://` rewrites rather than a contract; it now covers the shared rewrite. The legacy path's GCS slice URL changes to the JSON-API media form already used on the primary path.
 
 ## [0.85.1] - 2026-08-24

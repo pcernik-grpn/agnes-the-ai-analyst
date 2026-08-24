@@ -209,3 +209,41 @@ def test_a_complete_dispatch_is_accepted(tmp_path):
         cwd=REPO_ROOT,
     )
     assert result.returncode == 0, f"mypy rejected an exhaustive dispatch:\n{result.stdout}"
+
+
+def test_the_real_assert_never_call_sites_are_not_suppressed():
+    """A `# type: ignore` on the dispatch itself defeats the gate silently.
+
+    The checks above prove the typed core is clean, that it is non-empty, and
+    that every `assert_never` lives inside it — but all three stay green if
+    someone silences the one line that matters. mypy exits 0 because the error
+    is suppressed, the module is still listed, and the string `assert_never`
+    is still in a core file. The guarantee is gone and nothing says so.
+
+    A blanket ban on `type: ignore` would be wrong: the core legitimately
+    carries them for optional imports. Only the `assert_never` call sites, and
+    file-wide suppressions that would cover them, are off limits.
+    """
+    listing = subprocess.run(
+        ["bash", str(GATE_SCRIPT), "--list"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    core = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+
+    offences: list[str] = []
+    for module in core:
+        for lineno, line in enumerate((REPO_ROOT / module).read_text().splitlines(), start=1):
+            stripped = line.strip()
+            # A file-wide suppression covers every dispatch in the module.
+            if stripped.startswith("# mypy:") and "ignore-errors" in stripped:
+                offences.append(f"{module}:{lineno} disables mypy for the whole module: {stripped}")
+            if "assert_never" in line and "type: ignore" in line:
+                offences.append(f"{module}:{lineno} suppresses the exhaustiveness error: {stripped}")
+
+    assert not offences, (
+        "the exhaustiveness check is silenced where it is supposed to bite, so the "
+        "typed core stays mypy-clean while enforcing nothing:\n  " + "\n  ".join(offences)
+    )
