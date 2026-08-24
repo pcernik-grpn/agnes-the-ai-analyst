@@ -237,12 +237,20 @@ record, so logout cannot invalidate a stolen cookie. The available kill switch i
 deactivating the user. PATs, by contrast, are checked against the database on
 every request and revoke immediately.
 
-### CSRF relies mostly on `SameSite`
+### CSRF: an origin gate above `SameSite`
 
-There is no application-wide CSRF middleware. The session cookie is
-`HttpOnly`, `SameSite=Lax`, and `Secure` when the deployment resolves to HTTPS;
-one sensitive web form uses an explicit double-submit token. For other
-state-changing browser POSTs, `SameSite=Lax` is the protection.
+State-changing browser requests are defended in layers. The session cookie is
+`HttpOnly`, `SameSite=Lax`, and `Secure` when the deployment resolves to HTTPS,
+which keeps it off a truly cross-site POST; the sensitive HTML web forms add an
+explicit double-submit token. Above these, an application-wide
+`CsrfOriginMiddleware` refuses any state-changing request authenticated *only*
+by the session cookie when the browser reports it cross-origin
+(`Sec-Fetch-Site: same-site`/`cross-site`, or an `Origin` that is neither
+same-origin nor on the `CORS_ORIGINS` allowlist) — which also covers the case
+`SameSite=Lax` cannot: a *same-site* request from a hosted data app on a sibling
+sub-domain. Bearer/PAT API callers (CLI, MCP, agent API) are unaffected. The
+gate acts only on positive cross-origin evidence and can be disabled with
+`AGNES_CSRF_ORIGIN_ENFORCE=0`.
 
 ### Rate limiting is auth-only
 
@@ -332,6 +340,6 @@ Agnes secures what it controls; the rest is yours.
 ## Hardening roadmap
 
 Directionally, and without commitment to dates: per-tool approval and a command
-policy for the agent runtime, provenance labeling for untrusted content, an
-application-wide CSRF defense, tamper-evident audit, signed release artifacts, and
-per-app isolation for hosted data apps.
+policy for the agent runtime, provenance labeling for untrusted content,
+tamper-evident audit, signed release artifacts, and per-app isolation for hosted
+data apps.

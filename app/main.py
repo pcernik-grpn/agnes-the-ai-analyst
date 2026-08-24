@@ -2407,6 +2407,37 @@ def create_app() -> FastAPI:
                 )
         except Exception:
             pass
+
+    # CSRF gate for cookie-authenticated state-changing requests (F2). The
+    # double-submit `web_csrf` token covers only the HTML form handlers; the
+    # `/api/**` JSON surface is cookie-session authed with no token and its
+    # protection was implicit (Pydantic bodies force a pre-flighted
+    # `application/json`, `SameSite=Lax` drops a cross-site cookie). That misses
+    # no-body mutations (`POST /api/sync/trigger`, the admin `run-*` family are
+    # CORS-simple) and the sibling-sub-domain case (a data-app on `.<base>` is
+    # same-site, so Lax keeps the cookie). This gate refuses a cookie-only
+    # state-changing request the browser reports as cross-origin. Added BEFORE
+    # CORSMiddleware so it is the INNERMOST app-wide middleware: it runs after
+    # DataAppSubdomainMiddleware rewrites a sub-domain request to
+    # `/apps/<slug>/...`, so its proxy-path skip matches those too. It reuses the
+    # same parsed `cors_origins`, so an operator's explicit credentialed
+    # cross-origin allowlist is honored in one place. The env kill switch
+    # mirrors the CORS_ORIGINS / AGNES_TRUSTED_PROXY_HOPS operator-config
+    # precedent (a plain env read, not a user-facing switch).
+    from app.middleware.csrf_origin import CsrfOriginMiddleware
+
+    csrf_origin_enforce = os.environ.get("AGNES_CSRF_ORIGIN_ENFORCE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    app.add_middleware(
+        CsrfOriginMiddleware,
+        allowed_origins=set(cors_origins),
+        enabled=csrf_origin_enforce,
+    )
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,

@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Security
+
+- **The cookie-authenticated JSON API now refuses cross-origin state-changing requests, not just the HTML form handlers.** The double-submit `web_csrf` token guards only a handful of pure-HTML form POSTs; the much larger `/api/**` JSON surface (admin, sync, …) is called with `fetch(credentials:"include")` and authenticated by the `access_token` session cookie with no token. Its protection had been *implicit* — a Pydantic body forces a pre-flighted `application/json` (which the CORS allowlist rejects cross-origin) and `SameSite=Lax` keeps the cookie off a truly cross-site POST — and that left two gaps: mutations that take **no JSON body** (`POST /api/sync/trigger` and the admin `run-*` family are CORS-*simple* requests — no preflight, no content-type barrier) and the hosted-data-app case (when apps are served on sibling sub-domains the session cookie is parent-scoped, `Domain=.<base>`, and a sibling `<slug>.<base>` is *same-site*, so `SameSite=Lax` does not strip it from user-authored app code's requests). A new app-wide `CsrfOriginMiddleware` (`app/middleware/csrf_origin.py`) makes the defense explicit: a state-changing request authenticated *only* by the session cookie is refused when the browser reports it cross-origin — `Sec-Fetch-Site: same-site`/`cross-site`, or, for browsers too old to send it, an `Origin` that is neither same-origin nor on the operator's explicit `CORS_ORIGINS` allowlist. It acts only on **positive** cross-origin evidence, so bearer/PAT callers (CLI, MCP, agent API), same-origin UI `fetch`es and header-less clients pass through untouched; reverse-proxied data-app paths (`/apps/<slug>/...`) are skipped. Set `AGNES_CSRF_ORIGIN_ENFORCE=0` to disable. This closes the `SameSite`-only-CSRF limitation called out in `SECURITY.md`.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
