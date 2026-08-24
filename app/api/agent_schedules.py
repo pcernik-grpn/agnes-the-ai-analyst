@@ -39,7 +39,7 @@ from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_admin, require_agent_profiles_enabled
-from app.auth.dependencies import _get_db, require_session_token
+from app.auth.dependencies import _get_db, require_session_or_user_pat, require_session_token
 from src.repositories import agent_schedules_repo, agents_repo, audit_repo, jobs_repo, users_repo
 from src.scheduler import is_table_due, is_valid_schedule
 
@@ -144,7 +144,7 @@ class UpdateScheduleRequest(BaseModel):
 @router.get("/{slug}/schedules")
 async def list_schedules(
     slug: str,
-    user: dict = Depends(require_session_token),
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     agent = _load_agent_by_slug(slug, user)

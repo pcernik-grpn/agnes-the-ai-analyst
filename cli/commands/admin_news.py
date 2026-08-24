@@ -69,6 +69,7 @@ def _load_from_file(path: str) -> tuple[str, str]:
     # for YAMLError to avoid swallowing unrelated exceptions like
     # ImportError or KeyboardInterrupt.
     import yaml
+
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -81,6 +82,7 @@ def _load_from_file(path: str) -> tuple[str, str]:
 @admin_news_app.command("show")
 def show(
     version: int = typer.Option(None, "--version", "-v", help="Show a specific version (default: current published)"),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Print the current published version, or a specific version."""
     if version is not None:
@@ -88,6 +90,9 @@ def show(
     else:
         resp = api_get("/api/admin/news/current")
     body = _exit_on_error(resp)
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
     if isinstance(body, dict) and body.get("published") is False and "version" not in body:
         typer.echo("(published: none)")
         return
@@ -111,15 +116,17 @@ def edit(
     content: str = typer.Option(None, "--content", help="Full content HTML (used on /news)"),
     from_file: str = typer.Option(None, "--from", help="Read {intro, content} from YAML/JSON file (`-` for stdin)"),
     expect_version: int = typer.Option(
-        None, "--expect-version",
+        None,
+        "--expect-version",
         help="Refuse the edit unless the active draft is at this version "
-             "(0 = expect no draft). Guards against overwriting a draft a "
-             "concurrent admin started or edited after your last fetch.",
+        "(0 = expect no draft). Guards against overwriting a draft a "
+        "concurrent admin started or edited after your last fetch.",
     ),
     force: bool = typer.Option(
-        False, "--force",
+        False,
+        "--force",
         help="Skip the local collision check that warns when a draft was "
-             "created by another author. --expect-version still applies.",
+        "created by another author. --expect-version still applies.",
     ),
 ):
     """Upsert the active draft. One of --from / (--intro and --content) is required.
@@ -184,11 +191,12 @@ def edit(
 @admin_news_app.command("publish")
 def publish(
     version: int = typer.Option(
-        None, "--version",
+        None,
+        "--version",
         help="Refuse to publish unless the active draft is at this version. "
-             "Guards against publishing a draft a concurrent admin replaced "
-             "after you reviewed it. Without --version, publishes whatever "
-             "the active draft is.",
+        "Guards against publishing a draft a concurrent admin replaced "
+        "after you reviewed it. Without --version, publishes whatever "
+        "the active draft is.",
     ),
 ):
     """Publish the active draft.
@@ -235,11 +243,17 @@ def unpublish(
 
 
 @admin_news_app.command("versions")
-def versions(limit: int = typer.Option(20, "--limit", help="Max rows to print")):
+def versions(
+    limit: int = typer.Option(20, "--limit", help="Max rows to print"),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
     """Table of versions: number, status, created_at, by, published_at."""
     resp = api_get(f"/api/admin/news/versions?limit={limit}")
     body = _exit_on_error(resp)
     rows = body.get("versions", [])
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
     if not rows:
         typer.echo("(no versions)")
         return
@@ -258,6 +272,7 @@ def versions(limit: int = typer.Option(20, "--limit", help="Max rows to print"))
 def export(path: str = typer.Argument(..., help="YAML file to write {intro, content} into")):
     """Dump the currently-published version to a YAML file."""
     import yaml
+
     resp = api_get("/api/admin/news/current")
     body = _exit_on_error(resp)
     if isinstance(body, dict) and body.get("published") is False and "version" not in body:
