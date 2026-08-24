@@ -144,7 +144,7 @@ class UpdateScheduleRequest(BaseModel):
 @router.get("/{slug}/schedules")
 async def list_schedules(
     slug: str,
-    user: dict = Depends(require_session_or_user_pat),
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     agent = _load_agent_by_slug(slug, user)

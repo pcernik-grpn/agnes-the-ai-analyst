@@ -295,7 +295,7 @@ async def create_agent(
 
 
 @router.get("")
-async def list_agents(user: dict = Depends(require_session_or_user_pat)):
+async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True))):
     rows = agents_repo().list_for_user(user["id"])
     return {"data": [_serialize(r) for r in rows], "has_more": False, "next_cursor": None}
 
@@ -303,7 +303,7 @@ async def list_agents(user: dict = Depends(require_session_or_user_pat)):
 @router.get("/{agent_id}")
 async def get_agent(
     agent_id: str,
-    user: dict = Depends(require_session_or_user_pat),
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     row = _load_agent(agent_id, user, conn, require_owner=False)
@@ -648,7 +648,7 @@ def _load_agent_memory(agent_id: str, memory_id: str) -> Dict[str, Any]:
 async def list_agent_memories(
     agent_id: str,
     status: Optional[str] = None,
-    user: dict = Depends(require_session_or_user_pat),
+    user: dict = Depends(require_session_or_user_pat()),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     # Read-only — admins may inspect (require_owner=False), mirrors get_agent.

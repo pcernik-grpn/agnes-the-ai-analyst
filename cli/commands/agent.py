@@ -7,9 +7,9 @@ and the runtime surface (`app/api/agent_runtime.py`,
 `POST /api/v1/agents/{slug}/responses` + `GET /api/v1/jobs/{id}` — callable
 with either a session token or an agent PAT scoped to that agent). READ-only
 management routes (`list`, `show`, `schedule list`, `memory list`) accept a
-full-surface user PAT as well as a session token (`require_session_or_user_pat`)
-so a normally-logged-in analyst can discover their own agents without a
-fresh interactive session; every mutating route stays session-token only.
+user PAT as well as a session token (`require_session_or_user_pat`) so a
+normally-logged-in analyst can discover their own agents without a fresh
+interactive session; every mutating route stays session-token only.
 
 Each subcommand maps 1:1 to one HTTP endpoint:
 
@@ -27,16 +27,20 @@ Each subcommand maps 1:1 to one HTTP endpoint:
                        polls ``GET /api/v1/jobs/{id}`` on a `202` until the
                        job reaches a terminal status or ``--timeout`` runs out.
 
-``list``, ``show``, ``schedule list`` and ``memory list`` work with either an
-interactive session token or a full-surface user PAT (`agnes login`'s
-``surface='stack'`` token does NOT qualify — mint a full-surface PAT via
-``POST /auth/tokens`` instead). Every other management subcommand
-(``create``, ``scope set``, ``token``, ``delete``, ``memory approve/archive``,
-schedule create/update/delete) still needs an interactive session token — the
-server 403s any PAT outright (`require_session_token`). ``ask`` works with
-either credential too; the CLI doesn't distinguish, it just sends whatever
-`agnes auth` currently holds and renders a 401/403 the same way as any other
-error.
+``list``, ``show`` and ``schedule list`` work with an interactive session
+token, a full-surface PAT, or `agnes login`'s / `agnes init`'s
+``surface='stack'`` PAT (the default `agnes login` token) — that surface
+narrows *data reads* only (`src/rbac.py`), not the caller's own agent
+metadata, so it's accepted here. ``memory list`` is more conservative: it
+needs an interactive session token or a full-surface PAT — a
+``surface='stack'`` PAT does NOT qualify there, because a memory notebook
+can hold free-text content, the most sensitive of the four read surfaces.
+Every other management subcommand (``create``, ``scope set``, ``token``,
+``delete``, ``memory approve/archive``, schedule create/update/delete) still
+needs an interactive session token — the server 403s any PAT outright
+(`require_session_token`). ``ask`` works with either credential too; the CLI
+doesn't distinguish, it just sends whatever `agnes auth` currently holds and
+renders a 401/403 the same way as any other error.
 """
 
 from __future__ import annotations

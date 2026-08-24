@@ -478,21 +478,39 @@ def require_session_token(request: Request, user: dict = Depends(get_current_use
     return user
 
 
-def require_session_or_user_pat(request: Request, user: dict = Depends(get_current_user)) -> dict:
-    """Like ``require_session_token``, but ALSO accepts a full-surface user
-    PAT (``typ="pat"``, ``credential_surface == "all"``) — for READ-ONLY
-    agent-management endpoints only (`GET /api/v1/agents`,
-    `GET /api/v1/agents/{id}`, `GET /api/v1/agents/{slug}/schedules`,
-    `GET /api/v1/agents/{id}/memories`). Mutating agent-management routes
+def require_session_or_user_pat(*, allow_stack_surface: bool = False):
+    """Factory for a dependency like ``require_session_token``, but ALSO
+    accepting a user PAT (``typ="pat"``) — for READ-ONLY agent-management
+    endpoints only. Mutating agent-management routes
     (create/update/delete/scope/token issuance/memory writes) keep using
     ``require_session_token`` unchanged.
 
     Motivation: ``agnes agent list`` — the very command `agnes chat`'s own
     error text points a caller at — must work for a normally-logged-in
     analyst's own PAT, not force a fresh interactive session just to
-    discover which agents exist.
+    discover which agents exist. ``agnes login`` / ``agnes init`` both mint
+    ``surface='stack'`` PATs by default (`app/api/cli_auth.py`), so a fix
+    that only accepted ``surface='all'`` would not actually help the common
+    case — see (3) below.
 
-    Still rejects, fail-closed:
+    ``allow_stack_surface`` (default ``False``) controls whether a
+    ``surface='stack'`` PAT qualifies, on top of a full-surface
+    (``surface='all'``) one, which always qualifies:
+
+    - ``allow_stack_surface=True`` — used by ``GET /api/v1/agents``,
+      ``GET /api/v1/agents/{id}``, ``GET /api/v1/agents/{slug}/schedules``.
+      ``surface='stack'`` narrows *data reads* (it drops an admin's
+      god-mode short-circuit to the analyst stack branch — see
+      ``src/rbac.py``'s ``_credential_surface``); it was never meant to hide
+      the caller's own agent *metadata* (name, slug, scope shape, schedule
+      cadence), and accepting it here never widens data access.
+    - ``allow_stack_surface=False`` (default) — used by
+      ``GET /api/v1/agents/{id}/memories``. A memory notebook can hold
+      free-text content the owner wrote or an agent inferred, the most
+      sensitive of the four read surfaces — kept on the conservative
+      full-surface-PAT-or-session default; reviewers may widen this later.
+
+    Still rejects, fail-closed, regardless of ``allow_stack_surface``:
 
     1. **Every restricted principal** (``SessionPrincipal`` / ``AgentPrincipal``,
        ``PRINCIPAL_TYPES``) — neither carries a single owner identity these
@@ -502,62 +520,65 @@ def require_session_or_user_pat(request: Request, user: dict = Depends(get_curre
     2. **An agent-scoped PAT** (``typ="agent_pat"``) — an agent must never
        enumerate or read its OWNER's *other* agents just because it holds a
        PAT.
-    3. **A ``surface='stack'``-narrowed PAT** (``credential_surface ==
-       "stack"``, the ``agnes init`` / browser-login default) — that
-       credential is scoped to the data-read stack surface only, not agent
-       management. Only a full-surface (``surface="all"``) PAT, minted e.g.
-       via ``POST /auth/tokens``, qualifies.
-    4. **Scheduler shared secret / ``X-StorageApi-Token`` header credential**
+    3. **Scheduler shared secret / ``X-StorageApi-Token`` header credential**
        — same non-interactive-service exclusions as ``require_session_token``.
+    4. **Any ``credential_surface`` value other than ``'all'`` or (when
+       allowed) ``'stack'``** — an unrecognized/future surface value fails
+       closed rather than silently qualifying.
 
-    Any token kind not explicitly recognized as a qualifying full-surface
-    PAT above is treated exactly like ``require_session_token`` treats it
-    (i.e. accepted only if it is not one of the non-interactive kinds it
-    already excludes) — this dependency only ever *widens* access for the
-    one narrow case (2)-(3) above rule out, never for anything else.
-
-    Plain ``def`` — same Tier 1 threadpool convention as
-    ``require_session_token`` (PR #188).
+    Any token kind not explicitly recognized as a qualifying PAT above is
+    treated exactly like ``require_session_token`` treats it (i.e. accepted
+    only if it is not one of the non-interactive kinds it already excludes)
+    — this dependency only ever *widens* access for the narrow PAT cases
+    above, never for anything else.
     """
-    from app.auth.session_principal import PRINCIPAL_TYPES
 
-    if isinstance(user, PRINCIPAL_TYPES):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint requires an interactive session or a user PAT",
-        )
+    def _dependency(request: Request, user: dict = Depends(get_current_user)) -> dict:
+        """Plain ``def`` — same Tier 1 threadpool convention as
+        ``require_session_token`` (PR #188)."""
+        from app.auth.session_principal import PRINCIPAL_TYPES
 
-    auth = request.headers.get("authorization", "")
-    token = None
-    if auth.startswith("Bearer "):
-        token = auth.removeprefix("Bearer ")
-    if not token and request:
-        token = request.cookies.get("access_token")
-    if not token and request.headers.get("x-storageapi-token"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint requires an interactive session or a user PAT, not a Storage API token",
-        )
-    if token:
-        from app.auth.scheduler_token import is_scheduler_token
-
-        if is_scheduler_token(token):
+        if isinstance(user, PRINCIPAL_TYPES):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="This endpoint requires an interactive session or a user PAT, not a service token",
+                detail="This endpoint requires an interactive session or a user PAT",
             )
-        from app.auth.jwt import verify_token
-        from app.auth.pat_resolver import _PAT_LIKE_TYPES
 
-        payload = verify_token(token) or {}
-        typ = payload.get("typ")
-        if typ in _PAT_LIKE_TYPES:
-            if typ == "agent_pat" or user.get("credential_surface") != "all":
+        auth = request.headers.get("authorization", "")
+        token = None
+        if auth.startswith("Bearer "):
+            token = auth.removeprefix("Bearer ")
+        if not token and request:
+            token = request.cookies.get("access_token")
+        if not token and request.headers.get("x-storageapi-token"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint requires an interactive session or a user PAT, not a Storage API token",
+            )
+        if token:
+            from app.auth.scheduler_token import is_scheduler_token
+
+            if is_scheduler_token(token):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="This endpoint requires an interactive session or a full-surface user PAT",
+                    detail="This endpoint requires an interactive session or a user PAT, not a service token",
                 )
-    return user
+            from app.auth.jwt import verify_token
+            from app.auth.pat_resolver import _PAT_LIKE_TYPES
+
+            payload = verify_token(token) or {}
+            typ = payload.get("typ")
+            if typ in _PAT_LIKE_TYPES:
+                surface = user.get("credential_surface")
+                qualifies = surface == "all" or (allow_stack_surface and surface == "stack")
+                if typ == "agent_pat" or not qualifies:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="This endpoint requires an interactive session or a qualifying user PAT",
+                    )
+        return user
+
+    return _dependency
 
 
 def reject_keboola_header_credential(user: dict = Depends(get_current_user)) -> dict:

@@ -1,4 +1,4 @@
-"""READ-only agent-management endpoints accept a full-surface user PAT (B4).
+"""READ-only agent-management endpoints accept a user PAT (B4).
 
 `agnes agent list` — the command `agnes chat`'s own error text points a
 caller at — is the discovery entry point into the agent-profile API. Before
@@ -7,11 +7,22 @@ through `require_session_token`, which rejects every PAT flavor outright —
 so a normally-logged-in analyst holding only a PAT (no fresh interactive
 session) could never even list their own agents.
 
-This module covers the new `require_session_or_user_pat` dependency
+This module covers the `require_session_or_user_pat` dependency factory
 (`app/auth/dependencies.py`) wired onto the READ-only routes:
-`GET /api/v1/agents`, `GET /api/v1/agents/{id}`,
-`GET /api/v1/agents/{slug}/schedules`, `GET /api/v1/agents/{id}/memories`.
-Mutations (`POST /api/v1/agents`, ...) stay session-token-only.
+
+- `GET /api/v1/agents`, `GET /api/v1/agents/{id}`,
+  `GET /api/v1/agents/{slug}/schedules` accept BOTH a full-surface
+  (`surface='all'`) PAT and a `surface='stack'` PAT (`allow_stack_surface=
+  True`) — `agnes login` / `agnes init` mint `surface='stack'` by default
+  (`app/api/cli_auth.py`), so accepting only `surface='all'` would not
+  actually fix the common case. `surface='stack'` narrows *data reads*
+  (`src/rbac.py`), never the caller's own agent metadata.
+- `GET /api/v1/agents/{id}/memories` stays on the conservative default
+  (`allow_stack_surface=False`) — a memory notebook can hold free-text
+  content, the most sensitive of the four PAT-readable surfaces.
+
+Mutations (`POST /api/v1/agents`, ...) stay session-token-only regardless
+of PAT surface.
 """
 
 from __future__ import annotations
@@ -126,6 +137,34 @@ def test_list_memories_with_user_pat_returns_200(env):
 
 
 # ---------------------------------------------------------------------------
+# A surface='stack' PAT (the agnes login / agnes init default) can also
+# read list/get/schedules — but NOT memories.
+# ---------------------------------------------------------------------------
+
+
+def test_list_agents_with_stack_pat_returns_200(env):
+    token = _mint_user_pat(env["user"], surface="stack")
+    r = env["client"].get("/api/v1/agents", headers=_auth(token))
+    assert r.status_code == 200
+    slugs = [a["slug"] for a in r.json()["data"]]
+    assert "default" in slugs
+
+
+def test_get_agent_with_stack_pat_returns_200(env):
+    token = _mint_user_pat(env["user"], surface="stack")
+    r = env["client"].get(f"/api/v1/agents/{env['agent_id']}", headers=_auth(token))
+    assert r.status_code == 200
+    assert r.json()["id"] == env["agent_id"]
+
+
+def test_list_schedules_with_stack_pat_returns_200(env):
+    token = _mint_user_pat(env["user"], surface="stack")
+    r = env["client"].get("/api/v1/agents/default/schedules", headers=_auth(token))
+    assert r.status_code == 200
+    assert r.json() == {"data": [], "has_more": False, "next_cursor": None}
+
+
+# ---------------------------------------------------------------------------
 # Everything that must NOT gain read access
 # ---------------------------------------------------------------------------
 
@@ -133,12 +172,6 @@ def test_list_memories_with_user_pat_returns_200(env):
 def test_agent_scoped_pat_still_denied_on_agent_detail(env):
     token = _mint_agent_pat(env["user"], env["agent_id"])
     r = env["client"].get(f"/api/v1/agents/{env['agent_id']}", headers=_auth(token))
-    assert r.status_code == 403
-
-
-def test_stack_narrowed_pat_still_denied_on_list(env):
-    token = _mint_user_pat(env["user"], surface="stack")
-    r = env["client"].get("/api/v1/agents", headers=_auth(token))
     assert r.status_code == 403
 
 
@@ -150,6 +183,12 @@ def test_stack_narrowed_pat_still_denied_on_memories(env):
 
 def test_mutation_still_denied_for_full_surface_user_pat(env):
     token = _mint_user_pat(env["user"])
+    r = env["client"].post("/api/v1/agents", json={"name": "Sales", "slug": "sales"}, headers=_auth(token))
+    assert r.status_code == 403
+
+
+def test_mutation_still_denied_for_stack_surface_user_pat(env):
+    token = _mint_user_pat(env["user"], surface="stack")
     r = env["client"].post("/api/v1/agents", json={"name": "Sales", "slug": "sales"}, headers=_auth(token))
     assert r.status_code == 403
 
