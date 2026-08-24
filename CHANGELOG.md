@@ -10,7 +10,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
-## [0.86.0] - 2026-08-24
+### Internal
+
+- **Four dev-kit knowledge skills that never actually loaded, fixed.** The skill loader only discovers the directory form (`.claude/skills/<name>/SKILL.md`); `agnes-connectors`, `agnes-orchestrator`, `agnes-rbac` and `agnes-release-process` had shipped as bare `.claude/skills/<name>.md` files, invisible to every session that would have loaded them — including several review sub-agents that already invoked them by name (`agnes-reviewer-architecture`, `agnes-reviewer-rbac`, `agnes-releaser`). Moved into directory form (content unchanged); `tests/test_dev_skills_layout.py` is a new ratchet forbidding any future flat `.claude/skills/*.md` file. Also: `docs/superpowers/maps/` (the `agnes-wayfinder` output contract CLAUDE.md already routed to) now exists with a short README, and the `test_documentation_api_triple_surface.py` exemption for `/api/agents` no longer claims agents "cannot yet be run" — `/api/v1/agents` already is, via `agnes chat` / `agent ask`; the true reason is the pending agent-core consolidation between the two registries.
 
 ### Added
 

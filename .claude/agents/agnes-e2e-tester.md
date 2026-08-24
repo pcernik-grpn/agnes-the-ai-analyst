@@ -116,15 +116,20 @@ Live instance, manual:
 
 ### Onboarding tour
 
-Automated contract test: `tests/test_onboarding_not_outdated.py` (anchors
-exist, audience split, server-injected steps).
+Automated contract test: `tests/test_tour_onboarding_steps.py` (step order,
+anchors exist on the page each step names, checklist/tour key parity,
+auto-launch gating — the classic tour this section used to describe was
+retired in Wave 0, #1336; the current one is the rail's coach-mark tour).
 
 Live instance, manual:
-- [ ] Fresh non-admin login → intro modal offers the tour; spotlight steps
-      walk Home → Chat → Marketplace → Catalog → Memory → Profile.
+- [ ] Fresh chat, no journey progress yet → the `welcome` coach-mark tour
+      auto-launches once, opening on the composer, then walks Library → what
+      "in stack" means → adding your own → sharing.
+- [ ] Submitting the first message dismisses the coach mark even mid-tour.
 - [ ] Cross-page navigation mid-tour resumes at the right step (sessionStorage).
-- [ ] Admin sees the extra Admin step; non-admin never does.
-- [ ] Help (?) icon re-launches the tour from any page.
+- [ ] The onboarding checklist (rail) tracks the same steps plus the
+      agent-created milestone; "Skip onboarding" / "Start over" toggle its
+      completion state. No admin-only step.
 
 ## Known coverage gaps (be explicit when a claim rests on them)
 
