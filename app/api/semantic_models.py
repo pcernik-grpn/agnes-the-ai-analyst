@@ -37,7 +37,7 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType
 from src.repositories import semantic_model_repo, semantic_source_repo
 from src.semantic.document_validation import validate_document
-from src.semantic.projection import project_document
+from src.semantic.projection import project_document, prune_model
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
 from src.semantic_validation import validate_query
@@ -274,6 +274,14 @@ async def delete_semantic_model(model_id: str, user: dict = Depends(require_admi
     row = _resolve_model(model_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
+    # Prune the flat projection (metric_definitions/glossary_terms/
+    # column_metadata) BEFORE deleting the document row — the row is the
+    # only place that still carries the document once this call returns, and
+    # `prune_model` needs it to derive the exact model-id prefix `_project`
+    # wrote under. Otherwise a model created/edited through this API (which
+    # now projects, see `_project`) would leave those rows orphaned forever.
+    if row.get("document_json"):
+        prune_model(row["document_json"], source=row["source"], source_ref=row["source_ref"])
     semantic_model_repo().delete(row["id"])
 
 

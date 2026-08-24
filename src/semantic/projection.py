@@ -521,6 +521,51 @@ def project_document(
     return report
 
 
+def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) -> ProjectionReport:
+    """Delete everything :func:`project_document` previously wrote for the
+    model(s) declared in ``document_json`` — the write path's inverse, for
+    when the document ITSELF is being deleted (not merely re-projected
+    smaller, which ``project_document(..., partial=True)`` already handles
+    by rewriting-then-pruning).
+
+    Scoped exactly the way ``partial=True`` narrows a projection's prune:
+    per model, to ``<source>/<source_ref or '_'>/<model_key>/`` — reusing
+    the SAME ``_model_key``/``_scoped_id`` helpers ``project_document``
+    itself uses to compute that prefix, so the two can never disagree on
+    what one model "owns". A sibling model sharing ``(source, source_ref)``
+    — every ``source='manual'`` row does — is therefore never touched, the
+    identical guarantee a ``partial=True`` projection call gives on the
+    write side.
+
+    Column metadata is pruned per the model's OWN dataset table_ids —
+    ``(table_id, source)``, the finest boundary that table's schema
+    supports (see ``_prune_columns``'s own note: two source_refs of one
+    source describing the same table_id can still prune each other's
+    fields there; that gap pre-dates this function and is not introduced
+    by it).
+    """
+    report = ProjectionReport()
+    for model in document_json.get("semantic_model") or []:
+        if not isinstance(model, dict):
+            continue
+        prefix = _scoped_id(source, source_ref, _model_key(model)) + "/"
+        report.metrics_pruned += _prune_metrics(source, source_ref, set(), scope_prefixes={prefix})
+        report.glossary_pruned += _prune_glossary(source, source_ref, set(), scope_prefixes={prefix})
+
+        written_by_table = {
+            (dataset.get("source") or dataset.get("name") or ""): set()
+            for dataset in model.get("datasets") or []
+            if isinstance(dataset, dict)
+        }
+        if written_by_table:
+            _prune_columns(source, written_by_table)
+
+    if report.glossary_pruned:
+        glossary_repo().refresh_search_index()
+
+    return report
+
+
 def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
     """Whether an in-(source, source_ref) row is also inside the narrowed
     prune scope. ``None`` means "no narrowing" — the whole (source,
