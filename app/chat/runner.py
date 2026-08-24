@@ -1386,6 +1386,12 @@ async def _consume_turn(
                 "tool_use_id": block.tool_use_id,
                 "tool": block.tool_use_id,
                 "result": result,
+                # The SDK already knows whether the tool failed; forwarding it
+                # spares the client a guess. Without this the UI fell back to
+                # sniffing the payload for a leading "error"/"traceback", so a
+                # real failure whose text starts anywhere else ("Catalog Error:
+                # Table … does not exist") rendered with a success tick.
+                "is_error": bool(getattr(block, "is_error", False)),
             }
         )
 

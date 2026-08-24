@@ -3234,7 +3234,12 @@ function renderToolCallEnd(frame) {
 
   // Status update — error/cancel surfaced; otherwise success.
   const result = frame.result;
-  const isError = _looksLikeToolError(result);
+  // The producer's own verdict wins when it sent one (`is_error`, emitted by
+  // both the native runner and the engine provider). _looksLikeToolError is
+  // the fallback for a frame without it — a heuristic over the payload text,
+  // which silently passed real failures whose message starts anywhere other
+  // than "error"/"traceback" ("Catalog Error: Table … does not exist").
+  const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
   // A FAILED call opens itself: cards start collapsed, and the error text
