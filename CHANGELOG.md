@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-08-24
+
 ### Added
 
 - **Web chat: an assistant turn is stored as its ordered shape, so a reload renders what actually happened.** New `chat_messages.parts` (schema v123, DuckDB `_v122_to_v123` + Alembic `0071`): `[{type:'text'|'tool', …}]` in arrival order, where a tool entry carries its own `state` (`input-available` / `output-available` / `output-error`), `args`, `result` and `is_error`, and a tool's result **mutates the entry where its call already sits** rather than appending — so position is preserved by construction and ordering is array index end to end, never a timestamp and never a client-side reconstruction. This is the model `apps/kai-agent` persists and `apps/kbc-ui` renders in Keboola's frontend monorepo, adopted here rather than reinvented. `tool_calls` becomes its positionless projection, derived from the same source (`app/chat/message_parts.py`) so the two cannot disagree about which calls a turn made, and remains on the row for readers that predate `parts`. Additive, nullable, **no backfill**: the ordering a historical row lost is not recoverable from `content` + `tool_calls` — the positions are simply not in the data — and guessing would place tool cards where they never ran, so pre-v123 rows keep rendering the old way (answer, then its calls after it) through the fallback the client retains. Closes the half of #1504 that no client-side fix could reach: a refreshed conversation now shows prose → tool card → continuation prose exactly as the live turn did, with each card's real status icon, status edge and result body instead of a name and a neutral placeholder.
