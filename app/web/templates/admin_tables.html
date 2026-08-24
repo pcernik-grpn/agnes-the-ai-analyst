@@ -534,6 +534,23 @@
         /* Mode leads with meaning, keeps the system word. */
         .tbl-mode { white-space: nowrap; font-size: 12.5px; color: var(--ds-text-secondary); }
 
+        /* Sync status (B1) — same status vocabulary + colour mapping as
+           `/admin/sync`'s `.status-pill` (admin_sync.html), scoped under
+           `.tbl-sync-pill` to match this file's `.tbl-*` naming instead of
+           reusing the bare class names. Data comes straight off the
+           registry row this lens already fetches (`last_sync_status` /
+           `last_sync` / `last_sync_error`, #754) — no second request. */
+        .tbl-sync-pill {
+            display: inline-block; padding: 2px 8px; border-radius: var(--ds-radius-pill);
+            font-size: 11px; font-weight: 600;
+        }
+        .tbl-sync-pill--ok      { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+        .tbl-sync-pill--error   { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+        .tbl-sync-pill--pending { background: var(--ds-surface-dim);       color: var(--ds-text-secondary); }
+        .tbl-sync-pill--running { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+        .tbl-sync-pill--skipped { background: var(--ds-accent-info-bg);    color: var(--ds-accent-info-ink); }
+        .tbl-sync-age { display: block; margin-top: 2px; font-size: 10.5px; color: var(--ds-text-muted); }
+
         /* A package the row belongs to — a chip that is also the way in. */
         .tbl-pkg {
             display: inline-block;
@@ -7106,6 +7123,40 @@
              + '</span>';
     }
 
+    // ── Sync column (B1) ──────────────────────────────────────────────
+    // Same status vocabulary + colour mapping as `/admin/sync`
+    // (admin_sync.html: `const status = r.last_sync_status || (r.last_sync
+    // ? "ok" : "pending")`) so the two lenses never disagree about what a
+    // status word means. `t` is the raw `/api/admin/registry` row this
+    // page already fetched — `last_sync_status` / `last_sync` /
+    // `last_sync_error` are populated there per #754.
+    var _SYNC_PILL_CLASS = {
+        ok:      'tbl-sync-pill--ok',
+        error:   'tbl-sync-pill--error',
+        skipped: 'tbl-sync-pill--skipped',
+        running: 'tbl-sync-pill--running',
+        pending: 'tbl-sync-pill--pending',
+    };
+    function _fmtSyncAge(iso) {
+        if (!iso) return '';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        var diffS = Math.floor((Date.now() - d.getTime()) / 1000);
+        if (diffS < 60) return 'just now';
+        if (diffS < 3600) return Math.floor(diffS / 60) + 'm ago';
+        if (diffS < 86400) return Math.floor(diffS / 3600) + 'h ago';
+        return Math.floor(diffS / 86400) + 'd ago';
+    }
+    function renderSyncPill(t) {
+        var status = t.last_sync_status || (t.last_sync ? 'ok' : 'pending');
+        var cls = _SYNC_PILL_CLASS[status] || 'tbl-sync-pill--pending';
+        var age = _fmtSyncAge(t.last_sync);
+        var title = (status === 'error' || status === 'skipped') && t.last_sync_error
+            ? ' title="' + escapeHtmlAttr(t.last_sync_error) + '"' : '';
+        return '<span class="tbl-sync-pill ' + cls + '"' + title + '>' + escapeHtml(status) + '</span>'
+             + (age ? '<span class="tbl-sync-age">' + escapeHtml(age) + '</span>' : '');
+    }
+
     // Table access policies design doc §3: a policy may only survive on a
     // table agnes pull can't route around.
     function _apIsEligible(t) {
@@ -8436,10 +8487,11 @@
           + '<table class="data-table" id="adminTablesFlat">'
           + '<colgroup>'
           +   '<col style="width: 4%">'
-          +   '<col style="width: 24%">'
-          +   '<col style="width: 13%">'
-          +   '<col style="width: 13%">'
-          +   '<col style="width: 16%">'
+          +   '<col style="width: 20%">'
+          +   '<col style="width: 12%">'
+          +   '<col style="width: 12%">'
+          +   '<col style="width: 8%">'
+          +   '<col style="width: 14%">'
           +   '<col style="width: 11%">'
           +   '<col style="width: 13%">'
           +   '<col style="width: 6%">'
@@ -8450,6 +8502,7 @@
           +   '<th>Table</th>'
           +   '<th>Source</th>'
           +   '<th>Mode</th>'
+          +   '<th>Sync</th>'
           +   '<th>Package</th>'
           +   '<th>Access</th>'
           +   '<th>Reaches</th>'
@@ -8547,6 +8600,13 @@
 
             // ── Mode
             html += '<td class="tbl-mode">' + renderModeBadge(t.query_mode) + '</td>';
+
+            // ── Sync — same status vocabulary as /admin/sync, read straight
+            // off the registry row this lens already fetched (#754's
+            // last_sync_status / last_sync / last_sync_error) — no second
+            // request. Internal tables never sync, so they get the same
+            // quiet "—" the Package/Reaches columns give them.
+            html += '<td>' + (isInternal ? '<span class="tbl-muted">—</span>' : renderSyncPill(t)) + '</td>';
 
             // ── Package
             if (isInternal) {

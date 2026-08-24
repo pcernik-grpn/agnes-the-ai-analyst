@@ -4137,16 +4137,20 @@ async def list_registry(
     tables = repo.list_all()
 
     # Single batched read of sync_state — avoid N+1 GETs against
-    # `sync_state` for large registries. The sync_state row is keyed on
-    # `table_id` which mirrors `table_registry.name` (see comment in
-    # _run_materialized_pass / _build_manifest_for_user about name vs id).
-    state_by_name: Dict[str, Dict[str, Any]] = {}
+    # `sync_state` for large registries. B1: writers resolve `table_id` to
+    # the registry `id` when a matching row exists at write time (see
+    # `src.sync_state_key.resolve_sync_state_key`), so the join below tries
+    # `id` first. A row still keyed by `name` — a legacy row the backfill
+    # migration hasn't reached yet, or a fallback write for a table whose
+    # `_meta.table_name` had no registry match — is picked up by name so it
+    # doesn't silently vanish from this view.
+    state_by_key: Dict[str, Dict[str, Any]] = {}
     try:
         rows = sync_state_repo().get_all_states()
         for row in rows:
             tid = row.get("table_id")
             if tid:
-                state_by_name[tid] = row
+                state_by_key[tid] = row
     except Exception:
         # Defensive: if sync_state is unreadable for any reason, the
         # registry response still serializes — operators just lose the
@@ -4154,8 +4158,7 @@ async def list_registry(
         logger.exception("Failed to read sync_state for registry")
 
     for t in tables:
-        # Sync_state.table_id == table_registry.name by convention.
-        state = state_by_name.get(t.get("name"))
+        state = state_by_key.get(t.get("id")) or state_by_key.get(t.get("name"))
         status = state.get("status") if state else None
         error = state.get("error") if state else None
         ls = state.get("last_sync") if state else None

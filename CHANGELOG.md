@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **Sync status no longer disagrees with itself across admin pages.** `sync_state.table_id` was written keyed by a table's registry *name* while `/admin/data-sources`'s pipeline strip and the Tables lens' delivery map joined it against `table_registry` on *id* — so a table registered with a display name that isn't already a valid identifier (spaces, uppercase — e.g. `"Web Sessions"`, id `web_sessions`) showed healthy sync status on one admin surface and "never synced" on another, from the exact same sync. Writers (`app/api/sync.py`'s materialized pass, the orchestrator's rebuild + filesystem-fallback paths) now resolve the registry id at write time (`src/sync_state_key.py`), `/api/admin/registry`'s join tries id first, and a one-time backfill migration (schema v123) rewrites existing name-keyed rows. `/admin/tables` also gains a Sync column (status pill + relative time) — previously the sync state existed only on `/admin/sync`.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added

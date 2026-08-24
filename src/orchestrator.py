@@ -1529,6 +1529,7 @@ class SyncOrchestrator:
             # Backend-aware: write sync_state through the factory (Postgres on
             # a PG instance) so /dashboard's factory-backed reads see it.
             from src.repositories import sync_state_repo
+            from src.sync_state_key import resolve_sync_state_key
 
             extracts_dir = _get_extracts_dir()
             repo = sync_state_repo()
@@ -1540,6 +1541,12 @@ class SyncOrchestrator:
                 # is never retried until the next day.
                 if query_mode == "materialized":
                     continue
+                # B1: sync_state.table_id / sync_history.table_id are keyed
+                # by the registry id, resolved from this table's name (see
+                # src.sync_state_key) — the parquet filename below is a
+                # SEPARATE, unrelated convention (still `table_name`) and
+                # stays untouched.
+                sync_key = resolve_sync_state_key(table_name)
                 pq_path = extracts_dir / source_name / "data" / f"{table_name}.parquet"
                 table_dir = extracts_dir / source_name / "data" / table_name
                 file_hash = ""
@@ -1623,7 +1630,7 @@ class SyncOrchestrator:
                         out_size = sum(p["size_bytes"] for p in parts)
 
                 repo.update_sync(
-                    table_id=table_name,
+                    table_id=sync_key,
                     rows=rows or 0,
                     file_size_bytes=out_size,
                     hash=file_hash,
@@ -1638,7 +1645,7 @@ class SyncOrchestrator:
                     # written above untouched, so the bytes served here stay
                     # byte-for-byte identical to the flat-only case.
                     repo.set_error(
-                        table_name,
+                        sync_key,
                         f"Both a flat parquet ({pq_path}) and a partition "
                         f"directory ({table_dir}) exist for this table; "
                         f"serving the flat file, which may be stale. See #1339.",
@@ -1656,6 +1663,7 @@ class SyncOrchestrator:
         """
         try:
             from src.repositories import sync_state_repo, table_registry_repo
+            from src.sync_state_key import resolve_sync_state_key_for_row
 
             # Materialized rows own their last_sync (see _update_sync_state):
             # the fallback fires exactly when `_meta` is missing — e.g. a
@@ -1665,6 +1673,12 @@ class SyncOrchestrator:
             # next tick re-runs the materialize, healing `_meta`.
             registry_row = table_registry_repo().get_by_name(table_id)
             is_materialized = bool(registry_row and registry_row.get("query_mode") == "materialized")
+            # B1: sync_state.table_id is the registry id (src.sync_state_key)
+            # — reuses `registry_row`, already fetched above, rather than a
+            # second lookup. `table_id` (the parameter) stays the parquet
+            # filename stem used for the view lookup right below; only the
+            # sync_state write key changes.
+            sync_key = resolve_sync_state_key_for_row(table_id, registry_row)
 
             h = hashlib.md5()
             with open(parquet_path, "rb") as f:
@@ -1672,7 +1686,7 @@ class SyncOrchestrator:
                     h.update(chunk)
             row_count = conn.execute(f"SELECT COUNT(*) FROM {quote_ident(table_id)}").fetchone()[0]
             sync_state_repo().update_sync(
-                table_id=table_id,
+                table_id=sync_key,
                 rows=int(row_count or 0),
                 file_size_bytes=parquet_path.stat().st_size,
                 hash=h.hexdigest(),
