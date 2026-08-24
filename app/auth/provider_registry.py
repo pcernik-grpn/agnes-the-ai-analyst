@@ -23,6 +23,16 @@ allowlist — so the env / static-file path — which the admin API's lockout
 guard never sees — cannot lock the instance out either. Deliberately NOT
 "treat as unset": that would re-offer the self-provisioning OAuth
 providers, turning one typo into a widening of who may sign in.
+
+A THIRD, narrower rescue protects an already-deployed instance from the
+B6 default flip itself (Devin Review on PR #1548): one with SMTP configured,
+no OAuth, and no user holding a password relied on the magic link as its
+ONLY working door before this change — the unset default would otherwise
+take that door away on upgrade with no runtime recovery path (the admin
+API's write-time guard never ran, since nothing was ever saved to trigger
+it, and the misconfiguration rescue above doesn't apply either, since the
+value is unset rather than a narrowed list that resolves to nothing). See
+:func:`_email_default_offering`.
 """
 
 import importlib
@@ -234,18 +244,102 @@ def _parse_allowlist(source: Optional[object]) -> Optional[list[str]]:
     return known
 
 
+def _has_usable_password_holder() -> bool:
+    """At least one real (non-scheduler) user holds a password hash.
+
+    Mirrors the door computation in
+    ``app.services.instance_doctor.check_login_door`` exactly (same
+    scheduler-user exclusion — a synthetic account that cannot sign in
+    interactively must not count as a working door), so the doctor's
+    login-door check and this rescue can never disagree about whether
+    password sign-in is actually usable. Not imported from there directly:
+    ``instance_doctor`` already imports FROM this module
+    (:func:`probe_providers`), so importing back would be circular.
+
+    On any error this reads as "no holder" — a fail-open direction on
+    purpose: this function backs a rescue whose whole job is to avoid
+    losing a working door, so a transient DB fault should widen (keep email
+    enabled) rather than narrow (exclude it) the offering. It is a Python
+    exception in the DB read itself, so it's the same kind of failure
+    :func:`_provider_available` reads as unavailable, not a resolved answer.
+    """
+    from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
+    from src.repositories import users_repo
+
+    try:
+        return any(u.get("password_hash") and u.get("email") != SCHEDULER_USER_EMAIL for u in users_repo().list_all())
+    except Exception:
+        logger.warning(
+            "could not check for password holders (zero-door email rescue) — treating as none", exc_info=True
+        )
+        return False
+
+
+def _other_login_door_usable() -> bool:
+    """True when some door OTHER than email is genuinely usable under the
+    unset default: a configured OAuth provider, or password sign-in with at
+    least one holder.
+
+    Deliberately does not call :func:`provider_allowed` (would recurse into
+    the email rescue this function backs) or :func:`probe_providers` (would
+    recompute email's own answer as a side effect); it probes only the
+    non-email providers directly. Short-circuits on the first configured
+    OAuth provider, so the DB read only ever runs when none is configured.
+    """
+    for oauth in ("google", "microsoft", "keboola"):
+        if _provider_available(oauth):
+            return True
+    return _has_usable_password_holder()
+
+
+# Tracks whether the zero-door email rescue is CURRENTLY active, so the
+# warning logs once per activation rather than once ever — if the rescue
+# later deactivates (an OAuth provider gets configured, a user sets a
+# password) and then reactivates, the operator should hear about it again.
+_ZERO_DOOR_EMAIL_RESCUE_ACTIVE: bool = False
+
+
+def _email_default_offering() -> bool:
+    """Whether the unset default excludes or keeps ``email``.
+
+    Excludes it (the B6 contract) UNLESS ``email`` is both configured and
+    the instance's only usable login door, in which case it stays enabled
+    — see the module docstring's third rescue. The moment another door
+    becomes usable the default exclusion re-applies on the very next call;
+    there is nothing to "undo" since this holds no state beyond the log
+    dedup marker above.
+    """
+    if not _provider_available("email"):
+        return False
+    if _other_login_door_usable():
+        return False
+    global _ZERO_DOOR_EMAIL_RESCUE_ACTIVE
+    if not _ZERO_DOOR_EMAIL_RESCUE_ACTIVE:
+        _ZERO_DOOR_EMAIL_RESCUE_ACTIVE = True
+        logger.warning(
+            "email magic link kept enabled as the only usable login door (no OAuth "
+            "provider is configured and no user holds a password) — set auth.providers "
+            "explicitly to silence this warning and control the offering yourself."
+        )
+    return True
+
+
 def provider_allowed(name: str) -> bool:
     """Whether ``name`` is offered under the current ``auth.providers``.
 
     Unset allowlist (``None``) offers every provider EXCEPT ``email`` — see
-    the module docstring for why the magic link is opt-in only. A configured
-    allowlist (including the lockout rescue's own resolved list, which
-    already names ``email`` when it applies) is checked by membership as
-    before.
+    the module docstring for why the magic link is opt-in only, and
+    :func:`_email_default_offering` for the narrow rescue when email is the
+    only usable door. A configured allowlist (including the lockout
+    rescue's own resolved list, which already names ``email`` when it
+    applies) is checked by membership as before — the zero-door rescue
+    never fires there, only on the unset path.
     """
     allowlist = configured_allowlist()
     if allowlist is None:
-        return name != "email"
+        if name == "email":
+            return _email_default_offering()
+        return True
     return name in allowlist
 
 

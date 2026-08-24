@@ -205,7 +205,21 @@ class TestEndpointGating:
         assert "Sign in with Email &amp; Password" not in html and "Sign in with Email & Password" not in html
 
     def test_login_page_unset_offers_password_not_email(self, make_client):
+        # A password holder must exist so password is a genuinely USABLE
+        # door — otherwise this is the zero-usable-door state where email
+        # is kept as a rescue instead of excluded (see
+        # tests/test_auth_provider_defaults.py::TestZeroDoorEmailRescue).
+        from argon2 import PasswordHasher
+
+        from src.repositories import users_repo
+
         client = make_client(None)
+        users_repo().create(
+            id="pw-holder-allowlist",
+            email="allowlist-holder@test.com",
+            name="Holder",
+            password_hash=PasswordHasher().hash("x" * 12),
+        )
         html = client.get("/login").text
         # No Google credentials in the test env → password only; the magic
         # link is opt-in (B6) and is not offered without an explicit listing.

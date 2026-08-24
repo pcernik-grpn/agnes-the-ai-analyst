@@ -903,19 +903,32 @@ async def password_change(
     `require_session_token`, matching `/auth/tokens` and every other door
     that mints or rotates a credential).
 
-    Double-submit CSRF (F2): a cookie-authenticated JSON POST is not
-    automatically CSRF-safe (the cookie fallback in `get_current_user` means
-    an ordinary cross-site fetch would still carry the session), so the
-    caller must echo the `web_csrf` cookie value — minted on the GET page
-    above and embedded there for its own JS to read back — in the
-    `X-CSRF-Token` header. Same mechanism as `me_profile_refetch_groups`.
+    Double-submit CSRF (F2) is checked FIRST, before anything else runs —
+    including the no-password-hash lookup below. A cookie-authenticated JSON
+    POST is not automatically CSRF-safe (the cookie fallback in
+    `get_current_user` means an ordinary cross-site fetch would still carry
+    the session), so the caller must echo the `web_csrf` cookie value in the
+    `X-CSRF-Token` header (same mechanism as `me_profile_refetch_groups`).
+    Checking it first — rather than after the account-state read — closes a
+    response-shape leak (Devin Review on PR #1548): a caller with no CSRF
+    token would otherwise get a different status for an SSO-only account
+    (400) than a password account (403 from the CSRF check), letting a
+    same-site page without the token distinguish the two account types.
+    Nothing here is safe to do before proving the caller sent this request
+    on purpose. The GET page mints the `web_csrf` cookie unconditionally —
+    even for an SSO-only account with no form to submit — so this ordering
+    never blocks a legitimate caller who visited it first.
 
-    The no-password-hash check runs BEFORE the CSRF check: it's a read of
-    the caller's own account state with no mutation on either branch, the
-    GET page above never mints a CSRF token for an SSO-only account (no form
-    to submit), and CSRF exists to stop a forged STATE CHANGE — there isn't
-    one here to forge.
+    Existing sessions and PATs are NOT invalidated by a password change —
+    this endpoint only replaces the password hash. Revoking sessions/PATs is
+    a separate action (`DELETE /auth/tokens/{id}`), same as every other
+    password door in this module (reset, setup, admin reset).
     """
+    from app.web.router import _web_csrf_ok
+
+    if not _web_csrf_ok(request, request.headers.get("x-csrf-token", "")):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
     repo = users_repo()
     row = repo.get_by_id(user["id"])
     if not row or not row.get("password_hash"):
@@ -924,16 +937,15 @@ async def password_change(
             detail="This account signs in through single sign-on and has no password to change.",
         )
 
-    from app.web.router import _web_csrf_ok
-
-    if not _web_csrf_ok(request, request.headers.get("x-csrf-token", "")):
-        raise HTTPException(status_code=403, detail="csrf_check_failed")
-
     ph = PasswordHasher()
     try:
         ph.verify(row["password_hash"], body.current_password)
     except VerifyMismatchError:
-        _audit(user["id"], "password_change_failed", result="invalid_current_password")
+        # `invalid_password` — the same result literal `login_failed` uses
+        # for a wrong credential (already classified "denied" in
+        # src/audit_helpers.py) — not a new one; the action name
+        # ("password_change_failed") already says which door this was.
+        _audit(user["id"], "password_change_failed", result="invalid_password")
         raise HTTPException(status_code=403, detail="Current password is incorrect")
     except Exception:
         logger.exception("Unexpected error verifying current password during change")

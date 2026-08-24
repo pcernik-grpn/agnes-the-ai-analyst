@@ -11,6 +11,15 @@ explicitly. The misconfiguration lockout rescue
 (``provider_registry._rescue_if_unusable``) is untouched by this — it only
 fires when ``auth.providers`` is explicitly set to something entirely
 unusable, never on the unset path this file exercises.
+
+A second, narrower rescue (``TestZeroDoorEmailRescue`` below) protects an
+already-deployed instance from the default flip itself: one with SMTP
+configured, no OAuth, and no user holding a password relied on the magic
+link as its only working door before this change — the unset default would
+otherwise take that door away on upgrade with no runtime recovery path
+(the admin-API lockout guard never ran, since nothing was ever saved; the
+misconfiguration rescue doesn't apply either, since the value is unset, not
+a narrowed list that resolves to nothing).
 """
 
 import pytest
@@ -80,7 +89,18 @@ class TestLoginPageDefaultOffering:
         assert "Sign in with Email Link" not in html
 
     def test_unset_without_google_offers_password_only(self, make_client):
+        # A password holder must exist for password to be a genuinely
+        # USABLE door — otherwise this is the zero-door state
+        # TestZeroDoorEmailRescue covers, where email is kept as the
+        # fallback instead of excluded.
+        from argon2 import PasswordHasher
+
+        from src.repositories import users_repo
+
         client = make_client(None, google_configured=False)
+        users_repo().create(
+            id="pw-holder-1", email="holder@test.com", name="Holder", password_hash=PasswordHasher().hash("x" * 12)
+        )
         html = client.get("/login").text
         assert "Sign in with Google" not in html
         assert "Sign in with Email & Password" in html or "Sign in with Email &amp; Password" in html
@@ -106,3 +126,97 @@ class TestRescueBehaviorUnchanged:
         assert configured_allowlist() == ["password", "email"]
         assert provider_allowed("password") is True
         assert provider_allowed("email") is True
+
+
+class TestZeroDoorEmailRescue:
+    """Unit-level: the unset default excludes email UNLESS it is the
+    instance's only usable login door (no OAuth configured, no password
+    holder). Deliberately monkeypatches the primitives
+    (``_provider_available`` / ``_has_usable_password_holder``) rather than
+    the DB, mirroring the style of ``TestLockoutRescue`` in
+    ``test_auth_provider_allowlist.py`` — the end-to-end DB-backed variants
+    live in ``TestZeroDoorEmailRescueEndToEnd`` below."""
+
+    def test_a_magic_link_only_instance_keeps_its_door(self, monkeypatch):
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        from app.auth import provider_registry
+        from app.auth.provider_registry import provider_allowed
+
+        monkeypatch.setattr(provider_registry, "_provider_available", lambda name: name == "email")
+        monkeypatch.setattr(provider_registry, "_has_usable_password_holder", lambda: False)
+        assert provider_allowed("email") is True
+
+    def test_b_google_configured_excludes_email(self, monkeypatch):
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        from app.auth import provider_registry
+        from app.auth.provider_registry import provider_allowed
+
+        monkeypatch.setattr(provider_registry, "_provider_available", lambda name: name in ("email", "google"))
+        monkeypatch.setattr(provider_registry, "_has_usable_password_holder", lambda: False)
+        assert provider_allowed("email") is False
+
+    def test_b_password_holder_excludes_email(self, monkeypatch):
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        from app.auth import provider_registry
+        from app.auth.provider_registry import provider_allowed
+
+        monkeypatch.setattr(provider_registry, "_provider_available", lambda name: name == "email")
+        monkeypatch.setattr(provider_registry, "_has_usable_password_holder", lambda: True)
+        assert provider_allowed("email") is False
+
+    def test_no_smtp_nothing_to_rescue_and_no_db_hit(self, monkeypatch):
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        from app.auth import provider_registry
+        from app.auth.provider_registry import provider_allowed
+
+        monkeypatch.setattr(provider_registry, "_provider_available", lambda name: False)
+        called = {"holder_checked": False}
+
+        def _holder() -> bool:
+            called["holder_checked"] = True
+            return False
+
+        monkeypatch.setattr(provider_registry, "_has_usable_password_holder", _holder)
+        assert provider_allowed("email") is False
+        # Short-circuits on email's own unavailability — never touches the DB.
+        assert called["holder_checked"] is False
+
+    def test_c_explicit_allowlist_is_never_rescued(self, monkeypatch):
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
+        from app.auth.provider_registry import provider_allowed
+
+        # `password` needs no config — it's genuinely available (no probe
+        # patch needed), so the OLD misconfiguration rescue (which only
+        # fires when every NAMED provider is unconfigured) never triggers
+        # here either; this test is purely about the NEW zero-door rescue
+        # never reaching the unset-only branch that grants it.
+        assert provider_allowed("email") is False
+
+
+class TestZeroDoorEmailRescueEndToEnd:
+    """Same contract as TestZeroDoorEmailRescue, driven through the real
+    login page + a real (test) DB, so a wiring bug between the DB read and
+    the login-page render can't hide behind the unit-level monkeypatches
+    above."""
+
+    def test_magic_link_only_instance_keeps_its_door(self, make_client):
+        client = make_client(None, google_configured=False)
+        html = client.get("/login").text
+        assert "Sign in with Email Link" in html
+
+    def test_door_excluded_once_a_password_holder_exists(self, make_client):
+        from argon2 import PasswordHasher
+
+        from src.repositories import users_repo
+
+        client = make_client(None, google_configured=False)
+        users_repo().create(
+            id="pw-holder-2", email="holder2@test.com", name="Holder2", password_hash=PasswordHasher().hash("x" * 12)
+        )
+        html = client.get("/login").text
+        assert "Sign in with Email Link" not in html
+
+    def test_door_excluded_once_google_is_configured(self, make_client):
+        client = make_client(None, google_configured=True)
+        html = client.get("/login").text
+        assert "Sign in with Email Link" not in html

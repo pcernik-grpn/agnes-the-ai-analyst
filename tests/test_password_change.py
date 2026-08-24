@@ -181,16 +181,17 @@ class TestPasswordChange:
         assert resp.status_code == 403, resp.text
 
     def test_no_password_hash_user_gets_400_sso_message(self, app_client, fresh_db):
-        # No CSRF pre-fetch: the GET page never mints a token for an
-        # SSO-only account (no form to submit — see the change-page test
-        # below), so the 400 must be reachable without one.
+        # The GET page mints web_csrf unconditionally — including for an
+        # SSO-only account with no form to submit (Devin Review on PR
+        # #1548) — so a caller who did fetch it still reaches the 400.
         uid = _seed_user("google-only@test.com", password=None)
         token = _session_token(uid, "google-only@test.com")
+        csrf = _csrf_headers_and_cookies(app_client, token)
 
         resp = app_client.post(
             "/auth/password/change",
             json={"current_password": "anything", "new_password": "brand-new-password-456"},
-            headers=_auth(token),
+            headers={**_auth(token), **csrf},
         )
         assert resp.status_code == 400, resp.text
         assert "sso" in resp.text.lower() or "single sign-on" in resp.text.lower()
@@ -213,6 +214,24 @@ class TestPasswordChange:
             headers=_auth(token),
         )
         assert resp.status_code == 403, resp.text
+
+    def test_csrf_checked_before_no_password_hash_no_response_shape_leak(self, app_client, fresh_db):
+        """CSRF must be checked FIRST, before the no-password-hash lookup,
+        so a caller with no CSRF token gets the SAME 403 regardless of
+        whether the target account is SSO-only or password-based — the
+        ordering the pre-fix code got backwards (Devin Review on PR #1548):
+        SSO-only got 400, password accounts got 403, letting the status
+        code alone distinguish account type without proving anything."""
+        uid = _seed_user("google-only-csrf@test.com", password=None)
+        token = _session_token(uid, "google-only-csrf@test.com")
+        # No GET first — no web_csrf cookie, no header.
+        resp = app_client.post(
+            "/auth/password/change",
+            json={"current_password": "anything", "new_password": "brand-new-password-456"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 403, resp.text
+        assert "sso" not in resp.text.lower()
 
 
 class TestPasswordChangeRateLimit:
