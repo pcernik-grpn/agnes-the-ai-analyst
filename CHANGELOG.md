@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agnes update` no longer rewrites `CLAUDE.md` (and drops a fresh `.bak`) every day for no reason.** The workspace-prompt template's trailing "generated `{{ today }}`" stamp made `GET /api/welcome` render different bytes at every UTC date rollover even when nothing about the instance changed; the DEFAULT-mode refresh compared full content, so a pure date change looked like a real edit and triggered a rewrite + backup on the first session after midnight, forever. The comparison now masks date-shaped substrings before deciding whether to write — a genuine content change still rewrites and backs up as before. Backups everywhere a workspace-file `.bak` gets written (`agnes update`'s DEFAULT-mode refresh, `agnes init --force`, and the OVERRIDE-mode 3-way merge) are also now pruned to the 3 most recent per file, so they no longer accumulate unbounded. Closes #1476.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
