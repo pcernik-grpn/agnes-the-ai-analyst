@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.85.2] - 2026-08-24
+
 ### Fixed
 
 - **`/api/query` no longer lets a caller read absolute parquet paths out of DuckDB's SQLite-compat catalog.** The SELECT-only guard already blocked DuckDB's own metadata surfaces (`duckdb_views`, `information_schema`, …), but not the SQLite-compat aliases DuckDB also answers — `SELECT sql FROM sqlite_master` (and `sqlite_schema` / `sqlite_temp_master` / `sqlite_temp_schema`) returns every view's full `CREATE VIEW` body, which for the orchestrator's master views is `... AS SELECT * FROM read_parquet('/data/extracts/<source>/data/<id>.parquet')` — disclosing the server's absolute on-disk layout to any query caller regardless of RBAC. `duckdb_external_file_cache()` leaked the same paths directly. All five are now on the blocklist, in both the `/api/query` guard (`app/api/query.py`) and the hybrid/remote engine's sibling list (`src/remote_query.py`), which execute against the same local DuckDB views. BigQuery's `INFORMATION_SCHEMA` stays allowed — it runs remotely and discloses nothing local.
