@@ -301,9 +301,10 @@ def test_doctor_passes_side_car_backend(admin_client, force_side_car_state):
 ```
 
 - [x] **Step 2:** `.../bin/python scripts/verify_syncmap.py` → fix flags.
-- [ ] **Step 3:** Push `git push origin HEAD:refs/heads/zs/a1-pg-default-install`,
+- [x] **Step 3:** Push `git push origin HEAD:refs/heads/zs/a1-pg-default-install`,
   `gh pr create --draft` (body: deviation note, smoke-assumption list from
   Task 5 Step 1, no release cut), verify `gh pr checks` shows jobs.
+  → PR #1545, 16 jobs registered.
 - [ ] **Step 4:** `/agnes-review` on the branch; fix findings; `gh pr ready`
   only after CI green + review clean. Do not merge.
 
