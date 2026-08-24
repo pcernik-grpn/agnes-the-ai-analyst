@@ -286,6 +286,11 @@ class TestToolRegistration:
             # context/schema`.
             "get_semantic_context",
             "get_semantic_schema",
+            # Chat-first authoring (spec 2026-08-24) — the one semantic-layer
+            # write surface with outcome branching (admin → applied,
+            # non-admin → moderation queue). Triple-surface with POST
+            # /api/semantic-models/apply + `agnes semantic-model apply`.
+            "apply_semantic_model",
             # Re-run ingestion for one stuck file (needs_review/rejected) —
             # status-honesty follow-up (spec 2026-07-08). Triple-surface with
             # POST /api/collections/{cid}/files/{fid}/reingest +
