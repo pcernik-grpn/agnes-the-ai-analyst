@@ -1156,6 +1156,19 @@ _BLOCKED_SQL_TOKENS = [
     "duckdb_views",
     "duckdb_indexes",
     "duckdb_schemas",
+    # DuckDB's SQLite-compat catalog views. `SELECT sql FROM sqlite_master`
+    # returns every view's full CREATE VIEW body — which for the orchestrator's
+    # master views is `... AS SELECT * FROM read_parquet('/data/extracts/...')`,
+    # disclosing absolute on-disk parquet paths. Same class as duckdb_views
+    # above; the `duckdb_*` names just didn't cover the `sqlite_*` aliases
+    # (sqlite_master / sqlite_schema / sqlite_temp_master / sqlite_temp_schema —
+    # all four resolve in DuckDB).
+    "sqlite_master",
+    "sqlite_schema",
+    "sqlite_temp_master",
+    "sqlite_temp_schema",
+    # Leaks cached external file paths (absolute parquet paths) directly.
+    "duckdb_external_file_cache",
     "pragma_table_info",
     "pragma_storage_info",
     # Relative path traversal
