@@ -7,6 +7,7 @@ import os
 import re as _re
 import shutil as _shutil
 import sys
+import time as _time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -32,7 +33,18 @@ import tempfile as _tf
 # conftest first and its DATA_DIR is INHERITED by worker processes, so the
 # worker suffix must be applied even when DATA_DIR is already set — but only
 # when it points at our shared default, never at an operator-provided path.
-_default_data_dir = os.path.join(_tf.gettempdir(), ".agnes-test-data")
+#
+# Per-CHECKOUT isolation on top of that: the worker suffix alone is not
+# enough once a second git worktree runs its own suite concurrently, because
+# `gw0` in worktree A and `gw0` in worktree B resolve to the SAME
+# `$TMPDIR/.agnes-test-data/gw0/state/system.duckdb` — each worker really
+# does write an 18-35 MB DB there — and DuckDB takes an exclusive file lock
+# on it. Keying the root on a hash of this checkout's path gives every
+# worktree its own tree, so `scripts/dev/worktree-spawn.sh` sessions can run
+# tests at the same time. The hash (not the raw path) keeps the directory
+# name short and free of separators.
+_checkout_token = _hashlib.sha256(str(Path(__file__).resolve().parents[1]).encode()).hexdigest()[:8]
+_default_data_dir = os.path.join(_tf.gettempdir(), f".agnes-test-data-{_checkout_token}")
 _xdist_worker = os.environ.get("PYTEST_XDIST_WORKER", "")
 if "DATA_DIR" not in os.environ:
     os.environ["DATA_DIR"] = _default_data_dir
@@ -40,6 +52,37 @@ if _xdist_worker and os.path.normpath(os.environ["DATA_DIR"]) == _default_data_d
     os.environ["DATA_DIR"] = os.path.join(_default_data_dir, _xdist_worker)
 os.makedirs(os.path.join(os.environ["DATA_DIR"], "notifications"), exist_ok=True)
 os.makedirs(os.path.join(os.environ["DATA_DIR"], "state"), exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Local worker cap
+# ---------------------------------------------------------------------------
+# `-n auto` resolves to one worker per core, and each worker is a full Python
+# process that imports `app.main` — measured at ~430 MB RSS once warm (pandas
+# and sqlalchemy are pulled in eagerly). On a 14-core laptop that is ~6.5 GB
+# and 14 cores pinned for a suite that is mostly waiting on DuckDB file I/O,
+# which is what makes the machine unusable and drains the battery. Worse, a
+# second git worktree running its own suite doubles it.
+#
+# Past ~6 workers the suite is I/O-bound, not CPU-bound, so the extra
+# processes buy little wall-clock while costing linear RAM and heat. Capping
+# what `auto` MEANS (rather than editing the documented `-n auto` command)
+# keeps one command working everywhere and leaves every explicit `-n N`
+# untouched.
+#
+# CI is exempt: its runners have 2-4 cores, `auto` is already small there, and
+# shard wall-clock is the thing being optimized. `AGNES_TEST_MAX_WORKERS`
+# overrides the cap; `PYTEST_XDIST_AUTO_NUM_WORKERS` set by the caller always
+# wins, since we only fill it in when absent.
+LOCAL_MAX_WORKERS = 6
+
+if "PYTEST_XDIST_AUTO_NUM_WORKERS" not in os.environ and not os.environ.get("CI"):
+    _cap = os.environ.get("AGNES_TEST_MAX_WORKERS", "").strip()
+    try:
+        _cap_n = int(_cap) if _cap else LOCAL_MAX_WORKERS
+    except ValueError:
+        _cap_n = LOCAL_MAX_WORKERS
+    if _cap_n > 0:
+        os.environ["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(max(1, min(_cap_n, os.cpu_count() or _cap_n)))
 
 # ---------------------------------------------------------------------------
 # Small DuckDB blocks for every test-created database
@@ -178,6 +221,90 @@ def pytest_sessionstart(session):
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
         if reporter is not None:
             reporter.write_line(f"disk guard: {message}", yellow=True)
+
+    # Sweep leaked scratch from previous runs BEFORE this one allocates any.
+    # Both sweeps used to be reachable only from ``tests/db_pg``'s own session
+    # fixture, so a developer who never ran the PG package (the common case:
+    # `pytest tests/test_foo.py`) accumulated orphans indefinitely — measured
+    # at 4.1 GB of pgserver dirs plus 0.8 GB of stale DATA_DIR roots on one
+    # machine. Running it from the controller's sessionstart makes every
+    # invocation of the suite pay the (millisecond) scan and keeps the
+    # footprint bounded. Never fatal: this is hygiene, not a gate.
+    _sweep_leaked_scratch(session)
+
+
+def _sweep_leaked_scratch(session) -> None:
+    """Reap orphaned pgserver data dirs + stale per-checkout DATA_DIR roots."""
+    tmp_root = Path(_tf.gettempdir())
+    reaped: list[Path] = []
+    try:
+        from tests.db_pg.pgserver_reaper import reap_orphaned_pgserver_dirs
+
+        reaped.extend(reap_orphaned_pgserver_dirs(tmp_root))
+    except Exception:
+        pass  # psutil missing, permissions, racing session — never break a run
+    try:
+        reaped.extend(reap_stale_test_data_roots(tmp_root))
+    except Exception:
+        pass
+    if reaped:
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(f"swept {len(reaped)} leaked scratch dir(s) from previous runs", yellow=True)
+
+
+# Roots older than this are certainly not serving a live run: an active
+# session rewrites its worker DBs continuously, so a fresh mtime means "in
+# use". Deliberately generous — a stale root costs disk, a wrongly deleted
+# one breaks a concurrent worktree's suite mid-run.
+STALE_DATA_ROOT_SECONDS = 24 * 3600
+
+
+def reap_stale_test_data_roots(tmp_root: Path, *, max_age_seconds: int = STALE_DATA_ROOT_SECONDS) -> list[Path]:
+    """Remove ``.agnes-test-data*`` roots left by runs that are long gone.
+
+    Covers this checkout's own abandoned roots, other checkouts' roots (a
+    deleted worktree never cleans up after itself), and the legacy un-suffixed
+    ``.agnes-test-data`` from before the per-checkout token existed. The
+    CURRENT run's root is never a candidate: it was just created, so its mtime
+    is now.
+    """
+    removed: list[Path] = []
+    now = _time.time()
+    current = os.path.normpath(os.environ.get("DATA_DIR", ""))
+    for d in tmp_root.glob(".agnes-test-data*"):
+        try:
+            if not d.is_dir():
+                continue
+            if os.path.normpath(str(d)) == current or current.startswith(os.path.normpath(str(d)) + os.sep):
+                continue  # this run's own root (or its worker subdir's parent)
+            if now - _newest_mtime(d) < max_age_seconds:
+                continue
+            _shutil.rmtree(d, ignore_errors=True)
+            removed.append(d)
+        except OSError:
+            continue
+    return removed
+
+
+def _newest_mtime(root: Path) -> float:
+    """Most recent mtime anywhere under ``root``.
+
+    The root dir's own mtime only tracks direct-child creation, so a long run
+    writing into ``gw3/state/system.duckdb`` leaves it stale and would look
+    abandoned. Walk one worker level deep — enough to see liveness without
+    paying a full recursive stat on a multi-GB tree.
+    """
+    newest = root.stat().st_mtime
+    for child in root.iterdir():
+        try:
+            newest = max(newest, child.stat().st_mtime)
+            if child.is_dir():
+                for grandchild in child.iterdir():
+                    newest = max(newest, grandchild.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 # ---------------------------------------------------------------------------
