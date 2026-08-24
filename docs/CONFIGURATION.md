@@ -147,6 +147,15 @@ See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.
 | Skill-lint duplicate candidate count | `guardrails.lint_duplicate_top_n` | `5` | `get_lint_duplicate_top_n()` |
 | Skill-lint audit min interval (hours) | `guardrails.lint_audit_min_interval_hours` | `144` | `get_lint_audit_min_interval_hours()` |
 
+### Audit trail
+
+See [`observability.md`](observability.md) for the full audit/activity-trail
+inventory and which of the seven trails this retention policy covers.
+
+| Knob | `instance.yaml` path | Default | Resolver |
+|------|----------------------|---------|----------|
+| `audit_log` retention (days, `0` = keep forever) | `audit.retention_days` | `365` | `get_audit_retention_days()` |
+
 ---
 
 ## Annotated `instance.yaml` examples
