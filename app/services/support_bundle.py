@@ -2,9 +2,9 @@
 
 One structured, **redacted** snapshot of the instance an operator can attach
 to a support ticket: build fingerprint, schema/migration verdict, per-source
-sync rollup with the most recent failures, data-dir disk usage, process
-signals, retrieval mode, and secret *presence* (names and booleans only —
-never values; the redaction test pins this).
+sync rollup with a capped sample of failing tables, data-dir disk usage,
+process signals, retrieval mode, and secret *presence* (names and booleans
+only — never values; the redaction test pins this).
 
 Unlike its sibling ``instance_doctor`` (the new-instance deployment gate,
 active checks with pass/fail verdicts), this module *collects state*: the
@@ -209,6 +209,13 @@ def _collect_sync() -> dict:
 
         if state.get("status") == "error":
             agg["errors"] += 1
+            # A capped SAMPLE in registry (name) order, deliberately not
+            # "most recent": nothing records when a failure happened —
+            # `set_error` writes no timestamp and leaves `last_sync` at the
+            # last *success* (or NULL) — so any recency sort here (e.g. by
+            # `last_sync` desc) would order by last success while claiming
+            # failure recency. The `errors` count above is always exact;
+            # only this detail list is truncated.
             if len(agg["last_errors"]) < _MAX_ERRORS_PER_SOURCE:
                 agg["last_errors"].append(
                     {

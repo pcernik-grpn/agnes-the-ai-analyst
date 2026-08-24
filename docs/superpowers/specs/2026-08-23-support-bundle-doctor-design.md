@@ -61,7 +61,7 @@ Response sections:
 | `build` | version, channel, image tag, commit sha, deployed_at, uptime | same env vars `/api/version` + `/api/health/detailed` read |
 | `schema` | backend (duckdb/postgres), current vs expected, verdict | `app.api.health._check_db_schema` (reused, not re-derived) |
 | `retrieval` | `hybrid` \| `lexical_only` + verdict (`warning` on lexical_only — the degradation this key exists to make loud, #898) | `src.ingest.retrieval.retrieval_mode()` |
-| `sync` | per **source_type** rollup: table count, ok/error/stale counts, newest last_sync, up to 5 most recent `{table_id, error, at}` failures | `sync_state_repo()` × `table_registry_repo()` join in Python |
+| `sync` | per **source_type** rollup: table count, ok/error/stale counts, newest last_sync, plus a sample of up to 5 `{table_id, error, last_sync}` failures in registry name order (failure time is not recorded — `set_error` writes no timestamp — so the sample is capped, not recency-sorted; the error *count* stays exact) | `sync_state_repo()` × `table_registry_repo()` join in Python |
 | `disk` | data-dir filesystem total/used/free, state+analytics DB file sizes | `shutil.disk_usage`, `Path.stat` |
 | `process` | state backend (duckdb/pg), python version, data-apps enabled | `use_pg()`, `sys.version`, switches |
 | `secrets` | curated env-var names → `present`/`absent` — **names and booleans only, never values** | `os.environ` membership |

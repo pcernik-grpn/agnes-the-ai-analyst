@@ -61,8 +61,10 @@ async def doctor_support(_user: dict = Depends(require_admin)):
     ``schema`` (backend + current vs expected migration verdict), ``retrieval``
     (``hybrid``/``lexical_only`` — the latter with ``status: warning`` so the
     degradation is loud), ``sync`` (per-``source_type`` rollup: table/ok/error/
-    stale/never_synced counts, newest ``last_sync_max``, up to 5 most recent
-    ``last_errors``), ``disk`` (data-dir filesystem usage + DB file sizes),
+    stale/never_synced counts, newest ``last_sync_max``, and ``last_errors`` —
+    a sample of up to 5 failing tables in registry name order; failure time is
+    not recorded, so the sample is capped, not recency-sorted, while the
+    ``errors`` count stays exact), ``disk`` (data-dir filesystem usage + DB file sizes),
     ``process`` (state backend, roles, python), and ``secrets`` (env-var
     **presence booleans only — never values**). Each section is collected in
     isolation; a crashing collector reports ``{"status": "error"}`` for its

@@ -129,6 +129,30 @@ class TestSupportDoctorSync:
         assert failing and failing[0]["table_id"] == "events"
         assert "connection reset" in failing[0]["error"]
 
+    def test_last_errors_is_a_capped_sample_in_registry_order(self, seeded_app):
+        """`last_errors` is a SAMPLE capped at 5, in registry name order.
+
+        Deliberately not "most recent": nothing records when a failure
+        happened (`set_error` writes no timestamp and preserves `last_sync`
+        as the last *success*), so a recency sort would order by last
+        success while claiming failure recency. The contract is therefore
+        a deterministic capped sample — and the `errors` COUNT must stay
+        exact even when the detail list truncates.
+        """
+        from src.repositories import sync_state_repo, table_registry_repo
+
+        registry = table_registry_repo()
+        state = sync_state_repo()
+        names = [f"fail_{i:02d}" for i in range(7)]
+        for name in names:
+            registry.register(id=name, name=name, source_type="databricks")
+            state.set_error(name, f"boom in {name}")
+
+        sync = _run(seeded_app["client"], seeded_app["admin_token"])["sync"]
+        agg = sync["sources"]["databricks"]
+        assert agg["errors"] == 7
+        assert [e["table_id"] for e in agg["last_errors"]] == names[:5]
+
     def test_sync_state_is_keyed_by_name_not_id(self, seeded_app):
         """`sync_state.table_id` mirrors `table_registry.name`, never `id`.
 
