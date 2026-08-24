@@ -35,6 +35,30 @@ def _doc(slug: str, metric_names: list[str]) -> str:
     )
 
 
+def _doc_with_fields(slug: str, table_id: str, field_names: list[str]) -> str:
+    """A valid document whose single dataset binds ``source: <table_id>`` —
+    the collision shape: the raw dataset id under which the projection keys
+    ``column_metadata`` is exactly the table id the admin metadata API also
+    writes. Fields carry NO description (the blanking case)."""
+    fields = "\n".join(
+        f"          - name: {name}\n"
+        "            expression:\n"
+        "              dialects:\n"
+        "                - dialect: ANSI_SQL\n"
+        f"                  expression: {name}\n"
+        for name in field_names
+    )
+    return (
+        "version: '0.2.0.dev0'\n"
+        "semantic_model:\n"
+        f"  - name: {slug}\n"
+        "    datasets:\n"
+        f"      - name: {slug}_ds\n"
+        f"        source: {table_id}\n"
+        "        fields:\n" + fields
+    )
+
+
 class TestProjectionOnWrite:
     def test_create_projects_metrics_with_manual_provenance(self, seeded_app):
         c = seeded_app["client"]
@@ -95,6 +119,91 @@ class TestProjectionOnWrite:
         assert repo.get("manual/_/retail/revenue") is not None
         assert repo.get("manual/_/retail/order_count") is None, "dropped metric must be pruned"
         assert repo.get("manual/_/finance/arr") is not None, "an unrelated manual model must survive untouched"
+
+    def test_admin_authored_column_description_survives_manual_model_projection(self, seeded_app):
+        """RED regression (Devin, PR #1528): the admin metadata API
+        (`POST /api/admin/metadata/{table_id}`) writes `column_metadata` under
+        `(table_id, column_name)` with `source='manual'` — the same key AND
+        source the manual-model projection used to write, so projecting a
+        model whose dataset binds to that table silently overwrote (and, via
+        `_prune_columns`, deleted) admin-authored descriptions. The projection
+        now writes under its own distinct source (`semantic_model`) and never
+        touches a row another writer owns."""
+        c = seeded_app["client"]
+
+        # Admin authors a description through the metadata API path.
+        r = c.post(
+            "/api/admin/metadata/orders",
+            json={"columns": [{"column_name": "amount", "basetype": "DECIMAL", "description": "Admin: order amount"}]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+
+        # A manual model binds a dataset to the SAME table id, declaring the
+        # same column (with no description — the blanking case) plus one of
+        # its own.
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("retail", "orders", ["amount", "region"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        admin_row = repo.get("orders", "amount")
+        assert admin_row is not None
+        assert admin_row["description"] == "Admin: order amount", "admin-authored description must win"
+        assert admin_row["source"] == "manual"
+
+        model_row = repo.get("orders", "region")
+        assert model_row is not None, "a column the admin never authored is still projected"
+        assert model_row["source"] == "semantic_model"
+
+        # Replacing the model with fewer fields prunes ONLY the projection's
+        # own rows — the admin-authored one is out of the prune's source scope.
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("retail", "orders", ["amount"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+        assert repo.get("orders", "region") is None, "the model's own dropped field must be pruned"
+        assert repo.get("orders", "amount")["description"] == "Admin: order amount"
+        assert repo.get("orders", "amount")["source"] == "manual"
+
+    def test_deleting_a_manual_model_spares_admin_authored_columns(self, seeded_app):
+        """DELETE prunes the model's own projected columns but must never
+        reach an admin-authored `source='manual'` row for the same table."""
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/admin/metadata/orders",
+            json={"columns": [{"column_name": "amount", "description": "Admin: order amount"}]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        created = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("retail", "orders", ["amount", "region"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert created.status_code == 201, created.text
+
+        r = c.delete(
+            f"/api/admin/semantic-models/{created.json()['id']}",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 204, r.text
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("orders", "region") is None, "the deleted model's own column rows must be pruned"
+        admin_row = repo.get("orders", "amount")
+        assert admin_row is not None, "an admin-authored row must survive the model's deletion"
+        assert admin_row["description"] == "Admin: order amount"
+        assert admin_row["source"] == "manual"
 
     def test_update_via_put_does_not_break_projection(self, seeded_app):
         """The PUT (name/description only) path must not regress the

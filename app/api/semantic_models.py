@@ -152,6 +152,15 @@ def _project(document_json: Optional[dict], *, source: str, source_ref: Optional
     write. ``partial`` narrows the prune to this document's own model-id
     prefix (see ``project_document``'s docstring), leaving every other
     model's rows untouched.
+
+    ``column_metadata`` is one further step removed: the admin metadata API
+    (``app/api/metadata.py``) writes the same ``(table_id, column_name)``
+    key under ``source='manual'`` too, so the projection stores a manual
+    model's dataset fields under its own distinct source
+    (``MANUAL_MODEL_COLUMN_SOURCE``) and never overwrites a row another
+    writer owns — admin-authored descriptions win, and the projection's
+    prune cannot reach them (see ``src/semantic/projection.py::
+    _column_source``).
     """
     if not document_json:
         return

@@ -33,6 +33,40 @@ logger = logging.getLogger(__name__)
 _GLOSSARY_VENDOR = "agnes"
 
 
+# Provenance of a hand-authored model stored through the admin API
+# (app/api/semantic_models.py) — the one document source whose name collides
+# with an EXISTING `column_metadata.source` value: the admin metadata API
+# (app/api/metadata.py) writes the same `(table_id, column_name)` PK with
+# `source='manual'` too, and a manual dataset's `source` IS an Agnes table id
+# (that binding is what surfaces its field descriptions in /api/v2/schema).
+_MANUAL_DOCUMENT_SOURCE = "manual"
+
+# The distinct `column_metadata.source` a manual model's projection writes
+# — and prunes — under instead, so `_prune_columns` scoped to it can never
+# delete an admin-authored `source='manual'` row. See `_column_source`.
+MANUAL_MODEL_COLUMN_SOURCE = "semantic_model"
+
+
+def _column_source(source: str) -> str:
+    """The ``column_metadata.source`` value a document with provenance
+    ``source`` writes (and prunes) its dataset fields under.
+
+    Identity for every synced source (``ossie_git``/``ossie_upload``/
+    ``ossie_connection``, ``keboola_metastore``, …) — their provenance never
+    collides with another ``column_metadata`` writer. Only the manual admin
+    API path is remapped: keeping ``source='manual'`` there would make the
+    projection's upsert overwrite — and its prune delete — admin-authored
+    rows the metadata API stores under the very same key and source.
+    Precedence is write-time and explicit: an existing row owned by any
+    OTHER writer (admin ``'manual'``, ``'profiler'``, ``'ai_enrichment'``)
+    wins over a manual model's projection and is left untouched (see the
+    guard in :func:`project_document`); since ``(table_id, column_name)``
+    holds a single row, that write-time precedence is also what every reader
+    (e.g. ``/api/v2/schema``) sees.
+    """
+    return MANUAL_MODEL_COLUMN_SOURCE if source == _MANUAL_DOCUMENT_SOURCE else source
+
+
 def _is_agnes_vendor(vendor_name) -> bool:
     """Case-insensitive match against the Agnes vendor tag — the same
     casefolded posture the query validator and the browse view take."""
@@ -356,6 +390,12 @@ def project_document(
     binder = _table_binder()
     kb_lookups = _keboola_lookups()
 
+    # The `column_metadata.source` this document's dataset fields are written
+    # and pruned under — identical to `source` for every synced source, but a
+    # distinct value for the manual admin-API path, whose `source='manual'`
+    # collides with the admin metadata API's own rows (see `_column_source`).
+    column_source = _column_source(source)
+
     # One id prefix per model projected here. Used only when ``partial`` — see
     # the docstring — to keep the prune off models this call never saw.
     model_prefixes: set[str] = set()
@@ -460,12 +500,26 @@ def project_document(
                 column_name = column.get("name")
                 if not column_name:
                     continue
+                if column_source != source:
+                    # Manual path only (`_column_source` remapped it): a
+                    # manual dataset's `source` is an Agnes table id, i.e.
+                    # the SAME `(table_id, column_name)` key the admin
+                    # metadata API, the profiler and ai_enrichment write.
+                    # A row any of those already owns wins — the upsert
+                    # would otherwise silently overwrite an admin-authored
+                    # description (frequently blanking it, since model
+                    # fields often carry none). Skipped rows are also out
+                    # of `_prune_columns`'s reach, which is scoped to
+                    # `column_source`.
+                    existing = column_metadata_repo().get(table_id, column_name)
+                    if existing is not None and (existing.get("source") or "") != column_source:
+                        continue
                 column_metadata_repo().save(
                     table_id=table_id,
                     column_name=column_name,
                     basetype=column.get("datatype"),
                     description=column.get("description"),
-                    source=source,
+                    source=column_source,
                 )
                 field_names.add(column_name)
                 report.columns_written += 1
@@ -513,7 +567,10 @@ def project_document(
     )
     # `_prune_columns` needs no narrowing: it only visits tables THIS call
     # wrote to, so a dropped model's tables are out of its reach already.
-    _prune_columns(source, written_columns_by_table)
+    # Scoped to `column_source`, not `source` — for the manual path the two
+    # differ precisely so this prune can never delete an admin-authored
+    # `source='manual'` row for the same table (see `_column_source`).
+    _prune_columns(column_source, written_columns_by_table)
 
     if report.glossary_written or report.glossary_pruned:
         glossary_repo().refresh_search_index()
@@ -558,7 +615,11 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
             if isinstance(dataset, dict)
         }
         if written_by_table:
-            _prune_columns(source, written_by_table)
+            # Same `column_source` remapping as the write side: a manual
+            # model's rows live under `MANUAL_MODEL_COLUMN_SOURCE`, so this
+            # prune deletes exactly what `project_document` wrote and can
+            # never reach an admin-authored `source='manual'` row.
+            _prune_columns(_column_source(source), written_by_table)
 
     if report.glossary_pruned:
         glossary_repo().refresh_search_index()
