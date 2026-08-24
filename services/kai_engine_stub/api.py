@@ -121,8 +121,15 @@ def _verify_session_jwt(authorization: Optional[str]) -> dict:
 # scenario reads as the SHAPE of a turn, which is what a reader is here for.
 
 
-def _text(delta: str, *, part: str = "t1") -> dict:
-    return {"type": "text-delta", "id": part, "delta": delta}
+def _text(delta: str) -> dict:
+    """A text delta. The part id is assigned by :func:`_assign_part_ids` once
+    the whole scenario is known — a real stream opens a NEW text part after
+    each tool call, and that is load-bearing rather than cosmetic: the
+    provider builds the turn's persisted content as
+    ``"\\n\\n".join(part.strip() …)`` over parts, so a stub that reused one id
+    would make ``assistant_message.content`` a plain concatenation of the
+    deltas and hide every consumer that must not assume that."""
+    return {"type": "text-delta", "id": None, "delta": delta}
 
 
 def _tool_call(call_id: str, name: str, args: dict) -> dict:
@@ -215,6 +222,37 @@ SCENARIOS: dict[str, list[dict]] = {
         {"type": "finish"},
     ],
 }
+
+
+def _assign_part_ids(events: list[dict]) -> list[dict]:
+    """Give each RUN of text deltas its own part id.
+
+    A real AI-SDK stream opens a new text part after a tool call rather than
+    continuing the previous one, and the provider turns those parts into the
+    persisted answer with ``"\\n\\n".join(part.strip() …)``. So a multi-part
+    turn's ``assistant_message.content`` is deliberately NOT the concatenation
+    of its deltas — whitespace at the seams differs. Reproducing that here is
+    the whole point: a client that reconstructs its display by slicing the
+    server's content against the deltas it saw works fine on a single-part
+    turn and breaks on a real one, and only a stub that emits distinct part
+    ids can catch it.
+    """
+    out: list[dict] = []
+    part_index = 0
+    previous_was_text = False
+    for event in events:
+        if event.get("type") == "text-delta":
+            if not previous_was_text:
+                part_index += 1
+            out.append({**event, "id": f"t{part_index}"})
+            previous_was_text = True
+        else:
+            out.append(event)
+            previous_was_text = False
+    return out
+
+
+SCENARIOS = {key: _assign_part_ids(events) for key, events in SCENARIOS.items()}
 
 
 def _pick_scenario(message: str) -> list[dict]:

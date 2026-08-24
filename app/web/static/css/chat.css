@@ -1099,15 +1099,16 @@ pre.code-block-wrap code .hljs-deletion {
 .cloud-chat-tool.is-done    { border-left-color: var(--ds-accent-success-line); }
 .cloud-chat-tool.is-error   { border-left-color: var(--ds-accent-danger-line); }
 /* Replayed from a persisted `{tool, args}` row (reload path): the record
-   carries no outcome, so the status edge stays neutral — a success-green
-   card would claim an outcome the row cannot evidence. It also sits INSIDE
-   a message bubble rather than in the stream, so it drops the centering and
-   fills the bubble's width. */
+   carries no outcome, so the status edge stays neutral — a success-green card
+   would claim an outcome the row cannot evidence.
+   Status ONLY: no layout overrides. A replayed card is appended as a sibling
+   in the messages column, exactly where the live stream puts one, so it
+   inherits the geometry above by construction. It previously nested inside
+   `.msg-bubble` (`flex: 0 1 auto; max-width: 80%`) and needed margin/width
+   overrides to cope, which still left every card as wide as its own message's
+   longest line instead of the reading column. */
 .cloud-chat-tool.is-replayed {
   border-left-color: var(--ds-border);
-  margin-left: 0;
-  margin-right: 0;
-  max-width: 100%;
 }
 
 .cloud-chat-tool-head {

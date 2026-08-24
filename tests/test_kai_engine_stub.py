@@ -343,3 +343,35 @@ def _looks_like_error_text(result: str) -> bool:
     would have missed this failure."""
     head = str(result).strip()[:12].lower()
     return head.startswith("error") or head.startswith("traceback")
+
+
+def test_content_is_not_the_concatenation_of_the_deltas(stub_env):
+    """The regression guard for the whole segmentation design.
+
+    A real turn opens a new text part after each tool call, and the provider
+    persists the answer as `"\\n\\n".join(part.strip() …)`. So `content` differs
+    from the raw delta stream at the seams — which is why a client must not
+    rebuild its display by slicing `content` against the deltas it saw. If
+    this assertion ever flips to "equal", the stub has stopped reproducing the
+    real shape and the client-side guard in test_chat_tool_rendering_ui.py is
+    guarding nothing.
+    """
+    frames = asyncio.run(_turn(stub_env, "interleaved"))
+    deltas = "".join(f["text"] for f in frames if f["type"] == "token")
+    content = next(f for f in frames if f["type"] == "assistant_message")["content"]
+    assert content != deltas, (
+        "the stub must emit MULTIPLE text parts so content is a joined-and-stripped "
+        "assembly, not a plain concatenation — see _assign_part_ids"
+    )
+    # Both still carry the same prose; only the seams differ.
+    assert "server status" in content and "CZ leads" in content
+
+
+def test_text_parts_are_distinct_across_tool_boundaries(stub_env):
+    """Pins the cause of the divergence above, so a failure says which half
+    broke: the stub's part-id assignment, or the provider's join."""
+    import services.kai_engine_stub.api as stub_api
+
+    ids = [e["id"] for e in stub_api.SCENARIOS["interleav"] if e.get("type") == "text-delta"]
+    assert len(set(ids)) >= 3, f"expected a new text part after each tool call, got {ids}"
+    assert None not in ids, "every text delta must carry a resolved part id"

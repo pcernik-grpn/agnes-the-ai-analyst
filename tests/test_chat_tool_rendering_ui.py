@@ -711,6 +711,27 @@ def test_a_replayed_card_claims_no_outcome_it_cannot_evidence():
     assert "accent-success" not in replayed and "accent-info" not in replayed, (
         "a replayed card's status edge must stay neutral"
     )
+    # Status only. Layout overrides here mean the card is being nested
+    # somewhere with different geometry than the live stream's — which is how
+    # replayed cards ended up as wide as each message's longest line.
+    for prop in ("margin", "max-width", "width"):
+        assert prop not in replayed, (
+            f"`{prop}` on .is-replayed — a replayed card must inherit the live card's "
+            "geometry by being appended in the same place, not by overriding it"
+        )
+
+
+def test_replayed_cards_are_siblings_in_the_messages_column():
+    """`.msg-bubble` is `flex: 0 1 auto; max-width: 80%` — sized by its widest
+    line — so a card nested inside one cannot match the live card's reading-
+    column width, and two answers of different lengths produced two different
+    card widths. Append them where the live stream appends its own."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderMessage") : js.index("function enhanceTables")]
+    assert "bubble.appendChild(_buildToolCard(" not in body, "a card inside the bubble inherits the bubble's width"
+    assert 'for (const card of replayedCards) $("chat-messages").appendChild(card)' in body
+    # The collapse measures the answer, and the cards are no longer in it.
+    assert body.index("maybeMakeCollapsible(article)") < body.index("for (const card of replayedCards)")
 
 
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():
@@ -754,19 +775,40 @@ def test_seal_concatenates_exactly_and_skips_the_heavy_tail():
     assert "_markLatestAssistant" not in fn
 
 
-def test_finalize_subtracts_the_sealed_prefix():
-    """finalize's content is the WHOLE turn; with sealed segments already on
-    screen it must render only the remainder — and when the server's content
-    disagrees with the streamed deltas, drop the sealed bubbles and render
-    the authoritative content whole rather than duplicate or lose text."""
+def test_a_segmented_turn_paints_the_local_tail_not_a_slice_of_server_content():
+    """`assistant_message.content` is NOT the concatenation of the streamed
+    deltas: the engine provider builds it as `"\\n\\n".join(part.strip() …)`
+    over text parts (`_TurnState.text`) and the native runner consolidates
+    TextBlocks the same way. So reconstructing the final bubble by subtracting
+    a "sealed prefix" from `content` only works on a turn with ONE text part;
+    on a real multi-part turn the match misses, and any fallback that then
+    re-renders `content` whole puts all the text back below all the cards —
+    the exact bug the segmentation exists to fix. Display therefore comes from
+    the deltas the client actually showed; `content` stays the RECORD."""
     js = _read(CHAT_JS)
     fin = js[js.index("function finalizeAssistantMessage") : js.index("// ---------- Inline tool-call blocks")]
-    assert "content.startsWith(_turnSealedText)" in fin
-    assert "content.slice(_turnSealedText.length)" in fin
-    assert "el.remove()" in fin, "the mismatch fallback must remove the sealed bubbles"
+    assert "startsWith(_turnSealedText)" not in fin, "no prefix arithmetic against server content"
+    assert "_turnSealedText.length" not in fin, "no slicing of server content"
+    assert "segmented ? currentAssistantText : content" in fin, (
+        "segmented turns paint the local tail; unsegmented ones the authoritative content"
+    )
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in fin, (
         "the copy row hands over the WHOLE answer, not the tail the bubble shows"
     )
+
+
+def test_the_trailing_segment_finish_path_also_caps_a_long_answer():
+    """A turn that ends on a tool/approval/question card takes the early
+    return, which attaches chips and the copy row to the last sealed bubble.
+    Every other finish path caps an over-long answer; this one must too."""
+    js = _read(CHAT_JS)
+    fin = js[js.index("function finalizeAssistantMessage") : js.index("// ---------- Inline tool-call blocks")]
+    early = fin[
+        fin.index("if (!currentAssistantArticle && !tail.trim()") : fin.index(
+            '_turnSealedText = "";\n  _turnSealedArticles = [];\n  if ('
+        )
+    ]
+    assert "maybeMakeCollapsible(article)" in early
 
 
 def test_reset_clears_the_seal_bookkeeping():

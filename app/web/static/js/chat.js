@@ -2050,26 +2050,33 @@ function renderMessage(m) {
     bubble.insertBefore(who, body);
   }
 
-  if (m.tool_calls && m.tool_calls.length) {
-    for (const tc of m.tool_calls) {
-      // A row can carry no `tool` name at all — the cancelled/interrupted
-      // markers manager.py stores in place of a real tool call. Rendering
-      // those unconditionally produced `tool: undefined` and an empty fence.
-      if (!formatToolCall(tc)) continue;
-      // The SAME card the live stream renders, so a refresh doesn't downgrade
-      // the answer's evidence to a flat grey `tool: …` box. `is-replayed`:
-      // the persisted row is `{tool, args}` only, so there is no result body,
-      // no timing and no status icon to show. Position isn't persisted either
-      // — the cards still land after the bubble rather than inline where they
-      // ran (#1504 part 2 needs an ordered `parts` structure on the row).
-      // Built via textContent throughout (F3): tc.tool / tc.args are untrusted.
-      bubble.appendChild(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
-    }
+  // Replayed tool cards. Built here but appended AFTER the article below, as
+  // siblings in the messages column — which is where the live stream puts
+  // them. That placement is the whole point: `.msg-bubble` is
+  // `flex: 0 1 auto; max-width: 80%`, i.e. sized by its widest line, so a
+  // card nested inside one came out as wide as that message's prose happened
+  // to be (382px under one answer, 324px under another) while a live card
+  // spans the reading column. Same component, three different widths. As a
+  // sibling it inherits the identical `.cloud-chat-tool` geometry by
+  // construction rather than by a matching pair of overrides.
+  const replayedCards = [];
+  for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
+    // A row can carry no `tool` name at all — the cancelled/interrupted
+    // markers manager.py stores in place of a real tool call. Rendering
+    // those unconditionally produced `tool: undefined` and an empty fence.
+    if (!formatToolCall(tc)) continue;
+    // The SAME card the live stream renders, so a refresh doesn't downgrade
+    // the answer's evidence to a flat grey `tool: …` box. `is-replayed`: the
+    // persisted row is `{tool, args}` only, so there is no result body, no
+    // timing and no status icon to show. Position isn't persisted either —
+    // the cards land after the answer rather than inline where they ran
+    // (#1504 part 2 needs an ordered `parts` structure on the row).
+    // Built via textContent throughout (F3): tc.tool / tc.args are untrusted.
+    replayedCards.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
   }
 
-  // After the tool blocks: the chips summarise what those calls support, so
-  // they read as the conclusion of the evidence above them rather than as a
-  // header over it.
+  // Chips stay on the bubble, so they read as part of the answer; the cards
+  // that follow are the trail of what produced it.
   if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
@@ -2079,7 +2086,10 @@ function renderMessage(m) {
   attachMessageActions(article, stripNextActionsFence(m.content || ""));
   $("chat-messages").appendChild(article);
   if (m.role === "assistant") _markLatestAssistant(article);
+  // Before the cards are appended: the collapse measures the ANSWER's height,
+  // and the cards are no longer inside the article to be measured.
   maybeMakeCollapsible(article);
+  for (const card of replayedCards) $("chat-messages").appendChild(card);
   maybeScrollToBottom();
 }
 
@@ -2547,31 +2557,40 @@ function finalizeAssistantMessage(frame) {
   // journey counter (errors arrive on the separate "error" frame).
   onboardingNoteAnswered();
   const content = (frame && frame.content) || _turnSealedText + currentAssistantText;
-  // Segmented turn (#1504): the bubbles sealed at each inline block already
-  // show the turn's earlier text IN ORDER — only what follows the last seal
-  // belongs in the final bubble. The frame's content is the WHOLE turn, so
-  // subtract the sealed prefix. If the server's content disagrees with the
-  // streamed deltas (it is the authoritative record), the subtraction is
-  // meaningless: drop the sealed bubbles and render the content whole rather
-  // than duplicate or lose text — order degrades, the transcript does not.
-  let tail = content;
-  if (_turnSealedText) {
-    if (content.startsWith(_turnSealedText)) {
-      tail = content.slice(_turnSealedText.length);
-    } else {
-      for (const el of _turnSealedArticles) el.remove();
-    }
-  }
-  // No trailing text after the last block, but sealed text exists: the last
-  // sealed bubble is the answer's end — chips, sources and the copy row
-  // (carrying the FULL content) land there instead of on a phantom bubble.
-  if (!currentAssistantArticle && !tail.trim() && _turnSealedArticles.length) {
+  // Which text this bubble paints depends on whether the turn was SEGMENTED
+  // (#1504 — an inline block sealed at least one earlier bubble).
+  //
+  // Unsegmented: repaint from the server's `content`. It is the authoritative
+  // record (a partial-save or a rewrite lands there) and there is nothing on
+  // screen it could contradict.
+  //
+  // Segmented: paint the locally accumulated tail instead, and leave the
+  // sealed bubbles alone. `content` is NOT a concatenation of the deltas —
+  // the engine provider builds it as `"\n\n".join(part.strip() …)` over text
+  // parts (`_TurnState.text`), and the native runner likewise consolidates
+  // TextBlocks — so subtracting a "sealed prefix" from it only works while a
+  // turn happens to have a single text part. On a real multi-part turn the
+  // arithmetic misses, and any fallback that then re-renders `content` whole
+  // resurrects the exact bug this segmentation fixes: all the text below all
+  // the cards. The deltas the client actually displayed are the one source
+  // that is guaranteed ordered and complete, so display is derived from them
+  // and `content` is used only as the RECORD — the copy row and the
+  // next-actions/sources trailers below all still read from it.
+  const segmented = _turnSealedArticles.length > 0;
+  const tail = segmented ? currentAssistantText : content;
+  // No trailing text after the last block: the last sealed bubble is the
+  // answer's end — chips, sources and the copy row (carrying the FULL
+  // content) land there instead of on a phantom empty bubble.
+  if (!currentAssistantArticle && !tail.trim() && segmented) {
     const article = _turnSealedArticles[_turnSealedArticles.length - 1];
     const bubble = article.querySelector(".msg-bubble");
     renderSourcesChips(bubble, frame && frame.sources);
     renderNextActions(bubble, extractNextActions(content).actions);
     attachMessageActions(article, stripNextActionsFence(content));
     _markLatestAssistant(article);
+    // Every other finish path caps an over-long answer; this one must too, or
+    // a turn that ends on a tool card leaves its final segment uncapped.
+    maybeMakeCollapsible(article);
     _turnSealedText = "";
     _turnSealedArticles = [];
     maybeScrollToBottom();
