@@ -90,7 +90,7 @@ def test_start_pgserver_stops_postmaster_on_cleanup(monkeypatch):
     import time
     from pathlib import Path
 
-    from tests.db_pg.conftest import _resolve_backend, _start_pgserver
+    from tests.db_pg.conftest import _resolve_backend, _start_dedicated_pgserver
     from tests.db_pg.pgserver_reaper import OWNER_SENTINEL, _pid_alive
 
     if _resolve_backend() != "pgserver":
@@ -109,7 +109,7 @@ def test_start_pgserver_stops_postmaster_on_cleanup(monkeypatch):
 
     monkeypatch.setattr(tempfile, "mkdtemp", spying_mkdtemp)
 
-    gen = _start_pgserver()
+    gen = _start_dedicated_pgserver()
     try:
         url = next(gen)
         assert url.startswith("postgresql+psycopg://")

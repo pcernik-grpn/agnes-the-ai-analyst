@@ -67,9 +67,8 @@ def _reset_coordination():
 
 
 @pytest.fixture
-def proxy_env(e2e_env, monkeypatch):
+def proxy_env(e2e_env, monkeypatch, shared_app):
     """Real user/token rows + TestClient(app), data_apps enabled."""
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.access_tokens import AccessTokenRepository
@@ -108,7 +107,7 @@ def proxy_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
     from fastapi.testclient import TestClient
 
     client = TestClient(app)

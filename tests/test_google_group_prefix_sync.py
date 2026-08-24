@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def google_callback_env(tmp_path, monkeypatch):
+def google_callback_env(tmp_path, monkeypatch, shared_app):
     """TestClient for the Google callback wired against monkeypatched OAuth.
 
     Patches `is_available`, `oauth.google.authorize_access_token`, and
@@ -33,7 +33,6 @@ def google_callback_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
 
-    from app.main import create_app
     import app.auth.providers.google as g_mod
 
     monkeypatch.setattr(g_mod, "is_available", lambda: True)
@@ -49,7 +48,7 @@ def google_callback_env(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(g_mod.oauth, "google", fake_oauth_google, raising=False)
 
-    app = create_app()
+    app = shared_app
     return {
         "client": TestClient(app, follow_redirects=False),
         "monkeypatch": monkeypatch,
@@ -458,12 +457,11 @@ class TestApiGuard:
     """API endpoints reject mutations on Google-managed groups with 409."""
 
     @pytest.fixture
-    def admin_client(self, tmp_path, monkeypatch):
+    def admin_client(self, tmp_path, monkeypatch, shared_app):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
         monkeypatch.setenv("AGNES_GROUP_ADMIN_EMAIL", "grp_acme_admin@example.com")
 
-        from app.main import create_app
         from src.db import get_system_db
         from src.repositories.users import UserRepository
         from src.repositories.user_groups import UserGroupsRepository
@@ -489,7 +487,7 @@ class TestApiGuard:
         finally:
             conn.close()
 
-        app = create_app()
+        app = shared_app
         client = TestClient(app, follow_redirects=False)
         token = create_access_token("admin1", "admin@x")
         client.cookies.set("access_token", token)

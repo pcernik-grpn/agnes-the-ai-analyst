@@ -23,7 +23,7 @@ from tests.test_admin_store_submissions import _create_user, _seed_quarantined_e
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     """Same shape as the one in ``test_admin_store_submissions`` — declared here
     rather than imported, because importing a fixture by name trips ruff's F811
     on every test that takes it as a parameter."""
@@ -34,9 +34,8 @@ def web_client(tmp_path, monkeypatch):
     (tmp_path / "analytics").mkdir()
     (tmp_path / "extracts").mkdir()
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 

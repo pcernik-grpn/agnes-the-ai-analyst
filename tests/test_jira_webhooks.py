@@ -15,7 +15,7 @@ def _sign(payload: bytes, secret: str) -> str:
 
 
 @pytest.fixture()
-def webhook_client(tmp_path, monkeypatch):
+def webhook_client(tmp_path, monkeypatch, shared_app):
     """Create a TestClient with required env vars, dirs, and a seeded admin user."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -42,7 +42,6 @@ def webhook_client(tmp_path, monkeypatch):
     from src.repositories.user_group_members import UserGroupMembersRepository
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
-    from app.main import create_app
 
     conn = get_system_db()
     UserRepository(conn).create(id="wh_admin", email="whadmin@test.com", name="WH Admin")
@@ -50,7 +49,7 @@ def webhook_client(tmp_path, monkeypatch):
     UserGroupMembersRepository(conn).add_member("wh_admin", admin_gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     admin_token = create_access_token("wh_admin", "whadmin@test.com")
     return {"client": TestClient(app), "admin_token": admin_token}
 

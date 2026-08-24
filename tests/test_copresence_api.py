@@ -77,7 +77,7 @@ def _setup_users_and_chat_grant(conn):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def co_api(e2e_env):
+def co_api(e2e_env, shared_app):
     """Returns (client, s0_id, owner_hdr, invitee_email)."""
     conn = get_system_db()
     owner_token, collab_token, _ = _setup_users_and_chat_grant(conn)
@@ -88,9 +88,8 @@ def co_api(e2e_env):
     repo = ChatRepository(conn)
     s0 = repo.create_session(user_email="owner@example.com", surface=Surface.WEB)
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     # Wire both the auth DB + chat repo to the seeded conn
     app.state.chat_repo = repo
     client = TestClient(app)
@@ -101,7 +100,7 @@ def co_api(e2e_env):
 
 
 @pytest.fixture
-def co_api_other(e2e_env):
+def co_api_other(e2e_env, shared_app):
     """Returns (client, s0_id, other_hdr, invitee_email) — other is NOT the session owner."""
     conn = get_system_db()
     owner_token, collab_token, other_token = _setup_users_and_chat_grant(conn)
@@ -117,9 +116,8 @@ def co_api_other(e2e_env):
     repo = ChatRepository(conn)
     s0 = repo.create_session(user_email="owner@example.com", surface=Surface.WEB)
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     app.state.chat_repo = repo
     client = TestClient(app)
 
@@ -129,7 +127,7 @@ def co_api_other(e2e_env):
 
 
 @pytest.fixture
-def co_api_joined(e2e_env):
+def co_api_joined(e2e_env, shared_app):
     """Creates a co-session with owner + collab; stranger has no participant row.
     Returns (client, s1_id, collab_hdr, stranger_hdr).
     """
@@ -146,9 +144,8 @@ def co_api_joined(e2e_env):
         invitee_email="collab@example.com", invitee_user_id="collab1",
     )
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     app.state.chat_repo = repo
     client = TestClient(app)
 
@@ -159,7 +156,7 @@ def co_api_joined(e2e_env):
 
 
 @pytest.fixture
-def co_api_secret(e2e_env):
+def co_api_secret(e2e_env, shared_app):
     """S0 contains SECRET_ROW_VALUE in a message; invite must NOT clone it.
     Returns (client, s0_id, owner_hdr, invitee_email).
     """
@@ -173,9 +170,8 @@ def co_api_secret(e2e_env):
     # Seed a message with the secret that must NOT appear in the co-session
     repo.append_message(session_id=s0.id, role="assistant", content="SECRET_ROW_VALUE is the key")
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     app.state.chat_repo = repo
     client = TestClient(app)
 
@@ -196,7 +192,7 @@ def test_invite_requires_owner_and_invitee_chat_access(co_api):
 
 
 @pytest.fixture
-def co_api_case(e2e_env):
+def co_api_case(e2e_env, shared_app):
     """Like ``co_api`` but also yields the invitee's own token, so a test can
     check that the invited person can actually USE the session."""
     conn = get_system_db()
@@ -210,9 +206,7 @@ def co_api_case(e2e_env):
 
     from fastapi.testclient import TestClient
 
-    from app.main import create_app
-
-    app = create_app()
+    app = shared_app
     app.state.chat_repo = repo
     client = TestClient(app)
     yield client, s0.id, {"Authorization": f"Bearer {owner_token}"}, {"Authorization": f"Bearer {collab_token}"}

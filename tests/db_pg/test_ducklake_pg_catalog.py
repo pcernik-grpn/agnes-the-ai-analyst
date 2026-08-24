@@ -98,9 +98,9 @@ def _isolated_pg_url():
     would make a shared-server delta assertion flaky depending on test
     order; a dedicated throwaway server sidesteps it entirely.
     """
-    from tests.db_pg.conftest import _start_pgserver
+    from tests.db_pg.conftest import _start_dedicated_pgserver
 
-    yield from _start_pgserver()
+    yield from _start_dedicated_pgserver()
 
 
 @pytest.fixture

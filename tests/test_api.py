@@ -9,21 +9,19 @@ def _auth(token):
 
 
 @pytest.fixture
-def app_client(tmp_path, monkeypatch):
+def app_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret")
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     return TestClient(app)
 
 
 @pytest.fixture
-def seeded_client(tmp_path, monkeypatch):
+def seeded_client(tmp_path, monkeypatch, shared_app):
     """Client with a pre-created admin user and JWT token."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret")
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -41,7 +39,7 @@ def seeded_client(tmp_path, monkeypatch):
     grant_admin(conn, "admin1")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
 
     admin_token = create_access_token("admin1", "admin@acme.com")
