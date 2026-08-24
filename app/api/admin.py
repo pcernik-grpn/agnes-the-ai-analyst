@@ -2274,14 +2274,23 @@ def _feature_flags_inventory() -> List[Dict[str, Any]]:
             # there warns about). Same row shape as the leading experience
             # row: value_label carries the mode, effective mirrors
             # "resolved away from the default".
-            from app.switches import switch_value
-
-            value = str(switch_value(flag.name))
-            if os.environ.get(flag.env_var) is not None:
-                source = "env"
+            if flag.name in _CHAT_RUNTIME_FLAGS:
+                # A select that is ALSO chat-runtime-resolved (chat_provider):
+                # switch_value() raises for runtime_view switches by design —
+                # the runtime reads the overlay file alone, via
+                # load_chat_config — so its string comes from the same view
+                # the boolean chat flags use below.
+                value_raw, source = _chat_flag_runtime_view(flag)
+                value = str(value_raw)
             else:
-                probe = get_value(*flag.config_keys, default=_UNSET)
-                source = "default" if probe is _UNSET else "config"
+                from app.switches import switch_value
+
+                value = str(switch_value(flag.name))
+                if os.environ.get(flag.env_var) is not None:
+                    source = "env"
+                else:
+                    probe = get_value(*flag.config_keys, default=_UNSET)
+                    source = "default" if probe is _UNSET else "config"
             out.append(
                 {
                     "name": flag.name,

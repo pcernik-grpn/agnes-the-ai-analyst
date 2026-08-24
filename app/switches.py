@@ -152,6 +152,31 @@ SWITCHES: tuple[Switch, ...] = (
         description="Cloud-hosted chat (E2B sandbox agent sessions). New feature — off by default.",
     ),
     Switch(
+        name="chat_provider",
+        config_keys=("chat", "provider"),
+        env_var="AGNES_CHAT_PROVIDER",
+        kind="select",
+        options=("e2b", "docker", "kai-agent"),
+        default="e2b",
+        effect="restart",
+        category="product",
+        editable=True,
+        runtime_view="provider",
+        description=(
+            "Which engine runs web/Slack chat sessions: `e2b` (cloud microVM per session, the "
+            "default), `docker` (self-hosted container per session) or `kai-agent` (the embedded "
+            "kai-agent turn engine — see docs/cloud-chat.md). Resolved by `load_chat_config` "
+            "(env > instance.yaml > default) at boot, not through `switch_value` — hence "
+            "`runtime_view`. Editable because the whole `chat` section is (a raw section edit "
+            "could always write it); the real guards sit elsewhere: every provider rides "
+            "deployment-provisioned backing (E2B key/template, apps-runner sidecar, kai-agent "
+            "sidecar + KAI_HOST_JWT_SECRET), and app/main.py's boot gates refuse a provider "
+            "whose backing is absent, loudly, at the restart the save already requires. Pin "
+            "it in infrastructure via the customer-instance module's per-VM `chat_provider` "
+            "(AGNES_CHAT_PROVIDER) so a fresh data disk boots into the right engine."
+        ),
+    ),
+    Switch(
         name="data_apps",
         config_keys=("data_apps", "enabled"),
         env_var="AGNES_DATA_APPS_ENABLED",
