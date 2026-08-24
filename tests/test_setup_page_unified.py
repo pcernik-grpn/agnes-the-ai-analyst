@@ -186,7 +186,26 @@ def test_first_time_setup_data_source_dropdown(client):
     assert 'id="data-source-dd-btn"' in text
     assert 'aria-controls="data-source-dd-menu"' in text
     assert 'role="menuitemradio"' in text
-    for value in ("keboola", "bigquery", "local"):
+    for value in ("keboola", "bigquery"):
         assert f'data-value="{value}"' in text
     assert 'aria-checked="true"' in text
     assert "js/components/ds_dropdown.js" in text
+
+
+def test_first_time_setup_has_no_csv_dead_end(client):
+    """There is no CSV connector (see docs/DATA_SOURCES.md) — the wizard used
+    to offer "Local / CSV" as a Step 2 data source, which dead-ended at "Start
+    First Sync" with no upload UI. It is replaced by the same honest-guidance
+    pattern already shipped on `/admin/data-sources`: files enter through the
+    Library, not a connector."""
+    resp = client.get("/first-time-setup", follow_redirects=False)
+    assert resp.status_code == 200
+    text = resp.text
+    # The dead-end tile is gone from both the native select and the custom
+    # dropdown.
+    assert "Local / CSV" not in text
+    assert 'value="local"' not in text
+    assert 'data-value="local"' not in text
+    # Honest guidance pane in its place.
+    assert "ds-wguide" in text
+    assert "/library" in text

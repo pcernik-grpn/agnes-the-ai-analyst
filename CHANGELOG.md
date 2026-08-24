@@ -10,6 +10,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **`docker-compose.gcp-logging.yml` is now actually placed on a VM.** The Cloud Logging overlay's own header claimed the customer-instance Terraform module placed it, but nothing in `infra/modules/customer-instance/` did — so the overlay (and the log durability it buys across the auto-upgrade cron's routine container recreates) never activated on any deployment of the module. It now ships baked into the app image (`Dockerfile`) alongside every other host artifact and is extracted onto the VM by the startup script's existing `docker cp`; a new module variable `enable_gcp_logging` (default `true`) controls whether the script leaves it in place. For the non-gcplogs path (`enable_gcp_logging=false`, or any non-GCE deployment), the startup script now also writes `/etc/docker/daemon.json` with bounded `json-file` log rotation (`max-size=50m`, `max-file=5`) — but only when no `daemon.json` already exists, so an operator's own daemon config is never overwritten.
+- **`/setup` no longer offers "Local / CSV" as a data source.** There is no CSV connector — the tile dead-ended at Step 4's "Start First Sync" with no upload UI. Removed from the first-time-setup wizard's data-source picker and replaced with the same honest guidance already shown on `/admin/data-sources`: files enter through a Collection in the Library, not a connector.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
