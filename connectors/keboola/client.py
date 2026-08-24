@@ -648,36 +648,33 @@ class KeboolaClient:
                         if not slice_url:
                             continue
 
-                        # Convert gs:// URLs to HTTPS URLs for GCS
-                        if slice_url.startswith("gs://"):
-                            # gs://bucket/path -> https://storage.googleapis.com/bucket/path
-                            slice_url = slice_url.replace("gs://", "https://storage.googleapis.com/", 1)
-
                         logger.debug(f"Downloading slice {i + 1}/{len(slice_entries)}")
 
-                        # Add Bearer token for GCS authentication if available
-                        slice_headers = {}
-                        if gcs_access_token and "storage.googleapis.com" in slice_url:
-                            slice_headers["Authorization"] = f"Bearer {gcs_access_token}"
+                        # Every backend's scheme rewrite lives in the Storage
+                        # API client's dispatch, not here. This path grew its
+                        # own chain once and it silently lacked an azure://
+                        # arm long after the other one gained it, so the two
+                        # must not diverge again.
+                        from connectors.keboola.storage_api import KeboolaStorageClient
 
-                        # AWS-staged exports list raw s3:// slice URIs, which
-                        # requests cannot fetch at all. Rewrite + SigV4-sign
-                        # through the Storage API client's helper so this path
-                        # and that one cannot drift apart.
-                        if slice_url.startswith("s3://"):
-                            from connectors.keboola.storage_api import KeboolaStorageClient
-
-                            slice_url, slice_headers = KeboolaStorageClient._s3_slice_request(
-                                slice_url,
-                                i,
-                                KeboolaStorageClient._s3_context(file_data),
-                            )
+                        slice_url, extra_headers = KeboolaStorageClient._prepare_slice_request(
+                            slice_url,
+                            i,
+                            gcs_token=gcs_access_token,
+                            abs_credentials=file_data.get("absCredentials") or {},
+                            s3_context=KeboolaStorageClient._s3_context(file_data),
+                        )
+                        slice_headers = dict(extra_headers or {})
 
                         slice_response = requests.get(slice_url, headers=slice_headers)
                         slice_response.raise_for_status()
 
-                        # Check if slice is gzipped
-                        if slice_url.endswith(".gz"):
+                        # Check if slice is gzipped. Query-aware via the shared
+                        # detector: the rewrite above appends `?alt=media` (GCS)
+                        # or a SAS query (Azure), so a bare endswith(".gz") on
+                        # the full URL never matches and gzipped bytes would be
+                        # written raw into the CSV.
+                        if KeboolaStorageClient._slice_is_gzipped(slice_url):
                             import gzip
                             import io
 
