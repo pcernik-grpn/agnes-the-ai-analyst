@@ -283,13 +283,19 @@ jobs:
         run: |
           # Create empty .env (docker-compose.yml requires env_file: .env, gitignored)
           touch .env
-          # Use prod compose (GHCR images) + CI overlay (test secrets)
+          # Use prod compose (GHCR images) + the Postgres side-car overlay
+          # (A1: fresh installs default to it — see docker-compose.postgres.yml)
+          # + CI overlay (test secrets).
           export AGNES_TAG="${{ needs.build-and-push.outputs.image_tag }}"
-          compose="docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.ci.yml"
+          POSTGRES_PASSWORD="$(openssl rand -hex 16)"
+          export POSTGRES_PASSWORD
+          compose="docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml -f docker-compose.ci.yml"
           # Pull the app image with retries BEFORE `up` — a transient ghcr.io
           # pull timeout is an infra flake, not a broken :stable, and must not
           # trip the auto-rollback (issue #892). `up` below then starts from
-          # the already-pulled local image.
+          # the already-pulled local image. `migrate`/`data-migrate` share the
+          # same image reference, so pulling `app` covers them too; `postgres`
+          # is a public image `up` pulls on its own.
           for attempt in 1 2 3 4 5; do
             if $compose pull app; then
               break
@@ -298,16 +304,20 @@ jobs:
             echo "pull attempt $attempt failed; retrying in $((attempt * 5))s"
             sleep $((attempt * 5))
           done
+          # `up -d app` also brings up app's dependency chain (postgres ->
+          # migrate -> data-migrate) per their `depends_on` conditions.
           $compose up -d app
-          # Wait for healthy (max 60s)
-          timeout 60 bash -c 'until curl -sf http://localhost:8000/api/health | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d[\"status\"]!=\"unhealthy\" else 1)"; do sleep 3; done'
+          # Wait for healthy (max 120s — was 60s pre-A1; postgres init +
+          # `alembic upgrade head` + the DuckDB->PG data-migrate one-shot now
+          # gate app's start, on top of the app's own boot time).
+          timeout 120 bash -c 'until curl -sf http://localhost:8000/api/health | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d[\"status\"]!=\"unhealthy\" else 1)"; do sleep 3; done'
 
       - name: Run smoke tests
         run: bash scripts/smoke-test.sh http://localhost:8000
 
       - name: Collect logs on failure
         if: failure()
-        run: docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.ci.yml logs > smoke-test-logs.txt
+        run: docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml -f docker-compose.ci.yml logs > smoke-test-logs.txt
 
       - name: Upload logs
         if: failure()
@@ -318,7 +328,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.ci.yml down -v
+        run: docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml -f docker-compose.ci.yml down -v
 
   rollback-on-smoke-fail:
     needs: [build-and-push, smoke-test]

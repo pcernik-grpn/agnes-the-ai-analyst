@@ -162,20 +162,15 @@ services:
       - DATABASE_URL=postgresql+psycopg://agnes:${POSTGRES_PASSWORD}@postgres:5432/agnes
 
 volumes:
-  # On customer-instance VMs the startup-script creates /data/postgres
-  # (uid:gid 70:70, mode 0700) on every boot so this bind resolves to a
-  # location that:
-  #   1. Survives container recreates (lives on the config disk, not the
-  #      container layer);
-  #   2. Is covered by the daily disk-snapshot policy attached to /data;
-  #   3. Has the right ownership for the Alpine postgres user.
-  #
-  # For local dev where /data/postgres doesn't exist, override this overlay
-  # via docker-compose.override.yml — set ``postgres_data: {}`` to fall back
-  # to a plain Docker named volume on the local filesystem.
-  postgres_data:
-    driver: local
-    driver_opts:
-      type: none
-      device: /data/postgres
-      o: bind
+  # Plain Docker-managed named volume — works out of the box for local dev
+  # and CI (no host path required). On customer-instance VMs,
+  # docker-compose.postgres-host-mount.yml (always loaded alongside this
+  # overlay there — see scripts/ops/agnes-compose-file.sh) replaces the
+  # `postgres` service's mount with a direct host bind to /data/postgres
+  # instead. Direct service-level bind, NOT `driver_opts` on this named
+  # volume, for the same reason documented in docker-compose.host-mount.yml's
+  # header: a named volume's driver options are fixed at create time, so
+  # editing them and re-running `compose up` does not propagate — the exact
+  # footgun that already bit the `data:` volume in production once
+  # (root-owned WAL surviving a driver-opts change, DuckDB going FATAL).
+  postgres_data: {}

@@ -81,6 +81,30 @@ print('true' if 'version' in d and 'channel' in d and 'schema_version' in d else
     check "health detailed version fields" "$HAS_VERSION"
 fi
 
+# 2c. App-state backend is Postgres (A1: default for new installs). Reads
+# the same use_pg()-derived verdict app/services/instance_doctor.py's
+# app-state-backend check reports, via the support-bundle's
+# schema.backend field ("postgres"/"duckdb" — see app/services/support_bundle.py).
+# This is the release smoke gate's own positive assertion that A1's default
+# actually boots on Postgres, independent of the "duckdb"/"backend"/
+# "COMPOSE_FILE"/"postgres" string-grep audit that found no prior assumption
+# to fix here.
+if [ -n "$TOKEN" ]; then
+    BACKEND=$(curl -sf "$HOST/api/admin/doctor/support" \
+      -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d.get('schema',{}).get('backend','unknown'))
+" 2>/dev/null || echo "unreachable")
+    if [ "$BACKEND" = "postgres" ]; then
+        check "app-state backend ($BACKEND)" "true"
+    else
+        check "app-state backend ($BACKEND, expected postgres)" "false"
+    fi
+else
+    echo "  SKIP app-state backend (no token)"
+fi
+
 # 4. Query SELECT 1 (requires auth)
 if [ -n "$TOKEN" ]; then
     QUERY_OK=$(curl -sf -X POST "$HOST/api/query" \

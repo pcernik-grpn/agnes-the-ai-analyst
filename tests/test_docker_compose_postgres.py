@@ -47,6 +47,36 @@ class TestDocsHonesty:
         )
 
 
+class TestPostgresDataVolumeIsPortable:
+    """postgres_data must be a plain Docker-managed named volume in the base
+    overlay — works out of the box on local dev / CI (no /data/postgres host
+    path exists there). Only docker-compose.postgres-host-mount.yml — loaded
+    together with this overlay on every customer-instance VM (see
+    scripts/ops/agnes-compose-file.sh) — binds it to /data/postgres, and it
+    does so via a direct service-level bind (same footgun-avoidance pattern
+    as docker-compose.host-mount.yml's `data:` override), never via
+    `driver_opts` on the named volume itself: those are fixed at
+    volume-create time and do not propagate on a later `compose up` — the
+    exact bug that already bit the `data:` volume once in production
+    (root-owned WAL surviving a driver-opts change, DuckDB going FATAL)."""
+
+    def test_base_overlay_postgres_data_has_no_driver_opts(self, compose_pg):
+        volumes = compose_pg.get("volumes") or {}
+        postgres_data = volumes.get("postgres_data") or {}
+        assert "driver_opts" not in postgres_data, (
+            "postgres_data must stay a plain named volume in the base overlay "
+            "— local dev and CI have no /data/postgres host path"
+        )
+
+    def test_host_mount_bridge_binds_postgres_data_directly(self):
+        text = Path("docker-compose.postgres-host-mount.yml").read_text()
+        assert "/data/postgres:/var/lib/postgresql/data" in text, (
+            "docker-compose.postgres-host-mount.yml must bind postgres's data "
+            "dir directly to /data/postgres, mirroring docker-compose.host-mount.yml's "
+            "/data:/data pattern for the data: volume"
+        )
+
+
 class TestDataMigrateFreshVolumeBoot:
     def test_data_migrate_tolerates_missing_source(self, compose_pg):
         cmd = compose_pg["services"]["data-migrate"]["command"]
