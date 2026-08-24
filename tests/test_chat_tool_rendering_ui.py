@@ -53,9 +53,9 @@ def test_clipboard_strips_next_actions_but_keeps_sources():
     tests/test_chat_sources_ui.py for the full rationale)."""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(article, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(article, stripSourcesFence" not in js
+    assert "attachMessageActions(primary, stripSourcesFence" not in js
 
 
 def test_extract_next_actions_executable():
@@ -756,28 +756,76 @@ def test_replayed_cards_are_siblings_in_the_messages_column():
     js = _read(CHAT_JS)
     body = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
     assert "bubble.appendChild(_buildToolCard(" not in body, "a card inside the bubble inherits the bubble's width"
-    assert 'for (const el of _buildHistoryTail(parts, m)) $("chat-messages").appendChild(el)' in body
-    # The collapse measures the answer, and the tail is no longer part of it.
-    assert body.index("maybeMakeCollapsible(article)") < body.index("_buildHistoryTail(parts, m)")
+    assert 'for (const node of nodes) $("chat-messages").appendChild(node)' in body, (
+        "every node — bubbles and cards alike — is appended to the messages column in order"
+    )
+    # The collapse measures the primary article after insertion; the cards and
+    # continuations are siblings, not part of the answer's height.
+    assert body.index('for (const node of nodes)') < body.index("maybeMakeCollapsible(primary)")
 
 
-def test_history_renders_parts_in_order_and_degrades_for_pre_v123_rows():
+def test_history_renders_parts_in_order_with_nothing_hoisted():
     """`m.parts` is the turn's sequence (schema v123), so a reload walks it and
-    puts each tool card back where it ran — closing the half of #1504 that a
-    client-side fix never could. A row without parts keeps the only honest
-    fallback: the answer, then its positionless tool calls after it, because
-    the ordering those rows lost is not in the data to recover."""
+    puts each tool card back where it ran — closing the half of #1504 a
+    client-side fix never could.
+
+    Crucially it must not HOIST. An earlier cut painted the first TEXT part
+    into the message bubble regardless of position, which reversed a turn that
+    OPENS with a tool call: the prose came out above the card that ran first,
+    while the live stream renders card-then-text for the same turn. Order is
+    array order, and the only way to guarantee it is to never reorder.
+
+    A row without parts keeps the only honest fallback: the answer, then its
+    positionless tool calls after it, because the ordering those rows lost is
+    not in the data to recover."""
     js = _read(CHAT_JS)
-    fn = js[js.index("function _buildHistoryTail") : js.index("function _buildContinuationBubble")]
-    # The parts walk handles both kinds, in one pass, in array order.
-    assert 'part.type === "text"' in fn and 'part.type === "tool"' in fn
+    fn = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
     assert "for (const part of parts)" in fn, "array order IS the turn order — no sorting, no bucketing"
+    assert 'part.type === "text"' in fn and 'part.type === "tool"' in fn
+    # No hoisting: the first text part must not be selected out of sequence.
+    assert "textParts" not in fn, "selecting a text part by index reorders the turn"
+    assert ".filter(" not in fn.split("if (!parts)")[0], "no pre-pass over parts before the ordered walk"
     # State rides through to the card rather than being recomputed.
     assert "state: part.state" in fn and "isError: part.is_error === true" in fn
     # Legacy branch: guarded on the absence of parts, and still skips the
     # nameless cancelled/interrupted markers.
     assert "if (!parts) {" in fn
     assert "if (!formatToolCall(tc)) continue;" in fn
+    # The primary article is whichever text bubble comes first, and a
+    # tool-only row still gets one — appended LAST so cards keep their spots.
+    assert "if (primary === null) pushTextBubble(m.content)" in fn
+
+
+def test_a_tool_first_turn_reloads_card_before_prose():
+    """The specific inversion: parts `[tool, text]` must emit the card first.
+    Executed rather than asserted textually, because this is about the ORDER
+    the loop produces, not the text of the loop."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
+    # Extract just the ordering decision and run it over a tool-first row.
+    harness = """
+    const order = [];
+    const parts = [
+      {type: "tool", tool: "Bash", args: {}, state: "output-available", result: "r", is_error: false},
+      {type: "text", text: "Found it."},
+    ];
+    let primary = null;
+    const pushTextBubble = (t) => { if (primary === null) primary = "primary"; order.push("text"); };
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.type === "text") { pushTextBubble(part.text); continue; }
+      if (part.type === "tool" && part.tool) order.push("card");
+    }
+    if (primary === null) pushTextBubble("");
+    process.stdout.write(JSON.stringify(order));
+    """
+    assert json.loads(_node_run(harness)) == ["card", "text"], (
+        "a turn that opens with a tool call must reload card-then-prose, matching the live stream"
+    )
+    # And the shipped code contains no index-based text selection that would
+    # reintroduce the hoist.
+    assert "textParts[0]" not in fn
+
 
 
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():

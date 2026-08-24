@@ -2034,30 +2034,95 @@ function attachMessageActions(article, copyText) {
  *
  *  An assistant turn is a SEQUENCE — prose, a tool call, more prose about what
  *  came back — and `m.parts` is that sequence (schema v123, see
- *  app/chat/message_parts.py). Rendering walks it in order, so a reload puts
- *  every tool card back where it actually ran instead of appending them all
- *  under the finished answer (#1504).
+ *  app/chat/message_parts.py). This walks it in ORDER and emits one node per
+ *  part, so a reload puts every tool card back where it actually ran (#1504).
+ *
+ *  Nothing is hoisted. An earlier version painted the first TEXT part into the
+ *  message bubble regardless of its position, which silently reversed a turn
+ *  that OPENS with a tool call (an agent calling a tool before saying
+ *  anything): the prose came out above the card that ran first, while the live
+ *  stream renders card-then-text for the same turn. Order is array order, and
+ *  the only way to guarantee that is to never reorder.
+ *
+ *  The first text bubble is the PRIMARY article — it owns the avatar,
+ *  timestamp, sender attribution, sources chips, the copy row and the collapse
+ *  cap. Later text parts are continuation bubbles under the card above them,
+ *  which is what a sealed live segment looks like.
  *
  *  A row written before v123 has no `parts`; it falls back to `content` plus
- *  the positionless `tool_calls`, rendered after the answer. That is not a
- *  degraded choice, it is the only honest one — the ordering those rows lost
- *  is not in the data, and placing cards by guess would show tool calls in
- *  positions they never occupied.
+ *  the positionless `tool_calls` after it. That is not a degraded choice but
+ *  the only honest one — the ordering those rows lost is not in the data, and
+ *  placing cards by guess would show tool calls where they never ran.
  */
 function renderMessage(m) {
-  const article = createMessageShell({ role: m.role, createdAt: m.created_at });
-  const bubble = article.querySelector(".msg-bubble");
-  const body = bubble.querySelector(".msg-body");
-
   const parts = Array.isArray(m.parts) && m.parts.length ? m.parts : null;
-  // The bubble carries the FIRST text part (or the whole content, pre-v123);
-  // later text parts get their own bubble below the card that precedes them,
-  // which is exactly what the live stream produces.
-  const textParts = parts ? parts.filter(p => p && p.type === "text") : [];
-  body.innerHTML = renderAnswerMarkdown(parts ? (textParts[0] && textParts[0].text) || "" : m.content);
-  enhanceCodeBlocks(body);
-  enhanceTables(body);
-  renderMermaidBlocks(body);
+  //: DOM nodes in the order they will be appended. Built first, appended
+  //: after, so the collapse cap can measure a node that is already in the
+  //: document.
+  const nodes = [];
+  let primary = null;
+
+  const pushTextBubble = (text) => {
+    const isPrimary = primary === null;
+    const article = isPrimary
+      ? createMessageShell({ role: m.role, createdAt: m.created_at })
+      : createMessageShell({ role: m.role });
+    const body = article.querySelector(".msg-body");
+    body.innerHTML = renderAnswerMarkdown(text || "");
+    enhanceCodeBlocks(body);
+    enhanceTables(body);
+    renderMermaidBlocks(body);
+    if (isPrimary) {
+      primary = article;
+    } else {
+      // A continuation is the same speaker mid-answer: no second avatar, no
+      // second actions row. Both belong to the message, not to a segment.
+      article.classList.add("is-continuation");
+      const actions = article.querySelector(".msg-actions");
+      if (actions) actions.remove();
+    }
+    nodes.push(article);
+    return article;
+  };
+
+  if (!parts) {
+    pushTextBubble(m.content);
+    for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
+      // A row can carry no `tool` name at all — the cancelled/interrupted
+      // markers manager.py stores in place of a real call. Rendering those
+      // unconditionally produced `tool: undefined` and an empty fence.
+      if (!formatToolCall(tc)) continue;
+      nodes.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
+    }
+  } else {
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.type === "text") {
+        pushTextBubble(part.text);
+        continue;
+      }
+      if (part.type === "tool" && part.tool) {
+        nodes.push(
+          _buildToolCard({
+            tool: part.tool,
+            args: part.args || {},
+            // The persisted state IS the outcome, so a replayed card no
+            // longer has to omit the icon and edge to avoid claiming one.
+            status: "replayed",
+            state: part.state,
+            result: Object.prototype.hasOwnProperty.call(part, "result") ? part.result : undefined,
+            isError: part.is_error === true,
+          }),
+        );
+      }
+    }
+    // Degenerate row: tools but no text at all. The message still needs a
+    // primary article to carry the copy row — appended LAST so the cards keep
+    // the positions they actually had.
+    if (primary === null) pushTextBubble(m.content);
+  }
+
+  const bubble = primary.querySelector(".msg-bubble");
 
   // §5.3 Co-presence: per-message sender attribution for foreign senders.
   // sender_email is an optional co-drive field — single-user sessions never
@@ -2067,95 +2132,24 @@ function renderMessage(m) {
     who.className = "msg-sender-attr";
     who.textContent = m.sender_email;
     who.style.cssText = "font-size:var(--ds-text-xs,0.75rem);color:var(--ds-text-secondary);margin-bottom:2px;";
-    bubble.insertBefore(who, body);
+    bubble.insertBefore(who, bubble.querySelector(".msg-body"));
   }
 
-  // Chips stay on the bubble, so they read as part of the answer.
+  // Chips stay on the primary bubble, so they read as part of the answer.
   if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
   // only (see the note on stripSourcesFence) — but drops the next_actions
   // trailer: suggestions are chrome, and a copied transcript loses nothing
-  // without them.
-  attachMessageActions(article, stripNextActionsFence(m.content || ""));
-  $("chat-messages").appendChild(article);
-  if (m.role === "assistant") _markLatestAssistant(article);
-  // Before the trailing blocks are appended: the collapse measures the
-  // ANSWER's height, and those blocks are siblings, not part of it.
-  maybeMakeCollapsible(article);
+  // without them. It carries the WHOLE answer, not just this bubble's segment.
+  attachMessageActions(primary, stripNextActionsFence(m.content || ""));
 
-  // Everything after the first text part, in order. Tool cards and any
-  // further text land as siblings in the messages column — the same place
-  // and therefore the same geometry the live stream gives them.
-  for (const el of _buildHistoryTail(parts, m)) $("chat-messages").appendChild(el);
+  for (const node of nodes) $("chat-messages").appendChild(node);
+  if (m.role === "assistant") _markLatestAssistant(primary);
+  // Measured after insertion, and against the primary article only: the cards
+  // and continuations are siblings, not part of the answer's height.
+  maybeMakeCollapsible(primary);
   maybeScrollToBottom();
-}
-
-/** The blocks that follow a history message's first text part, in order.
- *
- *  With `parts` this is a straight walk: a tool part becomes a card carrying
- *  its persisted state (so the icon, the status edge and the result body are
- *  the real ones, not a neutral placeholder), and a later text part becomes
- *  its own bubble under the card above it.
- *
- *  Without `parts` (pre-v123 row) it degrades to the old shape: the tool
- *  calls, positionless, after the answer.
- */
-function _buildHistoryTail(parts, m) {
-  const out = [];
-  if (!parts) {
-    for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
-      // A row can carry no `tool` name at all — the cancelled/interrupted
-      // markers manager.py stores in place of a real call. Rendering those
-      // unconditionally produced `tool: undefined` and an empty fence.
-      if (!formatToolCall(tc)) continue;
-      out.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
-    }
-    return out;
-  }
-  let seenFirstText = false;
-  for (const part of parts) {
-    if (!part) continue;
-    if (part.type === "text") {
-      if (!seenFirstText) {
-        // Already painted into the bubble above.
-        seenFirstText = true;
-        continue;
-      }
-      out.push(_buildContinuationBubble(part.text || "", m));
-      continue;
-    }
-    if (part.type === "tool") {
-      if (!part.tool) continue;
-      out.push(_buildToolCard({
-        tool: part.tool,
-        args: part.args || {},
-        // The persisted state IS the outcome, so a replayed card no longer
-        // has to omit the icon and border to avoid claiming one.
-        status: "replayed",
-        state: part.state,
-        result: Object.prototype.hasOwnProperty.call(part, "result") ? part.result : undefined,
-        isError: part.is_error === true,
-      }));
-    }
-  }
-  return out;
-}
-
-/** A text part that follows a tool card: its own assistant bubble, no avatar
- *  or actions row — those belong to the message, and this is a continuation
- *  of one. Mirrors what a sealed live segment looks like. */
-function _buildContinuationBubble(text, m) {
-  const article = createMessageShell({ role: m.role });
-  article.classList.add("is-continuation");
-  const body = article.querySelector(".msg-body");
-  body.innerHTML = renderAnswerMarkdown(text);
-  enhanceCodeBlocks(body);
-  enhanceTables(body);
-  renderMermaidBlocks(body);
-  const actions = article.querySelector(".msg-actions");
-  if (actions) actions.remove();
-  return article;
 }
 
 // ---------- Result table enhancement -------------------------------------

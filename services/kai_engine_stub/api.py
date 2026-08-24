@@ -207,6 +207,15 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("Starting…"),
         {"type": "error", "errorText": "upstream model overloaded"},
     ],
+    # A turn that OPENS with a tool call — no prose first. The reload path
+    # used to hoist the later text above this card, reversing the order the
+    # live stream shows (Devin Review on #1524).
+    "toolfirst": [
+        _tool_call("call_tf", "server_info", {}),
+        _tool_output("call_tf", _mcp_envelope({"authenticated": True})),
+        _text("Checked first, explained after."),
+        {"type": "finish"},
+    ],
     "markdown": [
         _text("Here is a table the model wrote itself:\n\n"),
         _tool_call("call_md", "Bash", {"command": "agnes catalog"}),
