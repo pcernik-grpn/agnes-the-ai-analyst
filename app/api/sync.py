@@ -726,11 +726,23 @@ def _invoke_keboola_extractor_subprocess(
     env: dict,
     collected_errors: List[dict],
     synced_table_names: set,
+    merge: bool = False,
 ) -> None:
     """Run the Keboola extractor subprocess once for ``table_configs``
     against ``env`` (must carry ``KEBOOLA_STACK_URL`` + ``KEBOOLA_STORAGE_
     TOKEN`` — see ``_resolve_keboola_credentials``). Mutates
     ``collected_errors`` / ``synced_table_names`` in place.
+
+    ``merge=False`` (the first credential group of a pass) keeps the
+    historical semantics: ``extractor.run()`` rebuilds ``extract.duckdb``
+    from scratch, which is also the implicit prune for deleted/renamed
+    registry rows. ``merge=True`` (every LATER group of the same pass)
+    makes ``run()`` seed its temp build from the current extract and
+    replace only its own tables — without it, each group's atomic
+    tmp-then-move swap clobbered the previous group's output and only the
+    LAST connection's tables survived the pass (every earlier group's
+    ``_meta`` rows and views vanished from analytics at the next
+    orchestrator rebuild).
 
     Extracted out of ``_run_sync`` (#B2) so the per-``connection_id`` group
     dispatch there can call this once per credential group instead of
@@ -806,13 +818,20 @@ if not url or not token:
 
 from connectors.keboola.extractor import run, compute_exit_code
 data_dir = Path(os.environ.get("DATA_DIR", "./data"))
-result = run(str(data_dir / "extracts" / "keboola"), configs, url, token)
+# `--merge` (per-connection group 2..N of one sync pass): seed the temp
+# build from the current extract.duckdb instead of rebuilding from
+# scratch, so this group's swap does not clobber the previous group's
+# tables. See app.api.sync._invoke_keboola_extractor_subprocess.
+merge = "--merge" in sys.argv
+result = run(str(data_dir / "extracts" / "keboola"), configs, url, token, merge=merge)
 print(json.dumps(result))
 # Issue #81 Group B: surface partial-failure as exit 2 so the API
 # caller can distinguish "every table failed" from "9/10 succeeded".
 sys.exit(compute_exit_code(result, len(configs)))
 """,
     ]
+    if merge:
+        cmd.append("--merge")
 
     print(f"[SYNC] Starting extractor subprocess for {len(table_configs)} tables", file=_sys.stderr, flush=True)
 
@@ -1196,9 +1215,29 @@ def _run_sync(
             for _tc in table_configs:
                 _by_connection.setdefault(_tc.get("connection_id"), []).append(_tc)
 
-            for _conn_id, _group_configs in _by_connection.items():
+            # Every group writes the SAME extracts/keboola/extract.duckdb,
+            # and extractor.run()'s default mode rebuilds it from scratch
+            # (temp build + atomic move). So: the FIRST invocation of the
+            # pass runs fresh — keeping the whole-pass implicit-prune
+            # semantics — and every later group passes merge=True so it
+            # adds its own tables to the file instead of clobbering the
+            # previous group's. Order the global (None) group first: with
+            # remote rows on several stacks, the `kbc` `_remote_attach`
+            # alias is first-writer-wins and must stay with the global
+            # stack, whose token_env is the one the orchestrator can
+            # resolve at re-ATTACH time.
+            _first_group = True
+            for _conn_id in sorted(_by_connection, key=lambda c: (c is not None, c or "")):
+                _group_configs = _by_connection[_conn_id]
                 if _conn_id is None:
-                    _invoke_keboola_extractor_subprocess(_group_configs, env, collected_errors, synced_table_names)
+                    _invoke_keboola_extractor_subprocess(
+                        _group_configs,
+                        env,
+                        collected_errors,
+                        synced_table_names,
+                        merge=not _first_group,
+                    )
+                    _first_group = False
                     continue
                 try:
                     _sc_url, _sc_token = _resolve_keboola_credentials(_conn_id)
@@ -1211,7 +1250,14 @@ def _run_sync(
                             collected_errors.append({"table": _tname, "error": "missing_connection_token"})
                     continue
                 _group_env = {**env, "KEBOOLA_STACK_URL": _sc_url, "KEBOOLA_STORAGE_TOKEN": _sc_token}
-                _invoke_keboola_extractor_subprocess(_group_configs, _group_env, collected_errors, synced_table_names)
+                _invoke_keboola_extractor_subprocess(
+                    _group_configs,
+                    _group_env,
+                    collected_errors,
+                    synced_table_names,
+                    merge=not _first_group,
+                )
+                _first_group = False
 
             # Run custom connectors (Tier A: local mount) — only when there
             # were local-mode tables to drive the extractor. Custom connectors

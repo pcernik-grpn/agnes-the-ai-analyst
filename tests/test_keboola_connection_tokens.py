@@ -247,3 +247,63 @@ def test_mixed_rows_are_grouped_into_separate_subprocess_calls(tmp_path, monkeyp
     assert len(_FakePopen.calls) == 2, f"expected two grouped calls, got {_FakePopen.calls}"
     tokens = {c["env"]["KEBOOLA_STORAGE_TOKEN"] for c in _FakePopen.calls}
     assert tokens == {"global-token-abc", "conn-a-vault-token"}
+
+
+def test_second_group_runs_in_merge_mode_and_global_group_goes_first(tmp_path, monkeypatch):
+    """Every extractor group writes the SAME extracts/keboola/extract.duckdb,
+    and `run()`'s default mode rebuilds it from scratch — so with 2+ groups
+    the parent must pass `--merge` to every invocation AFTER the first, or
+    each later group clobbers the previous group's tables (only the last
+    connection's `_meta` rows and views would survive the pass). The global
+    (connection_id IS NULL) group must also be dispatched FIRST so it runs
+    fresh and keeps first-writer ownership of the `kbc` `_remote_attach`
+    alias."""
+    rows = [
+        # Deliberately listed connection-row-first: dispatch order must come
+        # from the None-first sort, not from registry order.
+        {
+            "id": "conn_a_table",
+            "name": "conn_a_table",
+            "source_type": "keboola",
+            "bucket": "in.c-a",
+            "source_table": "t",
+            "query_mode": "local",
+            "connection_id": "conn-a",
+        },
+        {
+            "id": "global_table",
+            "name": "global_table",
+            "source_type": "keboola",
+            "bucket": "in.c-global",
+            "source_table": "t",
+            "query_mode": "local",
+            "connection_id": None,
+        },
+    ]
+    _patch_common(monkeypatch, tmp_path, rows)
+
+    monkeypatch.setenv("KEBOOLA_STORAGE_TOKEN", "global-token-abc")
+    monkeypatch.setenv("KEBOOLA_STACK_URL", "https://global.example.com")
+
+    from src.repositories import source_connections_repo, connection_secrets_repo
+
+    source_connections_repo().create(
+        id="conn-a",
+        name="Project A",
+        source_type="keboola",
+        config={"stack_url": "https://a.keboola.com"},
+    )
+    connection_secrets_repo().upsert("conn-a", "conn-a-vault-token")
+
+    from app.api import sync as sync_mod
+
+    sync_mod._run_sync()
+
+    assert len(_FakePopen.calls) == 2, f"expected two grouped calls, got {_FakePopen.calls}"
+    first, second = _FakePopen.calls
+    # Global group first, fresh (no --merge): whole-pass prune semantics.
+    assert first["env"]["KEBOOLA_STORAGE_TOKEN"] == "global-token-abc"
+    assert "--merge" not in first["cmd"]
+    # Named-connection group second, merged on top of the global group's file.
+    assert second["env"]["KEBOOLA_STORAGE_TOKEN"] == "conn-a-vault-token"
+    assert "--merge" in second["cmd"]
