@@ -22,6 +22,31 @@ def compose_pg() -> dict:
     return yaml.safe_load((root / "docker-compose.postgres.yml").read_text())
 
 
+class TestDocsHonesty:
+    """A1: this overlay is the default for new installs, not an opt-in
+    extra. Pins the header comment + config/.env.template against drifting
+    back to "postgres is optional" framing (docs/QUICKSTART.md and
+    docs/DEPLOYMENT.md carry the same claim; tests/test_quickstart_pg_default.py
+    covers those)."""
+
+    def test_header_frames_postgres_as_the_default(self):
+        header = Path("docker-compose.postgres.yml").read_text()
+        assert "default for new installs" in header, (
+            "docker-compose.postgres.yml's header must state it is the "
+            "default for new installs (A1), not an opt-in extra"
+        )
+
+    def test_env_template_wires_the_overlay_by_default(self):
+        text = Path("config/.env.template").read_text()
+        assert any(
+            line.strip() == "COMPOSE_FILE=docker-compose.yml:docker-compose.postgres.yml" for line in text.splitlines()
+        ), (
+            "config/.env.template must ship an uncommented COMPOSE_FILE line "
+            "that includes docker-compose.postgres.yml, so plain "
+            "`docker compose up` boots on Postgres by default"
+        )
+
+
 class TestDataMigrateFreshVolumeBoot:
     def test_data_migrate_tolerates_missing_source(self, compose_pg):
         cmd = compose_pg["services"]["data-migrate"]["command"]

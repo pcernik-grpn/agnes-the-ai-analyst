@@ -1,11 +1,15 @@
-# Postgres app-state overlay for local dev + self-hosted prod.
+# Postgres app-state overlay — the default for new installs (A1), both local
+# dev and self-hosted prod, and what VM-provisioned instances boot on out of
+# the box. Omit it only on a legacy instance that predates this default and
+# is still running app-state on single-file DuckDB.
 #
 # Use ON TOP OF docker-compose.yml:
 #
 #     docker compose -f docker-compose.yml -f docker-compose.postgres.yml up
 #
 # Or set the env var ``COMPOSE_FILE=docker-compose.yml:docker-compose.postgres.yml``
-# so plain ``docker compose up`` includes the overlay automatically.
+# (config/.env.template ships this by default) so plain ``docker compose up``
+# includes the overlay automatically.
 #
 # What this adds:
 #
