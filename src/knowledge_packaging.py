@@ -59,7 +59,7 @@ def _list_files(corpus_id: str) -> List[Dict[str, Any]]:
 def _list_corpora() -> List[Dict[str, Any]]:
     from src.repositories import file_corpora_repo
 
-    return file_corpora_repo().list()
+    return file_corpora_repo().list_all()
 
 
 # ── state ──────────────────────────────────────────────────────────────────

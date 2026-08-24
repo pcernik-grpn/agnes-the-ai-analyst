@@ -112,6 +112,20 @@ class FileCorporaRepository:
         rows = self.conn.execute(query, params).fetchall()
         return [dict(zip(self._COLS, r)) for r in rows]
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every live corpus, name-ordered — no cap.
+
+        The unbounded twin of :meth:`list`, whose ``limit`` defaults to 200.
+        Callers that need the whole set rather than a page — an authorization
+        input, a full listing, an id→name map — must use this: a silent
+        truncation inside an access decision fails *closed*, which surfaces as
+        "the grant is broken" rather than "the list was cut off".
+        """
+        rows = self.conn.execute(
+            f"SELECT {self._SELECT} FROM file_corpora WHERE deleted_at IS NULL ORDER BY name"
+        ).fetchall()
+        return [dict(zip(self._COLS, r)) for r in rows]
+
     def soft_delete(self, corpus_id: str) -> None:
         """Set ``deleted_at`` to now (also bumps ``updated_at``). Idempotent."""
         self.conn.execute(

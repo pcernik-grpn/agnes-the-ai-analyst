@@ -642,6 +642,15 @@ def can_access_collection(
     return bool(row and row.get("created_by") == user_id)
 
 
+# Cap for the owned-collections lookup in ``accessible_collection_ids``.
+# Explicit and high for the same reason as ``_GRANT_PROJECTION_LIMIT``
+# (app/resource_types.py) and ``_COLLECTION_SCAN_LIMIT``
+# (src/agent_scope_intersection.py): ``list()`` defaults to 200, and a silent
+# truncation inside an authorization input fails *closed* — the owner of a
+# collection past the cap is denied their own upload with no signal.
+_OWNED_COLLECTION_SCAN_LIMIT = 100_000
+
+
 def accessible_collection_ids(user, conn=None):
     """COLLECTION ids the caller may access — group grants (admin => None,
     meaning "all") unioned with the collections they own. ``None`` means
@@ -659,7 +668,13 @@ def accessible_collection_ids(user, conn=None):
         return granted
     from src.repositories import file_corpora_repo
 
-    owned = frozenset(r["id"] for r in file_corpora_repo().list() if r.get("created_by") == user_id)
+    owned = frozenset(
+        # Filter in SQL: this runs on the authorization path, so keeping one
+        # creator's rows out of a whole-table read matters (same reasoning as
+        # ``_owned_collection_ids`` in src/agent_scope_intersection.py).
+        r["id"]
+        for r in file_corpora_repo().list(created_by=user_id, limit=_OWNED_COLLECTION_SCAN_LIMIT)
+    )
     return frozenset(granted) | owned
 
 

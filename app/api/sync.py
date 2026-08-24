@@ -1701,7 +1701,7 @@ def _chunk_artifact_entries(user) -> list:
     if not state:
         return []
     allowed = set(_accessible_corpus_ids(user))
-    names = {c["id"]: c.get("name") for c in file_corpora_repo().list()}
+    names = {c["id"]: c.get("name") for c in file_corpora_repo().list_all()}
     out = []
     for cid in sorted(state):
         if cid not in allowed or not (artifacts_dir() / f"{cid}.duckdb").exists():

@@ -110,6 +110,21 @@ class FileCorporaPgRepository:
             rows = conn.execute(sa.text(query), params).mappings().all()
         return [dict(r) for r in rows]
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every live corpus, name-ordered — no cap.
+
+        The unbounded twin of :meth:`list`, whose ``limit`` defaults to 200.
+        See the DuckDB sibling for why an access decision must not read a
+        capped list.
+        """
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(sa.text("SELECT * FROM file_corpora WHERE deleted_at IS NULL ORDER BY name"))
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
     def soft_delete(self, corpus_id: str) -> None:
         """Set ``deleted_at`` to now (also bumps ``updated_at``). Idempotent."""
         with self._engine.begin() as conn:
