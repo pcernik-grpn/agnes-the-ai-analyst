@@ -2343,6 +2343,12 @@ KNOWN_UNTESTED = {
     "GET /auth/email/verify",
     "GET /auth/password/reset",
     "GET /auth/password/setup",
+    # Self-serve change-password (B6) — session-only credential rotation,
+    # covered end-to-end (success/failure/CSRF/rate-limit/PAT-rejection) in
+    # tests/test_password_change.py, same as the other password sub-flows
+    # below being covered outside this PG smoke harness.
+    "GET /auth/password/change",
+    "POST /auth/password/change",
     "POST /auth/email/send-link",
     "POST /auth/email/send-link/web",
     "POST /auth/email/verify",

@@ -11,6 +11,13 @@ from app.auth.token_hash import hash_token
 def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
+    # This file tests provider MECHANICS (magic link, password, OAuth), not
+    # the default-offering policy (that's tests/test_auth_provider_defaults.py).
+    # Email is opt-in-only by default since B6, so pin an explicit allowlist
+    # naming every provider these tests exercise — otherwise the magic-link
+    # endpoints 404 under the new default and this file stops testing what
+    # it says it tests.
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "google,email,password,keboola,microsoft")
 
     from src.db import get_system_db
     from src.repositories.users import UserRepository

@@ -116,6 +116,10 @@ class TestLoginDoor:
 
     def test_email_only_door_is_warning_until_delivery_verified(self, seeded_app, monkeypatch):
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        # Email is opt-in-only by default (B6) — this scenario ("the ONLY
+        # login door is email") now only arises once an operator has
+        # explicitly named it in auth.providers.
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email")
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         check = _check(report, "login-door")
         assert check["status"] == "warning"

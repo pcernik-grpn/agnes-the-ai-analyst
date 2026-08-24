@@ -10,6 +10,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Self-serve change-password.** `POST /auth/password/change` for a logged-in session lets a user rotate their own password (verifying the current one, the same minimum-length policy and rate limiting as the other password doors) instead of only the token-based reset flow or an admin resetting it. Session-token only — a PAT gets 403, matching the other credential-minting/rotating doors. On success any outstanding password-reset / email-magic-link token is invalidated (they share `users.reset_token`). An account with no password (Google/SSO-only) gets a clear 400 instead of silently gaining a password. New account-menu entry "Change password" (`/auth/password/change`).
+
+### Changed
+
+- **BREAKING: the email magic link is opt-in only.** When `auth.providers` is unset, the login page now offers every configured provider EXCEPT `email` (its `GET /auth/email/verify` consumes the single-use token on the request, so a corporate mail scanner opening the link before the human clicks silently burns it). Instances that relied on the implicit magic-link offering must add `email` to `auth.providers` to keep it. The misconfiguration lockout rescue (an allowlist naming only unconfigured providers falls back to password + email) is unchanged.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added

@@ -32,6 +32,12 @@ def app_with_ratelimit(monkeypatch, fresh_db):
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-jwt-secret-key-minimum-32-chars!!")
     monkeypatch.setenv("AGNES_AUTH_RATELIMIT_ENABLED", "1")
+    # This file tests rate-limit mechanics, not the default-offering policy
+    # (that's tests/test_auth_provider_defaults.py). Email is opt-in-only by
+    # default since B6, so pin an explicit allowlist naming every provider
+    # exercised below — otherwise the magic-link endpoints 404 before the
+    # limiter ever runs.
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "google,email,password,keboola,microsoft")
     from app.auth.rate_limit import limiter
 
     limiter.enabled = True
@@ -227,6 +233,9 @@ def test_rate_limit_disabled_via_env(monkeypatch, fresh_db):
     every request through, no matter how many fire in the same window."""
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-jwt-secret-key-minimum-32-chars!!")
+    # Email is opt-in-only by default (B6) — name it explicitly, this test is
+    # about the rate-limit escape hatch, not the default-offering policy.
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
     from app.auth.rate_limit import limiter
 
     limiter.enabled = False  # mirrors what the env-var would do at module load

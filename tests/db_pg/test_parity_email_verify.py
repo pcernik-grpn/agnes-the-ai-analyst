@@ -20,9 +20,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
-def test_email_verify_consumes_token_on_both_backends(seeded_app_both):
+def test_email_verify_consumes_token_on_both_backends(seeded_app_both, monkeypatch):
     from app.auth.token_hash import hash_token
     from src.repositories import users_repo
+
+    # Email is opt-in-only by default (B6) — this test exercises the verify
+    # endpoint's backend parity, not the default-offering policy, so name it
+    # explicitly or the endpoint 404s before the parity assertion runs.
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
 
     # Seed a fresh, unexpired magic-link token on the active backend, exactly
     # as send_magic_link would (reset_token + reset_token_created) — the token

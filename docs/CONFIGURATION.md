@@ -176,9 +176,12 @@ auth:
   allowed_domain: "acme.com"     # Email domain restriction for login
 ```
 
-Only emails from this domain can log in via Google OAuth or email magic link.
-Google OAuth is optional — if not configured, only email magic link auth is
-available.
+Only emails from this domain can log in via Google OAuth or email magic link
+(when offered — see `auth.providers` in `config/instance.yaml.example`).
+Google OAuth is optional — if not configured, only password sign-in is
+available by default; the email magic link is opt-in only
+(`auth.providers: [..., email]`), since its single-use verify link can be
+silently burned by a corporate mail scanner before the human clicks.
 
 ### Email
 

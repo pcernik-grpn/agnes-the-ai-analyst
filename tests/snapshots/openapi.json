@@ -6165,6 +6165,24 @@
         "title": "PassthroughToolDTO",
         "type": "object"
       },
+      "PasswordChangeRequest": {
+        "properties": {
+          "current_password": {
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "PasswordChangeRequest",
+        "type": "object"
+      },
       "PasswordLoginRequest": {
         "properties": {
           "email": {
@@ -11299,7 +11317,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.84.8"
+    "version": "0.86.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -50725,6 +50743,112 @@
           }
         },
         "summary": "Microsoft Login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/password/change": {
+      "get": {
+        "description": "Self-serve change-password page, linked from the account menu.",
+        "operationId": "password_change_page_auth_password_change_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change Page",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Change the caller's own password. Session token only (PAT rejected by\n`require_session_token`, matching `/auth/tokens` and every other door\nthat mints or rotates a credential).\n\nDouble-submit CSRF (F2): a cookie-authenticated JSON POST is not\nautomatically CSRF-safe (the cookie fallback in `get_current_user` means\nan ordinary cross-site fetch would still carry the session), so the\ncaller must echo the `web_csrf` cookie value \u2014 minted on the GET page\nabove and embedded there for its own JS to read back \u2014 in the\n`X-CSRF-Token` header. Same mechanism as `me_profile_refetch_groups`.\n\nThe no-password-hash check runs BEFORE the CSRF check: it's a read of\nthe caller's own account state with no mutation on either branch, the\nGET page above never mints a CSRF token for an SSO-only account (no form\nto submit), and CSRF exists to stop a forged STATE CHANGE \u2014 there isn't\none here to forge.",
+        "operationId": "password_change_auth_password_change_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change",
         "tags": [
           "auth"
         ]

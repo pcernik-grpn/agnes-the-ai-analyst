@@ -16,7 +16,7 @@ from argon2.exceptions import VerifyMismatchError
 
 from app.auth.jwt import create_access_token, SESSION_COOKIE_MAX_AGE_SECONDS
 from app.auth.access import is_user_admin
-from app.auth.dependencies import _get_db, is_local_dev_mode
+from app.auth.dependencies import _get_db, is_local_dev_mode, require_session_token
 from app.auth.provider_registry import require_provider
 from app.auth.token_hash import hash_token
 from app.auth.rate_limit import limiter as _rate_limiter
@@ -70,6 +70,11 @@ class PasswordSetupRequest(BaseModel):
     email: str
     token: str
     password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 def is_available() -> bool:
@@ -844,3 +849,109 @@ async def setup_confirm(
     response = RedirectResponse(url=get_home_route(), status_code=302)
     _set_login_cookie(response, user["id"], user["email"], request)
     return response
+
+
+# ---- Web flow: self-serve password CHANGE (B6) ----
+#
+# Unlike every flow above, the caller already holds a session — this is a
+# logged-in user replacing their own password, not proving ownership of an
+# address via a token. `require_session_token` (not just `get_current_user`)
+# gates both routes: a PAT must never be able to rotate the credential it
+# was minted under, matching the other credential-minting/rotating doors
+# this dependency exists for (see its docstring).
+
+
+def _render_password_change_form(
+    request: Request,
+    user: dict,
+    *,
+    has_password: bool,
+    error: str = "",
+    success: str = "",
+):
+    from app.web.router import _get_or_mint_web_csrf, _set_web_csrf_cookie, _build_context, templates
+
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx = _build_context(
+        request,
+        user=user,
+        has_password=has_password,
+        error=error,
+        success=success,
+        csrf_token=csrf_token,
+    )
+    response = templates.TemplateResponse(request, "password_change.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
+
+
+@router.get("/change", response_class=HTMLResponse)
+async def password_change_page(request: Request, user: dict = Depends(require_session_token)):
+    """Self-serve change-password page, linked from the account menu."""
+    row = users_repo().get_by_id(user["id"]) or {}
+    return _render_password_change_form(request, user, has_password=bool(row.get("password_hash")))
+
+
+@router.post("/change")
+@_rate_limiter.limit("5/minute")
+async def password_change(
+    request: Request,
+    body: PasswordChangeRequest,
+    user: dict = Depends(require_session_token),
+):
+    """Change the caller's own password. Session token only (PAT rejected by
+    `require_session_token`, matching `/auth/tokens` and every other door
+    that mints or rotates a credential).
+
+    Double-submit CSRF (F2): a cookie-authenticated JSON POST is not
+    automatically CSRF-safe (the cookie fallback in `get_current_user` means
+    an ordinary cross-site fetch would still carry the session), so the
+    caller must echo the `web_csrf` cookie value — minted on the GET page
+    above and embedded there for its own JS to read back — in the
+    `X-CSRF-Token` header. Same mechanism as `me_profile_refetch_groups`.
+
+    The no-password-hash check runs BEFORE the CSRF check: it's a read of
+    the caller's own account state with no mutation on either branch, the
+    GET page above never mints a CSRF token for an SSO-only account (no form
+    to submit), and CSRF exists to stop a forged STATE CHANGE — there isn't
+    one here to forge.
+    """
+    repo = users_repo()
+    row = repo.get_by_id(user["id"])
+    if not row or not row.get("password_hash"):
+        raise HTTPException(
+            status_code=400,
+            detail="This account signs in through single sign-on and has no password to change.",
+        )
+
+    from app.web.router import _web_csrf_ok
+
+    if not _web_csrf_ok(request, request.headers.get("x-csrf-token", "")):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    ph = PasswordHasher()
+    try:
+        ph.verify(row["password_hash"], body.current_password)
+    except VerifyMismatchError:
+        _audit(user["id"], "password_change_failed", result="invalid_current_password")
+        raise HTTPException(status_code=403, detail="Current password is incorrect")
+    except Exception:
+        logger.exception("Unexpected error verifying current password during change")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    if len(body.new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD_LEN} characters")
+
+    repo.update(
+        id=user["id"],
+        password_hash=ph.hash(body.new_password),
+        # `users.reset_token` is shared between the password-reset and
+        # email-magic-link flows — a self-serve change makes either stale,
+        # so clear it rather than leave a live token usable after the
+        # password it would have set no longer matters.
+        reset_token=None,
+        reset_token_created=None,
+        must_change_password=False,
+    )
+    _audit(user["id"], "password_changed", result="success")
+    return {"status": "ok"}

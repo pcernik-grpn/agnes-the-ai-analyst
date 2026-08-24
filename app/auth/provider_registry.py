@@ -1,18 +1,28 @@
-"""Per-instance auth provider allowlist (spec 2026-08-12).
+"""Per-instance auth provider allowlist (spec 2026-08-12, default flipped
+2026-08 — B6 of the remediation program).
 
 ``auth.providers`` in instance.yaml (env override ``AGNES_AUTH_PROVIDERS``,
 comma-separated) narrows which login methods this instance offers. Unset =
-every available provider — byte-for-byte the pre-allowlist behavior. An
-explicitly empty (or all-unknown) list is a misconfiguration: rejected at
-the admin API, and treated here as unset with a loud error log so one
-overlay write can never lock every user out of the instance. A narrower
-rescue applies at read time when the list names only *unconfigured*
-providers (e.g. ``keboola`` with no stack configured): an allowlist that
-would leave zero usable login methods falls back to password + magic link,
-so the env / static-file path — which the admin API's lockout guard never
-sees — cannot lock the instance out either. Deliberately NOT "treat as
-unset": that would re-offer the self-provisioning OAuth providers, turning
-one typo into a widening of who may sign in.
+every available provider EXCEPT ``email``: the magic link's ``GET /auth/
+email/verify`` consumes its single-use token on the request, so a corporate
+mail scanner that opens the link before the human clicks silently burns it —
+a structural UX flaw the magic link should never be handed to a user by
+default. Every other provider (google/password/keboola/microsoft) keeps the
+original "offered when configured" default; an operator who wants the magic
+link back adds ``email`` to ``auth.providers`` explicitly (``**BREAKING**``:
+an instance that relied on the implicit offering must do this after
+upgrading). An explicitly empty (or all-unknown) list is a misconfiguration:
+rejected at the admin API, and treated here as unset with a loud error log
+so one overlay write can never lock every user out of the instance. A
+narrower rescue applies at read time when the list names only
+*unconfigured* providers (e.g. ``keboola`` with no stack configured): an
+allowlist that would leave zero usable login methods falls back to
+password + magic link — this rescue is unrelated to the unset-default above
+and unaffected by it, since it only fires on an EXPLICIT, entirely-unusable
+allowlist — so the env / static-file path — which the admin API's lockout
+guard never sees — cannot lock the instance out either. Deliberately NOT
+"treat as unset": that would re-offer the self-provisioning OAuth
+providers, turning one typo into a widening of who may sign in.
 """
 
 import importlib
@@ -225,8 +235,18 @@ def _parse_allowlist(source: Optional[object]) -> Optional[list[str]]:
 
 
 def provider_allowed(name: str) -> bool:
+    """Whether ``name`` is offered under the current ``auth.providers``.
+
+    Unset allowlist (``None``) offers every provider EXCEPT ``email`` — see
+    the module docstring for why the magic link is opt-in only. A configured
+    allowlist (including the lockout rescue's own resolved list, which
+    already names ``email`` when it applies) is checked by membership as
+    before.
+    """
     allowlist = configured_allowlist()
-    return allowlist is None or name in allowlist
+    if allowlist is None:
+        return name != "email"
+    return name in allowlist
 
 
 def probe_providers() -> list[dict]:
