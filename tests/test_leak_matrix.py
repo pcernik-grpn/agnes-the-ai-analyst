@@ -72,10 +72,9 @@ class AsgiClient:
 
 
 @pytest.fixture
-def matrix_env(e2e_env, mock_extract_factory):
+def matrix_env(e2e_env, mock_extract_factory, shared_app):
     """Two registered tables. ``analyst`` reaches t1 through a data package;
     ``outsider`` belongs to no group and reaches nothing."""
-    from app.main import create_app
     from src.db import SYSTEM_ADMIN_GROUP
     from src.repositories.table_registry import TableRegistryRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -90,7 +89,7 @@ def matrix_env(e2e_env, mock_extract_factory):
     UserGroupMembersRepository(conn).add_member("admin1", admin_gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
     admin_token = create_access_token("admin1", "admin@test.com")
 

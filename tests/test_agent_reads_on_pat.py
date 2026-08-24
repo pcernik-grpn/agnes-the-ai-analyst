@@ -37,11 +37,10 @@ from app.auth.jwt import create_access_token
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories import agents_repo
     from src.repositories.users import UserRepository
@@ -50,7 +49,7 @@ def env(tmp_path, monkeypatch):
     UserRepository(conn).create(id="owner1", email="owner@test.com", name="Owner")
     conn.close()
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     agent = agents_repo().get_or_create_default("owner1")
     return {"client": client, "user": {"id": "owner1", "email": "owner@test.com"}, "agent_id": agent["id"]}
 
