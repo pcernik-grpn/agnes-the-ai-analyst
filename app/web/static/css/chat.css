@@ -1098,9 +1098,18 @@ pre.code-block-wrap code .hljs-deletion {
 .cloud-chat-tool.is-running { border-left-color: var(--ds-accent-info-line); }
 .cloud-chat-tool.is-done    { border-left-color: var(--ds-accent-success-line); }
 .cloud-chat-tool.is-error   { border-left-color: var(--ds-accent-danger-line); }
-/* Replayed from a persisted `{tool, args}` row (reload path): the record
-   carries no outcome, so the status edge stays neutral — a success-green card
-   would claim an outcome the row cannot evidence.
+/* A continuation bubble: the second and later text parts of a replayed turn,
+   each sitting under the tool card it followed. It is the same assistant
+   bubble, minus the avatar gutter's second copy of the avatar — the message
+   has one speaker, and repeating the avatar per segment reads as several
+   replies instead of one answer with evidence threaded through it. The live
+   stream's sealed segments look the same way for the same reason. */
+.msg.is-continuation .msg-avatar { visibility: hidden; }
+
+/* A pre-v123 replayed card has no recorded outcome, so its status edge stays
+   neutral — a success-green card would claim an outcome the row cannot
+   evidence. A v123+ card carries `state` and therefore lands on is-done /
+   is-error above, exactly like a live one.
    Status ONLY: no layout overrides. A replayed card is appended as a sibling
    in the messages column, exactly where the live stream puts one, so it
    inherits the geometry above by construction. It previously nested inside

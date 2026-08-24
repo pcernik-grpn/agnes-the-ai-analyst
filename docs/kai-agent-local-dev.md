@@ -100,7 +100,10 @@ envelope reaches the client unflattened.
 What it does not cover is the browser: the renderer is still verified by
 opening the page. When you change `app/web/static/js/chat.js`, drive at least
 the `interleaved` and `fail` scenarios by hand and check that text and cards
-alternate in wire order, and that the failed card is red and open.
+alternate in wire order, and that the failed card is red and open. Then
+**reload the page** and check the transcript is unchanged — the turn's shape
+is persisted as `chat_messages.parts`, so a reload that differs from the live
+render is a bug in one of the two paths.
 
 ## Fidelity limits
 

@@ -164,19 +164,45 @@ class TestTheManagerFeedsTheVerdictRealToolCalls:
 
     def test_the_verdict_is_fed_from_the_turn_buffer(self):
         block = self._stamp_block()
-        assert 'live.turn_buffer' in block and '"tool_call"' in block, (
+        assert "live.turn_buffer" in block and '"tool_call"' in block, (
             "the verdict is computed against a field the runner never sets"
         )
 
     def test_only_the_tool_and_args_are_persisted(self):
         """This list rides on the message row forever — the frame envelope
         (`type`, `frame_seq`, ids) would be dead weight on every message, and
-        `chat.js::formatToolCall` reads `{tool, args}` anyway."""
+        `chat.js::formatToolCall` reads `{tool, args}` anyway.
+
+        The projection moved into ``app/chat/message_parts.py`` when the row
+        gained the ordered ``parts`` array: `tool_calls` is now derived from
+        `parts` rather than re-walking the buffer, so the two cannot disagree
+        about which calls a turn made. The invariant is unchanged, so it is
+        asserted where it now lives."""
+        from app.chat.message_parts import parts_to_tool_calls
+
         block = self._stamp_block()
-        assert '"tool": f.get("tool")' in block
-        assert '"args": f.get("args")' in block
-        assert 'isinstance(f.get("tool"), str)' in block, (
-            "a frame with no tool name would render as `tool: undefined`"
+        assert "parts_to_tool_calls(" in block, "tool_calls must be the projection of parts, not a second walk"
+
+        # Behavioural, not textual: a tool part carrying result/state/envelope
+        # noise must project down to exactly {tool, args}.
+        calls = parts_to_tool_calls(
+            [
+                {"type": "text", "text": "prose"},
+                {
+                    "type": "tool",
+                    "tool_use_id": "c1",
+                    "tool": "Bash",
+                    "args": {"command": "agnes catalog"},
+                    "state": "output-available",
+                    "result": "35 tables",
+                    "is_error": False,
+                },
+                # No tool name — would render as `tool: undefined`.
+                {"type": "tool", "tool_use_id": "c2", "tool": None, "args": {}},
+            ]
+        )
+        assert calls == [{"tool": "Bash", "args": {"command": "agnes catalog"}}], (
+            "only tool and args survive, and a nameless call is dropped"
         )
 
     def test_the_calls_are_attached_before_the_verdict_is_computed(self):
@@ -250,11 +276,9 @@ class TestTheBlockLocatorIsLinear:
 
         # Compare the COMPILED patterns, not the source text — the module
         # comment quotes the old pattern to explain why it went.
-        assert not any(
-            "(.*?)" in getattr(v, "pattern", "")
-            for v in vars(sources).values()
-            if hasattr(v, "pattern")
-        ), "a non-greedy body pattern is back"
+        assert not any("(.*?)" in getattr(v, "pattern", "") for v in vars(sources).values() if hasattr(v, "pattern")), (
+            "a non-greedy body pattern is back"
+        )
         src = inspect.getsource(sources)
         assert "_OPEN_RE" in src and "content.find(_CLOSE" in src
 

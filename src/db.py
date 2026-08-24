@@ -75,8 +75,12 @@ _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 # their knowledge/plugins declaration becomes `agent_scope` rows and the four
 # `*_mode` columns flip off the all-'all' passthrough shape, so the narrowing
 # the builder UI showed is the narrowing the runtime applies (see
-# `_v121_to_v122`).
-SCHEMA_VERSION = 122
+# `_v121_to_v122`),
+# 123 adds chat_messages.parts — the assistant turn's ordered
+# [{type:'text'|'tool', …}] shape, so prose and tool calls keep their
+# interleaving across a reload and a replayed tool card can show its real
+# outcome instead of only a name (see `_v122_to_v123`).
+SCHEMA_VERSION = 123
 
 # v96: data_apps registry (hosted user web apps). Extracted as a shared
 # module-level constant so the fresh-install DDL (appended to
@@ -1468,6 +1472,12 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role        VARCHAR NOT NULL,
     content     TEXT NOT NULL,
     tool_calls  JSON,
+    -- Ordered [{type:'text'|'tool', …}] — the turn's SHAPE, so prose and tool
+    -- calls keep their interleaving across a reload (#1504). `tool_calls`
+    -- stays as its positionless projection for readers that predate this and
+    -- for rows written before it existed; app/chat/message_parts.py owns both
+    -- and derives one from the other. NULL on a pre-v123 row.
+    parts       JSON,
     tokens_in   INTEGER,
     tokens_out  INTEGER,
     model       VARCHAR,
@@ -7751,6 +7761,35 @@ def _v121_to_v122(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("UPDATE schema_version SET version = 122")
 
 
+def _v122_to_v123(conn: duckdb.DuckDBPyConnection) -> None:
+    """v122→v123: ``chat_messages.parts`` — the assistant turn's ordered shape.
+
+    A turn is prose → tool → prose, and the row recorded ``content`` (one
+    flattened string) plus ``tool_calls`` (a positionless list), so the
+    interleaving existed only in the live frame order and was gone by the time
+    anything read the row back. A reloaded conversation therefore showed every
+    tool block appended under the whole answer, and a replayed tool card could
+    show only a name — no outcome, no result — because the row evidenced
+    neither (#1504).
+
+    ``parts`` stores the sequence instead: ``[{type:'text'|'tool', …}]``, with
+    a tool entry carrying its own ``state``/``result``/``is_error``. See
+    ``app/chat/message_parts.py`` for the shape and why it mirrors the one
+    ``apps/kai-agent`` persists.
+
+    Additive and nullable, with NO backfill: the ordering a historical row
+    lost cannot be recovered from ``content`` + ``tool_calls`` — the positions
+    are simply not in the data, and guessing them would put tool cards in
+    places they never ran. Pre-v123 rows keep rendering the old way (text,
+    then the calls after it) via the ``tool_calls`` fallback the client
+    retains; new turns get the real shape.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('chat_messages')").fetchall()}
+    if "parts" not in cols:
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN parts JSON")
+    conn.execute("UPDATE schema_version SET version = 123")
+
+
 def _backfill_builder_scope_rows(conn, rows, registries, _ids) -> None:
     """The per-agent write half of :func:`_v121_to_v122`, extracted so the
     transaction wrapper there reads as one unit."""
@@ -8829,6 +8868,11 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             # fresh install (no agents yet) — called for its version stamp,
             # which on this branch is what leaves the DB at SCHEMA_VERSION.
             _v121_to_v122(conn)
+            # v122→v123: chat_messages.parts. No-op on fresh installs —
+            # _SYSTEM_SCHEMA already declares the column — so this is called
+            # for its version stamp, which on this branch is what leaves the
+            # DB at SCHEMA_VERSION.
+            _v122_to_v123(conn)
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still
@@ -9126,6 +9170,8 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
                 _v120_to_v121(conn)
             if current < 122:
                 _v121_to_v122(conn)
+            if current < 123:
+                _v122_to_v123(conn)
             conn.execute(
                 "UPDATE schema_version SET version = ?, applied_at = current_timestamp",
                 [SCHEMA_VERSION],

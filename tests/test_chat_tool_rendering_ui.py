@@ -295,6 +295,12 @@ def test_mcp_envelope_unwraps_to_its_payload():
         # renderToolCallEnd gets frame.result, the raw wire string.
         "string_envelope": '{"content": [{"type": "text", "text": "{\\"status\\": \\"ok\\"}"}]}',
         "markdown_string": "| a | b |\n|---|---|\n| 1 | 2 |",
+        # A JSON string that is NOT an envelope must survive as a string:
+        # parsing every JSON-shaped result here would re-route unrelated
+        # tools (`agnes … --json`) through the table/JSON panel, a far wider
+        # behaviour change than unwrapping an envelope.
+        "json_string_not_envelope": '{"rows": 3, "table": "orders"}',
+        "json_scalar_string": "123",
     }
     script = (
         fn
@@ -309,6 +315,12 @@ def test_mcp_envelope_unwraps_to_its_payload():
     assert res["empty_content"] == cases["empty_content"]
     assert res["string_envelope"] == {"status": "ok"}, "a wire-string envelope unwraps all the way"
     assert res["markdown_string"] == cases["markdown_string"], "markdown strings pass through for marked"
+    assert res["json_string_not_envelope"] == cases["json_string_not_envelope"], (
+        "a JSON string that is not an envelope keeps its existing string rendering"
+    )
+    assert res["json_scalar_string"] == cases["json_scalar_string"], (
+        "`123` parses as a number but is not an envelope — hand back the string"
+    )
 
 
 def test_show_all_rows_is_a_table_not_json():
@@ -609,7 +621,10 @@ def test_tool_call_card_is_a_details_element_collapsed_by_default():
     card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
     assert 'document.createElement("details")' in card, "the whole card must be collapsible, not just its nested panels"
     assert 'document.createElement("summary")' in card, "the header becomes the <details>'s native toggle"
-    assert "wrap.open = true" not in card, (
+    # Collapsed by default: the ONLY thing that opens a card on construction is
+    # a failed call, whose output is the diagnosis nobody knows to click for.
+    assert "if (wrapIsError) wrap.open = true" in card
+    assert card.count("wrap.open = true") == 1, (
         "cards start as just the header line — the name is the toggle (user ask on #1504 follow-up)"
     )
     start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
@@ -696,20 +711,32 @@ def test_both_paths_build_the_same_tool_card():
     assert "summary.textContent = `tool: " not in js, "the flat legacy block is gone"
 
 
-def test_a_replayed_card_claims_no_outcome_it_cannot_evidence():
-    """The persisted row is `{tool, args}` — no result, no duration, no
-    status. A ✓ icon or a success-green edge would assert an outcome the
-    record does not carry, and a result panel would have nothing to show."""
+def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
+    """Since schema v123 the persisted part carries `state` / `result` /
+    `is_error`, so a reloaded card renders the REAL icon, status edge and
+    result body — that is the whole point of storing parts, and it is what
+    makes live and reload one component rather than two that resemble each
+    other. It routes the result through the same `_renderToolResultPreview`
+    the live path uses, so a table is a table and an MCP envelope is unwrapped
+    on both. A part with NO state (a pre-v123 row) still claims nothing."""
     js = _read(CHAT_JS)
     fn = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
-    # Icon and timing are both gated on the live status.
-    assert fn.count('status === "running"') >= 3, "icon, timing and the status class are all live-only"
-    assert "_renderToolResultPreview" not in fn, "a replayed card has no result to preview"
+    assert "_renderToolResultPreview(result)" in fn, "one result renderer for both paths"
+    assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
+        "the persisted state maps onto the same is-error / is-done classes a live result produces"
+    )
+    assert 'icon.textContent = "✓"' in fn and 'icon.textContent = "⚠"' in fn
+    # Neutral only when there is genuinely nothing to report: the fallback
+    # class, and an icon appended only when it has content.
+    assert 'let statusClass = "is-replayed"' in fn
+    assert "if (icon.textContent) head.appendChild(icon)" in fn, (
+        "a stateless (pre-v123) part must not get an empty icon slot"
+    )
     css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
     replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
     replayed = replayed[: replayed.index("}")]
     assert "accent-success" not in replayed and "accent-info" not in replayed, (
-        "a replayed card's status edge must stay neutral"
+        "the stateless fallback's edge must stay neutral"
     )
     # Status only. Layout overrides here mean the card is being nested
     # somewhere with different geometry than the live stream's — which is how
@@ -727,11 +754,30 @@ def test_replayed_cards_are_siblings_in_the_messages_column():
     column width, and two answers of different lengths produced two different
     card widths. Append them where the live stream appends its own."""
     js = _read(CHAT_JS)
-    body = js[js.index("function renderMessage") : js.index("function enhanceTables")]
+    body = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
     assert "bubble.appendChild(_buildToolCard(" not in body, "a card inside the bubble inherits the bubble's width"
-    assert 'for (const card of replayedCards) $("chat-messages").appendChild(card)' in body
-    # The collapse measures the answer, and the cards are no longer in it.
-    assert body.index("maybeMakeCollapsible(article)") < body.index("for (const card of replayedCards)")
+    assert 'for (const el of _buildHistoryTail(parts, m)) $("chat-messages").appendChild(el)' in body
+    # The collapse measures the answer, and the tail is no longer part of it.
+    assert body.index("maybeMakeCollapsible(article)") < body.index("_buildHistoryTail(parts, m)")
+
+
+def test_history_renders_parts_in_order_and_degrades_for_pre_v123_rows():
+    """`m.parts` is the turn's sequence (schema v123), so a reload walks it and
+    puts each tool card back where it ran — closing the half of #1504 that a
+    client-side fix never could. A row without parts keeps the only honest
+    fallback: the answer, then its positionless tool calls after it, because
+    the ordering those rows lost is not in the data to recover."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _buildHistoryTail") : js.index("function _buildContinuationBubble")]
+    # The parts walk handles both kinds, in one pass, in array order.
+    assert 'part.type === "text"' in fn and 'part.type === "tool"' in fn
+    assert "for (const part of parts)" in fn, "array order IS the turn order — no sorting, no bucketing"
+    # State rides through to the card rather than being recomputed.
+    assert "state: part.state" in fn and "isError: part.is_error === true" in fn
+    # Legacy branch: guarded on the absence of parts, and still skips the
+    # nameless cancelled/interrupted markers.
+    assert "if (!parts) {" in fn
+    assert "if (!formatToolCall(tc)) continue;" in fn
 
 
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():

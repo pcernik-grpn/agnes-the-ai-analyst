@@ -130,6 +130,12 @@ class ChatMessage(Base):
     role: Mapped[str] = mapped_column(String, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    #: The turn's ordered [{type:'text'|'tool', …}] shape — what keeps prose
+    #: and tool cards interleaved across a reload, with each tool entry
+    #: carrying its own state/result/is_error. `tool_calls` above is its
+    #: positionless projection. See app/chat/message_parts.py; DuckDB side is
+    #: `_v122_to_v123`. NULL on a row written before schema v123.
+    parts: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
     tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)

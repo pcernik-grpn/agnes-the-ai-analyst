@@ -2030,11 +2030,31 @@ function attachMessageActions(article, copyText) {
   bubble.appendChild(wrap);
 }
 
+/** A message from history.
+ *
+ *  An assistant turn is a SEQUENCE — prose, a tool call, more prose about what
+ *  came back — and `m.parts` is that sequence (schema v123, see
+ *  app/chat/message_parts.py). Rendering walks it in order, so a reload puts
+ *  every tool card back where it actually ran instead of appending them all
+ *  under the finished answer (#1504).
+ *
+ *  A row written before v123 has no `parts`; it falls back to `content` plus
+ *  the positionless `tool_calls`, rendered after the answer. That is not a
+ *  degraded choice, it is the only honest one — the ordering those rows lost
+ *  is not in the data, and placing cards by guess would show tool calls in
+ *  positions they never occupied.
+ */
 function renderMessage(m) {
   const article = createMessageShell({ role: m.role, createdAt: m.created_at });
   const bubble = article.querySelector(".msg-bubble");
   const body = bubble.querySelector(".msg-body");
-  body.innerHTML = renderAnswerMarkdown(m.content);
+
+  const parts = Array.isArray(m.parts) && m.parts.length ? m.parts : null;
+  // The bubble carries the FIRST text part (or the whole content, pre-v123);
+  // later text parts get their own bubble below the card that precedes them,
+  // which is exactly what the live stream produces.
+  const textParts = parts ? parts.filter(p => p && p.type === "text") : [];
+  body.innerHTML = renderAnswerMarkdown(parts ? (textParts[0] && textParts[0].text) || "" : m.content);
   enhanceCodeBlocks(body);
   enhanceTables(body);
   renderMermaidBlocks(body);
@@ -2050,33 +2070,7 @@ function renderMessage(m) {
     bubble.insertBefore(who, body);
   }
 
-  // Replayed tool cards. Built here but appended AFTER the article below, as
-  // siblings in the messages column — which is where the live stream puts
-  // them. That placement is the whole point: `.msg-bubble` is
-  // `flex: 0 1 auto; max-width: 80%`, i.e. sized by its widest line, so a
-  // card nested inside one came out as wide as that message's prose happened
-  // to be (382px under one answer, 324px under another) while a live card
-  // spans the reading column. Same component, three different widths. As a
-  // sibling it inherits the identical `.cloud-chat-tool` geometry by
-  // construction rather than by a matching pair of overrides.
-  const replayedCards = [];
-  for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
-    // A row can carry no `tool` name at all — the cancelled/interrupted
-    // markers manager.py stores in place of a real tool call. Rendering
-    // those unconditionally produced `tool: undefined` and an empty fence.
-    if (!formatToolCall(tc)) continue;
-    // The SAME card the live stream renders, so a refresh doesn't downgrade
-    // the answer's evidence to a flat grey `tool: …` box. `is-replayed`: the
-    // persisted row is `{tool, args}` only, so there is no result body, no
-    // timing and no status icon to show. Position isn't persisted either —
-    // the cards land after the answer rather than inline where they ran
-    // (#1504 part 2 needs an ordered `parts` structure on the row).
-    // Built via textContent throughout (F3): tc.tool / tc.args are untrusted.
-    replayedCards.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
-  }
-
-  // Chips stay on the bubble, so they read as part of the answer; the cards
-  // that follow are the trail of what produced it.
+  // Chips stay on the bubble, so they read as part of the answer.
   if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
@@ -2086,11 +2080,82 @@ function renderMessage(m) {
   attachMessageActions(article, stripNextActionsFence(m.content || ""));
   $("chat-messages").appendChild(article);
   if (m.role === "assistant") _markLatestAssistant(article);
-  // Before the cards are appended: the collapse measures the ANSWER's height,
-  // and the cards are no longer inside the article to be measured.
+  // Before the trailing blocks are appended: the collapse measures the
+  // ANSWER's height, and those blocks are siblings, not part of it.
   maybeMakeCollapsible(article);
-  for (const card of replayedCards) $("chat-messages").appendChild(card);
+
+  // Everything after the first text part, in order. Tool cards and any
+  // further text land as siblings in the messages column — the same place
+  // and therefore the same geometry the live stream gives them.
+  for (const el of _buildHistoryTail(parts, m)) $("chat-messages").appendChild(el);
   maybeScrollToBottom();
+}
+
+/** The blocks that follow a history message's first text part, in order.
+ *
+ *  With `parts` this is a straight walk: a tool part becomes a card carrying
+ *  its persisted state (so the icon, the status edge and the result body are
+ *  the real ones, not a neutral placeholder), and a later text part becomes
+ *  its own bubble under the card above it.
+ *
+ *  Without `parts` (pre-v123 row) it degrades to the old shape: the tool
+ *  calls, positionless, after the answer.
+ */
+function _buildHistoryTail(parts, m) {
+  const out = [];
+  if (!parts) {
+    for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
+      // A row can carry no `tool` name at all — the cancelled/interrupted
+      // markers manager.py stores in place of a real call. Rendering those
+      // unconditionally produced `tool: undefined` and an empty fence.
+      if (!formatToolCall(tc)) continue;
+      out.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
+    }
+    return out;
+  }
+  let seenFirstText = false;
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.type === "text") {
+      if (!seenFirstText) {
+        // Already painted into the bubble above.
+        seenFirstText = true;
+        continue;
+      }
+      out.push(_buildContinuationBubble(part.text || "", m));
+      continue;
+    }
+    if (part.type === "tool") {
+      if (!part.tool) continue;
+      out.push(_buildToolCard({
+        tool: part.tool,
+        args: part.args || {},
+        // The persisted state IS the outcome, so a replayed card no longer
+        // has to omit the icon and border to avoid claiming one.
+        status: "replayed",
+        state: part.state,
+        result: Object.prototype.hasOwnProperty.call(part, "result") ? part.result : undefined,
+        isError: part.is_error === true,
+      }));
+    }
+  }
+  return out;
+}
+
+/** A text part that follows a tool card: its own assistant bubble, no avatar
+ *  or actions row — those belong to the message, and this is a continuation
+ *  of one. Mirrors what a sealed live segment looks like. */
+function _buildContinuationBubble(text, m) {
+  const article = createMessageShell({ role: m.role });
+  article.classList.add("is-continuation");
+  const body = article.querySelector(".msg-body");
+  body.innerHTML = renderAnswerMarkdown(text);
+  enhanceCodeBlocks(body);
+  enhanceTables(body);
+  renderMermaidBlocks(body);
+  const actions = article.querySelector(".msg-actions");
+  if (actions) actions.remove();
+  return article;
 }
 
 // ---------- Result table enhancement -------------------------------------
@@ -3150,31 +3215,45 @@ function resolveQuestionCard(frame) {
  *  none of the design).
  *
  *  `status`: "running" (live, awaiting its result) or "replayed" (rebuilt
- *  from a persisted `{tool, args}` row). A replayed card carries no status
- *  icon, timing or result: persistence stores neither the outcome nor the
- *  duration, and inventing a ✓ would claim a success the row cannot
- *  evidence. Args are all it can honestly show, so they are all it shows.
+ *  from a persisted part). A replayed card now renders its real outcome:
+ *  since schema v123 the part carries `state` / `result` / `is_error`, so
+ *  the icon, the status edge and the result body are the recorded ones. Two
+ *  things it still cannot show, because nothing persists them: the duration
+ *  (neither producer puts elapsed time on the wire — the client measures it
+ *  live between the two frames) and, for a pre-v123 row, any outcome at all
+ *  — `state` is absent there and the card stays deliberately neutral rather
+ *  than claim a success the row cannot evidence.
  *
  *  <details>/<summary> — COLLAPSED by default: the header line (status,
  *  name, args summary, timing) is the transcript trail; one click opens the
- *  formatted args + result. A FAILED live call opens itself in
- *  renderToolCallEnd. */
-function _buildToolCard({ tool, args, status }) {
+ *  formatted args + result. A FAILED call opens itself. */
+function _buildToolCard({ tool, args, status, state, result, isError }) {
   const wrap = document.createElement("details");
-  wrap.className = status === "running" ? "cloud-chat-tool is-running" : "cloud-chat-tool is-replayed";
+  // One status vocabulary for both paths: a replayed part's `state` maps onto
+  // the same is-done / is-error classes a live result produces, so the card
+  // cannot look like a different component depending on where it came from.
+  let statusClass = "is-replayed";
+  if (status === "running") statusClass = "is-running";
+  else if (state === "output-error" || isError) statusClass = "is-error";
+  else if (state === "output-available") statusClass = "is-done";
+  const wrapIsError = statusClass === "is-error";
+  wrap.className = `cloud-chat-tool ${statusClass}`;
   wrap.dataset.tool = tool || "";
+  // A failed call opens itself — the error text is the one body a reader
+  // must not have to know to click for. Same rule live and replayed.
+  if (wrapIsError) wrap.open = true;
 
   // Header line — status + tool name + args summary. Always visible, even
   // collapsed: it's a <summary>, not a body element.
   const head = document.createElement("summary");
   head.className = "cloud-chat-tool-head";
-  if (status === "running") {
-    const icon = document.createElement("span");
-    icon.className = "cloud-chat-tool-icon";
-    icon.setAttribute("aria-hidden", "true");
-    icon.textContent = "⏳";
-    head.appendChild(icon);
-  }
+  const icon = document.createElement("span");
+  icon.className = "cloud-chat-tool-icon";
+  icon.setAttribute("aria-hidden", "true");
+  if (status === "running") icon.textContent = "⏳";
+  else if (wrapIsError) icon.textContent = "⚠";
+  else if (state === "output-available") icon.textContent = "✓";
+  if (icon.textContent) head.appendChild(icon);
 
   // A semantic-layer lookup is the one tool call that is PROVENANCE rather
   // than plumbing: it says the answer you are reading was built on the
@@ -3226,6 +3305,15 @@ function _buildToolCard({ tool, args, status }) {
   // collapsed card was two clicks to see what a tool was asked to do.
   if (args && Object.keys(args).length > 0) {
     wrap.appendChild(_jsonPanel("Args", args, "cloud-chat-tool-args"));
+  }
+
+  // A replayed card's result, from the persisted part. Routed through the
+  // SAME preview builder the live path uses in renderToolCallEnd, so a table
+  // is a table and an MCP envelope is unwrapped on both paths — the card is
+  // one component with one body, not two that resemble each other.
+  if (status !== "running" && result !== undefined) {
+    const body = _renderToolResultPreview(result);
+    if (body) wrap.appendChild(body);
   }
   return wrap;
 }
@@ -3338,18 +3426,29 @@ function _looksLikeToolError(result) {
  *  envelope: join the text blocks, and if the joined text is itself
  *  JSON hand back the parsed value, so it renders as formatted JSON —
  *  or even a table — instead of a string-in-a-string with escaped
- *  newlines. A result that arrives as a JSON *string* is parsed first
- *  — handleFrame's parse is a local for the preview-directive check
- *  and never reaches this layer — while a non-JSON string (markdown
- *  from the agnes CLI) passes through untouched, as does anything
- *  that isn't a pure text-block envelope. */
+ *  newlines. A result that arrives as a JSON *string* is inspected too
+ *  — handleFrame's parse is a local for the preview-directive check and
+ *  never reaches this layer.
+ *
+ *  Narrowly scoped on purpose: a string is only replaced when it turns
+ *  out to BE an envelope. A JSON string that is anything else (a tool
+ *  returning `agnes … --json` output, say) is handed back verbatim so it
+ *  keeps its existing string/markdown rendering — parsing every
+ *  JSON-shaped string here would quietly re-route unrelated tools
+ *  through the table/JSON panel, which is a bigger behaviour change than
+ *  this function is for. */
 function _unwrapMcpEnvelope(result) {
   if (typeof result === "string") {
+    let parsed;
     try {
-      result = JSON.parse(result);
+      parsed = JSON.parse(result);
     } catch (_e) {
       return result;
     }
+    // Only an envelope earns the substitution; everything else keeps the
+    // string it arrived as.
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.content)) return result;
+    result = parsed;
   }
   if (!result || typeof result !== "object" || !Array.isArray(result.content)) return result;
   if (result.content.length === 0) return result;

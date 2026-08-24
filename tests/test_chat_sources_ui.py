@@ -70,7 +70,12 @@ def test_both_render_paths_strip_the_fence():
     assert "renderMarkdownSafe(stripNextActionsFence(stripSourcesFence(" in js, (
         "renderAnswerMarkdown must strip sources first, then next_actions"
     )
-    assert "renderAnswerMarkdown(m.content)" in js, "renderMessage must use the helper"
+    # renderMessage paints the first text part of a `parts` row, or the whole
+    # content for a pre-v123 row — both through the helper.
+    assert 'renderAnswerMarkdown(parts ? (textParts[0] && textParts[0].text) || "" : m.content)' in js, (
+        "renderMessage must use the helper on both the parts and the legacy branch"
+    )
+    assert "renderAnswerMarkdown(text)" in js, "a continuation bubble must use it too"
     assert "renderAnswerMarkdown(tail)" in js, (
         "finalizeAssistantMessage must use the helper (on the post-seal tail — #1504 segmentation)"
     )

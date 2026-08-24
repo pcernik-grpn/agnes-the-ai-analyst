@@ -27,8 +27,9 @@ def _gen_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
 
 
-def _decode_tool_calls(value):
+def _decode_json_column(value):
     # JSONB columns deserialize to Python objects already; tolerate str too.
+    # Shared by `tool_calls` and `parts` — both are whole-value JSON columns.
     if value is None:
         return None
     if isinstance(value, str):
@@ -50,6 +51,7 @@ class ChatMessagePgRepository:
         role: str,
         content: str,
         tool_calls: Optional[list[dict]] = None,
+        parts: Optional[list[dict]] = None,
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         model: Optional[str] = None,
@@ -61,10 +63,11 @@ class ChatMessagePgRepository:
             conn.execute(
                 sa.text(
                     "INSERT INTO chat_messages "
-                    "(id, session_id, role, content, tool_calls, tokens_in, "
+                    "(id, session_id, role, content, tool_calls, parts, tokens_in, "
                     "tokens_out, model, sender_email, created_at) "
                     "VALUES (:id, :session_id, :role, :content, "
-                    "CAST(:tool_calls AS JSONB), :tokens_in, :tokens_out, "
+                    "CAST(:tool_calls AS JSONB), CAST(:parts AS JSONB), "
+                    ":tokens_in, :tokens_out, "
                     ":model, :sender_email, :created_at)"
                 ),
                 {
@@ -73,6 +76,7 @@ class ChatMessagePgRepository:
                     "role": role,
                     "content": content,
                     "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+                    "parts": json.dumps(parts) if parts else None,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
                     "model": model,
@@ -95,6 +99,7 @@ class ChatMessagePgRepository:
             role=role,
             content=content,
             tool_calls=tool_calls,
+            parts=parts,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             model=model,
@@ -111,7 +116,7 @@ class ChatMessagePgRepository:
                     {"id": after_id},
                 ).scalar()
             sql = (
-                "SELECT id, session_id, role, content, tool_calls, tokens_in, "
+                "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                 "tokens_out, model, sender_email, created_at FROM chat_messages "
                 "WHERE session_id = :session_id"
             )
@@ -128,7 +133,8 @@ class ChatMessagePgRepository:
                 session_id=r["session_id"],
                 role=r["role"],
                 content=r["content"],
-                tool_calls=_decode_tool_calls(r["tool_calls"]),
+                tool_calls=_decode_json_column(r["tool_calls"]),
+                parts=_decode_json_column(r["parts"]),
                 tokens_in=r["tokens_in"],
                 tokens_out=r["tokens_out"],
                 model=r["model"],
@@ -150,7 +156,7 @@ class ChatMessagePgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT id, session_id, role, content, tool_calls, tokens_in, "
+                        "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
                         "tokens_out, model, sender_email, created_at FROM chat_messages "
                         "WHERE session_id = :session_id ORDER BY created_at DESC LIMIT :limit"
                     ),
@@ -165,7 +171,8 @@ class ChatMessagePgRepository:
                 session_id=r["session_id"],
                 role=r["role"],
                 content=r["content"],
-                tool_calls=_decode_tool_calls(r["tool_calls"]),
+                tool_calls=_decode_json_column(r["tool_calls"]),
+                parts=_decode_json_column(r["parts"]),
                 tokens_in=r["tokens_in"],
                 tokens_out=r["tokens_out"],
                 model=r["model"],
