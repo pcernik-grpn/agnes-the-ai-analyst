@@ -10,6 +10,7 @@
    sat below the fold. A drawer is full-height by construction and keeps
    the sources list you are adding to visible behind it. #}
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   .ds-page {
     font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
@@ -1264,6 +1265,7 @@
 
 <div id="ds-toast" class="ds-toast" role="status" aria-live="polite"></div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
 const API_REGISTER_TABLE = "/api/admin/register-table";
@@ -2079,6 +2081,13 @@ function _chatToolsFactHtml(row) {
       ${on ? `<button type="button" class="btn btn-secondary" onclick="toggleChatTools('${id}', false, true)">Re-sync token</button>` : ""}
       ${on && row.chat_tools_source_id ? `
       <select id="ds-grant-group-${id}" class="ds-dropdown-native" aria-label="Group to grant this project's tools to"></select>
+      <div class="ds-dropdown" data-ds-dropdown-target="ds-grant-group-${id}">
+        <button type="button" class="ds-dropdown-btn" id="ds-grant-group-${id}-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="ds-grant-group-${id}-dd-menu">
+          <span class="ds-dropdown-btn-label" id="ds-grant-group-${id}-dd-btn-label"></span>
+          <svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <ul class="ds-dropdown-menu" id="ds-grant-group-${id}-dd-menu" role="menu" aria-label="Group to grant this project's tools to" hidden></ul>
+      </div>
       <button type="button" class="btn btn-secondary" onclick="grantChatTools('${id}', '${_esc(row.chat_tools_source_id)}')">Grant all to group</button>` : ""}
     </span>
   </div>`;
@@ -2102,6 +2111,23 @@ async function _loadGroups() {
   return _groupsCache;
 }
 
+// Rebuilds the paired `.ds-dropdown` (see _components.html's `dropdown`
+// macro) menu items + button label from the native select's own freshly-set
+// <option>s, then re-runs ds_dropdown.js's init via the exported
+// `dsDropdownInit` re-init hook — needed because `_connectionCardHtml`
+// re-renders this markup fresh on every list refresh, with an empty menu
+// until `_fillGrantPickers` below fills the paired native select.
+function _syncGrantPickerDropdown(sel) {
+  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
+  if (!host) return;
+  const opts = Array.from(sel.options);
+  host.querySelector(".ds-dropdown-btn-label").textContent = opts.length ? opts[0].textContent : "";
+  host.querySelector(".ds-dropdown-menu").innerHTML = opts
+    .map((o, i) => `<li class="ds-dropdown-menu-item${i === 0 ? " is-selected" : ""}" role="menuitemradio" aria-checked="${i === 0}" tabindex="0" data-value="${_esc(o.value)}">${_esc(o.textContent)}</li>`)
+    .join("");
+  if (window.dsDropdownInit) window.dsDropdownInit(host);
+}
+
 async function _fillGrantPickers() {
   const groups = await _loadGroups();
   document.querySelectorAll('select[id^="ds-grant-group-"]').forEach((sel) => {
@@ -2109,6 +2135,7 @@ async function _fillGrantPickers() {
     sel.innerHTML = groups
       .map((g) => `<option value="${_esc(g.id)}">${_esc(g.name)}</option>`)
       .join("");
+    _syncGrantPickerDropdown(sel);
   });
 }
 
