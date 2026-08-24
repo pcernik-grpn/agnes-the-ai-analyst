@@ -247,6 +247,10 @@ def entity_status(
     passes. Use `--wait` to block until the verdict lands. Exit codes:
     0 = live (approved/overridden), 1 = blocked or review error,
     2 = still pending (timeout with --wait, or non-terminal without).
+
+    With --json, exactly one JSON document (the final state) is emitted on
+    stdout — even under --wait, where the human-readable path reprints per
+    poll — so the output is always parseable with a single json.loads().
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -256,21 +260,27 @@ def entity_status(
             typer.echo(str(e), err=True)
             raise typer.Exit(1)
         if as_json:
-            typer.echo(json.dumps(body, indent=2))
+            # Per-poll output is suppressed in JSON mode; the single final
+            # document is emitted below once the loop terminates.
             sub = body.get("submission") or {}
             status = sub.get("status") or body.get("visibility_status") or "unknown"
         else:
             status = _print_status(body)
         if status in ("approved", "overridden"):
-            raise typer.Exit(0)
-        if status in _TERMINAL_SUBMISSION_STATUSES:
-            raise typer.Exit(1)
-        if not wait:
-            raise typer.Exit(2)
-        if time.monotonic() >= deadline:
+            exit_code = 0
+        elif status in _TERMINAL_SUBMISSION_STATUSES:
+            exit_code = 1
+        elif not wait:
+            exit_code = 2
+        elif time.monotonic() >= deadline:
             typer.echo(f"Review still {status} after {timeout}s — giving up.", err=True)
-            raise typer.Exit(2)
-        time.sleep(5)
+            exit_code = 2
+        else:
+            time.sleep(5)
+            continue
+        if as_json:
+            typer.echo(json.dumps(body, indent=2))
+        raise typer.Exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
