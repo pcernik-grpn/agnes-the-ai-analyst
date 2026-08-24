@@ -4,6 +4,11 @@
 !.claude/skills/
 !.claude/commands/
 !.claude/settings.json
+# Shared dev-server definitions for the Claude Code browser preview (the same
+# reason settings.json is tracked): the local-dev docs name these entries, so
+# a fresh clone has to actually have them. Ports are localhost-only and the
+# secrets in them are literal dev placeholders.
+!.claude/launch.json
 CLAUDE.local.md
 
 # Per-session working notes and throwaway mocks (conflict plans, HTML sketches).

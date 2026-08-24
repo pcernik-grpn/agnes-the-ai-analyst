@@ -898,6 +898,13 @@ chat:
   provider: e2b
   # Where the embedded engine listens (provider=kai-agent only). Default is
   # the compose service the customer-instance module materializes.
+  # Overridable from the environment as AGNES_CHAT_KAI_AGENT_URL (env > this
+  # key > default), same precedence as AGNES_CHAT_PROVIDER — infrastructure
+  # that pins the provider has to be able to pin its endpoint too. It is also
+  # what makes the provider reachable from a laptop, where the default names a
+  # compose host that does not resolve: see docs/kai-agent-local-dev.md for
+  # the local stub engine that lets you exercise this provider without the
+  # real one.
   # kai_agent_url: "http://kai-agent:3000"
   # E2B template id returned by `e2b template build` inside
   # app/initial_workspace_default/e2b-template/. Required when

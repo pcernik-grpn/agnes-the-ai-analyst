@@ -53,9 +53,9 @@ def test_clipboard_strips_next_actions_but_keeps_sources():
     tests/test_chat_sources_ui.py for the full rationale)."""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(article, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(article, stripSourcesFence" not in js
+    assert "attachMessageActions(primary, stripSourcesFence" not in js
 
 
 def test_extract_next_actions_executable():
@@ -218,10 +218,13 @@ def test_tool_label_executable():
 
 
 def test_live_and_history_headers_use_the_label():
+    """Both paths run through _buildToolCard, so the humanized label and the
+    raw-id tooltip are shared by construction — and formatToolCall keeps
+    agreeing for the transcript export."""
     js = _read(CHAT_JS)
-    start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
-    assert "_toolLabel(frame.tool, frame.args)" in start
-    assert "name.title = frame.tool" in start, "the raw id stays reachable as a tooltip"
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert "_toolLabel(tool, args)" in card
+    assert "name.title = tool" in card, "the raw id stays reachable as a tooltip"
     assert "_toolLabel(tc.tool, tc.args)" in js, "history formatToolCall must agree"
 
 
@@ -241,16 +244,83 @@ def test_summarize_args_shows_the_command_line():
 # ── tool results: JSON is one click away, never the primary rendering ───────
 
 
-def test_json_fallback_is_collapsed_behind_details():
+def test_result_json_renders_directly_inside_the_collapsed_card():
+    """The card itself starts collapsed — its header IS the "one click away"
+    a nested Structured-result toggle used to provide. Opening the card must
+    show the formatted JSON immediately; a second details inside would make
+    it two clicks to see what a tool returned."""
     js = _read(CHAT_JS)
     body = js[
         js.index('wrap.className = "cloud-chat-tool-result is-json"') : js.index("function _coerceToTablePreview")
     ]
-    assert 'document.createElement("details")' in body, "the JSON fallback must be a collapsed details, not a bare pre"
-    assert "Structured result" in body, "the visible line is a summary, not the payload"
-    det_pos = body.index('document.createElement("details")')
-    pre_pos = body.index('document.createElement("pre")')
-    assert det_pos < pre_pos, "the pre lives INSIDE the details"
+    assert "Structured result" not in body, "no nested toggle — the JSON is the body"
+    assert '_jsonPanel("Result"' in body, "the JSON fallback rides the shared formatted-JSON panel"
+
+
+def test_json_panel_is_highlighted_capped_and_keeps_a_full_route():
+    """`language-json` pins hljs (auto-detect misreads short payloads);
+    oversize payloads render capped with the whole thing one lazy toggle
+    away — the same idiom as the table preview's raw-JSON route."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _jsonPanel") : js.index("function _toolCallId")]
+    assert 'code.className = "language-json"' in fn
+    assert "_TOOL_JSON_PREVIEW_CHARS" in fn, "a DOM cap must exist for huge payloads"
+    assert '"toggle"' in fn, "the full payload is filled lazily, on first open"
+    assert "enhanceCodeBlocks(" in fn, "the shared pass adds highlight + copy button"
+
+
+def test_args_render_as_formatted_json_on_card_expand():
+    """One click total: expanding the card shows the args as formatted JSON —
+    the old nested args toggle was a second click inside a collapsed card."""
+    js = _read(CHAT_JS)
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert '_jsonPanel("Args"' in card
+    assert "Show args" not in js, "no nested args toggle on either path"
+
+
+def test_mcp_envelope_unwraps_to_its_payload():
+    """kai-agent delivers MCP results as the raw {content:[{type:"text",…}]}
+    envelope; the reader got a string-in-a-string with escaped newlines.
+    Unwrap to the joined text, parsed as JSON when it is JSON."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _unwrapMcpEnvelope") : js.index("function _renderToolResultPreview")]
+    cases = {
+        "json_payload": {"content": [{"type": "text", "text": '{"status": "ok"}'}]},
+        "text_payload": {"content": [{"type": "text", "text": "plain **markdown**"}]},
+        "joined": {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+        "not_envelope": {"columns": ["a"], "rows": [[1]]},
+        "mixed_blocks": {"content": [{"type": "image", "data": "x"}]},
+        "empty_content": {"content": []},
+        # handleFrame's parse is a LOCAL for the preview-directive check —
+        # renderToolCallEnd gets frame.result, the raw wire string.
+        "string_envelope": '{"content": [{"type": "text", "text": "{\\"status\\": \\"ok\\"}"}]}',
+        "markdown_string": "| a | b |\n|---|---|\n| 1 | 2 |",
+        # A JSON string that is NOT an envelope must survive as a string:
+        # parsing every JSON-shaped result here would re-route unrelated
+        # tools (`agnes … --json`) through the table/JSON panel, a far wider
+        # behaviour change than unwrapping an envelope.
+        "json_string_not_envelope": '{"rows": 3, "table": "orders"}',
+        "json_scalar_string": "123",
+    }
+    script = (
+        fn
+        + f"\nprocess.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)}).map(([k, v]) => [k, _unwrapMcpEnvelope(v)]))));\n"
+    )
+    res = json.loads(_node_run(script))
+    assert res["json_payload"] == {"status": "ok"}, "JSON payload comes back parsed"
+    assert res["text_payload"] == "plain **markdown**", "text payload comes back as the string"
+    assert res["joined"] == "a\nb", "multiple text blocks join"
+    assert res["not_envelope"] == cases["not_envelope"], "non-envelopes pass through untouched"
+    assert res["mixed_blocks"] == cases["mixed_blocks"], "non-text blocks disable the unwrap"
+    assert res["empty_content"] == cases["empty_content"]
+    assert res["string_envelope"] == {"status": "ok"}, "a wire-string envelope unwraps all the way"
+    assert res["markdown_string"] == cases["markdown_string"], "markdown strings pass through for marked"
+    assert res["json_string_not_envelope"] == cases["json_string_not_envelope"], (
+        "a JSON string that is not an envelope keeps its existing string rendering"
+    )
+    assert res["json_scalar_string"] == cases["json_scalar_string"], (
+        "`123` parses as a number but is not an envelope — hand back the string"
+    )
 
 
 def test_show_all_rows_is_a_table_not_json():
@@ -391,7 +461,8 @@ def test_transcript_export_keeps_the_raw_tool_id():
     assert "tool: tc.tool" in fmt, "formatToolCall must carry the raw id alongside the label"
     export = js[js.index("async function fetchTranscriptMarkdown") : js.index("function wireCopyTranscript")]
     assert "${call.label} (${call.tool})" in export
-    assert "summary.title = call.tool" in js, "the history block's tooltip carries the raw id"
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert "name.title = tool" in card, "the rendered card's tooltip carries the raw id (both paths)"
 
 
 def test_streaming_safe_text_executable():
@@ -538,23 +609,32 @@ def test_collapse_cap_clears_an_ordinary_long_answer():
     assert threshold >= 2000, f"COLLAPSE_THRESHOLD_PX={threshold}px collapses ordinary answers; the cap is for extremes"
 
 
-# ── tool cards: collapse once the turn that opened them ends ────────────────
-# A tool card used to stay fully expanded forever — stdout/stderr sitting in
-# the transcript under the answer with no way to tidy it up. The fix: the
-# card itself is a <details>, open while its turn runs, and every one opened
-# during a turn is folded to its header line the moment that turn ends.
+# ── tool cards: header line by default, one click to the JSON ───────────────
+# A tool card is a <details> collapsed to its header line (status, name, args
+# summary, timing); expanding shows the formatted-JSON args and result. A
+# failed call opens itself. Any card expanded during a turn folds back the
+# moment that turn ends.
 
 
-def test_tool_call_card_is_a_details_element_open_while_running():
+def test_tool_call_card_is_a_details_element_collapsed_by_default():
     js = _read(CHAT_JS)
-    start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
-    assert 'document.createElement("details")' in start, (
-        "the whole card must be collapsible, not just its nested args/result panels"
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert 'document.createElement("details")' in card, "the whole card must be collapsible, not just its nested panels"
+    assert 'document.createElement("summary")' in card, "the header becomes the <details>'s native toggle"
+    # Collapsed by default: the ONLY thing that opens a card on construction is
+    # a failed call, whose output is the diagnosis nobody knows to click for.
+    assert "if (wrapIsError) wrap.open = true" in card
+    assert card.count("wrap.open = true") == 1, (
+        "cards start as just the header line — the name is the toggle (user ask on #1504 follow-up)"
     )
-    assert 'document.createElement("summary")' in start, "the header becomes the <details>'s native toggle"
-    assert "wrap.open = true" in start, "expanded while the turn is running and just after — unchanged live behavior"
+    start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
+    assert "wrap.open = true" not in start
     assert "_currentTurnToolCards.push(wrap)" in start, (
         "tracked so every card opened this turn folds together at turn end"
+    )
+    end = js[js.index("function renderToolCallEnd") : js.index("function _collapseFinishedToolCalls")]
+    assert "if (isError) wrap.open = true" in end, (
+        "a FAILED card must open itself — its output is the diagnosis nobody knows to click for"
     )
 
 
@@ -599,9 +679,236 @@ def test_a_failed_tool_card_is_not_folded_shut():
     assert "is-error" in fn, "a failed card's output must survive the fold"
 
 
+def test_no_bare_details_box_rule_can_flatten_a_tool_card():
+    """A tool card IS a <details> — in the stream AND inside a bubble on the
+    reload path — so ANY box rule on a bare `details` descendant of
+    .cloud-chat-messages (or of .msg-bubble) outranks the whole
+    .cloud-chat-tool* family (0,1,1 vs 0,1,0) and flattens the cards:
+    horizontal margin 0, 1px border instead of the 3px status edge, cramped
+    padding. That was the #1504 styling regression. The legacy flat block
+    that needed such a rule is gone — both paths build the same card. Only
+    the code-block rules may stay broad: they paint the highlighted JSON
+    INSIDE the cards."""
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    for rule in re.finditer(r"\.(?:cloud-chat-messages|msg-bubble)\s+(?:\.msg-bubble\s+)?details([^{]*)\{", css):
+        rest = rule.group(1)
+        assert "code" in rest or "pre.code-block-wrap" in rest, (
+            f"box rule on a bare descendant `details` ({rest.strip()!r}) reaches the "
+            "tool cards and flattens them — target .cloud-chat-tool* instead (#1504)"
+        )
+
+
+def test_both_paths_build_the_same_tool_card():
+    """A refresh used to downgrade an answer's evidence to a flat grey
+    `tool: <label>` box — same information, none of the design. Live and
+    reload must build the card through one shared constructor."""
+    js = _read(CHAT_JS)
+    assert "function _buildToolCard" in js
+    start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
+    assert "_buildToolCard({" in start, "the live path must use the shared card"
+    hist = js[js.index("function renderMessage") : js.index("function enhanceTables")]
+    assert "_buildToolCard({" in hist, "the reload path must use the SAME card, not a bespoke details"
+    assert "summary.textContent = `tool: " not in js, "the flat legacy block is gone"
+
+
+def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
+    """Since schema v123 the persisted part carries `state` / `result` /
+    `is_error`, so a reloaded card renders the REAL icon, status edge and
+    result body — that is the whole point of storing parts, and it is what
+    makes live and reload one component rather than two that resemble each
+    other. It routes the result through the same `_renderToolResultPreview`
+    the live path uses, so a table is a table and an MCP envelope is unwrapped
+    on both. A part with NO state (a pre-v123 row) still claims nothing."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert "_renderToolResultPreview(result)" in fn, "one result renderer for both paths"
+    assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
+        "the persisted state maps onto the same is-error / is-done classes a live result produces"
+    )
+    assert 'icon.textContent = "✓"' in fn and 'icon.textContent = "⚠"' in fn
+    # Neutral only when there is genuinely nothing to report: the fallback
+    # class, and an icon appended only when it has content.
+    assert 'let statusClass = "is-replayed"' in fn
+    assert "if (icon.textContent) head.appendChild(icon)" in fn, (
+        "a stateless (pre-v123) part must not get an empty icon slot"
+    )
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
+    replayed = replayed[: replayed.index("}")]
+    assert "accent-success" not in replayed and "accent-info" not in replayed, (
+        "the stateless fallback's edge must stay neutral"
+    )
+    # Status only. Layout overrides here mean the card is being nested
+    # somewhere with different geometry than the live stream's — which is how
+    # replayed cards ended up as wide as each message's longest line.
+    for prop in ("margin", "max-width", "width"):
+        assert prop not in replayed, (
+            f"`{prop}` on .is-replayed — a replayed card must inherit the live card's "
+            "geometry by being appended in the same place, not by overriding it"
+        )
+
+
+def test_replayed_cards_are_siblings_in_the_messages_column():
+    """`.msg-bubble` is `flex: 0 1 auto; max-width: 80%` — sized by its widest
+    line — so a card nested inside one cannot match the live card's reading-
+    column width, and two answers of different lengths produced two different
+    card widths. Append them where the live stream appends its own."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
+    assert "bubble.appendChild(_buildToolCard(" not in body, "a card inside the bubble inherits the bubble's width"
+    assert 'for (const node of nodes) $("chat-messages").appendChild(node)' in body, (
+        "every node — bubbles and cards alike — is appended to the messages column in order"
+    )
+    # The collapse measures the primary article after insertion; the cards and
+    # continuations are siblings, not part of the answer's height.
+    assert body.index('for (const node of nodes)') < body.index("maybeMakeCollapsible(primary)")
+
+
+def test_history_renders_parts_in_order_with_nothing_hoisted():
+    """`m.parts` is the turn's sequence (schema v123), so a reload walks it and
+    puts each tool card back where it ran — closing the half of #1504 a
+    client-side fix never could.
+
+    Crucially it must not HOIST. An earlier cut painted the first TEXT part
+    into the message bubble regardless of position, which reversed a turn that
+    OPENS with a tool call: the prose came out above the card that ran first,
+    while the live stream renders card-then-text for the same turn. Order is
+    array order, and the only way to guarantee it is to never reorder.
+
+    A row without parts keeps the only honest fallback: the answer, then its
+    positionless tool calls after it, because the ordering those rows lost is
+    not in the data to recover."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
+    assert "for (const part of parts)" in fn, "array order IS the turn order — no sorting, no bucketing"
+    assert 'part.type === "text"' in fn and 'part.type === "tool"' in fn
+    # No hoisting: the first text part must not be selected out of sequence.
+    assert "textParts" not in fn, "selecting a text part by index reorders the turn"
+    assert ".filter(" not in fn.split("if (!parts)")[0], "no pre-pass over parts before the ordered walk"
+    # State rides through to the card rather than being recomputed.
+    assert "state: part.state" in fn and "isError: part.is_error === true" in fn
+    # Legacy branch: guarded on the absence of parts, and still skips the
+    # nameless cancelled/interrupted markers.
+    assert "if (!parts) {" in fn
+    assert "if (!formatToolCall(tc)) continue;" in fn
+    # The primary article is whichever text bubble comes first, and a
+    # tool-only row still gets one — appended LAST so cards keep their spots.
+    assert "if (primary === null) pushTextBubble(m.content)" in fn
+
+
+def test_a_tool_first_turn_reloads_card_before_prose():
+    """The specific inversion: parts `[tool, text]` must emit the card first.
+    Executed rather than asserted textually, because this is about the ORDER
+    the loop produces, not the text of the loop."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
+    # Extract just the ordering decision and run it over a tool-first row.
+    harness = """
+    const order = [];
+    const parts = [
+      {type: "tool", tool: "Bash", args: {}, state: "output-available", result: "r", is_error: false},
+      {type: "text", text: "Found it."},
+    ];
+    let primary = null;
+    const pushTextBubble = (t) => { if (primary === null) primary = "primary"; order.push("text"); };
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.type === "text") { pushTextBubble(part.text); continue; }
+      if (part.type === "tool" && part.tool) order.push("card");
+    }
+    if (primary === null) pushTextBubble("");
+    process.stdout.write(JSON.stringify(order));
+    """
+    assert json.loads(_node_run(harness)) == ["card", "text"], (
+        "a turn that opens with a tool call must reload card-then-prose, matching the live stream"
+    )
+    # And the shipped code contains no index-based text selection that would
+    # reintroduce the hoist.
+    assert "textParts[0]" not in fn
+
+
+
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():
     """Cards are built only from live `tool_call` frames; loadAndRenderHistory
     replays messages, not tool calls, so a reload leaves no card at all. The
     header line is the trail for the session, not a permanent record."""
     js = _read(CHAT_JS)
     assert "as the permanent record" not in js
+
+
+# ── live segmentation: blocks render AT their position in the turn (#1504) ──
+# Tokens used to keep appending into the one pre-block bubble, so a turn that
+# went text → tool → text displayed as [all text][all blocks]. Now every
+# inline block (tool card, approval card, question card) SEALS the streaming
+# bubble; the next token opens a fresh bubble below the block, and finalize
+# renders only the text after the last seal.
+
+
+def test_inline_blocks_seal_the_streaming_bubble():
+    js = _read(CHAT_JS)
+    assert "function _sealStreamingSegment" in js
+    for fn, end in (
+        ("function renderToolCallStart", "function renderToolCallEnd"),
+        ("function renderApprovalRequest", "function resolveApprovalCard"),
+        ("function renderQuestionRequest", "function resolveQuestionCard"),
+    ):
+        body = js[js.index(fn) : js.index(end)]
+        assert "_sealStreamingSegment()" in body, f"{fn} appends an inline block — it must seal first"
+
+
+def test_seal_concatenates_exactly_and_skips_the_heavy_tail():
+    """The sealed prefix must be the PLAIN join of the streamed deltas — the
+    finalize subtraction relies on it — and a sealed bubble gets only the
+    light finish: actions row, chips and latest-marking belong to the turn's
+    LAST bubble."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _sealStreamingSegment") : js.index("function appendToken")]
+    assert "_turnSealedText += currentAssistantText" in fn, "exact concatenation, no separator"
+    assert "attachMessageActions" not in fn
+    assert "renderSourcesChips" not in fn
+    assert "_markLatestAssistant" not in fn
+
+
+def test_a_segmented_turn_paints_the_local_tail_not_a_slice_of_server_content():
+    """`assistant_message.content` is NOT the concatenation of the streamed
+    deltas: the engine provider builds it as `"\\n\\n".join(part.strip() …)`
+    over text parts (`_TurnState.text`) and the native runner consolidates
+    TextBlocks the same way. So reconstructing the final bubble by subtracting
+    a "sealed prefix" from `content` only works on a turn with ONE text part;
+    on a real multi-part turn the match misses, and any fallback that then
+    re-renders `content` whole puts all the text back below all the cards —
+    the exact bug the segmentation exists to fix. Display therefore comes from
+    the deltas the client actually showed; `content` stays the RECORD."""
+    js = _read(CHAT_JS)
+    fin = js[js.index("function finalizeAssistantMessage") : js.index("// ---------- Inline tool-call blocks")]
+    assert "startsWith(_turnSealedText)" not in fin, "no prefix arithmetic against server content"
+    assert "_turnSealedText.length" not in fin, "no slicing of server content"
+    assert "segmented ? currentAssistantText : content" in fin, (
+        "segmented turns paint the local tail; unsegmented ones the authoritative content"
+    )
+    assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in fin, (
+        "the copy row hands over the WHOLE answer, not the tail the bubble shows"
+    )
+
+
+def test_the_trailing_segment_finish_path_also_caps_a_long_answer():
+    """A turn that ends on a tool/approval/question card takes the early
+    return, which attaches chips and the copy row to the last sealed bubble.
+    Every other finish path caps an over-long answer; this one must too."""
+    js = _read(CHAT_JS)
+    fin = js[js.index("function finalizeAssistantMessage") : js.index("// ---------- Inline tool-call blocks")]
+    early = fin[
+        fin.index("if (!currentAssistantArticle && !tail.trim()") : fin.index(
+            '_turnSealedText = "";\n  _turnSealedArticles = [];\n  if ('
+        )
+    ]
+    assert "maybeMakeCollapsible(article)" in early
+
+
+def test_reset_clears_the_seal_bookkeeping():
+    """An orphan turn keeps its sealed bubbles on screen, but the NEXT turn's
+    finalize must not subtract this turn's text."""
+    js = _read(CHAT_JS)
+    reset = js[js.index("function _resetStreamingState") : js.index("function _sealStreamingSegment")]
+    assert '_turnSealedText = ""' in reset
+    assert "_turnSealedArticles = []" in reset

@@ -1060,31 +1060,15 @@ pre.code-block-wrap code .hljs-deletion {
   .msg.is-streaming .msg-body::after { animation: none; }
 }
 
-/* tool-call collapsible blocks — legacy <details> rendering for
-   tool_calls embedded inside the persisted assistant message
-   (renderMessage path). The live in-stream renderer uses the richer
-   .cloud-chat-tool family below. */
-.cloud-chat-messages details {
-  margin: var(--space-1) 0;
-  padding: var(--space-2) var(--space-3);
-  background: var(--ds-surface-dim);
-  border: 1px solid var(--ds-border);
-  border-radius: var(--radius-md);
-  font-size: var(--text-sm);
-  color: var(--ds-text-secondary);
-}
-.cloud-chat-messages details summary {
-  cursor: pointer;
-  user-select: none;
-}
-.cloud-chat-messages details pre {
-  margin: var(--space-2) 0 0;
-  padding: var(--space-2);
-  background: var(--ds-surface);
-  border-radius: var(--radius-sm);
-  font-size: var(--text-sm);
-  overflow-x: auto;
-}
+/* NOTE — there is deliberately NO box rule for a bare
+   `.cloud-chat-messages details` (or `.msg-bubble details`) here. The tool
+   card IS a <details>, both in the stream and inside a bubble on the reload
+   path, so any such rule outranks the whole .cloud-chat-tool* family below
+   (0,1,1 vs 0,1,0) and flattens the cards to left-aligned 1px boxes. The
+   legacy flat `tool: <label>` block that used to need it is gone —
+   renderMessage builds the same card the live stream does. The
+   pre.code-block-wrap and inline-code rules above stay broad on purpose:
+   they paint the highlighted JSON inside those cards. */
 
 /* ===== Inline tool-call blocks ===== */
 /* Renders each live tool_call as a self-contained block in the
@@ -1095,10 +1079,11 @@ pre.code-block-wrap code .hljs-deletion {
 
    The block layout: small "card" sitting inline in the messages
    feed, capped at the reading column so wide previews share the
-   same gutter as message bubbles. Args + full-result are tucked
-   inside collapsed <details> below the header — and the card itself
-   is a <details> too (chat.js renderToolCallStart), open while the
-   turn runs and folded to just the header once it ends. */
+   same gutter as message bubbles. The card itself is a <details>
+   (chat.js renderToolCallStart), COLLAPSED to its header line by
+   default; expanding shows the formatted-JSON args and result
+   panels directly (only oversize payloads keep a nested toggle).
+   A failed call opens itself. */
 .cloud-chat-tool {
   margin: var(--space-2) auto;
   padding: var(--space-3) var(--space-4);
@@ -1113,6 +1098,27 @@ pre.code-block-wrap code .hljs-deletion {
 .cloud-chat-tool.is-running { border-left-color: var(--ds-accent-info-line); }
 .cloud-chat-tool.is-done    { border-left-color: var(--ds-accent-success-line); }
 .cloud-chat-tool.is-error   { border-left-color: var(--ds-accent-danger-line); }
+/* A continuation bubble: the second and later text parts of a replayed turn,
+   each sitting under the tool card it followed. It is the same assistant
+   bubble, minus the avatar gutter's second copy of the avatar — the message
+   has one speaker, and repeating the avatar per segment reads as several
+   replies instead of one answer with evidence threaded through it. The live
+   stream's sealed segments look the same way for the same reason. */
+.msg.is-continuation .msg-avatar { visibility: hidden; }
+
+/* A pre-v123 replayed card has no recorded outcome, so its status edge stays
+   neutral — a success-green card would claim an outcome the row cannot
+   evidence. A v123+ card carries `state` and therefore lands on is-done /
+   is-error above, exactly like a live one.
+   Status ONLY: no layout overrides. A replayed card is appended as a sibling
+   in the messages column, exactly where the live stream puts one, so it
+   inherits the geometry above by construction. It previously nested inside
+   `.msg-bubble` (`flex: 0 1 auto; max-width: 80%`) and needed margin/width
+   overrides to cope, which still left every card as wide as its own message's
+   longest line instead of the reading column. */
+.cloud-chat-tool.is-replayed {
+  border-left-color: var(--ds-border);
+}
 
 .cloud-chat-tool-head {
   display: flex;
@@ -1178,6 +1184,7 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool[open] .cloud-chat-tool-chevron { transform: rotate(90deg); }
 
 .cloud-chat-tool-args,
+.cloud-chat-tool-json,
 .cloud-chat-tool-result-full {
   margin-top: var(--space-2);
   padding: var(--space-2);
@@ -1185,7 +1192,15 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   border: 1px solid var(--ds-border);
   border-radius: var(--radius-sm);
 }
-.cloud-chat-tool-args > summary,
+/* The label over a formatted-JSON panel (Args / Result) — same voice as
+   the toggles below, but it is a heading, not a control. */
+.cloud-chat-tool-panel-label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--ds-text-muted);
+  user-select: none;
+}
 .cloud-chat-tool-result-full > summary {
   cursor: pointer;
   user-select: none;
@@ -1195,6 +1210,7 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   color: var(--ds-text-muted);
 }
 .cloud-chat-tool-args pre,
+.cloud-chat-tool-json pre,
 .cloud-chat-tool-result-full pre {
   margin: var(--space-2) 0 0;
   padding: 0;

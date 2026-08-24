@@ -86,6 +86,12 @@ class ChatMessage:
     model: Optional[str]
     created_at: datetime
     sender_email: Optional[str] = None
+    #: The turn's ordered [{type:'text'|'tool', …}] shape — what keeps prose
+    #: and tool calls interleaved across a reload, and what lets a replayed
+    #: tool card show its real outcome (app/chat/message_parts.py). None on a
+    #: row written before schema v123; `tool_calls` is its positionless
+    #: projection and remains the fallback for those.
+    parts: Optional[list[dict]] = None
 
 
 @dataclass

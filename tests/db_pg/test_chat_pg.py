@@ -216,6 +216,42 @@ def test_tool_calls_round_trip(sessions, messages):
     assert got.tool_calls == payload
 
 
+def test_parts_round_trip(sessions, messages):
+    """The turn's ordered shape (schema v123) must survive the store on BOTH
+    backends — it is what keeps prose and tool cards interleaved after a
+    reload, so a backend that silently dropped it would resurrect #1504 on
+    that engine only."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    parts = [
+        {"type": "text", "text": "Checking."},
+        {
+            "type": "tool",
+            "tool_use_id": "c1",
+            "tool": "Bash",
+            "args": {"command": "agnes catalog"},
+            "state": "output-available",
+            "result": {"columns": ["a"], "rows": [[1]]},
+            "is_error": False,
+        },
+        {"type": "text", "text": "Two tables."},
+    ]
+    messages.append_message(session_id=s.id, role="assistant", content="Checking.\n\nTwo tables.", parts=parts)
+    got = messages.list_messages(s.id)[0]
+    assert got.parts == parts, "order, nesting and the tool's state must all round-trip"
+    assert [p["type"] for p in got.parts] == ["text", "tool", "text"]
+    assert got.parts[1]["state"] == "output-available"
+
+
+def test_parts_default_to_null_not_an_empty_list(sessions, messages):
+    """A message written without parts (a user turn, or a pre-v123 writer)
+    leaves the column NULL, which is what the client reads as "fall back to
+    tool_calls" rather than "this turn had no content"."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    messages.append_message(session_id=s.id, role="user", content="hi")
+    got = messages.list_messages(s.id)[0]
+    assert got.parts is None
+
+
 def test_get_first_user_message(sessions, messages):
     s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
     messages.append_message(session_id=s.id, role="assistant", content="greeting")

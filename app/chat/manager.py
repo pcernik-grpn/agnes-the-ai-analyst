@@ -22,6 +22,7 @@ from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
 from app.chat.frame_seq import stamp_frame
+from app.chat.message_parts import build_message_parts, parts_to_tool_calls
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.provider import SandboxHandle, SandboxProvider
@@ -2211,11 +2212,19 @@ class ChatManager:
                 # It is also the shape `chat.js::formatToolCall` already
                 # expects, and the shape `verify()` serialises into its
                 # haystack.
-                frame["tool_calls"] = [
-                    {"tool": f.get("tool"), "args": f.get("args") or {}}
-                    for f in live.turn_buffer
-                    if f.get("type") == "tool_call" and isinstance(f.get("tool"), str)
-                ] or None
+                # The turn's ORDERED shape: text and tool entries in the
+                # sequence they arrived, with each tool's result folded onto
+                # the entry where its call already sits. That is what lets a
+                # reloaded conversation keep prose and tool cards interleaved,
+                # and a replayed card show its real outcome instead of only a
+                # name (#1504). `tool_calls` below is now its positionless
+                # projection, derived from the same source so the two cannot
+                # disagree about which calls a turn made — it stays on the
+                # frame and the row for readers that predate `parts` (the
+                # transcript export, the sources verdict, `verify()`'s
+                # haystack) and for rows written before schema v123.
+                frame["parts"] = build_message_parts(live.turn_buffer)
+                frame["tool_calls"] = parts_to_tool_calls(frame["parts"])
                 frame["sources"] = sources_verdict(frame.get("content", "") or "", frame.get("tool_calls")).to_dict()
             await self._broadcast(live, frame)
             ftype = frame.get("type")
@@ -2270,6 +2279,7 @@ class ChatManager:
                     role="assistant",
                     content=frame.get("content", ""),
                     tool_calls=frame.get("tool_calls"),
+                    parts=frame.get("parts"),
                     tokens_in=frame.get("tokens_in"),
                     tokens_out=frame.get("tokens_out"),
                     model=frame.get("model"),

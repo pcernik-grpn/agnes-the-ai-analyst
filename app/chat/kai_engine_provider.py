@@ -694,6 +694,12 @@ class KaiEngineHandle:
                     # pairing id (the manager's envelope overwrites `id`).
                     "tool": tool_call_id,
                     "result": result,
+                    # The event type IS the verdict — forward it instead of
+                    # making the client sniff the payload for a leading
+                    # "error". A `tool-output-error` whose text begins
+                    # anywhere else ("Catalog Error: Table … does not exist")
+                    # was rendering with a success tick and folded shut.
+                    "is_error": etype == "tool-output-error",
                 }
             )
         elif etype == "error":
