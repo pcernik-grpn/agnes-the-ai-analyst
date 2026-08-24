@@ -23,6 +23,14 @@ including on a deployment with no embedding model, where nothing reads them.
 That cost is memory, not milliseconds, and it scales with corpus size rather
 than with what the query needs.
 
+``ru_maxrss`` is a process-lifetime high-water mark — it never goes down —
+so measuring several scales sequentially in one process would hand every
+later scale the previous scale's peak as its "before" reading and understate
+``rss_growth_mb``. A multi-scale run therefore executes each scale in its
+own fresh subprocess (the script re-invokes itself with ``--emit-row``) and
+aggregates the rows in the parent, which keeps both ``peak_rss_mb`` and
+``rss_growth_mb`` per-scale accurate.
+
 Usage::
 
     scripts/bench_retrieval.py                       # default ladder
@@ -49,6 +57,7 @@ import random
 import resource
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -304,6 +313,30 @@ def bench_scale(
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _bench_scale_in_subprocess(n_chunks: int, n_queries: int, *, with_embeddings: bool) -> Dict[str, Any]:
+    """Run one scale in a fresh child process and return its result row.
+
+    ``ru_maxrss`` never decreases within a process, so per-scale peak/growth
+    numbers are only honest when each scale starts from a fresh high-water
+    mark. The child is this same script with ``--emit-row``, which prints the
+    row as JSON on stdout; stderr is inherited so a failure is visible.
+    """
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--scales",
+        str(n_chunks),
+        "--queries",
+        str(n_queries),
+        "--emit-row",
+    ]
+    if with_embeddings:
+        cmd.append("--embed")
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
+    row: Dict[str, Any] = json.loads(proc.stdout)
+    return row
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument(
@@ -318,9 +351,23 @@ def main() -> int:
         help="store random vectors and inject a query vector, so the cosine+fusion path is measured",
     )
     ap.add_argument("--json", dest="json_out", help="write the rows as JSON here")
+    ap.add_argument(
+        "--emit-row",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: single scale, JSON row on stdout (subprocess mode)
+    )
     args = ap.parse_args()
 
     scales = [int(s.strip()) for s in args.scales.split(",") if s.strip()]
+
+    if args.emit_row:
+        if len(scales) != 1:
+            print("--emit-row requires exactly one scale", file=sys.stderr)
+            return 2
+        row = bench_scale(scales[0], args.queries, with_embeddings=args.embed)
+        json.dump(row, sys.stdout)
+        return 0
+
     rows = []
     header = (
         f"{'chunks':>8} {'emb':>4} {'fetch p50':>10} {'fetch p95':>10} "
@@ -329,7 +376,11 @@ def main() -> int:
     print(header)
     print("-" * len(header))
     for n in scales:
-        row = bench_scale(n, args.queries, with_embeddings=args.embed)
+        if len(scales) == 1:
+            # A single scale gets a fresh process anyway — no need to fork.
+            row = bench_scale(n, args.queries, with_embeddings=args.embed)
+        else:
+            row = _bench_scale_in_subprocess(n, args.queries, with_embeddings=args.embed)
         rows.append(row)
         print(
             f"{row['chunks']:>8} {'y' if row['embeddings'] else 'n':>4} "
