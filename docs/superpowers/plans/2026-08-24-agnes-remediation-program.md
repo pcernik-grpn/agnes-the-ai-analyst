@@ -156,27 +156,24 @@ Sub-plans to write at execution start: `2026-08-XX-pg-default-install.md`
 
 ### A1: Postgres is the default app-state for new installs
 
-**Files:** `docker-compose.yml` (fold the `postgres` service + `migrate`
-one-shot from `docker-compose.postgres.yml` into the default graph),
-`scripts/ops/agnes-compose-file.sh` (resolver defaults), `src/db_state_machine.py`
-(fresh-install default state → SIDE_CAR), `infra/modules/customer-instance/startup-script.sh.tpl:100-111`
-(new VMs write `database: {backend: side_car}`), `docs/QUICKSTART.md`,
-`docs/DEPLOYMENT.md`, `config/instance.yaml.example`.
+**AMENDED 2026-08-24 — detailed plan: `2026-08-24-pg-default-install.md`.**
+The original "fold postgres into the default compose graph" sketch was
+rejected during detailed planning: the resolver keys the postgres overlays
+off persisted backend state, and shipping a `postgres` service +
+`DATABASE_URL` in the base graph would stealth-migrate every existing
+DuckDB-state instance on its next auto-upgrade tick. Instead A1 flips the
+**first-boot seed** to `backend: side_car`
+(`startup-script.sh.tpl:100-111`; existing instances keep their persisted
+value), updates the state-machine/docs/quickstart defaults, adds an
+`app_state_backend` check to the new-instance doctor, and re-points the
+release smoke gate at the PG chain. No schema change; base compose file
+untouched.
 
-**Interfaces:**
-- Produces: a fresh `docker compose up` boots app+scheduler against the PG
-  side-car with `use_pg() == True`; `agnes admin doctor --new-instance` passes.
-- Consumes: existing battle-tested overlay content; existing Alembic chain.
-
-**Acceptance:**
-- [ ] New test `tests/test_default_compose_pg.py::test_default_compose_includes_postgres`
-  parses `docker-compose.yml` and asserts the `postgres` service + `migrate`
-  init dependency exist in the *default* file (not only the overlay).
-- [ ] `tests/db_pg/` suite green unchanged; smoke-test workflow boots the
-  default compose (this is the release gate — expect one smoke-script update,
-  same class as the post-thin-prompt gate fix).
-- [ ] `**BREAKING**` changelog: fresh installs now require the bundled PG
-  container; DuckDB-state remains supported for existing instances until A4.
+**Acceptance:** per the detailed plan — tpl-grep guards
+(`tests/test_startup_pg_default.py`), quickstart/docs guards, doctor check
+tests, smoke gate boots `docker-compose.yml:docker-compose.postgres.yml`,
+`**BREAKING**` changelog bullet (fresh installs need `POSTGRES_PASSWORD`;
+DuckDB app-state legacy-only for new deploys until A4 removes it).
 
 ### A2: fleet migration off DuckDB app-state
 
