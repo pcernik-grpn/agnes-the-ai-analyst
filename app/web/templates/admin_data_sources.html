@@ -2128,8 +2128,9 @@ function _renderBucketPicker(connId, buckets) {
         </label>
         <span class="ds-table-rows">${(t.rows ?? 0).toLocaleString()} rows</span>
         <select class="ds-table-mode" data-kb-mode aria-label="How ${_esc(t.name)} is served"
-                title="materialized = scheduled copy on the server; live = every query goes to Keboola Storage">
+                title="materialized = scheduled copy on the server (DuckDB extension); local = Storage API direct extract, supports incremental sync; live = every query goes to Keboola Storage, nothing syncs">
           <option value="materialized" selected>materialized</option>
+          <option value="local">local</option>
           <option value="remote">live</option>
         </select>
         <span class="ds-table-status" id="ds-tstatus-${connId}-${bi}-${ti}"></span>
@@ -4014,7 +4015,19 @@ async function _shareAndFinish() {
   }
 }
 
+// Fire-and-forget: a wizard-registered local/materialized row sits unsynced
+// in table_registry until the next scheduled tick (which can be hours away
+// on a fresh instance's default schedule) or a manual trigger. One
+// unscoped POST (covers every source_type the wizard just touched, not just
+// Keboola) kicks that off the moment the wizard finishes; the registry rows
+// exist either way, so a failed/refused trigger here is not worth surfacing
+// as an error — the next scheduled tick still picks them up.
+function _triggerWizardSync() {
+  fetch("/api/sync/trigger", { method: "POST", credentials: "include" }).catch(() => {});
+}
+
 function _showDoneSlab() {
+  _triggerWizardSync();
   const lines = _wizardPackages.map((p) => {
     const shares = _wizardShares[p.localId] || [];
     if (!shares.length) {
@@ -4030,6 +4043,7 @@ function _showDoneSlab() {
   document.getElementById("ds-wdone-slab").innerHTML = `
     <div class="big">✓</div>
     <h3>${_wizardPackages.length} package${_wizardPackages.length === 1 ? "" : "s"} created${shared ? ` · ${shared} shared` : ""}</h3>
+    <p class="ds-wdone-sync-note">Sync started — newly registered tables will appear once it completes.</p>
     <ul>${lines.join("")}</ul>
     <a class="btn btn-secondary" href="/admin/data-packages">Open Data packages</a>
     <button type="button" class="btn btn-primary" id="ds-wdone-close">Done</button>`;
@@ -4277,7 +4291,11 @@ document.getElementById("ds-wizard-register-btn").addEventListener("click", asyn
 // Step 2 escape hatch: the pre-redesign behavior — register and stop.
 document.getElementById("ds-wizard-finish-early-btn").addEventListener("click", async () => {
   const result = await _registerStepTwo();
-  if (result && result.ok.length) finishWizard();
+  if (result && result.ok.length) {
+    _triggerWizardSync();
+    showToast("Sync started — pulling the newly registered tables.", true);
+    finishWizard();
+  }
 });
 
 document.getElementById("ds-wizard-bundle-btn").addEventListener("click", _createPackagesAndContinue);
