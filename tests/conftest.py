@@ -57,8 +57,9 @@ os.makedirs(os.path.join(os.environ["DATA_DIR"], "state"), exist_ok=True)
 # Local worker cap
 # ---------------------------------------------------------------------------
 # `-n auto` resolves to one worker per core, and each worker is a full Python
-# process that imports `app.main` — measured at ~430 MB RSS once warm (pandas
-# and sqlalchemy are pulled in eagerly). On a 14-core laptop that is ~6.5 GB
+# process that imports `app.main` plus everything DuckDB drags in (pandas
+# arrives via DuckDB's first parameter binding, not via our imports) —
+# measured at ~430 MB RSS once warm. On a 14-core laptop that is ~6.5 GB
 # and 14 cores pinned for a suite that is mostly waiting on DuckDB file I/O,
 # which is what makes the machine unusable and drains the battery. Worse, a
 # second git worktree running its own suite doubles it.
