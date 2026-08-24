@@ -8,12 +8,11 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
     monkeypatch.setenv("SCRIPT_TIMEOUT", "5")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -26,7 +25,7 @@ def client(tmp_path, monkeypatch):
     grant_admin(conn, "admin1")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     token = create_access_token("admin1", "admin@test.com")
     return c, token
@@ -325,13 +324,12 @@ class TestAuthSecurity:
 # ---- Script RBAC ----
 
 @pytest.fixture
-def viewer_client(tmp_path, monkeypatch):
+def viewer_client(tmp_path, monkeypatch, shared_app):
     """TestClient with a viewer-role user seeded."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
     monkeypatch.setenv("SCRIPT_TIMEOUT", "5")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -341,7 +339,7 @@ def viewer_client(tmp_path, monkeypatch):
     UserRepository(conn).create(id="viewer1", email="viewer@test.com", name="Viewer")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     token = create_access_token(user_id="viewer1", email="viewer@test.com")
     return c, token
@@ -455,12 +453,11 @@ class TestJwtSecretHardening:
 # ---- API hardening (issue #336) ----
 
 @pytest.fixture
-def hardening_client(tmp_path, monkeypatch):
+def hardening_client(tmp_path, monkeypatch, shared_app):
     """Minimal seeded app with an admin and a plain analyst for RBAC tests."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import get_system_db, SYSTEM_ADMIN_GROUP
     from src.repositories.users import UserRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -476,7 +473,7 @@ def hardening_client(tmp_path, monkeypatch):
     UserGroupMembersRepository(conn).add_member("hadmin", gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     return {
         "client": c,

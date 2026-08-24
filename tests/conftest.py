@@ -952,6 +952,45 @@ def seeded_app(e2e_env, _shared_seeded_app):
 
 
 @pytest.fixture
+def shared_app(_shared_seeded_app):
+    """The session-shared FastAPI app, with per-test mutations undone on teardown.
+
+    Use this INSTEAD of calling ``create_app()`` from a function-scoped fixture.
+    ``create_app()`` measured ~430 ms (roughly 90 ``include_router`` calls plus
+    middleware); a fixture that pays it per test spends far more time building
+    the app than running the test. A random 60-file sample measured 83% of the
+    suite's wall-clock in fixture setup, ~71% of THAT in per-test
+    ``create_app()`` across 74 files and 1229 tests. Converting one file
+    (test_api.py) took it from 26.3 s to 7.7 s with no test changes.
+
+    Isolation is unaffected: every DB access goes through ``get_system_db()`` /
+    the ``*_repo()`` factories, which read ``os.environ["DATA_DIR"]`` at CALL
+    time and reopen on path change, so a fixture that still does
+    ``monkeypatch.setenv("DATA_DIR", str(tmp_path))`` keeps its own state.
+    See ``_shared_seeded_app`` for the full argument.
+
+    DO NOT use this — build a fresh app (``create_app()`` directly, or
+    ``seeded_app_fresh``) — when the test:
+
+    - enters the client as a context manager (``with client as c:``), which
+      runs the ASGI lifespan; the streamable MCP session manager may be
+      entered only once per app instance;
+    - GETs ``/uploads/...``, which is mounted as ``StaticFiles`` against the
+      DATA_DIR present at construction, not the test's;
+    - asserts on app CONSTRUCTION itself (boot-time config refusal, router
+      wiring under a specific env).
+
+    ``tests/test_shared_app_contract.py`` is the ratchet that keeps new
+    per-test ``create_app()`` fixtures from reappearing.
+    """
+    app, pristine_state = _shared_seeded_app
+    yield app
+    app.state._state.clear()
+    app.state._state.update(pristine_state)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
 def seeded_app_fresh(e2e_env):
     """Same shape as ``seeded_app`` (seeded users, four role tokens,
     TestClient) but builds its OWN fresh ``create_app()`` instead of reusing

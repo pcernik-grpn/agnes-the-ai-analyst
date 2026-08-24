@@ -30,13 +30,12 @@ def _seed_query_co_env(conn):
 
 
 @pytest.fixture
-def query_co_app(e2e_env):
+def query_co_app(e2e_env, shared_app):
     conn = get_system_db()
     co_id = _seed_query_co_env(conn)
     conn.close()
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     from app.auth.access import mint_co_session_jwt
     token = mint_co_session_jwt(co_id)

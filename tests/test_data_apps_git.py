@@ -157,13 +157,12 @@ class TestSlugValidation:
 
 
 @pytest.fixture
-def data_apps_git_env(e2e_env, monkeypatch):
+def data_apps_git_env(e2e_env, monkeypatch, shared_app):
     """Same shape as `git_env` in tests/test_marketplace_server_git.py:
     real user + PAT rows so `resolve_token_to_user` passes, plus a
     `data_apps` row and its bare repo on disk, with the feature flag on."""
     import yaml
 
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.data_apps.git_repos import init_app_repo
     from src.db import get_system_db
@@ -246,7 +245,7 @@ def data_apps_git_env(e2e_env, monkeypatch):
 
     init_app_repo("sales")
 
-    app = create_app()
+    app = shared_app
     from fastapi.testclient import TestClient
 
     client = TestClient(app)

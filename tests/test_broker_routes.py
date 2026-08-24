@@ -81,10 +81,9 @@ def broker_session(e2e_env):
 
 
 @pytest.fixture
-def broker_app(e2e_env):
-    from app.main import create_app
+def broker_app(e2e_env, shared_app):
 
-    return create_app()
+    return shared_app
 
 
 @pytest.fixture
@@ -922,7 +921,7 @@ def test_anthropic_proxy_happy_path_records_usage_and_budget_headers(broker_app,
 
 
 @pytest.fixture
-def broker_env(e2e_env):
+def broker_env(e2e_env, shared_app):
     """A seeded user + chat session with a data_apps-scoped ticket, data_apps
     feature enabled, and a real TestClient(app) — standing in for the
     sandboxed authoring agent's broker call."""
@@ -930,7 +929,6 @@ def broker_env(e2e_env):
     from fastapi.testclient import TestClient
 
     import app.instance_config as instance_config
-    from app.main import create_app
 
     data_dir = e2e_env["data_dir"]
     state = data_dir / "state"
@@ -945,12 +943,12 @@ def broker_env(e2e_env):
     session = chat_session_repo().create_session(user_email="broker_da@test.com", surface=Surface.WEB)
     tok = ticket_repo().mint(session.id, "data_apps")
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return client, tok
 
 
 @pytest.fixture
-def broker_env_main_scope(e2e_env):
+def broker_env_main_scope(e2e_env, shared_app):
     """Same as `broker_env`, but the ticket is minted with the `main` scope —
     used to prove a wrong-scope ticket cannot authenticate the data-apps
     broker route."""
@@ -958,7 +956,6 @@ def broker_env_main_scope(e2e_env):
     from fastapi.testclient import TestClient
 
     import app.instance_config as instance_config
-    from app.main import create_app
 
     data_dir = e2e_env["data_dir"]
     state = data_dir / "state"
@@ -973,7 +970,7 @@ def broker_env_main_scope(e2e_env):
     session = chat_session_repo().create_session(user_email="broker_da_main@test.com", surface=Surface.WEB)
     tok = ticket_repo().mint(session.id, "main")
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return client, tok
 
 

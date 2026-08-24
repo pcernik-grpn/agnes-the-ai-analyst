@@ -95,15 +95,14 @@ def _seed_metrics_co_env(conn, *, shared_table: bool):
 
 
 @pytest.fixture
-def metrics_solo_app(e2e_env):
+def metrics_solo_app(e2e_env, shared_app):
     """Co-session where only the owner has the metric's table grant → hidden/403."""
     conn = get_system_db()
     co_id, metric_id = _seed_metrics_co_env(conn, shared_table=False)
     conn.close()
-    from app.main import create_app
     from fastapi.testclient import TestClient
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     from app.auth.access import mint_co_session_jwt
 
@@ -112,15 +111,14 @@ def metrics_solo_app(e2e_env):
 
 
 @pytest.fixture
-def metrics_shared_app(e2e_env):
+def metrics_shared_app(e2e_env, shared_app):
     """Co-session where both participants have the metric's table grant → visible/200."""
     conn = get_system_db()
     co_id, metric_id = _seed_metrics_co_env(conn, shared_table=True)
     conn.close()
-    from app.main import create_app
     from fastapi.testclient import TestClient
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     from app.auth.access import mint_co_session_jwt
 

@@ -5,11 +5,10 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from src.repositories.knowledge import KnowledgeRepository
@@ -35,7 +34,7 @@ def client(tmp_path, monkeypatch):
     kr.create(id="k2", title="Churn", content="Customer churn", category="metrics", status="approved")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     return {
         "client": c,

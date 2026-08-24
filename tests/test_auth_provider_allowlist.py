@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def make_client(tmp_path, monkeypatch):
+def make_client(tmp_path, monkeypatch, shared_app):
     def _make(providers_env: str | None):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
@@ -20,9 +20,8 @@ def make_client(tmp_path, monkeypatch):
             monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
         else:
             monkeypatch.setenv("AGNES_AUTH_PROVIDERS", providers_env)
-        from app.main import create_app
 
-        return TestClient(create_app())
+        return TestClient(shared_app)
 
     return _make
 

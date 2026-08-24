@@ -345,16 +345,15 @@ def test_persist_overlay_token_clear_removes_key(clean_env):
 
 
 @pytest.fixture
-def web_client(clean_env, monkeypatch):
+def web_client(clean_env, monkeypatch, shared_app):
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
     from fastapi.testclient import TestClient
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 
