@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **`POST /api/query`'s non-admin catalog gate and SELECT-only keyword blocklist both scanned raw SQL text, so a string literal or comment merely *containing* a registered catalog name or a word like `delete `/`load ` was refused, not just a real reference.** `SELECT 'keboola.com' AS x` 403'd as "un-granted source catalog" (#1394) and `SELECT 'load failed' AS x` / any literal or URL containing a blocked-list word 400'd as "Only single SELECT queries are allowed" (#1513) — an ordinary email-domain filter or ticket-text search was enough to trip either guard. Both guards now scan a copy with string and dollar-quoted literals blanked (`app/api/query.py::_mask_sql_for_guard`, one shared helper, length- and offset-preserving) before their own text scan runs; quoted **identifiers** stay visible in every mode, since `"keboola"."x"` is a genuine catalog-qualified reference the RBAC gate must still catch. The two guards disagree on comments on purpose: the catalog gate also masks them (a comment is inert, never executed, so a catalog name inside one is noise), while the keyword blocklist keeps them scanned (`-- drop table x` must still be refused — the blocklist is the only boundary in front of DML/DDL keywords, no parser backs it). An unterminated quoted string/identifier/dollar-quote or block comment is now refused outright (400) rather than treated as "everything after it is part of the literal", which used to silently mask whatever real SQL followed it.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
