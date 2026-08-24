@@ -628,3 +628,171 @@ def test_delete_marketplace_cascades_through_factory(web_client):
         ).fetchone() is None, "subscription orphaned after delete"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Disable + revoke_grants (one-click retirement)
+# ---------------------------------------------------------------------------
+
+
+def test_disable_with_revoke_grants_removes_all_plugin_grants(web_client):
+    """POST /disable with ``{"revoke_grants": true}`` drops every group grant
+    on the plugin in the same action — the one-click retirement path. Grants
+    on OTHER plugins must survive, including same-group ones."""
+    _seed_marketplace_with_plugin()
+    _seed_marketplace_with_plugin(marketplace="mkt-x", plugin="beta")
+    _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+    g1 = _add_group("engineers")
+    g2 = _add_group("analysts")
+
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    conn = get_system_db()
+    try:
+        repo = ResourceGrantsRepository(conn)
+        repo.ensure_grant(g1, "marketplace_plugin", "mkt-x/alpha", "test")
+        repo.ensure_grant(g2, "marketplace_plugin", "mkt-x/alpha", "test")
+        repo.ensure_grant(g1, "marketplace_plugin", "mkt-x/beta", "test")
+    finally:
+        conn.close()
+
+    r = web_client.post(
+        "/api/marketplaces/mkt-x/plugins/alpha/disable",
+        json={"revoke_grants": True},
+        cookies=cookies,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["admin_disabled"] is True
+    assert body["revoked_grants"] == 2
+
+    conn = get_system_db()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM resource_grants WHERE resource_id = 'mkt-x/alpha'"
+        ).fetchone() is None, "alpha grants survived revoke_grants"
+        assert conn.execute(
+            "SELECT 1 FROM resource_grants WHERE resource_id = 'mkt-x/beta'"
+        ).fetchone() is not None, "beta grant must survive alpha's retirement"
+        row = conn.execute(
+            "SELECT admin_disabled FROM marketplace_plugins "
+            "WHERE marketplace_id = 'mkt-x' AND name = 'alpha'"
+        ).fetchone()
+        assert row[0] is True
+    finally:
+        conn.close()
+
+
+def test_disable_without_body_keeps_grants(web_client):
+    """Plain POST /disable (the pre-existing no-body call shape) must keep
+    grants intact — disabling stays reversible; retirement is opt-in."""
+    _seed_marketplace_with_plugin()
+    _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+    gid = _add_group("engineers")
+
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    conn = get_system_db()
+    try:
+        ResourceGrantsRepository(conn).ensure_grant(
+            gid, "marketplace_plugin", "mkt-x/alpha", "test",
+        )
+    finally:
+        conn.close()
+
+    r = web_client.post(
+        "/api/marketplaces/mkt-x/plugins/alpha/disable", cookies=cookies,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("revoked_grants", 0) == 0
+
+    conn = get_system_db()
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM resource_grants WHERE resource_id = 'mkt-x/alpha'"
+        ).fetchone() is not None, "plain disable must NOT touch grants"
+    finally:
+        conn.close()
+
+
+def test_get_plugins_exposes_upstream_deprecation(web_client, tmp_path):
+    """GET /plugins surfaces the curator-side deprecation fields (read
+    on-demand from the cloned repo's marketplace-metadata.json) so the admin
+    Details modal can render the DEPRECATED pill + note."""
+    _seed_marketplace_with_plugin()
+    _seed_marketplace_with_plugin(marketplace="mkt-x", plugin="beta")
+    _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+
+    meta_dir = tmp_path / "marketplaces" / "mkt-x" / ".claude-plugin"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "marketplace-metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "plugins": {
+                    "alpha": {
+                        "deprecated": True,
+                        "deprecation_note": "generates unreliable output",
+                        "replacement": "beta",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    r = web_client.get("/api/marketplaces/mkt-x/plugins", cookies=cookies)
+    assert r.status_code == 200, r.text
+    rows = {p["name"]: p for p in r.json()}
+    assert rows["alpha"]["deprecated"] is True
+    assert rows["alpha"]["deprecation_note"] == "generates unreliable output"
+    assert rows["alpha"]["replacement"] == "beta"
+    assert rows["beta"]["deprecated"] is False
+    assert rows["beta"].get("deprecation_note") is None
+
+
+def test_disable_audit_distinguishes_retirement_from_plain_disable(web_client):
+    """A retirement that happened to find zero grants and a plain disable are
+    different admin intents — the audit row must tell them apart, so both keys
+    are always logged (mirrors mark_plugin_system, which always logs its
+    affected_* counts even when zero)."""
+    _seed_marketplace_with_plugin()
+    _seed_marketplace_with_plugin(marketplace="mkt-x", plugin="beta")
+    _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+
+    # alpha: retirement requested, but no grants exist → revoked_grants == 0
+    r = web_client.post(
+        "/api/marketplaces/mkt-x/plugins/alpha/disable",
+        json={"revoke_grants": True},
+        cookies=cookies,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["revoked_grants"] == 0
+
+    # beta: plain disable
+    assert web_client.post(
+        "/api/marketplaces/mkt-x/plugins/beta/disable", cookies=cookies,
+    ).status_code == 200
+
+    from src.db import get_system_db
+    conn = get_system_db()
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT resource, params FROM audit_log "
+                "WHERE action = 'marketplace.plugin.disable'"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+    def _params(resource):
+        raw = rows[f"marketplace:{resource}"]
+        return json.loads(raw) if isinstance(raw, str) else raw
+
+    alpha, beta = _params("mkt-x/alpha"), _params("mkt-x/beta")
+    assert alpha["revoke_grants_requested"] is True
+    assert alpha["revoked_grants"] == 0
+    assert beta["revoke_grants_requested"] is False
+    assert beta["revoked_grants"] == 0
+    assert alpha != beta, "the two intents must not produce identical audit params"

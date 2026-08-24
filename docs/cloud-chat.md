@@ -508,6 +508,13 @@ Requirements and semantics:
   re-attaches by chat id — the transcript and agent state live in the engine.
 - **Not per-conversation.** The provider is an instance-level choice; native
   sandbox chat and engine chat do not run side by side on one instance.
+- **Pin it in infrastructure, not by hand.** `AGNES_CHAT_PROVIDER` in the
+  server env overrides `chat.provider` in `instance.yaml` (env > yaml >
+  `e2b` default, the standard precedence). The `customer-instance` module's
+  per-VM `chat_provider` field writes it, so the choice lives in
+  code-reviewed Terraform and survives a fresh data disk — a hand-edited
+  `instance.yaml` overlay survives reboots and VM recreates but not that,
+  and is invisible in review.
 
 Limitations specific to this provider (each also noted in the module
 docstring):

@@ -958,6 +958,9 @@ AGNES_STUDIO_ENABLED=false
 %{ if experience != "" ~}
 AGNES_INSTANCE_EXPERIENCE=${experience}
 %{ endif ~}
+%{ if chat_provider != "" ~}
+AGNES_CHAT_PROVIDER=${chat_provider}
+%{ endif ~}
 %{ if theme != "" ~}
 AGNES_INSTANCE_THEME=${theme}
 %{ endif ~}

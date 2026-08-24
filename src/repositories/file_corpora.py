@@ -89,14 +89,24 @@ class FileCorporaRepository:
         self,
         *,
         search: Optional[str] = None,
+        created_by: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        """List live (non-soft-deleted) corpora, name-ordered."""
+        """List live (non-soft-deleted) corpora, name-ordered.
+
+        ``created_by`` filters to one creator in SQL. The agent-scope
+        intersection needs exactly that set and runs once per brokered
+        request; without the predicate it read the whole table under a
+        100k cap and filtered in Python, on the authorization path.
+        """
         query = f"SELECT {self._SELECT} FROM file_corpora WHERE deleted_at IS NULL"
         params: List[Any] = []
         if search:
             query += " AND name ILIKE ?"
             params.append(f"%{search}%")
+        if created_by:
+            query += " AND created_by = ?"
+            params.append(created_by)
         query += " ORDER BY name LIMIT ?"
         params.append(limit)
         rows = self.conn.execute(query, params).fetchall()

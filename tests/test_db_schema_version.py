@@ -1542,3 +1542,91 @@ def test_v119_db_migrates_to_v120_adds_agent_schedules(tmp_path):
     row = conn.execute("SELECT enabled FROM agent_schedules WHERE id = 's1'").fetchone()
     assert row == (True,)
     conn.close()
+
+
+def test_v122_backfills_builder_agent_scope(tmp_path):
+    """v121→v122: a builder row (``agt_`` prefix) still on the all-'all'
+    passthrough shape has its knowledge/plugins declaration turned into
+    ``agent_scope`` rows and its four modes flipped to 'selected'; the
+    seeded default agent, a governance row, and an already-narrowed agent
+    are left alone. Mirrors ``tests/db_pg/test_alembic_0070_builder_scope.py``.
+    """
+    import json
+
+    db_path = tmp_path / "system.duckdb"
+    conn = duckdb.connect(str(db_path))
+    _ensure_schema(conn)
+
+    pkg_id = "pkg-1"
+    conn.execute(
+        "INSERT INTO data_packages (id, name, slug, created_at, updated_at) "
+        "VALUES (?, 'Pkg', 'pkg', current_timestamp, current_timestamp)",
+        [pkg_id],
+    )
+
+    def _add(agent_id, slug, knowledge=(), plugins=(), modes="all", is_default=False):
+        conn.execute(
+            "INSERT INTO agents (id, owner_user_id, name, slug, knowledge, plugins, "
+            "tables_mode, plugins_mode, connections_mode, memory_mode, is_default, "
+            "created_at, updated_at) VALUES (?, 'u1', ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "current_timestamp, current_timestamp)",
+            [
+                agent_id,
+                slug,
+                slug,
+                json.dumps(list(knowledge)),
+                json.dumps(list(plugins)),
+                modes,
+                modes,
+                modes,
+                modes,
+                is_default,
+            ],
+        )
+
+    _add("agt_" + "a" * 32, "scoped", knowledge=[pkg_id], plugins=["plug-1"])
+    _add("agt_" + "b" * 32, "ghost", knowledge=["no-such-resource"])
+    _add("agt_" + "c" * 32, "hand-scoped", knowledge=[pkg_id], modes="selected")
+    _add("default-uuid", "default", is_default=True)
+    _add("governance-uuid", "governance")
+
+    from src.db import _v121_to_v122
+
+    _v121_to_v122(conn)
+
+    def _modes(agent_id):
+        return set(
+            conn.execute(
+                "SELECT tables_mode, plugins_mode, connections_mode, memory_mode FROM agents WHERE id = ?",
+                [agent_id],
+            ).fetchone()
+        )
+
+    def _scope(agent_id):
+        return {
+            tuple(r)
+            for r in conn.execute(
+                "SELECT item_type, item_id FROM agent_scope WHERE agent_id = ?", [agent_id]
+            ).fetchall()
+        }
+
+    assert _modes("agt_" + "a" * 32) == {"selected"}
+    assert _scope("agt_" + "a" * 32) == {("data_package", pkg_id), ("plugin", "plug-1")}
+
+    # An id resolving nowhere yields no row, but the agent still leaves the
+    # passthrough shape — "0 sources" enforced is the fail-closed reading.
+    assert _scope("agt_" + "b" * 32) == set()
+    assert _modes("agt_" + "b" * 32) == {"selected"}
+
+    # Already narrowed by hand → out of the cohort, scope untouched.
+    assert _scope("agt_" + "c" * 32) == set()
+
+    # Web chat's attribution row and a governance row keep passing the
+    # owner's own authority through.
+    assert _modes("default-uuid") == {"all"}
+    assert _modes("governance-uuid") == {"all"}
+
+    # idempotency — re-running the step must not raise or duplicate rows
+    _v121_to_v122(conn)
+    assert _scope("agt_" + "a" * 32) == {("data_package", pkg_id), ("plugin", "plug-1")}
+    conn.close()

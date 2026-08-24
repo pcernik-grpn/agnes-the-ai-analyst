@@ -2274,14 +2274,23 @@ def _feature_flags_inventory() -> List[Dict[str, Any]]:
             # there warns about). Same row shape as the leading experience
             # row: value_label carries the mode, effective mirrors
             # "resolved away from the default".
-            from app.switches import switch_value
-
-            value = str(switch_value(flag.name))
-            if os.environ.get(flag.env_var) is not None:
-                source = "env"
+            if flag.name in _CHAT_RUNTIME_FLAGS:
+                # A select that is ALSO chat-runtime-resolved (chat_provider):
+                # switch_value() raises for runtime_view switches by design —
+                # the runtime reads the overlay file alone, via
+                # load_chat_config — so its string comes from the same view
+                # the boolean chat flags use below.
+                value_raw, source = _chat_flag_runtime_view(flag)
+                value = str(value_raw)
             else:
-                probe = get_value(*flag.config_keys, default=_UNSET)
-                source = "default" if probe is _UNSET else "config"
+                from app.switches import switch_value
+
+                value = str(switch_value(flag.name))
+                if os.environ.get(flag.env_var) is not None:
+                    source = "env"
+                else:
+                    probe = get_value(*flag.config_keys, default=_UNSET)
+                    source = "default" if probe is _UNSET else "config"
             out.append(
                 {
                     "name": flag.name,
@@ -2368,7 +2377,14 @@ def _chat_flag_runtime_view(flag) -> tuple:
     key = _CHAT_RUNTIME_FLAGS[flag.name]
     overlay_path = _state_dir() / "instance.yaml"
     effective = getattr(load_chat_config(overlay_path), key)
-    if os.environ.get(flag.env_var) is not None:
+    env_raw = os.environ.get(flag.env_var)
+    # The "env" label must mirror each flag's own resolver: the boolean chat
+    # flags coerce ANY set value (blank included), but the select resolver
+    # (`_resolve_chat_provider`) treats a blank env as unset and falls
+    # through to yaml/default — labeling that "env" would tell the operator
+    # a pin exists where none does.
+    env_set = env_raw is not None and (flag.kind != "select" or env_raw.strip() != "")
+    if env_set:
         return effective, "env"
     try:
         raw = yaml.safe_load(overlay_path.read_text()) or {}
