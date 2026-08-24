@@ -86,8 +86,20 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
        -f docker-compose.postgres.yml \
        -f docker-compose.prod.yml \
        -f docker-compose.host-mount.yml \
+       -f docker-compose.postgres-host-mount.yml \
        up -d
    ```
+
+   The last file is required whenever `docker-compose.postgres.yml` and
+   `docker-compose.host-mount.yml` are combined (see its own header comment)
+   — it rebinds `postgres`'s data directory and `data-migrate`'s source
+   mount straight to the host `/data`, instead of the empty named volumes
+   the other two overlays would otherwise leave in place. Without it,
+   Postgres persistence silently reverts to a Docker-managed volume tied to
+   the boot disk, and `data-migrate` reads no rows at all. Also `mkdir -p
+   /data/postgres && chown -R 70:70 /data/postgres` on the host beforehand —
+   customer-instance VMs get this from the Terraform startup script, but a
+   self-provisioned host does not.
 
    Without a persistent disk (data on Docker named volume, tied to boot disk):
 
@@ -96,8 +108,11 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    ```
 
    **Legacy fallback (existing installs / explicit DuckDB opt-out):** drop
-   `-f docker-compose.postgres.yml` from either command above and don't set
-   `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
+   `-f docker-compose.postgres.yml` from either command above (and, in the
+   persistent-disk command, also drop `-f docker-compose.postgres-host-mount.yml`
+   — it references services `docker-compose.postgres.yml` defines, so
+   keeping it without the postgres overlay fails compose validation) and
+   don't set `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
    instance did before A1. Not recommended for a new install (see
    [postgres-cutover-runbook.md](postgres-cutover-runbook.md) for why).
 
