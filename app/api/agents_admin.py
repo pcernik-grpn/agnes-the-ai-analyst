@@ -66,7 +66,15 @@ _SELECTED_MODE_FIELDS = ("plugins_mode", "connections_mode", "tables_mode", "mem
 # agent (services/slack_bot/events.py). The scope-intersection axes each read
 # their own item_type, so a binding grants no plugin/table/connection reach.
 # At most one non-deleted agent may hold a given channel — enforced below.
-_ITEM_TYPES = frozenset({"plugin", "connection", "table", "memory_domain", "slack_channel"})
+# `data_package` and `collection` are DATA-authority items governed by
+# `tables_mode`, exactly like `table` — they are what the /agents builder
+# declares (`app/api/agents.py::_KNOWLEDGE_ITEM_TYPES`), and a declared
+# package additionally stands for its member tables (expanded live in
+# `src/agent_scope_intersection.py`). Accepted here so the governance API and
+# the builder describe one scope model rather than two.
+_ITEM_TYPES = frozenset(
+    {"plugin", "connection", "table", "data_package", "collection", "memory_domain", "slack_channel"}
+)
 
 _SCOPE_MODE_VALUES = frozenset({"all", "selected"})
 _MEMORY_WRITE_MODE_VALUES = frozenset({"off", "propose", "auto"})
@@ -509,8 +517,7 @@ async def set_agent_scope(
             raise _err(
                 409,
                 "slack_channel_taken",
-                f"slack channel '{item_id}' is already bound to {who} — "
-                f"unbind it there first (one agent per channel)",
+                f"slack channel '{item_id}' is already bound to {who} — unbind it there first (one agent per channel)",
             )
 
     agents_repo().set_scope(agent_id, items)

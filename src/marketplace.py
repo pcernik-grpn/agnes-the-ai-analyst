@@ -746,6 +746,29 @@ def _refresh_plugin_cache(slug: str, commit_sha: str | None = None) -> int:
         logger.warning("marketplace %s: plugin cache write failed: %s", slug, e)
         return 0
 
+    # Curator-side lifecycle: a plugin whose marketplace-metadata.json section
+    # carries the literal `"deprecated": true` is admin-disabled right after
+    # the cache write, so one upstream commit retires it on every consuming
+    # instance. One-way by design — removing the flag later never
+    # auto-re-enables; the admin decides whether a retired plugin comes back
+    # (and if they re-enable a still-flagged one, the next sync re-disables
+    # it). Failures degrade like every other enrichment step: warn, don't
+    # abort the sync — the next sync retries.
+    try:
+        plugins_repo = marketplace_plugins_repo()
+        already_disabled = set(plugins_repo.list_admin_disabled(slug))
+        for name, resolved in resolved_per_plugin.items():
+            if resolved.get("deprecated") is not True or name in already_disabled:
+                continue
+            if plugins_repo.set_admin_disabled(slug, name, True):
+                logger.info(
+                    "marketplace %s: plugin %s auto-disabled (deprecated upstream)",
+                    slug,
+                    name,
+                )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("marketplace %s: deprecated-plugin auto-disable failed: %s", slug, e)
+
     # v46: attribution tables removed. `MarketplaceItemLookup` resolves
     # skill/agent/command identifiers at usage-event write time by
     # prefix-splitting on `:` and matching the prefix against this same

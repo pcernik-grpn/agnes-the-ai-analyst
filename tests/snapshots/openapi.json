@@ -132,6 +132,11 @@
           "plugin_name": {
             "title": "Plugin Name",
             "type": "string"
+          },
+          "revoked_grants": {
+            "default": 0,
+            "title": "Revoked Grants",
+            "type": "integer"
           }
         },
         "required": [
@@ -3663,6 +3668,18 @@
         "title": "DeployScriptRequest",
         "type": "object"
       },
+      "DisablePluginRequest": {
+        "description": "Optional body of the disable endpoint.\n\n``revoke_grants=True`` turns the disable into a one-action retirement:\nevery ``marketplace_plugin`` grant on the plugin is deleted in the same\ncall. Without it (or with no body at all \u2014 the pre-existing call shape)\ngrants are left intact, so a later re-enable restores the plugin for the\nsame groups.",
+        "properties": {
+          "revoke_grants": {
+            "default": false,
+            "title": "Revoke Grants",
+            "type": "boolean"
+          }
+        },
+        "title": "DisablePluginRequest",
+        "type": "object"
+      },
       "DisplayNameRequest": {
         "properties": {
           "name": {
@@ -6708,6 +6725,22 @@
             ],
             "title": "Category"
           },
+          "deprecated": {
+            "default": false,
+            "title": "Deprecated",
+            "type": "boolean"
+          },
+          "deprecation_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deprecation Note"
+          },
           "description": {
             "anyOf": [
               {
@@ -6738,6 +6771,17 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "replacement": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacement"
           },
           "source_spec": {
             "anyOf": [
@@ -11255,7 +11299,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.83.49"
+    "version": "0.84.8"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -37349,7 +37393,7 @@
     },
     "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable": {
       "post": {
-        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.",
+        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
         "operationId": "disable_plugin_api_marketplaces__marketplace_id__plugins__plugin_name__disable_post",
         "parameters": [
           {
@@ -37387,6 +37431,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/DisablePluginRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

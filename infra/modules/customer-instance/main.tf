@@ -504,6 +504,9 @@ resource "google_compute_instance" "vm" {
     # still asking for "topnav" fails the plan instead of silently getting rail.
     theme      = each.value.theme
     experience = each.value.experience
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — "" writes no env line and
+    # the instance follows instance.yaml / the app default.
+    chat_provider = each.value.chat_provider
     # Vendor-neutral branding for the FIRST-boot instance.yaml (logo/brand/
     # theme colours/custom_scripts), pre-rendered to a base64'd YAML fragment —
     # "" when the caller set no branding on this VM.

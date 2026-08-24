@@ -142,6 +142,16 @@ variable "prod_instance" {
     # without the URL simply never registers the tool server. Inert unless
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
+    # (app >= 0.85: env > instance.yaml > "e2b"). Codifies which engine runs
+    # /chat sessions IN TERRAFORM instead of a hand-edited instance.yaml on
+    # the data disk — the overlay survives reboots and recreates, but not a
+    # fresh data disk, and it is invisible in review. Empty (the default)
+    # writes NO env line, so the instance keeps whatever instance.yaml says.
+    # "kai-agent" requires kai_agent_enabled on the same VM (validated below):
+    # pinning web chat onto an engine this VM does not run refuses every
+    # session at boot.
+    chat_provider = optional(string, "")
 
     # --- Vendor-neutral per-instance branding (all OPTIONAL) ---
     # Written into the VM's /data/state/instance.yaml on FIRST boot only. The
@@ -246,6 +256,20 @@ variable "prod_instance" {
   # entry in app/switches.py), so a typo here would look applied and do
   # nothing. Catch it at plan time. `classic` is retired for the same reason
   # `topnav` is above — it names a behavior the app no longer has.
+  # The app resolves an unknown chat.provider by REFUSING the ChatManager at
+  # boot (app/main.py provider allowlist) — loud, but only at runtime on the
+  # VM. Catch the typo (and the engine-less kai-agent pin, which would refuse
+  # every session at mint time) at plan time instead.
+  validation {
+    condition     = contains(["", "e2b", "docker", "kai-agent"], var.prod_instance.chat_provider)
+    error_message = "prod_instance.chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+  }
+
+  validation {
+    condition     = var.prod_instance.chat_provider != "kai-agent" || var.prod_instance.kai_agent_enabled
+    error_message = "prod_instance.chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
+  }
+
   validation {
     condition     = contains(["", "redesign"], var.prod_instance.experience)
     error_message = "prod_instance.experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
@@ -313,6 +337,9 @@ variable "dev_instances" {
     # Engine → instance MCP tool surface — see prod_instance for the
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
+    # rationale; same default (empty = no env line), same validations below.
+    chat_provider = optional(string, "")
     # See prod_instance for the rationale; same default.
     upgrade_schedule = optional(string, "*/5 * * * *")
 
@@ -386,6 +413,21 @@ variable "dev_instances" {
       for i in var.dev_instances : contains(["", "redesign"], i.experience)
     ])
     error_message = "each dev_instances[].experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
+  }
+
+  # Same plan-time guards as prod_instance.chat_provider — see there.
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : contains(["", "e2b", "docker", "kai-agent"], i.chat_provider)
+    ])
+    error_message = "each dev_instances[].chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+  }
+
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : i.chat_provider != "kai-agent" || i.kai_agent_enabled
+    ])
+    error_message = "dev_instances[].chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
   }
 }
 

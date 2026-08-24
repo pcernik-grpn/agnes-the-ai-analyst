@@ -122,6 +122,9 @@ the detail page) and `when_to_use` (markdown disambiguation block).
 | `when_to_use`        | **Skill / agent only.** Markdown body explaining when to pick this skill/agent over a similar one. Sample: `Use this for **Confluence only**. For mixed sources, see /my-plugin:query.` | "When to use this" panel below "Example". |
 | `skills`             | Map keyed by skill name (matching `name:` in the skill's `SKILL.md` frontmatter). | Skill detail page. |
 | `agents`             | Map keyed by agent name (the agent `.md` filename without extension). | Agent detail page. |
+| `deprecated`         | **Plugin only.** The literal boolean `true` retires the plugin: every Agnes instance consuming the repo admin-disables it on its next sync (one-way — removing the flag never auto-re-enables; an admin re-enable of a still-flagged plugin is re-disabled at the next sync). Any other value (`"true"`, `1`, …) is rejected with a warning so a typo can't retire a plugin. Non-Agnes consumers ignore the field. | DEPRECATED pill in the admin Details modal; plugin drops out of every served surface. |
+| `deprecation_note`   | **Plugin only, with `deprecated`.** Single line: why it was retired. | Tooltip on the DEPRECATED pill. |
+| `replacement`        | **Plugin only, with `deprecated`.** Single line: what to use instead (plugin name or short pointer). | Tooltip on the DEPRECATED pill. |
 
 The rich-content fields (`display_name`, `tagline`, `description`,
 `use_cases`, `sample_interaction`) are **read on-demand** from the working
@@ -130,6 +133,13 @@ the next page refresh without waiting for the next sync cycle. The visual
 fields (`cover_photo`, `video_url`, `category`, `doc_links`) are persisted
 into the marketplace database at sync time, because they participate in the
 asset-mirror flow that needs to run once per push.
+
+The lifecycle fields (`deprecated`, `deprecation_note`, `replacement`) sit in
+both camps: the admin UI reads them on demand like the rich content, but the
+**sync** is what acts on `deprecated` by admin-disabling the plugin. So a
+freshly-pushed `"deprecated": true` shows its pill immediately and takes the
+plugin off every served surface at the next sync (`agnes admin marketplace
+sync <slug>` to do it now).
 
 `<plugin-name>` matches the `name` field of the plugin in your
 `marketplace.json`. Same for skill and agent names — they match what's

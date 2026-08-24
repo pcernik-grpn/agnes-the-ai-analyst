@@ -312,9 +312,11 @@ _MEMORY_MINING_REASON = (
     "queue (itself exempt). No analyst CLI/MCP analogue."
 )
 _BUILTIN_DISABLE_REASON = (
-    "admin-only per-plugin disable toggle for built-in marketplace plugins — "
-    "web UI only at /admin/marketplaces, no analyst CLI/MCP analogue (mirrors "
-    "the grandfathered admin marketplace register/sync/delete mutations)"
+    "admin-only per-plugin disable toggle — web UI at /admin/marketplaces plus "
+    "`agnes admin marketplace disable-plugin/enable-plugin` (parity case in "
+    "tests/test_cli_api_parity.py). Deliberately never MCP-exposed: an "
+    "agent-invokable instance-wide kill switch over served plugins is a "
+    "privilege-escalation seam, not a convenience."
 )
 _REPORTS_REASON = (
     "admin-only marketplace usage digest — read-only JSON feed for an external "

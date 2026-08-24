@@ -143,6 +143,30 @@ def test_scope_replace_all(repo):
     assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2"}]
 
 
+def test_get_scope_for_agents_batches_the_same_rows(repo):
+    """The list endpoint projects every visible agent's declaration, hydrating
+    an empty axis from `agent_scope`. Per-agent reads made that an N+1, so the
+    batched read has to agree with `get_scope` row for row — on both backends,
+    since a divergence here would show as a wrong declaration on one engine
+    only."""
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.create(id="a2", owner_user_id="u1", name="B", slug="y")
+    repo.create(id="a3", owner_user_id="u1", name="C", slug="z")  # no scope rows
+    repo.set_scope("a1", [("plugin", "p1"), ("table", "t1")])
+    repo.set_scope("a2", [("data_package", "pkg1")])
+
+    batched = repo.get_scope_for_agents(["a1", "a2", "a3"])
+
+    assert batched["a1"] == repo.get_scope("a1")
+    assert batched["a2"] == repo.get_scope("a2")
+    # An agent with no rows is simply absent — callers use .get(id, []).
+    assert "a3" not in batched
+    assert repo.get_scope("a3") == []
+    # Unknown ids and an empty request are both benign.
+    assert repo.get_scope_for_agents(["nope"]) == {}
+    assert repo.get_scope_for_agents([]) == {}
+
+
 def test_update_whitelist(repo):
     repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
     repo.update("a1", name="B", model="claude-sonnet-5", plugins_mode="selected")

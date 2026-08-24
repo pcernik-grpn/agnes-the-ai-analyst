@@ -324,15 +324,41 @@ def _resolve_chat_enabled(raw: dict) -> bool:
     return coerce_flag_value(raw.get("enabled"), default=False)
 
 
+def _resolve_chat_provider(raw: dict) -> str:
+    """``chat.provider`` resolution: ``AGNES_CHAT_PROVIDER`` env > the
+    ``provider`` key in the parsed ``chat:`` block > ``"e2b"``.
+
+    The env override exists so INFRASTRUCTURE can pin the provider durably:
+    the deployment env rides code-reviewed Terraform (the ``customer-instance``
+    module's per-VM ``chat_provider`` field writes it into the app env), while
+    ``instance.yaml`` is a hand-edited overlay on the data disk that a fresh
+    machine starts without. Same precedence convention as
+    ``_resolve_chat_enabled`` above; a blank env value means unset (a key
+    written with nothing after it must not override the yaml, mirroring
+    ``_raw_str``'s treatment of blank yaml values).
+    """
+    env = (os.environ.get("AGNES_CHAT_PROVIDER") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "provider", "e2b")
+
+
 def load_chat_config(instance_yaml: Path) -> ChatConfig:
     if not instance_yaml.exists():
-        return ChatConfig(enabled=_resolve_chat_enabled({}), approvals_enabled=_resolve_chat_approvals({}))
+        return ChatConfig(
+            enabled=_resolve_chat_enabled({}),
+            # A fresh machine (no instance.yaml yet) must still honour an
+            # infra-pinned provider — without this the first boot ran e2b
+            # regardless of the deployment env.
+            provider=_resolve_chat_provider({}),
+            approvals_enabled=_resolve_chat_approvals({}),
+        )
     data = yaml.safe_load(instance_yaml.read_text()) or {}
     raw = data.get("chat", {}) or {}
     detach_linger_seconds = _raw_int(raw, "detach_linger_seconds", 60)
     return ChatConfig(
         enabled=_resolve_chat_enabled(raw),
-        provider=_raw_str(raw, "provider", "e2b"),
+        provider=_resolve_chat_provider(raw),
         kai_agent_url=_raw_str(raw, "kai_agent_url", "http://kai-agent:3000"),
         harness=_raw_str(raw, "harness", "claude-code"),
         concurrency_per_user=_raw_int(raw, "concurrency_per_user", 3),
