@@ -17624,6 +17624,60 @@
         ]
       }
     },
+    "/api/admin/doctor/support": {
+      "get": {
+        "description": "Collect the redacted support-bundle snapshot (server section of `agnes doctor`).\n\nResponse sections: ``build`` (version/channel/image tag/commit/deployed_at),\n``schema`` (backend + current vs expected migration verdict), ``retrieval``\n(``hybrid``/``lexical_only`` \u2014 the latter with ``status: warning`` so the\ndegradation is loud), ``sync`` (per-``source_type`` rollup: table/ok/error/\nstale/never_synced counts, newest ``last_sync_max``, and ``last_errors`` \u2014\na sample of up to 5 failing tables in registry name order; failure time is\nnot recorded, so the sample is capped, not recency-sorted, while the\n``errors`` count stays exact), ``disk`` (data-dir filesystem usage + DB file sizes),\n``process`` (state backend, roles, python), and ``secrets`` (env-var\n**presence booleans only \u2014 never values**). Each section is collected in\nisolation; a crashing collector reports ``{\"status\": \"error\"}`` for its\nsection instead of failing the request.",
+        "operationId": "doctor_support_api_admin_doctor_support_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Doctor Support",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/grants": {
       "get": {
         "operationId": "list_grants_api_admin_grants_get",

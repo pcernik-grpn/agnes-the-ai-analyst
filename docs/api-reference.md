@@ -1025,7 +1025,7 @@ synced IWT clone for the bind-git file picker.
 
 - /api/admin/bigquery/test-connection
 
-### `/api/admin/doctor` — deployment-gate diagnostics
+### `/api/admin/doctor` — deployment-gate & support diagnostics
 
 `POST /api/admin/doctor/new-instance` (admin-only) runs the new-instance
 deployment checks — `login-door`, `email-delivery`, `chat-grant`,
@@ -1037,7 +1037,17 @@ real test message through the same send path the login flows use. CLI:
 `agnes admin doctor --new-instance`; the host-side siblings live in
 `scripts/ops/post-deploy-smoke-test.sh`.
 
+`GET /api/admin/doctor/support` (admin-only) collects the redacted
+support-bundle snapshot that feeds the server section of `agnes doctor`:
+`build` (version/channel/image tag/commit), `schema` (backend + migration
+verdict), `retrieval` (`hybrid`/`lexical_only`, the latter a loud
+`warning`), `sync` (per-source rollup with the most recent failures),
+`disk`, `process`, and `secrets` (env-var **presence booleans only —
+never values**). Each section is collected in isolation, so a crashing
+collector reports itself instead of failing the request.
+
 - /api/admin/doctor/new-instance
+- /api/admin/doctor/support
 
 ### `/api/admin/keboola` — Keboola diagnostics
 
