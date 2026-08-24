@@ -2377,7 +2377,14 @@ def _chat_flag_runtime_view(flag) -> tuple:
     key = _CHAT_RUNTIME_FLAGS[flag.name]
     overlay_path = _state_dir() / "instance.yaml"
     effective = getattr(load_chat_config(overlay_path), key)
-    if os.environ.get(flag.env_var) is not None:
+    env_raw = os.environ.get(flag.env_var)
+    # The "env" label must mirror each flag's own resolver: the boolean chat
+    # flags coerce ANY set value (blank included), but the select resolver
+    # (`_resolve_chat_provider`) treats a blank env as unset and falls
+    # through to yaml/default — labeling that "env" would tell the operator
+    # a pin exists where none does.
+    env_set = env_raw is not None and (flag.kind != "select" or env_raw.strip() != "")
+    if env_set:
         return effective, "env"
     try:
         raw = yaml.safe_load(overlay_path.read_text()) or {}
