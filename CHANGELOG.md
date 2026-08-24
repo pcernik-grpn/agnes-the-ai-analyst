@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **Auto-title no longer fails silently when no Anthropic credential can be obtained.** `app/chat/auto_title.py` logged the "no credential" case at `debug`, so a session that couldn't mint a static or workload-identity token stayed `Untitled chat` forever with nothing at the default log level to explain why. It now logs a `WARNING` naming the cause and the env var(s) that fix it — once per process when no credential is configured at all (so a keyless dev/test instance doesn't get one line per conversation), and on every occurrence when a credential IS configured but minting keeps failing (an ongoing operational problem, not expected state). The turn itself is unaffected either way — auto-title stays best-effort and cosmetic. Closes #1526.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
