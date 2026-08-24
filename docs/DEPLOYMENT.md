@@ -548,10 +548,12 @@ print(retrieval_mode(), docling_capability())"
 the default image a rejected office upload says so in its rejection reason
 rather than leaving the operator to guess.
 
-Two allowlisted formats are readable on **neither** image and say so plainly
-rather than blaming the extra: `.msg` (Outlook's binary format needs a
-third-party parser) and `.epub`. `.eml` is parsed on every build, with no
-extra, by the standard library.
+Every other allowlisted format is readable on **both** images: `.eml` and
+`.epub` are parsed by the standard library, with no extra. `.msg` (Outlook's
+binary format) is not on the upload allowlist at all — no parser for it ships
+on either image, so an upload containing one is refused in the response rather
+than accepted and rejected afterwards. Mail exported as `.eml` works
+everywhere.
 
 ## Which path should I pick?
 

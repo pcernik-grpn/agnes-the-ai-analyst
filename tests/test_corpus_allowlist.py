@@ -55,8 +55,15 @@ class TestTier1Extensions:
     def test_tsv_is_tier1(self):
         assert classify("data.tsv") == "tier1"
 
-    def test_msg_is_tier1(self):
-        assert classify("email.msg") == "tier1"
+    def test_msg_is_not_allowlisted(self):
+        """Outlook's ``.msg`` is deliberately absent — no reader exists for it
+        on any build, and the only one available (``extract-msg``) resolves to
+        15 transitive packages, among them a Tkinter GUI toolkit and two
+        VBA/malware-analysis tools. Accepting a format we cannot index buys the
+        uploader nothing but a delayed rejection, so it is refused in the upload
+        response instead. Same reasoning as TIFF's absence from tier 2.
+        Exporting the mail as ``.eml`` works on every build."""
+        assert classify("email.msg") is None
 
 
 class TestTier2Extensions:
