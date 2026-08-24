@@ -294,16 +294,25 @@ def check_app_state_backend() -> dict:
     legacy-only for new deploys. This is a NEW-instance gate: an existing
     instance still persisted on DuckDB is expected to fail this check;
     that is correct and informative, not a bug.
+
+    Uses ``use_pg()`` (src/repositories/__init__.py) rather than reading
+    ``instance.yaml::database.backend`` directly: ``use_pg()`` also honors
+    the ``DATABASE_URL``/``AGNES_DB_URL`` env-var fallback, which is how
+    self-hosted-managed-Postgres deployments and the local/CI
+    ``docker-compose.postgres.yml`` overlay both activate Postgres WITHOUT
+    ever writing an ``instance.yaml`` — reading the raw persisted enum alone
+    would misreport those as legacy DuckDB.
     """
     from app.instance_config import get_database_config
+    from src.repositories import use_pg
 
-    backend = get_database_config()["backend"]
-    if backend in ("side_car", "cloud"):
-        return _row("app-state-backend", "ok", f"app-state backend is {backend!r} (Postgres)")
+    if use_pg():
+        backend = get_database_config()["backend"]
+        return _row("app-state-backend", "ok", f"app-state backend is Postgres (persisted backend={backend!r})")
     return _row(
         "app-state-backend",
         "error",
-        f"app-state backend is {backend!r} — fresh installs must run Postgres app-state "
+        "app-state backend is DuckDB — fresh installs must run Postgres app-state "
         "(see docs/QUICKSTART.md); DuckDB is legacy-only. If this is an existing instance "
         "that predates the Postgres default, this failure is expected and can be ignored.",
     )
