@@ -86,7 +86,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -104,6 +104,18 @@ DISAGREEMENT = "DISAGREEMENT"
 GAP = "GAP"
 
 _SEVERITY_ORDER = {LEAK: 0, DISAGREEMENT: 1, WRONGLY_DENIED: 2, GAP: 3}
+
+
+def _die(msg: str) -> NoReturn:
+    """Setup failure: the sweep could not run at all.
+
+    Exit 2, never 1 — exit 1 is reserved for ``--fail-on-leak`` finding a
+    leak, and a scheduled run must be able to tell "the fence has a hole"
+    apart from "the inspection van did not start".
+    """
+    print(msg, file=sys.stderr)
+    raise SystemExit(2)
+
 
 # An agent PAT is rejected on every other prefix by construction
 # (`app/auth/pat_resolver.py::_AGENT_PAT_ALLOWED_PREFIXES`), so probing the
@@ -136,6 +148,7 @@ class Persona:
     saw_tables: list = field(default_factory=list)
     saw_collections: list = field(default_factory=list)
     queryable: list = field(default_factory=list)
+    probed: list = field(default_factory=list)
     skipped: list = field(default_factory=list)
 
 
@@ -208,12 +221,10 @@ def load_config(path: str) -> dict:
     try:
         import yaml  # type: ignore
     except ImportError:
-        raise SystemExit(
-            f"{path} is not JSON and PyYAML is not installed — either install PyYAML or write the config as JSON"
-        )
+        _die(f"{path} is not JSON and PyYAML is not installed — either install PyYAML or write the config as JSON")
     parsed = yaml.safe_load(text)
     if not isinstance(parsed, dict):
-        raise SystemExit(f"{path}: expected a mapping at the top level")
+        _die(f"{path}: expected a mapping at the top level")
     return parsed
 
 
@@ -289,6 +300,7 @@ def sweep_persona(client: Client, p: Persona, canaries: list, findings: list) ->
         for table in sorted(set(p.saw_tables) | set(p.expect_tables)):
             if _is_internal(table):
                 continue
+            p.probed.append(table)
             sql = f"SELECT * FROM {quote_ident(table)} LIMIT 1"
             status, body = client.call("POST", "/api/query", p.token, {"sql": sql})
             allowed = status == 200
@@ -316,7 +328,22 @@ def sweep_persona(client: Client, p: Persona, canaries: list, findings: list) ->
                     findings.append(
                         Finding(WRONGLY_DENIED, p.name, "GET /api/collections", "expected collection not listed", c)
                     )
-        elif status not in (401, 403):
+        elif status in (401, 403):
+            # A persona expected to reach no collection may legitimately be
+            # refused the listing outright — but one that DECLARES collections
+            # cannot have them listed by a surface it is denied, so silence
+            # here would hide a broken grant.
+            for c in p.expect_collections:
+                findings.append(
+                    Finding(
+                        WRONGLY_DENIED,
+                        p.name,
+                        "GET /api/collections",
+                        f"listing refused ({status}) though this persona declares expected collections",
+                        c,
+                    )
+                )
+        else:
             findings.append(Finding(GAP, p.name, "GET /api/collections", f"unexpected status {status}: {_short(body)}"))
 
         # Canary text: listing a collection and reading its CONTENT are
@@ -405,6 +432,23 @@ def cross_check(client: Client, p: Persona, findings: list) -> None:
             )
         )
     for t in sorted(claimed - set(p.queryable)):
+        if _is_internal(t):
+            continue
+        if t not in p.probed:
+            # The query probe only exercised catalog ∪ expected tables, so a
+            # claim outside that set is untested, not contradicted — saying
+            # "could not query" here would be inventing a result.
+            findings.append(
+                Finding(
+                    GAP,
+                    p.name,
+                    "effective-access vs POST /api/query",
+                    "self-audit claims a table the query probe never exercised — declare it in "
+                    "expect_tables to test the claim",
+                    t,
+                )
+            )
+            continue
         findings.append(
             Finding(
                 DISAGREEMENT,
@@ -471,18 +515,18 @@ def main() -> int:
     cfg = load_config(args.config)
     base_url = cfg.get("base_url")
     if not base_url:
-        raise SystemExit("config: base_url is required")
+        _die("config: base_url is required")
 
     client = Client(base_url, insecure=args.insecure)
     status, _ = client.call("GET", "/api/health", None)
     if status == 0:
-        raise SystemExit(f"cannot reach {base_url} — is the host right and are you on the network?")
+        _die(f"cannot reach {base_url} — is the host right and are you on the network?")
 
     personas = []
     for raw in cfg.get("personas") or []:
         name = raw.get("name")
         if not name:
-            raise SystemExit("config: every persona needs a name")
+            _die("config: every persona needs a name")
         personas.append(
             Persona(
                 name=name,
@@ -493,7 +537,7 @@ def main() -> int:
             )
         )
     if not personas:
-        raise SystemExit("config: no personas declared — nothing to sweep")
+        _die("config: no personas declared — nothing to sweep")
 
     canaries = cfg.get("canaries") or []
     findings: list = []

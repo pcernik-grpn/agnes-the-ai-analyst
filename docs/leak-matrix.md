@@ -55,7 +55,11 @@ no venv, only `src/sql_ident.py`).
 
 `GAP` exists so a missing credential can never render as an empty row that
 reads like "nothing leaked". A run with gaps is **not** a clean result, and
-the report says so.
+the report says so. The same severity covers a narrower hole: the query
+probe only exercises the tables the catalog offered plus the ones the
+persona declared, so a table the self-audit view claims *outside* that set
+is untested rather than contradicted — it is reported as a gap, and
+declaring it in `expect_tables` turns the claim into a tested one.
 
 ## Usage
 
