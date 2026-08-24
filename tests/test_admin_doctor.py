@@ -13,6 +13,9 @@ failed on a real new-instance deployment and cost hours of debugging:
   surface the entry point — see ``_compute_can_chat``).
 - agent-scope: an agent whose owner-grants ∩ scope is empty answers every
   data question with 403 "not in your stack".
+- app-state-backend: since A1, fresh installs run app-state on Postgres
+  (``side_car``/``cloud``); DuckDB is legacy-only for new deploys. See
+  tests/test_doctor_backend.py for the dedicated coverage.
 - branding: ``instance.brand`` set while the rendered login page still shows
   a default title (the title reads ``instance.name``, a different knob).
 """
@@ -59,7 +62,14 @@ class TestDoctorShape:
     def test_all_checks_present_with_diagnose_vocabulary(self, seeded_app):
         report = _run(seeded_app["client"], seeded_app["admin_token"])
         names = [c["name"] for c in report["checks"]]
-        assert names == ["login-door", "email-delivery", "chat-grant", "agent-scope", "branding"]
+        assert names == [
+            "login-door",
+            "email-delivery",
+            "chat-grant",
+            "agent-scope",
+            "app-state-backend",
+            "branding",
+        ]
         for c in report["checks"]:
             assert c["status"] in ("ok", "warning", "error", "info"), c
             assert c["audience"] == "operator"
@@ -84,7 +94,7 @@ class TestDoctorShape:
         assert agent_check["status"] == "error"
         assert "resolver exploded" in agent_check["detail"]
         # The other checks still reported.
-        assert len(report["checks"]) == 5
+        assert len(report["checks"]) == 6
 
 
 class TestLoginDoor:

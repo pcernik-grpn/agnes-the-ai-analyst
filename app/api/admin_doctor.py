@@ -46,8 +46,8 @@ async def doctor_new_instance(
     ``status ∈ {ok, warning, error, info}`` per check (the ``agnes diagnose``
     vocabulary) and the headline aggregating the worst check. Checks:
     ``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,
-    ``branding``. Optional body ``{"email_to": ...}`` makes the
-    email-delivery check send a real test message.
+    ``app-state-backend``, ``branding``. Optional body ``{"email_to": ...}``
+    makes the email-delivery check send a real test message.
     """
     email_to = body.email_to if body else None
     return await run_new_instance_doctor(request.app, email_to=email_to)

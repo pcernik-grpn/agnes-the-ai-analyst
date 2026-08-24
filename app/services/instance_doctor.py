@@ -1,6 +1,6 @@
 """New-instance deployment doctor — the server-side half of the deploy gate.
 
-Five checks, each of which silently failed on a real new-instance deployment
+Six checks, each of which silently failed on a real new-instance deployment
 and cost hours of debugging. They are deliberately independent of startup
 logs: the failures they catch end in a single ``logger.warning`` (or in no
 signal at all), so the doctor re-derives every answer from the database, the
@@ -22,6 +22,10 @@ environment and a real page render.
 - ``agent-scope`` — every table-scoped agent profile has a non-empty
   owner-grants ∩ scope; an empty intersection means the agent answers every
   data question with 403 "not in your stack".
+- ``app-state-backend`` — since A1, fresh installs run app-state on Postgres
+  (``side_car``/``cloud``); DuckDB is legacy-only for new deploys. This
+  check is a NEW-instance gate — an existing instance still on DuckDB
+  failing it here is correct and informative, not a bug.
 - ``branding`` — when ``instance.brand`` is customized, the *rendered* login
   page no longer shows a default title (the title reads ``instance.name``, a
   different knob, so setting brand alone leaves the default visible).
@@ -46,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SENDER = "noreply@example.com"
 
-CHECK_NAMES = ("login-door", "email-delivery", "chat-grant", "agent-scope", "branding")
+CHECK_NAMES = ("login-door", "email-delivery", "chat-grant", "agent-scope", "app-state-backend", "branding")
 
 
 def _row(name: str, status: str, detail: str) -> dict:
@@ -285,6 +289,26 @@ async def check_branding(app) -> dict:
     return _row("branding", "ok", f"login page title renders as {title!r}")
 
 
+def check_app_state_backend() -> dict:
+    """Since A1, fresh installs run app-state on Postgres — DuckDB is
+    legacy-only for new deploys. This is a NEW-instance gate: an existing
+    instance still persisted on DuckDB is expected to fail this check;
+    that is correct and informative, not a bug.
+    """
+    from app.instance_config import get_database_config
+
+    backend = get_database_config()["backend"]
+    if backend in ("side_car", "cloud"):
+        return _row("app-state-backend", "ok", f"app-state backend is {backend!r} (Postgres)")
+    return _row(
+        "app-state-backend",
+        "error",
+        f"app-state backend is {backend!r} — fresh installs must run Postgres app-state "
+        "(see docs/QUICKSTART.md); DuckDB is legacy-only. If this is an existing instance "
+        "that predates the Postgres default, this failure is expected and can be ignored.",
+    )
+
+
 def _isolated(name: str, fn: Callable[[], dict]) -> dict:
     """Run one check; a crashing resolver reports itself instead of dying."""
     try:
@@ -304,7 +328,7 @@ def aggregate_status(checks: list[dict]) -> str:
 
 
 async def run_new_instance_doctor(app, email_to: Optional[str] = None) -> dict:
-    """All five checks, blocking work off the event loop, one report."""
+    """All six checks, blocking work off the event loop, one report."""
     from anyio import to_thread
 
     checks: list[dict] = []
@@ -313,6 +337,7 @@ async def run_new_instance_doctor(app, email_to: Optional[str] = None) -> dict:
         ("email-delivery", lambda: check_email_delivery(email_to)),
         ("chat-grant", lambda: check_chat_grant(app)),
         ("agent-scope", check_agent_scope),
+        ("app-state-backend", check_app_state_backend),
     ]
     for name, fn in sync_checks:
         checks.append(await to_thread.run_sync(_isolated, name, fn))
