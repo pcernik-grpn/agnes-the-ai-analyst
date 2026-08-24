@@ -2050,11 +2050,18 @@
                             <span>Keboola is not connected — <strong>Discover</strong> won't work. <a href="/admin/data-sources" style="color:inherit; text-decoration:underline;">Connect a Keboola project</a>, or fill in Bucket / Source Table by hand.</span>
                         </div>
                         {% endif %}
-                        {# Three sync-mode radios:
+                        {# Four sync-mode radios:
                            - whole / custom → query_mode='materialized' (DuckDB Keboola
                              extension; whole synthesizes SELECT *, custom uses admin SQL)
                            - direct → query_mode='local' (Storage API SDK, supports
-                             v26 sync strategies: incremental/partitioned + where_filters) #}
+                             v26 sync strategies: incremental/partitioned + where_filters)
+                           - remote → query_mode='remote' (live — same DuckDB extension
+                             view as 'whole', but nothing syncs; every analyst query goes
+                             straight to Keboola). Mirrors the "Live" option already
+                             offered by the BigQuery/Databricks/Snowflake modals in this
+                             template — bucket/source_table stay required (kb-source-table
+                             visibility already treats any non-custom mode the same way,
+                             see onKbSyncModeChange()). #}
                         <div class="form-group">
                             <label class="form-label">What to sync?</label>
                             <div class="bq-sync-radio-group" style="display:flex; gap:12px; margin-top:6px; flex-wrap:wrap;">
@@ -2081,6 +2088,16 @@
                                     <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
                                         Pre-aggregate or filter with your own SELECT
                                         (e.g. last 30 days only, per-day rollup).
+                                    </div>
+                                </label>
+                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:12px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
+                                    <input type="radio" name="kbSyncMode" value="remote" onchange="onKbSyncModeChange()">
+                                    <strong>Live (remote)</strong>
+                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
+                                        Each analyst query goes straight to Keboola through
+                                        the DuckDB extension view. Always current; 0 disk on
+                                        the analyst machine. Nothing syncs — no schedule,
+                                        no server-only distribution.
                                     </div>
                                 </label>
                             </div>
@@ -4865,10 +4882,12 @@
     });
 
     function _buildKeboolaPayload() {
-        // Three modes:
+        // Four modes:
         //   whole / custom → query_mode='materialized' (DuckDB Keboola extension)
         //   direct         → query_mode='local' + v26 sync_strategy fields
         //                    (Storage API SDK, supports incremental/partitioned/where_filters)
+        //   remote         → query_mode='remote' (live — same extension view as
+        //                    'whole', but nothing syncs; no server_only, no sync_schedule)
         var mode = _getKbSyncMode();
         var viewName = (document.getElementById('kbViewName').value || '').trim();
         var bucket = (document.getElementById('kbBucket').value || '').trim();
@@ -4932,6 +4951,25 @@
                 payload.where_filters = _parseFiltersJSONOrThrow('kbWhereFilters');
             }
             return payload;
+        }
+
+        if (mode === 'remote') {
+            // Live — mirrors the BigQuery live branch (_buildBigQueryPayload):
+            // no server_only (the model validator 422s server_only=true +
+            // query_mode='remote' — there's no server-stored parquet to
+            // suppress), no v26 sync-strategy fields (nothing ever syncs).
+            return {
+                name: viewName || sourceTable,
+                source_type: 'keboola',
+                query_mode: 'remote',
+                bucket: bucket,
+                source_table: sourceTable,
+                primary_key: primaryKey,
+                connection_id: connectionId,
+                sync_schedule: (document.getElementById('kbSyncSchedule').value || '').trim() || null,
+                description: (document.getElementById('kbDescription').value || '').trim() || null,
+                folder: (document.getElementById('kbFolder').value || '').trim() || null,
+            };
         }
 
         // Materialized paths (whole / custom)

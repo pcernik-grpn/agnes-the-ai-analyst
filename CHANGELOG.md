@@ -10,6 +10,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Keboola tables can be registered as "Live (remote)".** The `/admin/tables` Keboola modal and the `/admin/data-sources` wizard's per-table mode picker both offered only materialized/local sync — never `query_mode='remote'`, even though the register API and the DuckDB Keboola extension already supported it end-to-end. The Keboola modal's "What to sync?" step gains a fourth option matching the wording pattern already used for BigQuery/Databricks/Snowflake; the wizard's per-row select gains `local` alongside `materialized`/`remote`. The wizard's finish step (both the Share&finish/Skip path and the "Register only & finish" escape hatch) now fires a fire-and-forget `POST /api/sync/trigger` so newly registered tables don't wait for the next scheduled tick, with a "Sync started" note in the success state.
+
+### Fixed
+
+- **Keboola local/remote sync no longer risks extracting with the wrong project's token.** Only the materialized pass resolved a per-`connection_id` Keboola credential; the extractor subprocess that handles `local`/`remote` registry rows always used a single global `KEBOOLA_STACK_URL`/`KEBOOLA_STORAGE_TOKEN` pair, so a UI-created connection's rows never synced and, on a multi-connection instance, a second project's rows could silently extract with the first project's token. The extractor pass now groups rows by `connection_id` and resolves each group's own credential (vault first, then the connection's `token_env`) via the same resolution `_run_materialized_pass` already used — extracted into a shared helper. A row whose connection has no resolvable credential is recorded as `sync_state` error `missing_connection_token` and skipped, never silently synced with the wrong token. Rows with no `connection_id` are unaffected.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added

@@ -196,6 +196,65 @@ def _is_permanent_upstream_error(exc: Exception) -> bool:
     return isinstance(exc, StorageApiError) and exc.status == 404
 
 
+class _KeboolaCredentialError(Exception):
+    """No resolvable Keboola ``stack_url``/token for a sync pass.
+
+    Raised by ``_resolve_keboola_credentials`` — callers must record a
+    per-row/per-group error and skip the row rather than falling back to a
+    different credential. A Keboola connection is per-project; silently
+    substituting a different token (or the instance's global one) extracts
+    the WRONG project's data instead of failing loudly (#B2)."""
+
+
+def _resolve_keboola_credentials(conn_id: Optional[str]) -> tuple:
+    """Resolve ``(stack_url, token)`` for a Keboola sync pass.
+
+    ``conn_id=None`` resolves the instance-level/global credential —
+    ``data_source.keboola.stack_url`` + the configured token env var
+    (``KEBOOLA_STORAGE_TOKEN`` by default), vault fallback last. This is
+    today's unscoped, backwards-compatible path — unchanged.
+
+    A non-null ``conn_id`` resolves the NAMED ``source_connections`` row:
+    vault takes priority (``connection_secrets_repo().get(conn_id)``),
+    falling back to the env var named in the row's own ``token_env``.
+
+    Always raises ``_KeboolaCredentialError`` rather than returning a
+    partial/empty pair, so every caller fails loudly instead of guessing.
+
+    Shared by ``_run_materialized_pass`` (materialized rows) and
+    ``_run_sync``'s extractor-subprocess dispatch (local/remote rows) —
+    the two Keboola sync passes that both need a per-``connection_id``
+    credential (#B2 — pre-fix only the materialized pass resolved one; the
+    extractor subprocess used a single global env pair for every row).
+    """
+    if conn_id:
+        sc = source_connections_repo().get(conn_id)
+        if not sc:
+            raise _KeboolaCredentialError(f"connection_id {conn_id!r} not found in source_connections")
+        sc_url = sc["config"].get("stack_url", "")
+        sc_token = connection_secrets_repo().get(conn_id) or os.environ.get(sc.get("token_env") or "", "")
+        if not (sc_url and sc_token):
+            raise _KeboolaCredentialError(f"connection {conn_id!r} missing URL or token")
+        return sc_url, sc_token
+
+    from app.instance_config import get_value
+
+    sc_url = get_value("data_source", "keboola", "stack_url", default="") or os.environ.get("KEBOOLA_STACK_URL", "")
+    token_env = (
+        get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN") or "KEBOOLA_STORAGE_TOKEN"
+    )
+    sc_token = os.environ.get(token_env, "")
+    if not sc_token:
+        from app.datasource_secrets import datasource_secret as _ds_secret
+
+        sc_token = _ds_secret("KEBOOLA_STORAGE_TOKEN") or ""
+    if not (sc_url and sc_token):
+        raise _KeboolaCredentialError(
+            f"Keboola URL/token not configured (data_source.keboola.stack_url + env {token_env})"
+        )
+    return sc_url, sc_token
+
+
 def _run_materialized_pass(
     conn: duckdb.DuckDBPyConnection,
     bq,
@@ -449,63 +508,11 @@ def _run_materialized_pass(
                 if conn_id not in keboola_clients:
                     from connectors.keboola.storage_api import KeboolaStorageClient
 
-                    if conn_id:
-                        # Per-connection resolution: look up the named
-                        # source_connection record and resolve its token.
-                        # Vault takes priority; falls back to the env var
-                        # named in the record's token_env field.
-                        sc = source_connections_repo().get(conn_id)
-                        if not sc:
-                            summary["errors"].append(
-                                {
-                                    "table": ref_name,
-                                    "error": f"connection_id {conn_id!r} not found in source_connections",
-                                }
-                            )
-                            continue
-                        sc_url = sc["config"].get("stack_url", "")
-                        sc_token = connection_secrets_repo().get(conn_id) or os.environ.get(
-                            sc.get("token_env") or "", ""
-                        )
-                        if not (sc_url and sc_token):
-                            summary["errors"].append(
-                                {
-                                    "table": ref_name,
-                                    "error": f"connection {conn_id!r} missing URL or token",
-                                }
-                            )
-                            continue
-                    else:
-                        # Global/instance token path (backwards compatible).
-                        sc_url = get_value("data_source", "keboola", "stack_url", default="") or os.environ.get(
-                            "KEBOOLA_STACK_URL", ""
-                        )
-                        token_env = (
-                            get_value(
-                                "data_source",
-                                "keboola",
-                                "token_env",
-                                default="KEBOOLA_STORAGE_TOKEN",
-                            )
-                            or "KEBOOLA_STORAGE_TOKEN"
-                        )
-                        sc_token = os.environ.get(token_env, "")
-                        if not sc_token:
-                            from app.datasource_secrets import datasource_secret as _ds_secret
-
-                            sc_token = _ds_secret("KEBOOLA_STORAGE_TOKEN") or ""
-                        if not (sc_url and sc_token):
-                            summary["errors"].append(
-                                {
-                                    "table": ref_name,
-                                    "error": (
-                                        "Keboola URL/token not configured for "
-                                        "materialized path (data_source.keboola.stack_url "
-                                        f"+ env {token_env})"
-                                    ),
-                                }
-                            )
-                            continue
+                    try:
+                        sc_url, sc_token = _resolve_keboola_credentials(conn_id)
+                    except _KeboolaCredentialError as cred_err:
+                        summary["errors"].append({"table": ref_name, "error": str(cred_err)})
+                        continue
                     keboola_clients[conn_id] = KeboolaStorageClient(
                         url=sc_url,
                         token=sc_token,
@@ -714,6 +721,262 @@ def _run_materialized_pass(
     return summary
 
 
+def _invoke_keboola_extractor_subprocess(
+    table_configs: List[dict],
+    env: dict,
+    collected_errors: List[dict],
+    synced_table_names: set,
+) -> None:
+    """Run the Keboola extractor subprocess once for ``table_configs``
+    against ``env`` (must carry ``KEBOOLA_STACK_URL`` + ``KEBOOLA_STORAGE_
+    TOKEN`` — see ``_resolve_keboola_credentials``). Mutates
+    ``collected_errors`` / ``synced_table_names`` in place.
+
+    Extracted out of ``_run_sync`` (#B2) so the per-``connection_id`` group
+    dispatch there can call this once per credential group instead of
+    duplicating the subprocess plumbing per group — a UI-created Keboola
+    connection was previously invisible here: this pass always used the
+    single global env pair (``KEBOOLA_STACK_URL``/``KEBOOLA_STORAGE_
+    TOKEN``), even for a ``local``/``remote`` row attributed to a
+    different, non-default connection (wrong-project extraction on a
+    multi-connection instance, or a silent no-op on a fresh one).
+    """
+    import json as _json
+    import sys as _sys
+
+    # v26: incremental + partitioned strategies need last_sync from
+    # sync_state to compute changedSince. The subprocess MUST NOT
+    # reopen system.duckdb (parent holds the lock — see contract at
+    # the top of this function), so the parent reads watermarks
+    # here and injects them into each table_config under the key
+    # `__last_sync__`. extractor.run() picks them up via
+    # _read_last_sync's first-check-config-then-fall-back pattern.
+    ws_repo = sync_state_repo()
+    for tc in table_configs:
+        if tc.get("sync_strategy") in ("incremental", "partitioned"):
+            state = ws_repo.get_table_state(tc.get("id") or tc.get("name"))
+            if state and state.get("status") != "error":
+                ls = state.get("last_sync")
+                if ls is not None:
+                    tc["__last_sync__"] = ls
+
+    # Serialize configs — strip non-serializable fields
+    serializable = []
+    for tc in table_configs:
+        serializable.append(
+            {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in tc.items() if v is not None}
+        )
+
+    # Run extractor subprocess with table configs via stdin
+    # Subprocess does NOT open system.duckdb — no lock conflict
+    cmd = [
+        _sys.executable,
+        "-c",
+        """
+import json, sys, os, logging, signal
+from pathlib import Path
+
+# Subprocess inherits no logging config — without basicConfig, Python's
+# lastResort handler only surfaces WARNING+ to stderr and INFO-level
+# extraction progress from connectors.keboola.extractor.run() is silently
+# dropped. capture_output=True in the parent then swallows the rest.
+# Devin BUG_0002 on PR #136 review.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# Convert SIGTERM into a controlled SystemExit so the ProcessPoolExecutor
+# `with` block in connectors.keboola.extractor.run() runs its __exit__
+# (shutdown/wait_for_workers) before this process dies. Without this,
+# SIGTERM kills the parent abruptly, leaving the OS to clean up the pool
+# children — but each worker holds an open Keboola Storage export job
+# whose lifetime is tied to the HTTP poll loop, and those leak until the
+# Keboola side TTLs them out. The parent extractor calls this from
+# app.api.sync._run_sync after `subprocess.Popen(start_new_session=True)`
+# + `os.killpg(SIGTERM)` on timeout.
+def _exit_on_sigterm(signum, frame):
+    sys.exit(143)
+signal.signal(signal.SIGTERM, _exit_on_sigterm)
+
+configs = json.load(sys.stdin)
+url = os.environ.get("KEBOOLA_STACK_URL", "")
+token = os.environ.get("KEBOOLA_STORAGE_TOKEN", "")
+
+if not url or not token:
+    print("ERROR: Missing KEBOOLA_STACK_URL or KEBOOLA_STORAGE_TOKEN", file=sys.stderr)
+    sys.exit(1)
+
+from connectors.keboola.extractor import run, compute_exit_code
+data_dir = Path(os.environ.get("DATA_DIR", "./data"))
+result = run(str(data_dir / "extracts" / "keboola"), configs, url, token)
+print(json.dumps(result))
+# Issue #81 Group B: surface partial-failure as exit 2 so the API
+# caller can distinguish "every table failed" from "9/10 succeeded".
+sys.exit(compute_exit_code(result, len(configs)))
+""",
+    ]
+
+    print(f"[SYNC] Starting extractor subprocess for {len(table_configs)} tables", file=_sys.stderr, flush=True)
+
+    # Run in a new process group (start_new_session=True) so a
+    # timeout can take down the whole tree — the extractor itself
+    # plus any ProcessPoolExecutor workers it spawned for parallel
+    # legacy-fallback. Without this, plain `subprocess.run` on
+    # timeout SIGKILLs only the immediate child; the pool workers
+    # are reparented to PID 1 and continue holding open Keboola
+    # Storage export jobs, blocking the next sync cycle's
+    # connectivity to those same job IDs.
+    extractor_timeout = int(os.environ.get("AGNES_EXTRACTOR_TIMEOUT_SEC", "3600"))
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).parent.parent.parent),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=_json.dumps(serializable), timeout=extractor_timeout)
+        result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        # SIGTERM the whole process group first to give workers a
+        # chance to shut down cleanly (release Keboola export jobs,
+        # close DuckDB conns), then SIGKILL the stragglers after a
+        # short grace window.
+        import signal
+
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        # Catch the timeout LOCALLY so the materialized BQ pass and
+        # orchestrator rebuild below still fire — pre-fix the timeout
+        # propagated to the outer except handler and skipped the rest
+        # of `_run_sync` (Devin BUG_0001 on PR #148 commit 2219255).
+        print(
+            f"[SYNC] Extractor timed out after {extractor_timeout}s — process "
+            "group killed; continuing to materialized pass + orchestrator rebuild",
+            file=_sys.stderr,
+            flush=True,
+        )
+        result = None
+        # Record the timeout so the per-table webhook alert fires —
+        # this LOCAL catch (the common timeout path) sets result=None
+        # and skips the exit-code error collection below, so without
+        # this append a clean materialized pass + rebuild would leave
+        # collected_errors empty and the operator never learns the
+        # extractor stalled (#397, #648 review).
+        collected_errors.append(
+            {
+                "table": "(keboola extractor)",
+                "error": f"extractor timed out after {extractor_timeout}s — process group killed",
+            }
+        )
+
+    if result is not None:
+        if result.stdout:
+            print(f"[SYNC] Extractor stdout: {result.stdout.strip()[-500:]}", file=_sys.stderr, flush=True)
+        if result.stderr:
+            print(f"[SYNC] Extractor stderr: {result.stderr[-500:]}", file=_sys.stderr, flush=True)
+
+        # #754 — recover the subprocess's per-table stats (it can't
+        # write system.duckdb itself; the parent holds that lock for
+        # the duration of the sync) and persist real failures via
+        # sync_state.set_error so `GET /api/admin/registry` /
+        # `agnes admin list-tables` can explain a "N total, 0 synced"
+        # run instead of an operator having to trawl container logs
+        # for the 500-char stdout tail above.
+        extractor_stats = _parse_extractor_stats(result.stdout)
+        extractor_table_errors = (extractor_stats or {}).get("errors") or []
+        if extractor_table_errors:
+            err_state = sync_state_repo()
+            for entry in extractor_table_errors:
+                tname = entry.get("table")
+                terror = entry.get("error")
+                if tname and terror:
+                    err_state.set_error(tname, terror)
+                    collected_errors.append({"table": tname, "error": terror})
+
+        # Issue #81 Group B: three exit codes. 0 = full success,
+        # 1 = full failure, 2 = partial. Partial is a data-quality
+        # alert, not a crash — the orchestrator's per-table _meta
+        # machinery already captured which tables succeeded; we just
+        # need to log loudly so operator alerting can pick it up.
+        if result.returncode == 0:
+            print("[SYNC] Extractor OK", file=_sys.stderr, flush=True)
+        elif result.returncode == 2:
+            print(
+                "[SYNC] Extractor PARTIAL FAILURE (exit 2) — some tables "
+                "succeeded, some failed; see stderr for per-table errors. "
+                "Successful tables will still be published by the orchestrator.",
+                file=_sys.stderr,
+                flush=True,
+            )
+            # Real per-table entries (just persisted above) are more
+            # actionable than this placeholder — only fall back to it
+            # when the stats line couldn't be recovered at all.
+            if not extractor_table_errors:
+                collected_errors.append(
+                    {
+                        "table": "(keboola extractor)",
+                        "error": "partial failure (exit 2) — see server logs for per-table errors",
+                    }
+                )
+        else:
+            print(f"[SYNC] Extractor FAILED (exit {result.returncode})", file=_sys.stderr, flush=True)
+            if not extractor_table_errors:
+                collected_errors.append(
+                    {
+                        "table": "(keboola extractor)",
+                        "error": f"extractor failed (exit {result.returncode}) — see server logs",
+                    }
+                )
+
+        # Record which of THIS run's attempted tables actually landed
+        # data, for notify_sync_completed below. "Attempted minus
+        # recovered errors" over-claims in two ways, so both are
+        # excluded here — an analyst-facing "N table(s) refreshed"
+        # must never count a table this run did not write:
+        #
+        #  - Only `local` rows land parquet through this extractor.
+        #    A `tables=[…]` operator trigger reads registry rows
+        #    directly (`repo.get`), so table_configs can also carry
+        #    `materialized` rows — which the extractor `continue`s
+        #    over without recording anything, because
+        #    `_run_materialized_pass` owns them and contributes its
+        #    own positively-accounted names below (and may itself
+        #    have skipped the row on its due/in_flight check) — and
+        #    `remote` rows, which only get a view over the source:
+        #    no data is downloaded, and `agnes pull` skips them.
+        #  - Exit 2 means SOME table failed. When the stats line
+        #    couldn't be parsed there is no per-table error list to
+        #    subtract (that's the fallback branch above), so we know
+        #    a failure happened but not whose — claim none rather
+        #    than announce the failures as refreshes. Exit 0 carries
+        #    no failures by construction (`compute_exit_code`), so
+        #    it needs no such evidence.
+        _stats_recovered = result.returncode == 0 or bool(extractor_table_errors)
+        if result.returncode in (0, 2) and _stats_recovered:
+            _failed_names = {e.get("table") for e in extractor_table_errors}
+            for _tc in table_configs:
+                _name = _tc.get("name")
+                if not _name or (_tc.get("query_mode") or "local") != "local":
+                    continue
+                if _name not in _failed_names:
+                    synced_table_names.add(_name)
+
+
 def _run_sync(
     tables: Optional[List[str]] = None,
     source_type_filter: Optional[str] = None,
@@ -767,7 +1030,6 @@ def _run_sync(
         this returns ``False`` so the job's failure/retry semantics apply;
         it treats ``None`` the same as ``True`` (no-op, not a failure).
     """
-    import json as _json
     import sys as _sys
 
     if not _sync_lock.acquire(blocking=False):
@@ -922,237 +1184,34 @@ def _run_sync(
                 env["KEBOOLA_STORAGE_TOKEN"] = _vt
 
         if run_extractor_subprocess:
-            # v26: incremental + partitioned strategies need last_sync from
-            # sync_state to compute changedSince. The subprocess MUST NOT
-            # reopen system.duckdb (parent holds the lock — see contract at
-            # the top of this function), so the parent reads watermarks
-            # here and injects them into each table_config under the key
-            # `__last_sync__`. extractor.run() picks them up via
-            # _read_last_sync's first-check-config-then-fall-back pattern.
-            ws_repo = sync_state_repo()
-            for tc in table_configs:
-                if tc.get("sync_strategy") in ("incremental", "partitioned"):
-                    state = ws_repo.get_table_state(tc.get("id") or tc.get("name"))
-                    if state and state.get("status") != "error":
-                        ls = state.get("last_sync")
-                        if ls is not None:
-                            tc["__last_sync__"] = ls
+            # Group by connection_id — a row with no connection_id keeps
+            # today's global-env behavior (one call, below); a row
+            # attributed to a named connection gets its OWN subprocess
+            # call against THAT connection's resolved credential (#B2).
+            # Never fall back to the global env pair for a connection-
+            # attributed row: on a multi-connection instance the global
+            # pair belongs to a DIFFERENT project, and using it would
+            # silently extract the wrong data rather than fail loudly.
+            _by_connection: dict = {}
+            for _tc in table_configs:
+                _by_connection.setdefault(_tc.get("connection_id"), []).append(_tc)
 
-            # Serialize configs — strip non-serializable fields
-            serializable = []
-            for tc in table_configs:
-                serializable.append(
-                    {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in tc.items() if v is not None}
-                )
-
-            # Run extractor subprocess with table configs via stdin
-            # Subprocess does NOT open system.duckdb — no lock conflict
-            cmd = [
-                _sys.executable,
-                "-c",
-                """
-import json, sys, os, logging, signal
-from pathlib import Path
-
-# Subprocess inherits no logging config — without basicConfig, Python's
-# lastResort handler only surfaces WARNING+ to stderr and INFO-level
-# extraction progress from connectors.keboola.extractor.run() is silently
-# dropped. capture_output=True in the parent then swallows the rest.
-# Devin BUG_0002 on PR #136 review.
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-# Convert SIGTERM into a controlled SystemExit so the ProcessPoolExecutor
-# `with` block in connectors.keboola.extractor.run() runs its __exit__
-# (shutdown/wait_for_workers) before this process dies. Without this,
-# SIGTERM kills the parent abruptly, leaving the OS to clean up the pool
-# children — but each worker holds an open Keboola Storage export job
-# whose lifetime is tied to the HTTP poll loop, and those leak until the
-# Keboola side TTLs them out. The parent extractor calls this from
-# app.api.sync._run_sync after `subprocess.Popen(start_new_session=True)`
-# + `os.killpg(SIGTERM)` on timeout.
-def _exit_on_sigterm(signum, frame):
-    sys.exit(143)
-signal.signal(signal.SIGTERM, _exit_on_sigterm)
-
-configs = json.load(sys.stdin)
-url = os.environ.get("KEBOOLA_STACK_URL", "")
-token = os.environ.get("KEBOOLA_STORAGE_TOKEN", "")
-
-if not url or not token:
-    print("ERROR: Missing KEBOOLA_STACK_URL or KEBOOLA_STORAGE_TOKEN", file=sys.stderr)
-    sys.exit(1)
-
-from connectors.keboola.extractor import run, compute_exit_code
-data_dir = Path(os.environ.get("DATA_DIR", "./data"))
-result = run(str(data_dir / "extracts" / "keboola"), configs, url, token)
-print(json.dumps(result))
-# Issue #81 Group B: surface partial-failure as exit 2 so the API
-# caller can distinguish "every table failed" from "9/10 succeeded".
-sys.exit(compute_exit_code(result, len(configs)))
-""",
-            ]
-
-            print(f"[SYNC] Starting extractor subprocess for {len(table_configs)} tables", file=_sys.stderr, flush=True)
-
-            # Run in a new process group (start_new_session=True) so a
-            # timeout can take down the whole tree — the extractor itself
-            # plus any ProcessPoolExecutor workers it spawned for parallel
-            # legacy-fallback. Without this, plain `subprocess.run` on
-            # timeout SIGKILLs only the immediate child; the pool workers
-            # are reparented to PID 1 and continue holding open Keboola
-            # Storage export jobs, blocking the next sync cycle's
-            # connectivity to those same job IDs.
-            extractor_timeout = int(os.environ.get("AGNES_EXTRACTOR_TIMEOUT_SEC", "3600"))
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-                cwd=str(Path(__file__).parent.parent.parent),
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = proc.communicate(input=_json.dumps(serializable), timeout=extractor_timeout)
-                result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired:
-                # SIGTERM the whole process group first to give workers a
-                # chance to shut down cleanly (release Keboola export jobs,
-                # close DuckDB conns), then SIGKILL the stragglers after a
-                # short grace window.
-                import signal
-
+            for _conn_id, _group_configs in _by_connection.items():
+                if _conn_id is None:
+                    _invoke_keboola_extractor_subprocess(_group_configs, env, collected_errors, synced_table_names)
+                    continue
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        proc.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                # Catch the timeout LOCALLY so the materialized BQ pass and
-                # orchestrator rebuild below still fire — pre-fix the timeout
-                # propagated to the outer except handler and skipped the rest
-                # of `_run_sync` (Devin BUG_0001 on PR #148 commit 2219255).
-                print(
-                    f"[SYNC] Extractor timed out after {extractor_timeout}s — process "
-                    "group killed; continuing to materialized pass + orchestrator rebuild",
-                    file=_sys.stderr,
-                    flush=True,
-                )
-                result = None
-                # Record the timeout so the per-table webhook alert fires —
-                # this LOCAL catch (the common timeout path) sets result=None
-                # and skips the exit-code error collection below, so without
-                # this append a clean materialized pass + rebuild would leave
-                # collected_errors empty and the operator never learns the
-                # extractor stalled (#397, #648 review).
-                collected_errors.append(
-                    {
-                        "table": "(keboola extractor)",
-                        "error": f"extractor timed out after {extractor_timeout}s — process group killed",
-                    }
-                )
-
-            if result is not None:
-                if result.stdout:
-                    print(f"[SYNC] Extractor stdout: {result.stdout.strip()[-500:]}", file=_sys.stderr, flush=True)
-                if result.stderr:
-                    print(f"[SYNC] Extractor stderr: {result.stderr[-500:]}", file=_sys.stderr, flush=True)
-
-                # #754 — recover the subprocess's per-table stats (it can't
-                # write system.duckdb itself; the parent holds that lock for
-                # the duration of the sync) and persist real failures via
-                # sync_state.set_error so `GET /api/admin/registry` /
-                # `agnes admin list-tables` can explain a "N total, 0 synced"
-                # run instead of an operator having to trawl container logs
-                # for the 500-char stdout tail above.
-                extractor_stats = _parse_extractor_stats(result.stdout)
-                extractor_table_errors = (extractor_stats or {}).get("errors") or []
-                if extractor_table_errors:
+                    _sc_url, _sc_token = _resolve_keboola_credentials(_conn_id)
+                except _KeboolaCredentialError:
                     err_state = sync_state_repo()
-                    for entry in extractor_table_errors:
-                        tname = entry.get("table")
-                        terror = entry.get("error")
-                        if tname and terror:
-                            err_state.set_error(tname, terror)
-                            collected_errors.append({"table": tname, "error": terror})
-
-                # Issue #81 Group B: three exit codes. 0 = full success,
-                # 1 = full failure, 2 = partial. Partial is a data-quality
-                # alert, not a crash — the orchestrator's per-table _meta
-                # machinery already captured which tables succeeded; we just
-                # need to log loudly so operator alerting can pick it up.
-                if result.returncode == 0:
-                    print("[SYNC] Extractor OK", file=_sys.stderr, flush=True)
-                elif result.returncode == 2:
-                    print(
-                        "[SYNC] Extractor PARTIAL FAILURE (exit 2) — some tables "
-                        "succeeded, some failed; see stderr for per-table errors. "
-                        "Successful tables will still be published by the orchestrator.",
-                        file=_sys.stderr,
-                        flush=True,
-                    )
-                    # Real per-table entries (just persisted above) are more
-                    # actionable than this placeholder — only fall back to it
-                    # when the stats line couldn't be recovered at all.
-                    if not extractor_table_errors:
-                        collected_errors.append(
-                            {
-                                "table": "(keboola extractor)",
-                                "error": "partial failure (exit 2) — see server logs for per-table errors",
-                            }
-                        )
-                else:
-                    print(f"[SYNC] Extractor FAILED (exit {result.returncode})", file=_sys.stderr, flush=True)
-                    if not extractor_table_errors:
-                        collected_errors.append(
-                            {
-                                "table": "(keboola extractor)",
-                                "error": f"extractor failed (exit {result.returncode}) — see server logs",
-                            }
-                        )
-
-                # Record which of THIS run's attempted tables actually landed
-                # data, for notify_sync_completed below. "Attempted minus
-                # recovered errors" over-claims in two ways, so both are
-                # excluded here — an analyst-facing "N table(s) refreshed"
-                # must never count a table this run did not write:
-                #
-                #  - Only `local` rows land parquet through this extractor.
-                #    A `tables=[…]` operator trigger reads registry rows
-                #    directly (`repo.get`), so table_configs can also carry
-                #    `materialized` rows — which the extractor `continue`s
-                #    over without recording anything, because
-                #    `_run_materialized_pass` owns them and contributes its
-                #    own positively-accounted names below (and may itself
-                #    have skipped the row on its due/in_flight check) — and
-                #    `remote` rows, which only get a view over the source:
-                #    no data is downloaded, and `agnes pull` skips them.
-                #  - Exit 2 means SOME table failed. When the stats line
-                #    couldn't be parsed there is no per-table error list to
-                #    subtract (that's the fallback branch above), so we know
-                #    a failure happened but not whose — claim none rather
-                #    than announce the failures as refreshes. Exit 0 carries
-                #    no failures by construction (`compute_exit_code`), so
-                #    it needs no such evidence.
-                _stats_recovered = result.returncode == 0 or bool(extractor_table_errors)
-                if result.returncode in (0, 2) and _stats_recovered:
-                    _failed_names = {e.get("table") for e in extractor_table_errors}
-                    for _tc in table_configs:
-                        _name = _tc.get("name")
-                        if not _name or (_tc.get("query_mode") or "local") != "local":
-                            continue
-                        if _name not in _failed_names:
-                            synced_table_names.add(_name)
+                    for _tc in _group_configs:
+                        _tname = _tc.get("name")
+                        if _tname:
+                            err_state.set_error(_tname, "missing_connection_token")
+                            collected_errors.append({"table": _tname, "error": "missing_connection_token"})
+                    continue
+                _group_env = {**env, "KEBOOLA_STACK_URL": _sc_url, "KEBOOLA_STORAGE_TOKEN": _sc_token}
+                _invoke_keboola_extractor_subprocess(_group_configs, _group_env, collected_errors, synced_table_names)
 
             # Run custom connectors (Tier A: local mount) — only when there
             # were local-mode tables to drive the extractor. Custom connectors
