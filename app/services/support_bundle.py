@@ -257,7 +257,7 @@ def _collect_disk() -> dict:
         "used_bytes": usage.used,
         "free_bytes": usage.free,
         # The system DB honors a STATE_DIR override (see src.db._get_state_dir),
-        # so resolve it the same way get_system_db() does.
+        # so resolve it the same way src.db resolves the system DB path.
         "system_db_bytes": _size(_get_state_dir() / "system.duckdb"),
         "analytics_db_bytes": _size(data_dir / "analytics" / "server.duckdb"),
     }
