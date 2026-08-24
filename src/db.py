@@ -79,8 +79,13 @@ _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 # 123 adds chat_messages.parts — the assistant turn's ordered
 # [{type:'text'|'tool', …}] shape, so prose and tool calls keep their
 # interleaving across a reload and a replayed tool card can show its real
-# outcome instead of only a name (see `_v122_to_v123`).
-SCHEMA_VERSION = 123
+# outcome instead of only a name (see `_v122_to_v123`),
+# 124 (remediation B1) backfills name-keyed `sync_state.table_id` /
+# `sync_history.table_id` rows to the matching `table_registry.id`, data-only
+# — writers now resolve the id themselves (see `src.sync_state_key`); this
+# step only rewrites what an earlier binary already wrote (see
+# `_v123_to_v124`).
+SCHEMA_VERSION = 124
 
 # v96: data_apps registry (hosted user web apps). Extracted as a shared
 # module-level constant so the fresh-install DDL (appended to
@@ -7790,6 +7795,125 @@ def _v122_to_v123(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("UPDATE schema_version SET version = 123")
 
 
+def _v123_to_v124(conn: duckdb.DuckDBPyConnection) -> None:
+    """v123→v124 (remediation B1): backfill name-keyed ``sync_state.table_id``
+    / ``sync_history.table_id`` rows to the matching ``table_registry.id``.
+
+    Every writer wrote these keyed by the table's *name* (`_meta.table_name`
+    for connector syncs, `table_registry.name` for the materialized pass)
+    while several admin-status readers (`/api/admin/registry`, the
+    data-sources pipeline strip, the Tables lens' delivery map) joined
+    `sync_state` against `table_registry` on `id`. The two agree only when a
+    table's registry id happens to equal its display name (the common
+    case); a table registered with a display name that isn't already a
+    valid identifier (spaces, uppercase — e.g. `name="Web Sessions"`, id
+    `web_sessions`) showed healthy sync status on one admin surface and
+    "never synced" on another, from the exact same sync. The writers now
+    resolve the id themselves going forward (`src.sync_state_key`); this
+    step is the one-time catch-up for rows an earlier binary already wrote.
+
+    Data-only — no column or table change, so `src/db_pg.py` needs no
+    matching edit; the Alembic sibling (`0072_sync_state_id_backfill_v124`)
+    does the same rewrite against Postgres.
+
+    A `sync_state.table_id` value that:
+      - matches NO `table_registry.name` is left unchanged (an unregistered
+        or since-renamed table) — logged, never dropped, matching the
+        writers' own fallback behavior;
+      - matches a `table_registry.name` whose `id` a row ALREADY under
+        (i.e. `id == name`, or a stray duplicate) is a no-op — nothing to
+        rewrite;
+      - would collide with a row that ALREADY exists under the target id
+        (a pathological pre-existing state — two rows that would both want
+        `table_id = <that id>`) is left unchanged and logged rather than
+        silently dropping one row's history; `sync_state.table_id` is a
+        PRIMARY KEY, so blindly renaming into an existing key would raise.
+
+    `sync_history.table_id` shares the exact same keying convention (every
+    `sync_state.update_sync()` call inserts both rows under the identical
+    key — see `src.repositories.sync_state.SyncStateRepository.update_sync`)
+    but carries no uniqueness constraint, so its rewrite has no collision
+    case to guard.
+
+    Idempotent: a re-run finds no more name-keyed rows to touch (they were
+    already renamed, or never had a registry match and are unchanged either
+    way).
+
+    Column-defensive: a DB replaying the ladder from far enough back can
+    have `sync_state` / `table_registry` / `sync_history` present as bare
+    stub tables (e.g. a pre-`_SYSTEM_SCHEMA` install, or a test harness
+    that only stubs `CREATE TABLE IF NOT EXISTS <name> (id VARCHAR PRIMARY
+    KEY)` for tables it doesn't otherwise exercise) — `IF NOT EXISTS` in
+    `_SYSTEM_SCHEMA`'s own `CREATE TABLE` means that stub survives
+    untouched all the way to here, since no earlier `_vN_to_v(N+1)` step
+    ever needed to reshape `sync_state`'s columns before this one. No
+    other migration step queries these tables' columns directly (every
+    other consumer goes through the repo layer at RUNTIME, not during the
+    ladder walk), so this is the first step a shape gap like that would
+    ever surface for. `PRAGMA table_info` is checked before any SELECT
+    that names a specific column; a table missing what this step expects
+    has nothing to backfill (no real sync_state row can exist keyed by a
+    column that doesn't exist) and is skipped with a log line rather than
+    raising a Binder Error.
+    """
+    tables_present = {r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()}
+    if "sync_state" not in tables_present or "table_registry" not in tables_present:
+        conn.execute("UPDATE schema_version SET version = 124")
+        return
+
+    def _cols(table_name: str) -> set:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()}
+
+    sync_state_cols = _cols("sync_state")
+    registry_cols = _cols("table_registry")
+    if "table_id" not in sync_state_cols or "id" not in registry_cols or "name" not in registry_cols:
+        logger.warning(
+            "sync_state backfill (v124): skipped — sync_state and/or table_registry is missing an "
+            "expected column at this point in the migration ladder (sync_state has %s, table_registry "
+            "has %s); nothing to backfill on a table shaped like this",
+            sorted(sync_state_cols),
+            sorted(registry_cols),
+        )
+        conn.execute("UPDATE schema_version SET version = 124")
+        return
+
+    sync_history_has_table_id = "sync_history" in tables_present and "table_id" in _cols("sync_history")
+    if "sync_history" in tables_present and not sync_history_has_table_id:
+        logger.warning(
+            "sync_state backfill (v124): sync_history is missing the table_id column at this point "
+            "in the migration ladder — its rows are left untouched"
+        )
+
+    name_to_id: dict[str, str] = {}
+    for rid, name in conn.execute("SELECT id, name FROM table_registry").fetchall():
+        if name:
+            name_to_id[name] = rid
+
+    existing_ids = {row[0] for row in conn.execute("SELECT table_id FROM sync_state").fetchall()}
+
+    for (table_id,) in conn.execute("SELECT table_id FROM sync_state").fetchall():
+        new_id = name_to_id.get(table_id)
+        if not new_id or new_id == table_id:
+            # No registry match (left unchanged — a writer already logged
+            # this at write time), or already id-keyed (id == name, or a
+            # prior run of this same step).
+            continue
+        if new_id in existing_ids:
+            logger.warning(
+                "sync_state backfill (v124): leaving %r name-keyed — a row already exists under the target id %r",
+                table_id,
+                new_id,
+            )
+            continue
+        conn.execute("UPDATE sync_state SET table_id = ? WHERE table_id = ?", [new_id, table_id])
+        if sync_history_has_table_id:
+            conn.execute("UPDATE sync_history SET table_id = ? WHERE table_id = ?", [new_id, table_id])
+        existing_ids.discard(table_id)
+        existing_ids.add(new_id)
+
+    conn.execute("UPDATE schema_version SET version = 124")
+
+
 def _backfill_builder_scope_rows(conn, rows, registries, _ids) -> None:
     """The per-agent write half of :func:`_v121_to_v122`, extracted so the
     transaction wrapper there reads as one unit."""
@@ -8870,9 +8994,13 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             _v121_to_v122(conn)
             # v122→v123: chat_messages.parts. No-op on fresh installs —
             # _SYSTEM_SCHEMA already declares the column — so this is called
-            # for its version stamp, which on this branch is what leaves the
-            # DB at SCHEMA_VERSION.
+            # for its version stamp.
             _v122_to_v123(conn)
+            # v123→v124: sync_state/sync_history id backfill (B1). No-op on
+            # a fresh install — no sync_state rows exist yet; called for its
+            # version stamp, which on this branch is what leaves the DB at
+            # SCHEMA_VERSION.
+            _v123_to_v124(conn)
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still
@@ -9172,6 +9300,8 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
                 _v121_to_v122(conn)
             if current < 123:
                 _v122_to_v123(conn)
+            if current < 124:
+                _v123_to_v124(conn)
             conn.execute(
                 "UPDATE schema_version SET version = ?, applied_at = current_timestamp",
                 [SCHEMA_VERSION],

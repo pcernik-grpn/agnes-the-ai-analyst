@@ -26,6 +26,7 @@ from src.distribution import cached_mirror_index
 from src.object_store import ObjectStore, object_store
 from src.rbac import get_accessible_tables
 from src.scheduler import filter_due_tables, is_table_due
+from src.sync_state_key import resolve_sync_state_key_for_row
 
 from src.repositories import (
     audit_repo,
@@ -449,14 +450,24 @@ def _run_materialized_pass(
         if row.get("query_mode") != "materialized":
             continue
 
-        # Convention across connectors: sync_state.table_id and the parquet
-        # filename are keyed by `table_registry.name` (matches Keboola's
-        # `_meta.table_name`) so the manifest's `registry_by_name` lookup
-        # at `_build_manifest_for_user` resolves cleanly. Without this,
-        # admins who register `name="Orders_90d"` (id slugified to
-        # `orders_90d`) would see `query_mode` default to `"local"` in the
-        # manifest because the lookup misses on `id`.
+        # The parquet filename (and the manifest's flat `tables{}` key) is
+        # keyed by `table_registry.name` (matches Keboola's `_meta.
+        # table_name`) — that convention is unrelated to this key and
+        # stays untouched; `_build_manifest_for_user` resolves it off the
+        # registry row, not off `sync_state.table_id`.
         ref_name = row["name"]
+        # B1: `sync_state.table_id` / `sync_history.table_id` are keyed by
+        # the registry `id` — every admin-status reader (`/api/admin/
+        # registry`, the data-sources pipeline strip, the Tables lens'
+        # delivery map) joins sync state against the registry on `id`, and
+        # pre-fix this row wrote under `name`, so a table registered with a
+        # display name that isn't already a valid id (spaces, uppercase —
+        # e.g. `name="Web Sessions"`, id `web_sessions`) showed healthy sync
+        # status on one surface and "never synced" on another for the exact
+        # same sync. `row` is already the registry row, so this is a plain
+        # field read, not a second lookup — see `resolve_sync_state_key`
+        # for the name-only variant `_update_sync_state` uses.
+        sync_key = resolve_sync_state_key_for_row(ref_name, row)
 
         # Partial-rebuild scoping (POST /api/sync/trigger?source=…). Compute
         # the row's source_type once, with the same `or "bigquery"` legacy
@@ -469,15 +480,15 @@ def _run_materialized_pass(
             # bounded-frequency request (not a routine per-tick skip), so an
             # operator later looking at `GET /api/admin/registry` for "why
             # didn't this sync" sees the real reason instead of a stale row.
-            state.set_skipped(ref_name, "source_filter")
+            state.set_skipped(sync_key, "source_filter")
             continue
 
         if target_set is not None and not (ref_name in target_set or row.get("id") in target_set):
             summary["skipped"].append({"table": ref_name, "reason": "not_in_target"})
-            state.set_skipped(ref_name, "not_in_target")
+            state.set_skipped(sync_key, "not_in_target")
             continue
 
-        last = state.get_last_sync(ref_name)
+        last = state.get_last_sync(sync_key)
         last_iso = last.isoformat() if last else None
         # Per-table schedule wins; fall through to AGNES_DEFAULT_SYNC_SCHEDULE
         # (operator override), then to ``every 1h`` (OSS-historical default).
@@ -636,7 +647,7 @@ def _run_materialized_pass(
             # `GET /api/admin/registry` explains the miss instead of leaving
             # the row's prior state unexplained.
             summary["skipped"].append({"table": ref_name, "reason": "in_flight"})
-            state.set_skipped(ref_name, "in_flight")
+            state.set_skipped(sync_key, "in_flight")
             continue
         except MaterializeBudgetError as e:
             logger.warning(
@@ -657,7 +668,7 @@ def _run_materialized_pass(
             # `last_sync_error` to the admin UI / `agnes admin status`.
             # Without this, scheduler stderr was the only place the cap
             # failure showed up and operators had no API path to it.
-            state.set_error(ref_name, str(e))
+            state.set_error(sync_key, str(e))
             continue
         except Exception as e:
             logger.exception("Materialize failed for %s", ref_name)
@@ -670,7 +681,7 @@ def _run_materialized_pass(
                 # admin registry UI keeps surfacing it per-table.
                 entry["permanent"] = True
             summary["errors"].append(entry)
-            state.set_error(ref_name, str(e))
+            state.set_error(sync_key, str(e))
             continue
 
         # `materialize_query` returns the parquet's MD5 inline — hashing
@@ -711,7 +722,7 @@ def _run_materialized_pass(
         # leaves status='ok' and error='', which `update_sync` already
         # establishes.
         state.update_sync(
-            table_id=ref_name,
+            table_id=sync_key,
             rows=stats["rows"],
             file_size_bytes=stats["size_bytes"],
             hash=parquet_hash,
@@ -920,11 +931,19 @@ sys.exit(compute_exit_code(result, len(configs)))
         extractor_table_errors = (extractor_stats or {}).get("errors") or []
         if extractor_table_errors:
             err_state = sync_state_repo()
+            # One registry read for this batch of errors, not one
+            # per entry — mirrors the same fix in
+            # src.orchestrator._update_sync_state.
+            err_registry_by_name = {r["name"]: r for r in table_registry_repo().list_all()}
             for entry in extractor_table_errors:
                 tname = entry.get("table")
                 terror = entry.get("error")
                 if tname and terror:
-                    err_state.set_error(tname, terror)
+                    # B1: resolve to the registry id (see
+                    # `src.sync_state_key`) so this error lands under
+                    # the same key `_update_sync_state` will use for
+                    # this table on the next successful rebuild.
+                    err_state.set_error(resolve_sync_state_key_for_row(tname, err_registry_by_name.get(tname)), terror)
                     collected_errors.append({"table": tname, "error": terror})
 
         # Issue #81 Group B: three exit codes. 0 = full success,
@@ -1246,7 +1265,9 @@ def _run_sync(
                     for _tc in _group_configs:
                         _tname = _tc.get("name")
                         if _tname:
-                            err_state.set_error(_tname, "missing_connection_token")
+                            # B1: `_tc` is the registry row, so resolve the
+                            # canonical id-first sync_state key directly.
+                            err_state.set_error(resolve_sync_state_key_for_row(_tname, _tc), "missing_connection_token")
                             collected_errors.append({"table": _tname, "error": "missing_connection_token"})
                     continue
                 _group_env = {**env, "KEBOOLA_STACK_URL": _sc_url, "KEBOOLA_STORAGE_TOKEN": _sc_token}
@@ -1673,8 +1694,18 @@ def _table_manifest_entry(state: dict, reg: dict, *, principal=None) -> dict:
     Optional, default ``None``, so every existing direct caller of this
     helper (tests, and any future caller with no principal in hand) keeps
     compiling unchanged and simply gets a ``None`` fingerprint.
+
+    ``name`` prefers ``reg["name"]`` (B1: ``state["table_id"]`` is the
+    registry ``id`` when a matching row existed at write time — see
+    ``src.sync_state_key`` — not the on-disk parquet stem) so this field
+    keeps meaning what every caller already treats it as: the flat parquet
+    stem ``agnes pull`` downloads under (its own docstring: "the authorized
+    table-name set is the union of every typed entry's `name` field — which
+    equals the flat parquet stem"). Falls back to ``state["table_id"]`` for
+    a sync_state row that outlived its registry row (no ``reg`` to read a
+    name from).
     """
-    name = state.get("table_id") or reg.get("name") or reg.get("id") or ""
+    name = reg.get("name") or state.get("table_id") or reg.get("id") or ""
     entry = {
         "id": reg.get("id") or name,
         "name": name,
@@ -1747,10 +1778,13 @@ def _build_data_packages_section(conn, user, registry_by_name: dict, states_by_t
         total_size_bytes = 0
         for t in table_rows:
             packaged_table_ids.add(t["id"])
-            # registry_by_name keys on name; sync_state.table_id mirrors
-            # registry.name today. Cover the id↔name asymmetry.
+            # registry_by_name keys on name (unaffected by B1 — `t` is a
+            # genuine data_packages junction row, not a sync_state lookup).
+            # `states_by_table_id` keys on whatever a writer stored: the
+            # registry id (B1, the common case going forward) or — for a
+            # legacy/unmatched row — the name. Try both.
             reg = registry_by_name.get(t["name"]) or {}
-            state = states_by_table_id.get(t["name"]) or states_by_table_id.get(t["id"]) or {}
+            state = states_by_table_id.get(t["id"]) or states_by_table_id.get(t["name"]) or {}
             entry_obj = _table_manifest_entry(state, reg or {"id": t["id"]}, principal=user)
             if not entry.materialized:
                 # Auto-membership: authorized + listed, but not downloaded
@@ -1990,24 +2024,33 @@ def _build_manifest_for_user(conn, user: dict) -> dict:
     sync_repo = sync_state_repo()
     table_repo = table_registry_repo()
     all_states = sync_repo.get_all_states()
-    # `sync_state.table_id` is sourced from `_meta.table_name` which equals
-    # `table_registry.name`, NOT `table_registry.id`. Auto-discovered Keboola
-    # tables and manually-registered ones with mixed-case/spaced names produce
-    # id != name; an id-keyed lookup would miss them and silently default to
-    # `query_mode=local`, causing the CLI to try downloading remote tables.
-    registry_by_name = {t["name"]: t for t in table_repo.list_all()}
+    # B1: `sync_state.table_id` is the registry `id` when a matching row
+    # existed at write time (`src.sync_state_key.resolve_sync_state_key`);
+    # a legacy row a backfill hasn't reached yet, or one from a table with
+    # no registry match at write time, is still keyed by name. Every lookup
+    # below tries `id` first, `name` second, via `_reg_for`.
+    #
+    # The manifest itself, however, must keep exposing the actual on-disk
+    # parquet stem — `table_registry.name`, what the extractor / materialize
+    # pass names files after, NOT `id` — as its flat `tables{}` key and as
+    # the `signed_url`/download identifier. `agnes pull` and the
+    # distribution mirror job (`app/worker/kinds.py`) both treat that key as
+    # a literal filename, so this key migration must never leak into it.
+    all_tables = table_repo.list_all()
+    registry_by_id = {t["id"]: t for t in all_tables}
+    registry_by_name = {t["name"]: t for t in all_tables}
+
+    def _reg_for(raw_table_id: str) -> dict:
+        return registry_by_id.get(raw_table_id) or registry_by_name.get(raw_table_id) or {}
 
     # Filter by user's accessible tables. `get_accessible_tables` resolves the
     # caller's accessible id set ONCE (None => admin/all) instead of the old
     # per-row `can_access_table` call — same admin shortcut and stack-gated
     # semantics, collapsed from an N+1 to a single resolution + in-memory
-    # membership test (FAI-132). Lookup translates name→id first because
-    # `s["table_id"]` is sourced from `_meta.table_name` = registry `name`
-    # while the accessible-id set keys on registry `id`; when id != name an
-    # id-keyed call would miss.
+    # membership test (FAI-132).
     def _id_for(state):
-        reg = registry_by_name.get(state["table_id"])
-        return reg["id"] if reg else state["table_id"]
+        reg = _reg_for(state["table_id"])
+        return reg.get("id") or state["table_id"]
 
     _accessible_ids = get_accessible_tables(user, conn)
     _allowed = None if _accessible_ids is None else set(_accessible_ids)
@@ -2046,8 +2089,12 @@ def _build_manifest_for_user(conn, user: dict) -> dict:
     _signed_url_store, _mirror_index = _resolve_signed_url_context()
     tables = {}
     for state in all_states:
-        table_id = state["table_id"]
-        reg = registry_by_name.get(table_id, {})
+        reg = _reg_for(state["table_id"])
+        # The flat dict's key IS the parquet stem `agnes pull` downloads
+        # under and the distribution mirror uploads under — see the
+        # docstring note above. Falls back to the raw sync_state key for an
+        # orphaned row (no registry match at all).
+        table_id = reg.get("name") or state["table_id"]
         query_mode = reg.get("query_mode") or "local"
         # #607 registry-level flag OR'd with the v-next per-user
         # auto-membership flag: authorized+listed but not downloaded until
