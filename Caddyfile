@@ -120,6 +120,19 @@
 		}
 	}
 
+	# `/metrics` is an internal-scrape-only surface (docs/observability.md:
+	# "Operators must not expose this endpoint publicly"; a scraper polls the
+	# app port from inside the deployment boundary, never through this proxy).
+	# Without this deny the catch-all reverse_proxy below would forward it to
+	# the app, exposing the unauthenticated observability payload (queue
+	# depth, worker-lane occupancy, replica hostname:pid, per-route latency
+	# histograms, the full route inventory) to the open internet. `/healthz` +
+	# `/readyz` stay reachable — they leak only status and double as
+	# LB/uptime probes. Mirrors deploy/caddy/Caddyfile.mtier, which has
+	# carried the same rule since it shipped.
+	@metrics path /metrics
+	respond @metrics 404
+
 	reverse_proxy app:8000 {
 		# App's uvicorn runs with --proxy-headers, so stamping these
 		# ourselves makes OAuth callback URLs and Set-Cookie Secure

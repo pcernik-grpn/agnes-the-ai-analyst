@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **The single-VM TLS proxy no longer exposes `GET /metrics` publicly.** The Prometheus endpoint is unauthenticated by design — internal-scrape-only, with docs/observability.md instructing operators never to expose it — and the mtier proxy has denied it at the edge since it shipped, but the root `Caddyfile` (every `tls_mode=caddy` deployment) forwarded it to the app along with everything else, publishing queue depth, worker-lane occupancy, replica `hostname:pid`, per-route latency histograms, and the full route inventory to anyone who could reach the instance's HTTPS port. The primary site block now answers `/metrics` with the same 404 the mtier proxy uses; `/healthz` + `/readyz` stay reachable (status-only, double as uptime probes), and scrapers keep polling the app port from inside the deployment boundary as documented. Running VMs pick the change up on the next config refresh — no image release required.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added
