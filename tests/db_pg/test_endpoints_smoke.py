@@ -2547,6 +2547,13 @@ KNOWN_UNTESTED = {
     "POST /api/admin/metadata/{table_id}",
     "POST /api/admin/metrics",
     "POST /api/admin/run-blocked-purge",
+    # B8 audit-trail seam — scheduler-driven audit_log retention prune, mirrors
+    # run-knowledge-digests. The new repo method (AuditRepository/AuditPgRepository
+    # .prune_older_than) IS dual-backend proven, by
+    # tests/db_pg/test_audit_contract.py::test_prune_older_than_*. Endpoint
+    # behaviour (config gate, logging, audit row) covered single-backend in
+    # tests/test_audit_retention.py.
+    "POST /api/admin/run-audit-prune",
     "POST /api/admin/run-bq-metadata-refresh",
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",

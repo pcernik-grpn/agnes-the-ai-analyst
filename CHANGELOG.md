@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Audit trail viewer seam.** `/admin/activity` (the Activity Center) now links out to the other two admin audit-trail viewers it doesn't cover — Analyst sessions (`/admin/sessions`) and Telemetry (`/admin/telemetry`) — real links, not embedded re-implementations. `audit_log` gets its first retention policy: `audit.retention_days` in `instance.yaml` (default 365, `0` keeps rows forever), enforced by a new daily `audit-prune` scheduler job (`POST /api/admin/run-audit-prune`, `src/audit_retention.py`) that logs the pruned-row count. The other six audit/observability trails (chat transcripts, CLI session JSONLs, usage rollups, `sync_history`, `llm_usage`, agent-runtime forensics) remain undocumented-retention on purpose — see `docs/observability.md`.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added

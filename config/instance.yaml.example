@@ -334,6 +334,15 @@ auth:
 #   # cookie jar to re-elevate with. See docs/RBAC.md.
 #   admin_default_elevation: "elevated"
 
+# --- Audit trail (optional) ---
+# audit:
+#   # How many days to keep `audit_log` rows before the daily audit-prune
+#   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
+#   # Only `audit_log` has a retention policy today — see docs/observability.md
+#   # for the other audit/observability trails (chat, sessions, usage, sync,
+#   # llm_usage, agent-runtime forensics).
+#   retention_days: 365
+
 # --- Feature flags (optional) ---
 # See docs/feature-flags.md for the full inventory and resolution order.
 # features:

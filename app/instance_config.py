@@ -1624,6 +1624,24 @@ def get_guardrails_stuck_review_grace_seconds() -> int:
         return 1800
 
 
+def get_audit_retention_days() -> int:
+    """How many days to keep ``audit_log`` rows before the daily
+    ``audit-prune`` scheduler job deletes them.
+
+    Reads ``audit.retention_days``. Default 365. Set to 0 to keep audit
+    rows forever (disables the prune job's DELETE, mirroring
+    ``blocked_bundle_ttl_days``'s "0 = retain indefinitely" convention).
+    Every other audit/observability trail (chat transcripts, CLI session
+    JSONLs, usage rollups, sync_history, llm_usage, agent-runtime
+    forensics) has no retention policy yet — see docs/observability.md.
+    """
+    val = get_value("audit", "retention_days", default=365)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 365
+
+
 def get_guardrails_min_description_chars() -> int:
     """Minimum character floor for skill / agent / plugin descriptions.
 

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import duckdb
 import pytest
+import sqlalchemy as sa
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +402,7 @@ def _as_dict(v):
 # include_self_reads filters (same semantics both backends)
 # ---------------------------------------------------------------------------
 
+
 def _seed_parity_rows(repo):
     repo.log(user_id="u1", action="table.read", result="success", client_kind="cli")
     repo.log(user_id="u1", action="table.read", result="ok", client_kind="cli")
@@ -487,17 +489,62 @@ def test_log_autofills_duration_from_request_context(audit_repo):
     assert by_action["in.scope"] is not None and by_action["in.scope"] >= 0
 
 
+# ---------------------------------------------------------------------------
+# B8: prune_older_than — retention-based audit_log pruning
+# ---------------------------------------------------------------------------
+
+
+def _backdate(audit_repo_tuple, entry_id: str, ts: datetime) -> None:
+    """Rewrite one row's ``timestamp`` directly — ``log()`` always stamps
+    ``now()``, so the prune tests need an implementation-specific path to
+    plant an old row, exactly like ``test_query_time_range``'s docstring
+    notes for the same reason."""
+    repo, conn, backend = audit_repo_tuple
+    if backend == "duckdb":
+        conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [ts, entry_id])
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text("UPDATE audit_log SET timestamp = :ts WHERE id = :id"),
+                {"ts": ts, "id": entry_id},
+            )
+
+
+def test_prune_older_than_deletes_only_old_rows(audit_repo):
+    repo, _, _ = audit_repo
+    old_id = repo.log(action="old.one")
+    new_id = repo.log(action="new.one")
+    _backdate(audit_repo, old_id, datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 1
+    rows, _ = repo.query(limit=10)
+    ids = {r["id"] for r in rows}
+    assert old_id not in ids
+    assert new_id in ids
+
+
+def test_prune_older_than_returns_zero_when_nothing_qualifies(audit_repo):
+    repo, _, _ = audit_repo
+    repo.log(action="recent.one")
+    repo.log(action="recent.two")
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 0
+    rows, _ = repo.query(limit=10)
+    assert len(rows) == 2
+
+
 def test_upload_filenames_since_parses_params_on_both_engines(audit_repo):
     """PR-C: the reconciliation source — distinct session.upload filenames.
     Exercises the JSONB-vs-JSON-string params divergence between engines."""
     repo, _, _ = audit_repo
     since = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    repo.log(user_id="u1", action="session.upload",
-             params={"bytes": 1, "filename": "aaa.jsonl"})
-    repo.log(user_id="u1", action="session.upload",
-             params={"bytes": 2, "filename": "aaa.jsonl"})  # dup → distinct
-    repo.log(user_id="u2", action="session.upload",
-             params={"bytes": 3, "filename": "bbb.jsonl"})
+    repo.log(user_id="u1", action="session.upload", params={"bytes": 1, "filename": "aaa.jsonl"})
+    repo.log(user_id="u1", action="session.upload", params={"bytes": 2, "filename": "aaa.jsonl"})  # dup → distinct
+    repo.log(user_id="u2", action="session.upload", params={"bytes": 3, "filename": "bbb.jsonl"})
     repo.log(user_id="u2", action="session.upload", params={"bytes": 4})  # no filename
     repo.log(user_id="u2", action="other.action", params={"filename": "zzz.jsonl"})
     assert repo.upload_filenames_since(since) == ["aaa.jsonl", "bbb.jsonl"]
