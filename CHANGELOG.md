@@ -13,6 +13,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Fixed
 
 - **Sync status no longer disagrees with itself across admin pages.** `sync_state.table_id` was written keyed by a table's registry *name* while `/admin/data-sources`'s pipeline strip and the Tables lens' delivery map joined it against `table_registry` on *id* — so a table registered with a display name that isn't already a valid identifier (spaces, uppercase — e.g. `"Web Sessions"`, id `web_sessions`) showed healthy sync status on one admin surface and "never synced" on another, from the exact same sync. Writers (`app/api/sync.py`'s materialized pass, the orchestrator's rebuild + filesystem-fallback paths) now resolve the registry id at write time (`src/sync_state_key.py`), `/api/admin/registry`'s join tries id first, and a one-time backfill migration (schema v123) rewrites existing name-keyed rows. `/admin/tables` also gains a Sync column (status pill + relative time) — previously the sync state existed only on `/admin/sync`.
+- **`PUT /api/admin/registry/{id}` now rejects a rename that collides with another table's name or id** (409), mirroring the check `POST /api/admin/register-table` already ran. `table_registry.name` has no database-level uniqueness constraint, and the id-first sync_state/manifest resolvers this same change introduces (`_reg_for` in `app/api/sync.py`, the distribution mirror job, `list_registry`) would otherwise misroute a legacy name-keyed `sync_state` row to the wrong table after an unchecked rename.
 
 ## [0.85.1] - 2026-08-24
 

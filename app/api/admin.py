@@ -5265,6 +5265,35 @@ async def update_table(
     # old "null = no-op" semantics for some field, it should omit the field
     # from the body instead of sending null — that's the canonical PUT shape.
     updates = request.model_dump(exclude_unset=True)
+    # View-name / id collision guard, mirrored from register_table's
+    # `existing_by_name` check. `table_registry.name` has no DB-level
+    # uniqueness constraint and register_table only pre-checks it against
+    # OTHER names on the way in (a duplicate matching another row's ID is
+    # already caught there, indirectly, by the derived-id collision check —
+    # PUT never re-derives an id, so that protection doesn't carry over
+    # here). Left unchecked, a rename could collide with another table's
+    # `name` (the original register_table concern: a silent view overwrite
+    # at next rebuild) OR — since B1 — with another table's `id`: every
+    # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
+    # the distribution mirror job in `app/worker/kinds.py`, this module's
+    # own `list_registry`) tries a raw key against the registry BY ID
+    # before falling back to name, so a legacy name-keyed sync_state row
+    # sharing that string would resolve to the WRONG registry entry.
+    if "name" in updates and updates["name"] != existing.get("name"):
+        new_name = updates["name"]
+        collision = next(
+            (
+                r
+                for r in repo.list_all()
+                if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
+            ),
+            None,
+        )
+        if collision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
+            )
     # Run BQ-shape validation BEFORE persisting whenever the merged record
     # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
     # or the patch touches BQ-relevant fields on an already-BQ row). Without

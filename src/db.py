@@ -7799,11 +7799,51 @@ def _v122_to_v123(conn: duckdb.DuckDBPyConnection) -> None:
     Idempotent: a re-run finds no more name-keyed rows to touch (they were
     already renamed, or never had a registry match and are unchanged either
     way).
+
+    Column-defensive: a DB replaying the ladder from far enough back can
+    have `sync_state` / `table_registry` / `sync_history` present as bare
+    stub tables (e.g. a pre-`_SYSTEM_SCHEMA` install, or a test harness
+    that only stubs `CREATE TABLE IF NOT EXISTS <name> (id VARCHAR PRIMARY
+    KEY)` for tables it doesn't otherwise exercise) — `IF NOT EXISTS` in
+    `_SYSTEM_SCHEMA`'s own `CREATE TABLE` means that stub survives
+    untouched all the way to here, since no earlier `_vN_to_v(N+1)` step
+    ever needed to reshape `sync_state`'s columns before this one. No
+    other migration step queries these tables' columns directly (every
+    other consumer goes through the repo layer at RUNTIME, not during the
+    ladder walk), so this is the first step a shape gap like that would
+    ever surface for. `PRAGMA table_info` is checked before any SELECT
+    that names a specific column; a table missing what this step expects
+    has nothing to backfill (no real sync_state row can exist keyed by a
+    column that doesn't exist) and is skipped with a log line rather than
+    raising a Binder Error.
     """
     tables_present = {r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()}
     if "sync_state" not in tables_present or "table_registry" not in tables_present:
         conn.execute("UPDATE schema_version SET version = 123")
         return
+
+    def _cols(table_name: str) -> set:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()}
+
+    sync_state_cols = _cols("sync_state")
+    registry_cols = _cols("table_registry")
+    if "table_id" not in sync_state_cols or "id" not in registry_cols or "name" not in registry_cols:
+        logger.warning(
+            "sync_state backfill (v123): skipped — sync_state and/or table_registry is missing an "
+            "expected column at this point in the migration ladder (sync_state has %s, table_registry "
+            "has %s); nothing to backfill on a table shaped like this",
+            sorted(sync_state_cols),
+            sorted(registry_cols),
+        )
+        conn.execute("UPDATE schema_version SET version = 123")
+        return
+
+    sync_history_has_table_id = "sync_history" in tables_present and "table_id" in _cols("sync_history")
+    if "sync_history" in tables_present and not sync_history_has_table_id:
+        logger.warning(
+            "sync_state backfill (v123): sync_history is missing the table_id column at this point "
+            "in the migration ladder — its rows are left untouched"
+        )
 
     name_to_id: dict[str, str] = {}
     for rid, name in conn.execute("SELECT id, name FROM table_registry").fetchall():
@@ -7827,7 +7867,7 @@ def _v122_to_v123(conn: duckdb.DuckDBPyConnection) -> None:
             )
             continue
         conn.execute("UPDATE sync_state SET table_id = ? WHERE table_id = ?", [new_id, table_id])
-        if "sync_history" in tables_present:
+        if sync_history_has_table_id:
             conn.execute("UPDATE sync_history SET table_id = ? WHERE table_id = ?", [new_id, table_id])
         existing_ids.discard(table_id)
         existing_ids.add(new_id)

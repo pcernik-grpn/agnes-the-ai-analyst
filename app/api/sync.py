@@ -26,7 +26,7 @@ from src.distribution import cached_mirror_index
 from src.object_store import ObjectStore, object_store
 from src.rbac import get_accessible_tables
 from src.scheduler import filter_due_tables, is_table_due
-from src.sync_state_key import resolve_sync_state_key, resolve_sync_state_key_for_row
+from src.sync_state_key import resolve_sync_state_key_for_row
 
 from src.repositories import (
     audit_repo,
@@ -1090,6 +1090,10 @@ sys.exit(compute_exit_code(result, len(configs)))
                 extractor_table_errors = (extractor_stats or {}).get("errors") or []
                 if extractor_table_errors:
                     err_state = sync_state_repo()
+                    # One registry read for this batch of errors, not one
+                    # per entry — mirrors the same fix in
+                    # src.orchestrator._update_sync_state.
+                    err_registry_by_name = {r["name"]: r for r in table_registry_repo().list_all()}
                     for entry in extractor_table_errors:
                         tname = entry.get("table")
                         terror = entry.get("error")
@@ -1098,7 +1102,9 @@ sys.exit(compute_exit_code(result, len(configs)))
                             # `src.sync_state_key`) so this error lands under
                             # the same key `_update_sync_state` will use for
                             # this table on the next successful rebuild.
-                            err_state.set_error(resolve_sync_state_key(tname), terror)
+                            err_state.set_error(
+                                resolve_sync_state_key_for_row(tname, err_registry_by_name.get(tname)), terror
+                            )
                             collected_errors.append({"table": tname, "error": terror})
 
                 # Issue #81 Group B: three exit codes. 0 = full success,

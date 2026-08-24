@@ -33,6 +33,15 @@ carries no uniqueness constraint, so its rewrite has no collision case.
 step renamed, so reverting would require distinguishing them from names
 that legitimately equal their id, which isn't recoverable after the fact.
 
+Column-defensive, mirroring the DuckDB sibling: every column this step
+names (``sync_state.table_id``, ``table_registry.id``/``.name``,
+``sync_history.table_id``) has been part of these tables' shape since they
+were created (revision 0004), so a normal Alembic chain always has them by
+0071 — but a table missing one is skipped with a log line rather than
+raising, the same defensive posture ``_v122_to_v123`` needs for a DuckDB
+install replaying the ladder from far enough back that ``sync_state``
+predates its modern columns.
+
 Revision ID: 0071_sync_state_id_v123
 Revises: 0070_builder_scope_v122
 Create Date: 2026-08-24
@@ -40,6 +49,7 @@ Create Date: 2026-08-24
 
 from __future__ import annotations
 
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -50,6 +60,8 @@ down_revision: Union[str, None] = "0070_builder_scope_v122"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+logger = logging.getLogger(__name__)
+
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -57,6 +69,26 @@ def upgrade() -> None:
     tables = set(insp.get_table_names())
     if "sync_state" not in tables or "table_registry" not in tables:
         return
+
+    sync_state_cols = {c["name"] for c in insp.get_columns("sync_state")}
+    registry_cols = {c["name"] for c in insp.get_columns("table_registry")}
+    if "table_id" not in sync_state_cols or "id" not in registry_cols or "name" not in registry_cols:
+        logger.warning(
+            "sync_state backfill (0071): skipped — sync_state and/or table_registry is missing an "
+            "expected column (sync_state has %s, table_registry has %s); nothing to backfill on a "
+            "table shaped like this",
+            sorted(sync_state_cols),
+            sorted(registry_cols),
+        )
+        return
+
+    sync_history_has_table_id = "sync_history" in tables and "table_id" in {
+        c["name"] for c in insp.get_columns("sync_history")
+    }
+    if "sync_history" in tables and not sync_history_has_table_id:
+        logger.warning(
+            "sync_state backfill (0071): sync_history is missing the table_id column — its rows are left untouched"
+        )
 
     name_to_id: dict[str, str] = {}
     for rid, name in bind.execute(sa.text("SELECT id, name FROM table_registry")).fetchall():
@@ -73,12 +105,17 @@ def upgrade() -> None:
         if new_id in existing_ids:
             # A row already exists under the target id — leave this one
             # name-keyed rather than raise on the primary-key collision.
+            logger.warning(
+                "sync_state backfill (0071): leaving %r name-keyed — a row already exists under the target id %r",
+                table_id,
+                new_id,
+            )
             continue
         bind.execute(
             sa.text("UPDATE sync_state SET table_id = :new WHERE table_id = :old"),
             {"new": new_id, "old": table_id},
         )
-        if "sync_history" in tables:
+        if sync_history_has_table_id:
             bind.execute(
                 sa.text("UPDATE sync_history SET table_id = :new WHERE table_id = :old"),
                 {"new": new_id, "old": table_id},

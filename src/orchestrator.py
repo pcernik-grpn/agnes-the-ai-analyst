@@ -1528,11 +1528,17 @@ class SyncOrchestrator:
         try:
             # Backend-aware: write sync_state through the factory (Postgres on
             # a PG instance) so /dashboard's factory-backed reads see it.
-            from src.repositories import sync_state_repo
-            from src.sync_state_key import resolve_sync_state_key
+            from src.repositories import sync_state_repo, table_registry_repo
+            from src.sync_state_key import resolve_sync_state_key_for_row
 
             extracts_dir = _get_extracts_dir()
             repo = sync_state_repo()
+            # One registry read for the whole rebuild, not one per table —
+            # this loop can run per Jira webhook (rebuild_source) as well
+            # as per scheduler tick, under `_rebuild_lock` + the PG
+            # advisory lease, so a per-row `get_by_name()` round trip here
+            # would scale with meta_rows on every single call.
+            registry_by_name = {r["name"]: r for r in table_registry_repo().list_all()}
             for table_name, rows, size_bytes, query_mode in meta_rows:
                 # Materialized rows own their sync_state: the materialized
                 # pass writes it on success (update_sync) and failure
@@ -1546,7 +1552,7 @@ class SyncOrchestrator:
                 # src.sync_state_key) — the parquet filename below is a
                 # SEPARATE, unrelated convention (still `table_name`) and
                 # stays untouched.
-                sync_key = resolve_sync_state_key(table_name)
+                sync_key = resolve_sync_state_key_for_row(table_name, registry_by_name.get(table_name))
                 pq_path = extracts_dir / source_name / "data" / f"{table_name}.parquet"
                 table_dir = extracts_dir / source_name / "data" / table_name
                 file_hash = ""
