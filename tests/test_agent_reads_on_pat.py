@@ -98,6 +98,32 @@ def _mint_agent_pat(user: dict, agent_id: str, *, token_id: str | None = None) -
     return jwt_token
 
 
+def _mint_sandbox_shaped_token(user: dict, *, chat_session_id: str = "sess-1") -> str:
+    """Same shape as `app.auth.access.mint_session_jwt` (the chat-sandbox
+    token injected into a spawned runner): NO `typ` claim at all,
+    `scope="chat"` + `chat_session_id`. `resolve_token_to_user`
+    (app/auth/pat_resolver.py) stashes `credential_surface="stack"` for any
+    session-shaped credential carrying `scope in ("chat", "mcp-oauth")` —
+    not just PATs."""
+    return create_access_token(
+        user_id=user["id"],
+        email=user["email"],
+        extra_claims={"scope": "chat", "chat_session_id": chat_session_id},
+    )
+
+
+def _mint_mcp_oauth_shaped_token(user: dict) -> str:
+    """Same shape as an MCP-OAuth connector access token
+    (app/auth/mcp_oauth.py): `typ="session"`, `scope="mcp-oauth"` — also
+    stashed `credential_surface="stack"` by the resolver."""
+    return create_access_token(
+        user_id=user["id"],
+        email=user["email"],
+        typ="session",
+        extra_claims={"scope": "mcp-oauth"},
+    )
+
+
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -162,6 +188,42 @@ def test_list_schedules_with_stack_pat_returns_200(env):
     r = env["client"].get("/api/v1/agents/default/schedules", headers=_auth(token))
     assert r.status_code == 200
     assert r.json() == {"data": [], "has_more": False, "next_cursor": None}
+
+
+# ---------------------------------------------------------------------------
+# Non-PAT credentials tagged credential_surface='stack' (chat-sandbox
+# mint_session_jwt tokens, MCP-OAuth connector tokens) must be held to the
+# exact same rule as a surface='stack' PAT — allowed on list/get/schedules,
+# denied on memories. The surface check must not be gated on typ="pat".
+# ---------------------------------------------------------------------------
+
+
+def test_list_agents_with_sandbox_shaped_token_returns_200(env):
+    token = _mint_sandbox_shaped_token(env["user"])
+    r = env["client"].get("/api/v1/agents", headers=_auth(token))
+    assert r.status_code == 200
+    slugs = [a["slug"] for a in r.json()["data"]]
+    assert "default" in slugs
+
+
+def test_memories_denied_for_sandbox_shaped_token(env):
+    token = _mint_sandbox_shaped_token(env["user"])
+    r = env["client"].get(f"/api/v1/agents/{env['agent_id']}/memories", headers=_auth(token))
+    assert r.status_code == 403
+
+
+def test_list_agents_with_mcp_oauth_shaped_token_returns_200(env):
+    token = _mint_mcp_oauth_shaped_token(env["user"])
+    r = env["client"].get("/api/v1/agents", headers=_auth(token))
+    assert r.status_code == 200
+    slugs = [a["slug"] for a in r.json()["data"]]
+    assert "default" in slugs
+
+
+def test_memories_denied_for_mcp_oauth_shaped_token(env):
+    token = _mint_mcp_oauth_shaped_token(env["user"])
+    r = env["client"].get(f"/api/v1/agents/{env['agent_id']}/memories", headers=_auth(token))
+    assert r.status_code == 403
 
 
 # ---------------------------------------------------------------------------

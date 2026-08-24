@@ -519,18 +519,26 @@ def require_session_or_user_pat(*, allow_stack_surface: bool = False):
        owner-facing agent API.
     2. **An agent-scoped PAT** (``typ="agent_pat"``) — an agent must never
        enumerate or read its OWNER's *other* agents just because it holds a
-       PAT.
+       PAT. Denied unconditionally, regardless of surface.
     3. **Scheduler shared secret / ``X-StorageApi-Token`` header credential**
        — same non-interactive-service exclusions as ``require_session_token``.
     4. **Any ``credential_surface`` value other than ``'all'`` or (when
        allowed) ``'stack'``** — an unrecognized/future surface value fails
        closed rather than silently qualifying.
 
-    Any token kind not explicitly recognized as a qualifying PAT above is
-    treated exactly like ``require_session_token`` treats it (i.e. accepted
-    only if it is not one of the non-interactive kinds it already excludes)
-    — this dependency only ever *widens* access for the narrow PAT cases
-    above, never for anything else.
+    The surface check in (4) applies to EVERY credential that carries a
+    ``credential_surface`` tag, not just ``typ="pat"`` ones. Two non-PAT
+    credential kinds are also stamped ``credential_surface="stack"`` by
+    ``resolve_token_to_user`` (``app/auth/pat_resolver.py``): a session JWT
+    minted for an AGENT surface — the chat-sandbox token from
+    ``mint_session_jwt`` (no ``typ`` claim at all) and an MCP-OAuth connector
+    token (``typ="session"``, ``scope="mcp-oauth"``). Gating the surface
+    check on ``typ in _PAT_LIKE_TYPES`` would let both slip through
+    unchecked on every route including ``memories`` — the same rule must
+    apply to them as to a PAT carrying the same surface tag. A credential
+    with no ``credential_surface`` key at all (a genuine interactive browser
+    session) reads as ``'all'``, same convention as
+    ``src/rbac.py``'s ``_credential_surface`` helper, and is unaffected.
     """
 
     def _dependency(request: Request, user: dict = Depends(get_current_user)) -> dict:
@@ -564,14 +572,23 @@ def require_session_or_user_pat(*, allow_stack_surface: bool = False):
                     detail="This endpoint requires an interactive session or a user PAT, not a service token",
                 )
             from app.auth.jwt import verify_token
-            from app.auth.pat_resolver import _PAT_LIKE_TYPES
 
             payload = verify_token(token) or {}
-            typ = payload.get("typ")
-            if typ in _PAT_LIKE_TYPES:
-                surface = user.get("credential_surface")
-                qualifies = surface == "all" or (allow_stack_surface and surface == "stack")
-                if typ == "agent_pat" or not qualifies:
+            if payload.get("typ") == "agent_pat":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This endpoint requires an interactive session or a qualifying user PAT",
+                )
+
+            # Surface check is keyed on the RESOLVED credential_surface, not
+            # on typ — a sandbox (mint_session_jwt) or MCP-OAuth token
+            # carrying credential_surface='stack' must be held to the same
+            # rule as a surface='stack' PAT (see docstring). No key at all
+            # reads as 'all' and always qualifies.
+            surface = user.get("credential_surface")
+            if surface is not None and surface != "all":
+                qualifies = allow_stack_surface and surface == "stack"
+                if not qualifies:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="This endpoint requires an interactive session or a qualifying user PAT",
