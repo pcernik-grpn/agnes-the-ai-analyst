@@ -182,6 +182,18 @@ deployment:
                                    # and (for a shared analytics.backend=ducklake catalog) a Postgres
                                    # ducklake.catalog_dsn — see app/roles.py + app/startup_guards.py.
 
+# --- App-state database backend (managed by the DB backend state machine) ---
+# Not normally hand-edited: a VM-provisioned fresh install seeds this key
+# itself (side_car), an existing instance keeps whatever it was migrated to,
+# and further changes go through the state-machine migration API/UI rather
+# than a raw file edit. Documented here for reference.
+# database:
+#   backend: "side_car"            # side_car (default for new installs) | duckdb (legacy, existing
+                                    # single-process installs only) | cloud (managed Postgres).
+                                    # DATABASE_URL env var also selects Postgres — see docs/DEPLOYMENT.md.
+#   # url: ""                      # Postgres DSN when backend is side_car/cloud; set by the
+                                    # provisioning flow, not normally hand-edited.
+
 # --- Coordination backend (multi-process deployments only) ---
 # In-process memory (default) is zero-config and correct for a single "all"-role
 # process. Running api/gateway/worker as separate replicas needs a shared
