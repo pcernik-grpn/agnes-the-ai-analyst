@@ -173,6 +173,61 @@ class TestProjectionOnWrite:
         assert repo.get("orders", "amount")["description"] == "Admin: order amount"
         assert repo.get("orders", "amount")["source"] == "manual"
 
+    def test_sibling_manual_models_sharing_a_table_do_not_prune_each_others_columns(self, seeded_app):
+        """Follow-up RED regression (Devin, PR #1528): every manual model's
+        column rows share `(source='semantic_model', source_ref=None)`, and
+        each admin-API write projects alone (`partial=True`) — but
+        `_prune_columns` scopes only on `(table_id, source)`, so projecting
+        model A used to delete sibling model B's projected columns whenever
+        both bound a dataset to the same table id. The partial call must
+        spare the columns its in-scope siblings still claim, while pruning
+        its OWN dropped fields normally."""
+        c = seeded_app["client"]
+
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("retail", "orders", ["col_a", "col_shared"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+
+        # Projecting the sibling used to prune retail's columns outright.
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("finance", "orders", ["col_b"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        for name in ("col_a", "col_shared", "col_b"):
+            row = repo.get("orders", name)
+            assert row is not None, f"{name} must survive the sibling model's projection"
+            assert row["source"] == "semantic_model"
+
+        # Re-projecting retail WITHOUT col_a prunes its own dropped field —
+        # and only that: finance's col_b (and the still-shared col_shared)
+        # survive.
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": _doc_with_fields("retail", "orders", ["col_shared"])},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+        assert repo.get("orders", "col_a") is None, "the model's own dropped field must still be pruned"
+        assert repo.get("orders", "col_b") is not None, "a sibling model's column must survive re-projection"
+        assert repo.get("orders", "col_shared") is not None
+
+        # Deleting finance prunes col_b (nobody else claims it) but spares
+        # col_shared, which retail still claims.
+        finance_id = "manual/_/finance"
+        r = c.delete(f"/api/admin/semantic-models/{finance_id}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 204, r.text
+        assert repo.get("orders", "col_b") is None, "the deleted model's own column must be pruned"
+        assert repo.get("orders", "col_shared") is not None, "a surviving sibling's claim must spare the shared column"
+
     def test_deleting_a_manual_model_spares_admin_authored_columns(self, seeded_app):
         """DELETE prunes the model's own projected columns but must never
         reach an admin-authored `source='manual'` row for the same table."""
