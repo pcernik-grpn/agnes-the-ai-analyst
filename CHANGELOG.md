@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Chat-first semantic-layer authoring: one apply surface with outcome branching.** `POST /api/semantic-models/apply` (any authenticated caller) is the semantic layer's missing write surface — the deferred "wave 4.3" mutation counterpart to the read-only browse UI, shaped for chat rather than per-object forms. What "apply" means depends on the caller's authority, and the response labels it: an admin's Ossie document is validated, stored as `source='manual'` (create-or-replace by slug), and projected (`outcome: applied`); anyone else's is queued for admin moderation as an `authoring_suggestions` row — the new `semantic-layer` Studio domain — and **never touches `semantic_models` before approval** (`outcome: submitted_for_review`). Approval replays through the same validate → upsert → project pipeline the admin branch uses (shared `apply_manual_model`), so a payload that rotted while pending, or a slug an imported model claimed meanwhile, fails the approve and reopens the suggestion instead of storing a half-valid document or shadowing an imported model. Shared guards for both roles: schema-invalid 422; a slug owned by an imported source 409 `source_owned` (stronger than the raw admin POST, which would create a shadow `manual/_/<slug>` row); an optional `expected_content_hash` optimistic lock 409s `stale_document` on a concurrent change. The non-admin branch 409s `duplicate_pending` while an earlier proposal for the same slug awaits review and respects the Studio toggle (403 `studio_disabled`); the admin branch is a plain admin write, not Studio-gated. Full triple surface: CLI `agnes semantic-model apply <file>` (labeled outcome), MCP foundation tool `apply_semantic_model`, and a Semantic Model Builder studio page (`/admin/studio/semantic-layer`, chat profile `semantic-model-builder`) where admins Create directly and everyone else Submits for approval. Spec: `docs/superpowers/specs/2026-08-24-semantic-layer-chat-authoring-design.md`.
+
 ## [0.86.0] - 2026-08-24
 
 ### Added

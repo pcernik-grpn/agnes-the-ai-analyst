@@ -96,7 +96,9 @@ async function createEntity() {
   const btn = $("studio-create");
   if (inFlight) return;
   const payload = collectPayload();
-  if (!payload.name && !payload.slug) {
+  // Document-based domains (semantic-layer) have no name/slug field — the
+  // slug comes from the document itself.
+  if (!payload.name && !payload.slug && !payload.document) {
     result.textContent = "Fill in the required fields.";
     return;
   }
