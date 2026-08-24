@@ -6,6 +6,7 @@
 {% set page_hero_subtitle = "Install prompt + workspace CLAUDE.md. Edit inline (Editor override) or bind to a file in the Initial Workspace Template repo (Git)." %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css"
       integrity="sha512-uf06llspW44/LZpHzHT6qBOIVODjWtv4MxCricRxkzvopAlSWnTf6hpZTFxuuZcuNE9CBQhqE0Seu1CoRk84nQ=="
       crossorigin="anonymous">
@@ -99,17 +100,19 @@
     <!-- Git mode -->
     <div data-pane="git" class="hidden">
       <div class="prompt-git-field">
-        {# #1055: not converted to ds.dropdown() — populatePicker() rebuilds
-           this <select>'s options from scratch (gitPathSelect.innerHTML = '')
-           on every load()/card, fetched from the IWT repo file list. Card
-           markup itself repeats per card (install / workspace), so this one
-           template spot renders it twice. ds_dropdown.js only wires up the
-           menu items present at DOMContentLoaded and exposes no re-init hook,
-           so a custom dropdown here would drift out of sync with the picker
-           without changes to that file — out of scope here. #}
-        <select class="search-input" data-role="git-path-select" aria-label="Pick a repo file to bind">
+        {# populatePicker() rebuilds this <select>'s options from scratch
+           (gitPathSelect.innerHTML = '') on every load()/card, fetched from
+           the IWT repo file list. The paired .ds-dropdown below is kept in
+           sync by _syncGitPathDropdown() (see below), using ds_dropdown.js's
+           exported re-init hook (#1473). Card markup repeats per card
+           (install / workspace, `card.kind`), so the select's id is scoped
+           by kind to stay unique across both. #}
+        <select id="git-path-select-{{ card.kind }}" class="search-input ds-dropdown-native" data-role="git-path-select" aria-label="Pick a repo file to bind">
           <option value="">— pick a file from the IWT repo —</option>
         </select>
+        {{ ds.dropdown(id='git-path-dd-' ~ card.kind, target='git-path-select-' ~ card.kind,
+                       aria_label='Pick a repo file to bind',
+                       options=[{'value': '', 'label': '— pick a file from the IWT repo —'}]) }}
         <button type="button" class="btn btn-primary" data-action="bind">Bind</button>
         <span class="prompt-status" data-role="git-status"></span>
       </div>
@@ -138,10 +141,46 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   const root = document.querySelector('.prompt-cards');
   const iwtConfigured = root.getAttribute('data-iwt-configured') === '1';
+
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[c]);
+  }
+
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from a native
+  // select's own freshly-set <option>s, then re-runs ds_dropdown.js's init
+  // via the exported `dsDropdownInit` hook. Needed because populatePicker()
+  // rebuilds gitPathSelect's options from scratch on every load. The button
+  // is rebuilt too, not just the menu: init() isn't idempotent for its
+  // per-element listeners, so leaving the same persisting <button> node
+  // across two init() calls (one from ds_dropdown.js's own DOMContentLoaded
+  // bootstrap, one from here) double-registers its click handler — the
+  // second open()/close() undoes the first, and the menu never appears to
+  // open. Recreating the button discards that stale listener along with the
+  // old node.
+  function syncGitPathDropdown(sel) {
+    const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
+    if (!host) return;
+    const ddId = sel.id.replace('git-path-select-', 'git-path-dd-');
+    const opts = Array.from(sel.options);
+    const current = sel.value || (opts[0] && opts[0].value) || '';
+    const currentOpt = opts.find((o) => o.value === current) || opts[0];
+    const menuEl = host.querySelector('.ds-dropdown-menu');
+    const ariaLabel = menuEl ? menuEl.getAttribute('aria-label') || '' : '';
+    const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="${ddId}-name">${escHtml(ariaLabel)}</span>` : '';
+    const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : '';
+    const items = opts
+      .map((o) => `<li class="ds-dropdown-menu-item${o === currentOpt ? ' is-selected' : ''}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${escHtml(o.value)}">${escHtml(o.textContent)}</li>`)
+      .join('');
+    host.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${currentOpt ? escHtml(currentOpt.textContent) : ''}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${escHtml(ariaLabel || 'Options')}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(host);
+  }
 
   async function api(method, url, body) {
     const opts = { method, headers: {} };
@@ -268,6 +307,7 @@
       // Keep the hidden input in lockstep so Bind works whether the operator
       // picks from the dropdown or types manually.
       gitPathInput.value = gitPathSelect.value || gitPathInput.value || '';
+      syncGitPathDropdown(gitPathSelect);
     }
 
     toggleBtns.forEach(function (b) {
