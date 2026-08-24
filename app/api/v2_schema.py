@@ -97,6 +97,41 @@ def _fetch_bq_table_options(bq, dataset: str, table: str) -> dict:
     return {"partition_by": partition_by, "clustered_by": clustered_by}
 
 
+def _column_descriptions(table_id: str) -> dict[str, str]:
+    """Per-column descriptions for ``table_id``.
+
+    Precedence: admin-authored ``column_metadata`` (the key shape
+    ``app/api/metadata.py`` writes and reads, ``(table_id, column_name)``)
+    wins over an Ossie dataset field description bound to the same
+    ``table_id`` (``src/semantic_context.py::dataset_field_descriptions``,
+    the read-side counterpart of what ``src/semantic/projection.py`` writes
+    at sync time); a column with neither source contributes nothing here and
+    the caller's existing ``""`` default stands.
+
+    No RBAC of its own -- this only fills a description STRING into a
+    response ``build_schema`` has already gated on ``can_access_table``; it
+    never exposes a semantic model's own content (name, other fields,
+    metrics, ...).
+    """
+    from src.repositories import column_metadata_repo, semantic_model_repo
+    from src.semantic_context import dataset_field_descriptions
+
+    descriptions: dict[str, str] = {}
+    for row in semantic_model_repo().list_all():
+        if row.get("status") != "valid" or not row.get("document_json"):
+            continue
+        for model in row["document_json"].get("semantic_model") or []:
+            if not isinstance(model, dict):
+                continue
+            found = dataset_field_descriptions(model, table_id)
+            if found:
+                descriptions.update(found)
+    for col in column_metadata_repo().list_for_table(table_id):
+        if col.get("description"):
+            descriptions[col["column_name"]] = col["description"]
+    return descriptions
+
+
 def build_schema(
     conn: duckdb.DuckDBPyConnection,
     user: dict,
@@ -340,6 +375,18 @@ def build_schema_uncached(
             "clustered_by": [],
             "where_dialect_hints": {},
         }
+
+    # Fill in a real per-column description where one exists (column_metadata
+    # over an Ossie dataset field bound to this table_id — see
+    # `_column_descriptions`), leaving `""` where neither source has one. A
+    # branch above that already carries its own description (e.g. a
+    # Databricks/Snowflake INFORMATION_SCHEMA comment fetched by `fetch_schema`)
+    # is left untouched — this only fills in the blank.
+    descriptions = _column_descriptions(table_id)
+    if descriptions:
+        for col in payload["columns"]:
+            if not col.get("description"):
+                col["description"] = descriptions.get(col["name"], "")
 
     # A policied table's schema is caller-scoped (§11), so it must never
     # land in a cache keyed on `table_id` alone — `row` (not `user`; this

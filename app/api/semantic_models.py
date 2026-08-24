@@ -37,6 +37,7 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType
 from src.repositories import semantic_model_repo, semantic_source_repo
 from src.semantic.document_validation import validate_document
+from src.semantic.projection import project_document
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
 from src.semantic_validation import validate_query
@@ -134,6 +135,29 @@ def _export_denied_message(slug: str) -> str:
     )
 
 
+def _project(document_json: Optional[dict], *, source: str, source_ref: Optional[str]) -> None:
+    """Project one stored model's document into the flat tables
+    (``metric_definitions``, ``glossary_terms``, ``column_metadata``) —
+    the same call ``src/semantic/importer.py`` makes for a synced source, so
+    a model created or edited through this admin API also reaches
+    ``agnes catalog --metrics``, chat, and search rather than sitting in
+    ``semantic_models`` unread.
+
+    ``partial=True``: every ``source='manual'`` row shares one provenance
+    tuple (``source='manual', source_ref=None``) — unlike a git/upload
+    source sync, where ``import_documents`` merges every document of ONE
+    sync batch before a single ``project_document`` call. Here each POST/PUT
+    is its own call for just ONE model, so an unscoped prune would delete a
+    *sibling* manual model's already-projected rows on every unrelated
+    write. ``partial`` narrows the prune to this document's own model-id
+    prefix (see ``project_document``'s docstring), leaving every other
+    model's rows untouched.
+    """
+    if not document_json:
+        return
+    project_document(document_json, source=source, source_ref=source_ref, partial=True)
+
+
 def _resolve_model(model_ref: str) -> Optional[dict]:
     """Accept either a model id or its slug — ids are opaque
     (``<source>/<source_ref>/<slug>``), so a slug is the friendlier handle
@@ -193,6 +217,7 @@ async def create_semantic_model(
         validation_errors=None,
         validated_at=datetime.now(timezone.utc),
     )
+    _project(result.parsed, source="manual", source_ref=None)
     return row
 
 
@@ -236,6 +261,11 @@ async def update_semantic_model(model_id: str, body: SemanticModelUpdate, user: 
         validation_errors=row["validation_errors"],
         validated_at=row["validated_at"],
     )
+    # The document itself is unchanged here (this endpoint only touches
+    # name/description), so this is normally a no-op re-projection — a
+    # safety net that keeps the projected rows in sync should an earlier
+    # write ever have failed to project.
+    _project(updated["document_json"], source=updated["source"], source_ref=updated["source_ref"])
     return updated
 
 

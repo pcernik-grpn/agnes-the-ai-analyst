@@ -10,6 +10,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **A semantic model created or edited through the admin API now projects into `metric_definitions`/`glossary_terms`/`column_metadata`, instead of sitting stored and unread.** `POST`/`PUT /api/admin/semantic-models` only wrote the raw Ossie document — the flat-table projection that `agnes catalog --metrics`, chat metric lookups and search all read ran only for a synced source (git/upload/connection), so a hand-authored model's metrics never showed up anywhere. Both endpoints now call the same `project_document` the source importer uses, scoped (`partial=True`) to just that model's own id prefix — every `source='manual'` row shares one provenance tuple, so an unscoped prune would otherwise delete a *sibling* manual model's rows on every unrelated write. `agnes admin semantic-model import` rides the same endpoint and now projects too.
+- **`agnes schema` / `/api/v2/schema` carry real per-column descriptions instead of a hardcoded blank.** All three local schema-building branches (BigQuery, internal, local-parquet) always returned `"description": ""`, even when a description existed in admin-authored `column_metadata` or in a bound semantic-model dataset field. Descriptions are now resolved with `column_metadata` taking precedence over an Ossie dataset field description bound to the same table, `""` only when neither source has one.
+- **A semantic model's browse page now says when metrics were dropped for an unsupported dialect, instead of showing nothing.** A metric declared only in a warehouse-specific dialect (e.g. SNOWFLAKE-only, no ANSI_SQL/DuckDB fallback) is silently skipped at projection; `/semantic-layer/{slug}` now shows a "N metrics skipped (unsupported dialect)" warning pill next to the model's status badges.
+
 ## [0.85.1] - 2026-08-24
 
 ### Added
