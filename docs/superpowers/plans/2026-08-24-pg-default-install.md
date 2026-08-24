@@ -45,7 +45,7 @@ piece. The master plan's A1 section carries a pointer to this deviation.
 - Dual-backend discipline still applies program-wide until A3 lands; this
   plan adds **no schema change** and **no repo change**, so no ladder work.
 - Never run the full test suite locally; run the named test files only.
-- Python: `/Users/zdeneksrotyr/Sources/VsCode/component_factory/tmp_oss/.venv/bin/pytest`.
+- Python: `.venv/bin/pytest`.
 - Branch for this plan: `zs/a1-pg-default-install` off `origin/main`; one PR.
 - Reserved files (do not touch): `app/api/agents*.py`, `app/api/broker*.py`,
   `src/repositories/__init__.py`, `connectors/jira/file_lock.py`.
