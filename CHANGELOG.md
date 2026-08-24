@@ -10,6 +10,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.85.1] - 2026-08-24
+
+### Added
+
+- **`AGNES_CHAT_PROVIDER` env override + per-VM `chat_provider` module field — pin the web-chat provider in infrastructure.** `chat.provider` now resolves env > `instance.yaml` > `e2b` (the standard precedence every other chat env override follows), and the `customer-instance` module gains a per-VM `chat_provider` field (`""` default = no env line; values validated against the app's own boot allowlist at plan time, and `"kai-agent"` requires `kai_agent_enabled` on the same VM). Codifies the provider choice in code-reviewed Terraform instead of a hand-edited `instance.yaml` overlay on the data disk — the overlay survives reboots and VM recreates, but not a fresh data disk, and it is invisible in review.
+
 ## [0.85.0] - 2026-08-23
 
 ### Added
