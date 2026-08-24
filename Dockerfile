@@ -107,7 +107,21 @@ RUN uv build --wheel --out-dir /app/dist
 # inbound transport works out-of-the-box in the server image (HTTP-only
 # deployments simply never enable it; the import stays lazy + fail-closed).
 # See [project.optional-dependencies] in pyproject.toml.
-RUN uv pip install --system --no-cache ".[server,slack-socket,telegram]"
+#
+# EXTRA_EXTRAS appends optional extras to the SAME install, for image variants
+# that need them. It is empty by default on purpose: `[docling]` and
+# `[embeddings]` each pull torch, which adds gigabytes to every VM's disk and
+# image pull — a cost the whole fleet would carry for a capability only some
+# instances use. Build the rich variant explicitly instead:
+#
+#   docker build --build-arg EXTRA_EXTRAS=",docling,embeddings" .
+#
+# `.github/workflows/image-rich.yml` does exactly that and publishes it under
+# a `-rich` tag suffix, so an instance opts in by pointing its image_tag at
+# that tag. Note the leading comma — the value is concatenated inside the
+# bracket list.
+ARG EXTRA_EXTRAS=""
+RUN uv pip install --system --no-cache ".[server,slack-socket,telegram${EXTRA_EXTRAS}]"
 
 # Run as non-root user for container hardening (C13).
 # uid/gid pinned to 999 so host-side chown in startup-script.sh.tpl can match
