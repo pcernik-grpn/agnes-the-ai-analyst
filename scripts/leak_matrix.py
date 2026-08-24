@@ -369,6 +369,10 @@ def sweep_persona(client: Client, p: Persona, canaries: list, findings: list) ->
                     findings.append(
                         Finding(WRONGLY_DENIED, p.name, surface, "canary text not found though expected", text)
                     )
+    else:
+        p.skipped.append("GET /api/collections (agent PAT: wrong surface by design)")
+        if canaries:
+            p.skipped.append("canary search probes (agent PAT: wrong surface by design)")
 
     # --- agents (agent-PAT persona) ---------------------------------------
     if agent_only:
