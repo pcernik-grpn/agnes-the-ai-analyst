@@ -10,6 +10,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Internal
+
+- **The nightly `/catalog` smoke tests content the fixture actually has.** `scripts/e2e/smoke_catalog.sh` was rewritten for the folded Library (#1487) but kept a needle from the retired kind-tabs script: unlike those tabs (always rendered, hidden only when empty), a folded-Library section doesn't exist in the DOM until it holds at least one row. The bare CI stack seeds the built-in marketplace unconditionally, so Plugins always has one — but recipes are pure admin-curated content with no bundled seed, so a Recipes section never renders on a fresh instance. The smoke had been failing every night since 2026-08-21 against that gap rather than a regression — four tracking issues (#1497, #1506, #1510, #1522) for the same stale assertion. Dropped the Recipes needle; Plugins plus the "Not in stack yet" filter chip remain.
+- **`e2e-nightly`'s tracking issue no longer forks into a new dated issue every night.** The failure title embedded `new Date().toISOString()`, so a recurring failure (as above) opened a fresh issue every run instead of accumulating on one. The workflow now searches for an OPEN issue carrying the `agent-browser-nightly` label first and comments the new run's link + commit onto it; only when none is open does it file a new one, under a stable, date-free title (`[e2e-nightly] smoke failure`).
+
 ## [0.86.0] - 2026-08-24
 
 ### Added
