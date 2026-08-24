@@ -52,6 +52,7 @@ mirror is missing.
 | User-visible behavior change | `## [Unreleased]` bullet in `CHANGELOG.md` | BLOCKING | `scripts/verify_syncmap.py` (skipped on a release-cut) |
 | New connector extractor | `_meta` table contract (`table_name, description, rows, size_bytes, extracted_at, query_mode`); see `connectors/keboola/extractor.py` as canonical example | BLOCKING | partial |
 | `query_mode='remote'` table | `_remote_attach` row in `extract.duckdb` | BLOCKING | `scripts/verify_syncmap.py` (connector must mention `_remote_attach`) |
+| New function-scoped test fixture needing a FastAPI app | request the session-shared `shared_app` (or `seeded_app`) — never call `create_app()` per test (~430 ms each) | BLOCKING | `tests/test_shared_app_contract.py` |
 | New web page | extends `base_ds.html` / `base_page.html` (never `base.html`); CSS in `head_extra` | BLOCKING | `tests/test_design_system_contract.py` (partial) |
 | New/changed CLI or MCP read/find command | command-UX standard (`.claude/skills/agnes-conventions/references/command-ux.md`): default scope = auto/everywhere, origin labeled, `--scope` (never a new boolean scope flag), positional term + `--limit` + `--json`, "not found" hints the next step | BLOCKING | `scripts/verify_syncmap.py` (new boolean scope flag only — the rest is review) |
 | New MCP foundation tool | defined in `app/api/mcp/foundation_tools.py` + name appended to `FOUNDATION_TOOL_NAMES` — never hand-added to a single transport module | BLOCKING | `tests/test_mcp_tool_parity.py` |
