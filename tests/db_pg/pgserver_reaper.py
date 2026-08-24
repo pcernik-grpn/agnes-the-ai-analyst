@@ -142,7 +142,19 @@ def reap_orphaned_pgserver_dirs(tmp_root: Path, *, min_age_seconds: int = MIN_AG
         try:
             if not d.is_dir():
                 continue
-            if now - d.stat().st_mtime < min_age_seconds:
+            owner = _owner_pid(d)
+            # A sentinel naming a DEAD owner is positive proof of an orphan.
+            owner_dead = owner is not None and not _pid_alive(owner)
+            # The minimum-age guard exists only for dirs we cannot positively
+            # classify: one still mid-initdb (sentinel not yet written) or a
+            # pre-sentinel dir from an older release. Applying it to a
+            # provably-dead owner as well is what let orphans pile up — a
+            # local `-n auto` db_pg run creates one dir PER WORKER and
+            # abandons them all on the next hard kill, far faster than they
+            # age out, so a measured 10 dirs / 4.1 GB all sat under the 1 h
+            # threshold at once. Age is now consulted only when ownership is
+            # inconclusive.
+            if not owner_dead and now - d.stat().st_mtime < min_age_seconds:
                 continue
             if (d / "postmaster.pid").exists():
                 pid = _postmaster_pid(d)
@@ -150,8 +162,7 @@ def reap_orphaned_pgserver_dirs(tmp_root: Path, *, min_age_seconds: int = MIN_AG
                     continue
                 if _pid_alive(pid):
                     # Live postmaster: only a verified orphan may be stopped.
-                    owner = _owner_pid(d)
-                    if owner is None or _pid_alive(owner):
+                    if not owner_dead:
                         continue  # concurrent session, or pre-sentinel dir
                     if not _is_postmaster_for(pid, d):
                         continue  # PID reused by an unrelated process
