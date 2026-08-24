@@ -58,6 +58,23 @@ class TestSupportDoctorShape:
         assert disk["free_bytes"] >= 0
         assert "data_dir" in disk
 
+    def test_disk_system_db_honors_state_dir_override(self, tmp_path, monkeypatch):
+        # STATE_DIR relocates system.duckdb out of ${DATA_DIR}/state
+        # (src.db._get_state_dir); the disk section must size the file where
+        # get_system_db() actually keeps it, not the default nested path.
+        from app.services.support_bundle import _collect_disk
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        state_dir = tmp_path / "relocated-state"
+        state_dir.mkdir()
+        (state_dir / "system.duckdb").write_bytes(b"x" * 1234)
+        monkeypatch.setenv("DATA_DIR", str(data_dir))
+        monkeypatch.setenv("STATE_DIR", str(state_dir))
+
+        disk = _collect_disk()
+        assert disk["system_db_bytes"] == 1234
+
     def test_process_section_names_backend_and_roles(self, seeded_app):
         proc = _run(seeded_app["client"], seeded_app["admin_token"])["process"]
         assert proc["state_backend"] in ("duckdb", "postgres")

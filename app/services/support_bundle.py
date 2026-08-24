@@ -230,7 +230,7 @@ def _collect_sync() -> dict:
 
 
 def _collect_disk() -> dict:
-    from src.db import _get_data_dir
+    from src.db import _get_data_dir, _get_state_dir
 
     data_dir = _get_data_dir()
     usage = shutil.disk_usage(data_dir)
@@ -249,7 +249,9 @@ def _collect_disk() -> dict:
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
-        "system_db_bytes": _size(data_dir / "state" / "system.duckdb"),
+        # The system DB honors a STATE_DIR override (see src.db._get_state_dir),
+        # so resolve it the same way get_system_db() does.
+        "system_db_bytes": _size(_get_state_dir() / "system.duckdb"),
         "analytics_db_bytes": _size(data_dir / "analytics" / "server.duckdb"),
     }
 
