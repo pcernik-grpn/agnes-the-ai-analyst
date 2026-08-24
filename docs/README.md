@@ -54,6 +54,9 @@ Deploying, configuring, and running an Agnes instance.
   surfaces with the full Agnes harness.
 - [`chat-keyless-auth.md`](chat-keyless-auth.md) — keyless LLM auth for chat via
   Workload Identity Federation (no static `ANTHROPIC_API_KEY`); opt-in.
+- [`kai-agent-local-dev.md`](kai-agent-local-dev.md) — exercising
+  `chat.provider: kai-agent` on a laptop against the scripted stub engine (the
+  real engine lives outside this repo); scenarios, compose profile, limits.
 
 ## For developers
 

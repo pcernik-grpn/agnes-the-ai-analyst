@@ -30,12 +30,11 @@ def _auth(token: str) -> dict:
 
 
 @pytest.fixture
-def flag_env(tmp_path, monkeypatch):
+def flag_env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
     from app.chat.types import Surface
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories import agents_repo, chat_session_repo
     from src.repositories.users import UserRepository
@@ -49,7 +48,7 @@ def flag_env(tmp_path, monkeypatch):
 
     session = chat_session_repo().create_session(user_email="owner@test.com", surface=Surface.API, agent_id=agent_id)
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {
         "client": client,
         "owner_token": create_access_token("owner1", "owner@test.com"),

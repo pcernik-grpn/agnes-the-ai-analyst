@@ -189,29 +189,39 @@ class TestCreateCollection:
 
 
 class TestListCollections:
-    def test_list_calls_file_corpora_list_once(self, seeded_app, monkeypatch):
-        """Regression: N+1 collapse — the handler must call
-        ``file_corpora_repo().list()`` exactly once per request (previously
-        called once inside ``_accessible_corpus_ids`` and once more in the
-        handler)."""
+    def test_list_enumerates_corpora_once(self, seeded_app, monkeypatch):
+        """Regression: N+1 collapse — the handler must enumerate the corpora
+        exactly once per request (previously once inside
+        ``_accessible_corpus_ids`` and once more in the handler).
+
+        Counts *both* enumerating methods rather than one by name: the handler
+        reads ``list_all()`` (``list()`` defaults to ``limit=200``, which
+        truncated the listing), and a future second enumeration through either
+        method is the regression this guards.
+        """
         import app.api.collections as collections_mod
         from src.repositories import file_corpora_repo as real_file_corpora_repo
 
         calls = {"n": 0}
         real_repo = real_file_corpora_repo()
-        real_list = real_repo.list
+        real_list, real_list_all = real_repo.list, real_repo.list_all
 
-        def counting_list():
+        def counting_list(**kwargs):
             calls["n"] += 1
-            return real_list()
+            return real_list(**kwargs)
+
+        def counting_list_all():
+            calls["n"] += 1
+            return real_list_all()
 
         monkeypatch.setattr(real_repo, "list", counting_list)
+        monkeypatch.setattr(real_repo, "list_all", counting_list_all)
         monkeypatch.setattr(collections_mod, "file_corpora_repo", lambda: real_repo)
 
         c = seeded_app["client"]
         resp = c.get("/api/collections", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
-        assert calls["n"] == 1, f"expected file_corpora_repo().list() called once, got {calls['n']}"
+        assert calls["n"] == 1, f"expected the corpora enumerated once, got {calls['n']}"
 
     def test_admin_sees_all_collections(self, seeded_app):
         c = seeded_app["client"]
@@ -1510,3 +1520,59 @@ class TestFilePreview:
         with pytest.raises(_HTTPException) as outside_err:
             asyncio.run(preview_file(collection_id=outside, file_id=fid_out, user=principal))
         assert outside_err.value.detail == "file_not_found"
+
+
+class TestListingPastTheRepoCap:
+    """A 201st collection is still listed and still authorized.
+
+    ``file_corpora_repo().list()`` defaults to ``limit=200``. Two surfaces read
+    it for "every live corpus": the listing itself, and
+    ``accessible_collection_ids``, which builds the *owned* half of an
+    authorization decision from it. Truncation there fails closed — the owner
+    of the 201st collection is told they have no access — which reads as a
+    broken grant rather than as a cut-off list.
+
+    Filler names sort before the target so the target is exactly the row an
+    ``ORDER BY name LIMIT 200`` drops.
+    """
+
+    _FILLER = 200
+    _TARGET_NAME = "zzz-owned-by-analyst"
+
+    def _seed(self, owner: str) -> str:
+        from src.repositories import file_corpora_repo
+
+        repo = file_corpora_repo()
+        for i in range(self._FILLER):
+            repo.create(name=f"coll-{i:03d}", slug=f"coll-{i:03d}", description=None, created_by="somebody-else")
+        return repo.create(
+            name=self._TARGET_NAME,
+            slug="zzz-owned-by-analyst",
+            description=None,
+            created_by=owner,
+        )
+
+    def test_owner_of_201st_collection_is_granted_access(self, seeded_app):
+        """The authorization input must see past the cap."""
+        from app.auth.access import accessible_collection_ids
+
+        target = self._seed(owner="analyst1")
+        allowed = accessible_collection_ids({"id": "analyst1", "email": "analyst@test.com"})
+        assert allowed is not None, "analyst is not admin — expected a concrete set"
+        assert target in allowed
+
+    def test_owner_sees_201st_collection_in_listing(self, seeded_app):
+        c = seeded_app["client"]
+        target = self._seed(owner="analyst1")
+        resp = c.get("/api/collections", headers=_auth(seeded_app["analyst_token"]))
+        assert resp.status_code == 200, resp.text
+        assert target in {item["id"] for item in resp.json()["items"]}
+
+    def test_admin_listing_is_not_truncated(self, seeded_app):
+        c = seeded_app["client"]
+        target = self._seed(owner="somebody-else")
+        resp = c.get("/api/collections", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200, resp.text
+        items = resp.json()["items"]
+        assert len(items) == self._FILLER + 1
+        assert target in {item["id"] for item in items}

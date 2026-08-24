@@ -145,3 +145,84 @@ def test_put_does_not_typeerror_once_a_policy_is_set(seeded_app):
     assert row["description"] == "still fine"
     # An unrelated PUT must not disturb the policy already attached.
     assert row["access_policy_sql"] == "SELECT * FROM policied_tbl WHERE owner = $user_email"
+
+
+def _register_two_tables(c, auth):
+    """`Orders Alpha` (id `orders_alpha`, id != name) and `Orders Beta`
+    (id `orders_beta`) — the id/name split on the first row is what lets
+    the two collision tests below tell "collides on name" apart from
+    "collides on id" (`orders_alpha` is Alpha's id but not its name)."""
+    r = c.post(
+        "/api/admin/register-table",
+        headers=auth,
+        json={"name": "Orders Alpha", "source_type": "keboola", "query_mode": "local"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["id"] == "orders_alpha"
+
+    r = c.post(
+        "/api/admin/register-table",
+        headers=auth,
+        json={"name": "Orders Beta", "source_type": "keboola", "query_mode": "local"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["id"] == "orders_beta"
+
+
+def test_put_rename_rejects_collision_with_another_tables_name(seeded_app):
+    """table_registry.name has no DB-level uniqueness constraint and PUT
+    never re-derives `id` from a renamed `name` (unlike POST, whose
+    slugified-id collision check catches this indirectly) — an unchecked
+    rename could silently shadow another table's display name, the same
+    concern register_table's own `existing_by_name` guard exists for."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    auth = _auth(token)
+    _register_two_tables(c, auth)
+
+    r = c.put(
+        "/api/admin/registry/orders_beta",
+        headers=auth,
+        json={"name": "Orders Alpha"},
+    )
+    assert r.status_code == 409, r.text
+    assert "orders_alpha" in r.text
+
+
+def test_put_rename_rejects_collision_with_another_tables_id(seeded_app):
+    """B1: sync_state/manifest readers resolve a raw key against the
+    registry BY ID first (`app/api/sync.py::_reg_for`, the distribution
+    mirror job, `list_registry`) before falling back to name — a rename
+    that collides with another table's id (not its name) would still
+    misroute a legacy name-keyed sync_state row to the wrong registry
+    entry, so this must be rejected exactly like a name collision."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    auth = _auth(token)
+    _register_two_tables(c, auth)
+
+    r = c.put(
+        "/api/admin/registry/orders_beta",
+        headers=auth,
+        json={"name": "orders_alpha"},  # Alpha's id, not its "Orders Alpha" name
+    )
+    assert r.status_code == 409, r.text
+    assert "orders_alpha" in r.text
+
+
+def test_put_rename_to_a_free_name_succeeds(seeded_app):
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    auth = _auth(token)
+    _register_two_tables(c, auth)
+
+    r = c.put(
+        "/api/admin/registry/orders_beta",
+        headers=auth,
+        json={"name": "Orders Beta Renamed"},
+    )
+    assert r.status_code == 200, r.text
+
+    r = c.get("/api/admin/registry", headers=auth)
+    row = next(t for t in r.json()["tables"] if t["id"] == "orders_beta")
+    assert row["name"] == "Orders Beta Renamed"

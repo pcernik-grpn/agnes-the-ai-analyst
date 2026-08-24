@@ -887,8 +887,7 @@ def _persist_materialized_inner_view(
                     [table_id, "", rows, size_bytes],
                 )
                 conn.execute(
-                    f"CREATE OR REPLACE VIEW {quote_ident(table_id)} AS "
-                    f"SELECT * FROM read_parquet('{safe_path}')"
+                    f"CREATE OR REPLACE VIEW {quote_ident(table_id)} AS SELECT * FROM read_parquet('{safe_path}')"
                 )
                 conn.execute("COMMIT")
             except Exception:
@@ -937,6 +936,33 @@ def _create_remote_attach_table(conn: duckdb.DuckDBPyConnection, keboola_url: st
     )
 
 
+def _ensure_remote_attach_row(conn: duckdb.DuckDBPyConnection, keboola_url: str) -> None:
+    """Merge-mode variant of :func:`_create_remote_attach_table` — creates the
+    table if absent and inserts the ``kbc`` alias row only when no row already
+    claims that alias.
+
+    First writer wins: ``_run_sync`` dispatches the global (``connection_id
+    IS NULL``) credential group first, so when both the global project and a
+    named connection carry ``remote`` rows, the alias keeps pointing at the
+    global stack — matching how the orchestrator resolves the re-ATTACH token
+    (``token_env='KEBOOLA_STORAGE_TOKEN'``, the global env credential). A
+    DROP-and-recreate here would silently repoint every remote view of the
+    pass at the LAST group's stack URL.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS _remote_attach (
+        alias VARCHAR,
+        extension VARCHAR,
+        url VARCHAR,
+        token_env VARCHAR
+    )""")
+    existing = conn.execute("SELECT count(*) FROM _remote_attach WHERE alias = 'kbc'").fetchone()[0]
+    if not existing:
+        conn.execute(
+            "INSERT INTO _remote_attach VALUES (?, ?, ?, ?)",
+            ["kbc", "keboola", keboola_url, "KEBOOLA_STORAGE_TOKEN"],
+        )
+
+
 def _try_attach_extension(conn: duckdb.DuckDBPyConnection, keboola_url: str, keboola_token: str) -> bool:
     """Try to install and attach the Keboola DuckDB extension. Returns True on success."""
     try:
@@ -955,7 +981,13 @@ def _try_attach_extension(conn: duckdb.DuckDBPyConnection, keboola_url: str, keb
         return False
 
 
-def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, keboola_token: str) -> Dict[str, Any]:
+def run(
+    output_dir: str,
+    table_configs: List[Dict[str, Any]],
+    keboola_url: str,
+    keboola_token: str,
+    merge: bool = False,
+) -> Dict[str, Any]:
     """Extract tables from Keboola into output_dir using DuckDB extension.
 
     Args:
@@ -963,10 +995,25 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         table_configs: List of table config dicts from table_registry
         keboola_url: Keboola stack URL
         keboola_token: Keboola Storage API token
+        merge: When False (default), the produced ``extract.duckdb`` is
+            rebuilt from scratch and contains ONLY this call's tables —
+            the historical whole-pass semantics, whose implicit prune is
+            how deleted/renamed registry rows disappear. When True, the
+            temp build is seeded from the CURRENT ``extract.duckdb`` so
+            this call only replaces its own tables' ``_meta`` rows and
+            views, preserving every other table already in the extract.
+            ``app.api.sync._run_sync`` dispatches one ``run()`` per
+            ``connection_id`` credential group (#B2); the first group of
+            a pass runs ``merge=False`` and every later group
+            ``merge=True`` — without this, each group's atomic
+            tmp-then-move swap clobbered the previous group's extract and
+            only the LAST connection's tables survived the pass.
 
     Returns:
         Dict with extraction stats: {tables_extracted: int, tables_failed: int, errors: list}
     """
+    import shutil
+
     output_path = Path(output_dir)
     data_dir = output_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -977,6 +1024,12 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
     tmp_db_path = output_path / "extract.duckdb.tmp"
     if tmp_db_path.exists():
         tmp_db_path.unlink()
+    if merge and db_path.exists():
+        # Seed the temp build with the extract as it stands (a previous
+        # credential group's output in the same sync pass) so the swap
+        # below replaces rather than discards it. Copy, never open the
+        # live file for write — the orchestrator may hold a read ATTACH.
+        shutil.copy2(str(db_path), str(tmp_db_path))
     conn = _open_duckdb(str(tmp_db_path))
 
     stats = {"tables_extracted": 0, "tables_failed": 0, "errors": []}
@@ -991,11 +1044,23 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         # Try DuckDB Keboola extension
         use_extension = _try_attach_extension(conn, keboola_url, keboola_token)
 
-        _create_meta_table(conn)
+        if merge:
+            # Merge mode: keep foreign `_meta` rows (previous credential
+            # groups of this pass); replace only this call's own rows so a
+            # re-extracted table never duplicates. Views use CREATE OR
+            # REPLACE below, so no separate view cleanup is needed.
+            _ensure_meta_table(conn)
+            for tc in table_configs:
+                conn.execute("DELETE FROM _meta WHERE table_name = ?", [tc["name"]])
+        else:
+            _create_meta_table(conn)
 
         has_remote = any(tc.get("query_mode") == "remote" for tc in table_configs)
         if has_remote and use_extension:
-            _create_remote_attach_table(conn, keboola_url)
+            if merge:
+                _ensure_remote_attach_row(conn, keboola_url)
+            else:
+                _create_remote_attach_table(conn, keboola_url)
 
         for tc in table_configs:
             table_name = tc["name"]
@@ -1301,8 +1366,6 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         conn.close()
 
     # Atomic replace: swap temp DB into place, cleaning up any WAL files
-    import shutil
-
     old_wal = Path(str(db_path) + ".wal")
     if old_wal.exists():
         old_wal.unlink()

@@ -344,11 +344,10 @@ class FakeManager:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
     from src.repositories import agents_repo, resource_grants_repo, user_group_members_repo, user_groups_repo
     from src.repositories.users import UserRepository
@@ -368,7 +367,7 @@ def env(tmp_path, monkeypatch):
     other_agent_id = str(uuid.uuid4())
     agents_repo().create(id=other_agent_id, owner_user_id="owner1", name="Other Agent", slug="other-agent")
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {
         "client": client,
         "owner_token": create_access_token("owner1", "owner@test.com"),

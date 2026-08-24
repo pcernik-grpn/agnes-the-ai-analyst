@@ -6,12 +6,11 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
     monkeypatch.setenv("SCRIPT_TIMEOUT", "10")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -42,7 +41,7 @@ def client(tmp_path, monkeypatch):
                   assigned_by="test")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     test_client = TestClient(app)
     admin_token = create_access_token("admin1", "admin@acme.com")
     analyst_token = create_access_token("analyst1", "analyst@acme.com")

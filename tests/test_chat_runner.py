@@ -438,6 +438,9 @@ def _make_fake_sdk(monkeypatch, *, with_stream_event: bool):
     class ToolResultBlock:
         tool_use_id: str
         content: object
+        # The real SDK block carries this; defaulted so every existing script
+        # in this file keeps meaning "the tool succeeded".
+        is_error: bool = False
 
     @dataclasses.dataclass
     class AssistantMessage:
@@ -909,6 +912,46 @@ def test_tool_frames_carry_tool_use_id_and_text_blocks_join_with_blank_line(monk
 
     final = next(f for f in emitted if f["type"] == "assistant_message")
     assert final["content"] == "Let me check.\n\nThere are 35 tables."
+    assert result["is_error"] is False, "a successful tool must say so explicitly"
+
+
+def test_a_failed_tool_result_carries_the_sdk_verdict(monkeypatch):
+    """The SDK block already knows the tool failed; forwarding it spares the
+    client a guess. Without this the UI sniffed the payload for a leading
+    "error"/"traceback", so a real failure reading "Catalog Error: Table …
+    does not exist" rendered with a success tick and folded itself shut.
+
+    This is the NATIVE (e2b/docker) path — the engine provider sets the same
+    field from its own `tool-output-error` event, so both producers agree."""
+    mod = _make_fake_sdk(monkeypatch, with_stream_event=False)
+    script = [
+        mod.AssistantMessage(
+            content=[
+                mod.TextBlock(text="Trying."),
+                mod.ToolUseBlock(id="toolu_9", name="Bash", input={"command": "agnes query 'SELECT * FROM nope'"}),
+            ]
+        ),
+        mod.UserMessage(
+            content=[
+                mod.ToolResultBlock(
+                    tool_use_id="toolu_9",
+                    content="Catalog Error: Table with name nope does not exist!",
+                    is_error=True,
+                )
+            ]
+        ),
+        mod.AssistantMessage(content=[mod.TextBlock(text="No such table.")]),
+        mod.ResultMessage(),
+    ]
+    emitted, _client = _run_real_agent_turn(monkeypatch, mod, script, [{"type": "user_msg", "text": "q"}])
+
+    result = next(f for f in emitted if f["type"] == "tool_result")
+    assert result["is_error"] is True
+    # The failure is the TOOL's, not the turn's: the answer still completes.
+    assert not result["result"].strip().lower().startswith("error"), (
+        "this fixture exists because the text defeats the old leading-'error' heuristic"
+    )
+    assert next(f for f in emitted if f["type"] == "assistant_message")["content"].endswith("No such table.")
 
 
 def test_idle_watchdog_interrupts_a_wedged_turn(monkeypatch):
@@ -989,9 +1032,16 @@ def test_restore_context_appended_to_system_prompt(monkeypatch, tmp_path):
     # accepted and observable.
     import dataclasses
 
-    fields = [(f, object, dataclasses.field(default=None)) for f in (
-        "permission_mode", "cwd", "setting_sources", "mcp_servers", "system_prompt",
-    )]
+    fields = [
+        (f, object, dataclasses.field(default=None))
+        for f in (
+            "permission_mode",
+            "cwd",
+            "setting_sources",
+            "mcp_servers",
+            "system_prompt",
+        )
+    ]
     fields.append(("include_partial_messages", bool, dataclasses.field(default=False)))
     mod.ClaudeAgentOptions = dataclasses.make_dataclass("ClaudeAgentOptions", fields)
 

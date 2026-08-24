@@ -27,13 +27,12 @@ def _auth(pat: str) -> dict:
 
 
 @pytest.fixture
-def mcp_env(e2e_env, monkeypatch):
+def mcp_env(e2e_env, monkeypatch, shared_app):
     """`(call_tool)` — invokes a registered foundation tool directly, with
     its internal `httpx.AsyncClient()` self-calls routed into the SAME
     in-process app via `ASGITransport`."""
     pytest.importorskip("mcp", reason="mcp package not installed")
     from app.auth.jwt import create_access_token
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.access_tokens import AccessTokenRepository
     from src.repositories.users import UserRepository
@@ -54,7 +53,7 @@ def mcp_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
 
     _RealAsyncClient = httpx.AsyncClient
 

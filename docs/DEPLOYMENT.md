@@ -504,6 +504,57 @@ status. The endpoint requires admin auth (the sidecar's
   Auto-recovery via max-runtime detection is intentionally out of scope
   for v0; revisit if it happens in practice.
 
+## The `-rich` image variant (office documents + hybrid retrieval)
+
+Two Collections capabilities ship as optional extras, because each pulls
+torch and together they add gigabytes to the image:
+
+| Extra | Without it | With it |
+|---|---|---|
+| `docling` | `.docx` / `.pptx` uploads are accepted and then **rejected** — there is no lightweight parser for them | office documents are parsed and indexed |
+| `embeddings` | retrieval is `lexical_only` — whole-word matching, weak on slide decks and prose | retrieval is `hybrid` (semantic + lexical) |
+
+The default image deliberately ships **without** them: every VM in a fleet
+would pay the disk and pull cost for a capability only some instances use.
+Instances that need it run the `-rich` variant instead.
+
+**Build and publish it** with the `Rich image (docling + embeddings)`
+workflow (`.github/workflows/image-rich.yml`, `workflow_dispatch`). It
+builds the same commit with the extras appended and publishes
+`:<channel>-rich` (e.g. `stable-rich`), plus version- and SHA-pinned tags.
+The workflow asserts the capabilities inside the built image before
+finishing, so a variant whose extras silently failed to install cannot ship
+looking identical to a working one.
+
+Locally, the same thing:
+
+```bash
+docker build --build-arg EXTRA_EXTRAS=",docling,embeddings" -t agnes:rich .
+```
+
+**Point an instance at it** by setting its image tag to `stable-rich`
+(Terraform: the `image_tag` variable; Compose: the `image:` line). Nothing
+else changes — same code, same schema, same configuration.
+
+**Check which one is running:**
+
+```bash
+docker exec <container> python -c "from src.ingest.retrieval import retrieval_mode; \
+from src.ingest.text_extract import docling_capability; \
+print(retrieval_mode(), docling_capability())"
+```
+
+`hybrid True` is the rich image; `lexical_only False` is the default one. On
+the default image a rejected office upload says so in its rejection reason
+rather than leaving the operator to guess.
+
+Every other allowlisted format is readable on **both** images: `.eml` and
+`.epub` are parsed by the standard library, with no extra. `.msg` (Outlook's
+binary format) is not on the upload allowlist at all — no parser for it ships
+on either image, so an upload containing one is refused in the response rather
+than accepted and rejected afterwards. Mail exported as `.eml` works
+everywhere.
+
 ## Which path should I pick?
 
 | | Terraform | Docker Compose |

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     """TestClient against a freshly-built FastAPI app rooted at tmp_path.
 
     Mirrors the `web_client` fixture in tests/test_web_ui.py — we re-create
@@ -28,9 +28,8 @@ def client(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 

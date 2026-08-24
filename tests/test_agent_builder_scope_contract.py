@@ -75,13 +75,12 @@ def _keboola_instance(monkeypatch):
 
 
 @pytest.fixture
-def builder_env(e2e_env, mock_extract_factory):
+def builder_env(e2e_env, mock_extract_factory, shared_app):
     """Owner holds t1 and t2 through two SEPARATE data packages and no
     per-table grants. A builder agent is then created through
     ``POST /api/agents`` declaring only the package holding t1.
     """
     from fastapi.testclient import TestClient as _TC  # noqa: F401  (clarity at the call site)
-    from app.main import create_app
     from src.db import SYSTEM_ADMIN_GROUP
     from src.repositories.table_registry import TableRegistryRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -95,7 +94,7 @@ def builder_env(e2e_env, mock_extract_factory):
     UserGroupMembersRepository(conn).add_member("admin1", admin_gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
     admin_token = create_access_token("admin1", "admin@test.com")
     owner_jwt = create_access_token("owner1", "owner@test.com")

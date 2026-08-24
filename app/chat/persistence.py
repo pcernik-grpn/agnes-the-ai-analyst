@@ -495,6 +495,7 @@ class ChatRepository:
         role: str,
         content: str,
         tool_calls: Optional[list[dict]] = None,
+        parts: Optional[list[dict]] = None,
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         model: Optional[str] = None,
@@ -506,6 +507,7 @@ class ChatRepository:
                 role=role,
                 content=content,
                 tool_calls=tool_calls,
+                parts=parts,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 model=model,
@@ -525,14 +527,15 @@ class ChatRepository:
         # read-time-derivation approach for both columns for consistency.
         self._conn.execute(
             "INSERT INTO chat_messages "
-            "(id, session_id, role, content, tool_calls, tokens_in, tokens_out, model, sender_email, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, model, sender_email, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 msg_id,
                 session_id,
                 role,
                 content,
                 json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(parts) if parts else None,
                 tokens_in,
                 tokens_out,
                 model,
@@ -546,6 +549,7 @@ class ChatRepository:
             role=role,
             content=content,
             tool_calls=tool_calls,
+            parts=parts,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             model=model,
@@ -569,7 +573,7 @@ class ChatRepository:
             cutoff = None
 
         q = (
-            "SELECT id, session_id, role, content, tool_calls, tokens_in, tokens_out, "
+            "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
             "model, sender_email, created_at FROM chat_messages WHERE session_id = ?"
         )
         params: list = [session_id]
@@ -587,11 +591,12 @@ class ChatRepository:
                 role=r[2],
                 content=r[3],
                 tool_calls=json.loads(r[4]) if r[4] else None,
-                tokens_in=r[5],
-                tokens_out=r[6],
-                model=r[7],
-                sender_email=r[8],
-                created_at=r[9],
+                parts=json.loads(r[5]) if r[5] else None,
+                tokens_in=r[6],
+                tokens_out=r[7],
+                model=r[8],
+                sender_email=r[9],
+                created_at=r[10],
             )
             for r in rows
         ]
@@ -607,7 +612,7 @@ class ChatRepository:
         if self._messages_pg is not None:
             return self._messages_pg.list_recent_messages(session_id, limit=limit)
         rows = self._conn.execute(
-            "SELECT id, session_id, role, content, tool_calls, tokens_in, tokens_out, "
+            "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
             "model, sender_email, created_at FROM chat_messages WHERE session_id = ? "
             "ORDER BY created_at DESC LIMIT ?",
             [session_id, limit],
@@ -619,11 +624,12 @@ class ChatRepository:
                 role=r[2],
                 content=r[3],
                 tool_calls=json.loads(r[4]) if r[4] else None,
-                tokens_in=r[5],
-                tokens_out=r[6],
-                model=r[7],
-                sender_email=r[8],
-                created_at=r[9],
+                parts=json.loads(r[5]) if r[5] else None,
+                tokens_in=r[6],
+                tokens_out=r[7],
+                model=r[8],
+                sender_email=r[9],
+                created_at=r[10],
             )
             for r in rows
         ]

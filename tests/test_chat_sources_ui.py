@@ -70,8 +70,14 @@ def test_both_render_paths_strip_the_fence():
     assert "renderMarkdownSafe(stripNextActionsFence(stripSourcesFence(" in js, (
         "renderAnswerMarkdown must strip sources first, then next_actions"
     )
-    assert "renderAnswerMarkdown(m.content)" in js, "renderMessage must use the helper"
-    assert "renderAnswerMarkdown(content)" in js, "finalizeAssistantMessage must use the helper"
+    # renderMessage paints the first text part of a `parts` row, or the whole
+    # content for a pre-v123 row — both through the helper.
+    assert 'renderAnswerMarkdown(text || "")' in js, (
+        "every history text bubble — parts walk and pre-v123 fallback alike — goes through the helper"
+    )
+    assert "renderAnswerMarkdown(tail)" in js, (
+        "finalizeAssistantMessage must use the helper (on the post-seal tail — #1504 segmentation)"
+    )
 
 
 def test_the_clipboard_keeps_the_fence():
@@ -79,9 +85,9 @@ def test_the_clipboard_keeps_the_fence():
     (next_actions is stripped — suggestions are chrome; provenance is not.)"""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(article, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(article, stripSourcesFence" not in js
+    assert "attachMessageActions(primary, stripSourcesFence" not in js
 
 
 def test_chips_come_from_the_server_verdict_only():

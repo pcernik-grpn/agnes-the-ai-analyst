@@ -8,11 +8,10 @@ from app.auth.token_hash import hash_token
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
 
@@ -40,7 +39,7 @@ def client(tmp_path, monkeypatch):
     ur.create(id="ml1", email="ml@test.com", name="ML User")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     return TestClient(app)
 
 
@@ -909,7 +908,7 @@ class TestLocalDevGroupsInjection:
     so /me/profile renders the mocked groups."""
 
     @pytest.fixture
-    def dev_client(self, tmp_path, monkeypatch):
+    def dev_client(self, tmp_path, monkeypatch, shared_app):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
         monkeypatch.setenv("SESSION_SECRET", "test-session-secret-32chars-minimum!!")
@@ -919,9 +918,8 @@ class TestLocalDevGroupsInjection:
             "LOCAL_DEV_GROUPS",
             '[{"id":"local-dev-engineers@example.com","name":"Local Dev Engineers"}]',
         )
-        from app.main import create_app
 
-        return TestClient(create_app())
+        return TestClient(shared_app)
 
     def test_dev_user_sees_mocked_groups_on_profile(self, dev_client):
         resp = dev_client.get("/me/profile")
@@ -1025,7 +1023,7 @@ class TestGoogleCallbackGroupSync:
     """
 
     @pytest.fixture
-    def google_app(self, tmp_path, monkeypatch):
+    def google_app(self, tmp_path, monkeypatch, shared_app):
         import json as _json
         from unittest.mock import AsyncMock
         from types import SimpleNamespace
@@ -1033,7 +1031,6 @@ class TestGoogleCallbackGroupSync:
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
 
-        from app.main import create_app
         import app.auth.providers.google as g_mod
 
         # (1) bypass the is_available guard
@@ -1063,7 +1060,7 @@ class TestGoogleCallbackGroupSync:
             lambda email: ["grp_a@groupon.com", "grp_b@groupon.com"],
         )
 
-        app = create_app()
+        app = shared_app
         client = TestClient(app, follow_redirects=False)
         return {"client": client, "json": _json}
 

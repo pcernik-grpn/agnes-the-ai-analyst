@@ -21,7 +21,7 @@ def _auth(token):
 
 
 @pytest.fixture
-def marketplace_env(e2e_env, monkeypatch):
+def marketplace_env(e2e_env, monkeypatch, shared_app):
     """Spin up the FastAPI app with two fake marketplaces populated on disk.
 
     Populates:
@@ -34,7 +34,6 @@ def marketplace_env(e2e_env, monkeypatch):
       - analyst user in TestGroup with grant for plug-y only
       - nogroups user (only Everyone, no grants)
     """
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.users import UserRepository
@@ -143,7 +142,7 @@ def marketplace_env(e2e_env, monkeypatch):
     analyst_token = create_access_token("analyst1", "analyst@test.local")
     nogroups_token = create_access_token("nogroups1", "nobody@test.local")
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
     return {
         "client": client,
@@ -420,12 +419,11 @@ class TestBuildInfoEtagCache:
 
 
 @pytest.fixture
-def root_source_env(e2e_env):
+def root_source_env(e2e_env, shared_app):
     """A curated marketplace whose single plugin declares ``source: "./"`` —
     the plugin IS the repo root (the common single-plugin-repo shape). The
     clone carries a ``.git`` dir and Agnes-only enrichment files that must
     never reach the served tree."""
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.users import UserRepository
@@ -497,7 +495,7 @@ def root_source_env(e2e_env):
         conn.close()
 
     return {
-        "client": TestClient(create_app()),
+        "client": TestClient(shared_app),
         "token": create_access_token("rs-user", "rs@test.local"),
     }
 

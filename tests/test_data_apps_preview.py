@@ -41,10 +41,9 @@ def _enable_data_apps(data_dir) -> None:
 
 
 @pytest.fixture
-def preview_api_env(e2e_env, monkeypatch):
+def preview_api_env(e2e_env, monkeypatch, shared_app):
     """Real user/token/app rows + TestClient(app), data_apps enabled — for
     direct REST assertions against `POST /{slug}/preview-grant`."""
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.access_tokens import AccessTokenRepository
@@ -99,7 +98,7 @@ def preview_api_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
     from fastapi.testclient import TestClient
 
     client = TestClient(app)
@@ -282,14 +281,13 @@ class TestPreviewGrantEndpoint:
 
 
 @pytest.fixture
-def preview_env(e2e_env, monkeypatch):
+def preview_env(e2e_env, monkeypatch, shared_app):
     """`(client, call_tool)` — real app + rows, `call_tool` invokes a
     registered foundation tool directly (mirrors `app.api.mcp_http.<name>`
     unit-test idiom), with the tool's internal `httpx.AsyncClient()`
     self-calls routed into the SAME in-process app via `ASGITransport`."""
     pytest.importorskip("mcp", reason="mcp package not installed")
     from app.auth.jwt import create_access_token
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.access_tokens import AccessTokenRepository
     from src.repositories.data_apps import DataAppsRepository
@@ -320,7 +318,7 @@ def preview_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
     from fastapi.testclient import TestClient
 
     client = TestClient(app)

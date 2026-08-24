@@ -135,12 +135,13 @@ def test_filter_due_tables_handles_naive_last_sync():
     assert [c["id"] for c in out] == ["old"]
 
 
-def test_filter_due_tables_keys_lookup_by_name_when_id_differs():
-    """sync_state.table_id is populated from _meta.table_name (= registry
-    name), NOT registry id. When id != name (auto-discovered Keboola rows),
-    the helper must look up sync_state by NAME or it sees last_sync=None
-    for every row → degrades to "always sync" → schedule no-op. See
-    Devin review BUG_0002 + the comment in app/api/sync.py:244-249."""
+def test_filter_due_tables_keys_lookup_by_id_when_name_differs():
+    """B1: sync_state.table_id is the registry `id` (src.sync_state_key) —
+    every writer in this change re-keys to it. When id != name
+    (auto-discovered Keboola rows), the filter must look up sync_state by
+    ID or it sees last_sync=None for every row → degrades to "always sync"
+    → schedule no-op. Inverts the pre-B1 name-keyed contract this test
+    used to encode."""
     configs = [
         {
             "id": "in_c-crm_company",  # auto-discovered shape
@@ -148,12 +149,34 @@ def test_filter_due_tables_keys_lookup_by_name_when_id_differs():
             "sync_schedule": "every 1h",
         }
     ]
-    # 30m ago — keyed by NAME, the lookup must hit and the table must skip.
+    # 30m ago — keyed by registry ID, the lookup must hit → table skips.
+    repo = _FakeSyncStateRepo({"in_c-crm_company": _utc(2026, 5, 1, 9, 30)})
+    out = filter_due_tables(configs, repo, now=_utc(2026, 5, 1, 10, 0))
+    assert out == [], (
+        "name-keyed lookup would have missed the id-keyed sync_state row, "
+        "treated the table as never-synced, and kept it. B1 keys by id."
+    )
+
+
+def test_filter_due_tables_falls_back_to_name_for_legacy_rows():
+    """A sync_state row written pre-B1 (or before the 0071 backfill ran) is
+    still keyed by the table's NAME. The filter must fall back to a
+    name-keyed lookup when the id-keyed one misses — same id-first/
+    name-second resolution as `list_registry` and
+    `_build_manifest_for_user` — so legacy rows keep honoring the
+    schedule until the backfill re-keys them."""
+    configs = [
+        {
+            "id": "in_c-crm_company",
+            "name": "company",
+            "sync_schedule": "every 1h",
+        }
+    ]
+    # 30m ago — only the legacy NAME key exists; fallback must hit → skip.
     repo = _FakeSyncStateRepo({"company": _utc(2026, 5, 1, 9, 30)})
     out = filter_due_tables(configs, repo, now=_utc(2026, 5, 1, 10, 0))
     assert out == [], (
-        "id-keyed lookup would have missed sync_state, treated table as "
-        "never-synced, and kept it. The fix keys by name."
+        "an id-only lookup would have missed the legacy name-keyed row, treated the table as never-synced, and kept it."
     )
 
 

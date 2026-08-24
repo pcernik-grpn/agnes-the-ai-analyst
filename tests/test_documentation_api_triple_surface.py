@@ -615,6 +615,15 @@ _EXEMPT: dict[str, str] = {
         "reconnaissance in a prompt-injected agent session, not an agent "
         "affordance"
     ),
+    "/api/admin/doctor/support": (
+        "support-bundle doctor (redacted state snapshot) — CLI-reachable via "
+        "`agnes doctor` (it renders the server section of the bundle file), "
+        "but deliberately never MCP-exposed per the 'operator security-posture "
+        "diagnostics' standing exemption in CONTRIBUTING.md: the response "
+        "enumerates build fingerprints, schema state and secret PRESENCE — "
+        "one-call reconnaissance in a prompt-injected agent session, not an "
+        "agent affordance"
+    ),
     "/api/admin/mcp-tools/{tool_id}/projection-map": (
         "names which of a lister tool's columns carry an app's id, URL and "
         "name. The decision is only makeable against the column list a fetch "

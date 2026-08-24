@@ -384,20 +384,31 @@ def filter_due_tables(
         sync).
 
     ``sync_state_repo`` is duck-typed: only ``get_last_sync(table_id)`` is
-    called, returning a ``datetime`` (tz-aware preferred, naive treated as
-    UTC) or ``None``.
+    called — up to twice per table (canonical key first, legacy name
+    fallback second, see below) — returning a ``datetime`` (tz-aware
+    preferred, naive treated as UTC) or ``None``.
     """
+    from src.sync_state_key import resolve_sync_state_key_for_row
+
     if now is None:
         now = datetime.now(timezone.utc)
     out: list[dict] = []
     for tc in table_configs:
-        # sync_state.table_id is populated from _meta.table_name by the
-        # orchestrator and equals table_registry.name (NOT id). When
-        # id != name (auto-discovered Keboola rows: id="in_c-crm_company",
-        # name="company") an id-keyed lookup misses every row and the
-        # filter degrades to "always sync" — defeating the schedule. The
-        # same pitfall is documented at app/api/sync.py:244-249.
-        table_id = tc.get("name") or tc.get("id")
+        # B1: sync_state.table_id is the registry `id` when a matching
+        # registry row existed at write time (src.sync_state_key), so the
+        # lookup resolves the canonical key first — `tc` IS the registry
+        # row, so this is a plain field read via the shared resolver. A
+        # sync_state row still keyed by `name` (legacy state the backfill
+        # migration hasn't reached yet) is picked up by the name fallback
+        # below — the same id-first/name-second resolution the other B1
+        # readers use (`app/api/admin.py::list_registry`, `app/api/
+        # sync.py::_build_manifest_for_user`). Keying name-first here (the
+        # pre-B1 contract) would make an id != name table (auto-discovered
+        # Keboola rows: id="in_c-crm_company", name="company") read
+        # last_sync=None on every tick once writers re-key, degrading the
+        # filter to "always sync" and defeating the schedule.
+        name = tc.get("name") or tc.get("id")
+        table_id = resolve_sync_state_key_for_row(name, tc)
         schedule = tc.get("sync_schedule")
         if not schedule:
             out.append(tc)
@@ -412,6 +423,10 @@ def filter_due_tables(
             out.append(tc)
             continue
         last_sync = sync_state_repo.get_last_sync(table_id)
+        if last_sync is None and name and name != table_id:
+            # Legacy fallback: a sync_state row written pre-B1 (or before
+            # the 0071 backfill ran) is keyed by the table's name.
+            last_sync = sync_state_repo.get_last_sync(name)
         if last_sync is None:
             last_sync_iso = None
         else:

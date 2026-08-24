@@ -142,6 +142,37 @@ def get_semantic_context(
     return {"results": results, "unknown_types": unknown_types}
 
 
+def dataset_field_descriptions(document: dict[str, Any], table_id: str) -> dict[str, str]:
+    """Field-name -> description for the dataset in ``document`` bound to
+    ``table_id``.
+
+    A dataset's binding is its own ``source`` (the upstream table it
+    projects from), falling back to its ``name`` when ``source`` is absent —
+    the same ``dataset.get("source") or dataset.get("name") or ""``
+    derivation ``src/semantic/projection.py`` uses when it stamps a
+    dataset's fields into ``column_metadata``, so a ``table_id`` that lines
+    up there also resolves here. Returns ``{}`` when no dataset in this
+    document binds to ``table_id``, or when the bound dataset declares no
+    field descriptions.
+    """
+    for dataset in document.get("datasets") or []:
+        if not isinstance(dataset, dict):
+            continue
+        bound = dataset.get("source") or dataset.get("name") or ""
+        if bound != table_id:
+            continue
+        out: dict[str, str] = {}
+        for field in dataset.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            name = field.get("name")
+            description = field.get("description")
+            if isinstance(name, str) and isinstance(description, str) and description.strip():
+                out[name] = description.strip()
+        return out
+    return {}
+
+
 def get_semantic_schema(semantic_types: list[str]) -> dict[str, Any]:
     """The vendored Apache Ossie JSON Schema, sliced to the requested
     ``semantic_types``.
@@ -174,6 +205,7 @@ def get_semantic_schema(semantic_types: list[str]) -> dict[str, Any]:
 
 __all__ = [
     "SEMANTIC_TYPES",
+    "dataset_field_descriptions",
     "get_semantic_context",
     "get_semantic_schema",
 ]

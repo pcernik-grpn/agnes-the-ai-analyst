@@ -3519,7 +3519,13 @@ async def agents_page(
 
         allowed = accessible_collection_ids(user)  # None => admin sees all
         cf_repo = corpus_files_repo()
-        for col in file_corpora_repo().list():
+        # TODO: the per-collection file count below is an N+1 (one query per
+        # reachable collection, so per *every* collection for an admin). It was
+        # incidentally bounded while this read the 200-capped list(); switching
+        # to list_all() to stop hiding reachable collections removes that
+        # ceiling. A bulk `counts_by_corpus()` on both corpus_files backends
+        # would collapse it into one query.
+        for col in file_corpora_repo().list_all():
             if allowed is not None and col["id"] not in allowed:
                 continue
             try:
@@ -3819,6 +3825,7 @@ async def semantic_layer_detail(
     """
     from app.web.semantic_layer_view import (
         agnes_extension_payload,
+        dialect_skipped_count,
         is_imported,
         model_constraints,
         model_glossary,
@@ -3942,6 +3949,7 @@ async def semantic_layer_detail(
         relationships=relationships,
         glossary=glossary,
         counts=object_counts(model),
+        dialect_skipped_count=dialect_skipped_count(model),
     )
     return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
 

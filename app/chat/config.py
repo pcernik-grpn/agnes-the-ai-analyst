@@ -343,6 +343,25 @@ def _resolve_chat_provider(raw: dict) -> str:
     return _raw_str(raw, "provider", "e2b")
 
 
+def _resolve_kai_agent_url(raw: dict) -> str:
+    """``chat.kai_agent_url`` resolution: ``AGNES_CHAT_KAI_AGENT_URL`` env >
+    the ``kai_agent_url`` key > ``"http://kai-agent:3000"``.
+
+    Same precedence convention and same motivation as
+    :func:`_resolve_chat_provider` — the provider it configures is pinned from
+    the deployment env, so its endpoint has to be pinnable the same way or the
+    pair can only ever be half-configured from infrastructure. It also makes
+    the provider reachable from a laptop: the default names a compose service,
+    which does not resolve outside the compose network, and the local-dev flow
+    deliberately runs without an ``instance.yaml`` (see
+    ``docs/kai-agent-local-dev.md``).
+    """
+    env = (os.environ.get("AGNES_CHAT_KAI_AGENT_URL") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "kai_agent_url", "http://kai-agent:3000")
+
+
 def load_chat_config(instance_yaml: Path) -> ChatConfig:
     if not instance_yaml.exists():
         return ChatConfig(
@@ -351,6 +370,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
             # infra-pinned provider — without this the first boot ran e2b
             # regardless of the deployment env.
             provider=_resolve_chat_provider({}),
+            kai_agent_url=_resolve_kai_agent_url({}),
             approvals_enabled=_resolve_chat_approvals({}),
         )
     data = yaml.safe_load(instance_yaml.read_text()) or {}
@@ -359,7 +379,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
     return ChatConfig(
         enabled=_resolve_chat_enabled(raw),
         provider=_resolve_chat_provider(raw),
-        kai_agent_url=_raw_str(raw, "kai_agent_url", "http://kai-agent:3000"),
+        kai_agent_url=_resolve_kai_agent_url(raw),
         harness=_raw_str(raw, "harness", "claude-code"),
         concurrency_per_user=_raw_int(raw, "concurrency_per_user", 3),
         idle_ttl_seconds=_raw_int(raw, "idle_ttl_seconds", 30 * 60),
