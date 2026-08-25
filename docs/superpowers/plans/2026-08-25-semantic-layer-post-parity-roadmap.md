@@ -327,6 +327,36 @@ chat-authoring ploše; žádná nová zápisová cesta do `semantic_models` vedl
 
 ---
 
+## 3a. Odhad náročnosti
+
+Velikost (S/M/L) v nadpisu fází říká rozsah práce; tahle tabulka přidává
+druhou osu — **kde to bolí**, ne jen kolik je toho. Odhady jsou v
+člověko-dnech pro inženýra, který kodebázi zná (počítá se s TDD-first a
+review, ne s "napsat kód"). `agnes-build` dovoluje nezávislé kousky pustit
+paralelně přes worktree — kalendářní čas viz doporučení pod tabulkou.
+
+| Fáze | Rozsah | Odhad | Náročnost | Hlavní zdroj náročnosti |
+|---|---|---|---|---|
+| F0 — Databricks | M | 6–9 dní | **Vysoká** | Mutuje data existující instalace (cutover); kopíruje ověřený Keboola playbook, takže riziko je *snížené*, ne nulové — golden diff musí pokrýt `MEASURE()` dialekt a kolizi jmen napříč zdroji (O5 zatím neověřeno) |
+| F1 — Distribuce/TTL | S | 3–5 dní | **Nízká** | Čistě aditivní — nový render krok + doplnění existující CLAUDE.md sekce, žádná schema migrace, nic existujícího se nepřepisuje |
+| F2 — Provider granty | S–M | 4–6 dní | **Nízká–střední** | Nový `ResourceType` nepotřebuje DB migraci (CLAUDE.md to garantuje), ale `_can_read_model` třetí větev musí projít RBAC-negativním testem (K0.10) — chyba tady je přesně tvar chyby, co bolí nejvíc |
+| F3 — Detach & override | M | 7–10 dní | **Vysoká** | Nejvíc pohyblivých částí v celém plánu: schema migrace (DuckDB+PG pár + kontraktní test dle dual-backend disciplíny), danger-flow UX na dvou místech (detach i re-attach), guard, co dnes vrací flat 409 na více místech najednou |
+| F4.1 — Pokrytí (cross-source) | S | 2–3 dny | **Nízká** | Rozšíření existujícího enginu (K0.5), ne nová stavba |
+| F4.2 — Health check | S–M | 3–4 dny | **Nízká–střední** | Agregace nad existujícími sloupci, ale výsledek je neúplný, dokud nedoběhne F3 (odpojené-a-uteklo) |
+| F4.3 — Mute s podpisem | S | 2 dny | **Nízká** | Malý audit-trail přírůstek, žádná nová entita |
+| F4.4 — Chování agenta | S | 1–2 dny | **Nízká** | Textová úprava CLAUDE.md + e2e test konverzace; nejmenší kousek s nejvyšší pákou na grounding (K0.10) |
+| F4.5 — Feedback | S–M | 3–4 dny | **Nízká–střední** | Nová tabulka `semantic_feedback` → schema migrace DuckDB+PG, ale malý, izolovaný povrch |
+| F5 — Auto-build trigger | S | 3–4 dny | **Nízká–střední** | Rozhodnutí o scaffoldu (otevřená otázka 4) je produktové, ne technické — pokud padne na variantu (b), odhad roste o 2–3 dny |
+
+**Součet:** ~35–49 člověko-dní sekvenčně (bez F4 podfází sečtených zvlášť by
+to vypadalo menší, ale F4 je ve skutečnosti pět nezávislých kousků, ne
+jeden). Doporučené paralelní pořadí z §4 (F0+F1+F4.1+F4.4 souběžně → F2+F3
+→ F4.2-4.5 → F5) stlačuje kalendářní čas na zhruba polovinu při dvou
+souběžně pracujících inženýrech (přes `.worktrees/`), protože nejnáročnější
+kousky (F0, F3) neleží na stejné závislostní větvi.
+
+---
+
 ## 4. Pořadí a závislosti
 
 ```
