@@ -15382,6 +15382,7 @@
     "tests/test_orchestrator_sync_state_hash.py::test_hash_table_parts_none_when_not_a_dir": 0.0018801246769726276,
     "tests/test_orchestrator_sync_state_hash.py::test_hash_table_parts_one_bad_month_does_not_cost_the_table": 0.010767417028546333,
     "tests/test_orchestrator_sync_state_hash.py::test_hash_table_parts_rejects_corrupt_part_and_warns": 0.0046854168176651,
+    "tests/test_orchestrator_sync_state_hash.py::test_hash_table_parts_rejects_mismatched_end_magics": 0.02,
     "tests/test_orchestrator_sync_state_hash.py::test_merge_frozen_parts_keeps_prior_good_entry_for_rejected_path": 0.0006487914361059666,
     "tests/test_orchestrator_sync_state_hash.py::test_merge_frozen_parts_omits_rejected_path_with_no_prior_entry": 0.0005139578133821487,
     "tests/test_orchestrator_sync_state_hash.py::test_parts_rollup_hash_changes_when_a_part_changes": 0.0007251654751598835,

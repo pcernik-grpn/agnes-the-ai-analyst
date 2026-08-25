@@ -307,15 +307,35 @@ def test_hash_table_parts_accepts_real_pyarrow_parquet(tmp_path):
 
 
 def test_hash_table_parts_accepts_encrypted_footer_magic(tmp_path):
-    """PARE (encrypted-footer) tail is accepted, not treated as corruption."""
+    """An encrypted-footer parquet carries PARE at BOTH ends, not just the
+    tail — pyarrow's own `verify_file_encrypted` asserts the file's FIRST
+    four bytes are PARE. A head check pinned to PAR1 would refuse every
+    such file as corrupt and make this branch unreachable (Devin review
+    on #1559)."""
     tdir = tmp_path / "orders"
     tdir.mkdir()
-    b = b"PAR1" + b"x" * 32 + b"PARE"
+    b = b"PARE" + b"x" * 32 + b"PARE"
     (tdir / "2026_01.parquet").write_bytes(b)
 
     parts, rejected = _hash_table_parts(tdir)
     assert rejected == []
     assert parts == [{"path": "2026_01.parquet", "hash": hashlib.md5(b).hexdigest(), "size_bytes": len(b)}]
+
+
+def test_hash_table_parts_rejects_mismatched_end_magics(tmp_path):
+    """The two ends must AGREE. A PAR1 head with a PARE tail (or the
+    reverse) is not a shape the format produces, so it reads as damage
+    rather than as an encrypted file."""
+    tdir = tmp_path / "orders"
+    tdir.mkdir()
+    (tdir / "mixed_a.parquet").write_bytes(b"PAR1" + b"x" * 32 + b"PARE")
+    (tdir / "mixed_b.parquet").write_bytes(b"PARE" + b"x" * 32 + b"PAR1")
+
+    parts, rejected = _hash_table_parts(tdir)
+    # Every part rejected -> the documented all-rejected contract (None),
+    # same shape as an empty directory; both paths still reported.
+    assert parts is None
+    assert sorted(rejected) == ["mixed_a.parquet", "mixed_b.parquet"]
 
 
 def test_merge_frozen_parts_keeps_prior_good_entry_for_rejected_path():

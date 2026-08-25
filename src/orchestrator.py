@@ -158,8 +158,12 @@ def _parquet_magic_ok(f, size: int) -> bool:
     for a fresh streaming read, so a caller that also needs to hash *f*
     reuses this one open descriptor rather than opening the file twice.
 
-    A parquet file starts with a 4-byte ``PAR1`` magic and ends with a
-    4-byte footer magic — ``PAR1``, or ``PARE`` for an encrypted footer.
+    A parquet file carries the SAME 4-byte magic at both ends: ``PAR1``
+    normally, or ``PARE`` when the footer is encrypted (verified against
+    pyarrow's own `verify_file_encrypted`, which asserts the FIRST four
+    bytes of an encrypted-footer file are ``PARE``). Requiring the two ends
+    to match is deliberately stricter than checking them independently: a
+    file whose head and tail disagree is not a shape the format produces.
     This catches truncation and footerless writes (the #1354 failure mode:
     a process killed mid-write leaves a file with a valid header and no
     footer) — it does NOT catch subtle internal corruption (a footer that
@@ -176,7 +180,7 @@ def _parquet_magic_ok(f, size: int) -> bool:
     f.seek(-4, os.SEEK_END)
     tail = f.read(4)
     f.seek(0)
-    return head == b"PAR1" and tail in (b"PAR1", b"PARE")
+    return head in (b"PAR1", b"PARE") and tail == head
 
 
 def _hash_table_parts(table_dir: Path) -> tuple[list[dict] | None, list[str]]:
