@@ -7,9 +7,9 @@ button+menu alongside it. Visibility between the two is a CSS theme decision,
 not a template one — see `app/web/static/css/paper-skin.css`.
 
 The two facet selects (`#sx-user`, `#sx-model`) are populated client-side
-from `/api/admin/sessions/facets` and are NOT converted — `ds_dropdown.js`
-has no mechanism to re-populate a paired dropdown's menu when the target
-select's options change after load.
+from `/api/admin/sessions/facets` and also get a paired `ds.dropdown()`
+(initially just the `{'', 'Any'}` option), kept in sync with the fetched
+facet options via `ds_dropdown.js`'s exported re-init hook (#1473).
 """
 
 from __future__ import annotations
@@ -27,13 +27,15 @@ class TestAdminSessionsDropdown:
         assert '<select id="sx-window" class="ds-dropdown-native">' in text
         assert '<option value="10080" selected>Last 7d</option>' in text
 
-    def test_facet_selects_are_not_converted(self, seeded_app):
+    def test_facet_selects_are_converted(self, seeded_app):
         resp = seeded_app["client"].get("/admin/sessions", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
         text = resp.text
         for select_id in ("sx-user", "sx-model"):
-            assert f'<select id="{select_id}" class="obs-select">' in text
-            assert f'data-ds-dropdown-target="{select_id}"' not in text
+            assert f'<select id="{select_id}" class="obs-select ds-dropdown-native">' in text
+            assert f'data-ds-dropdown-target="{select_id}"' in text
+            assert f'id="{select_id}-dd-btn"' in text
+            assert f'id="{select_id}-dd-menu"' in text
 
     def test_custom_dropdown_markup_present(self, seeded_app):
         resp = seeded_app["client"].get("/admin/sessions", headers=_auth(seeded_app["admin_token"]))
