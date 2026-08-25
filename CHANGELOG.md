@@ -115,6 +115,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   auto-upgrade tick's `CONFIG_FILES`, refetched every tick, and the content
   drift triggers the recreate itself.
 
+### Removed
+## [0.87.1] - 2026-08-25
+
+### Fixed
+
 - **A marketplace plugin in your stack now actually reaches your chat session —
   whole.** The composer's slash menu offered `/<skill-name>` for every skill in
   the caller's stack while nothing delivered those plugins into the session, so
