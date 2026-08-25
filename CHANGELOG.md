@@ -28,6 +28,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `docker-compose.postgres-host-mount.yml` (a direct service-level bind, not
   `driver_opts`, mirroring how `docker-compose.host-mount.yml` already binds
   the `data:` volume).
+### Added
+
+- **Self-serve change-password.** `POST /auth/password/change` for a logged-in session lets a user rotate their own password (verifying the current one, the same minimum-length policy and rate limiting as the other password doors) instead of only the token-based reset flow or an admin resetting it. Session-token only — a PAT gets 403, matching the other credential-minting/rotating doors. CSRF is checked before anything else, including whether the account even has a password, so a caller without a valid CSRF token gets the same 403 regardless of account type. On success any outstanding password-reset / email-magic-link token is invalidated (they share `users.reset_token`); existing sessions and PATs are NOT revoked by a password change (a separate action). An account with no password (Google/SSO-only) gets a clear 400 instead of silently gaining a password. New account-menu entry "Change password" (`/auth/password/change`).
+
+### Changed
+
+- **BREAKING: the email magic link is opt-in only.** When `auth.providers` is unset, the login page now offers every configured provider EXCEPT `email` (its `GET /auth/email/verify` consumes the single-use token on the request, so a corporate mail scanner opening the link before the human clicks silently burns it). Instances that relied on the implicit magic-link offering must add `email` to `auth.providers` to keep it. The misconfiguration lockout rescue (an allowlist naming only unconfigured providers falls back to password + email) is unchanged. A second, narrower rescue protects an already-deployed instance from this default flip itself: when `auth.providers` is unset, email is configured (SMTP), and no OTHER door is usable (no OAuth provider configured and no user holds a password), email stays enabled and a one-time warning is logged — the moment another door becomes usable, the default exclusion applies again.
 
 ## [0.86.0] - 2026-08-24
 

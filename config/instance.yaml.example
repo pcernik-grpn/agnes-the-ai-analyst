@@ -230,21 +230,27 @@ deployment:
 
 # --- Authentication ---
 # At minimum, set allowed_domain and webapp_secret_key.
-# Email magic link auth works out of the box (no external service needed).
+# Password sign-in works out of the box (no external service needed).
 # Google OAuth is optional - add credentials to enable it.
 auth:
   allowed_domain: ""              # Email domain(s) for login, comma-separated (e.g., "acme.com" or "acme.com, partner.org")
   webapp_secret_key: "${WEBAPP_SECRET_KEY}"
-  # Optional: Google OAuth (if not set, only email magic link is available)
+  # Optional: Google OAuth (if not set, only password sign-in is offered)
   google_client_id: "${GOOGLE_CLIENT_ID}"
   google_client_secret: "${GOOGLE_CLIENT_SECRET}"
 
   # providers: [google, email, password, keboola, microsoft]
   #                                 # Which login methods this instance offers.
-  #                                 # Unset = every configured provider (default).
-  #                                 # Explicit empty list is rejected. Excluded
-  #                                 # providers' endpoints return 404. Env
-  #                                 # override: AGNES_AUTH_PROVIDERS (comma-sep).
+  #                                 # Unset = every configured provider EXCEPT
+  #                                 # `email` (default) — the magic link's
+  #                                 # single-use verify link can be silently
+  #                                 # burned by a corporate mail scanner
+  #                                 # before the human clicks, so it is
+  #                                 # opt-in only: list `email` explicitly to
+  #                                 # offer it. Explicit empty list is
+  #                                 # rejected. Excluded providers' endpoints
+  #                                 # return 404. Env override:
+  #                                 # AGNES_AUTH_PROVIDERS (comma-sep).
 
   # --- Keboola login (optional) ---
   # Lets users sign in with their Keboola platform identity. The OAuth

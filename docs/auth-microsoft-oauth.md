@@ -26,7 +26,8 @@ groups into `user_group_members` at sign-in (see
 | `FORWARDED_ALLOW_IPS` / `SERVER_URL` / `DOMAIN` | as for Google | Same proxy/redirect-URI concerns — see [`auth-google-oauth.md`](auth-google-oauth.md). |
 
 Enable the provider on the login page with `auth.providers` in
-`instance.yaml` (unset = every configured provider):
+`instance.yaml` (unset = every configured provider except `email`, which is
+opt-in only — see `config/instance.yaml.example`):
 
 ```yaml
 auth:
