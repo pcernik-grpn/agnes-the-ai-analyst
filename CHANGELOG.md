@@ -26,6 +26,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   E2B backing (`kai_agent_e2b_key_secret`) is unaffected. The E2E chat suites
   now run on the docker provider (`AGNES_E2E_DOCKER=1` replaces
   `AGNES_E2E_E2B`; `e2e-docker.yml` replaces `e2e-e2b.yml`).
+### Fixed
+- **A corrupt parquet part is no longer distributed, and no longer overwrites
+  an analyst's good local copy.** `_hash_table_parts` / `_update_sync_state`
+  (`src/orchestrator.py`) now check each part's leading + trailing `PAR1`
+  magic bytes (or a `PARE` encrypted-footer tail) before hashing it — reusing
+  the file handle already open for the MD5, not a second read. This is a
+  structural check only ("well-formed enough to admit", not "valid"): it
+  catches truncation/footerless writes (the failure mode behind #1354) but
+  not subtle internal corruption a footer-level check can't see. A part that
+  fails it is refused and logged at WARNING naming the exact path. Refusing a
+  part that was never previously published simply excludes it from this
+  sync's manifest — nothing local depends on it yet. Refusing a part that
+  *was* previously published good instead freezes its manifest entry at the
+  last known-good hash: `agnes pull`'s `_diff_parts` treats a part that is
+  locally present but absent from a fresh manifest as an intentional
+  server-side deletion and prunes it, so naive omission would have deleted
+  the analyst's good copy — the opposite of the fix's intent, and worse than
+  the original bug (which only overwrote it with corrupt bytes). Healthy
+  sibling parts of the same table, and the same table on a later rebuild once
+  the source part is repaired, are unaffected. (#1364)
+
 
 ## [0.88.0] - 2026-08-25
 

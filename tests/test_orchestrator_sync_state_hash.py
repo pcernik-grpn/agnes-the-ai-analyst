@@ -184,42 +184,163 @@ def test_update_sync_state_silent_when_only_one_layout_present(
 # today (no single `{table}.parquet` for the single-file path to find).
 # ---------------------------------------------------------------------------
 
-from src.orchestrator import _hash_table_parts, _parts_rollup_hash
+from src.orchestrator import _hash_table_parts, _parts_rollup_hash  # noqa: E402
 
 
 def test_hash_table_parts_hive_layout(tmp_path):
     tdir = tmp_path / "issues"
     (tdir / "month=2026-06").mkdir(parents=True)
     (tdir / "month=2026-07").mkdir(parents=True)
-    b6, b7 = b"jun" * 10, b"july" * 20
+    b6, b7 = b"PAR1" + b"jun" * 10 + b"PAR1", b"PAR1" + b"july" * 20 + b"PAR1"
     (tdir / "month=2026-06" / "data.parquet").write_bytes(b6)
     (tdir / "month=2026-07" / "data.parquet").write_bytes(b7)
 
-    assert _hash_table_parts(tdir) == [
+    parts, rejected = _hash_table_parts(tdir)
+    assert parts == [
         {"path": "month=2026-06/data.parquet", "hash": hashlib.md5(b6).hexdigest(), "size_bytes": len(b6)},
         {"path": "month=2026-07/data.parquet", "hash": hashlib.md5(b7).hexdigest(), "size_bytes": len(b7)},
     ]
+    assert rejected == []
 
 
 def test_hash_table_parts_flat_layout(tmp_path):
     tdir = tmp_path / "cost"
     tdir.mkdir()
-    b = b"data123"
+    b = b"PAR1" + b"data123" + b"PAR1"
     (tdir / "2025_11.parquet").write_bytes(b)
-    assert _hash_table_parts(tdir) == [
-        {"path": "2025_11.parquet", "hash": hashlib.md5(b).hexdigest(), "size_bytes": len(b)}
-    ]
+    parts, rejected = _hash_table_parts(tdir)
+    assert parts == [{"path": "2025_11.parquet", "hash": hashlib.md5(b).hexdigest(), "size_bytes": len(b)}]
+    assert rejected == []
 
 
 def test_hash_table_parts_none_when_not_a_dir(tmp_path):
-    assert _hash_table_parts(tmp_path / "nope") is None
+    parts, rejected = _hash_table_parts(tmp_path / "nope")
+    assert parts is None
+    assert rejected == []
 
 
 def test_hash_table_parts_none_when_no_parquets(tmp_path):
     d = tmp_path / "empty"
     d.mkdir()
     (d / "readme.txt").write_text("x")
-    assert _hash_table_parts(d) is None
+    parts, rejected = _hash_table_parts(d)
+    assert parts is None
+    assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# #1364 — refuse a corrupt parquet part at hash time, so it never enters the
+# manifest and never gets distributed. The check is structural only (leading
+# + trailing PAR1 magic): cheap, catches truncation/footerless writes (the
+# #1354 failure mode), NOT subtle internal corruption.
+# ---------------------------------------------------------------------------
+
+CORRUPT_PARQUET_BYTES = b"PAR1" + b"\x00" * 64  # good header, no footer magic — truncated-write shape
+
+
+def test_hash_table_parts_rejects_corrupt_part_and_warns(tmp_path, caplog):
+    """A corrupt part is excluded from `parts` and reported in `rejected`;
+    a WARNING names the exact path and the reason."""
+    tdir = tmp_path / "issues"
+    tdir.mkdir()
+    (tdir / "month=2026-01" / "data.parquet").parent.mkdir(parents=True)
+    (tdir / "month=2026-01" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    with caplog.at_level("WARNING", logger="src.orchestrator"):
+        parts, rejected = _hash_table_parts(tdir)
+
+    assert parts is None
+    assert rejected == ["month=2026-01/data.parquet"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("month=2026-01/data.parquet" in w and "PAR1" in w for w in warnings), (
+        f"expected a WARNING naming the corrupt part's path; got {warnings!r}"
+    )
+
+
+def test_hash_table_parts_one_bad_month_does_not_cost_the_table(tmp_path):
+    """The healthy parts of the SAME table still hash and are still listed —
+    one bad month must not cost the table."""
+    tdir = tmp_path / "issues"
+    good = b"PAR1" + b"good" * 20 + b"PAR1"
+    (tdir / "month=2026-01").mkdir(parents=True)
+    (tdir / "month=2026-01" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+    (tdir / "month=2026-02").mkdir(parents=True)
+    (tdir / "month=2026-02" / "data.parquet").write_bytes(good)
+
+    parts, rejected = _hash_table_parts(tdir)
+    assert rejected == ["month=2026-01/data.parquet"]
+    assert parts == [
+        {"path": "month=2026-02/data.parquet", "hash": hashlib.md5(good).hexdigest(), "size_bytes": len(good)}
+    ]
+
+
+def test_hash_table_parts_all_corrupt_returns_none_but_reports_every_rejection(tmp_path):
+    """An all-corrupt table degrades to the same `parts=None` contract as an
+    empty directory — nothing publishable, but every bad part is named."""
+    tdir = tmp_path / "issues"
+    (tdir / "month=2026-01").mkdir(parents=True)
+    (tdir / "month=2026-01" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+    (tdir / "month=2026-02").mkdir(parents=True)
+    (tdir / "month=2026-02" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    parts, rejected = _hash_table_parts(tdir)
+    assert parts is None
+    assert set(rejected) == {"month=2026-01/data.parquet", "month=2026-02/data.parquet"}
+
+
+def test_hash_table_parts_accepts_real_pyarrow_parquet(tmp_path):
+    """Guard against a check that rejects everything: a valid parquet
+    written by the real writer (pyarrow), not a hand-built byte string,
+    must pass."""
+    pa = pytest.importorskip("pyarrow")
+    pq_mod = pytest.importorskip("pyarrow.parquet")
+    tdir = tmp_path / "orders"
+    tdir.mkdir()
+    table = pa.table({"id": [1, 2, 3], "amount": [10.0, 20.0, 30.0]})
+    pq_mod.write_table(table, tdir / "2026_01.parquet")
+
+    parts, rejected = _hash_table_parts(tdir)
+    assert rejected == []
+    assert parts is not None
+    assert parts[0]["path"] == "2026_01.parquet"
+    assert parts[0]["hash"] == hashlib.md5((tdir / "2026_01.parquet").read_bytes()).hexdigest()
+
+
+def test_hash_table_parts_accepts_encrypted_footer_magic(tmp_path):
+    """PARE (encrypted-footer) tail is accepted, not treated as corruption."""
+    tdir = tmp_path / "orders"
+    tdir.mkdir()
+    b = b"PAR1" + b"x" * 32 + b"PARE"
+    (tdir / "2026_01.parquet").write_bytes(b)
+
+    parts, rejected = _hash_table_parts(tdir)
+    assert rejected == []
+    assert parts == [{"path": "2026_01.parquet", "hash": hashlib.md5(b).hexdigest(), "size_bytes": len(b)}]
+
+
+def test_merge_frozen_parts_keeps_prior_good_entry_for_rejected_path():
+    """The core of the #1364 fix: a rejected path with a prior known-good
+    entry is reintroduced UNCHANGED, not dropped — dropping it would make
+    `agnes pull`'s `_diff_parts` prune (delete) the analyst's local copy."""
+    from src.orchestrator import _merge_frozen_parts
+
+    fresh = [{"path": "month=2026-02/data.parquet", "hash": "freshhash", "size_bytes": 10}]
+    rejected = ["month=2026-01/data.parquet"]
+    previous_by_path = {
+        "month=2026-01/data.parquet": {"path": "month=2026-01/data.parquet", "hash": "oldgoodhash", "size_bytes": 5},
+    }
+    merged = _merge_frozen_parts(fresh, rejected, previous_by_path)
+    assert {"path": "month=2026-01/data.parquet", "hash": "oldgoodhash", "size_bytes": 5} in merged
+    assert len(merged) == 2
+
+
+def test_merge_frozen_parts_omits_rejected_path_with_no_prior_entry():
+    """A rejected path that was never distributed good has nothing local to
+    protect — it stays omitted."""
+    from src.orchestrator import _merge_frozen_parts
+
+    merged = _merge_frozen_parts([], ["month=2026-01/data.parquet"], {})
+    assert merged == []
 
 
 def test_parts_rollup_hash_order_independent_and_full_md5():
@@ -274,6 +395,232 @@ def test_update_sync_state_single_file_still_has_no_parts(system_db_path, parque
     finally:
         conn.close()
     assert state["parts"] is None
+
+
+# ---------------------------------------------------------------------------
+# #1364 end-to-end through `_update_sync_state`: a corrupt part/file must
+# never be published with a hash describing its corrupt bytes, and — the
+# STOP-AND-VERIFY finding this fix is built around — when the analyst
+# already has a good local copy, that copy must be neither overwritten NOR
+# pruned. `cli/lib/pull.py::_diff_parts` treats "on disk locally, absent
+# from the fresh manifest" as an intentional server-side deletion and
+# PRUNES it (`test_diff_parts_prunes_dropped_month`), so naive omission
+# would delete the good copy — the opposite of the goal. The fix instead
+# freezes a corrupt part's manifest entry at its last known-good hash when
+# one exists, and omits it outright only when nothing was ever distributed.
+# ---------------------------------------------------------------------------
+
+
+def test_update_sync_state_partitioned_corrupt_part_excluded_when_no_prior_state(system_db_path, tmp_path, caplog):
+    """(a) First-ever sync, one corrupt part: excluded from the manifest —
+    nothing local depends on it yet — and a WARNING names it."""
+    tdir = tmp_path / "extracts" / "keboola" / "data" / "orders" / "month=2026-01"
+    tdir.mkdir(parents=True)
+    (tdir / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    with caplog.at_level("WARNING", logger="src.orchestrator"):
+        _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("month=2026-01/data.parquet" in w for w in warnings)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state is not None
+    assert not state.get("parts")
+    assert state["hash"] == ""
+
+
+def test_update_sync_state_partitioned_healthy_part_still_published_alongside_corrupt_one(system_db_path, tmp_path):
+    """(b) One bad month must not cost the table: the healthy sibling part
+    still hashes and is still listed."""
+    base = tmp_path / "extracts" / "keboola" / "data" / "orders"
+    (base / "month=2026-01").mkdir(parents=True)
+    (base / "month=2026-01" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+    good = b"PAR1" + b"good" * 20 + b"PAR1"
+    (base / "month=2026-02").mkdir(parents=True)
+    (base / "month=2026-02" / "data.parquet").write_bytes(good)
+
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["parts"] == [
+        {"path": "month=2026-02/data.parquet", "hash": hashlib.md5(good).hexdigest(), "size_bytes": len(good)}
+    ]
+
+
+def test_update_sync_state_partitioned_corrupt_part_with_prior_good_copy_is_frozen_not_pruned(system_db_path, tmp_path):
+    """The STOP-AND-VERIFY case: a part that WAS published good, then goes
+    corrupt on a later rebuild, keeps its LAST KNOWN-GOOD manifest entry
+    instead of being dropped — dropping it would make `agnes pull` prune
+    (delete) the analyst's already-downloaded good copy."""
+    base = tmp_path / "extracts" / "keboola" / "data" / "orders"
+    good = b"PAR1" + b"good-january" * 5 + b"PAR1"
+    (base / "month=2026-01").mkdir(parents=True)
+    part_path = base / "month=2026-01" / "data.parquet"
+    part_path.write_bytes(good)
+
+    # First pass: publishes the good hash.
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        before = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert before["parts"] == [
+        {"path": "month=2026-01/data.parquet", "hash": hashlib.md5(good).hexdigest(), "size_bytes": len(good)}
+    ]
+
+    # The part goes corrupt on disk (e.g. a killed webhook write) before the
+    # next rebuild — the SAME failure mode #1354 documents.
+    part_path.write_bytes(CORRUPT_PARQUET_BYTES)
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        after = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    # Frozen: identical manifest entry to before the corruption, NOT dropped
+    # and NOT the corrupt bytes' own (self-consistent) hash.
+    assert after["parts"] == before["parts"]
+    assert after["hash"] == before["hash"]
+
+
+def test_update_sync_state_partitioned_all_corrupt_first_sync_publishes_nothing(system_db_path, tmp_path):
+    """(c) All-corrupt table, never synced before: degrades to the same
+    empty contract as an empty directory — nothing publishable, no crash."""
+    base = tmp_path / "extracts" / "keboola" / "data" / "orders"
+    for month in ("2026-01", "2026-02"):
+        d = base / f"month={month}"
+        d.mkdir(parents=True)
+        (d / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state is not None
+    assert not state.get("parts")
+    assert state["hash"] == ""
+
+
+def test_update_sync_state_partitioned_all_corrupt_with_prior_state_stays_fully_frozen(system_db_path, tmp_path):
+    """(c) All-corrupt table that WAS fully synced before: the whole
+    table's manifest entry freezes unchanged rather than collapsing to
+    empty — every already-downloaded part stays protected from pruning."""
+    base = tmp_path / "extracts" / "keboola" / "data" / "orders"
+    goods = {}
+    for month in ("2026-01", "2026-02"):
+        d = base / f"month={month}"
+        d.mkdir(parents=True)
+        b = f"PAR1good-{month}".encode() + b"PAR1"
+        (d / "data.parquet").write_bytes(b)
+        goods[month] = b
+
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        before = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert before["parts"] is not None and len(before["parts"]) == 2
+
+    for month in ("2026-01", "2026-02"):
+        (base / f"month={month}" / "data.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+    _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        after = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert after["parts"] == before["parts"]
+    assert after["hash"] == before["hash"]
+
+
+def test_update_sync_state_single_file_corrupt_no_prior_state_publishes_nothing(system_db_path, tmp_path, caplog):
+    """Single-file sibling, (a): a corrupt flat parquet with no prior good
+    sync leaves no sync_state row — never published — and warns."""
+    extracts = tmp_path / "extracts" / "keboola" / "data"
+    extracts.mkdir(parents=True)
+    (extracts / "orders.parquet").write_bytes(CORRUPT_PARQUET_BYTES)
+
+    with caplog.at_level("WARNING", logger="src.orchestrator"):
+        _run_update(system_db_path, meta_rows=[("orders", 0, 0, "local")], data_dir=tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("orders.parquet" in w and "PAR1" in w for w in warnings)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state is None
+
+
+def test_update_sync_state_single_file_corrupt_with_prior_good_state_is_frozen(system_db_path, tmp_path):
+    """Single-file sibling: a table that WAS published good, then its flat
+    parquet goes corrupt on a later rebuild, keeps its LAST KNOWN-GOOD
+    sync_state row untouched — not overwritten with the corrupt bytes'
+    (self-consistent) hash, and not blanked out either."""
+    extracts = tmp_path / "extracts" / "keboola" / "data"
+    extracts.mkdir(parents=True)
+    pq_path = extracts / "orders.parquet"
+    good = b"PAR1" + b"good-data" * 10 + b"PAR1"
+    pq_path.write_bytes(good)
+
+    _run_update(system_db_path, meta_rows=[("orders", 100, pq_path.stat().st_size, "local")], data_dir=tmp_path)
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        before = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert before["hash"] == hashlib.md5(good).hexdigest()
+
+    pq_path.write_bytes(CORRUPT_PARQUET_BYTES)
+    _run_update(system_db_path, meta_rows=[("orders", 100, pq_path.stat().st_size, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        after = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert after["hash"] == before["hash"]
+    assert after["rows"] == before["rows"]
+
+
+def test_update_sync_state_single_file_valid_real_writer_parquet_still_passes(system_db_path, tmp_path):
+    """(d) Guard against a check that rejects everything: a real
+    pyarrow-written single-file parquet still hashes and publishes."""
+    pa = pytest.importorskip("pyarrow")
+    pq_mod = pytest.importorskip("pyarrow.parquet")
+    extracts = tmp_path / "extracts" / "keboola" / "data"
+    extracts.mkdir(parents=True)
+    pq_path = extracts / "orders.parquet"
+    table = pa.table({"id": [1, 2, 3]})
+    pq_mod.write_table(table, pq_path)
+
+    _run_update(system_db_path, meta_rows=[("orders", 3, pq_path.stat().st_size, "local")], data_dir=tmp_path)
+
+    conn = duckdb.connect(str(system_db_path))
+    try:
+        state = SyncStateRepository(conn).get_table_state("orders")
+    finally:
+        conn.close()
+    assert state["hash"] == hashlib.md5(pq_path.read_bytes()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
