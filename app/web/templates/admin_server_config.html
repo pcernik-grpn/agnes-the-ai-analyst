@@ -438,6 +438,15 @@
           precedence — a token shown as <code>env</code> can't be changed
           here. Storing a token requires <code>AGNES_VAULT_KEY</code> on the
           server.
+          <br>
+          Create the Slack app from the shipped manifest —
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-http.md"
+             target="_blank" rel="noopener">docs/slack-manifest-http.md</a>
+          (or the
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-socket.md"
+             target="_blank" rel="noopener">Socket&nbsp;Mode variant</a>)
+          — never by hand-picking scopes. The manifest is the minimal
+          bot-token scope set; the bot needs no user scopes at all.
         </div>
       </div>
     </header>
