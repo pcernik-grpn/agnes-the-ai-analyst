@@ -1572,10 +1572,12 @@ def _grant_marketplace_skill(
 
     conn = get_system_db()
     try:
-        conn.execute(
-            "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
-            ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(timezone.utc)],
-        )
+        # Idempotent: a test may stack two plugins from the same marketplace.
+        if not conn.execute("SELECT 1 FROM marketplace_registry WHERE id = 'mkt'").fetchone():
+            conn.execute(
+                "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
+                ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(timezone.utc)],
+            )
         conn.execute(
             "INSERT INTO marketplace_plugins (marketplace_id, name, version, raw, updated_at) VALUES (?, ?, ?, ?, ?)",
             ["mkt", plugin, "1.0", json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
@@ -1769,3 +1771,26 @@ def test_no_mcp_servers_no_allow_list(seeded_app, kai_env):
     settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
 
     assert "enabledMcpjsonServers" not in settings
+
+
+def test_merged_config_bytes_do_not_depend_on_plugin_order(seeded_app, kai_env):
+    """The engine re-fetches this archive on every SDK respawn and compares
+    bytes. The merged `hooks` / `mcpServers` blocks are built by iterating
+    plugins, so their serialization must not carry that order — otherwise
+    stability rests on a guarantee three modules away."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+    _grant_marketplace_skill(plugin="aaa-first", skill="other-skill", full=True)
+
+    mcp = json.loads(_workspace_member(seeded_app, ".mcp.json"))
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    raw_mcp = _workspace_member(seeded_app, ".mcp.json")
+    raw_settings = _workspace_member(seeded_app, ".claude/settings.json")
+
+    # Key-sorted at every level we synthesize, so a different merge order
+    # produces identical bytes.
+    assert list(mcp) == sorted(mcp)
+    assert list(mcp["mcpServers"]) == sorted(mcp["mcpServers"])
+    assert list(settings) == sorted(settings)
+    assert raw_mcp == _workspace_member(seeded_app, ".mcp.json")
+    assert raw_settings == _workspace_member(seeded_app, ".claude/settings.json")

@@ -1172,6 +1172,16 @@ def _merged_json_member(template_bytes: Optional[bytes], key: str, additions: Di
     template's own file untouched. A template file that is not a JSON object is
     left alone too — overwriting an operator's settings with a synthesized one
     would be a worse failure than not delivering hooks.
+
+    ``sort_keys`` so the bytes do not depend on the order the plugins were
+    merged in. ``resolve_user_marketplace`` does document a deterministic order
+    (admin entries by registration time + name, then Store entries by entity
+    id), but the engine re-fetches this archive on every SDK respawn and
+    compares bytes — resting that on an ordering guarantee three modules away is
+    the kind of coupling that breaks quietly. Sorting here makes the stability
+    local and unconditional. List order inside a block is untouched: a hook
+    array's order is the author's execution order. Found by Devin Review on
+    #1552.
     """
     if not additions:
         return None
@@ -1189,7 +1199,7 @@ def _merged_json_member(template_bytes: Optional[bytes], key: str, additions: Di
     merged = dict(block) if isinstance(block, dict) else {}
     merged.update(additions)
     base[key] = merged
-    return (json.dumps(base, indent=2) + "\n").encode("utf-8")
+    return (json.dumps(base, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def _with_approved_mcp_servers(settings_bytes: Optional[bytes], names: "list[str]") -> Optional[bytes]:
@@ -1214,7 +1224,7 @@ def _with_approved_mcp_servers(settings_bytes: Optional[bytes], names: "list[str
         if name not in allow:
             allow.append(name)
     base["enabledMcpjsonServers"] = allow
-    return (json.dumps(base, indent=2) + "\n").encode("utf-8")
+    return (json.dumps(base, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def _build_workspace_archive(
