@@ -999,7 +999,12 @@
             <p class="ds-wexisting__copy" id="ds-wexisting-copy">Go straight to its tables — no URL, no token to paste again.</p>
           </div>
           <div class="ds-wexisting__act">
-            <select id="ds-wexisting-select" aria-label="Which connected project"></select>
+            {# Options are rebuilt from _connections every time the wizard's
+               "share" step renders; the paired .ds-dropdown is kept in sync
+               by _syncWexistingDropdown() (see below). #}
+            <select id="ds-wexisting-select" class="ds-dropdown-native" aria-label="Which connected project"></select>
+            {{ ds.dropdown(id='ds-wexisting-select-dd', target='ds-wexisting-select',
+                           aria_label='Which connected project', options=[]) }}
             <button type="button" class="ds-wexisting__cta" id="ds-wexisting-btn">Choose tables <span aria-hidden="true">→</span></button>
           </div>
         </div>
@@ -1073,10 +1078,18 @@
           </div>
           <div class="ds-field">
             <label for="ds-sf-auth-type">Authentication <span style="color:var(--ds-accent-danger-ink)">*</span></label>
-            <select id="ds-sf-auth-type">
+            <select id="ds-sf-auth-type" class="ds-dropdown-native">
               <option value="password" selected>Password</option>
               <option value="key_pair">Key-pair</option>
             </select>
+            {{ ds.dropdown(
+              id='ds-sf-auth-type-dd', target='ds-sf-auth-type',
+              aria_label='Authentication', selected='password',
+              options=[
+                {'value': 'password', 'label': 'Password'},
+                {'value': 'key_pair', 'label': 'Key-pair'},
+              ],
+            ) }}
             <div class="field-hint">Choose how the wizard stores the Snowflake credential.</div>
           </div>
           <div id="ds-sf-auth-password">
@@ -1213,9 +1226,18 @@
              tables into it and Finish POSTs them to the package, creating
              nothing and leaving its sharing exactly as it stands. Options
              load on first open (the list is another page's data). #}
-          <select id="ds-existing-pkg-sel" class="ds-exist-sel" aria-label="Add tables to an existing package">
+          {# Options load lazily (see _refreshExistingPkgOptions below) — the
+             paired .ds-dropdown never receives the native `focus` event that
+             drives that load on the default theme (the branded button
+             intercepts all interaction, and the paper theme hides the real
+             select), so _refreshExistingPkgOptions is also called whenever
+             this step becomes visible and after each pick updates the board. #}
+          <select id="ds-existing-pkg-sel" class="ds-exist-sel ds-dropdown-native" aria-label="Add tables to an existing package">
             <option value="">＋ Into existing package…</option>
           </select>
+          {{ ds.dropdown(id='ds-existing-pkg-sel-dd', target='ds-existing-pkg-sel',
+                         aria_label='Add tables to an existing package',
+                         options=[{'value': '', 'label': '＋ Into existing package…'}]) }}
           <span style="flex:1"></span>
           <button type="button" class="btn btn-secondary" id="ds-new-tray-btn">＋ New package</button>
         </div>
@@ -1286,6 +1308,47 @@ function _registerErrorText(body) {
 
 function _esc(s) {
   return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Hand-built `.ds-dropdown` markup (see _components.html's `dropdown` macro)
+// for pairing with a <select> built entirely in a JS template literal, where
+// the select doesn't exist yet at Jinja-render time. `options` is
+// `[{value, label}]`; the caller is responsible for calling
+// `window.dsDropdownInit` on the inserted host once, after the surrounding
+// innerHTML assignment — matching `dsDropdownMarkup()` in
+// admin_server_config.html.
+function _dropdownMarkupHtml(id, targetId, ariaLabel, options, selected) {
+  const current = options.some((o) => o.value === selected) ? selected : (options[0] ? options[0].value : null);
+  const currentLabel = (options.find((o) => o.value === current) || {}).label || "";
+  const items = options.map((o) => `<li class="ds-dropdown-menu-item${o.value === current ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o.value === current}" tabindex="0" data-value="${_esc(o.value)}">${_esc(o.label)}</li>`).join("");
+  const nameSpan = ariaLabel ? `<span class="ds-dropdown-name" id="${id}-name">${_esc(ariaLabel)}</span>` : "";
+  const labelledBy = ariaLabel ? ` aria-labelledby="${id}-name ${id}-btn-label"` : "";
+  return `<div class="ds-dropdown" data-ds-dropdown-target="${targetId}">
+    <button type="button" class="ds-dropdown-btn" id="${id}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${id}-menu"${labelledBy}>
+      ${nameSpan}<span class="ds-dropdown-btn-label" id="${id}-btn-label">${_esc(currentLabel)}</span>
+      <svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <ul class="ds-dropdown-menu" id="${id}-menu" role="menu" aria-label="${_esc(ariaLabel || "Options")}" hidden>${items}</ul>
+  </div>`;
+}
+
+// ds_dropdown.js only pushes a selection FROM the custom button+menu ONTO the
+// paired native <select> — for a static option list (never rebuilt), setting
+// `.value` straight from code needs this explicit re-sync or the paper-theme
+// dropdown keeps showing whatever was picked last. Mutates the EXISTING
+// items in place rather than rebuilding, since the option list itself never
+// changes for these controls.
+function _syncDropdownFromSelect(sel) {
+  const dd = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
+  if (!dd) return;
+  const label = dd.querySelector(".ds-dropdown-btn-label");
+  const opt = sel.options[sel.selectedIndex];
+  dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach((item) => {
+    const isSelected = item.dataset.value === sel.value;
+    item.classList.toggle("is-selected", isSelected);
+    item.setAttribute("aria-checked", isSelected ? "true" : "false");
+  });
+  if (label && opt) label.textContent = opt.textContent.trim();
 }
 
 // Mirrors register_table's identifier derivation in app/api/admin.py BYTE FOR
@@ -2128,6 +2191,32 @@ function _syncGrantPickerDropdown(sel) {
   if (window.dsDropdownInit) window.dsDropdownInit(host);
 }
 
+// Rebuilds the paired `.ds-dropdown`'s button AND menu from a select's own
+// freshly-set <option>s, then re-runs ds_dropdown.js's init via the exported
+// `dsDropdownInit` hook. Unlike `_syncGrantPickerDropdown` above (safe to
+// touch only the menu because its host's whole row is discarded and rebuilt
+// fresh on every render), this is for statically-rendered `.ds-dropdown`
+// markup whose surrounding DOM persists across repeat calls — leaving the
+// same <button> node in place across two init() calls double-registers its
+// click handler and the menu never appears to open, so the button is
+// recreated too.
+function _syncDropdownRebuild(sel) {
+  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${sel.id}"]`);
+  if (!host) return;
+  const ddId = `${sel.id}-dd`;
+  const opts = Array.from(sel.options);
+  const currentOpt = opts.find((o) => o.value === sel.value) || opts[0];
+  const menuEl = host.querySelector(".ds-dropdown-menu");
+  const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
+  const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="${ddId}-name">${_esc(ariaLabel)}</span>` : "";
+  const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : "";
+  const items = opts
+    .map((o) => `<li class="ds-dropdown-menu-item${o === currentOpt ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${_esc(o.value)}">${_esc(o.textContent)}</li>`)
+    .join("");
+  host.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${currentOpt ? _esc(currentOpt.textContent) : ""}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${_esc(ariaLabel || "Options")}" hidden>${items}</ul>`;
+  if (window.dsDropdownInit) window.dsDropdownInit(host);
+}
+
 async function _fillGrantPickers() {
   const groups = await _loadGroups();
   document.querySelectorAll('select[id^="ds-grant-group-"]').forEach((sel) => {
@@ -2748,9 +2837,11 @@ async function _loadBqCredStatus() {
 }
 
 function _updateSfAuthUI() {
-  const authType = document.getElementById("ds-sf-auth-type").value;
+  const sel = document.getElementById("ds-sf-auth-type");
+  const authType = sel.value;
   document.getElementById("ds-sf-auth-password").hidden = authType !== "password";
   document.getElementById("ds-sf-auth-key").hidden = authType !== "key_pair";
+  _syncDropdownFromSelect(sel);
 }
 
 /* POST /api/admin/server-config answers `restart_required: true` and resets
@@ -3258,13 +3349,15 @@ function openWizard(connector) {
     // The option carries what the project already holds. "Keboola AI" alone
     // does not say whether picking it is worth anything; "· 3 tables" does,
     // and it is the number the card behind the drawer is showing anyway.
-    document.getElementById("ds-wexisting-select").innerHTML = browsable
+    const wexistingSel = document.getElementById("ds-wexisting-select");
+    wexistingSel.innerHTML = browsable
       .map((c) => {
         const n = ((SOURCE_PIPELINES[c.id] || {}).tables || {}).count || 0;
         const held = n ? ` · ${n} table${n === 1 ? "" : "s"}` : " · no tables yet";
         return `<option value="${_esc(c.id)}">${_esc(c.name || c.id)}${held}</option>`;
       })
       .join("");
+    _syncDropdownRebuild(wexistingSel);
     document.getElementById("ds-wexisting-copy").textContent = browsable.length === 1
       ? "Go straight to its tables — no URL, no token to paste again."
       : `Pick one of your ${browsable.length} connected projects and go straight to its tables.`;
@@ -3618,10 +3711,12 @@ function _renderSfRowsEditor() {
       <button type="button" class="btn btn-secondary" id="ds-sf-browse">Reload tables</button>
       <label style="display:inline-flex; align-items:center; gap:6px;">
         <span style="color:var(--ds-text-secondary);">register selected as</span>
-        <select id="ds-sf-picker-mode">
+        <select id="ds-sf-picker-mode" class="ds-dropdown-native">
           <option value="remote" selected>live</option>
           <option value="materialized">materialized</option>
         </select>
+        ${_dropdownMarkupHtml("ds-sf-picker-mode-dd", "ds-sf-picker-mode", "register selected as",
+          [{ value: "remote", label: "live" }, { value: "materialized", label: "materialized" }], "remote")}
       </label>
       <span class="ds-browse-error" id="ds-sf-browse-error"></span>
     </div>
@@ -3636,8 +3731,11 @@ function _renderSfRowsEditor() {
       <button type="button" class="btn btn-secondary" id="ds-sfrow-add">＋ Add another table</button>
     </div>
     <div class="ds-browse-error" id="ds-sf-rows-error" style="display:block; margin-top:8px;"></div>`;
+  if (window.dsDropdownInit) body.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
   body.querySelector("#ds-sfrow-add").addEventListener("click", () => {
-    body.querySelector("#ds-sfrows").insertAdjacentHTML("beforeend", _sfRowHtml());
+    const rows = body.querySelector("#ds-sfrows");
+    rows.insertAdjacentHTML("beforeend", _sfRowHtml());
+    if (window.dsDropdownInit) rows.lastElementChild.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
   });
   body.querySelector("#ds-sf-browse").addEventListener("click", _loadSfCatalog);
   // Auto-load, mirroring the Keboola step (which lists tables as soon as the
@@ -3739,15 +3837,24 @@ function _sfPickerHtml(schemas, database) {
     </div>`;
 }
 
+let _sfRowIdSeq = 0;
+
 function _sfRowHtml() {
+  // Each row is inserted once via insertAdjacentHTML and never re-rendered
+  // in place, so a per-row id is safe to hand to dsDropdownInit exactly
+  // once at insertion (see the "+ Add another table" handler above) — no
+  // double-init risk the way a re-rendered-in-place list would have.
+  const id = `ds-sfrow-mode-${++_sfRowIdSeq}`;
   return `
   <div class="ds-sfrow">
     <input type="text" data-sf-schema placeholder="schema (e.g. PUBLIC)" autocomplete="off" spellcheck="false">
     <input type="text" data-sf-table placeholder="table (e.g. ORDERS)" autocomplete="off" spellcheck="false">
-    <select data-sf-mode>
+    <select id="${id}" data-sf-mode class="ds-dropdown-native">
       <option value="remote" selected>live</option>
       <option value="materialized">materialized</option>
     </select>
+    ${_dropdownMarkupHtml(`${id}-dd`, id, "How this table is served",
+      [{ value: "remote", label: "live" }, { value: "materialized", label: "materialized" }], "remote")}
     <span class="ds-table-status"></span>
   </div>`;
 }
@@ -4434,6 +4541,7 @@ document.getElementById("ds-wizard-register-btn").addEventListener("click", asyn
       _renderBoard();
     }
     _setWizStep(3);
+    _refreshExistingPkgOptions();
   } finally {
     btn.disabled = false;
   }
@@ -4468,8 +4576,7 @@ document.getElementById("ds-wizard-step-bundle").addEventListener("change", (e) 
   if (e.target.classList.contains("ds-bt-check")) _updateMovebar();
   if (e.target.id === "ds-existing-pkg-sel" && e.target.value) {
     const pkg = (_wizardExistPkgs || []).find((p) => p.id === e.target.value);
-    e.target.value = "";
-    if (!pkg) return;
+    if (!pkg) { e.target.value = ""; _syncDropdownRebuild(e.target); return; }
     _wizardBoard.trays.push({
       id: "t" + (++_wizardTrayIdSeq),
       name: pkg.name,
@@ -4477,14 +4584,23 @@ document.getElementById("ds-wizard-step-bundle").addEventListener("change", (e) 
       existing: pkg.id,
     });
     _renderBoard();
+    // Re-filters the onBoard exclusion now that this pick joined the board,
+    // and resets the select back to its placeholder.
+    _refreshExistingPkgOptions();
   }
 });
 // The existing-package list loads on first open, not on page load — it is
 // another page's data and most wizard runs never open this picker. Packages
 // already sitting on the board are omitted, not disabled: offering a second
 // tray for the same package would make Finish attach twice.
-document.getElementById("ds-existing-pkg-sel").addEventListener("focus", async (e) => {
-  const sel = e.target;
+//
+// `_wizardExistPkgs` is fetched once and cached; the onBoard filter is
+// recomputed every call since the board changes as packages are added. Also
+// called from _setWizStep(3) (paired .ds-dropdown never receives the native
+// `focus` below — the branded button intercepts all interaction, and the
+// paper theme hides the real select) and after each pick updates the board.
+async function _refreshExistingPkgOptions() {
+  const sel = document.getElementById("ds-existing-pkg-sel");
   if (_wizardExistPkgs === null) {
     try {
       const r = await fetch("/api/admin/data-packages", { credentials: "include" });
@@ -4496,7 +4612,9 @@ document.getElementById("ds-existing-pkg-sel").addEventListener("focus", async (
   sel.innerHTML = '<option value="">＋ Into existing package…</option>' +
     _wizardExistPkgs.filter((p) => !onBoard.has(p.id))
       .map((p) => `<option value="${_esc(p.id)}">${_esc(p.name)}</option>`).join("");
-});
+  _syncDropdownRebuild(sel);
+}
+document.getElementById("ds-existing-pkg-sel").addEventListener("focus", _refreshExistingPkgOptions);
 document.getElementById("ds-wizard-step-bundle").addEventListener("input", (e) => {
   if (e.target.classList.contains("ds-tray-name")) {
     const tray = _wizardBoard.trays.find((t) => t.id === e.target.closest(".ds-btray").dataset.tray);
