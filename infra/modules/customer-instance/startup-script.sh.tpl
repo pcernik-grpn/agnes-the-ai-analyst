@@ -59,6 +59,42 @@ if [ -w /sys/kernel/mm/transparent_hugepage/enabled ]; then
     echo "THP set to: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
 fi
 
+# --- 1d. Docker log rotation (default json-file path) ---
+# Without an explicit log-driver config, Docker's json-file driver never
+# rotates — a routinely-recreated container (agnes-auto-upgrade ticks every
+# 5 min) can accumulate unbounded log files on the boot disk, on top of the
+# recreate itself already destroying the previous container's log history.
+# This is the fallback for VMs that don't run docker-compose.gcp-logging.yml
+# (enable_gcp_logging=false, or any non-GCE deployment of this module).
+# Placed here — BEFORE the data disk mount and well before any `docker
+# compose up` — because a daemon restart is safe with no containers running
+# and unsafe once they are. Written ONLY when the file is absent: an
+# operator-authored daemon.json (custom log driver, registry mirror, other
+# daemon setting) must never be clobbered by this script re-running on every
+# boot.
+DAEMON_JSON=/etc/docker/daemon.json
+# --- docker-log-rotation begin (extracted + executed by tests/test_daemon_json_rotation.py) ---
+DOCKER_LOG_ROTATION_WRITTEN=0
+if [ -f "$DAEMON_JSON" ]; then
+    echo "INFO: $DAEMON_JSON already exists — leaving Docker log-rotation config to the operator" >&2
+else
+    mkdir -p "$(dirname "$DAEMON_JSON")"
+    cat > "$DAEMON_JSON" <<'DAEMONEOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "5"
+  }
+}
+DAEMONEOF
+    DOCKER_LOG_ROTATION_WRITTEN=1
+fi
+# --- docker-log-rotation end ---
+if [ "$DOCKER_LOG_ROTATION_WRITTEN" = "1" ]; then
+    systemctl restart docker
+fi
+
 # --- 2. Persistent data disk mount ---
 DATA_DEV="/dev/disk/by-id/google-data"
 DATA_MNT="/data"
@@ -161,6 +197,21 @@ trap "docker rm '$EXTRACT_CONTAINER' >/dev/null 2>&1 || true" EXIT
 docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/." "$APP_DIR/"
 docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/agnes-auto-upgrade.sh" /usr/local/bin/agnes-auto-upgrade.sh
 chmod +x /usr/local/bin/agnes-auto-upgrade.sh
+
+# docker-compose.gcp-logging.yml (see its own header comment) ships baked
+# into the image and was just extracted into $APP_DIR unconditionally by the
+# recursive docker cp above. Its mere PRESENCE is what activates it — the
+# COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) appends it to
+# every recurring `docker compose` invocation whenever the file exists on
+# disk, and section 4 below inlines the same presence check into
+# COMPOSE_FILE_VALUE so this script's own first `up -d` engages it too. On a
+# non-GCE / non-GCP deployment (or an operator who wants the default
+# json-file driver instead), remove it right back out so that presence check
+# stays false. Runs on every boot, so it also self-heals a VM whose
+# enable_gcp_logging flipped since the last provisioning.
+%{ if !enable_gcp_logging ~}
+rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
+%{ endif ~}
 
 # Install agnes-state-applier (DB backend state machine — applies compose
 # lifecycle changes when /data/state/db-state-target.flag changes). The
@@ -577,6 +628,23 @@ if [ "$PERSISTED_BACKEND" = "side_car" ]; then
     COMPOSE_FILE_VALUE="docker-compose.yml:docker-compose.prod.yml:docker-compose.postgres.yml:docker-compose.host-mount.yml:docker-compose.postgres-host-mount.yml"
 else
     COMPOSE_FILE_VALUE="docker-compose.yml:docker-compose.prod.yml:docker-compose.host-mount.yml"
+fi
+
+# GCP Cloud Logging overlay — same presence gate as the canonical resolver
+# (scripts/ops/agnes-compose-file.sh::agnes_resolve_compose_file), inlined
+# because only the recurring drivers (agnes-auto-upgrade.sh,
+# agnes-state-applier.sh) source that file; this script's first
+# `docker compose up -d` builds COMPOSE_FILE_VALUE itself. Without this
+# append the very first boot ran the stack on the json-file driver, and the
+# first auto-upgrade tick lazily initializes its config marker to the status
+# quo (no drift detected) — so logs didn't reach Cloud Logging until some
+# unrelated recreate. Section 2 above removed the extracted file when
+# enable_gcp_logging=false, so presence is the single switch, exactly as the
+# resolver sees it. Appended before the deploy-layer overlays
+# (dispatcher/kai-agent) to match the resolver's managed-first ordering and
+# keep kai-agent last for the strict-boot strip below.
+if [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
+    COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.gcp-logging.yml"
 fi
 
 %{ if dispatcher_enabled ~}

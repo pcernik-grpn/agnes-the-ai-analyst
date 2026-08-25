@@ -1,18 +1,27 @@
 # GCP Cloud Logging overlay — ships container stdout/stderr to Google Cloud
 # Logging via Docker's built-in `gcplogs` driver.
 #
-# Activation is PLACEMENT-DRIVEN: this file is deliberately NOT baked into the
-# image and NOT in any default COMPOSE_FILE / CONFIG_FILES list. The runtime
-# drivers (agnes-auto-upgrade.sh, agnes-state-applier.sh) append it ONLY when the
-# file physically exists on disk (`[ -f docker-compose.gcp-logging.yml ]`). The
-# only thing that places the file on a VM is the GCE deploy layer (the customer
-# infra Terraform startup script), which runs exclusively on GCE — so file
-# presence is a reliable "I'm on GCE" signal.
+# Activation is PLACEMENT-DRIVEN: this file is not in any default COMPOSE_FILE
+# / CONFIG_FILES list. The runtime drivers (agnes-auto-upgrade.sh,
+# agnes-state-applier.sh) append it ONLY when the file physically exists on
+# disk (`[ -f docker-compose.gcp-logging.yml ]`), via the shared resolver in
+# scripts/ops/agnes-compose-file.sh.
 #
-# Why not default-on: the gcplogs driver requires Google ADC from the GCE
-# metadata server, so on a non-GCP host the containers would fail to start.
-# Placement-driven activation keeps non-GCP deployments on the default
-# json-file driver untouched, preserving the vendor-agnostic OSS deployment.
+# The real placement mechanism (`infra/modules/customer-instance/`, the
+# reusable Terraform module for GCE-hosted instances): this file is baked
+# into the app image at /opt/agnes-host/ (Dockerfile) alongside every other
+# host artifact, and startup-script.sh.tpl's existing recursive
+# `docker cp .../opt/agnes-host/. $APP_DIR/` extracts it onto the VM on every
+# boot. The module's `enable_gcp_logging` variable (default true) then
+# decides whether the script leaves the extracted file in place or removes
+# it again — removal is what turns the resolver's presence check off for a
+# VM that opts out.
+#
+# Why not default-on regardless of host: the gcplogs driver requires Google
+# ADC from the GCE metadata server, so on a non-GCP host the containers would
+# fail to start. `enable_gcp_logging=false` (or simply not using this module
+# at all — the file is only ever placed by it) keeps a deployment on the
+# default json-file driver, preserving the vendor-agnostic OSS deployment.
 #
 # The driver auto-detects the GCP project and the instance name/id/zone from the
 # metadata server, writes under resource `gce_instance` (next to the VM/system

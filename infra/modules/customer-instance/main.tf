@@ -525,6 +525,7 @@ resource "google_compute_instance" "vm" {
     data_apps_enabled               = each.value.data_apps_enabled
     data_apps_runtime_image         = var.data_apps_runtime_image
     enable_watchdog                 = var.enable_watchdog
+    enable_gcp_logging              = var.enable_gcp_logging
     alert_webhook_url               = var.alert_webhook_url
     watchdog_files_b64              = local.watchdog_files_b64
     dispatcher_enabled              = each.value.dispatcher_enabled
