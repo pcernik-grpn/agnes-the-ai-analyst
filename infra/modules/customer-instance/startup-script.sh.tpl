@@ -195,7 +195,9 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 # into the image and was just extracted into $APP_DIR unconditionally by the
 # recursive docker cp above. Its mere PRESENCE is what activates it — the
 # COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) appends it to
-# every `docker compose` invocation whenever the file exists on disk. On a
+# every recurring `docker compose` invocation whenever the file exists on
+# disk, and section 4 below inlines the same presence check into
+# COMPOSE_FILE_VALUE so this script's own first `up -d` engages it too. On a
 # non-GCE / non-GCP deployment (or an operator who wants the default
 # json-file driver instead), remove it right back out so that presence check
 # stays false. Runs on every boot, so it also self-heals a VM whose
@@ -619,6 +621,23 @@ if [ "$PERSISTED_BACKEND" = "side_car" ]; then
     COMPOSE_FILE_VALUE="docker-compose.yml:docker-compose.prod.yml:docker-compose.postgres.yml:docker-compose.host-mount.yml:docker-compose.postgres-host-mount.yml"
 else
     COMPOSE_FILE_VALUE="docker-compose.yml:docker-compose.prod.yml:docker-compose.host-mount.yml"
+fi
+
+# GCP Cloud Logging overlay — same presence gate as the canonical resolver
+# (scripts/ops/agnes-compose-file.sh::agnes_resolve_compose_file), inlined
+# because only the recurring drivers (agnes-auto-upgrade.sh,
+# agnes-state-applier.sh) source that file; this script's first
+# `docker compose up -d` builds COMPOSE_FILE_VALUE itself. Without this
+# append the very first boot ran the stack on the json-file driver, and the
+# first auto-upgrade tick lazily initializes its config marker to the status
+# quo (no drift detected) — so logs didn't reach Cloud Logging until some
+# unrelated recreate. Section 2 above removed the extracted file when
+# enable_gcp_logging=false, so presence is the single switch, exactly as the
+# resolver sees it. Appended before the deploy-layer overlays
+# (dispatcher/kai-agent) to match the resolver's managed-first ordering and
+# keep kai-agent last for the strict-boot strip below.
+if [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
+    COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.gcp-logging.yml"
 fi
 
 %{ if dispatcher_enabled ~}
