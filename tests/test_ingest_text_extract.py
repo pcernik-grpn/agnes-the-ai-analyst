@@ -118,4 +118,12 @@ def test_pypdf_is_a_core_dependency(tmp_path, caplog):
         result = extract_text(str(path), "pdf")
     assert isinstance(result, ExtractResult)
     assert "Hello Agnes" in result.full_text
-    assert caplog.records == [], "pypdf should parse this fixture cleanly, not via malformed-PDF recovery"
+    # Scoped to pypdf's own records on purpose. `caplog.at_level(level,
+    # logger=...)` sets the LEVEL for that logger but `caplog.records` still
+    # collects from every logger, so the bare `caplog.records == []` this
+    # replaces failed on warnings from unrelated libraries: in the `rich-extras`
+    # job, where docling is installed, `extract_text` reaches huggingface_hub
+    # and it logs "You are sending unauthenticated requests to the HF Hub"
+    # (#1553). That says nothing about whether pypdf parsed the fixture.
+    pypdf_warnings = [r for r in caplog.records if r.name.split(".")[0] == "pypdf"]
+    assert pypdf_warnings == [], "pypdf should parse this fixture cleanly, not via malformed-PDF recovery"
