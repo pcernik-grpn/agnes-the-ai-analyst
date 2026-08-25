@@ -24,7 +24,18 @@
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
+  /* Non-interactive group heading inside the skill picker's branded menu —
+     mirrors the native <optgroup label> the select itself still carries
+     (ds_dropdown.js's item-scan is `[role="menuitemradio"]`, so a
+     `role="presentation"` row here is automatically excluded from both
+     keyboard nav and click-to-select — no ds_dropdown.js change needed). */
+  .ds-dropdown-menu-group {
+    padding: 6px 10px 2px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--ds-text-muted); cursor: default;
+  }
   /* Page chrome only — all colors ride --ds-* tokens. The agent's own
      identity (avatar chip, preview greeting) uses the --ds-agnes assistant
      accent; actions stay on --ds-primary; entity-kind tags keep the
@@ -241,6 +252,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   'use strict';
@@ -755,7 +767,8 @@
         '<input type="text" data-ag-sch-field="schedule" value="' + esc(schedForm.schedule) + '" placeholder="e.g. cron 0 7 * * 1-5" autocomplete="off">' +
         '<span class="ag-hint">Formats: <code>every 30m</code> / <code>every 2h</code> · <code>daily 07:00</code> (comma-separate several times) · <code>cron 0 7 * * 1-5</code> — note the literal <code>cron </code> prefix.</span></label>' +
       '<label class="ag-field"><span>Skill <em>— optional; picking one drafts the prompt for you</em></span>' +
-        '<select data-ag-sch-skill>' + skillOptionsHtml(a) + '</select></label>' +
+        '<select id="ag-sch-skill" data-ag-sch-skill class="ds-dropdown-native">' + skillOptionsHtml(a) + '</select>' +
+        '<div class="ds-dropdown" data-ds-dropdown-target="ag-sch-skill"></div></label>' +
       '<label class="ag-field"><span>Prompt <em>— what the agent is asked on every run</em></span>' +
         '<textarea rows="3" data-ag-sch-field="prompt" placeholder="e.g. Prepare the morning briefing from the latest data.">' + esc(schedForm.prompt) + '</textarea></label>' +
       '<label class="ag-sch-en"><input type="checkbox" data-ag-sch-enabled' + (schedForm.enabled ? ' checked' : '') + '> Enabled</label>' +
@@ -797,10 +810,47 @@
     var sumEl = document.querySelector('[data-sec="schedules"] .ag-sec-sum');
     if (sumEl) sumEl.textContent = scheduleSummary();
   }
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from ag-sch-skill's
+  // own <option>/<optgroup> DOM, preserving the "From this agent's plugins"
+  // / "From other plugins" grouping as non-interactive `.ds-dropdown-menu-
+  // group` headers (ds_dropdown.js's item-scan is `[role="menuitemradio"]`,
+  // so these are automatically skipped by both keyboard nav and click-to-
+  // select). Called after every renderBuilder() (fresh <select> each time —
+  // safe either way) and from refreshSkillSelect() below (same persisting
+  // <select>, where NOT rebuilding the button would double-register its
+  // click handler on ds_dropdown.js's next init() call).
+  function syncSkillDropdown() {
+    var sel = document.getElementById('ag-sch-skill');
+    var host = document.querySelector('.ds-dropdown[data-ds-dropdown-target="ag-sch-skill"]');
+    if (!sel || !host) return;
+    var selectedOpt = sel.options[sel.selectedIndex];
+    var itemsHtml = '';
+    Array.prototype.forEach.call(sel.children, function (node) {
+      if (node.tagName === 'OPTGROUP') {
+        itemsHtml += '<li class="ds-dropdown-menu-group" role="presentation">' + esc(node.label) + '</li>';
+        Array.prototype.forEach.call(node.children, function (opt) { itemsHtml += skillOptionLi(opt, selectedOpt); });
+      } else if (node.tagName === 'OPTION') {
+        itemsHtml += skillOptionLi(node, selectedOpt);
+      }
+    });
+    host.innerHTML =
+      '<button type="button" class="ds-dropdown-btn" id="ag-sch-skill-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="ag-sch-skill-dd-menu">' +
+        '<span class="ds-dropdown-btn-label" id="ag-sch-skill-dd-btn-label">' + (selectedOpt ? esc(selectedOpt.textContent) : '') + '</span>' +
+        '<svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>' +
+      '</button>' +
+      '<ul class="ds-dropdown-menu" id="ag-sch-skill-dd-menu" role="menu" aria-label="Skill" hidden>' + itemsHtml + '</ul>';
+    if (window.dsDropdownInit) window.dsDropdownInit(host);
+  }
+  function skillOptionLi(opt, selectedOpt) {
+    if (opt.disabled) return '';
+    var selected = opt === selectedOpt;
+    return '<li class="ds-dropdown-menu-item' + (selected ? ' is-selected' : '') + '" role="menuitemradio" aria-checked="' + selected + '" tabindex="0" data-value="' + esc(opt.value) + '">' + esc(opt.textContent) + '</li>';
+  }
   function refreshSkillSelect() {
     var sel = document.querySelector('[data-ag-sch-skill]');
     var a = current();
     if (sel && a) sel.innerHTML = skillOptionsHtml(a);
+    syncSkillDropdown();
   }
   function setSchedErr(msg) {
     var el = document.querySelector('[data-sch-err]');
@@ -876,6 +926,7 @@
         '</div>' +
         '<aside class="ag-preview" id="ag-preview">' + previewHtml(a) + '</aside>' +
       '</div>';
+    syncSkillDropdown();
   }
 
   /* Light-touch preview sync while typing (no re-render → keeps focus). */
