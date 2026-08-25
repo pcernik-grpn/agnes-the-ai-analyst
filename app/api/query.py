@@ -1015,6 +1015,43 @@ def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
                 i = n
             else:
                 i = close + 1
+        elif (
+            ch in ("E", "e")
+            and i + 1 < n
+            and sql[i + 1] == "'"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):
+            # DuckDB E-strings: `E'...'` / `e'...'` accept BACKSLASH escapes
+            # on top of the usual `''` (verified against the engine:
+            # `SELECT E'\''` yields `'`, and `SELECT E'a\'` is a parser
+            # error because the `\'` escapes the quote and the literal
+            # never closes). A scanner that ignored the prefix would read
+            # `E'\''` as an unterminated literal and refuse a valid query,
+            # and would end `E'\'; DROP TABLE x --'` early — exposing text
+            # DuckDB itself treats as data. Both mismatches fail CLOSED
+            # (a 400/403 on a valid query, never a hidden statement), but
+            # false positives are exactly what this masking exists to
+            # remove. The identifier guard on the preceding character keeps
+            # a trailing `e` of some longer word from starting an E-string.
+            j = i + 2
+            closed = False
+            while j < n:
+                if sql[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed and strict:
+                raise _UnterminatedSqlLiteralError("unterminated E-string literal")
+            end = j + 1 if closed else n
+            for k in range(i, end):
+                out[k] = " "
+            i = end
         elif ch == "'":
             j = i + 1
             closed = False

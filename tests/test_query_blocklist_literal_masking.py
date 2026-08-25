@@ -248,3 +248,68 @@ class TestMaskSqlForGuardHelper:
         result = _mask_sql_noise("select 'abc")
         assert isinstance(result, str)
         assert len(result) == len("select 'abc")
+
+
+class TestEStringLiterals:
+    """DuckDB E-strings (`E'...'` / `e'...'`) accept BACKSLASH escapes on top
+    of the usual `''`. Every expectation below was verified against the engine
+    itself before being pinned here:
+
+        SELECT E'\\''                     -> "'"          (valid)
+        SELECT E'a''b'                    -> "a'b"        (valid)
+        SELECT E'\\'; DROP TABLE x --'    -> "'; DROP TABLE x --"  (ONE literal)
+        SELECT E'a\\'                     -> Parser Error: unterminated
+
+    A scanner blind to the `E` prefix reads the first as unterminated (400 on a
+    valid query) and ends the third early (exposing text DuckDB treats as pure
+    data). Both mismatches fail closed, but false positives are precisely what
+    this masking exists to remove. Raised by Devin review on #1546.
+    """
+
+    def test_backslash_escaped_quote_is_not_read_as_unterminated(self):
+        from app.api.query import _mask_sql_for_guard
+
+        sql = r"SELECT E'\'' AS x"
+        masked = _mask_sql_for_guard(sql, mask_comments=False)
+        assert len(masked) == len(sql)
+        assert masked.strip().startswith("SELECT")
+        assert masked.rstrip().endswith("AS x")
+
+    def test_doubled_quote_escape_also_works_inside_an_e_string(self):
+        from app.api.query import _mask_sql_for_guard
+
+        sql = "SELECT E'a''b' AS x"
+        masked = _mask_sql_for_guard(sql, mask_comments=False)
+        assert "a''b" not in masked
+        assert len(masked) == len(sql)
+
+    def test_e_string_body_is_masked_whole_matching_duckdb(self):
+        # DuckDB parses this as a SINGLE string whose VALUE is
+        # "'; DROP TABLE x --" — nothing is executed. Ending the literal
+        # early would refuse a valid query.
+        from app.api.query import _mask_sql_for_guard
+
+        sql = r"SELECT E'\'; DROP TABLE x --' AS y"
+        masked = _mask_sql_for_guard(sql, mask_comments=False)
+        assert "DROP" not in masked
+        assert len(masked) == len(sql)
+
+    def test_unterminated_e_string_is_still_refused(self):
+        # DuckDB itself rejects this (the \' escapes the quote, so the
+        # literal never closes) — the guard must not guess otherwise.
+        import pytest
+        from fastapi import HTTPException
+
+        from app.api.query import _mask_sql_for_guard
+
+        with pytest.raises(HTTPException) as exc:
+            _mask_sql_for_guard(r"SELECT E'a\'", mask_comments=False)
+        assert exc.value.status_code == 400
+
+    def test_trailing_e_of_an_identifier_does_not_start_an_e_string(self):
+        from app.api.query import _mask_sql_for_guard
+
+        sql = "SELECT case_e'x' AS y"
+        masked = _mask_sql_for_guard(sql, mask_comments=False)
+        assert "case_e" in masked, "the identifier must stay visible to the guards"
+        assert "'x'" not in masked
