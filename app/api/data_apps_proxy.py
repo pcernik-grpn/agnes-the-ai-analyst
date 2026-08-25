@@ -337,7 +337,7 @@ allow same-origin serving.</p></div>
 """
 
 
-def _same_origin_serving_refused(request: Request, accepts_json: bool) -> Optional[Response]:
+def _same_origin_serving_refused(request: Request, accepts_json: bool, via_preview: bool) -> Optional[Response]:
     """Refuse serving a hosted app on the MAIN origin unless explicitly allowed.
 
     A request rewritten from a data-app subdomain
@@ -346,15 +346,29 @@ def _same_origin_serving_refused(request: Request, accepts_json: bool) -> Option
     A request that arrived on the main host serves the app SAME-ORIGIN as the
     Agnes API: the app's user-authored JS shares the viewer's session cookie
     and can read ``/api`` (mint a PAT, read admin config). That is refused
-    unless the operator set ``data_apps.allow_same_origin`` /
-    ``AGNES_DATA_APPS_ALLOW_SAME_ORIGIN`` (see
-    ``app/api/data_apps.py::_CONFIG_DEFAULTS`` for why headers can't close it).
+    unless:
+
+    - ``via_preview`` — the caller holds a ``data-app-preview:<slug>`` token
+      (per-app, short-TTL, minted only to someone who already passed
+      ``_can_view`` for THIS slug). The in-chat preview loads the app
+      same-origin in an iframe and needs this; scoping the allowance to the
+      preview token — rather than the instance-global flag below — keeps a
+      plain drive-by navigation to ``/apps/<other-slug>/`` (no preview token)
+      refused, so enabling the preview does NOT re-open same-origin serving for
+      every app. The previewer's own session is still exposed to the app they
+      chose to preview — an inherent, deliberate, per-app preview risk.
+    - the operator set ``data_apps.allow_same_origin`` /
+      ``AGNES_DATA_APPS_ALLOW_SAME_ORIGIN`` — serve ALL apps same-origin
+      (trusted authors only; see ``app/api/data_apps.py::_CONFIG_DEFAULTS`` for
+      why no response header can close a same-origin read).
 
     Returns the refusal ``Response`` (403) when serving must be refused, else
     ``None`` to proceed. Runs after RBAC so it never reveals an app's
     existence to a caller who would otherwise get a plain 401/403.
     """
     if request.scope.get("agnes_data_app_subdomain"):
+        return None
+    if via_preview:
         return None
     if same_origin_serving_allowed():
         return None
@@ -574,9 +588,10 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
 
     accepts_json = _wants_json(request)
     # Refuse same-origin serving unless the request arrived on a data-app
-    # subdomain (isolated origin) or the operator opted in. After RBAC so the
-    # refusal never leaks an app's existence to an unauthorized caller.
-    refused = _same_origin_serving_refused(request, accepts_json)
+    # subdomain (isolated origin), carries a per-app preview token, or the
+    # operator opted in. After RBAC so the refusal never leaks an app's
+    # existence to an unauthorized caller.
+    refused = _same_origin_serving_refused(request, accepts_json, via_preview)
     if refused is not None:
         return refused
 

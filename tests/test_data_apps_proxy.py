@@ -869,6 +869,21 @@ def test_preview_token_authorizes_iframe(proxy_client, fake_runner, respx_upstre
     assert r.text == "hello from app"
 
 
+def test_preview_token_serves_same_origin_without_global_ack(
+    proxy_client, fake_runner, respx_upstream, running_app, mint_preview, proxy_env
+):
+    """A per-app preview token serves same-origin even with
+    `allow_same_origin=False` — the in-chat preview works WITHOUT the global
+    flag. A plain navigation (no preview token) to the same origin is still
+    refused (see `test_same_origin_serving_refused_by_default`), so enabling the
+    preview does not re-open drive-by same-origin serving for every app."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": tok.cookie})
+    assert r.status_code == 200, r.text
+    assert r.text == "hello from app"
+
+
 def test_expired_preview_token_403(proxy_client, running_app, mint_preview):
     """A GET returning a raw 401 on a non-API path is redirected to
     ``/login`` by the app-wide browser-friendly error handler

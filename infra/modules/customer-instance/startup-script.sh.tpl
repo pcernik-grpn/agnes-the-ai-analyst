@@ -1190,10 +1190,17 @@ fi
 #
 # Scoped to the agnes-apps bridge SOURCE subnet, NOT a blanket block: the Agnes
 # app container itself legitimately reaches the metadata server (e.g. BigQuery
-# GCE-metadata auth) and egresses it via its default-network interface, so a
-# source-subnet rule on agnes-apps leaves the app untouched. DOCKER-USER is the
-# Docker-provided FORWARD hook, evaluated before SNAT/MASQUERADE, so a
+# GCE-metadata auth). The app is multi-homed but `default` is pinned as its
+# highest-priority network (docker-compose.yml `networks.default.priority`), so
+# its egress — metadata included — routes via `default`, its source IP is in the
+# `default` subnet, and this agnes-apps-scoped rule never matches it. DOCKER-USER
+# is the Docker-provided FORWARD hook, evaluated before SNAT/MASQUERADE, so a
 # container's real source IP still matches here. Idempotent (check before insert).
+#
+# Resolved at boot from the live network. If agnes-apps is later recreated with a
+# different subnet (e.g. `docker network prune` + redeploy without a reboot), the
+# rule is stale until the next boot re-runs this block — re-run it (or reboot)
+# after any manual agnes-apps network recreation.
 METADATA_IP="169.254.169.254"
 APPS_NETWORK="agnes-apps"
 # Compose created agnes-apps on `up`; ensure it exists so its subnet resolves

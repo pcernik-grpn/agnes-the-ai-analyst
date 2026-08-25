@@ -628,11 +628,24 @@ CSP). The only fix is origin isolation: configure `data_apps.subdomain_base` so
 apps are served from their own origin (`<slug>.<subdomain_base>`), where the
 existing CORS policy blocks the credentialed read and `CsrfOriginMiddleware`
 blocks the write. The ingress proxy therefore **refuses** to serve an app on the
-main origin unless the operator opts in with `data_apps.allow_same_origin` /
-`AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (trusted authors only, or to keep the
-in-chat preview working); requests that arrive on a data-app subdomain are
-always served. A startup log flags an enabled-but-unservable posture
-(no isolated origin, no opt-in).
+main origin unless one of: the request carries a per-app `data-app-preview:<slug>`
+token (the in-chat preview — served same-origin only to a caller who already
+holds a short-TTL token for *that* app, so a plain drive-by navigation to
+`/apps/<other-slug>/` stays refused), or the operator opts into
+`data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (serve ALL
+apps same-origin — trusted authors only). Requests that arrive on a data-app
+subdomain are always served. A startup log flags an enabled-but-unservable
+posture (no isolated origin, no opt-in).
+
+The isolated-origin signal is the request's `Host` (rewritten by
+`app/data_apps_subdomain.py`), so the TLS-terminating reverse proxy in front of
+Agnes **must route by Host** — a `<slug>.<subdomain_base>` request should reach
+Agnes only when the client genuinely connected to that subdomain, and a
+client-supplied `Host` that doesn't match the terminating certificate should be
+rejected or normalized. A browser cannot forge `Host` for a cross-origin request,
+so this is a deployment-correctness requirement rather than a browser-reachable
+bypass; when `subdomain_base` is unset the marker is never set regardless of
+`Host`.
 
 **Network egress** (GCP metadata): a data-app container sits on the `agnes-apps`
 bridge with normal egress (its runtime image installs dependencies from PyPI/npm
@@ -644,7 +657,12 @@ idempotent `DOCKER-USER` iptables DROP from the `agnes-apps` source subnet to
 `169.254.169.254/32`, installed at boot (see the `container-metadata-hardening`
 block in `infra/modules/customer-instance/startup-script.sh.tpl`). It is
 source-scoped, not a blanket block, so the Agnes app container's own metadata
-use (e.g. BigQuery GCE-metadata auth) is unaffected. For a non-Terraform host
+use (e.g. BigQuery GCE-metadata auth) is unaffected — the `app` service pins
+`default` as its highest-priority network (`docker-compose.yml`
+`networks.default.priority`) so its egress routes via `default`, keeping its
+source IP out of the `agnes-apps` subnet the rule matches. The rule resolves the
+subnet at boot; re-run the block (or reboot) after any manual `agnes-apps`
+network recreation. For a non-Terraform host
 (plain docker-compose), install the equivalent rule yourself:
 `iptables -I DOCKER-USER -s <agnes-apps-subnet> -d 169.254.169.254/32 -j DROP`
 (resolve the subnet with `docker network inspect agnes-apps`). Least-privilege

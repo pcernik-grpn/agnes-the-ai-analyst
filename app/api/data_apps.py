@@ -145,9 +145,11 @@ _CONFIG_DEFAULTS = {
     # ungoverned by CSP), so the only real fix is origin isolation. Configure
     # `subdomain_base` to serve apps from their own origin (where the existing
     # CORS + CsrfOrigin defenses contain the attack); requests that arrive on a
-    # data-app subdomain are always served. This flag is the explicit,
-    # documented escape hatch for an operator who accepts same-origin serving
-    # (e.g. only trusted authors, or the in-chat preview) — see
+    # data-app subdomain are always served. The in-chat preview does NOT need
+    # this flag — it is served same-origin only for a caller holding a per-app
+    # `data-app-preview:<slug>` token (see `data_apps_proxy._same_origin_serving_
+    # refused`). This flag is the explicit escape hatch for serving ALL apps
+    # same-origin to everyone (trusted authors only) — see
     # `app/api/data_apps_proxy.py` and docs/architecture.md#hosted-data-apps.
     "allow_same_origin": False,
     "default_idle_timeout_s": 1800,

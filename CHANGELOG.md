@@ -21,10 +21,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   iptables DROP at boot (`container-metadata-hardening` block in
   `startup-script.sh.tpl`), source-scoped to the `agnes-apps` subnet so the
   Agnes app container's own metadata use (e.g. BigQuery GCE-metadata auth) is
-  untouched. Non-Terraform hosts should install the equivalent rule (see
-  `docs/architecture.md#hosted-data-apps`) and least-privilege the VM service
-  account regardless. Fail-soft: a missing `iptables` or an unresolvable subnet
-  warns and never blocks the boot.
+  untouched — the `app` service now pins `default` as its highest-priority
+  network (`docker-compose.yml`), so its egress routes off `agnes-apps` and its
+  source IP never matches the rule. Non-Terraform hosts should install the
+  equivalent rule (see `docs/architecture.md#hosted-data-apps`) and
+  least-privilege the VM service account regardless. Fail-soft: a missing
+  `iptables` or an unresolvable subnet warns and never blocks the boot.
 
 ### Changed
 
@@ -38,11 +40,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   where the existing CORS + CSRF-origin defenses contain the attack) or
   explicitly opts into same-origin serving with the new
   `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (default
-  `false`). Requests that arrive on a data-app subdomain are always served. A
-  deployment that runs apps in path-prefix mode (no `subdomain_base`) — **and
-  the in-chat app preview, which loads same-origin** — must set
-  `allow_same_origin: true` (trusted authors only) or move to subdomain mode;
-  a startup log flags an enabled-but-unservable posture.
+  `false`). Requests that arrive on a data-app subdomain are always served, and
+  the in-chat preview keeps working without the flag — it is served same-origin
+  only to a caller holding a per-app `data-app-preview:<slug>` token, so
+  enabling the preview does not re-open drive-by same-origin serving for other
+  apps. A deployment that serves apps publicly in path-prefix mode (no
+  `subdomain_base`) must set `allow_same_origin: true` (trusted authors only) or
+  move to subdomain mode; a startup log flags an enabled-but-unservable posture.
 
 ### Removed
 
