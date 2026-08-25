@@ -59,9 +59,9 @@
     font-size: 10px; font-weight: 600;
     text-transform: uppercase; letter-spacing: 0.4px;
   }
-  .gr-origin-system     { background: #fef3c7; color: #92400e; }
-  .gr-origin-custom     { background: #ede9fe; color: #6d28d9; }
-  .gr-origin-google_sync { background: #dcfce7; color: #166534; }
+  .gr-origin-system     { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .gr-origin-custom     { background: var(--ds-kind-agent-soft); color: var(--ds-kind-agent); }
+  .gr-origin-google_sync { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
 
   .gr-empty, .gr-loading {
     padding: 32px 16px; text-align: center;
@@ -85,14 +85,14 @@
     display: flex; flex-direction: column; gap: 8px; pointer-events: none;
   }
   .toast {
-    background: #111827; color: #fff; padding: 10px 16px;
+    background: var(--ds-text-primary); color: var(--ds-text-inverse); padding: 10px 16px;
     border-radius: 8px; font-size: 13px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
     opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
     pointer-events: auto; max-width: 380px;
   }
   .toast.show { opacity: 1; transform: translateY(0); }
-  .toast.success { background: #047857; }
-  .toast.error { background: #b91c1c; }
+  .toast.success { background: var(--ds-accent-success-ink); }
+  .toast.error { background: var(--ds-accent-danger-ink); }
 </style>
 {% endblock %}
 
@@ -123,7 +123,7 @@
       <span id="grant-count" style="font-size: 12px; color: var(--text-secondary, #6b7280);"></span>
     </div>
     <div class="gr-filter">
-      <input id="group-filter" type="search" placeholder="Filter groups…" autocomplete="off">
+      <input id="group-filter" type="search" placeholder="Filter groups…" aria-label="Filter groups" autocomplete="off">
     </div>
     <ul class="gr-grants-list" id="group-list"></ul>
     <div id="group-empty" class="gr-empty" style="display:none;">No user groups found.</div>

@@ -6,6 +6,7 @@
 {% set page_hero_subtitle = "Ingest externally-hosted apps from a Keboola MCP source and grant them to a group — in three steps. Linked apps open on Keboola; " ~ (instance_brand or 'Agnes') ~ " only catalogs, links, and grants them." %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   .wiz-step { margin-bottom: var(--space-6); }
   .wiz-step[hidden] { display: none; }
@@ -34,14 +35,15 @@
     <p class="wiz-note">The source whose "list data apps" tool exposes the Keboola apps to ingest.
       Not registered yet? <a href="/admin">Register an MCP source</a> first, then come back.</p>
     <div class="wiz-row">
-      {# #1055: not converted to ds.dropdown() — options are fetched and the
-         <select> rebuilt entirely by loadSources() (fillSelect/replaceChildren)
-         after the page loads, but ds_dropdown.js only wires up (open/close/
-         select) the `.ds-dropdown-menu` items present at DOMContentLoaded and
-         exposes no public re-init hook. Keeping the custom menu in sync would
-         need touching ds_dropdown.js, which is out of scope here. Same reason
-         for #wiz-tool / #wiz-group below. #}
-      <select id="wiz-source" aria-label="MCP source"><option value="">Loading sources…</option></select>
+      {# Options are fetched and the <select> rebuilt entirely by loadSources()
+         (fillSelect/replaceChildren) after the page loads — the paired
+         .ds-dropdown here starts with a matching placeholder and is rebuilt
+         in sync by syncDropdown() (see below), using ds_dropdown.js's
+         exported re-init hook (#1473). Same for #wiz-tool / #wiz-map-* /
+         #wiz-group below. #}
+      <select id="wiz-source" aria-label="MCP source" class="ds-dropdown-native"><option value="">Loading sources…</option></select>
+      {{ ds.dropdown(id='wiz-source-dd', target='wiz-source', aria_label='MCP source',
+                     options=[{'value': '', 'label': 'Loading sources…'}]) }}
       {{ ds.button('Next', variant='primary', id='wiz-source-next') }}
     </div>
   </div>
@@ -53,7 +55,9 @@
       MCP source's Materialize button) whenever you want a refresh; there is no
       background sync yet.</p>
     <div class="wiz-row">
-      <select id="wiz-tool" aria-label="Lister tool"><option value="">Loading tools…</option></select>
+      <select id="wiz-tool" aria-label="Lister tool" class="ds-dropdown-native"><option value="">Loading tools…</option></select>
+      {{ ds.dropdown(id='wiz-tool-dd', target='wiz-tool', aria_label='Lister tool',
+                     options=[{'value': '', 'label': 'Loading tools…'}]) }}
       {{ ds.button('Fetch apps now', variant='primary', id='wiz-fetch') }}
     </div>
     <div class="wiz-result" id="wiz-fetch-result"></div>
@@ -68,11 +72,14 @@
         to be linkable; the name is optional and falls back to the id.</p>
       <div class="wiz-row">
         <label for="wiz-map-id">Id</label>
-        <select id="wiz-map-id" aria-label="Column carrying the app id"></select>
+        <select id="wiz-map-id" aria-label="Column carrying the app id" class="ds-dropdown-native"></select>
+        {{ ds.dropdown(id='wiz-map-id-dd', target='wiz-map-id', aria_label='Column carrying the app id', options=[]) }}
         <label for="wiz-map-url">URL</label>
-        <select id="wiz-map-url" aria-label="Column carrying the app URL"></select>
+        <select id="wiz-map-url" aria-label="Column carrying the app URL" class="ds-dropdown-native"></select>
+        {{ ds.dropdown(id='wiz-map-url-dd', target='wiz-map-url', aria_label='Column carrying the app URL', options=[]) }}
         <label for="wiz-map-name">Name</label>
-        <select id="wiz-map-name" aria-label="Column carrying the app name"></select>
+        <select id="wiz-map-name" aria-label="Column carrying the app name" class="ds-dropdown-native"></select>
+        {{ ds.dropdown(id='wiz-map-name-dd', target='wiz-map-name', aria_label='Column carrying the app name', options=[]) }}
         {{ ds.button('Save mapping & re-fetch', variant='secondary', id='wiz-map-save') }}
       </div>
     </div>
@@ -84,7 +91,9 @@
       (a <code>data_app</code> resource grant). Leave unchecked the ones you don't want to expose.</p>
     <div class="wiz-row">
       <label><input type="checkbox" id="wiz-all"> Select all</label>
-      <select id="wiz-group" aria-label="Group"><option value="">Loading groups…</option></select>
+      <select id="wiz-group" aria-label="Group" class="ds-dropdown-native"><option value="">Loading groups…</option></select>
+      {{ ds.dropdown(id='wiz-group-dd', target='wiz-group', aria_label='Group',
+                     options=[{'value': '', 'label': 'Loading groups…'}]) }}
       {{ ds.button('Grant to group', variant='primary', id='wiz-grant') }}
     </div>
     <div class="data-table-wrap">
@@ -102,10 +111,48 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   const $ = (id) => document.getElementById(id);
   let sourceId = "";
+
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[c]);
+  }
+
+  // Rebuilds the paired `.ds-dropdown` (see _components.html's `dropdown`
+  // macro, and admin_server_config.html's `dsDropdownMarkup()` for the same
+  // shape) from a native <select>'s current <option>s, then re-runs
+  // ds_dropdown.js's init on it via the exported `dsDropdownInit` re-init
+  // hook (#1473). Rebuilds the button element too, not just the menu items —
+  // init() isn't idempotent for its per-element listeners, so leaving the
+  // same <button> node across two init() calls double-registers its click
+  // handler (the second call's open()/close() sees the first call's toggle
+  // and immediately undoes it — the menu never appears to open). Recreating
+  // the button discards the old node, and its stale listener along with it.
+  function syncDropdown(selectId) {
+    const sel = $(selectId);
+    const ddId = selectId + "-dd";
+    const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${selectId}"]`);
+    if (!sel || !host) return;
+    const options = Array.from(sel.options).map((o) => ({ value: o.value, label: o.textContent }));
+    const current = sel.value;
+    const currentLabel = (options.find((o) => o.value === current) || options[0] || {}).label || "";
+    const menuEl = host.querySelector(".ds-dropdown-menu");
+    const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
+    const nameHtml = ariaLabel
+      ? `<span class="ds-dropdown-name" id="${ddId}-name">${escHtml(ariaLabel)}</span>`
+      : "";
+    const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : "";
+    const items = options.map((o) =>
+      `<li class="ds-dropdown-menu-item${o.value === current ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o.value === current}" tabindex="0" data-value="${escHtml(o.value)}">${escHtml(o.label)}</li>`
+    ).join("");
+    host.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${escHtml(currentLabel)}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${escHtml(ariaLabel || "Options")}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(host);
+  }
 
   // ── safe DOM helpers (never innerHTML with API-supplied text) ─────
   function el(tag, opts) {
@@ -161,6 +208,8 @@
       fillSelect($("wiz-source"), sources, (s) => s.id, (s) => s.name);
     } catch (e) {
       placeholderOption($("wiz-source"), "Failed to load sources");
+    } finally {
+      syncDropdown("wiz-source");
     }
   }
 
@@ -184,6 +233,8 @@
       );
     } catch (e) {
       placeholderOption($("wiz-tool"), "Failed to load tools");
+    } finally {
+      syncDropdown("wiz-tool");
     }
   }
 
@@ -267,6 +318,7 @@
         sel.appendChild(o);
       }
       sel.value = current[field] || guessColumn(field, columns);
+      syncDropdown(id);
     }
     panel.hidden = false;
   }
@@ -343,6 +395,8 @@
       fillSelect($("wiz-group"), groups, (g) => g.id, (g) => g.name);
     } catch (e) {
       placeholderOption($("wiz-group"), "Failed to load groups");
+    } finally {
+      syncDropdown("wiz-group");
     }
   }
 

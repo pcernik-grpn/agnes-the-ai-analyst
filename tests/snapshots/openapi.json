@@ -2212,6 +2212,11 @@
             "title": "Name",
             "type": "string"
           },
+          "seed_from_instance_credentials": {
+            "default": false,
+            "title": "Seed From Instance Credentials",
+            "type": "boolean"
+          },
           "source_type": {
             "title": "Source Type",
             "type": "string"

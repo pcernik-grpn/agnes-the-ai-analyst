@@ -13,11 +13,18 @@ last task in the team (blocked-by all reviewers). Read-only.
 The parent passes each in-scope reviewer's output. Formats differ:
 `agnes-reviewer-parity` returns JSON (`{"in_scope", "findings": [{severity,
 title, introduced_at, mirror_missing_at, detail}]}`); `agnes-reviewer-rules`,
-`agnes-reviewer-architecture`, and `agnes-reviewer-rbac` return Markdown sections
-(one finding per section, each citing `file:line`). An out-of-scope reviewer
-returns `OUT_OF_SCOPE` or `{"in_scope": false}` — skip it. Normalize every
-finding into a common shape (severity, title, `file:line`, detail) before
-merging, and dedup on `file:line`.
+`agnes-reviewer-adversarial`, `agnes-reviewer-architecture`, and
+`agnes-reviewer-rbac` return Markdown sections (one finding per section, each
+citing `file:line` or the command output it was grounded in). An out-of-scope
+reviewer returns `OUT_OF_SCOPE` or `{"in_scope": false}` — skip it. Normalize
+every finding into a common shape (severity, title, `file:line`, detail)
+before merging, and dedup on `file:line`.
+
+`agnes-reviewer-adversarial`'s `FALSE_PREMISE` and `SIBLING_BUG_UNFIXED`
+findings are BLOCKING by default — they mean a stated claim is false or a
+reported bug is only partially fixed, not a style nit. `UNVERIFIED_PREMISE`
+and `EXISTENCE_ONLY_TEST` default to NON-BLOCKING unless the traced dataflow
+in the latter came back `BROKEN`, which escalates to BLOCKING.
 
 ## Merge rules
 

@@ -19,7 +19,6 @@ result as "Keboola is broken".
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -98,16 +97,12 @@ def test_connection(_user: dict = Depends(require_admin)):
         )
 
     token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-    token = os.environ.get(token_env, "").strip() if token_env else ""
-    if not token:
-        token = os.environ.get("KEBOOLA_STORAGE_TOKEN", "").strip()
-    if not token:
-        try:
-            from app.datasource_secrets import datasource_secret  # noqa: PLC0415
+    from app.datasource_secrets import keboola_instance_token  # noqa: PLC0415
 
-            token = (datasource_secret("KEBOOLA_STORAGE_TOKEN") or "").strip()
-        except Exception:
-            pass
+    # The ONE place this 3-step fallback (token_env -> KEBOOLA_STORAGE_TOKEN
+    # -> vault) is implemented — this used to duplicate it inline, which is
+    # exactly the drift `keboola_instance_token()` was extracted to prevent.
+    token, _provenance = keboola_instance_token(token_env or "")
     if not token:
         raise HTTPException(
             status_code=400,
