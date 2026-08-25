@@ -467,6 +467,13 @@ slovník fyzicky) + F4.1 (vidí mezery) + F5 (mezera vede k automaticky
 založenému draftu, ne k nové zápisové cestě); důvěryhodnost navenek vzniká
 kombinací F1+F4.4 (grounding) + F2/F3 bez úniku (governance).
 
+**Stav (2026-08-25): tahle první vlna se už implementuje.** Fáze K
+(kontrakt), F0 (sjednocení na OSI, odstranění ploché struktury) a F1
+(lokální cache, vynucení napříč UI chatem/CLI/MCP) běží souběžně, přesně
+podle doporučení výše — na branch a lokálně. Součástí je i testovací část
+F4.4 (baseline bez sémantiky vs. se sémantikou). Nejde ven postupně po
+fázích: sloučí se a vydá najednou, až tahle vlna doběhne.
+
 ---
 
 ## 5. Otevřené otázky
