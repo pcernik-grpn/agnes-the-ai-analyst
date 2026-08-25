@@ -143,7 +143,8 @@ variable "prod_instance" {
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
-    # (app >= 0.85: env > instance.yaml > "e2b"). Codifies which engine runs
+    # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
+    # Codifies which engine runs
     # /chat sessions IN TERRAFORM instead of a hand-edited instance.yaml on
     # the data disk — the overlay survives reboots and recreates, but not a
     # fresh data disk, and it is invisible in review. Empty (the default)
@@ -261,8 +262,8 @@ variable "prod_instance" {
   # VM. Catch the typo (and the engine-less kai-agent pin, which would refuse
   # every session at mint time) at plan time instead.
   validation {
-    condition     = contains(["", "e2b", "docker", "kai-agent"], var.prod_instance.chat_provider)
-    error_message = "prod_instance.chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+    condition     = contains(["", "docker", "kai-agent"], var.prod_instance.chat_provider)
+    error_message = "prod_instance.chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.88.0."
   }
 
   validation {
@@ -418,9 +419,9 @@ variable "dev_instances" {
   # Same plan-time guards as prod_instance.chat_provider — see there.
   validation {
     condition = alltrue([
-      for i in var.dev_instances : contains(["", "e2b", "docker", "kai-agent"], i.chat_provider)
+      for i in var.dev_instances : contains(["", "docker", "kai-agent"], i.chat_provider)
     ])
-    error_message = "each dev_instances[].chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+    error_message = "each dev_instances[].chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.88.0."
   }
 
   validation {
@@ -556,13 +557,13 @@ variable "notification_channel_ids" {
 }
 
 variable "runtime_secrets" {
-  description = "Names of existing Secret Manager secrets the VM needs to read at runtime (e.g. Keboola Storage token). VM SA gets scoped secretAccessor on each. Use this for secrets the startup script handles explicitly (KEBOOLA_STORAGE_TOKEN, GOOGLE_CLIENT_ID/SECRET — names are hardcoded in startup-script.sh.tpl). For new app-level secrets (E2B_API_KEY, ANTHROPIC_API_KEY, SLACK_*), prefer `runtime_secret_env` below."
+  description = "Names of existing Secret Manager secrets the VM needs to read at runtime (e.g. Keboola Storage token). VM SA gets scoped secretAccessor on each. Use this for secrets the startup script handles explicitly (KEBOOLA_STORAGE_TOKEN, GOOGLE_CLIENT_ID/SECRET — names are hardcoded in startup-script.sh.tpl). For new app-level secrets (ANTHROPIC_API_KEY, SLACK_*), prefer `runtime_secret_env` below."
   type        = list(string)
   default     = ["keboola-storage-token"]
 }
 
 variable "runtime_secret_env" {
-  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: e2b-api-key -> E2B_API_KEY, anthropic-api-key -> ANTHROPIC_API_KEY."
+  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN."
   type        = map(string)
   default     = {}
 }

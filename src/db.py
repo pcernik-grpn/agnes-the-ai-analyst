@@ -6322,7 +6322,7 @@ def _v71_to_v72(conn: duckdb.DuckDBPyConnection) -> None:
 def _v72_to_v73(conn: duckdb.DuckDBPyConnection) -> None:
     """v73: sandbox pause/resume refs on ``chat_sessions``.
 
-    Three nullable columns tracking the E2B sandbox ID, the runner PID,
+    Three nullable columns tracking the provider sandbox ID, the runner PID,
     and the time the session was paused. Must stay un-indexed — DuckDB 1.5.3
     raises a false FK violation when UPDATE-ing indexed columns of
     ``chat_sessions`` after any ``chat_messages`` INSERT (see comment at the

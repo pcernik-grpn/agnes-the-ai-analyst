@@ -26,28 +26,31 @@ import json
 import os
 import secrets
 import subprocess
-import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 from urllib.parse import urlparse
 
 import pytest
 
 
 def skip_unless_chat_sessions_possible() -> None:
-    """Skip tests that create chat sessions when E2B_API_KEY is unset.
+    """Skip tests that create chat sessions unless AGNES_E2E_DOCKER=1.
 
     Fake-agent mode (AGNES_E2E_FAKE_AGENT=1) only removes the Anthropic
-    dependency — every chat session still spawns a real E2B microVM, and
-    without E2B_API_KEY the startup gate in app/main.py leaves
-    ``chat_manager`` unset so POST /api/chat/sessions 503s with
-    ``chat_disabled``. Sandbox minutes are billed when the key IS set.
+    dependency — every chat session still spawns a real docker sandbox
+    container through the apps-runner sidecar, and without that topology
+    (sidecar reachable + `agnes-chat-sandbox` image built) the boot gates
+    in app/main.py leave ``chat_manager`` unset so POST /api/chat/sessions
+    503s with ``chat_disabled``. AGNES_E2E_DOCKER=1 is the operator's
+    statement that the topology is up (mirrors
+    tests/e2e/test_docker_sandbox_smoke.py's gate).
     """
-    if not os.environ.get("E2B_API_KEY"):
+    if not os.environ.get("AGNES_E2E_DOCKER"):
         pytest.skip(
-            "chat sessions spawn real E2B sandboxes even in fake-agent "
-            "mode — set E2B_API_KEY to run this test"
+            "chat sessions spawn real docker sandboxes — set AGNES_E2E_DOCKER=1 "
+            "with the apps-runner sidecar up and the agnes-chat-sandbox image built"
         )
+
 
 import urllib.error
 import urllib.request
@@ -213,8 +216,7 @@ def pump_until(
         if predicate(frame):
             return seen
     raise AssertionError(
-        f"predicate never matched after {max_frames} frames; "
-        f"frame types seen: {[f.get('type') for f in seen]}"
+        f"predicate never matched after {max_frames} frames; frame types seen: {[f.get('type') for f in seen]}"
     )
 
 
@@ -259,8 +261,7 @@ def container_exec_python(code: str, *, timeout: float = 30.0) -> str:
     """
     proc = docker_exec(["python", "-c", code], timeout=timeout)
     assert proc.returncode == 0, (
-        f"container python snippet failed (rc={proc.returncode}); "
-        f"stderr: {proc.stderr.decode('utf-8', 'replace')!r}"
+        f"container python snippet failed (rc={proc.returncode}); stderr: {proc.stderr.decode('utf-8', 'replace')!r}"
     )
     return proc.stdout.decode("utf-8", "replace")
 

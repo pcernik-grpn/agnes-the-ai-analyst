@@ -2090,7 +2090,7 @@ KNOWN_UNTESTED = {
     "POST /api/telegram/webhook",
     # Jira webhooks — live external service
     "POST /api/jira/webhook",
-    # Chat SSE / co-presence — requires live E2B/Anthropic creds
+    # Chat SSE / co-presence — requires live sandbox/Anthropic creds
     "GET /api/chat/sessions/{session_id}/stream",
     "POST /api/chat/sessions",
     "DELETE /api/chat/sessions/{session_id}",

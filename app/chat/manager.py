@@ -1386,7 +1386,7 @@ class ChatManager:
             self._repo.set_sandbox_paused_at(live.chat_id, None)
 
     async def _destroy_old_sandbox(self, session: "ChatSession") -> None:
-        """Best-effort teardown of a session's paused E2B sandbox before its
+        """Best-effort teardown of a session's paused sandbox before its
         refs are cleared. Never raises — a destroy failure must not block the
         fresh spawn, but skipping it entirely leaks a billable microVM (§11)."""
         sandbox_id = getattr(session, "sandbox_id", None)
@@ -1420,7 +1420,7 @@ class ChatManager:
             # Destroy the old (paused, billable) sandbox BEFORE clearing its
             # ref — clear_sandbox_ref NULLs sandbox_paused_at, after which the
             # paused-TTL reaper can never find it, so skipping the destroy here
-            # leaks one E2B microVM per resumable session on every restart (§11).
+            # leaks one remote sandbox per resumable session on every restart (§11).
             await self._destroy_old_sandbox(session)
             self._repo.clear_sandbox_ref(session.id)
             return await self._spawn_live(session)
@@ -1706,7 +1706,7 @@ class ChatManager:
         new owner already destroyed this session's OLD sandbox and has
         since overwritten the repo row with its OWN fresh sandbox_id/
         runner_pid. Calling destroy() again would at best be a redundant
-        no-op (E2B ``AsyncSandbox.kill`` on an already-gone id) and at worst
+        no-op (destroying an already-gone sandbox id) and at worst
         — if sandbox ids were ever reused, which they are not, but the
         principle holds — tear down the NEW owner's live sandbox out from
         under it; clearing the repo's sandbox ref would corrupt the new
@@ -1956,11 +1956,11 @@ class ChatManager:
             # this manager pushes after spawn/resume (_push_ticket_frame).
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             # ``session_dir`` is an Agnes-host-side path; it doesn't exist
-            # inside the E2B sandbox. claude-agent-sdk's inner ``claude``
+            # inside the sandbox. claude-agent-sdk's inner ``claude``
             # CLI needs a writable HOME for ``~/.claude/`` config — using
             # the host path here makes the CLI hang on first config write,
             # which surfaces as ``Control request timeout: initialize``.
-            # ``/home/user`` is created by the e2b template's base image
+            # ``/home/user`` is created by the sandbox base image
             # and is writable by the in-sandbox ``user`` account.
             "HOME": "/home/user",
             "TERM": "dumb",

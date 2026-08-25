@@ -914,7 +914,6 @@ def test_workspace_serves_a_gzipped_tar_of_the_template(seeded_app, kai_env):
 
     # Sandbox-image build assets describe how to BUILD a sandbox, not how to
     # work in one — they have no place in another engine's workspace.
-    assert not any(n.startswith("e2b-template/") for n in names)
     assert not any(n.startswith("docker-sandbox/") for n in names)
 
 

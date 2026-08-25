@@ -41,7 +41,7 @@ async def slack_events(request: Request):
     if payload.get("type") == "url_verification":
         return {"challenge": payload["challenge"]}
     if payload.get("type") == "event_callback":
-        # Ack-then-async: schedule the (slow, E2B-spawning) dispatch and
+        # Ack-then-async: schedule the (slow, sandbox-spawning) dispatch and
         # return the 200 immediately so Slack's 3s budget is never blown.
         # A failure inside the detached task is handled by _run_logged, not
         # by a Slack retry (we already acked). The DM handler emits its own

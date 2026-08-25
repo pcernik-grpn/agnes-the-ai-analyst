@@ -8,15 +8,14 @@ def test_default_disabled(tmp_path: Path):
     yaml.write_text("instance_name: test\n")
     cfg = load_chat_config(yaml)
     assert cfg.enabled is False
-    assert cfg.provider == "e2b"
+    assert cfg.provider == "kai-agent"
     assert cfg.concurrency_per_user == 3
     assert cfg.idle_ttl_seconds == 1800
     assert cfg.per_tool_call_seconds == 90
     assert cfg.per_session_bq_scan_bytes == 20 * 1024**3
     assert cfg.daily_anthropic_spend_usd == 20.0
-    assert cfg.e2b_template_id is None
-    assert cfg.e2b_workspace_max_bytes == 100 * 1024 * 1024
-    assert cfg.e2b_kill_on_ws_disconnect is True
+    assert not hasattr(cfg, "e2b_template_id")
+    assert not hasattr(cfg, "e2b_kill_on_ws_disconnect")
 
 
 def test_enabled_with_overrides(tmp_path: Path):
@@ -25,27 +24,21 @@ def test_enabled_with_overrides(tmp_path: Path):
         "instance_name: test\n"
         "chat:\n"
         "  enabled: true\n"
-        "  provider: e2b\n"
-        "  e2b_template_id: agnes-chat\n"
-        "  e2b_workspace_max_bytes: 52428800\n"
-        "  e2b_kill_on_ws_disconnect: false\n"
+        "  provider: docker\n"
         "  concurrency_per_user: 5\n"
         "  idle_ttl_seconds: 900\n"
     )
     cfg = load_chat_config(yaml)
     assert cfg.enabled is True
-    assert cfg.provider == "e2b"
-    assert cfg.e2b_template_id == "agnes-chat"
-    assert cfg.e2b_workspace_max_bytes == 52428800
-    assert cfg.e2b_kill_on_ws_disconnect is False
+    assert cfg.provider == "docker"
     assert cfg.concurrency_per_user == 5
     assert cfg.idle_ttl_seconds == 900
 
 
 def test_docker_provider_defaults(tmp_path: Path):
-    """`chat.docker_*` knobs are inert under the default e2b provider but must
-    still carry usable defaults — an operator flipping `provider: docker`
-    should get a working stack from the image tag alone."""
+    """`chat.docker_*` knobs are inert under the default kai-agent provider
+    but must still carry usable defaults — an operator flipping
+    `provider: docker` should get a working stack from the image tag alone."""
     yaml = tmp_path / "instance.yaml"
     yaml.write_text("instance_name: test\n")
     cfg = load_chat_config(yaml)
@@ -102,7 +95,7 @@ def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
         "chat:\n  enabled: true\n  provider:\n  harness:\n  docker_egress_mode:\n  on_detach:\n  llm:\n    auth:\n"
     )
     cfg = load_chat_config(y)
-    assert cfg.provider == "e2b"
+    assert cfg.provider == "kai-agent"
     assert cfg.harness == "claude-code"
     assert cfg.docker_egress_mode == "open"
     assert cfg.on_detach == "pause"
@@ -112,9 +105,8 @@ def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
 def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path, caplog):
     """The numeric variant of the same trap: `int(raw.get(key, default))` on a
     key written with no value raised `int(None)` out of load_chat_config,
-    turning one blank line into chat being disabled at boot; `bool(None)`
-    silently flipped e2b_kill_on_ws_disconnect to False. Garbage values warn
-    and fall back rather than aborting the load."""
+    turning one blank line into chat being disabled at boot. Garbage values
+    warn and fall back rather than aborting the load."""
     y = tmp_path / "instance.yaml"
     y.write_text(
         "chat:\n"
@@ -124,7 +116,6 @@ def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path,
         "  docker_max_total_sandboxes:\n"
         "  concurrency_per_user:\n"
         "  detach_linger_seconds:\n"
-        "  e2b_kill_on_ws_disconnect:\n"
         "  bootstrap_marketplace:\n"
         "  rate_messages_per_hour: not-a-number\n"
     )
@@ -135,26 +126,24 @@ def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path,
     assert cfg.concurrency_per_user == 3
     assert cfg.detach_linger_seconds == 60
     assert cfg.idle_grace_seconds == 60
-    assert cfg.e2b_kill_on_ws_disconnect is True
     assert cfg.bootstrap_marketplace is True  # blank yaml value → the (on) default
     assert cfg.rate_messages_per_hour == 100
     assert "rate_messages_per_hour" in caplog.text
 
 
-def test_textual_kill_flag_drives_on_detach_and_echo_identically(tmp_path: Path):
-    """Both readers of the deprecated kill flag must share one parser: with
-    plain truthiness in _parse_on_detach, `"no"` was echoed as disabled while
-    still switching on_detach to kill."""
+def test_removed_kill_flag_is_warned_and_ignored(tmp_path: Path, caplog):
+    """`chat.e2b_kill_on_ws_disconnect` was removed with the e2b provider
+    (0.88.0). A stale key no longer implies `on_detach: kill` — it warns and
+    the config gets the `pause` default; an explicit `on_detach` still wins."""
     y = tmp_path / "instance.yaml"
-    y.write_text('chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: "no"\n')
+    y.write_text("chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: true\n")
     cfg = load_chat_config(y)
-    assert cfg.e2b_kill_on_ws_disconnect is False
     assert cfg.on_detach == "pause"
+    assert not hasattr(cfg, "e2b_kill_on_ws_disconnect")
+    assert "e2b_kill_on_ws_disconnect is removed" in caplog.text
 
-    y.write_text('chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: "yes"\n')
-    cfg = load_chat_config(y)
-    assert cfg.e2b_kill_on_ws_disconnect is True
-    assert cfg.on_detach == "kill"
+    y.write_text("chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: true\n  on_detach: kill\n")
+    assert load_chat_config(y).on_detach == "kill"
 
 
 def test_legacy_sandbox_uid_knob_is_dropped(tmp_path: Path):
@@ -162,9 +151,7 @@ def test_legacy_sandbox_uid_knob_is_dropped(tmp_path: Path):
     ignored — the ChatConfig dataclass no longer exposes them and the
     loader doesn't trip on their presence in older instance.yaml files."""
     yaml = tmp_path / "instance.yaml"
-    yaml.write_text(
-        "chat:\n  enabled: true\n  e2b_template_id: agnes-chat\n  require_isolation: true\n  sandbox_uid: 1500\n"
-    )
+    yaml.write_text("chat:\n  enabled: true\n  require_isolation: true\n  sandbox_uid: 1500\n")
     cfg = load_chat_config(yaml)
     assert cfg.enabled is True
     assert not hasattr(cfg, "require_isolation")
@@ -198,38 +185,19 @@ def test_idle_grace_seconds_explicit_override(tmp_path: Path):
     assert cfg.idle_grace_seconds == 120
 
 
-def test_legacy_kill_knob_maps_to_on_detach_kill(tmp_path, caplog):
-    p = tmp_path / "instance.yaml"
-    p.write_text("chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: true\n")
-    cfg = load_chat_config(p)
-    assert cfg.on_detach == "kill"
-    assert "deprecated" in caplog.text.lower()
-
-
-def test_explicit_on_detach_wins_over_legacy_knob(tmp_path):
-    p = tmp_path / "instance.yaml"
-    p.write_text("chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: true\n  on_detach: pause\n")
-    assert load_chat_config(p).on_detach == "pause"
-
-
 def test_unknown_on_detach_normalizes_to_pause(tmp_path):
     p = tmp_path / "instance.yaml"
     p.write_text("chat:\n  enabled: true\n  on_detach: explode\n")
     assert load_chat_config(p).on_detach == "pause"
 
 
-def test_egress_allow_out_parsed(tmp_path: Path):
+def test_removed_egress_allow_out_key_is_ignored(tmp_path: Path):
+    """`chat.egress_allow_out` died with the e2b provider — a stale key must
+    not trip the loader or resurface on the config object."""
     y = tmp_path / "instance.yaml"
     y.write_text("chat:\n  enabled: true\n  egress_allow_out:\n    - api.github.com\n")
     cfg = load_chat_config(y)
-    assert cfg.egress_allow_out == ["api.github.com"]
-
-
-def test_egress_allow_out_defaults_empty(tmp_path: Path):
-    y = tmp_path / "instance.yaml"
-    y.write_text("chat:\n  enabled: true\n")
-    cfg = load_chat_config(y)
-    assert cfg.egress_allow_out == []
+    assert not hasattr(cfg, "egress_allow_out")
 
 
 # --- AGNES_CHAT_ENABLED env override (#1022 feature-flag canonicalization) ---
@@ -270,15 +238,15 @@ def test_provider_env_var_wins_over_yaml(tmp_path: Path, monkeypatch):
     the hand-edited instance.yaml overlay on the data disk."""
     monkeypatch.setenv("AGNES_CHAT_PROVIDER", "kai-agent")
     y = tmp_path / "instance.yaml"
-    y.write_text("chat:\n  enabled: true\n  provider: e2b\n")
+    y.write_text("chat:\n  enabled: true\n  provider: docker\n")
     assert load_chat_config(y).provider == "kai-agent"
 
 
 def test_provider_env_var_applies_even_without_an_instance_yaml(monkeypatch):
     """A FRESH machine boots with no instance.yaml yet — the infra-pinned
-    provider must apply there too, or first boot silently runs e2b."""
-    monkeypatch.setenv("AGNES_CHAT_PROVIDER", "kai-agent")
-    assert load_chat_config(Path("/nonexistent")).provider == "kai-agent"
+    provider must apply there too, or first boot silently runs the default."""
+    monkeypatch.setenv("AGNES_CHAT_PROVIDER", "docker")
+    assert load_chat_config(Path("/nonexistent")).provider == "docker"
 
 
 def test_provider_blank_env_falls_through_to_yaml(tmp_path: Path, monkeypatch):
@@ -356,7 +324,6 @@ def test_no_doc_or_dockerfile_names_an_egress_mode_config_does_not_accept():
     files = [
         Path("docs/cloud-chat.md"),
         Path("app/initial_workspace_default/docker-sandbox/Dockerfile"),
-        Path("app/initial_workspace_default/e2b-template/Dockerfile"),
     ]
     pattern = re.compile(r"docker_egress_mode\s*:\s*([A-Za-z_-]+)")
     for f in files:

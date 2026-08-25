@@ -9,8 +9,7 @@ Stdout: JSON lines. Outbound types: runner_ready, token, tool_call,
         approval_request / approval_resolved (ApprovalGate round-trip),
         question_request / question_resolved (QuestionGate round-trip).
 
-Env (set by ChatManager via the sandbox provider — under v1 the
-E2BProvider passes these through ``AsyncSandbox.create(envs=...)``):
+Env (set by ChatManager via the sandbox provider's spawn env):
 - AGNES_SESSION_ID, AGNES_USER_EMAIL, AGNES_SERVER, AGNES_TOKEN
 - AGNES_DAILY_BUDGET_USD, AGNES_PER_TOOL_CALL_SECONDS
 
@@ -39,7 +38,7 @@ if TYPE_CHECKING:  # names for annotations only — no runtime import (see below
     from app.chat.relay import Relay
 
 # NOTE: `app.chat.relay` is intentionally NOT imported at module level. This
-# file runs as a standalone script (`python3 /work/runner.py`) inside the E2B
+# file runs as a standalone script (`python3 /work/runner.py`) inside the
 # sandbox, where the `app` package does not exist until `_install_agnes_cli()`
 # pip-installs the uploaded wheel. A module-level `from app.chat.relay import
 # Relay` crashed the runner at interpreter startup with `ModuleNotFoundError:
@@ -56,7 +55,7 @@ if TYPE_CHECKING:  # names for annotations only — no runtime import (see below
 _relay: "Relay | None" = None
 
 # Directory the agnes CLI wheel is staged in by ChatManager at spawn
-# (e2b_workspace_sync.upload_agnes_wheel keeps the wheel's PEP 427 filename).
+# (sandbox_staging.stage_agnes_wheel keeps the wheel's PEP 427 filename).
 # Module-level so tests can point it at a temp dir.
 _SANDBOX_WHEEL_DIR = "/tmp/agnes-cli"
 # ``.ready`` sentinel the manager writes after staging the wheel. The runner
@@ -81,7 +80,7 @@ _WORKSPACE_WAIT_SECONDS = 180
 # post-restart spawn, cross-gateway takeover). Appended to the agent's
 # system prompt at boot so the conversation stays coherent — including the
 # assistant's own earlier answers. Mirrors
-# app/chat/e2b_workspace_sync.SANDBOX_CONTEXT_RESTORE (this file runs
+# app/chat/sandbox_staging.SANDBOX_CONTEXT_RESTORE (this file runs
 # standalone inside the sandbox, so the path is duplicated by design, like
 # _SANDBOX_WHEEL_DIR above). Module-level so tests can point it elsewhere.
 _CONTEXT_RESTORE_PATH = "/tmp/agnes-context.md"
@@ -579,7 +578,7 @@ def _install_agnes_cli() -> None:
     - ``--no-deps``: every runtime dep is already in the template image;
       reinstalling the tree would add seconds to every spawn.
     - NO ``--user``: the console script must land in ``/usr/local/bin`` (the
-      e2b base image chmods ``/usr/local`` 777, so the non-root sandbox
+      sandbox base image chmods ``/usr/local`` 777, so the non-root sandbox
       ``user`` can write there). A ``--user`` install lands ``agnes`` in
       ``~/.local/bin``, which is NOT on the PATH the agent's Bash tool runs
       with — Claude Code's Bash tool resets PATH to a system default
@@ -1039,7 +1038,7 @@ async def _real_agent_loop(
     # catalog``/``query``/…) autonomously. The SDK's default permission mode
     # denies any tool needing approval in this headless context (no human to
     # prompt), so the agent emits a tool_call and then hangs / hallucinates
-    # success without ever executing it. The E2B microVM is the isolation
+    # success without ever executing it. The sandbox is the isolation
     # boundary here (ephemeral, per-session); egress control is the workspace
     # PreToolUse hook's job and is documented as best-effort/fail-open.
     # bypassPermissions swallows the file hook's ``ask`` verdicts (executes
@@ -1068,7 +1067,7 @@ async def _real_agent_loop(
     )
     # Approval gate (SDK in-process PreToolUse hook). HookMatcher AND the
     # ClaudeAgentOptions.hooks field must both exist — an older sandbox
-    # template (the E2B :latest tag is mutable, outside the wheel's pin) could
+    # image (its :latest tag is mutable, outside the wheel's pin) could
     # ship one without the other; degrade to today's behavior (no gate) rather
     # than crash the runner at ClaudeAgentOptions(**options_kwargs). Same
     # __dataclass_fields__ probe used for include_partial_messages below
@@ -1083,7 +1082,7 @@ async def _real_agent_loop(
         if not _hooks_supported or HookMatcher is None:
             # Nothing can be registered, so nothing can deny either — be
             # honest about that rather than calling it fail-closed. The
-            # sandbox template's SDK is outside the wheel's pin (the E2B
+            # sandbox image's SDK is outside the wheel's pin (its
             # :latest tag is mutable), so log loudly enough for an operator
             # to notice that ask-flagged commands are running unasked.
             gate.disable_unsupported(

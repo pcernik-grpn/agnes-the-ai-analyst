@@ -483,9 +483,6 @@ async def download_session_artifact(
     belongs to a different session — same non-leaking posture
     `require_session_principal` already applies at the session level (a
     cross-agent PAT never even resolves a `principal` to get this far)."""
-    # Local import: app.chat.artifact_harvest -> app.chat.e2b_provider pulls
-    # in the e2b SDK (~250ms) at module top — heavy for this one filename
-    # sanitizer, only worth paying when an artifact is actually downloaded.
     from app.chat.artifact_harvest import sanitize_filename
 
     row = agent_artifacts_repo().get(artifact_id)

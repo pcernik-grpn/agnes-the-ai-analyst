@@ -10,6 +10,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Removed
+
+- **BREAKING: removed the `e2b` chat provider.** `chat.provider` now accepts
+  only `kai-agent` (the new default) and `docker`. A deployment still
+  configured with `provider: e2b` (instance.yaml or `AGNES_CHAT_PROVIDER`)
+  boots with chat disabled and an actionable error log — switch the provider
+  and restart; the `customer-instance` Terraform module refuses `e2b` at plan
+  time. The `chat.e2b_template_id`, `chat.egress_allow_out`,
+  `chat.e2b_workspace_max_bytes` and `chat.e2b_kill_on_ws_disconnect` config
+  keys, the `E2B_API_KEY` secret (admin UI field, readiness rows, live probe)
+  and the bundled `e2b-template/` sandbox image are gone
+  (`e2b_kill_on_ws_disconnect: true` no longer implies `on_detach: kill` — a
+  stale key warns and gets the `pause` default). The kai engine sidecar's own
+  E2B backing (`kai_agent_e2b_key_secret`) is unaffected. The E2E chat suites
+  now run on the docker provider (`AGNES_E2E_DOCKER=1` replaces
+  `AGNES_E2E_E2B`; `e2e-docker.yml` replaces `e2e-e2b.yml`).
+
 ### Changed
 
 - **Slack app manifests trimmed to the minimal bot-token scope set.** The

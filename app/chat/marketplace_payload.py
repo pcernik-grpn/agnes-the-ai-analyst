@@ -13,7 +13,7 @@ filtered marketplace written to disk exactly as the served ZIP lays it out
 (``.claude-plugin/marketplace.json`` + ``plugins/<prefixed_name>/…``). Claude
 Code registers a plain directory as a marketplace and installs from it entirely
 offline (``claude plugin marketplace add <dir>`` + ``claude plugin install
-<name>@agnes --scope project``), which is what the e2b/docker sandbox does with
+<name>@agnes --scope project``), which is what the docker sandbox does with
 it. That is the faithful delivery: real plugins, so hooks keep their
 ``${CLAUDE_PLUGIN_ROOT}``, MCP servers register as ``plugin:<plugin>:<server>``,
 and agents/commands keep the ``<plugin>:<name>`` namespace the usage-event

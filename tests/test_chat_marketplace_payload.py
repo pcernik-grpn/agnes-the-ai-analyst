@@ -4,7 +4,7 @@ Two shapes, one content source (#1552):
 
 - ``export_marketplace_tree`` writes the filtered marketplace as a directory,
   which Claude Code registers and installs from offline. This is what makes a
-  stack plugin a REAL plugin in an e2b/docker sandbox, with its agents, slash
+  stack plugin a REAL plugin in a docker sandbox, with its agents, slash
   commands, hooks and MCP servers intact.
 - ``materialize_plugin_components`` flattens the same plugins into project-scope
   files, for the kai-agent provider whose sandbox Agnes never enters.

@@ -1,6 +1,6 @@
 """KaiEngineProvider — run web-chat sessions on the embedded kai-agent turn engine.
 
-The third ``SandboxProvider`` (``chat.provider: kai-agent``), next to ``e2b``
+A ``SandboxProvider`` (``chat.provider: kai-agent``), next to ``docker``
 and ``docker`` — except the "sandbox" it provides is the embedded `kai-agent`
 turn engine this instance already hosts for ``app/api/kai.py``. The engine
 owns its own agent loop, its own conversation store and its own remote
@@ -127,7 +127,7 @@ class _FrameReader(_StreamReaderAdapter):
 
     ``feed_frame`` owns the newline framing so no caller can emit a torn
     line; everything else (EOF sentinel, ``readline``, size-honoring
-    ``read``) is the same class the e2b and docker handles expose, so
+    ``read``) is the same class the docker handles expose, so
     host-side readers see identical stream semantics on all three providers.
     """
 

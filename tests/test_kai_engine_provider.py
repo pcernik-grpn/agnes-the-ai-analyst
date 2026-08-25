@@ -809,7 +809,7 @@ def test_create_session_mints_uuid_ids_for_engine_provider(tmp_path):
 
 
 def test_create_session_keeps_chat_hex_ids_for_native_providers(tmp_path):
-    mgr = _make_manager(tmp_path, ChatConfig(enabled=True, provider="e2b"))
+    mgr = _make_manager(tmp_path, ChatConfig(enabled=True, provider="docker"))
     session = asyncio.run(mgr.create_session(user_email="u@x", surface=Surface.WEB))
     assert session.id.startswith("chat_")
 
@@ -835,7 +835,7 @@ def test_slack_producer_mints_uuid_ids_for_engine_provider(tmp_path):
     uuid.UUID(session.id)
     native = resolve_or_create_slack_session(
         repo,
-        ChatConfig(enabled=True, provider="e2b"),
+        ChatConfig(enabled=True, provider="docker"),
         user_email="u@x",
         surface=Surface.SLACK_DM,
         slack_channel_id="D456",
@@ -857,7 +857,7 @@ def test_revoke_native_tickets_skipped_for_own_credentials_provider(tmp_path, mo
     tickets.revoke_session.assert_not_called()
     # A plain MagicMock provider (attribute exists but is a truthy Mock, not
     # the literal True) keeps the native sweep — the duck-typed-double rule.
-    mgr2 = _make_manager(tmp_path, ChatConfig(enabled=True, provider="e2b"))
+    mgr2 = _make_manager(tmp_path, ChatConfig(enabled=True, provider="docker"))
     mgr2._revoke_native_tickets("c-9")
     tickets.revoke_session.assert_called_once_with("c-9")
 
@@ -865,10 +865,10 @@ def test_revoke_native_tickets_skipped_for_own_credentials_provider(tmp_path, mo
 def test_boot_provider_allowlist_admits_kai_agent():
     """The lifespan's provider allowlist runs BEFORE every kai-specific gate —
     if it does not admit the value, the whole feature is dead on arrival with
-    a log naming only e2b/docker (found by review; pinned so a refactor of the
+    a log naming only docker (found by review; pinned so a refactor of the
     boot chain cannot silently regress it)."""
     body = Path("app/main.py").read_text()
-    assert 'not in ("e2b", "docker", "kai-agent")' in body
+    assert 'not in ("docker", "kai-agent")' in body
 
 
 def test_push_ticket_frame_skips_native_mints_for_own_credentials_provider(tmp_path, monkeypatch):
@@ -906,7 +906,7 @@ def test_kai_agent_boot_gate_requires_the_shared_secret(monkeypatch):
     assert not _chat_kai_agent_ok(ChatConfig(enabled=True, provider="kai-agent", kai_agent_url=""))
     monkeypatch.delenv("KAI_HOST_JWT_SECRET", raising=False)
     # Other providers and disabled chat are out of this gate's scope.
-    assert _chat_kai_agent_ok(ChatConfig(enabled=True, provider="e2b"))
+    assert _chat_kai_agent_ok(ChatConfig(enabled=True, provider="docker"))
     assert _chat_kai_agent_ok(ChatConfig(enabled=False, provider="kai-agent"))
 
 

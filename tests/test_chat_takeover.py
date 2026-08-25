@@ -1,7 +1,7 @@
 """Tests for cross-gateway claim-then-respawn takeover (wave-2F task 5).
 
 Two ``ChatManager`` instances sharing one ``ChatRepository`` (same DuckDB
-connection) AND one ``FakeProvider`` (same simulated E2B account) model two
+connection) AND one ``FakeProvider`` (same simulated sandbox account) model two
 gateway replicas — the same "two simulated managers, one shared backend"
 convention ``tests/test_chat_routing.py`` and ``tests/test_chat_inbound.py``
 already established. ``app.chat.routing.this_gateway_id`` is monkeypatched
@@ -11,7 +11,7 @@ identical for both — sharing the provider (unlike test_chat_inbound.py,
 which never needs the non-owner gateway to actually touch a sandbox) is
 what lets these tests observe the SAME destroy()/spawn() call history no
 matter which manager made the call, mirroring a real deployment where both
-gateways talk to the same E2B account.
+gateways talk to the same sandbox backend.
 
 Uses asyncio.run() per the project convention (no pytest-asyncio required)
 — see tests/test_chat_manager.py.
@@ -256,7 +256,7 @@ def test_takeover_claims_lease_destroys_old_spawns_fresh_restores_context(two_ga
     fake_tickets = _FakeTicketRepo()
     monkeypatch.setattr(manager_mod, "ticket_repo", lambda: fake_tickets)
 
-    # Capture the takeover spawn's context upload: attach a fake E2B sandbox
+    # Capture the takeover spawn's context upload: attach a fake sandbox
     # to every handle B spawns so _spawn_runner's sync branch runs.
     from unittest.mock import AsyncMock, MagicMock
 

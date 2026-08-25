@@ -2,7 +2,7 @@
 
 The overlay is the admin's persisted runtime configuration — secrets set via
 ``/api/admin/configure`` and the chat "configure secrets" UI (ANTHROPIC_API_KEY,
-E2B_API_KEY, marketplace PATs). ``persist_overlay_token`` writes both the file
+ANTHROPIC_API_KEY, marketplace PATs). ``persist_overlay_token`` writes both the file
 and ``os.environ[k] = v`` (a hard override) in the live process. The boot-load
 in ``create_app`` must apply the SAME precedence, otherwise a stale baked key
 already occupying ``os.environ`` shadows the overlay and, on the next restart,
@@ -33,12 +33,12 @@ def test_env_overlay_sets_key_absent_from_baked_env(e2e_env, monkeypatch):
     """Sanity: overlay still populates a key that isn't in the baked env."""
     from app.main import create_app
 
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.delenv("SENDGRID_API_KEY", raising=False)
     overlay = e2e_env["data_dir"] / "state" / ".env_overlay"
-    overlay.write_text("E2B_API_KEY=e2b-from-overlay\n", encoding="utf-8")
+    overlay.write_text("SENDGRID_API_KEY=sg-from-overlay\n", encoding="utf-8")
 
     create_app()
 
     import os
 
-    assert os.environ["E2B_API_KEY"] == "e2b-from-overlay"
+    assert os.environ["SENDGRID_API_KEY"] == "sg-from-overlay"

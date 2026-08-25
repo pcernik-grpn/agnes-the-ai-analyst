@@ -2,7 +2,8 @@
 
 ``chat_provider`` codifies which engine runs an instance's web-chat sessions
 IN TERRAFORM: the per-VM module field writes ``AGNES_CHAT_PROVIDER`` into the
-app ``.env``, and ``load_chat_config`` resolves env > instance.yaml > "e2b".
+app ``.env``, and ``load_chat_config`` resolves env > instance.yaml >
+"kai-agent".
 Without it the provider choice lives only in the hand-edited instance.yaml
 overlay on the data disk — which survives reboots and recreates but not a
 fresh data disk, and is invisible in review.
@@ -70,12 +71,12 @@ def test_tf_allowlist_matches_the_apps_boot_allowlist():
     accept the same set — a value the plan admits but boot refuses turns a
     typo into a VM whose every chat route 503s."""
     vbody = (MODULE / "variables.tf").read_text()
-    tf_values = set(re.findall(r'contains\(\["", "e2b", "docker", "kai-agent"\][^)]*chat_provider\)', vbody))
+    tf_values = set(re.findall(r'contains\(\["", "docker", "kai-agent"\][^)]*chat_provider\)', vbody))
     assert len(tf_values) >= 1, "chat_provider allowlist validation missing"
     prod_block, dev_block = _object_type_blocks(vbody)
     assert "chat_provider" in prod_block and "chat_provider" in dev_block
     app_main = Path("app/main.py").read_text()
-    assert 'not in ("e2b", "docker", "kai-agent")' in app_main, (
+    assert 'not in ("docker", "kai-agent")' in app_main, (
         "app/main.py's provider allowlist changed — update the Terraform validation to match"
     )
 

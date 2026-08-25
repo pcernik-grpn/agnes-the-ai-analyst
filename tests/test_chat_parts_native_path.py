@@ -1,10 +1,10 @@
-"""The `parts` model on the NATIVE (e2b / docker) path, end to end.
+"""The `parts` model on the NATIVE (docker) path, end to end.
 
 `tests/test_kai_engine_stub.py` proves the engine provider produces an
 interleaved turn. This file proves the same for the provider Agnes ships by
 default — because everything that builds and stores `parts` lives in
 `ChatManager`, not in a provider, and a change there would silently affect
-both. E2B itself needs real credentials (and costs money per sandbox), so the
+both. A real sandbox needs infrastructure, so the
 turn is driven through `FakeProvider`, which stands in at exactly the
 `SandboxProvider` seam E2B plugs into and speaks the native runner's frame
 vocabulary.

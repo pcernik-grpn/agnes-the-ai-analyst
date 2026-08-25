@@ -61,7 +61,10 @@ def manager(tmp_path: Path) -> ChatManager:
         provider=provider,
         workdir_mgr=workdir_mgr,
         repo=repo,
-        config=ChatConfig(enabled=True, concurrency_per_user=2),
+        # Pin the native provider: this suite exercises the runner-frame path
+        # and asserts on chat_<hex> session ids, which `engine_session_id`
+        # replaces with UUIDs under the (default) kai-agent provider.
+        config=ChatConfig(enabled=True, concurrency_per_user=2, provider="docker"),
     )
 
 
@@ -3858,7 +3861,7 @@ def test_web_session_with_no_attached_browser_still_waits(manager: ChatManager):
 
 
 def test_orphan_sweep_is_a_noop_for_providers_without_listing(manager: ChatManager):
-    """E2B (and any provider whose sandboxes aren't host-local) has no
+    """A provider whose sandboxes aren't host-local has no
     list_sandboxes — the sweep must do nothing, not crash the reaper."""
 
     async def _run():
