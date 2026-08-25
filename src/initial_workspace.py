@@ -929,6 +929,37 @@ def _unique_bak_path(path: Path) -> Path:
         i += 1
 
 
+# Retention cap for ``<name>.bak.<ts>[.<n>]`` files written next to a workspace
+# file (#1476: nothing pruned these before, so they accumulated forever —
+# grep found no existing backup-retention precedent elsewhere in the
+# codebase, so this is a fresh, conservative pick, not a match to a prior
+# convention).
+_MAX_BACKUPS_PER_FILE = 3
+
+
+def _prune_backups(original: Path, *, keep: int = _MAX_BACKUPS_PER_FILE) -> None:
+    """Delete all but the ``keep`` most recently created ``<original>.bak.*``
+    files next to ``original``.
+
+    Called after every ``.bak`` write (DEFAULT-mode ``CLAUDE.md`` refresh,
+    ``agnes init --force``, and the OVERRIDE-mode 3-way merge) so backups
+    stay bounded instead of growing one-per-day/one-per-merge forever.
+
+    Filenames sort chronologically for the ``<name>.bak.<UTC timestamp>``
+    scheme every caller uses (``YYYYMMDDTHHMMSSZ`` sorts lexicographically =
+    chronologically); the rare ``.<n>`` collision suffix from
+    ``_unique_bak_path`` sorts immediately after the plain timestamp it
+    disambiguates, which is also chronologically correct.
+    """
+    backups = sorted(original.parent.glob(f"{original.name}.bak.*"), key=lambda p: p.name)
+    stale = backups[:-keep] if keep > 0 else backups
+    for path in stale:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 @dataclass
 class UpdatePlan:
     """Dry classification of a re-apply — what WOULD happen, nothing written.
@@ -1039,6 +1070,7 @@ def update_workspace_from_template(
         bak = _unique_bak_path(target.with_name(f"{target.name}.bak.{ts}"))
         bak.write_bytes(disk_content)
         backed_up.append((name, bak.relative_to(workspace).as_posix()))
+        _prune_backups(target)
 
     for name in plan.created + plan.updated + plan.backed_up:
         target = workspace / name
