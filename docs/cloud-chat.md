@@ -76,7 +76,7 @@ whose config still says `provider: e2b` boots with chat disabled and
 logs:
 
 > chat.provider=e2b is no longer supported — the E2B provider was removed
-> in 0.88.0. Set chat.provider in instance.yaml (or AGNES_CHAT_PROVIDER /
+> in 0.89.0. Set chat.provider in instance.yaml (or AGNES_CHAT_PROVIDER /
 > the customer-instance module's chat_provider field) to 'kai-agent' (the
 > embedded turn engine) or 'docker' (self-hosted containers via the
 > apps-runner sidecar; see docs/cloud-chat.md), then restart. Chat stays
