@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -292,9 +293,40 @@ def test_stub_is_not_reachable_without_the_dev_profile():
     """The stub answers every turn with a canned script, so it must never be
     something a default `docker compose up` can start."""
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
-    block = compose[compose.index("  kai-agent:") :]
+    block = compose[compose.index("  kai-agent-stub:") :]
     block = block[: block.index("\n  telegram-bot:")]
     assert 'profiles: ["kai-stub"]' in block, "the stub must sit behind its own compose profile"
+
+
+def test_stub_does_not_squat_the_real_engine_service_name():
+    """The fixture must not be called `kai-agent`.
+
+    That name belongs to the real engine, which a deployment adds as a compose
+    service of its own. Compose merges same-named services across the files in
+    ``COMPOSE_FILE`` and an overlay inherits every key it does not restate, so
+    a stub holding this name hands the real engine image its ``command`` --
+    node dies on ``Cannot find module '/app/python'``, the engine crash-loops
+    out of compose DNS, and the app answers every turn with
+    ``engine_error -- [Errno -3] Temporary failure in name resolution``. The
+    stub's ``profiles:`` gate does not prevent it: naming a service on the
+    ``up`` command line auto-activates its profiles.
+
+    Also pins that the profile gate is not the thing being relied on, and that
+    the default endpoint still resolves to the real engine's name.
+    """
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    services = set(re.findall(r"^  ([a-z0-9-]+):$", compose, re.M))
+    assert "kai-agent-stub" in services, "expected the local-dev stub service"
+    assert "kai-agent" not in services, (
+        "docker-compose.yml defines a service named `kai-agent`, which is the real "
+        "engine's name in a deployment overlay -- compose would merge the two"
+    )
+
+    from app.chat.config import _resolve_kai_agent_url
+
+    assert _resolve_kai_agent_url({}) == "http://kai-agent:3000", (
+        "the default endpoint must keep naming the real engine, not the stub"
+    )
 
 
 def test_engine_url_has_an_env_override():
