@@ -26,6 +26,8 @@ import json
 import os
 import secrets
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlparse
@@ -50,10 +52,6 @@ def skip_unless_chat_sessions_possible() -> None:
             "chat sessions spawn real docker sandboxes — set AGNES_E2E_DOCKER=1 "
             "with the apps-runner sidecar up and the agnes-chat-sandbox image built"
         )
-
-
-import urllib.error
-import urllib.request
 
 
 _COMPOSE_FILE = Path(__file__).parent / "docker-compose.e2e.yml"

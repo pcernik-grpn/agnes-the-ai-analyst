@@ -6,7 +6,7 @@ default — because everything that builds and stores `parts` lives in
 `ChatManager`, not in a provider, and a change there would silently affect
 both. A real sandbox needs infrastructure, so the
 turn is driven through `FakeProvider`, which stands in at exactly the
-`SandboxProvider` seam E2B plugs into and speaks the native runner's frame
+`SandboxProvider` seam the docker provider plugs into and speaks the native runner's frame
 vocabulary.
 
 What this pins: an interleaved native turn is persisted with its shape, the

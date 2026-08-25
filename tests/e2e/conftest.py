@@ -5,7 +5,8 @@ real Chromium) and gated behind env vars so they never run in the
 default `pytest` invocation. Without `AGNES_E2E=1` every test that
 depends on `e2e_agnes` skips cleanly; without `AGNES_E2E_ANTHROPIC=1`
 every test marked `real_llm` skips on top of that; without
-`AGNES_E2E_E2B=1` tests that need a real E2B sandbox spawn skip too.
+`AGNES_E2E_DOCKER=1` tests that need a real docker sandbox spawn (the
+apps-runner sidecar up + the agnes-chat-sandbox image built) skip too.
 """
 
 from __future__ import annotations
