@@ -24,14 +24,15 @@ services:
   # prod-VM reasoning as apps-runner above.
   egress-proxy:
     image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
-  # kai-agent (compose profile `kai-stub`) is the DEVELOPMENT stub engine and
-  # has no business running on a prod VM — but it carries `build: .`, and the
-  # override is what keeps a source-less host from trying to build it if the
-  # profile were ever selected there. Pinning the image is a boot-safety
+  # kai-agent-stub (compose profile `kai-stub`) is the DEVELOPMENT stub engine
+  # and has no business running on a prod VM — but it carries `build: .`, and
+  # the override is what keeps a source-less host from trying to build it if
+  # the profile were ever selected there. Pinning the image is a boot-safety
   # measure, NOT an endorsement: the stub answers every turn with a canned
   # script, so selecting `--profile kai-stub` in production would replace real
-  # answers with fixtures. Point `chat.kai_agent_url` at the real engine.
-  kai-agent:
+  # answers with fixtures. The real engine is the `kai-agent` service a
+  # deployment brings its own overlay for.
+  kai-agent-stub:
     image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
   # corporate-memory and session-collector were dropped in #176 —
   # the scheduler container drives them via /api/admin/run-* endpoints.

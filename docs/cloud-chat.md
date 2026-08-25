@@ -522,6 +522,13 @@ chat:
   kai_agent_url: "http://kai-agent:3000"   # default; the engine's compose service
 ```
 
+The default needs no override in a normal deployment: `kai-agent` is the
+service name the `customer-instance` module's engine overlay uses. Override it
+with `AGNES_CHAT_KAI_AGENT_URL` (env > `instance.yaml` > default) when the
+engine lives somewhere else — including local development, where the stand-in
+engine runs as `kai-agent-stub` (see
+[`docs/kai-agent-local-dev.md`](kai-agent-local-dev.md)).
+
 Requirements and semantics:
 
 - **`KAI_HOST_JWT_SECRET` must be set** (the same shared secret that turns on

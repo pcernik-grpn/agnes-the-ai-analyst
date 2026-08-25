@@ -10,6 +10,53 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **`chat.provider: kai-agent` no longer fails every turn on a freshly booted
+  deployment.** The local-dev stand-in engine was named `kai-agent` — the same
+  name a deployment gives the real turn engine (the `customer-instance`
+  module's `docker-compose.kai-agent.yml` overlay). Compose merges same-named
+  services across the files in `COMPOSE_FILE` and the later file inherits every
+  key it does not itself restate, so the overlay's `image:` won while the
+  stub's `command: python -m services.kai_engine_stub` came along for the ride.
+  The real engine image was launched as the fixture, node died on `Cannot find
+  module '/app/python'`, and the crash loop took the service out of compose DNS
+  — surfacing to users as `engine_error — engine turn failed: [Errno -3]
+  Temporary failure in name resolution` on every message. The stub's
+  `profiles: ["kai-stub"]` gate did not help: naming a service on the `up`
+  command line auto-activates its profiles.
+
+  The stub is now `kai-agent-stub` and the real engine keeps `kai-agent`, so the
+  default `chat.kai_agent_url` (`http://kai-agent:3000`) resolves to the real
+  engine in every deployment with no configuration — the fixture is what needs
+  an override now, not production. Renaming the deployment's service instead
+  would have inverted that: the only chat engine running under a name chosen to
+  dodge a test fixture, `AGNES_CHAT_KAI_AGENT_URL` mandatory everywhere, and two
+  repos obliged to agree on the non-obvious name. Local dev's compose flow gains
+  `AGNES_CHAT_KAI_AGENT_URL=http://kai-agent-stub:3000` (one env var in a flow
+  that already sets `KAI_HOST_JWT_SECRET`); the host-process flow already set it.
+  `docker-compose.prod.yml`'s source-less-host `image:` pin follows the stub to
+  its new name.
+
+  Two paired tests keep the names apart from both sides, asserting DISJOINTNESS
+  rather than specific names:
+  `test_stub_does_not_squat_the_real_engine_service_name` (no
+  `docker-compose.yml` service may be called `kai-agent`, and the default
+  endpoint must still resolve to it) and
+  `test_overlay_service_names_are_disjoint_from_the_base_compose_file` (no
+  overlay service may collide with a base one) — so the next dev-only service
+  added under a colliding name fails in CI instead of in production.
+
+  Note why this hid: the stub landed in `docker-compose.yml` in 0.86.0, but an
+  engine container created before that keeps running across app upgrades (the
+  auto-upgrade tick does not recreate it unless the pinned engine image
+  changes). Only a VM recreate — or an engine image bump — exposed it, which is
+  why a deployment that had been serving engine turns for days broke the moment
+  it was replaced. No infra module change and no VM recreate are needed to pick
+  this up: `docker-compose.yml` and `docker-compose.prod.yml` are both in the
+  auto-upgrade tick's `CONFIG_FILES`, refetched every tick, and the content
+  drift triggers the recreate itself.
+
 ## [0.87.1] - 2026-08-25
 
 ### Fixed
