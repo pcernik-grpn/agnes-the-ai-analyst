@@ -6,6 +6,7 @@
    a paired `ds.dropdown()` alongside them (#1055) — see `_components.html`'s
    `dropdown` macro. #}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
 <style>
   /* A stored auth method this build no longer offers. `[hidden]` first, so the
      layout rule below cannot resurrect an empty strip. */
@@ -130,17 +131,7 @@
   }
 
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
-  .icon-btn {
-    background: transparent; border: 1px solid var(--ds-border); border-radius: 6px;
-    padding: 5px 10px; font-size: 12px; cursor: pointer;
-    color: var(--ds-text-secondary); transition: all 0.15s;
-    text-decoration: none; line-height: 1.4; white-space: nowrap;
-  }
-  .icon-btn:hover { color: var(--ds-text-primary); border-color: var(--ds-border); background: var(--ds-surface-dim); }
-  .icon-btn.primary { color: var(--ds-primary); border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent); }
-  .icon-btn.primary:hover { background: var(--ds-primary-light); }
-  .icon-btn.danger:hover { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
-  .icon-btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* .icon-btn now shared — see css/icon_btn.css */
 
   .empty-row {
     text-align: center; padding: 32px 12px;
@@ -1026,10 +1017,10 @@ function renderProposals() {
           </div>
         </td>
         <td>
-          <input type="text" class="exposed-name-input" data-field="exposed_name" value="${esc(exposedDefault)}" placeholder="exposed_name">
+          <input type="text" class="exposed-name-input" data-field="exposed_name" value="${esc(exposedDefault)}" placeholder="exposed_name" aria-label="Exposed name for ${esc(p.name)}">
         </td>
         <td>
-          <input type="text" class="schedule-input" data-field="schedule" placeholder="0 */6 * * *" title="Cron schedule (materialize mode only)">
+          <input type="text" class="schedule-input" data-field="schedule" placeholder="0 */6 * * *" title="Cron schedule (materialize mode only)" aria-label="Schedule for ${esc(p.name)}">
         </td>
       </tr>`;
   }

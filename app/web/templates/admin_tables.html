@@ -1879,7 +1879,7 @@
                                 </label>
                             </div>
                             <div class="form-hint" id="editBqModeWarning" style="display:none;
-                                 color:#EA580C;background:rgba(234,88,12,.08);padding:8px;border-radius:6px;margin-top:8px;">
+                                 color:var(--ds-accent-warn-ink);background:var(--ds-accent-warn-bg);padding:8px;border-radius:6px;margin-top:8px;">
                                 <!-- Filled by onEditBqAccessModeChange() when switching
                                      modes on an existing row — warns about parquet
                                      drop / scheduling impact. -->
@@ -3131,7 +3131,7 @@
         document.getElementById('editDataPackageModal').style.display = 'flex';
         document.getElementById('edp-id').value = pkgId;
         document.getElementById('edp-tables-list').innerHTML =
-          '<div style="padding:12px; color:#5f6368;">Loading…</div>';
+          '<div style="padding:12px; color:var(--ds-text-secondary);">Loading…</div>';
         try {
           const r = await fetch('/api/admin/data-packages/' + encodeURIComponent(pkgId),
                                 { credentials: 'same-origin' });
@@ -3337,7 +3337,7 @@
       function renderEdpTablesList(tables) {
         const el = document.getElementById('edp-tables-list');
         if (!tables.length) {
-          el.innerHTML = '<div style="padding:12px; color:#5f6368; font-size:13px;">'
+          el.innerHTML = '<div style="padding:12px; color:var(--ds-text-secondary); font-size:13px;">'
             + 'No tables in this package yet. Click <strong>+ Add tables</strong> above.</div>';
           return;
         }
@@ -3454,7 +3454,7 @@
                   { credentials: 'same-origin' }),
           ]);
           if (!allResp.ok || !pkgResp.ok) {
-            listEl.innerHTML = '<div style="padding:8px; color:#b91c1c;">'
+            listEl.innerHTML = '<div style="padding:8px; color:var(--ds-accent-danger-ink);">'
               + 'Failed to load tables (' + allResp.status + ' / ' + pkgResp.status + ').</div>';
             return;
           }
@@ -3470,7 +3470,7 @@
           });
           renderEdpInlineAddList();
         } catch (e) {
-          listEl.innerHTML = '<div style="padding:8px; color:#b91c1c;">'
+          listEl.innerHTML = '<div style="padding:8px; color:var(--ds-accent-danger-ink);">'
             + 'Network error: ' + escapeHtml(e.message) + '</div>';
         }
       }
@@ -3757,13 +3757,13 @@
         const list = document.getElementById('bulk-assign-list');
         if (!pkgResp.ok) {
           sel.innerHTML = '<option value="">Failed to load packages</option>';
-          list.innerHTML = '<div style="padding:12px; color:#b91c1c;">HTTP '
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-accent-danger-ink);">HTTP '
             + pkgResp.status + ' on /api/admin/data-packages</div>';
           return;
         }
         if (!tableResp.ok) {
           sel.innerHTML = '<option value="">Failed to load tables</option>';
-          list.innerHTML = '<div style="padding:12px; color:#b91c1c;">HTTP '
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-accent-danger-ink);">HTTP '
             + tableResp.status + ' on /api/admin/registry</div>';
           return;
         }
@@ -3877,7 +3877,7 @@
       function renderBulkAssignList() {
         const list = document.getElementById('bulk-assign-list');
         if (!_bulkAssignTables.length) {
-          list.innerHTML = '<div style="padding:12px; color:#5f6368;">'
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-text-secondary);">'
             + 'No tables registered yet — use "+ Register new table" above.</div>';
           return;
         }
@@ -3894,7 +3894,7 @@
             + '       style="display:flex; gap:8px; align-items:center; padding:6px; border-radius:4px; cursor:pointer;">'
             + '  <input type="checkbox" class="bulk-assign-cb" value="' + escapeHtmlAttr(id) + '">'
             + '  <span style="flex:1; font-family:var(--font-mono);">' + escapeHtml(name) + '</span>'
-            + (meta ? '  <span style="font-size:12px; color:#5f6368;">' + escapeHtml(meta) + '</span>' : '')
+            + (meta ? '  <span style="font-size:12px; color:var(--ds-text-secondary);">' + escapeHtml(meta) + '</span>' : '')
             + '</label>';
         }).join('');
       }
@@ -4266,7 +4266,7 @@
             <div id="bulk-assign-list"
                  style="border:1px solid var(--border); border-radius:6px;
                         max-height:50vh; overflow-y:auto; padding:6px;">
-              <div style="padding:12px; color:#5f6368;">Loading tables…</div>
+              <div style="padding:12px; color:var(--ds-text-secondary);">Loading tables…</div>
             </div>
             <div class="form-hint" id="bulk-assign-hint">
               Already-assigned tables are checked + disabled so re-submitting
@@ -4582,9 +4582,9 @@
         msg.textContent = message;
 
         if (type === 'success') {
-            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10B77F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ds-accent-success-ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
         } else {
-            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#EA580C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ds-accent-warn-ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
         }
 
         // Show
@@ -5171,11 +5171,11 @@
                 var kind = detail && typeof detail === 'object' ? (detail.kind || 'error') : 'error';
                 var hint = detail && typeof detail === 'object' ? (detail.hint || detail.message || '') : String(detail);
                 resultEl.textContent = '✗ ' + kind + (hint ? ' — ' + hint : '');
-                resultEl.style.color = '#c0392b';
+                resultEl.style.color = 'var(--ds-accent-danger-ink)';
             }
         } catch (e) {
             resultEl.textContent = '✗ network error — ' + e.message;
-            resultEl.style.color = '#c0392b';
+            resultEl.style.color = 'var(--ds-accent-danger-ink)';
         } finally {
             btn.disabled = false;
         }
@@ -8504,7 +8504,7 @@
             if (!idCell || idCell.textContent.trim() !== tableId) return;
             var statusCell = tr.querySelector('td.col-status');
             if (!statusCell) return;
-            var color = {fresh: '#10B77F', warming: 'var(--ds-primary)', pending: '#9CA3AF', error: '#EA580C'}[rs.status] || '#9CA3AF';
+            var color = {fresh: 'var(--ds-accent-success-ink)', warming: 'var(--ds-primary)', pending: 'var(--ds-text-muted)', error: 'var(--ds-accent-warn-ink)'}[rs.status] || 'var(--ds-text-muted)';
             var label = rs.status === 'fresh' ? 'fresh' : rs.status;
             // Build via DOM API so rs.error escapes safely into the title
             // attribute (XSS guard — rs.error is server-derived, may contain

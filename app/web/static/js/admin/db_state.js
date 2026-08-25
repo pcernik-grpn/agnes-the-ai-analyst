@@ -113,7 +113,7 @@ const DBState = {
         }
       } else {
         actionsEl.innerHTML = transitionBtns
-          .map(b => `<button class="btn" data-target="${b.target}"${b.disabled ? ' disabled title="Not yet available"' : ''}>${b.label}</button>`)
+          .map(b => `<button class="btn btn-primary" data-target="${b.target}"${b.disabled ? ' disabled title="Not yet available"' : ''}>${b.label}</button>`)
           .join(' ');
         if (helpEl) {
           helpEl.textContent = `Pick a target to start a migration. The
