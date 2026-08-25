@@ -1552,10 +1552,14 @@ def test_a_deleted_conversation_cannot_spend_budget_with_an_issued_llm_ticket(se
 # ---------------------------------------------------------------------------
 
 
-def _grant_marketplace_skill(*, plugin: str, skill: str, body: str = "Body.", extra_file: str = "") -> None:
-    """Grant + subscribe the seeded analyst to a marketplace plugin shipping
-    one skill, and write that skill to the marketplace clone on disk."""
-    import json as _json
+def _grant_marketplace_skill(
+    *, plugin: str, skill: str, body: str = "Body.", extra_file: str = "", full: bool = False
+) -> None:
+    """Grant + subscribe the seeded analyst to a marketplace plugin shipping one
+    skill, and write that plugin to the marketplace clone on disk.
+
+    ``full=True`` also gives it an agent, a slash command, a hook and an MCP
+    server — the component types that make it a plugin rather than a skill."""
     from datetime import datetime, timezone
 
     from app.utils import get_marketplaces_dir
@@ -1574,7 +1578,7 @@ def _grant_marketplace_skill(*, plugin: str, skill: str, body: str = "Body.", ex
         )
         conn.execute(
             "INSERT INTO marketplace_plugins (marketplace_id, name, version, raw, updated_at) VALUES (?, ?, ?, ?, ?)",
-            ["mkt", plugin, "1.0", _json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
+            ["mkt", plugin, "1.0", json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
         )
     finally:
         conn.close()
@@ -1583,11 +1587,28 @@ def _grant_marketplace_skill(*, plugin: str, skill: str, body: str = "Body.", ex
     resource_grants_repo().create(everyone["id"], "marketplace_plugin", f"mkt/{plugin}")
     user_curated_subscriptions_repo().subscribe("analyst1", "mkt", plugin)
 
-    skill_dir = get_marketplaces_dir() / "mkt" / "plugins" / plugin / "skills" / skill
+    plugin_root = get_marketplaces_dir() / "mkt" / "plugins" / plugin
+    skill_dir = plugin_root / "skills" / skill
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(f"---\nname: {skill}\n---\n\n{body}", encoding="utf-8")
     if extra_file:
         (skill_dir / extra_file).write_text("extra", encoding="utf-8")
+    if not full:
+        return
+    (plugin_root / "agents").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "agents" / "kbl-reviewer.md").write_text(
+        "---\nname: kbl-reviewer\ndescription: Agent.\n---\n\nBody.", encoding="utf-8"
+    )
+    (plugin_root / "commands").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "commands" / "kbl-ship.md").write_text("---\ndescription: Command.\n---\n\nBody.", encoding="utf-8")
+    (plugin_root / "hooks").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "hooks" / "hooks.json").write_text(
+        json.dumps({"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}}),
+        encoding="utf-8",
+    )
+    (plugin_root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"probe-mcp": {"command": "echo", "args": ["noop"]}}}), encoding="utf-8"
+    )
 
 
 def _workspace_names(seeded_app) -> list[str]:
@@ -1662,3 +1683,89 @@ def test_the_archive_stays_byte_stable_with_marketplace_skills(seeded_app, kai_e
         second = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
 
     assert first == second
+
+
+def _workspace_member(seeded_app, arcname: str) -> str:
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200, resp.text
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        return tar.extractfile(arcname).read().decode()
+
+
+def test_the_engine_gets_every_component_type_not_just_skills(seeded_app, kai_env):
+    """A plugin is its agents, commands, hooks and MCP servers too — delivering
+    only skills would leave most of a user's stack unreachable on this provider.
+    Agnes cannot install real plugins here (that writes the CLI's HOME registry
+    in a sandbox Agnes never enters), so they arrive as project-scope files."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names
+    assert ".claude/agents/kbl-reviewer.md" in names
+    assert ".claude/commands/kbl-ship.md" in names
+    # Hooks and MCP servers have no installed plugin to live in, so they have to
+    # become project config or they do not exist for the agent at all.
+    assert ".claude/settings.json" in names
+    assert ".mcp.json" in names
+
+
+def test_plugin_hooks_merge_into_the_templates_settings(seeded_app, kai_env):
+    """Merged, not replaced: the bundled template's own settings (the org safety
+    hook among them) must survive a marketplace plugin arriving."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    before = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert "PostToolUse" in before.get("hooks", {})
+    # Whatever else the template declared at the top level is still there.
+    assert set(before) >= {"hooks"}
+
+
+def test_plugin_mcp_servers_reach_the_project(seeded_app, kai_env):
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    mcp = json.loads(_workspace_member(seeded_app, ".mcp.json"))
+
+    assert "probe-mcp" in mcp["mcpServers"]
+
+
+def test_no_components_no_synthesized_config(seeded_app, kai_env):
+    """A stack with no hooks/MCP must not gain an empty settings or .mcp.json
+    that was never in the template — the payload is byte-compared by the engine
+    on every respawn."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names
+    assert ".mcp.json" not in names
+
+
+def test_flattened_mcp_servers_are_pre_approved(seeded_app, kai_env):
+    """A project `.mcp.json` server is untrusted-by-default: without an
+    allow-list entry the CLI never spawns it (verified against Claude Code
+    2.1.218 by watching for the server process), and no one can approve it
+    interactively in a headless sandbox. On the sibling providers the same
+    servers arrive inside an installed plugin and need no approval at all."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert settings["enabledMcpjsonServers"] == ["probe-mcp"]
+    # The template's own hook survives the merge.
+    assert "PreToolUse" in settings["hooks"]
+
+
+def test_no_mcp_servers_no_allow_list(seeded_app, kai_env):
+    """The allow-list names exactly what Agnes put there — it is not a blanket
+    `enableAllProjectMcpServers`, which would also pre-approve anything a future
+    template or an operator's own `.mcp.json` adds."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli")
+
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert "enabledMcpjsonServers" not in settings

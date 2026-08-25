@@ -21,8 +21,8 @@ from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
 from app.chat.skills_catalog import (
     BUNDLED_TEMPLATE_DIR,
-    list_recognized_commands,
     marketplace_delivery,
+    merged_commands,
     merged_skills,
 )
 from app.chat.sources import verdict as sources_verdict
@@ -455,14 +455,20 @@ async def list_skills(
     ``<plugin>:<skill>`` — verified against the sandboxed CLI's own command
     list, see the ``app.chat.skills_catalog`` module docstring.
 
-    ``commands`` is currently always empty: neither ``app/chat/runner.py`` nor
-    the bundled workspace template recognize any slash command today (checked,
-    not assumed — see ``list_recognized_commands``'s docstring). Nothing is
-    invented ahead of an actual implementation.
+    ``commands`` carries the slash commands the caller's stack plugins ship
+    (``commands/*.md``). Their token, unlike a skill's, depends on how the
+    plugin was delivered — ``/<plugin>:<command>`` where Agnes installed a real
+    plugin (e2b/docker), ``/<command>`` where it could only flatten the plugin
+    into project files (kai-agent). ``list_marketplace_commands`` documents the
+    CLI handshake that table was verified against. Plugin AGENTS are delivered
+    but deliberately not listed: they are dispatched by the Task tool, not by a
+    slash command.
     """
     delivery = marketplace_delivery(_chat_config_for_delivery(request))
-    skills = merged_skills(BUNDLED_TEMPLATE_DIR, conn, user, delivery=delivery)
-    return {"skills": skills, "commands": list_recognized_commands()}
+    return {
+        "skills": merged_skills(BUNDLED_TEMPLATE_DIR, conn, user, delivery=delivery),
+        "commands": merged_commands(conn, user, delivery=delivery),
+    }
 
 
 class JourneyUpdateBody(BaseModel):

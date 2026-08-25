@@ -728,6 +728,80 @@ def _agnes_mcp_servers() -> dict:
     }
 
 
+def _register_workspace_marketplace(workdir: Path) -> None:
+    """Install the workspace's shipped marketplace plugins into this project.
+
+    The server wrote the caller's RBAC-filtered marketplace as a plain directory
+    inside the workspace (``app/chat/marketplace_payload.py``); Claude Code
+    registers a directory as a marketplace and installs from it with no network
+    access at all:
+
+        claude plugin marketplace add <workspace>/.claude/agnes-marketplace
+        claude plugin install <name>@agnes --scope project
+
+    Both are needed. ``marketplace add`` records the source in the CLI's HOME
+    settings and ``plugin install`` records the install in its HOME registry —
+    HOME is fresh in every sandbox, so this runs per spawn even though the
+    workspace persists. The project-level ``enabledPlugins`` half is already in
+    the workspace settings the server wrote, which is what makes the plugins
+    load rather than sit installed-but-disabled.
+
+    ``--scope user``, deliberately, even though this is conceptually a
+    per-project install: ``--scope project`` writes ``enabledPlugins`` into
+    ``<cwd>/.claude/settings.json``, and in a session directory that path is a
+    SYMLINK to the shared workspace — which the CLI refuses outright
+    (``SymlinkWriteRefusedError``), so every install failed and no plugin
+    loaded. User scope has no such write, and in a sandbox it means exactly the
+    same thing: HOME is created fresh for this session and thrown away with it.
+
+    Best-effort and bounded, like every other spawn-time convergence: a failure
+    costs the session its marketplace plugins, never the session. Output goes to
+    stderr so it cannot corrupt the stdout frame protocol.
+    """
+    from shutil import which
+
+    from app.chat.marketplace_payload import MARKETPLACE_NAME, MARKETPLACE_TREE_SUBDIR
+
+    tree = workdir / MARKETPLACE_TREE_SUBDIR
+    manifest = tree / ".claude-plugin" / "marketplace.json"
+    if not manifest.is_file():
+        # No stack plugins for this user, or the operator turned delivery off.
+        return
+    claude = which("claude")
+    if claude is None:
+        print("marketplace: no `claude` on PATH; skipping plugin registration", file=sys.stderr, flush=True)
+        return
+
+    def _run(args: list[str], label: str) -> bool:
+        try:
+            result = subprocess.run(
+                [claude, *args],
+                cwd=str(workdir),
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stderr.fileno(),
+                stderr=sys.stderr.fileno(),
+                check=False,
+                timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 — non-fatal; agent still runs
+            print(f"marketplace: {label} failed: {exc}", file=sys.stderr, flush=True)
+            return False
+        if result.returncode != 0:
+            print(f"marketplace: {label} exited {result.returncode}", file=sys.stderr, flush=True)
+            return False
+        return True
+
+    if not _run(["plugin", "marketplace", "add", str(tree)], "marketplace add"):
+        return
+    try:
+        names = [p["name"] for p in json.loads(manifest.read_text(encoding="utf-8")).get("plugins", [])]
+    except (OSError, ValueError, TypeError):
+        print("marketplace: shipped manifest is unreadable; skipping installs", file=sys.stderr, flush=True)
+        return
+    for name in names:
+        _run(["plugin", "install", f"{name}@{MARKETPLACE_NAME}", "--scope", "user"], f"install {name}")
+
+
 async def _dispatch_frame(frame: dict, queue: "asyncio.Queue[dict]") -> None:
     """Route one parsed inbound stdin frame.
 
@@ -1702,17 +1776,16 @@ async def amain() -> None:
         # with`) loads CLAUDE.md/.claude from /work at boot. The wheel install
         # above deliberately does NOT gate on this — it overlaps the upload.
         await _wait_workspace_ready()
-        # No marketplace bootstrap here. It used to run `agnes
-        # refresh-marketplace --bootstrap` in the sandbox, which cannot work
-        # from inside one: the marketplace git endpoint is PAT-gated and the
-        # sandbox deliberately holds no PAT (see the manager's env comment), and
-        # the in-sandbox relay routes no marketplace prefix
-        # (`app/chat/relay.py::_SCOPE_FOR_PREFIX`) — so the clone 401'd behind a
-        # `check=False` subprocess and the feature looked enabled while
-        # delivering nothing (#1552). The server now materializes the user's
-        # marketplace skills into the workspace tree it uploads
-        # (`app/chat/workdir.py::_reconcile_marketplace_skills`), which reaches
-        # this project scope through the same `setting_sources` path.
+        # Register the marketplace the server shipped in the workspace, so the
+        # user's stack plugins load with everything they contain — skills,
+        # agents, slash commands, hooks, MCP servers. Offline by construction
+        # (a local directory), which is what the old design got wrong: it ran
+        # `agnes refresh-marketplace --bootstrap` here to CLONE the marketplace,
+        # impossible from inside a sandbox (the git endpoint is PAT-gated, the
+        # sandbox deliberately holds no PAT, and the relay routes no marketplace
+        # prefix), so it 401'd behind a `check=False` subprocess (#1552). After
+        # the CLI install; before the reader attaches, for the same fd-0 reason.
+        _register_workspace_marketplace(workdir)
 
     _emit({"type": "runner_ready"})
     queue = await _stdin_lines()

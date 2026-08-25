@@ -110,108 +110,86 @@ def _reconcile_feature_gated_skills(ws: Path, bundled_template_dir: Path, *, all
             logger.warning("workdir: could not restore skill %s", skill_name, exc_info=True)
 
 
-#: Provenance file for the marketplace skills Agnes wrote into a workspace.
-#: The reconcile needs to know which ``.claude/skills/<name>/`` directories are
-#: ITS OWN before it may delete one — the same tree holds bundled template
-#: skills, and an unsubscribe must never take one of those with it. Lives inside
-#: `.claude` so `purge_user` and the template reinit clean it up for free.
-_MARKETPLACE_SKILLS_MANIFEST = ".claude/.agnes-marketplace-skills.json"
+def _reconcile_marketplace_tree(ws: Path, export: "Callable[[Path], list[str]]") -> list[str]:
+    """Put the caller's whole marketplace in the workspace; return plugin names.
+
+    Not just skills. A plugin ships agents, slash commands, hooks and MCP
+    servers too, and the point of a stack is that all of it reaches the agent —
+    so what lands here is the filtered marketplace TREE, laid out exactly as the
+    served ZIP (`app/chat/marketplace_payload.py`). The runner then registers it
+    with the sandbox's own CLI (`claude plugin marketplace add <dir>` +
+    `claude plugin install <name>@agnes --scope project`), which is a purely
+    offline operation against a local directory — no network, no PAT.
+
+    That is why this exists at all: the previous design ran `agnes
+    refresh-marketplace --bootstrap` INSIDE the sandbox, where the clone is
+    impossible (the marketplace git endpoint is PAT-gated, the sandbox
+    deliberately holds no PAT, and the in-sandbox relay routes no marketplace
+    path), so it 401'd behind a `check=False` subprocess and delivered nothing
+    while the composer's slash menu advertised the skills anyway. See #1552.
+
+    Runs on every convergence, not only on reinit: `needs_reinit` compares the
+    global marketplace-ingest SHA and the Agnes version, neither of which moves
+    when THIS user subscribes to a plugin.
+    """
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    names = export(ws / MARKETPLACE_TREE_SUBDIR)
+    _enable_stack_plugins(ws, names)
+    return names
 
 
-def _reconcile_marketplace_skills(ws: Path, desired: "list[tuple[str, Path]]", bundled_template_dir: Path) -> None:
-    """Make the workspace's ``.claude/skills`` agree with the user's stack.
+def _enable_stack_plugins(ws: Path, names: "list[str]") -> None:
+    """Write `enabledPlugins` for the stack into the workspace settings.
 
-    Both directions, like :func:`_reconcile_feature_gated_skills`: a subscribed
-    skill is copied in, and one that left the stack is removed again. Removal is
-    bounded by the manifest this function writes, so it can only ever delete a
-    directory it created — a bundled skill of the same name is restored from the
-    template afterwards, since the marketplace copy had been shadowing it.
+    `claude plugin install --scope project` records the install in the CLI's own
+    HOME registry but does NOT enable the plugin for the project, so without
+    this every stack plugin loads disabled. Same contract as the analyst-side
+    writer (`cli/commands/refresh_marketplace.py::_enable_plugins_in_workspace_
+    settings`), including its two asymmetries: the stack is the source of truth,
+    so a locally disabled stack plugin is re-enabled; and only `@agnes` keys are
+    ours to prune — an entry from another marketplace is never touched.
 
-    This is what makes a stack skill invokable in chat at all on e2b/docker:
-    the session directory symlinks ``.claude`` from here, so a directory written
-    here is a PROJECT skill in the sandbox, and Claude Code exposes it as
-    ``/<name>`` — the token ``GET /api/chat/skills`` advertises. (The previous
-    design instead ran ``agnes refresh-marketplace --bootstrap`` inside the
-    sandbox, which cannot work there: the marketplace git endpoint is PAT-gated
-    and the sandbox deliberately holds no PAT, and the in-sandbox relay routes
-    no marketplace path. See #1552.)
-
-    Runs on every convergence rather than only on reinit: ``needs_reinit``
-    compares the global marketplace-ingest SHA and the Agnes version, neither of
-    which moves when THIS user subscribes to a plugin.
-
-    Copy-if-changed, not copy-always: the workspace is uploaded to the sandbox
-    on spawn, and rewriting identical trees would churn mtimes for nothing.
+    Idempotent: writes only when something actually changed, because this file
+    rides the workspace upload on every spawn.
     """
     import json
-    import shutil
 
-    skills_root = ws / ".claude" / "skills"
-    manifest_path = ws / _MARKETPLACE_SKILLS_MANIFEST
+    from app.chat.marketplace_payload import MARKETPLACE_NAME
+
+    settings_path = ws / ".claude" / "settings.json"
     try:
-        previous = set(json.loads(manifest_path.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError):
-        previous = set()
+        cfg = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (OSError, ValueError):
+        logger.warning("workdir: %s is not valid JSON; skipping plugin enable", settings_path)
+        return
+    if not isinstance(cfg, dict):
+        logger.warning("workdir: %s top-level is not an object; skipping plugin enable", settings_path)
+        return
+    enabled = cfg.setdefault("enabledPlugins", {})
+    if not isinstance(enabled, dict):
+        logger.warning("workdir: %s enabledPlugins is not an object; skipping plugin enable", settings_path)
+        return
 
-    # Last-wins on a duplicate name, matching ``merged_skills``'s dict merge —
-    # the menu and the workspace must resolve a clash the same way.
-    wanted: dict[str, Path] = {name: src for name, src in desired}
+    suffix = f"@{MARKETPLACE_NAME}"
+    wanted = {f"{name}{suffix}" for name in names}
+    changed = False
+    for key in sorted(wanted):
+        if enabled.get(key) is not True:
+            enabled[key] = True
+            changed = True
+    for key in [k for k in list(enabled) if k.endswith(suffix) and k not in wanted]:
+        del enabled[key]
+        changed = True
 
-    for name in sorted(previous - set(wanted)):
-        target = skills_root / name
-        try:
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target)
-                logger.info("workdir: dropped marketplace skill %s (no longer in the user's stack)", name)
-            # It was shadowing a bundled skill of the same name — put that back,
-            # or the unsubscribe silently costs the user a skill they still have.
-            bundled = bundled_template_dir / ".claude" / "skills" / name
-            if bundled.is_dir() and not target.exists():
-                shutil.copytree(bundled, target)
-                logger.info("workdir: restored bundled skill %s after marketplace copy left", name)
-        except OSError:
-            logger.warning("workdir: could not drop marketplace skill %s", name, exc_info=True)
-
-    for name, src in sorted(wanted.items()):
-        target = skills_root / name
-        try:
-            if not src.is_dir():
-                continue
-            if target.exists() and _trees_match(src, target):
-                continue
-            if target.is_symlink():
-                target.unlink()
-            elif target.is_dir():
-                shutil.rmtree(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # symlinks=False: the source is a synced git clone / uploaded
-            # bundle, i.e. untrusted content that must not carry a link out of
-            # the workspace into the sandbox upload.
-            shutil.copytree(src, target, symlinks=False)
-            logger.info("workdir: materialized marketplace skill %s", name)
-        except OSError:
-            logger.warning("workdir: could not materialize marketplace skill %s", name, exc_info=True)
-
-    if set(wanted) != previous:
-        try:
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(sorted(wanted)), encoding="utf-8")
-        except OSError:
-            logger.warning("workdir: could not write %s", _MARKETPLACE_SKILLS_MANIFEST, exc_info=True)
-
-
-def _trees_match(src: Path, dst: Path) -> bool:
-    """True when both directories hold the same relative files with the same
-    bytes. Cheap enough for a skill directory (a handful of markdown files) and
-    it is what lets the reconcile skip the common no-change case."""
+    if not changed:
+        return
     try:
-        src_files = {p.relative_to(src).as_posix(): p for p in src.rglob("*") if p.is_file()}
-        dst_files = {p.relative_to(dst).as_posix(): p for p in dst.rglob("*") if p.is_file()}
-        if set(src_files) != set(dst_files):
-            return False
-        return all(src_files[rel].read_bytes() == dst_files[rel].read_bytes() for rel in src_files)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        logger.info("workdir: enabled %d stack plugin(s) in %s", len(wanted), settings_path)
     except OSError:
-        return False
+        logger.warning("workdir: could not write %s", settings_path, exc_info=True)
 
 
 def _prune_disabled_feature_skills(ws: Path) -> None:
@@ -271,7 +249,7 @@ class WorkdirManager:
         get_template_status: Callable[[], Optional[TemplateStatus]],
         fetch_template_zip: Optional[Callable[[], bytes]] = None,
         render_workspace_prompt: Optional[Callable[[str], Optional[str]]] = None,
-        list_marketplace_skills: Optional[Callable[[str], "list[tuple[str, Path]]"]] = None,
+        export_marketplace: Optional[Callable[[str, Path], "list[str]"]] = None,
         marketplace_sha_debounce_seconds: int = 0,
     ) -> None:
         self._data_dir = data_dir
@@ -290,15 +268,16 @@ class WorkdirManager:
         # cloud chat consistent with a local install instead of diverging onto
         # the static bundled CLAUDE.md. Returns None → keep the static file.
         self._render_workspace_prompt = render_workspace_prompt
-        # Optional ``user_email -> [(skill_name, skill_dir)]`` hook: the
-        # caller's RBAC-filtered marketplace skills, or ``[]`` when the
-        # operator has ``chat.bootstrap_marketplace`` off. Injected rather than
+        # Optional ``(user_email, dest) -> [plugin_name]`` hook: writes the
+        # caller's RBAC-filtered marketplace tree at ``dest`` and returns the
+        # plugin names it wrote (``[]`` when the stack is empty, or when the
+        # operator has ``chat.bootstrap_marketplace`` off). Injected rather than
         # resolved here for the same reason as the prompt renderer — this module
-        # stays free of DB/RBAC coupling, and tests drive it with a list.
-        # ``None`` means "no marketplace wiring on this instance": the
-        # reconcile is skipped entirely, leaving any previously-written skills
-        # alone rather than pruning them on a half-configured manager.
-        self._list_marketplace_skills = list_marketplace_skills
+        # stays free of DB/RBAC coupling, and tests drive it with a stub.
+        # ``None`` means "no marketplace wiring on this instance": the reconcile
+        # is skipped entirely, leaving whatever is on disk alone rather than
+        # pruning it on a half-configured manager.
+        self._export_marketplace = export_marketplace
         # Debounce cache for the marketplace-SHA lookup. Operators set
         # ``marketplace_sha_debounce_seconds`` in instance.yaml to bound
         # how often the (potentially-slow) SHA source is consulted; this
@@ -397,28 +376,25 @@ class WorkdirManager:
         return ws
 
     def _reconcile_marketplace(self, ws: Path, user_email: str) -> None:
-        """Converge this workspace's marketplace skills — best-effort.
+        """Converge this workspace's marketplace tree — best-effort.
 
         Both convergence branches call it (a fresh workspace and an already-
         initialized one), for the same reason the feature-gate reconcile does:
         a stack change is not something ``needs_reinit`` can see.
 
-        A failure here must never deny someone their chat session — they lose a
-        marketplace skill for this spawn, not the session. The composer's menu
-        reads the stack independently, so a persistent failure shows up as a
-        menu entry that does nothing; the warning below is the breadcrumb.
+        A failure here must never deny someone their chat session — they lose
+        their marketplace plugins for this spawn, not the session. The
+        composer's menu reads the stack independently, so a persistent failure
+        shows up as a menu entry that does nothing; the warning is the
+        breadcrumb.
         """
-        if self._list_marketplace_skills is None:
+        export = self._export_marketplace
+        if export is None:
             return
         try:
-            desired = self._list_marketplace_skills(user_email)
+            _reconcile_marketplace_tree(ws, lambda dest: export(user_email, dest))
         except Exception:
-            logger.warning("workdir: marketplace skill resolution failed for %s", user_email, exc_info=True)
-            return
-        try:
-            _reconcile_marketplace_skills(ws, desired, self._bundled_template_dir)
-        except Exception:
-            logger.warning("workdir: marketplace skill reconcile failed for %s", user_email, exc_info=True)
+            logger.warning("workdir: marketplace reconcile failed for %s", user_email, exc_info=True)
 
     def run_init(self, user_email: str, workspace: Optional[Path] = None) -> None:
         ws = workspace or self.user_workspace(user_email)

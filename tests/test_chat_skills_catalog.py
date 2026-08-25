@@ -16,8 +16,9 @@ import pytest
 
 from app.chat.skills_catalog import (
     list_bundled_skills,
+    list_marketplace_commands,
     list_marketplace_skills,
-    list_recognized_commands,
+    merged_commands,
     merged_skills,
 )
 
@@ -377,15 +378,80 @@ class TestMergedSkills:
 
 
 # ---------------------------------------------------------------------------
-# list_recognized_commands
+# marketplace slash commands — the token depends on the delivery mode
 # ---------------------------------------------------------------------------
 
 
-def test_list_recognized_commands_is_empty():
-    """Nothing is currently backend-recognized — see the docstring for what
-    was checked. Locks the contract so a future PR can't silently start
-    inventing entries without updating this test."""
-    assert list_recognized_commands() == []
+def _write_command_md(path: Path, *, description: str | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    if description is not None:
+        lines.append(f"description: {description}")
+    lines += ["---", "", "Body."]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+class TestMarketplaceCommands:
+    """Verified against the sandboxed CLI (Claude Code 2.1.218): a plugin's
+    command is advertised as `/<plugin>:<command>` while a plugin's SKILL is
+    advertised bare — so the menu has to namespace one and not the other, and
+    only when the plugin was really installed."""
+
+    def _seed(self, db_conn, tmp_path, monkeypatch, *, command: str = "kbl-ship") -> None:
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "kbl", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="kbl")
+
+        from app.utils import get_marketplaces_dir
+
+        plugin_dir = get_marketplaces_dir() / "mkt" / "plugins" / "kbl"
+        _write_command_md(plugin_dir / "commands" / f"{command}.md", description="Ship it.")
+
+    def test_plugin_delivery_namespaces_the_command(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_PLUGIN
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        out = list_marketplace_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_PLUGIN)
+
+        assert out == [{"name": "kbl:kbl-ship", "description": "Ship it.", "source": "marketplace"}]
+
+    def test_flattened_delivery_leaves_the_command_bare(self, db_conn, tmp_path, monkeypatch):
+        """kai-agent gets loose project files, where a command has no plugin
+        namespace to be reached through."""
+        from app.chat.skills_catalog import DELIVERY_PROJECT
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        out = list_marketplace_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_PROJECT)
+
+        assert [c["name"] for c in out] == ["kbl-ship"]
+
+    def test_delivery_none_offers_no_commands(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_NONE
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        assert merged_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_NONE) == []
+
+    def test_no_plugins_yields_no_commands(self, db_conn):
+        assert merged_commands(db_conn, {"id": "nobody"}) == []
+
+    def test_agents_are_delivered_but_never_offered_as_commands(self, db_conn, tmp_path, monkeypatch):
+        """An agent is dispatched by the Task tool, so a menu entry for one would
+        insert a token nothing resolves."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "kbl", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="kbl")
+
+        from app.utils import get_marketplaces_dir
+
+        plugin_dir = get_marketplaces_dir() / "mkt" / "plugins" / "kbl"
+        _write_command_md(plugin_dir / "agents" / "kbl-reviewer.md", description="Reviews things.")
+
+        assert merged_commands(db_conn, {"id": "u1"}) == []
 
 
 # ---------------------------------------------------------------------------
@@ -412,14 +478,22 @@ class TestMarketplaceDelivery:
 
         assert marketplace_delivery(_Cfg(False)) == DELIVERY_NONE
 
-    @pytest.mark.parametrize("provider", ["e2b", "docker", "kai-agent"])
-    def test_flag_on_delivers_project_skills_on_every_provider(self, provider):
-        """One mechanism for all three: the server materializes skill
-        directories. Only the placement differs (workspace tree vs tarball), and
-        the composer's `/<name>` token is the same either way."""
+    @pytest.mark.parametrize("provider", ["e2b", "docker"])
+    def test_a_sandbox_agnes_enters_gets_real_plugins(self, provider):
+        """Agnes ships the marketplace as a directory and the sandbox's own CLI
+        installs from it offline — so hooks, MCP servers and the `<plugin>:<name>`
+        namespace all survive."""
+        from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(True, provider)) == DELIVERY_PLUGIN
+
+    def test_the_embedded_engine_gets_flattened_components(self):
+        """kai-agent runs the agent in a sandbox Agnes never enters, so a plugin
+        install (which writes the CLI's HOME registry) is out of reach; the
+        components ride the workspace tarball as loose project files instead."""
         from app.chat.skills_catalog import DELIVERY_PROJECT, marketplace_delivery
 
-        assert marketplace_delivery(_Cfg(True, provider)) == DELIVERY_PROJECT
+        assert marketplace_delivery(_Cfg(True, "kai-agent")) == DELIVERY_PROJECT
 
 
 class TestMenuNeverOffersAnUndeliveredSkill:

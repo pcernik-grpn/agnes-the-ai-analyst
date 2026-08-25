@@ -212,35 +212,48 @@ ecosystem — skills, marketplace re-serving, hooks — so a second adapter
 is a when-needed decision, not a roadmap item. The seam exists so that
 decision doesn't require an architecture change.
 
-### Marketplace skills in a chat session
+### Marketplace plugins in a chat session
 
-A skill in the user's stack is invokable in chat as `/<skill-name>` — the same
-bare token the composer's slash menu inserts. What makes that token resolve is
-Agnes materializing the skill directory into the agent's **project** scope,
-server-side, from one walk (`app/chat/skills_catalog.py`):
+A plugin in the user's stack reaches their chat session whole — skills, agents,
+slash commands, hooks and MCP servers — not just its skills. Agnes ships the
+caller's RBAC-filtered marketplace from the server (same content builder as the
+served ZIP an analyst's `agnes refresh-marketplace` downloads, so a sandbox and
+a laptop get byte-identical plugins), in one of two shapes:
 
-| Provider | Where the skill directory is written |
-|---|---|
-| `e2b`, `docker` | the per-user chat workspace, `.claude/skills/<name>/` (`app/chat/workdir.py::_reconcile_marketplace_skills`), which the session dir symlinks and the sandbox mounts |
-| `kai-agent` | the workspace tarball `GET /api/kai/workspace` serves, which the engine unpacks into its own project scope |
+| Provider | Shape | How |
+|---|---|---|
+| `e2b`, `docker` | **real plugins** | the marketplace is written into the workspace as a directory (`.claude/agnes-marketplace/`) and the sandbox's own CLI installs from it *offline* — `claude plugin marketplace add <dir>` + `claude plugin install <name>@agnes --scope user` (`app/chat/runner.py::_register_workspace_marketplace`) |
+| `kai-agent` | **flattened components** | Agnes never enters that provider's sandbox, and a plugin install writes the CLI's own HOME registry — out of reach. The components ride the workspace tarball as project files instead (`app/api/kai.py`) |
 
-The reconcile runs on every workspace convergence, both directions: a newly
-subscribed skill appears, one that left the stack is removed again (bounded by
-`.claude/.agnes-marketplace-skills.json`, so it can only delete directories it
-wrote), and a bundled skill it had been shadowing is restored.
+Both shapes deliver every component type. What differs is the invocation token,
+because Claude Code namespaces a plugin's components but not a project's —
+verified against the CLI's init handshake, not assumed:
 
-`chat.bootstrap_marketplace` (the `chat_bootstrap_marketplace` switch) gates the
-whole thing and is **on** by default. Turning it off also removes marketplace
-skills from the slash menu — the menu never offers what nothing delivers, which
-is the bug this replaced: the menu listed them while nothing installed them, so
-picking one answered `Unknown command: /<skill>`.
+| Component | Installed as a plugin | Flattened to project |
+|---|---|---|
+| skill | `/keboola-cli` | `/keboola-cli` |
+| slash command | `/kbl:kbl-ship` | `/kbl-ship` |
+| agent (Task tool) | `kbl:kbl-reviewer` | `kbl-reviewer` |
+| MCP server | `plugin:kbl:probe-mcp` | `probe-mcp` |
 
-Note what does NOT reach a chat session: a marketplace plugin's *agents*,
-*commands*, *hooks* and *MCP servers*. Only skills are materialized. Earlier
-versions tried to install whole plugins by running `agnes refresh-marketplace
---bootstrap` inside the sandbox, which cannot work from there — the marketplace
-git endpoint is PAT-gated, the sandbox deliberately holds no PAT, and the
-in-sandbox relay routes no marketplace path.
+`GET /api/chat/skills` reports the token for the running provider, which is what
+keeps the composer's slash menu honest. Two notes on the flattened shape: a
+plugin hook whose command needs `${CLAUDE_PLUGIN_ROOT}` is dropped (there is no
+installed plugin root to resolve, so shipping it would fail mid-turn instead),
+and its MCP servers are added to `enabledMcpjsonServers` — without that
+allow-list entry the CLI never spawns a project-scope server, and nobody can
+approve one interactively in a headless sandbox.
+
+Delivery is gated by `chat.bootstrap_marketplace` (the
+`chat_bootstrap_marketplace` switch), **on** by default. Turning it off also
+removes marketplace entries from the slash menu — the menu never offers what
+nothing delivers, which is the bug this replaced: it listed skills while nothing
+installed them, so picking one answered `Unknown command: /<skill>`. The earlier
+attempt ran `agnes refresh-marketplace --bootstrap` *inside* the sandbox to
+clone the marketplace, which cannot work from there — the git endpoint is
+PAT-gated, the sandbox deliberately holds no PAT, and the in-sandbox relay
+routes no marketplace path. Shipping the marketplace as files is what makes the
+install offline, and therefore possible.
 
 ## Security model
 

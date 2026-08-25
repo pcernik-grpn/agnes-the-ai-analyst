@@ -1105,76 +1105,116 @@ def _workspace_prompt_for(session: Any, *, override_active: bool = False) -> Opt
     return rendered if rendered and rendered.strip() else None
 
 
-#: Where a marketplace skill lands in the shipped tree. The engine materializes
-#: the tarball into its sandbox's PROJECT scope, so `.claude/skills/<name>/` is
-#: discovered by the Claude Agent SDK's `project` setting source exactly as a
-#: local checkout's would be — which is what makes the skill invokable as
-#: `/<name>`, the same token `GET /api/chat/skills` advertises.
-_MARKETPLACE_SKILLS_PREFIX = ".claude/skills"
+#: Project-scope settings file inside the shipped tree — where a plugin's hooks
+#: have to end up, since this shape has no installed plugin to carry them.
+_SETTINGS_ARCNAME = ".claude/settings.json"
+
+#: Project-scope MCP config inside the shipped tree.
+_MCP_ARCNAME = ".mcp.json"
 
 
-def _marketplace_skill_members(conn: Any, owner: Optional[Dict[str, Any]]) -> Dict[str, Path]:
-    """``{arcname: source file}`` for the caller's marketplace skills, or ``{}``.
+def _marketplace_components(
+    conn: Any, owner: Optional[Dict[str, Any]]
+) -> "tuple[Dict[str, Path], Dict[str, Any], Dict[str, Any]]":
+    """``(files, hooks, mcp_servers)`` from the caller's stack, or all empty.
 
-    This is the kai-agent half of ``chat.bootstrap_marketplace``. The sibling
-    providers get the same skill directories written into the per-user chat
-    workspace (``app/chat/workdir.py``'s ``_reconcile_marketplace_skills``),
-    which the sandbox then mounts; this provider has no such workspace on our
-    side — the tarball IS its project scope — so without this overlay a user's
-    stack skills reached every surface except the embedded engine, and the
-    composer's `/<skill>` came back "Unknown command" (#1552).
+    This is the kai-agent half of ``chat.bootstrap_marketplace``, and it is
+    deliberately a different SHAPE from the sibling providers'. They get the
+    marketplace as a directory and let the sandbox's own CLI install real
+    plugins (``app/chat/marketplace_payload.export_marketplace_tree`` +
+    ``app/chat/runner.py::_register_workspace_marketplace``). That is impossible
+    here: a plugin install writes state into the CLI's HOME registry, and Agnes
+    never enters this provider's sandbox — this tarball IS its project scope.
 
-    Gated on :func:`app.chat.skills_catalog.marketplace_delivery` resolving to
-    ``project``, and sourced from the same walk the menu uses
-    (``iter_marketplace_skill_dirs``), so the archive ships exactly the set the
-    composer offers rather than a second, drifting scan.
+    So the plugins are flattened into project-scope files instead:
+    ``.claude/skills/``, ``.claude/agents/``, ``.claude/commands/``, plus merged
+    ``hooks`` and ``mcpServers`` blocks. Every component type still reaches the
+    agent; what is lost is the plugin namespace, which is why
+    ``app.chat.skills_catalog`` reports bare invocation tokens for this delivery
+    mode and namespaced ones for the other.
 
     Best-effort by design: the archive's job is to carry the workspace, and a
-    marketplace that fails to resolve must degrade to "no marketplace skills",
+    marketplace that fails to resolve must degrade to "no marketplace content",
     never to a failed turn (the engine treats any non-200/204 as fatal).
     """
+    empty: "tuple[Dict[str, Path], Dict[str, Any], Dict[str, Any]]" = ({}, {}, {})
     if owner is None:
-        return {}
+        return empty
     try:
         from app.chat.config import load_chat_config
-        from app.chat.skills_catalog import (
-            DELIVERY_PROJECT,
-            iter_marketplace_skill_dirs,
-            marketplace_delivery,
-        )
+        from app.chat.marketplace_payload import materialize_plugin_components
+        from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
         from app.secrets import _state_dir
-        from src.marketplace_filter import escapes_base
 
-        # The same overlay file `app/main.py` boots the chat runtime from — not
-        # `switch_value()`, which would answer from the static base config the
-        # running chat config never reads (see `Switch.runtime_view`).
-        if marketplace_delivery(load_chat_config(_state_dir() / "instance.yaml")) != DELIVERY_PROJECT:
-            return {}
-
-        members: Dict[str, Path] = {}
-        for skill_name, skill_dir in iter_marketplace_skill_dirs(conn, owner):
-            base = skill_dir.resolve()
-            prefix = f"{_MARKETPLACE_SKILLS_PREFIX}/{skill_name}"
-            # A later same-named skill fully replaces an earlier one rather than
-            # merging two skills' files into one directory — matching the menu's
-            # "last one wins" dict merge, and keeping a stale `references/` file
-            # from leaking into the winner.
-            members = {k: v for k, v in members.items() if not k.startswith(f"{prefix}/")}
-            for path in sorted(skill_dir.rglob("*")):
-                if not path.is_file() or path.is_symlink():
-                    continue
-                rel = path.relative_to(skill_dir)
-                if ".git" in rel.parts:
-                    continue
-                # Containment check on top of the symlink skip: the source tree
-                # is a synced git clone / uploaded bundle, i.e. untrusted input.
-                if escapes_base(path, [base]):
-                    continue
-                members[f"{prefix}/{rel.as_posix()}"] = path
-        return members
+        # Gated on delivery being enabled AT ALL, not on the provider being
+        # `kai-agent`: this route exists to serve the engine, so if it is being
+        # called the engine is in play, and the flattened shape is the only one
+        # it can receive. Reading the provider here would ALSO refuse the
+        # content on an instance whose `chat.provider` still says `e2b` while
+        # the engine is configured — a distinction the caller has already
+        # settled by fetching this.
+        #
+        # The overlay file is the same one `app/main.py` boots the chat runtime
+        # from — not `switch_value()`, which would answer from the static base
+        # config the running chat config never reads (see `Switch.runtime_view`).
+        if marketplace_delivery(load_chat_config(_state_dir() / "instance.yaml")) == DELIVERY_NONE:
+            return empty
+        return materialize_plugin_components(conn, owner)
     except Exception:
-        logger.warning("kai workspace: marketplace skills unavailable, shipping template only", exc_info=True)
-        return {}
+        logger.warning("kai workspace: marketplace unavailable, shipping template only", exc_info=True)
+        return empty
+
+
+def _merged_json_member(template_bytes: Optional[bytes], key: str, additions: Dict[str, Any]) -> Optional[bytes]:
+    """The template's JSON file with ``additions`` merged under ``key``.
+
+    Returns ``None`` when there is nothing to add, so the caller ships the
+    template's own file untouched. A template file that is not a JSON object is
+    left alone too — overwriting an operator's settings with a synthesized one
+    would be a worse failure than not delivering hooks.
+    """
+    if not additions:
+        return None
+    base: Dict[str, Any] = {}
+    if template_bytes:
+        try:
+            parsed = json.loads(template_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("kai workspace: %s is not valid JSON; not merging %s", key, key)
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        base = parsed
+    block = base.get(key)
+    merged = dict(block) if isinstance(block, dict) else {}
+    merged.update(additions)
+    base[key] = merged
+    return (json.dumps(base, indent=2) + "\n").encode("utf-8")
+
+
+def _with_approved_mcp_servers(settings_bytes: Optional[bytes], names: "list[str]") -> Optional[bytes]:
+    """Add ``names`` to the settings' ``enabledMcpjsonServers`` allow-list.
+
+    Returns ``None`` when there is nothing to do or the file cannot be parsed —
+    the caller then ships the template's own settings rather than replacing them
+    with a synthesized guess.
+    """
+    base: Dict[str, Any] = {}
+    if settings_bytes:
+        try:
+            parsed = json.loads(settings_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        base = parsed
+    existing = base.get("enabledMcpjsonServers")
+    allow = list(existing) if isinstance(existing, list) else []
+    for name in names:
+        if name not in allow:
+            allow.append(name)
+    base["enabledMcpjsonServers"] = allow
+    return (json.dumps(base, indent=2) + "\n").encode("utf-8")
 
 
 def _build_workspace_archive(
@@ -1231,17 +1271,51 @@ def _build_workspace_archive(
             continue
         paths[rel.as_posix()] = path
 
-    overlay = _marketplace_skill_members(conn, owner)
+    overlay, hooks, mcp_servers = _marketplace_components(conn, owner)
     if overlay:
-        # Shadow whole directories, not individual files: a bundled skill the
-        # marketplace overrides must contribute nothing to the winner (a
+        # Shadow whole SKILL directories, not individual files: a bundled skill
+        # the marketplace overrides must contribute nothing to the winner (a
         # leftover `references/stale.md` would still be read by the agent).
-        shadowed = {"/".join(arcname.split("/")[:3]) for arcname in overlay}  # .claude/skills/<name>
+        # Agents and commands are single files by convention, so a plain
+        # overwrite is already wholesale for them.
+        shadowed = {"/".join(arcname.split("/")[:3]) for arcname in overlay if arcname.startswith(".claude/skills/")}
         paths = {k: v for k, v in paths.items() if not any(k.startswith(f"{root}/") for root in shadowed)}
         paths.update(overlay)
 
-    prompt = claude_md.encode("utf-8") if claude_md else None
-    names = sorted(paths if prompt is None else {*paths, _WORKSPACE_PROMPT_ARCNAME})
+    # Synthesized members: the rendered prompt, plus the two config files a
+    # flattened plugin needs (its hooks and MCP servers have no installed plugin
+    # to live in). Each merges into the template's own file rather than
+    # replacing it, so an operator's settings survive.
+    synthesized: Dict[str, bytes] = {}
+    if claude_md:
+        synthesized[_WORKSPACE_PROMPT_ARCNAME] = claude_md.encode("utf-8")
+    settings_additions: Dict[str, Any] = dict(hooks)
+    for arcname, key, additions in (
+        (_MCP_ARCNAME, "mcpServers", mcp_servers),
+        (_SETTINGS_ARCNAME, "hooks", settings_additions),
+    ):
+        template_file = paths.get(arcname)
+        merged = _merged_json_member(template_file.read_bytes() if template_file is not None else None, key, additions)
+        if merged is not None:
+            synthesized[arcname] = merged
+    if mcp_servers:
+        # A project `.mcp.json` server is untrusted-by-default: the CLI parks it
+        # at "Pending approval (run `claude` to approve)" until a human says yes,
+        # which no one can do in a headless sandbox — so the server would be
+        # delivered and never usable. Pre-approve exactly the ones Agnes put
+        # there. This is not a widening of trust: on the sibling providers the
+        # same servers arrive inside an installed plugin and register with no
+        # prompt at all, and both sets come from the caller's admin-granted,
+        # RBAC-filtered stack.
+        template_file = paths.get(_SETTINGS_ARCNAME)
+        base_bytes = synthesized.get(_SETTINGS_ARCNAME) or (
+            template_file.read_bytes() if template_file is not None else None
+        )
+        approved = _with_approved_mcp_servers(base_bytes, sorted(mcp_servers))
+        if approved is not None:
+            synthesized[_SETTINGS_ARCNAME] = approved
+
+    names = sorted({*paths, *synthesized})
 
     buffer = io.BytesIO()
     members = 0
@@ -1257,14 +1331,16 @@ def _build_workspace_archive(
     with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
         with tarfile.open(fileobj=gz, mode="w|") as tar:
             for arcname in names:
-                if prompt is not None and arcname == _WORKSPACE_PROMPT_ARCNAME:
-                    # Synthesized rather than read: the rendered prompt has no
-                    # file on disk, and building the header here keeps it under
-                    # the same pinning as every other member.
+                if arcname in synthesized:
+                    # Synthesized rather than read: the rendered prompt and the
+                    # merged config files have no file on disk, and building the
+                    # header here keeps them under the same pinning as every
+                    # other member.
+                    payload = synthesized[arcname]
                     info = tarfile.TarInfo(name=arcname)
-                    info.size = len(prompt)
+                    info.size = len(payload)
                     info.mode = 0o644
-                    body: Any = io.BytesIO(prompt)
+                    body: Any = io.BytesIO(payload)
                 else:
                     path = paths[arcname]
                     info = tar.gettarinfo(str(path), arcname=arcname)

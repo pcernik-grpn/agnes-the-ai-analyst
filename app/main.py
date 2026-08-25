@@ -1691,25 +1691,25 @@ async def lifespan(app):
                         if conn is not None:
                             conn.close()
 
-                def _list_marketplace_skills(user_email: str) -> "list[tuple[str, Path]]":
-                    """The user's RBAC-filtered marketplace skill directories.
+                def _export_marketplace(user_email: str, dest: Path) -> "list[str]":
+                    """Write the user's RBAC-filtered marketplace tree at `dest`.
 
-                    Delegates to the same walk `GET /api/chat/skills` lists the
-                    composer's slash menu from, so a menu entry and a
-                    materialized skill directory can never disagree. Returns []
-                    when the operator has `chat.bootstrap_marketplace` off (then
-                    the menu omits them too) or when the user row is gone.
+                    Returns the plugin names written — the `<name>@agnes` refs
+                    the sandbox installs offline. The content comes from the same
+                    builder the served marketplace ZIP uses, so a chat sandbox
+                    and an analyst's laptop get byte-identical plugins.
+
+                    Returns [] when the operator has `chat.bootstrap_marketplace`
+                    off (the composer's menu omits them too, so the two agree) or
+                    when the user row is gone.
 
                     Conn resolution mirrors `_render_workspace_prompt` above:
                     handed in under DuckDB, None on Postgres (where opening the
                     system DuckDB is a forbidden invariant) — the resolver reads
                     its state through the repo factory either way.
                     """
-                    from app.chat.skills_catalog import (
-                        DELIVERY_NONE,
-                        iter_marketplace_skill_dirs,
-                        marketplace_delivery,
-                    )
+                    from app.chat.marketplace_payload import export_marketplace_tree
+                    from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
                     from src.db import get_system_db
                     from src.repositories import use_pg, users_repo
 
@@ -1720,7 +1720,7 @@ async def lifespan(app):
                         return []
                     conn = None if use_pg() else get_system_db()
                     try:
-                        return iter_marketplace_skill_dirs(conn, dict(user))
+                        return export_marketplace_tree(conn, dict(user), dest)
                     finally:
                         if conn is not None:
                             conn.close()
@@ -1735,7 +1735,7 @@ async def lifespan(app):
                     get_template_status=_server_template_status,
                     fetch_template_zip=_fetch_local_template_zip,
                     render_workspace_prompt=_render_workspace_prompt,
-                    list_marketplace_skills=_list_marketplace_skills,
+                    export_marketplace=_export_marketplace,
                     marketplace_sha_debounce_seconds=app.state.chat_config.marketplace_sha_debounce_seconds,
                 )
                 if app.state.chat_config.provider == "docker":

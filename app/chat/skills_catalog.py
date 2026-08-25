@@ -65,37 +65,52 @@ logger = logging.getLogger(__name__)
 # regardless of where the process was launched from.
 BUNDLED_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "app" / "initial_workspace_default"
 
-#: ``marketplace_delivery`` results.
+#: ``marketplace_delivery`` results — HOW the caller's stack plugins reach the
+#: agent, which decides what a component is called once it is there.
 #:
-#: ``project`` — the caller's marketplace skills are materialized as PROJECT
-#:               skills (``.claude/skills/<name>/``): into the per-user chat
-#:               workspace for e2b/docker (``app/chat/workdir.py``), and into
-#:               the workspace tarball for kai-agent (``app/api/kai.py``).
-#:               Different placements, one mechanism — and one ``/<name>`` token
-#:               for the composer to offer.
-#: ``none``    — ``chat.bootstrap_marketplace`` is off; nothing delivers them,
-#:               so the menu must not offer them.
+#: ``plugin``  — e2b / docker: the server writes the filtered marketplace as a
+#:               directory in the workspace and the sandbox's own CLI installs
+#:               real plugins from it, offline (``app/chat/marketplace_payload
+#:               .export_marketplace_tree`` + ``app/chat/runner.py::
+#:               _register_workspace_marketplace``). Faithful: hooks keep
+#:               ``${CLAUDE_PLUGIN_ROOT}``, MCP servers register as
+#:               ``plugin:<plugin>:<server>``, and agents/commands keep the
+#:               ``<plugin>:<name>`` namespace.
+#: ``project`` — kai-agent: Agnes never enters that provider's sandbox, so a
+#:               plugin install (which writes the CLI's HOME registry) is out of
+#:               reach and the plugins are flattened into project-scope files in
+#:               the workspace tarball (``app/api/kai.py``). Every component type
+#:               still arrives; the plugin namespace does not.
+#: ``none``    — ``chat.bootstrap_marketplace`` is off; nothing is delivered, so
+#:               the menu must not offer anything from the marketplace.
+DELIVERY_PLUGIN = "plugin"
 DELIVERY_PROJECT = "project"
 DELIVERY_NONE = "none"
 
+#: Providers Agnes cannot run a CLI inside — the workspace payload is the only
+#: project scope it controls, so components ship flattened. A set so a fourth
+#: engine-style provider is one entry, not another branch.
+_FLATTENED_DELIVERY_PROVIDERS = frozenset({"kai-agent"})
+
 
 def marketplace_delivery(chat_config: object) -> str:
-    """Whether marketplace skills are delivered to chat sessions at all.
+    """How this configuration delivers the caller's marketplace plugins.
 
-    One resolver for the three consumers that must agree: ``GET
-    /api/chat/skills`` (what the composer offers), ``app/chat/workdir.py``
+    One resolver for every consumer that must agree: ``GET /api/chat/skills``
+    (what the composer offers, and under which token), ``app/chat/workdir.py``
     (what an e2b/docker workspace receives) and ``app/api/kai.py``'s workspace
     archive (what the engine's project scope receives). Splitting the decision
-    would let the menu offer a skill no sandbox got — the drift this whole
-    change exists to remove.
+    would let the menu offer a token no sandbox answers to — the drift this
+    whole change exists to remove.
 
     ``None``/missing config resolves to :data:`DELIVERY_NONE` rather than
     guessing: with no chat runtime loaded there is nothing to deliver into, and
-    offering the skills anyway is the failure mode, not the safe default.
+    offering the plugins anyway is the failure mode, not the safe default.
     """
     if chat_config is None or not getattr(chat_config, "bootstrap_marketplace", False):
         return DELIVERY_NONE
-    return DELIVERY_PROJECT
+    provider = str(getattr(chat_config, "provider", "") or "").strip().lower()
+    return DELIVERY_PROJECT if provider in _FLATTENED_DELIVERY_PROVIDERS else DELIVERY_PLUGIN
 
 
 def _read_skill_md(skill_md: Path) -> tuple[str, Optional[str]]:
@@ -240,7 +255,7 @@ def merged_skills(
     conn: duckdb.DuckDBPyConnection,
     user: dict,
     *,
-    delivery: str = DELIVERY_PROJECT,
+    delivery: str = DELIVERY_PLUGIN,
 ) -> list[dict]:
     """Merge bundled + marketplace skills into one deterministic list.
 
@@ -249,8 +264,11 @@ def merged_skills(
     with ``chat.bootstrap_marketplace`` off, nothing materializes those skills
     into the session, and a menu row for one is a promise the agent cannot keep
     (``/keboola-cli`` → "Unknown command", #1552). It defaults to
-    :data:`DELIVERY_PROJECT` — the delivering value — so a caller that forgets
-    the argument offers exactly what it offered before this argument existed.
+    :data:`DELIVERY_PLUGIN` — a delivering value — so a caller that forgets the
+    argument offers exactly what it offered before this argument existed. Skill
+    names are identical under both delivering modes (a plugin's skill is
+    exposed bare, same as a project skill), so only :func:`list_marketplace_commands`
+    actually branches on it.
 
     Marketplace entries win name clashes against bundled ones (more
     user-specific). Either source failing to list is logged as a warning
@@ -280,30 +298,83 @@ def merged_skills(
     return sorted(by_name.values(), key=lambda s: s["name"])
 
 
-def list_recognized_commands() -> list[dict]:
-    """Slash commands the chat backend/agent actually recognizes.
+def list_marketplace_commands(
+    conn: duckdb.DuckDBPyConnection,
+    user: dict,
+    *,
+    delivery: str = DELIVERY_PLUGIN,
+) -> list[dict]:
+    """Slash commands the caller's stack plugins ship (``commands/*.md``).
 
-    As things stand, this is an empty list — checked, not assumed:
+    Unlike a skill, a command's invocation token DEPENDS on the delivery mode —
+    verified against the sandboxed CLI (Claude Code 2.1.218), not assumed:
 
-    - ``app/chat/runner.py`` performs no slash-command parsing of its own.
-      Every ``user_msg`` frame's ``text`` is forwarded verbatim to
-      ``ClaudeSDKClient.connect()``/``query()`` as a plain user turn; Agnes
-      never special-cases a leading ``/``.
-    - The bundled chat workspace template (``app/initial_workspace_default``,
-      the same tree ``list_bundled_skills`` reads) ships no
-      ``.claude/commands/*.md`` — so there are no custom project commands
-      either (contrast with the LOCAL laptop workspace, which does get
-      ``.claude/commands/*.md`` from ``cli/templates/commands/`` via
-      ``agnes init`` — a different, non-chat code path).
-    - The underlying claude-agent-sdk's ``ClaudeSDKClient.get_server_info()``
-      can surface the sandboxed CLI's own built-in commands from its init
-      handshake, but Agnes doesn't read or forward that handshake data
-      anywhere today, so there is no verified list to publish without
-      guessing at Claude Code version-specific command names.
+    ===============  ==========================  =====================
+    component        installed as a plugin       flattened to project
+    ===============  ==========================  =====================
+    skill            ``/keboola-cli``            ``/keboola-cli``
+    command          ``/kbl:kbl-ship``           ``/kbl-ship``
+    agent            ``kbl:kbl-reviewer``        ``kbl-reviewer``
+    ===============  ==========================  =====================
 
-    Extend this once a command is actually wired end-to-end (a bundled
-    ``.claude/commands/*.md`` file, or the runner intercepting a specific
-    command before forwarding to the SDK) — don't invent entries ahead of
-    the implementation.
+    So a skill is bare either way, and a command is namespaced by its plugin
+    exactly when Agnes could install the plugin for real. Getting this backwards
+    in either direction produces the original bug — a menu entry the agent
+    answers "Unknown command" to.
+
+    Agents are deliberately absent from this listing: they are dispatched by the
+    Task tool, not by a slash command, so offering one in the composer's menu
+    would insert a token nothing resolves. They ARE delivered.
+
+    :data:`DELIVERY_NONE` is handled by the caller (:func:`merged_commands`),
+    which omits the whole source.
     """
-    return []
+    out: list[dict] = []
+    for plugin in resolve_user_marketplace(conn, user):
+        namespace = plugin.get("manifest_name") or plugin.get("original_name") or ""
+        for plugin_dir in _plugin_dirs(plugin):
+            if plugin_dir is None or not plugin_dir.is_dir():
+                continue
+            commands_dir = plugin_dir / "commands"
+            if not commands_dir.is_dir():
+                continue
+            for md in sorted(commands_dir.rglob("*.md")):
+                try:
+                    fm = parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    logger.warning("chat skills: unreadable marketplace command %s", md, exc_info=True)
+                    continue
+                local = md.stem
+                name = f"{namespace}:{local}" if (delivery == DELIVERY_PLUGIN and namespace) else local
+                description = (fm.get("description") or "").strip() or None
+                out.append({"name": name, "description": description, "source": "marketplace"})
+    return out
+
+
+def merged_commands(
+    conn: duckdb.DuckDBPyConnection,
+    user: dict,
+    *,
+    delivery: str = DELIVERY_PLUGIN,
+) -> list[dict]:
+    """Every slash command the composer may offer, deterministically ordered.
+
+    Only marketplace-plugin commands today: the bundled chat workspace template
+    ships no ``.claude/commands/*.md`` (checked, not assumed — contrast the
+    LOCAL analyst workspace, which gets them from ``cli/templates/commands/``
+    via ``agnes init``, a different code path), and the runner still performs no
+    slash-command parsing of its own — every ``user_msg`` is forwarded verbatim
+    and resolved by the sandboxed CLI.
+
+    A failure to list degrades to an empty list with a warning, matching
+    ``merged_skills``: a broken marketplace must not empty the whole menu.
+    """
+    if delivery == DELIVERY_NONE:
+        return []
+    try:
+        commands = list_marketplace_commands(conn, user, delivery=delivery)
+    except Exception:
+        logger.warning("chat commands: marketplace source failed to list", exc_info=True)
+        return []
+    by_name: dict[str, dict] = {c["name"]: c for c in commands}
+    return sorted(by_name.values(), key=lambda c: c["name"])
