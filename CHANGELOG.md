@@ -10,6 +10,40 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Hosted data-app containers are blocked from the cloud metadata server at
+  the host firewall.** A data app runs user-authored code (RCE inside its own
+  container is by design), and on the `agnes-apps` bridge it could otherwise
+  reach the instance metadata server (`169.254.169.254`), read the VM's
+  service-account token, and pivot to the whole cloud project. The
+  `customer-instance` Terraform module now installs an idempotent `DOCKER-USER`
+  iptables DROP at boot (`container-metadata-hardening` block in
+  `startup-script.sh.tpl`), source-scoped to the `agnes-apps` subnet so the
+  Agnes app container's own metadata use (e.g. BigQuery GCE-metadata auth) is
+  untouched. Non-Terraform hosts should install the equivalent rule (see
+  `docs/architecture.md#hosted-data-apps`) and least-privilege the VM service
+  account regardless. Fail-soft: a missing `iptables` or an unresolvable subnet
+  warns and never blocks the boot.
+
+### Changed
+
+- **BREAKING: hosted data apps are no longer served on the main Agnes origin by
+  default.** A hosted app's user-authored JS, served same-origin with the Agnes
+  `/api` (the `/apps/<slug>/…` path-prefix form), can call `/api` with the
+  viewer's own session and read the response (mint a PAT, read admin config) —
+  no response header can close a same-origin read. The ingress proxy now
+  refuses to serve an app on the main origin unless the operator either
+  configures `data_apps.subdomain_base` (serve apps from an isolated origin,
+  where the existing CORS + CSRF-origin defenses contain the attack) or
+  explicitly opts into same-origin serving with the new
+  `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (default
+  `false`). Requests that arrive on a data-app subdomain are always served. A
+  deployment that runs apps in path-prefix mode (no `subdomain_base`) — **and
+  the in-chat app preview, which loads same-origin** — must set
+  `allow_same_origin: true` (trusted authors only) or move to subdomain mode;
+  a startup log flags an enabled-but-unservable posture.
+
 ### Removed
 
 - **BREAKING: removed the `e2b` chat provider.** `chat.provider` now accepts

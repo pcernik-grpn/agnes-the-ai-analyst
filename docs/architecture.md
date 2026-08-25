@@ -616,6 +616,41 @@ runtime image, whose nginx + supervisord write outside the `/tmp` + `/app`
 tmpfs the spec builder currently supplies, so turning it on unverified would
 crash-loop every hosted app.
 
+**Origin isolation** (`data_apps.allow_same_origin`, default **off**): a hosted
+app runs user-authored JS, so *where* it is served decides what that JS can
+reach. Served on the **main origin** (`/apps/<slug>/…`) it is same-origin with
+the Agnes `/api`, so its JS can `fetch('/api/…', {credentials:'include'})` with
+the viewer's own session cookie and read the response — mint a PAT, read admin
+config — because same-origin reads need no CORS and the `CsrfOriginMiddleware`
+only refuses *cross*-origin state changes. No response header closes this (a
+same-origin `window.open`/`<iframe>` to `/api` is DOM-readable and ungoverned by
+CSP). The only fix is origin isolation: configure `data_apps.subdomain_base` so
+apps are served from their own origin (`<slug>.<subdomain_base>`), where the
+existing CORS policy blocks the credentialed read and `CsrfOriginMiddleware`
+blocks the write. The ingress proxy therefore **refuses** to serve an app on the
+main origin unless the operator opts in with `data_apps.allow_same_origin` /
+`AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (trusted authors only, or to keep the
+in-chat preview working); requests that arrive on a data-app subdomain are
+always served. A startup log flags an enabled-but-unservable posture
+(no isolated origin, no opt-in).
+
+**Network egress** (GCP metadata): a data-app container sits on the `agnes-apps`
+bridge with normal egress (its runtime image installs dependencies from PyPI/npm
+at boot). On a cloud VM that reach includes the instance **metadata server**
+(`169.254.169.254`), from which a compromised app could read the VM's
+service-account token and pivot to the whole cloud project. The
+`customer-instance` Terraform module blocks this at the host firewall — an
+idempotent `DOCKER-USER` iptables DROP from the `agnes-apps` source subnet to
+`169.254.169.254/32`, installed at boot (see the `container-metadata-hardening`
+block in `infra/modules/customer-instance/startup-script.sh.tpl`). It is
+source-scoped, not a blanket block, so the Agnes app container's own metadata
+use (e.g. BigQuery GCE-metadata auth) is unaffected. For a non-Terraform host
+(plain docker-compose), install the equivalent rule yourself:
+`iptables -I DOCKER-USER -s <agnes-apps-subnet> -d 169.254.169.254/32 -j DROP`
+(resolve the subnet with `docker network inspect agnes-apps`). Least-privilege
+the VM service account regardless — the firewall rule is defense-in-depth, not a
+substitute for a narrowly-scoped SA.
+
 ---
 
 ## Background Jobs

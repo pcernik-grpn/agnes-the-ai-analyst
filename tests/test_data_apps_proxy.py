@@ -79,7 +79,11 @@ def proxy_env(e2e_env, monkeypatch, shared_app):
 
     state = data_dir / "state"
     state.mkdir(parents=True, exist_ok=True)
-    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True}}))
+    # `allow_same_origin` on by default in tests: most proxy tests exercise the
+    # path-prefix serving mechanics, which the same-origin gate would otherwise
+    # refuse (see `_same_origin_serving_refused`). The gate itself is covered by
+    # the dedicated tests below, which flip it off explicitly.
+    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True, "allow_same_origin": True}}))
     import app.instance_config as instance_config
 
     instance_config._instance_config = None
@@ -111,7 +115,13 @@ def proxy_env(e2e_env, monkeypatch, shared_app):
     from fastapi.testclient import TestClient
 
     client = TestClient(app)
-    return {"client": client, "app": app, "owner_pat": pats["owner1"], "other_pat": pats["other1"], "data_dir": data_dir}
+    return {
+        "client": client,
+        "app": app,
+        "owner_pat": pats["owner1"],
+        "other_pat": pats["other1"],
+        "data_dir": data_dir,
+    }
 
 
 def _set_data_apps_config(data_dir, **overrides) -> None:
@@ -120,7 +130,10 @@ def _set_data_apps_config(data_dir, **overrides) -> None:
     import app.instance_config as instance_config
 
     state = data_dir / "state"
-    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True, **overrides}}))
+    # `allow_same_origin` defaults on (path-prefix mechanics); a test exercising
+    # the same-origin gate passes `allow_same_origin=False` to override it.
+    base = {"enabled": True, "allow_same_origin": True}
+    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {**base, **overrides}}))
     instance_config._instance_config = None
 
 
@@ -645,6 +658,101 @@ def test_ws_sleeping_app_rejected_with_4404(client_granted, sleeping_app):
         with client_granted.websocket_connect("/apps/s/ws"):
             pass
     assert excinfo.value.code == 4404
+
+
+# ---------------------------------------------------------------------------
+# Same-origin serving gate (security): a hosted app served on the MAIN origin
+# shares the viewer's session with app-authored JS, which can read /api. Refused
+# unless the request arrived on a data-app subdomain (isolated origin) or the
+# operator opted in via data_apps.allow_same_origin.
+# ---------------------------------------------------------------------------
+
+
+def test_same_origin_serving_refused_by_default(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 403
+    assert "isolated origin" in r.text  # the operator-facing HTML explains the fix
+    assert respx_upstream.calls == []  # hard stop — never proxied to the container
+
+
+def test_same_origin_serving_refused_json(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_granted.get("/apps/s/hello", headers={"accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
+
+
+def test_same_origin_serving_allowed_with_ack(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=True)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200
+    assert r.text == "hello from app"
+
+
+def test_same_origin_gate_honors_env_override(client_granted, running_app, respx_upstream, proxy_env, monkeypatch):
+    """The env override wins over an instance.yaml `allow_same_origin: false`."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    monkeypatch.setenv("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN", "1")
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200
+    assert r.text == "hello from app"
+
+
+def test_subdomain_request_served_without_ack(client_granted, running_app, respx_upstream, proxy_env):
+    """A subdomain-origin request is already on an isolated origin, so it is
+    served even with same-origin serving off."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com", allow_same_origin=False)
+    r = client_granted.get("/", headers={"host": "s.apps.example.com"})
+    assert r.status_code == 200
+    assert respx_upstream.calls  # reached and proxied to the container
+
+
+def test_same_origin_gate_runs_after_rbac(client_stranger, running_app, respx_upstream, proxy_env):
+    """The gate runs AFTER RBAC: a stranger still gets a plain 403 `forbidden`,
+    so the refusal never reveals an app's existence to an unauthorized caller."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_stranger.get("/apps/s/hello", headers={"accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "forbidden"
+
+
+def test_ws_same_origin_refused_by_default(client_granted, running_app, proxy_env):
+    """The WS bridge mirrors the HTTP gate — owner passes RBAC, so the only
+    reason for the 4403 close here is the same-origin refusal."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with client_granted.websocket_connect("/apps/s/ws"):
+            pass
+    assert excinfo.value.code == 4403
+
+
+# ---------------------------------------------------------------------------
+# same_origin_serving_warning() — the startup log when apps are enabled but no
+# hosted app can be served (same-origin off, no isolated origin configured).
+# ---------------------------------------------------------------------------
+
+
+def test_same_origin_warning_fires_when_enabled_without_isolation(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    msg = same_origin_serving_warning()
+    assert msg is not None and "subdomain_base" in msg
+
+
+def test_same_origin_warning_silent_with_subdomain(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com", allow_same_origin=False)
+    assert same_origin_serving_warning() is None
+
+
+def test_same_origin_warning_silent_with_ack(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=True)
+    assert same_origin_serving_warning() is None
 
 
 # ---------------------------------------------------------------------------
