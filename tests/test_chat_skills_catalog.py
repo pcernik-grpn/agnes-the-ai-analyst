@@ -386,3 +386,159 @@ def test_list_recognized_commands_is_empty():
     was checked. Locks the contract so a future PR can't silently start
     inventing entries without updating this test."""
     assert list_recognized_commands() == []
+
+
+# ---------------------------------------------------------------------------
+# Delivery gate + naming contract (#1552)
+# ---------------------------------------------------------------------------
+
+
+class _Cfg:
+    def __init__(self, bootstrap_marketplace: bool, provider: str = "e2b"):
+        self.bootstrap_marketplace = bootstrap_marketplace
+        self.provider = provider
+
+
+class TestMarketplaceDelivery:
+    def test_no_chat_runtime_delivers_nothing(self):
+        """No config loaded → nothing to deliver into. Offering the skills anyway
+        is the failure mode, so `None` must not resolve to a delivering value."""
+        from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
+
+        assert marketplace_delivery(None) == DELIVERY_NONE
+
+    def test_flag_off_delivers_nothing(self):
+        from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(False)) == DELIVERY_NONE
+
+    @pytest.mark.parametrize("provider", ["e2b", "docker", "kai-agent"])
+    def test_flag_on_delivers_project_skills_on_every_provider(self, provider):
+        """One mechanism for all three: the server materializes skill
+        directories. Only the placement differs (workspace tree vs tarball), and
+        the composer's `/<name>` token is the same either way."""
+        from app.chat.skills_catalog import DELIVERY_PROJECT, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(True, provider)) == DELIVERY_PROJECT
+
+
+class TestMenuNeverOffersAnUndeliveredSkill:
+    def test_delivery_none_omits_the_marketplace_source(self, db_conn, tmp_path, monkeypatch):
+        """The bug this change exists to remove: with nothing delivering
+        marketplace skills, a menu row for one inserts `/name` and the agent
+        answers "Unknown command"."""
+        from app.chat.skills_catalog import DELIVERY_NONE
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        template = tmp_path / "bundled"
+        _write_skill_md(template / ".claude" / "skills" / "bundled-one" / "SKILL.md", name="bundled-one")
+
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = merged_skills(template, db_conn, {"id": "u1"}, delivery=DELIVERY_NONE)
+
+        assert [s["name"] for s in out] == ["bundled-one"]
+
+    def test_delivery_project_offers_them(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_PROJECT
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = merged_skills(tmp_path / "empty", db_conn, {"id": "u1"}, delivery=DELIVERY_PROJECT)
+
+        assert [s["name"] for s in out] == ["keboola-cli"]
+
+
+class TestSkillNamesStayBare:
+    def test_a_marketplace_skill_is_named_without_its_plugin(self, db_conn, tmp_path, monkeypatch):
+        """Verified against the sandboxed CLI (Claude Code 2.1.218): a plugin's
+        skill is advertised as `{"name": "keboola-cli", "description":
+        "(demo-plugin) …"}` — the owning plugin appears in the DESCRIPTION, never
+        in the command token. Prefixing the name here (`demo-plugin:keboola-cli`)
+        is what would make the menu insert an unknown command, so this locks the
+        bare form in."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "demo-plugin", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="demo-plugin")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "demo-plugin" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = list_marketplace_skills(db_conn, {"id": "u1"})
+
+        assert [s["name"] for s in out] == ["keboola-cli"]
+        assert all(":" not in s["name"] for s in out)
+
+
+class TestOneWalkFeedsMenuAndDelivery:
+    """The invariant that keeps the three surfaces from drifting: what the
+    composer offers, what `app/chat/workdir.py` writes into the workspace and
+    what `app/api/kai.py` packs into the tarball all come from one walk."""
+
+    def test_names_and_dirs_agree(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import iter_marketplace_skill_dirs
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        root = get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills"
+        _write_skill_md(root / "alpha" / "SKILL.md", name="alpha")
+        _write_skill_md(root / "beta" / "SKILL.md", name="beta")
+
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        delivered = iter_marketplace_skill_dirs(db_conn, {"id": "u1"})
+
+        assert menu == [name for name, _dir in delivered] == ["alpha", "beta"]
+        for name, skill_dir in delivered:
+            assert (skill_dir / "SKILL.md").is_file()
+            assert skill_dir.name == name
+
+    def test_the_directory_is_named_by_the_frontmatter_not_the_folder(self, db_conn, tmp_path, monkeypatch):
+        """The delivered directory must be named by the token the menu offers.
+        When frontmatter and folder disagree, frontmatter wins in the menu — so
+        `iter_marketplace_skill_dirs` reports that name and the copy lands
+        under it, keeping directory, frontmatter and slash command in agreement."""
+        from app.chat.skills_catalog import iter_marketplace_skill_dirs
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "folder-name" / "SKILL.md",
+            name="frontmatter-name",
+        )
+
+        assert [n for n, _ in iter_marketplace_skill_dirs(db_conn, {"id": "u1"})] == ["frontmatter-name"]
+        assert [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})] == ["frontmatter-name"]

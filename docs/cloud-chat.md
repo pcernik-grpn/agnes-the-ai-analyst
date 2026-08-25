@@ -212,6 +212,36 @@ ecosystem — skills, marketplace re-serving, hooks — so a second adapter
 is a when-needed decision, not a roadmap item. The seam exists so that
 decision doesn't require an architecture change.
 
+### Marketplace skills in a chat session
+
+A skill in the user's stack is invokable in chat as `/<skill-name>` — the same
+bare token the composer's slash menu inserts. What makes that token resolve is
+Agnes materializing the skill directory into the agent's **project** scope,
+server-side, from one walk (`app/chat/skills_catalog.py`):
+
+| Provider | Where the skill directory is written |
+|---|---|
+| `e2b`, `docker` | the per-user chat workspace, `.claude/skills/<name>/` (`app/chat/workdir.py::_reconcile_marketplace_skills`), which the session dir symlinks and the sandbox mounts |
+| `kai-agent` | the workspace tarball `GET /api/kai/workspace` serves, which the engine unpacks into its own project scope |
+
+The reconcile runs on every workspace convergence, both directions: a newly
+subscribed skill appears, one that left the stack is removed again (bounded by
+`.claude/.agnes-marketplace-skills.json`, so it can only delete directories it
+wrote), and a bundled skill it had been shadowing is restored.
+
+`chat.bootstrap_marketplace` (the `chat_bootstrap_marketplace` switch) gates the
+whole thing and is **on** by default. Turning it off also removes marketplace
+skills from the slash menu — the menu never offers what nothing delivers, which
+is the bug this replaced: the menu listed them while nothing installed them, so
+picking one answered `Unknown command: /<skill>`.
+
+Note what does NOT reach a chat session: a marketplace plugin's *agents*,
+*commands*, *hooks* and *MCP servers*. Only skills are materialized. Earlier
+versions tried to install whole plugins by running `agnes refresh-marketplace
+--bootstrap` inside the sandbox, which cannot work from there — the marketplace
+git endpoint is PAT-gated, the sandbox deliberately holds no PAT, and the
+in-sandbox relay routes no marketplace path.
+
 ## Security model
 
 Single-tenant: all users in one Agnes instance trust each other. The

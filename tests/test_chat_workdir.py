@@ -357,3 +357,165 @@ class TestTurningTheFeatureBackOnRestoresTheSkill:
         monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "1")
         _reconcile_feature_gated_skills(ws, template)
         assert (ws / ".claude" / "skills" / "agnes-data-apps-extras" / "SKILL.md").read_text(encoding="utf-8") == "x"
+
+
+# ---------------------------------------------------------------------------
+# Marketplace skill delivery (#1552) — the workspace half of
+# `chat.bootstrap_marketplace`. The composer offers `/<skill-name>` for every
+# marketplace skill in the caller's stack, and these directories are what makes
+# that token resolve: the session dir symlinks `.claude` from the workspace, so
+# a skill written here is a PROJECT skill in the sandbox.
+# ---------------------------------------------------------------------------
+
+
+def _marketplace_src(root: Path, name: str, *, body: str = "Body.", extra: dict | None = None) -> Path:
+    """A marketplace-side skill directory, as resolve_user_marketplace exposes it."""
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n\n{body}", encoding="utf-8")
+    for rel, content in (extra or {}).items():
+        target = d / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return d
+
+
+def _mgr_with_marketplace(tmp_path: Path, resolver, *, bundled_skills: dict | None = None) -> WorkdirManager:
+    conn = duckdb.connect(":memory:")
+    _ensure_schema(conn)
+    bundled = tmp_path / "bundled"
+    (bundled / ".claude").mkdir(parents=True)
+    (bundled / "CLAUDE.md").write_text("default")
+    (bundled / ".claude" / "settings.json").write_text("{}")
+    for name, body in (bundled_skills or {}).items():
+        _marketplace_src(bundled / ".claude" / "skills", name, body=body)
+    return WorkdirManager(
+        data_dir=tmp_path / "data",
+        repo=ChatRepository(conn),
+        bundled_template_dir=bundled,
+        server_url="https://agnes.example",
+        agnes_version="0.55.0",
+        get_marketplace_sha=lambda: "mkt-sha-1",
+        get_template_status=lambda: None,
+        list_marketplace_skills=resolver,
+    )
+
+
+def test_a_stack_skill_is_materialized_into_the_workspace(tmp_path: Path):
+    """The bug: the slash menu offered `/keboola-cli` and the sandbox had never
+    been given it, so the turn came back "Unknown command"."""
+    src = _marketplace_src(tmp_path / "mkt", "keboola-cli", body="Use the Keboola CLI.")
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: [("keboola-cli", src)])
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    landed = ws / ".claude" / "skills" / "keboola-cli" / "SKILL.md"
+    assert landed.is_file(), "the skill the menu offers never reached the agent's project scope"
+    assert "Use the Keboola CLI." in landed.read_text()
+
+
+def test_supporting_files_travel_with_the_skill(tmp_path: Path):
+    """A skill's own references/ are part of it — copying SKILL.md alone gives
+    the agent a skill whose first Read fails."""
+    src = _marketplace_src(tmp_path / "mkt", "s1", extra={"references/deep.md": "detail"})
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: [("s1", src)])
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    assert (ws / ".claude" / "skills" / "s1" / "references" / "deep.md").read_text() == "detail"
+
+
+def test_a_skill_that_left_the_stack_is_removed(tmp_path: Path):
+    src = _marketplace_src(tmp_path / "mkt", "gone-later")
+    desired: list = [("gone-later", src)]
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: list(desired))
+
+    ws = mgr.ensure_user_workdir("u@x")
+    assert (ws / ".claude" / "skills" / "gone-later").is_dir()
+
+    desired.clear()  # user unsubscribed
+    mgr.ensure_user_workdir("u@x")
+
+    assert not (ws / ".claude" / "skills" / "gone-later").exists()
+
+
+def test_unsubscribing_restores_the_bundled_skill_it_shadowed(tmp_path: Path):
+    """Marketplace wins the name clash while subscribed (merged_skills's rule),
+    but the user must not LOSE the bundled skill by having tried the other one."""
+    src = _marketplace_src(tmp_path / "mkt", "shared", body="from the marketplace")
+    desired: list = [("shared", src)]
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: list(desired), bundled_skills={"shared": "from the template"})
+
+    ws = mgr.ensure_user_workdir("u@x")
+    assert "from the marketplace" in (ws / ".claude" / "skills" / "shared" / "SKILL.md").read_text()
+
+    desired.clear()
+    mgr.ensure_user_workdir("u@x")
+
+    assert "from the template" in (ws / ".claude" / "skills" / "shared" / "SKILL.md").read_text()
+
+
+def test_the_reconcile_never_deletes_a_skill_it_did_not_write(tmp_path: Path):
+    """Pruning is bounded by the manifest. A bundled skill (or anything else in
+    .claude/skills) must survive a reconcile that wants nothing."""
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: [], bundled_skills={"bundled-only": "keep me"})
+
+    ws = mgr.ensure_user_workdir("u@x")
+    hand_written = ws / ".claude" / "skills" / "hand-written"
+    hand_written.mkdir(parents=True, exist_ok=True)
+    (hand_written / "SKILL.md").write_text("mine", encoding="utf-8")
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert "keep me" in (ws / ".claude" / "skills" / "bundled-only" / "SKILL.md").read_text()
+    assert (hand_written / "SKILL.md").read_text() == "mine"
+
+
+def test_an_unchanged_skill_is_not_rewritten(tmp_path: Path):
+    """The workspace is uploaded to the sandbox on every spawn; rewriting an
+    identical tree would churn mtimes (and the upload) for nothing."""
+    src = _marketplace_src(tmp_path / "mkt", "stable")
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: [("stable", src)])
+
+    ws = mgr.ensure_user_workdir("u@x")
+    landed = ws / ".claude" / "skills" / "stable" / "SKILL.md"
+    first = landed.stat().st_mtime_ns
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert landed.stat().st_mtime_ns == first
+
+
+def test_an_updated_skill_is_refreshed(tmp_path: Path):
+    """...but a real content change must land — copy-if-changed, not copy-once."""
+    src = _marketplace_src(tmp_path / "mkt", "moving", body="v1")
+    mgr = _mgr_with_marketplace(tmp_path, lambda _email: [("moving", src)])
+
+    ws = mgr.ensure_user_workdir("u@x")
+    _marketplace_src(tmp_path / "mkt", "moving", body="v2")
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert "v2" in (ws / ".claude" / "skills" / "moving" / "SKILL.md").read_text()
+
+
+def test_no_marketplace_wiring_leaves_the_workspace_alone(tmp_path: Path):
+    """`list_marketplace_skills=None` is "this instance has no marketplace
+    wiring", not "the user's stack is empty" — it must not prune."""
+    mgr = _mgr_with_marketplace(tmp_path, None, bundled_skills={"b": "keep"})
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    assert "keep" in (ws / ".claude" / "skills" / "b" / "SKILL.md").read_text()
+    assert not (ws / ".claude" / ".agnes-marketplace-skills.json").exists()
+
+
+def test_a_failing_resolver_does_not_deny_the_session(tmp_path: Path):
+    def _boom(_email):
+        raise RuntimeError("marketplace resolver exploded")
+
+    mgr = _mgr_with_marketplace(tmp_path, _boom)
+
+    ws = mgr.ensure_user_workdir("u@x")  # must not raise
+
+    assert (ws / "CLAUDE.md").exists()

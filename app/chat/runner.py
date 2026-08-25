@@ -728,41 +728,6 @@ def _agnes_mcp_servers() -> dict:
     }
 
 
-def _bootstrap_marketplace(workdir: str) -> None:
-    """Install the user's RBAC-filtered Agnes marketplace plugins (skills)
-    into this session's project so the agent can use them.
-
-    Runs the same ``agnes refresh-marketplace --bootstrap`` the analyst
-    workspace runs at first init: it clones the per-user marketplace bare repo
-    (PAT-gated, from AGNES_SERVER), registers it with the in-sandbox ``claude``
-    CLI (``claude plugin marketplace add``), and enables the plugins in the
-    project (cwd). Combined with ``setting_sources=["project"]`` on the SDK
-    client, the agent then sees the plugin skills (e.g. ``keboola-howto``).
-
-    Without this the sandbox only has Claude Code's built-in skills — the
-    synced marketplace is invisible. Best-effort and bounded: a failure (no
-    token, network, claude CLI quirk) leaves the agent on built-in skills only
-    rather than blocking the session; output is routed to stderr so it never
-    corrupts the stdout JSON-frame protocol.
-    """
-    from shutil import which
-
-    if which("agnes") is None:
-        return
-    try:
-        subprocess.run(
-            ["agnes", "refresh-marketplace", "--bootstrap"],
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            stdout=sys.stderr.fileno(),
-            stderr=sys.stderr.fileno(),
-            check=False,
-            timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001 — non-fatal; agent still runs
-        print(f"marketplace bootstrap failed: {exc}", file=sys.stderr, flush=True)
-
-
 async def _dispatch_frame(frame: dict, queue: "asyncio.Queue[dict]") -> None:
     """Route one parsed inbound stdin frame.
 
@@ -1737,12 +1702,17 @@ async def amain() -> None:
         # with`) loads CLAUDE.md/.claude from /work at boot. The wheel install
         # above deliberately does NOT gate on this — it overlaps the upload.
         await _wait_workspace_ready()
-        # Opt-in (AGNES_BOOTSTRAP_MARKETPLACE=1): install the user's marketplace
-        # plugins into this project so setting_sources surfaces them. After the
-        # CLI install (needs the `agnes` binary); before the reader attaches for
-        # the same fd-0 reason as the install.
-        if os.environ.get("AGNES_BOOTSTRAP_MARKETPLACE") == "1":
-            _bootstrap_marketplace(str(workdir))
+        # No marketplace bootstrap here. It used to run `agnes
+        # refresh-marketplace --bootstrap` in the sandbox, which cannot work
+        # from inside one: the marketplace git endpoint is PAT-gated and the
+        # sandbox deliberately holds no PAT (see the manager's env comment), and
+        # the in-sandbox relay routes no marketplace prefix
+        # (`app/chat/relay.py::_SCOPE_FOR_PREFIX`) — so the clone 401'd behind a
+        # `check=False` subprocess and the feature looked enabled while
+        # delivering nothing (#1552). The server now materializes the user's
+        # marketplace skills into the workspace tree it uploads
+        # (`app/chat/workdir.py::_reconcile_marketplace_skills`), which reaches
+        # this project scope through the same `setting_sources` path.
 
     _emit({"type": "runner_ready"})
     queue = await _stdin_lines()

@@ -84,7 +84,7 @@ from pydantic import BaseModel
 
 from app.api.broker import _require_scope, require_broker_ticket
 from app.auth.access import can_access, require_resource_access
-from app.auth.dependencies import reject_keboola_header_credential
+from app.auth.dependencies import _get_db, reject_keboola_header_credential
 from app.chat.types import Surface
 from app.resource_types import ResourceType
 from src.repositories import audit_repo, chat_session_repo, ticket_repo
@@ -480,6 +480,11 @@ def _require_session_credential(request: Request) -> Dict[str, Any]:
     # point, so the identity a route acts on is the one the credential was
     # checked against rather than one re-derived later.
     row["session"] = session
+    # Same rationale for the owner row: `/workspace` resolves this caller's
+    # RBAC-filtered marketplace skills, and it must do so for the identity the
+    # chat-access check above just passed — not a second lookup that could
+    # answer differently.
+    row["owner"] = owner
     if row.get("scope") != _CREDENTIAL_SCOPE:
         try:
             audit_repo().log(
@@ -1100,7 +1105,84 @@ def _workspace_prompt_for(session: Any, *, override_active: bool = False) -> Opt
     return rendered if rendered and rendered.strip() else None
 
 
-def _build_workspace_archive(session: Any = None) -> Optional[bytes]:
+#: Where a marketplace skill lands in the shipped tree. The engine materializes
+#: the tarball into its sandbox's PROJECT scope, so `.claude/skills/<name>/` is
+#: discovered by the Claude Agent SDK's `project` setting source exactly as a
+#: local checkout's would be — which is what makes the skill invokable as
+#: `/<name>`, the same token `GET /api/chat/skills` advertises.
+_MARKETPLACE_SKILLS_PREFIX = ".claude/skills"
+
+
+def _marketplace_skill_members(conn: Any, owner: Optional[Dict[str, Any]]) -> Dict[str, Path]:
+    """``{arcname: source file}`` for the caller's marketplace skills, or ``{}``.
+
+    This is the kai-agent half of ``chat.bootstrap_marketplace``. The sibling
+    providers get the same skill directories written into the per-user chat
+    workspace (``app/chat/workdir.py``'s ``_reconcile_marketplace_skills``),
+    which the sandbox then mounts; this provider has no such workspace on our
+    side — the tarball IS its project scope — so without this overlay a user's
+    stack skills reached every surface except the embedded engine, and the
+    composer's `/<skill>` came back "Unknown command" (#1552).
+
+    Gated on :func:`app.chat.skills_catalog.marketplace_delivery` resolving to
+    ``project``, and sourced from the same walk the menu uses
+    (``iter_marketplace_skill_dirs``), so the archive ships exactly the set the
+    composer offers rather than a second, drifting scan.
+
+    Best-effort by design: the archive's job is to carry the workspace, and a
+    marketplace that fails to resolve must degrade to "no marketplace skills",
+    never to a failed turn (the engine treats any non-200/204 as fatal).
+    """
+    if owner is None:
+        return {}
+    try:
+        from app.chat.config import load_chat_config
+        from app.chat.skills_catalog import (
+            DELIVERY_PROJECT,
+            iter_marketplace_skill_dirs,
+            marketplace_delivery,
+        )
+        from app.secrets import _state_dir
+        from src.marketplace_filter import escapes_base
+
+        # The same overlay file `app/main.py` boots the chat runtime from — not
+        # `switch_value()`, which would answer from the static base config the
+        # running chat config never reads (see `Switch.runtime_view`).
+        if marketplace_delivery(load_chat_config(_state_dir() / "instance.yaml")) != DELIVERY_PROJECT:
+            return {}
+
+        members: Dict[str, Path] = {}
+        for skill_name, skill_dir in iter_marketplace_skill_dirs(conn, owner):
+            base = skill_dir.resolve()
+            prefix = f"{_MARKETPLACE_SKILLS_PREFIX}/{skill_name}"
+            # A later same-named skill fully replaces an earlier one rather than
+            # merging two skills' files into one directory — matching the menu's
+            # "last one wins" dict merge, and keeping a stale `references/` file
+            # from leaking into the winner.
+            members = {k: v for k, v in members.items() if not k.startswith(f"{prefix}/")}
+            for path in sorted(skill_dir.rglob("*")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                rel = path.relative_to(skill_dir)
+                if ".git" in rel.parts:
+                    continue
+                # Containment check on top of the symlink skip: the source tree
+                # is a synced git clone / uploaded bundle, i.e. untrusted input.
+                if escapes_base(path, [base]):
+                    continue
+                members[f"{prefix}/{rel.as_posix()}"] = path
+        return members
+    except Exception:
+        logger.warning("kai workspace: marketplace skills unavailable, shipping template only", exc_info=True)
+        return {}
+
+
+def _build_workspace_archive(
+    session: Any = None,
+    *,
+    conn: Any = None,
+    owner: Optional[Dict[str, Any]] = None,
+) -> Optional[bytes]:
     """Pack this caller's workspace into the gzipped tar the engine expects,
     or ``None`` when there is nothing to ship.
 
@@ -1118,6 +1200,16 @@ def _build_workspace_archive(session: Any = None) -> Optional[bytes]:
     ``app/chat/workdir.py``, and ``docs/initial-workspace-override.md``).
     Overwriting there would make the engine the only surface that merges two
     override mechanisms the platform deliberately keeps apart.
+
+    The caller's RBAC-filtered marketplace skills are overlaid into
+    ``.claude/skills/<name>/`` on top of the template
+    (:func:`_marketplace_skill_members`) — which is how a stack skill becomes
+    invokable on this provider at all: it spawns no runner, so the in-sandbox
+    ``claude plugin install`` the sibling providers rely on never happens here.
+    A marketplace skill SHADOWS a bundled one of the same name, matching
+    ``merged_skills``'s "marketplace wins name clashes" rule; the shadowed
+    directory is dropped wholesale rather than merged, so no file of the loser
+    survives inside the winner.
 
     Members are relative POSIX paths of regular files only — the engine
     rejects the whole payload on an absolute path, a `..` segment, or any
@@ -1138,6 +1230,15 @@ def _build_workspace_archive(session: Any = None) -> Optional[bytes]:
         if rel.parts[0] in _WORKSPACE_EXCLUDED_TOPLEVEL or ".git" in rel.parts:
             continue
         paths[rel.as_posix()] = path
+
+    overlay = _marketplace_skill_members(conn, owner)
+    if overlay:
+        # Shadow whole directories, not individual files: a bundled skill the
+        # marketplace overrides must contribute nothing to the winner (a
+        # leftover `references/stale.md` would still be read by the agent).
+        shadowed = {"/".join(arcname.split("/")[:3]) for arcname in overlay}  # .claude/skills/<name>
+        paths = {k: v for k, v in paths.items() if not any(k.startswith(f"{root}/") for root in shadowed)}
+        paths.update(overlay)
 
     prompt = claude_md.encode("utf-8") if claude_md else None
     names = sorted(paths if prompt is None else {*paths, _WORKSPACE_PROMPT_ARCNAME})
@@ -1203,7 +1304,10 @@ def _build_workspace_archive(session: Any = None) -> Optional[bytes]:
         204: {"description": "this deployment ships no workspace payload"},
     },
 )
-async def kai_workspace(row: Dict[str, Any] = Depends(_require_session_credential)) -> Response:
+async def kai_workspace(
+    row: Dict[str, Any] = Depends(_require_session_credential),
+    conn: Any = Depends(_get_db),
+) -> Response:
     """Serve this caller's workspace tree as one gzipped tarball.
 
     Closed contract: exactly ``200`` with the archive, or ``204`` for "this
@@ -1216,16 +1320,18 @@ async def kai_workspace(row: Dict[str, Any] = Depends(_require_session_credentia
     sees it.
 
     The payload is per-session, because the ``CLAUDE.md`` inside it is the
-    RBAC-filtered Workspace Prompt. It stays byte-stable for a given session
-    and configuration — the session, not merely the caller, because the
+    RBAC-filtered Workspace Prompt and the ``.claude/skills`` overlay is the
+    caller's RBAC-filtered marketplace set. It stays byte-stable for a given
+    session and configuration — the session, not merely the caller, because the
     rendered document carries a date and is therefore pinned to
     ``started_at``. That stability is what the engine's re-fetch on every SDK
-    respawn relies on.
+    respawn relies on; a stack change (a plugin subscribed or dropped) is a
+    configuration change and is meant to move the bytes.
     """
 
     # One hop off the event loop for the whole payload: rendering the prompt is
     # a synchronous DB read and packing is filesystem work.
-    archive = await asyncio.to_thread(_build_workspace_archive, row["session"])
+    archive = await asyncio.to_thread(_build_workspace_archive, row["session"], conn=conn, owner=row.get("owner"))
     if archive is None:
         return Response(status_code=204)
     return Response(content=archive, media_type="application/gzip")

@@ -1540,3 +1540,125 @@ def test_a_deleted_conversation_cannot_spend_budget_with_an_issued_llm_ticket(se
         f"a deleted conversation's llm ticket still reached the LLM broker ({resp.status_code})"
     )
     assert resp.json()["detail"] == "ticket_session_gone"
+
+
+# ---------------------------------------------------------------------------
+# workspace payload — marketplace skills (#1552)
+#
+# The kai-agent provider spawns no runner of ours, so this tarball IS the
+# engine's project scope. Before this, a user's stack skills reached every
+# surface except the embedded engine: the composer offered `/keboola-cli` and
+# the engine answered "Unknown command".
+# ---------------------------------------------------------------------------
+
+
+def _grant_marketplace_skill(*, plugin: str, skill: str, body: str = "Body.", extra_file: str = "") -> None:
+    """Grant + subscribe the seeded analyst to a marketplace plugin shipping
+    one skill, and write that skill to the marketplace clone on disk."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    from app.utils import get_marketplaces_dir
+    from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
+    from src.repositories import (
+        resource_grants_repo,
+        user_curated_subscriptions_repo,
+        user_groups_repo,
+    )
+
+    conn = get_system_db()
+    try:
+        conn.execute(
+            "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
+            ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(timezone.utc)],
+        )
+        conn.execute(
+            "INSERT INTO marketplace_plugins (marketplace_id, name, version, raw, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ["mkt", plugin, "1.0", _json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
+        )
+    finally:
+        conn.close()
+
+    everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+    resource_grants_repo().create(everyone["id"], "marketplace_plugin", f"mkt/{plugin}")
+    user_curated_subscriptions_repo().subscribe("analyst1", "mkt", plugin)
+
+    skill_dir = get_marketplaces_dir() / "mkt" / "plugins" / plugin / "skills" / skill
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {skill}\n---\n\n{body}", encoding="utf-8")
+    if extra_file:
+        (skill_dir / extra_file).write_text("extra", encoding="utf-8")
+
+
+def _workspace_names(seeded_app) -> list[str]:
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200, resp.text
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        return [m.name for m in tar.getmembers()]
+
+
+def test_the_engine_gets_the_callers_marketplace_skills(seeded_app, kai_env):
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli", extra_file="reference.md")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names, (
+        "the composer offers /keboola-cli; without this member the engine has never been given it"
+    )
+    # A skill's supporting files are part of it.
+    assert ".claude/skills/keboola-cli/reference.md" in names
+
+
+def test_marketplace_skills_are_omitted_when_the_switch_is_off(seeded_app, kai_env, monkeypatch):
+    """With delivery off the composer stops offering them, so the archive must
+    stop shipping them — one switch, both sides."""
+    monkeypatch.setenv("AGNES_CHAT_BOOTSTRAP_MARKETPLACE", "0")
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" not in names
+    assert "CLAUDE.md" in names, "the rest of the workspace must still ship"
+
+
+def test_a_marketplace_skill_shadows_the_bundled_one_wholesale(seeded_app, kai_env):
+    """`merged_skills`'s rule is "marketplace wins name clashes". Merging the two
+    directories instead would leave the loser's files inside the winner, and the
+    agent would read them."""
+    from app.chat.skills_catalog import BUNDLED_TEMPLATE_DIR
+
+    bundled_names = [p.name for p in (BUNDLED_TEMPLATE_DIR / ".claude" / "skills").iterdir() if p.is_dir()]
+    assert bundled_names, "the bundled template ships no skills — nothing to shadow"
+    victim = sorted(bundled_names)[0]
+    _grant_marketplace_skill(plugin="demo-plugin", skill=victim, body="MARKETPLACE VERSION")
+
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        names = [m.name for m in tar.getmembers()]
+        body = tar.extractfile(f".claude/skills/{victim}/SKILL.md").read().decode()
+
+    assert "MARKETPLACE VERSION" in body
+    assert names.count(f".claude/skills/{victim}/SKILL.md") == 1, "a duplicate member is a malformed tar"
+    # Nothing of the bundled copy survives inside the winner.
+    assert [n for n in names if n.startswith(f".claude/skills/{victim}/")] == [f".claude/skills/{victim}/SKILL.md"]
+
+
+def test_the_archive_stays_byte_stable_with_marketplace_skills(seeded_app, kai_env):
+    """The engine re-fetches on every SDK respawn — the overlay must not
+    reintroduce the churn the mtime pinning exists to prevent."""
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli")
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    headers = {"Authorization": f"Bearer {credential}"}
+
+    with mock.patch("time.time", return_value=1_700_000_000.0):
+        first = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
+    with mock.patch("time.time", return_value=1_700_000_042.0):
+        second = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
+
+    assert first == second

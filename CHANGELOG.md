@@ -10,6 +10,44 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **A marketplace skill in your stack is now actually invokable in chat.** The
+  composer's slash menu offered `/<skill-name>` for every skill in the caller's
+  stack while nothing ever delivered those skills into the session, so picking
+  one came back `Unknown command: /<skill>` — on every provider. Three separate
+  causes, all fixed: (1) `chat.bootstrap_marketplace` was **off by default**, so
+  nothing was attempted at all; it is now **on**, with a new
+  `chat_bootstrap_marketplace` switch (`AGNES_CHAT_BOOTSTRAP_MARKETPLACE`,
+  editable in `/admin/server-config`) to turn it off. (2) The e2b/docker path it
+  gated could not have worked from where it ran: the runner shelled out to
+  `agnes refresh-marketplace --bootstrap` *inside* the sandbox, where the
+  PAT-gated marketplace git endpoint is unreachable (the sandbox deliberately
+  holds no PAT, and the in-sandbox relay routes no marketplace path) — a clone
+  that 401'd behind a `check=False` subprocess. Agnes now materializes the
+  skills server-side into the per-user chat workspace
+  (`.claude/skills/<name>/`), which the sandbox already mounts. (3) The
+  `kai-agent` provider was never wired at all — it spawns no runner of ours — so
+  the skills now ride the workspace tarball `GET /api/kai/workspace` serves, the
+  archive that IS that engine's project scope. With delivery off, the slash menu
+  omits marketplace skills instead of advertising undelivered ones. Names stay
+  bare (`/keboola-cli`, never `<plugin>:<skill>`) — verified against the
+  sandboxed CLI's own command list, where the owning plugin appears in the
+  description, not the token. The workspace reconcile runs on every convergence
+  and both ways: a newly subscribed skill appears, one that left the stack is
+  removed (bounded by a provenance manifest, so it can only delete what it
+  wrote) and any bundled skill it shadowed is restored. Reference:
+  `docs/cloud-chat.md` → *Marketplace skills in a chat session*.
+
+### Removed
+
+- `AGNES_BOOTSTRAP_MARKETPLACE` (the chat sandbox's env var) and the runner's
+  in-sandbox marketplace bootstrap. It could not clone from inside a sandbox
+  (see Fixed above) and is replaced by server-side materialization. The
+  operator-facing `chat.bootstrap_marketplace` config key keeps its name and now
+  gates that. A marketplace plugin's *agents*, *commands*, *hooks* and *MCP
+  servers* still do not reach a chat session — only skills are materialized.
+
 ## [0.87.0] - 2026-08-25
 
 ### Added

@@ -19,7 +19,12 @@ from app.chat.manager import ChatManager, ConcurrencyCapHit, SessionNotFound
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
-from app.chat.skills_catalog import BUNDLED_TEMPLATE_DIR, list_recognized_commands, merged_skills
+from app.chat.skills_catalog import (
+    BUNDLED_TEMPLATE_DIR,
+    list_recognized_commands,
+    marketplace_delivery,
+    merged_skills,
+)
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
@@ -401,8 +406,28 @@ async def delete_session_permanently(
     repo.hard_delete_session(chat_id)
 
 
+def _chat_config_for_delivery(request: Request):
+    """The chat config the delivery gate must be resolved against.
+
+    ``app.main`` always sets ``app.state.chat_config`` (chat-enabled or not), so
+    the state read is the normal path. The fallback re-reads the same overlay
+    file it loads from, which is also what ``app/api/kai.py`` reads when it
+    builds the workspace archive — so a harness that mounts this router without
+    app state still resolves the flag the way the delivering side will, instead
+    of silently reporting "nothing is delivered".
+    """
+    cfg = getattr(request.app.state, "chat_config", None)
+    if cfg is not None:
+        return cfg
+    from app.chat.config import load_chat_config
+    from app.secrets import _state_dir
+
+    return load_chat_config(_state_dir() / "instance.yaml")
+
+
 @router.get("/skills")
 async def list_skills(
+    request: Request,
     user: dict = Depends(require_chat_access),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -413,19 +438,30 @@ async def list_skills(
     Two sources are merged server-side (see ``app.chat.skills_catalog`` for the
     full rationale): skills shipped in the bundled chat workspace template
     (``source="bundled"``) and the caller's RBAC-filtered marketplace/store
-    plugin skills (``source="marketplace"``) — the same set
-    ``app/chat/runner.py``'s ``_bootstrap_marketplace`` installs into the live
-    sandbox. **Shadowing**: when a skill name is present in both sources, the
-    marketplace entry wins (it is the more user-specific grant). Either source
-    failing to list degrades non-fatally — a warning is logged and the other
-    source's skills still come back.
+    plugin skills (``source="marketplace"``) — the same set that is materialized
+    into the session's project scope, by ``app/chat/workdir.py`` (e2b/docker)
+    or by the workspace archive ``app/api/kai.py`` serves (kai-agent). **Shadowing**: when a skill name is
+    present in both sources, the marketplace entry wins (it is the more
+    user-specific grant). Either source failing to list degrades non-fatally —
+    a warning is logged and the other source's skills still come back.
+
+    The marketplace source is offered only when something actually delivers it
+    (``chat.bootstrap_marketplace``; ``marketplace_delivery`` resolves the
+    mechanism per provider). With the flag off, those rows are omitted rather
+    than advertised — a menu entry the agent has never been given resolves to
+    "Unknown command" when the user picks it.
+
+    Names are bare ``/<skill-name>`` tokens on every delivery path, never
+    ``<plugin>:<skill>`` — verified against the sandboxed CLI's own command
+    list, see the ``app.chat.skills_catalog`` module docstring.
 
     ``commands`` is currently always empty: neither ``app/chat/runner.py`` nor
     the bundled workspace template recognize any slash command today (checked,
     not assumed — see ``list_recognized_commands``'s docstring). Nothing is
     invented ahead of an actual implementation.
     """
-    skills = merged_skills(BUNDLED_TEMPLATE_DIR, conn, user)
+    delivery = marketplace_delivery(_chat_config_for_delivery(request))
+    skills = merged_skills(BUNDLED_TEMPLATE_DIR, conn, user, delivery=delivery)
     return {"skills": skills, "commands": list_recognized_commands()}
 
 

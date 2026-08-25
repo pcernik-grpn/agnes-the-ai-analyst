@@ -136,7 +136,7 @@ def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path,
     assert cfg.detach_linger_seconds == 60
     assert cfg.idle_grace_seconds == 60
     assert cfg.e2b_kill_on_ws_disconnect is True
-    assert cfg.bootstrap_marketplace is False
+    assert cfg.bootstrap_marketplace is True  # blank yaml value → the (on) default
     assert cfg.rate_messages_per_hour == 100
     assert "rate_messages_per_hour" in caplog.text
 

@@ -1941,11 +1941,6 @@ class ChatManager:
             # entry would have left the switch unsettable anywhere while the
             # docs still advertised it (Devin Review on #1157).
             "AGNES_APPROVALS": "on" if self._config.approvals_enabled else "off",
-            # Opt-in: bootstrap the user's marketplace plugins into the sandbox
-            # at spawn and load them via setting_sources. Off by default (adds
-            # per-spawn latency; only useful once the marketplace ships real
-            # skill content). See ChatConfig.bootstrap_marketplace.
-            "AGNES_BOOTSTRAP_MARKETPLACE": "1" if self._config.bootstrap_marketplace else "",
             # Sandbox path of the workspace-upload sentinel the runner must
             # wait on before spawning the agent CLI (the CLI reads CLAUDE.md
             # and .claude settings from /work at startup, and upload_workspace

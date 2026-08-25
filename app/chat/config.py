@@ -136,14 +136,22 @@ class ChatConfig:
     paused_ttl_seconds: int = 7 * 24 * 3600
     # Back-compat echo only — new code reads on_detach, never this field.
     e2b_kill_on_ws_disconnect: bool = True
-    # When true, the runner bootstraps the user's RBAC-filtered marketplace
-    # plugins into each sandbox at spawn (clone + `claude plugin install` +
-    # load via setting_sources) so the agent can use marketplace skills.
-    # Off by default: it adds ~10-15 s of per-spawn latency, only worthwhile
-    # once the operator's marketplace actually ships skill/agent content
-    # (an empty placeholder plugin contributes nothing). Independent of the
+    # When true, the caller's RBAC-filtered marketplace skills are delivered
+    # into the agent's project scope, so a stack skill is actually invokable
+    # (`/<skill-name>`) in chat. One mechanism — the server materializes the
+    # skill directories; two placements, since the providers differ in what
+    # Agnes owns (`app.chat.skills_catalog.marketplace_delivery` is the gate):
+    #   - e2b / docker: written into the per-user chat workspace that gets
+    #     uploaded to the sandbox (`app/chat/workdir.py`).
+    #   - kai-agent: overlaid into the workspace tarball the engine
+    #     materializes into its own project scope (`app/api/kai.py`).
+    # ON by default since 0.87.1: with it off the composer's slash menu
+    # advertised marketplace skills the agent had never been given, so
+    # `/<skill>` came back "Unknown command" (#1552). Turning it off (the
+    # `chat_bootstrap_marketplace` switch) makes the menu stop offering
+    # marketplace skills rather than lie about them. Independent of the
     # always-on plugin.json sanitization in the marketplace packager.
-    bootstrap_marketplace: bool = False
+    bootstrap_marketplace: bool = True
     # How the chat broker authenticates to Anthropic. ``api_key`` (default) uses
     # the static ``ANTHROPIC_API_KEY``. ``workload_identity`` mints a short-lived
     # token from the workload's own OIDC identity via Anthropic Workload Identity
@@ -324,6 +332,23 @@ def _resolve_chat_enabled(raw: dict) -> bool:
     return coerce_flag_value(raw.get("enabled"), default=False)
 
 
+def _resolve_chat_bootstrap_marketplace(raw: dict) -> bool:
+    """``chat.bootstrap_marketplace`` resolution:
+    ``AGNES_CHAT_BOOTSTRAP_MARKETPLACE`` env > the ``bootstrap_marketplace``
+    key in the parsed ``chat:`` block > ``True``.
+
+    Same precedence convention as :func:`_resolve_chat_enabled` — and the same
+    reason for the env layer: infrastructure pins the flag durably (a fresh
+    data disk boots with no ``instance.yaml``), and ``/admin/server-config``
+    must report the value the running system actually honours rather than the
+    YAML's.
+    """
+    env = os.environ.get("AGNES_CHAT_BOOTSTRAP_MARKETPLACE")
+    if env is not None:
+        return coerce_flag_value(env, default=True)
+    return coerce_flag_value(raw.get("bootstrap_marketplace"), default=True)
+
+
 def _resolve_chat_provider(raw: dict) -> str:
     """``chat.provider`` resolution: ``AGNES_CHAT_PROVIDER`` env > the
     ``provider`` key in the parsed ``chat:`` block > ``"e2b"``.
@@ -372,6 +397,9 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
             provider=_resolve_chat_provider({}),
             kai_agent_url=_resolve_kai_agent_url({}),
             approvals_enabled=_resolve_chat_approvals({}),
+            # Same reason as ``provider``: an infra-pinned flag must survive a
+            # machine that has not written its ``instance.yaml`` overlay yet.
+            bootstrap_marketplace=_resolve_chat_bootstrap_marketplace({}),
         )
     data = yaml.safe_load(instance_yaml.read_text()) or {}
     raw = data.get("chat", {}) or {}
@@ -413,7 +441,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         idle_grace_seconds=_raw_int(raw, "idle_grace_seconds", detach_linger_seconds),
         paused_ttl_seconds=_raw_int(raw, "paused_ttl_seconds", 7 * 24 * 3600),
         e2b_kill_on_ws_disconnect=coerce_flag_value(raw.get("e2b_kill_on_ws_disconnect"), default=True),
-        bootstrap_marketplace=coerce_flag_value(raw.get("bootstrap_marketplace"), default=False),
+        bootstrap_marketplace=_resolve_chat_bootstrap_marketplace(raw),
         llm_auth=_raw_str(raw.get("llm") or {}, "auth", "api_key").lower(),
         agent_api_utility_models=list(raw.get("agent_api_utility_models") or []),
         agent_api_budget_cache_ttl_s=_raw_int(raw, "agent_api_budget_cache_ttl_s", 60),

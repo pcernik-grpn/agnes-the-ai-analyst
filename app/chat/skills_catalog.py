@@ -23,6 +23,27 @@ entry wins — it is the more user-specific grant. Merging happens in
 ``merged_skills``, which also isolates each source so a failure in one
 (unreadable directory, resolver exception) never blocks the other; the
 failing source is logged as a warning and treated as empty.
+
+**Names are bare, deliberately.** A skill is invoked as ``/<name>`` on both
+delivery paths — verified against the sandboxed CLI (Claude Code 2.1.218)
+rather than assumed: a skill installed as part of a *plugin* is advertised by
+the CLI's init handshake as ``{"name": "keboola-cli", "description":
+"(demo-plugin) …"}``, and a *project* skill (``.claude/skills/<dir>/SKILL.md``)
+as ``{"name": "project-scope-probe", …}``. The owning plugin shows up in the
+description, never in the command token, so this module must NOT prefix a
+marketplace skill with its plugin name — doing so is exactly what would make
+the menu insert an unknown command.
+
+**Delivery** (:func:`marketplace_delivery`) is the other half of the contract:
+a marketplace skill is only invokable if something actually put it in the
+agent's project scope. Agnes materializes the skill directories server-side —
+into the per-user chat workspace for e2b/docker (``app/chat/workdir.py``), into
+the workspace tarball for kai-agent (``app/api/kai.py``) — from this module's
+own walk, so all three surfaces name the same set. With
+``chat.bootstrap_marketplace`` off nothing is materialized, delivery is
+``none``, and ``merged_skills`` omits the marketplace source entirely: a menu
+entry for an undelivered skill is exactly what produced "Unknown command:
+/keboola-cli" (#1552).
 """
 
 from __future__ import annotations
@@ -43,6 +64,38 @@ logger = logging.getLogger(__name__)
 # Resolved relative to the repo root (not CWD) so this module works the same
 # regardless of where the process was launched from.
 BUNDLED_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "app" / "initial_workspace_default"
+
+#: ``marketplace_delivery`` results.
+#:
+#: ``project`` — the caller's marketplace skills are materialized as PROJECT
+#:               skills (``.claude/skills/<name>/``): into the per-user chat
+#:               workspace for e2b/docker (``app/chat/workdir.py``), and into
+#:               the workspace tarball for kai-agent (``app/api/kai.py``).
+#:               Different placements, one mechanism — and one ``/<name>`` token
+#:               for the composer to offer.
+#: ``none``    — ``chat.bootstrap_marketplace`` is off; nothing delivers them,
+#:               so the menu must not offer them.
+DELIVERY_PROJECT = "project"
+DELIVERY_NONE = "none"
+
+
+def marketplace_delivery(chat_config: object) -> str:
+    """Whether marketplace skills are delivered to chat sessions at all.
+
+    One resolver for the three consumers that must agree: ``GET
+    /api/chat/skills`` (what the composer offers), ``app/chat/workdir.py``
+    (what an e2b/docker workspace receives) and ``app/api/kai.py``'s workspace
+    archive (what the engine's project scope receives). Splitting the decision
+    would let the menu offer a skill no sandbox got — the drift this whole
+    change exists to remove.
+
+    ``None``/missing config resolves to :data:`DELIVERY_NONE` rather than
+    guessing: with no chat runtime loaded there is nothing to deliver into, and
+    offering the skills anyway is the failure mode, not the safe default.
+    """
+    if chat_config is None or not getattr(chat_config, "bootstrap_marketplace", False):
+        return DELIVERY_NONE
+    return DELIVERY_PROJECT
 
 
 def _read_skill_md(skill_md: Path) -> tuple[str, Optional[str]]:
@@ -115,20 +168,28 @@ def _plugin_dirs(plugin: dict) -> list[Path]:
     return [plugin_dir] if plugin_dir is not None else []
 
 
-def list_marketplace_skills(conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:
-    """The caller's RBAC-filtered marketplace/store plugin skills.
+def _marketplace_skill_entries(conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:
+    """``[{name, description, dir}]`` for every marketplace skill the caller has.
 
-    Uses ``resolve_user_marketplace`` (admin-granted-and-subscribed
-    marketplace plugins, unioned with the caller's Store installs) — the
-    same composition ``agnes refresh-marketplace`` fetches server-side and
-    ``app/chat/runner.py``'s ``_bootstrap_marketplace`` installs into the
-    live sandbox.
+    The single walk both consumers share: :func:`list_marketplace_skills` turns
+    it into menu rows and :func:`iter_marketplace_skill_dirs` hands the
+    directories to ``app/api/kai.py``'s workspace archive. Sharing the walk is
+    what makes the ``project`` delivery path ship exactly the set the menu
+    advertises, instead of two scans that can disagree.
+
+    ``name`` is the frontmatter name (directory-name fallback), i.e. the
+    ``/<name>`` token — so a copy made under that name has its directory,
+    frontmatter and slash command all agreeing. ``dir`` is the SKILL.md's
+    parent, so a skill's own ``references/`` files travel with it.
 
     A plugin's ``SKILL.md`` may live directly at its root (single-skill
     plugins, e.g. the built-in marketplace) or under ``skills/<name>/
     SKILL.md`` (multi-skill plugins, the curated-marketplace and Store
     convention) — this looks anywhere under the plugin root, mirroring
     ``src/store_guardrails/manifest_check.py``'s same defensive scan.
+
+    Order is the resolver's (deterministic), then path, so a duplicate name
+    resolves the same way in both consumers.
     """
     out: list[dict] = []
     for plugin in resolve_user_marketplace(conn, user):
@@ -141,12 +202,55 @@ def list_marketplace_skills(conn: duckdb.DuckDBPyConnection, user: dict) -> list
                 except OSError:
                     logger.warning("chat skills: unreadable marketplace SKILL.md %s", skill_md, exc_info=True)
                     continue
-                out.append({"name": name, "description": description, "source": "marketplace"})
+                out.append({"name": name, "description": description, "dir": skill_md.parent})
     return out
 
 
-def merged_skills(bundled_template_dir: Path, conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:
+def iter_marketplace_skill_dirs(conn: duckdb.DuckDBPyConnection, user: dict) -> list[tuple[str, Path]]:
+    """``[(skill_name, skill_dir)]`` for the ``project`` delivery path.
+
+    Used by ``app/api/kai.py`` to overlay the caller's marketplace skills into
+    the workspace tarball the kai-agent engine materializes into its project
+    scope — that provider spawns no runner of ours, so this archive is the only
+    project scope Agnes controls there.
+    """
+    return [(e["name"], e["dir"]) for e in _marketplace_skill_entries(conn, user)]
+
+
+def list_marketplace_skills(conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:
+    """The caller's RBAC-filtered marketplace/store plugin skills.
+
+    Uses ``resolve_user_marketplace`` (admin-granted-and-subscribed
+    marketplace plugins, unioned with the caller's Store installs) — the
+    same composition ``agnes refresh-marketplace`` fetches server-side and
+    ``app/chat/runner.py``'s ``_bootstrap_marketplace`` installs into the
+    live sandbox.
+
+    Names are bare (never ``<plugin>:<skill>``) — see the module docstring for
+    the CLI handshake this was verified against.
+    """
+    return [
+        {"name": e["name"], "description": e["description"], "source": "marketplace"}
+        for e in _marketplace_skill_entries(conn, user)
+    ]
+
+
+def merged_skills(
+    bundled_template_dir: Path,
+    conn: duckdb.DuckDBPyConnection,
+    user: dict,
+    *,
+    delivery: str = DELIVERY_PROJECT,
+) -> list[dict]:
     """Merge bundled + marketplace skills into one deterministic list.
+
+    ``delivery`` is :func:`marketplace_delivery`'s answer for the running
+    configuration. :data:`DELIVERY_NONE` drops the marketplace source entirely:
+    with ``chat.bootstrap_marketplace`` off, nothing materializes those skills
+    into the session, and a menu row for one is a promise the agent cannot keep
+    (``/keboola-cli`` → "Unknown command", #1552). It defaults to
+    :data:`DELIVERY_PROJECT` — the delivering value — so a caller that forgets
+    the argument offers exactly what it offered before this argument existed.
 
     Marketplace entries win name clashes against bundled ones (more
     user-specific). Either source failing to list is logged as a warning
@@ -160,11 +264,14 @@ def merged_skills(bundled_template_dir: Path, conn: duckdb.DuckDBPyConnection, u
         logger.warning("chat skills: bundled source failed to list", exc_info=True)
         bundled = []
 
-    try:
-        marketplace = list_marketplace_skills(conn, user)
-    except Exception:
-        logger.warning("chat skills: marketplace source failed to list", exc_info=True)
-        marketplace = []
+    if delivery == DELIVERY_NONE:
+        marketplace: list[dict] = []
+    else:
+        try:
+            marketplace = list_marketplace_skills(conn, user)
+        except Exception:
+            logger.warning("chat skills: marketplace source failed to list", exc_info=True)
+            marketplace = []
 
     by_name: dict[str, dict] = {s["name"]: s for s in bundled}
     for s in marketplace:
