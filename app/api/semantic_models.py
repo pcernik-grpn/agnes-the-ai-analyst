@@ -34,6 +34,7 @@ from pydantic import BaseModel
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db, get_current_user
+from app.instance_config import get_studio_enabled
 from app.resource_types import ResourceType
 from src.repositories import semantic_model_repo, semantic_source_repo
 from src.semantic.document_validation import validate_document
@@ -53,6 +54,14 @@ router = APIRouter(tags=["semantic-models"])
 class SemanticModelCreate(BaseModel):
     document: str
     description: Optional[str] = None
+
+
+class SemanticModelApply(BaseModel):
+    document: str
+    description: Optional[str] = None
+    # Optimistic lock for read → modify → apply loops: the content_hash the
+    # caller's edit was based on. A mismatch 409s instead of overwriting.
+    expected_content_hash: Optional[str] = None
 
 
 class SemanticModelUpdate(BaseModel):
@@ -173,6 +182,98 @@ def _resolve_model(model_ref: str) -> Optional[dict]:
     for an interactive admin."""
     repo = semantic_model_repo()
     return repo.get(model_ref) or repo.get_by_slug(model_ref)
+
+
+# ---------------------------------------------------------------------------
+# Apply pipeline — shared by the /apply endpoint and the moderation-queue
+# replay (spec 2026-08-24-semantic-layer-chat-authoring)
+# ---------------------------------------------------------------------------
+
+
+class SemanticApplyError(ValueError):
+    """A refused apply, carrying a machine-readable ``code``.
+
+    A plain ``ValueError`` subclass so the authoring-suggestions replay path
+    (which maps any exception onto 409 ``create_failed`` + reopen) needs no
+    knowledge of this module's HTTP vocabulary."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _check_apply(document: str, expected_content_hash: Optional[str] = None):
+    """Validate ``document`` and run the write-independent guards.
+
+    Returns ``(slug, validation_result)``. Raises ``SemanticApplyError``:
+
+    - ``invalid_document`` — schema errors, or no named ``semantic_model``.
+    - ``source_owned`` — the slug belongs to an imported model. Unlike the
+      raw admin POST (which would create a shadow ``manual/_/<slug>`` row
+      next to the imported one), apply refuses for admins and non-admins
+      alike — the next source sync would not revert the write, it would
+      coexist with it, and ``get_by_slug`` would resolve ambiguously.
+    - ``stale_document`` — ``expected_content_hash`` no longer matches.
+    """
+    result = validate_document(document)
+    if not result.ok:
+        raise SemanticApplyError("invalid_document", "; ".join(str(e) for e in result.errors))
+    models = (result.parsed or {}).get("semantic_model") or []
+    slug = models[0].get("name") if models else None
+    if not slug:
+        raise SemanticApplyError("invalid_document", "Document declares no semantic_model entry with a name")
+
+    existing = semantic_model_repo().get_by_slug(slug)
+    if existing is not None and existing.get("source") != "manual":
+        raise SemanticApplyError(
+            "source_owned",
+            f"slug '{slug}' is owned by source '{existing['source']}'"
+            + (f" (source_ref={existing['source_ref']!r})" if existing.get("source_ref") else "")
+            + " — edit it there, then re-sync, rather than here",
+        )
+    if expected_content_hash is not None:
+        current = existing.get("content_hash") if existing is not None else None
+        if current != expected_content_hash:
+            raise SemanticApplyError(
+                "stale_document",
+                f"model '{slug}' changed since it was read — re-read it and re-apply",
+            )
+    return slug, result
+
+
+def apply_manual_model(
+    document: str,
+    description: Optional[str] = None,
+    expected_content_hash: Optional[str] = None,
+) -> dict:
+    """The one write pipeline for a hand-authored model: guards → upsert as
+    ``source='manual'`` → project. Used by the ``/apply`` admin branch AND
+    the moderation-queue replay, so the two paths cannot diverge. Raises
+    ``SemanticApplyError`` (a ``ValueError``)."""
+    slug, result = _check_apply(document, expected_content_hash)
+    row = semantic_model_repo().upsert(
+        id=f"manual/_/{slug}",
+        slug=slug,
+        name=slug,
+        description=description,
+        document=document,
+        document_json=result.parsed,
+        spec_version=result.spec_version,
+        content_hash=hashlib.sha256(document.encode()).hexdigest(),
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=datetime.now(timezone.utc),
+    )
+    _project(result.parsed, source="manual", source_ref=None)
+    return row
+
+
+def _apply_error_to_http(exc: SemanticApplyError) -> HTTPException:
+    if exc.code == "invalid_document":
+        return HTTPException(status_code=422, detail={"code": exc.code, "errors": str(exc)})
+    return HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)})
 
 
 # ---------------------------------------------------------------------------
@@ -570,3 +671,77 @@ async def get_semantic_schema_endpoint(
     """
     del user  # authentication-only dependency — nothing model-specific to gate on
     return _get_semantic_schema(semantic_types)
+
+
+@router.post("/api/semantic-models/apply")
+async def apply_semantic_model_endpoint(
+    body: SemanticModelApply,
+    user: dict = Depends(get_current_user),
+):
+    """Apply a hand-authored Ossie document — the one semantic-layer write
+    surface for chat, CLI, and the studio builder.
+
+    What "apply" means depends on the caller's authority, and the response
+    labels the outcome so callers (human or agent) never have to guess:
+
+    - **admin** → the document is validated, stored as a ``source='manual'``
+      model (create-or-replace by slug), and projected into the flat tables.
+      Response: ``{"outcome": "applied", "model": {...}}``.
+    - **non-admin** → the document is validated, then queued as an
+      ``authoring_suggestions`` row (domain ``semantic-layer``) for admin
+      moderation — it never touches ``semantic_models`` before approval.
+      Response: ``{"outcome": "submitted_for_review", "suggestion_id": ...}``.
+
+    Shared guards, both roles: schema-invalid documents 422; a slug owned by
+    an imported source 409 ``source_owned``; a supplied
+    ``expected_content_hash`` that no longer matches 409 ``stale_document``.
+    The non-admin branch additionally 409s ``duplicate_pending`` while an
+    earlier proposal for the same slug awaits review, and 403s
+    ``studio_disabled`` when the instance-level Studio toggle is off (the
+    admin branch is a plain admin write, not Studio-gated).
+    """
+    from app.auth.access import is_user_admin
+    from src.repositories import audit_repo, authoring_suggestions_repo
+
+    try:
+        slug, result = _check_apply(body.document, body.expected_content_hash)
+    except SemanticApplyError as exc:
+        raise _apply_error_to_http(exc) from None
+
+    if is_user_admin(user["id"]):
+        try:
+            row = apply_manual_model(body.document, body.description, body.expected_content_hash)
+        except SemanticApplyError as exc:  # raced with a concurrent write between check and apply
+            raise _apply_error_to_http(exc) from None
+        return {"outcome": "applied", "model": row}
+
+    if not get_studio_enabled():
+        raise HTTPException(status_code=403, detail={"kind": "studio_disabled"})
+
+    repo = authoring_suggestions_repo()
+    # One pending proposal per slug: a second submission while the first
+    # awaits review points at the existing one instead of stacking dupes.
+    # (Suggestions submitted through the raw studio-page POST carry no
+    # ``slug`` key and are invisible to this guard — a courtesy check, not
+    # an invariant; the replay handles any residual collision by upserting.)
+    for sug in repo.list(status="pending", domain="semantic-layer"):
+        if (sug.get("payload") or {}).get("slug") == slug:
+            raise HTTPException(
+                status_code=409,
+                detail={"kind": "duplicate_pending", "suggestion_id": sug["id"]},
+            )
+
+    payload = {
+        "slug": slug,
+        "document": body.document,
+        "description": body.description,
+        "expected_content_hash": body.expected_content_hash,
+    }
+    sid = repo.create(domain="semantic-layer", payload=payload, created_by=user["email"])
+    audit_repo().log(
+        user_id=user["id"],
+        action="authoring_suggestion.submit",
+        resource=sid,
+        params={"domain": "semantic-layer", "slug": slug},
+    )
+    return {"outcome": "submitted_for_review", "suggestion_id": sid, "slug": slug}

@@ -273,6 +273,80 @@ _AGENT_AUTHOR = ChatProfile(
     ),
 )
 
+_SEMANTIC_MODEL_BUILDER = ChatProfile(
+    slug="semantic-model-builder",
+    claude_md=(
+        "# Semantic Model Builder\n\n"
+        "You help a user author an **Ossie semantic-model document** — "
+        "datasets, per-field context, relationships, metrics, and "
+        "`ai_context` — so agents querying the data understand it instantly "
+        "instead of rediscovering its quirks.\n\n"
+        "Rules:\n"
+        "- Survey first: `agnes semantic-model context dataset` (what models "
+        "already describe), `agnes catalog --json` (what tables exist), "
+        "`agnes schema <table>` (columns + types). Never invent structure.\n"
+        "- Read the schema, don't recall it: `agnes semantic-model schema "
+        "dataset metric relationship` serves the vendored Ossie JSON Schema.\n"
+        "- Check for a canonical metric (`agnes catalog --metrics --show "
+        "<id>`) before writing any metric SQL — never invent calculations.\n"
+        '- Operational caveats ("this flag never needs filtering", "a '
+        "missing value here is intentional\") belong in the dataset's "
+        "`ai_context`, not in prose nobody reads at query time.\n"
+        "- Show the full document and get an explicit go-ahead before "
+        "applying it.\n"
+        "- Apply through the builder's Create action or `POST "
+        "/api/semantic-models/apply`, and report the labeled outcome "
+        "honestly: `applied` means the model is live; `submitted_for_review` "
+        "means an admin still has to approve it — never claim a queued "
+        "proposal is live.\n"
+        "- Use the `agnes-semantic-authoring` skill for the document shape "
+        "and endpoints.\n"
+    ),
+    skill_name="agnes-semantic-authoring",
+    skill_body=(
+        "---\n"
+        "name: agnes-semantic-authoring\n"
+        "description: How semantic models work in Agnes — the Ossie document "
+        "shape, what ai_context is for, and the one apply surface with its "
+        "outcome branching.\n"
+        "---\n\n"
+        "# Semantic models in Agnes\n\n"
+        "One model = one Ossie document (`semantic_model:` list with one "
+        "named entry), stored whole in `semantic_models` and projected into "
+        "`metric_definitions` / `glossary_terms` / `column_metadata`. Agents "
+        "read it at query time via `get_semantic_context`, "
+        "`knowledge_search`, and `validate_semantic_query`.\n\n"
+        "## Document shape (minimum)\n"
+        "```yaml\n"
+        "version: '0.2.0.dev0'\n"
+        "semantic_model:\n"
+        "  - name: my-model          # becomes the slug\n"
+        "    datasets:\n"
+        "      - name: orders\n"
+        "        source: db.public.orders\n"
+        "        fields: []\n"
+        "        ai_context: >-\n"
+        "          Free-text guidance an agent reads before querying.\n"
+        "```\n"
+        "`ai_context` (a string, or `{instructions, synonyms}`) may sit on "
+        "the model, a dataset, a metric, or a relationship.\n\n"
+        "## Apply\n"
+        "- `POST /api/semantic-models/apply` — JSON `{document, "
+        "description?, expected_content_hash?}`. Admin callers: applied "
+        "directly (`outcome: applied`). Non-admin callers: queued for admin "
+        "moderation (`outcome: submitted_for_review`) — the document is NOT "
+        "live until approved.\n"
+        "- Editing: export the current document (`GET "
+        "/api/semantic-models/{slug}.yaml`), modify, re-apply with "
+        "`expected_content_hash` set to the model's current hash — a "
+        "mismatch 409s (`stale_document`) instead of overwriting.\n"
+        "- A slug owned by an imported source (git/metastore sync) 409s "
+        "(`source_owned`) — that model is edited at its source, not here.\n"
+        "- Offline pre-check: `agnes admin semantic-model validate <file>` "
+        "(no server, no token).\n"
+    ),
+)
+
 _PROFILES: dict[str, ChatProfile] = {
     _DATA_PACKAGE_BUILDER.slug: _DATA_PACKAGE_BUILDER,
     _MCP_CONNECT.slug: _MCP_CONNECT,
@@ -280,6 +354,7 @@ _PROFILES: dict[str, ChatProfile] = {
     _CORPORATE_MEMORY.slug: _CORPORATE_MEMORY,
     _SKILL_AUTHOR.slug: _SKILL_AUTHOR,
     _AGENT_AUTHOR.slug: _AGENT_AUTHOR,
+    _SEMANTIC_MODEL_BUILDER.slug: _SEMANTIC_MODEL_BUILDER,
 }
 
 

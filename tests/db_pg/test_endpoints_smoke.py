@@ -2951,6 +2951,7 @@ class TestSemanticLayerSmoke:
         "POST /api/semantic-models/validate-query",
         "GET /api/semantic-models/context",
         "GET /api/semantic-models/schema",
+        "POST /api/semantic-models/apply",
     }
 
     def test_model_crud_and_export(self, seeded_app_both):
@@ -3005,6 +3006,40 @@ class TestSemanticLayerSmoke:
         assert "Dataset" in schema.json()["$defs"]
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
+
+    def test_apply_branches_on_authority(self, seeded_app_both):
+        """The one write surface (chat-first authoring): an admin's document
+        applies directly; a non-admin's lands in the moderation queue and
+        never touches ``semantic_models`` before approval."""
+        c = seeded_app_both["client"]
+        doc = _SEMANTIC_DOC.replace("smoke_model", "apply_model")
+
+        applied = c.post(
+            "/api/semantic-models/apply",
+            json={"document": doc},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert applied.status_code == 200
+        assert applied.json()["outcome"] == "applied"
+        assert applied.json()["model"]["slug"] == "apply_model"
+
+        queued = c.post(
+            "/api/semantic-models/apply",
+            json={"document": _SEMANTIC_DOC.replace("smoke_model", "proposed_model")},
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert queued.status_code == 200
+        assert queued.json()["outcome"] == "submitted_for_review"
+        assert (
+            c.get("/api/semantic-models/proposed_model.yaml", headers=_admin_headers(seeded_app_both)).status_code
+            == 404
+        )
+
+        model_id = applied.json()["model"]["id"]
+        assert (
+            c.delete(f"/api/admin/semantic-models/{model_id}", headers=_admin_headers(seeded_app_both)).status_code
+            == 204
+        )
 
     def test_source_crud_and_sync(self, seeded_app_both):
         c = seeded_app_both["client"]

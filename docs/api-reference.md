@@ -1206,6 +1206,7 @@ so comments and key order survive.
 - /api/semantic-models/validate-query
 - /api/semantic-models/context
 - /api/semantic-models/schema
+- /api/semantic-models/apply
 
 `POST /api/admin/semantic-models` validates the pasted document against the
 vendored Ossie schema (422 with the schema errors on failure) and stores it
@@ -1229,6 +1230,22 @@ CLI: `agnes admin semantic-model list/show/import/export/validate` (the
 last runs entirely offline — no server, no token) and `agnes admin
 semantic-source add/list/sync`. MCP: `semantic_model_search`,
 `semantic_model_get`.
+
+`POST /api/semantic-models/apply` is the one non-admin-reachable write
+surface (chat-first authoring): any authenticated caller submits an Ossie
+document, and the outcome branches on authority — an admin's document is
+validated, stored as `source='manual'`, and projected (`outcome: applied`);
+anyone else's is queued as an `authoring_suggestions` row (domain
+`semantic-layer`) for admin moderation (`outcome: submitted_for_review`) and
+never touches `semantic_models` before approval. Shared guards for both
+roles: schema-invalid 422; a slug owned by an imported source 409
+`source_owned` (stronger than the raw admin POST — apply refuses to shadow
+an imported model even for admins); a stale `expected_content_hash` 409
+`stale_document` (the optimistic lock for read → modify → re-apply). The
+non-admin branch also 409s `duplicate_pending` while an earlier proposal for
+the same slug awaits review, and 403s `studio_disabled` when the Studio
+toggle is off. CLI: `agnes semantic-model apply`. MCP:
+`apply_semantic_model`.
 
 `POST /api/semantic-models/validate-query` validates a SQL statement against
 the caller's accessible `status='valid'` models (same RBAC tier as

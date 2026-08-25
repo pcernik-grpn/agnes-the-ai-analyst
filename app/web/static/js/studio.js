@@ -96,7 +96,9 @@ async function createEntity() {
   const btn = $("studio-create");
   if (inFlight) return;
   const payload = collectPayload();
-  if (!payload.name && !payload.slug) {
+  // Document-based domains (semantic-layer) have no name/slug field — the
+  // slug comes from the document itself.
+  if (!payload.name && !payload.slug && !payload.document) {
     result.textContent = "Fill in the required fields.";
     return;
   }
@@ -142,10 +144,16 @@ async function createEntity() {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    // Outcome-branching endpoints (semantic-layer apply) nest the created
+    // resource under `model` and label the outcome instead of returning the
+    // row at the top level.
+    const model = (created && created.model) || {};
     const id =
-      created && (created.id || created.slug)
-        ? created.id || created.slug
-        : payload.slug || payload.name;
+      (created && (created.id || created.slug)) ||
+      model.slug ||
+      model.id ||
+      payload.slug ||
+      payload.name;
     // A seeded knowledge item is created `pending` — approval is what
     // publishes it to every analyst — so say so rather than let the author
     // assume the knowledge is live. (Devin Review on #1263.)
