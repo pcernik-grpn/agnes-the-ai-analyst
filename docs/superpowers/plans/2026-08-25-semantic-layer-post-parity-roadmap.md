@@ -9,6 +9,8 @@
 - `docs/superpowers/specs/2026-08-14-semantic-layer-ui-and-agent-parity-design.md` (UI + agentní parita, schváleno)
 - `docs/superpowers/plans/2026-08-16-semantic-layer-parity-sequencing.md` (vlny 0–4 — **kompletně doběhly**, viz níže)
 - `docs/superpowers/specs/2026-08-24-semantic-layer-chat-authoring-design.md` (chat-first authoring, implementováno)
+- V0 ticket (2026-08-25, tento dokument §7) — první konkrétní, timeboxovaný
+  řez roadmapy; opravuje tři věci z korekcí níže (viz K0.11)
 
 Tenhle dokument neotvírá znovu principy původního zadání — ty se auditem
 nezpochybnily. Opravuje **šest faktů**, na kterých zadání stálo, protože
@@ -134,6 +136,27 @@ viditelnost) analogicky nesou riziko na governance straně: nekonzistentní
 nebo neúplný grant je přesně tvar chyby, který takové hodnocení penalizuje
 tvrdě a bez odstupňování. Viz přeuspořádané doporučení v §4.
 
+**K0.11 — V0 ticket (2026-08-25) opravuje tři odhady z tohodle plánu a
+přidává novou, dřívější fázi.** Nezávisle vznikl konkrétní, timeboxovaný V0
+ticket pro tuhle práci (plné mapování viz §7). Tři korekce vůči textu výše:
+
+1. **Multi-doménový completeness check (K0.9) NENÍ mimo rozsah.** Ticket ho
+   staví jako jádro V0 — sémantika/metriky/skill/specializovaný agent/
+   knowledge base/glosář v jednom seznamu s dopadem, klikatelné "dodělej
+   tohle". Jen % skóre a gamifikace zůstávají V1 (ticket to sám odděluje).
+   F4.1 se tím rozšiřuje z "zobecni Keboola coverage" na "postav
+   cross-doménový přehled" — viz aktualizovaná Fáze 4.1 a §3a.
+2. **Kontrakt pro agenta (root manifest, YAML schéma, progressive
+   disclosure) musí být zamrzlý PŘED jakoukoli generací** — F0 i F5 na něm
+   stojí doslova, ne jen "hezké mít hotové souběžně". Nová **Fáze K** níže,
+   před číslovanou Fází 0.
+3. **F0 a Fáze K jsou dvě různé vrstvy a neblokují se navzájem** — F0 řeší
+   úložiště (aby každý provider zapisoval do stejných Ossie dokumentů), Fáze
+   K řeší, jak z úložiště čte agent na file systému. Obě mohou být "krok 0"
+   souběžně. Jediná brzda: přesný scope adaptérové práce (který provider,
+   jak velký zásah) čeká na vstup od týmu o tom, co reálně chybí — dokud
+   nepřijde, F0 zůstává scope-TBD, ne pevně "Databricks" (viz Fáze 0 níže).
+
 ---
 
 ## 1. Principy a argumentace
@@ -197,43 +220,80 @@ coverage→authoring.
 
 ## 3. Plán ve fázích (revidováno)
 
-### Fáze 0 — Databricks na dokumentovou cestu *(M, beze změny rozsahu)*
+### Fáze K — kontrakt pro agenta *(S, nová, blokující — dělá se první)*
 
-Postup kopíruje ověřený Keboola playbook (K0.3): nový
-`connectors/databricks/semantic_ossie.py` (fetch: `information_schema.tables`
-→ `METRIC_VIEW`, tělo `SHOW CREATE TABLE`, YAML mezi `$$`) → shadow write pod
-`source='databricks_metrics'` vedle legacy → golden diff na nulu → jedna
-transakce cutover (smazat `source='databricks_semantic_layer'`, projektor
-přebírá) → smazat `sync_semantic_layer`. `MEASURE()` výrazy tagovat výhradně
-databricks dialektem, aby je `validate-query` (už hotový, vlna 3) korektně
-označil jako lokálně nespustitelné. Guard na kolizi jmen metrik napříč zdroji
-(`metric_definitions.name` nemá unique constraint — týká se i Snowflake).
-Mimochodem: migrace `source_ref` do `column_metadata` (vzor 0054).
+Bez tohohle nemá smysl generovat nic (V0 ticket, §7) — určuje tvar, do
+kterého F1 renderuje a F5 generuje. Specifikovat a zamrznout:
 
-**DoD:** Databricks metriky v dokumentech, `sync_semantic_layer` smazán,
+1. **Adresářová struktura + root entry point** ve workspace, tak aby agent
+   poznal, co tam je, bez nutnosti prohledávat celý strom.
+2. **Schéma YAMLů** (struktura — ontologie, metriky, vztahy) + Markdown
+   (próza — glosář, kontext, kdy co použít), **verzované**, žijící v
+   `<DOPLNIT: repo>` — otevřené pole z ticketu, potřebuje rozhodnutí, ne
+   odhad.
+3. **Pravidla progressive disclosure** — co patří do root manifestu (aby
+   agent věděl, kam sáhnout) vs. co až do listu (detail, který se čte jen
+   na vyžádání).
+4. **MCP/API jako sekundární přístup ke stejnému obsahu** — `get_semantic_
+   context`/`get_semantic_schema` (K0.1, vlna 4.1) už existují a zůstávají
+   jako fallback/ověřovací cesta, ne primární — primární je file systém.
+
+**DoD:** layout + schéma zdokumentované a zamrzlé pro V0; F1 i F5 se na ně
+odkazují, ne vymýšlí formát samy za sebe.
+
+### Fáze 0 — sjednocení providera na dokumentovou cestu *(M, scope TBD — viz K0.11.3)*
+
+Cíl beze změny: každý provider zapisuje do stejných Ossie dokumentů, ne do
+staré ploché tabulky vedle nich — dokud aspoň jeden zůstává na starém
+formátu, každá další fáze (F1 render, F4.1 completeness) ho musí
+speciálně ošetřovat. **Který provider a jak velký zásah je otevřené** —
+V0 ticket (§7, bod 2) to výslovně čeká na vstup, co reálně chybí; bez něj
+nejde odhadnout, jestli jde o dvoudenní rozšíření, nebo dvoutýdenní práci.
+Následující postup platí, ať to dopadne na Databricks nebo jinam:
+
+Postup kopíruje ověřený Keboola playbook (K0.3): nový adaptér (pro
+Databricks konkrétně: `connectors/databricks/semantic_ossie.py`, fetch
+`information_schema.tables` → `METRIC_VIEW`, tělo `SHOW CREATE TABLE`, YAML
+mezi `$$`) → shadow write pod novým `source=` vedle legacy → golden diff na
+nulu → jedna transakce cutover (smazat starý flat zápis, projektor přebírá)
+→ smazat starý synchronizační kód. Cílový dialekt (pro Databricks:
+`MEASURE()`) tagovat výhradně tím zdrojem, aby ho `validate-query` (už
+hotový, vlna 3) korektně označil jako lokálně nespustitelný. Guard na kolizi
+jmen metrik napříč zdroji (`metric_definitions.name` nemá unique constraint).
+**Nově (V0 ticket, §7 bod 2):** cokoli se do Ossie modelu nevejde, jde do
+`unmapped[]` a zůstává viditelné — nezahazovat potichu.
+
+**DoD:** provider promítnutý do dokumentů, starý flat zápis smazán,
 `agnes catalog --metrics` vrací stejný tvar (`table_name` + runnable SQL)
-napříč Keboola/Snowflake/Databricks, export i `validate-query` fungují.
+napříč všemi providery, export i `validate-query` fungují, `unmapped[]`
+neprázdný obsah je vidět v UI/CLI, ne jen v datech.
 
-### Fáze 1 — distribuce jako fyzická cache s TTL *(S, rozsah zúžen K0.1/K0.2)*
+### Fáze 1 — distribuce jako fyzická cache *(S, rozsah zúžen K0.1/K0.2, tvar určuje Fáze K)*
 
 Živá čtecí vrstva už existuje a se neduplikuje. Fáze 1 řeší jen materializaci
-na disk:
+na disk, do layoutu, který zamrzla Fáze K:
 
 1. Nový render krok v `agnes pull`: pro RBAC-viditelné validní modely
    (stejná brána jako `_can_read_model` + package granty) zapsat dokument
-   jako soubor do workspace (layout `_brief.md` / `tables/*.yml` /
-   `metrics/*.yml` / `glossary.md` — recyklovat z `data_semantics_scaffold.py`
-   jen renderovací část, ne jeho čtení z plochých tabulek).
+   jako soubor do workspace (layout dle Fáze K — `_brief.md` / `tables/*.yml`
+   / `metrics/*.yml` / `glossary.md` je výchozí návrh, ne finální slovo;
+   recyklovat z `data_semantics_scaffold.py` jen renderovací část, ne jeho
+   čtení z plochých tabulek).
 2. Hlavička na souboru: `generated_at`, `content_hash` (existující sloupec
-   `semantic_models.content_hash` — recyklovat, ne vymýšlet), `source_slug`,
-   `ttl`. Soubory read-only (chmod).
-3. TTL politika **doplněná do existující sekce** `config/
-   claude_md_template.txt:47-72` (ne nová sekce) — do vypršení agent věří
-   souboru; po vypršení instrukce velí ověřit přes `get_semantic_context`
-   (hash už do jeho odpovědi patří nebo se doplní), `validate-query` vždy
-   serverová beztak.
-4. Jednořádkový katalog modelů (jméno + popis) do stejné CLAUDE.md sekce —
-   dnes tam je jen autoritativní prosa, ne výčet.
+   `semantic_models.content_hash` — recyklovat, ne vymýšlet), `source_slug`.
+   Soubory read-only (chmod).
+3. **Invalidace, ne časová TTL** (V0 ticket, §7, upřesňuje princip 5): server
+   → analytik synchronizace je hash-based už dnes (importer dělá hash-skip,
+   K0.1); tahle fáze jen posouvá stejnou logiku o krok dál — při `agnes pull`
+   se soubor přepíše, pokud se `content_hash` liší, bez ohledu na stáří.
+   Časová TTL zůstává jen jako **fallback instrukce pro agenta** v CLAUDE.md
+   pro dlouho běžící session mezi dvěma pully ("pokud sedíš v jedné session
+   déle než X hodin, ověř přes `get_semantic_context`, i když jsi soubor
+   nepřepisoval") — ne jako mechanismus, který cokoli maže nebo invaliduje
+   sám o sobě. `validate-query` zůstává vždy serverová beztak.
+4. Jednořádkový katalog modelů (jméno + popis) do existující CLAUDE.md sekce
+   (`config/claude_md_template.txt:47-72`) — dnes tam je jen autoritativní
+   prosa, ne výčet.
 
 **DoD:** po pullu má analytik dle svých práv slovník fyzicky na disku;
 zastaralá cache se pozná z hlavičky a CLAUDE.md agentovi řekne, co s tím.
@@ -271,22 +331,35 @@ uteklém zdroji; návrat je jedno tlačítko s náhledem.
 
 ### Fáze 4 — kvalita a krytí zad *(M, 4.1 zobecněná, zbytek beze změny)*
 
-1. **Pokrytí (zobecnit, ne stavět):** rozšířit/obalit existující Keboola
-   binding-coverage engine (K0.5) o cross-source dotaz: registr tabulek
-   (data packages) vs. tabulky referencované ve *všech* valid dokumentech
-   napříč zdroji. Endpoint + CLI `agnes semantic-model coverage` (odlišit
-   jménem od stávajícího Keboola-specific `admin semantic-layer coverage`)
-   + badge v UI.
+1. **Completeness check, cross-doménový (K0.11.1 — jádro V0, ne jen
+   zobecnění):** rozšířit/obalit existující Keboola binding-coverage engine
+   (K0.5), ale nezastavit se u semantiky. Pro každý data source vyhodnotit
+   napříč doménami, co existuje a co chybí: sémantika (jak dřív), metriky,
+   skill, specializovaný agent, knowledge base, glosář — každá doména má
+   jiný zdroj pravdy (semantic_models, metric_definitions, marketplace
+   registrace, agent profily, corporate memory, glossary_terms), takže
+   endpoint agreguje přes víc subsystémů, ne jen přes jeden. Výstup ve V0:
+   **seznam s vysvětlením dopadu**, chybějící položka klikatelná ("dodělej
+   tohle") — **bez** procentuálního skóre a gamifikace (ty zůstávají V1,
+   viz Non-goals §7). Endpoint + CLI `agnes semantic-model coverage`
+   (odlišit jménem od stávajícího Keboola-specific `admin semantic-layer
+   coverage`) + seznam v UI. Navrhnout endpoint tak, aby šel bez přepisu
+   rozšířit o skóre později (otevřená otázka 9).
 2. **Health check:** agregát nad `semantic_sources.last_sync_status/at`,
    počtem odpojených modelů s uteklým zdrojem (závisí na F3), chybami
    validace dokumentů, pokrytím z 4.1. Jeden endpoint pro UI banner, CLI,
    MCP.
 3. **Vypnutí kontroly = podpis:** mute per instance/zdroj s uloženým
    kdo/kdy/co, viditelné v health výstupu.
-4. **Chování agenta:** ověřit, co `config/claude_md_template.txt:47-72` už
-   říká (autoritativnost, canonical-metric-first), a **doplnit** jen chybějící
-   pravidla — explicitní "zeptej se, nehádej" mimo slovník a "odpověď bez
-   opory v sémantice označ". Nepsat sekci od nuly. E2E test konverzace.
+4. **Chování agenta + eval harness (rozšířeno V0 ticketem, §7 bod 5):**
+   ověřit, co `config/claude_md_template.txt:47-72` už říká (autoritativnost,
+   canonical-metric-first), a **doplnit** jen chybějící pravidla — explicitní
+   "zeptej se, nehádej" mimo slovník a "odpověď bez opory v sémantice
+   označ". Nepsat sekci od nuly. K tomu **eval set v CI**: sada reálných
+   otázek + očekávané odpovědi, baseline BEZ sémantiky vs. S sémantikou,
+   acceptance `<DOPLNIT: X% → Y%>` — otevřené pole, čeká na práh od
+   produktu/zákazníka. Tohle je zároveň test čitelnosti kontraktu z Fáze K:
+   ukáže, jestli agent soubory reálně používá, nebo je ignoruje.
 5. **Feedback:** tabulka `semantic_feedback` (otázka, SQL, metrika, hash
    verze modelu, komentář, kdo/kdy) + MCP tool `flag_semantic_issue` + admin
    fronta — nejpřirozeněji jako doména ve Studiu vedle `semantic-layer`
@@ -296,34 +369,38 @@ uteklém zdroji; návrat je jedno tlačítko s náhledem.
 **DoD:** admin na jedné obrazovce vidí, co nemá sémantiku napříč zdroji, co
 se nesynchronizuje/je odpojené-a-uteklo, co lidi hlásí.
 
-### Fáze 5 — auto-build: napojit existující chat authoring, nestavět nový *(S, přepsáno z L)*
+### Fáze 5 — auto-generace: chat-authoring agent auto-spuštěný, ne deterministický scaffold *(S, mechanismus rozhodnut V0 ticketem §7 bod 3)*
 
-Zadání navrhovalo deterministický scaffold + LLM draft vrstvu + `status=
-'draft'` dokument + `GEN`/`DRAFT`/`KEEP` regenerace + auto-trigger. To je
-v přímém konfliktu s implementovaným designem (K0.4), který zvolil
-opačně: žádný deterministický scaffold, chat agent *je* scaffolder, review
-vždy před apply. Nová fáze 5 respektuje tohle rozhodnutí a řeší jen chybějící
-propojku:
+Zadání v2 navrhovalo deterministický scaffold + LLM draft vrstvu + `status=
+'draft'` dokument mimo review frontu. To bylo v přímém konfliktu s
+implementovaným designem (K0.4): žádný deterministický scaffold, chat agent
+*je* scaffolder, review vždy před apply. V0 ticket (§7 bod 3) chce navíc, aby
+"Agnes si sémantiku odvodila sama" pro native-mode datasety bez existující
+vrstvy — **rozhodnuto**: sama = ten samý chat-authoring agent, jen spuštěný
+systémem, ne až po člověku, který otevře Studio chat. Princip 3 (jedna
+zapisovatelná strana) zůstává netknutý, protože výstup jde pořád do stejné
+fronty:
 
 1. **Trigger:** nová tabulka v registru / nový data package s 0% pokrytím
-   (napojení na F4.1) ⇒ notifikace/CTA směrem k existujícímu
-   `/admin/studio/semantic-layer` s předvyplněným kontextem (jméno tabulky,
-   schéma, proč se to zobrazilo) — **ne** automaticky vygenerovaný draft
-   dokument mimo review.
-2. **Scaffold modul:** rozhodnout explicitně, ne předpokládat. Buď (a)
-   `data_semantics_scaffold.py` zrušit — jeho práci dnes dělá chat agent
-   lépe (čte živá data, ne cache) — nebo (b) zúžit na jediný ospravedlnitelný
-   use-case, který chat-authoring nepokrývá (např. plně offline/bulk
-   generace bez lidské interakce pro desítky tabulek najednou). Toto je
-   otevřená otázka pro produktové rozhodnutí, ne implementační detail —
-   viz níže.
-3. Pokud (b): scaffold přesměrovat na výstup v Ossie *jako draft-only vstup
-   do stejné chat-authoring session* (ne jako samostatná cesta k `valid`
-   dokumentu), aby nevznikla druhá autorská cesta do `semantic_models`.
+   (napojení na F4.1) ⇒ systém **automaticky spustí** existujícího
+   `semantic-model-builder` chat agenta nad danou tabulkou (stejná metoda
+   survey → schema → draft → validate, co dnes běží po lidském promptu),
+   výstup přistane v `authoring_suggestions` frontě přesně jako
+   human-initiated návrh. Notifikace pro admina/vlastníka dat je pak "draft
+   čeká na schválení", ne "jdi si to sám napsat".
+2. **V0 scope:** jen registrované **tabulky**, ne soubory (ticket to
+   explicitně zužuje) — auto-trigger na unstrukturovaná data je pozdější
+   rozšíření.
+3. **Scaffold modul (`data_semantics_scaffold.py`) je teď oddělená otázka**,
+   ne blokující: auto-generaci ve V0 řeší auto-spuštěný chat agent, ne
+   scaffold. Zda `data_semantics_scaffold.py` zrušit, nebo zúžit na
+   ospravedlnitelný bulk-offline use-case (desítky tabulek bez lidské
+   interakce, kde by i auto-spuštěný chat agent byl pomalý/drahý), zůstává
+   otevřená otázka 4 — ale nebrání dokončení téhle fáze.
 
-**DoD:** napojení dat bez sémantiky vede k viditelné výzvě směrem k existující
-chat-authoring ploše; žádná nová zápisová cesta do `semantic_models` vedle
-`/apply`.
+**DoD:** napojení dat bez sémantiky vede automaticky k draftu v approval
+frontě (ne jen k výzvě, ať to člověk sám napíše); žádná nová zápisová cesta
+do `semantic_models` vedle `/apply`.
 
 ---
 
@@ -337,21 +414,22 @@ paralelně přes worktree — kalendářní čas viz doporučení pod tabulkou.
 
 | Fáze | Rozsah | Odhad | Náročnost | Hlavní zdroj náročnosti |
 |---|---|---|---|---|
-| F0 — Databricks | M | 6–9 dní | **Vysoká** | Mutuje data existující instalace (cutover); kopíruje ověřený Keboola playbook, takže riziko je *snížené*, ne nulové — golden diff musí pokrýt `MEASURE()` dialekt a kolizi jmen napříč zdroji (O5 zatím neověřeno) |
-| F1 — Distribuce/TTL | S | 3–5 dní | **Nízká** | Čistě aditivní — nový render krok + doplnění existující CLAUDE.md sekce, žádná schema migrace, nic existujícího se nepřepisuje |
+| Fáze K — Kontrakt | S | 2–4 dny | **Nízká–střední** | Malý po řádcích kódu, ale je to rozhodnutí, ne implementace — chyba tady (špatný layout) se promítne do F1 i F5 a je drahá na opravu zpětně |
+| F0 — sjednocení providera | M | 6–9 dní | **Vysoká** | Mutuje data existující instalace (cutover); kopíruje ověřený Keboola playbook, takže riziko je *snížené*, ne nulové — golden diff musí pokrýt cílový dialekt a kolizi jmen napříč zdroji (O5 zatím neověřeno). Rozsah navíc TBD (K0.11.3) |
+| F1 — Distribuce (fyzická cache) | S | 3–5 dní | **Nízká** | Čistě aditivní — nový render krok + doplnění existující CLAUDE.md sekce, žádná schema migrace, nic existujícího se nepřepisuje |
 | F2 — Provider granty | S–M | 4–6 dní | **Nízká–střední** | Nový `ResourceType` nepotřebuje DB migraci (CLAUDE.md to garantuje), ale `_can_read_model` třetí větev musí projít RBAC-negativním testem (K0.10) — chyba tady je přesně tvar chyby, co bolí nejvíc |
 | F3 — Detach & override | M | 7–10 dní | **Vysoká** | Nejvíc pohyblivých částí v celém plánu: schema migrace (DuckDB+PG pár + kontraktní test dle dual-backend disciplíny), danger-flow UX na dvou místech (detach i re-attach), guard, co dnes vrací flat 409 na více místech najednou |
-| F4.1 — Pokrytí (cross-source) | S | 2–3 dny | **Nízká** | Rozšíření existujícího enginu (K0.5), ne nová stavba |
+| F4.1 — Completeness check (cross-doménový) | M | 5–8 dní | **Střední** | Rozšířeno V0 ticketem (K0.11.1) z jednoho enginu na agregaci přes několik subsystémů (semantika, metriky, marketplace, agent profily, corporate memory, glosář) — víc integračních bodů, ne víc logiky na bod |
 | F4.2 — Health check | S–M | 3–4 dny | **Nízká–střední** | Agregace nad existujícími sloupci, ale výsledek je neúplný, dokud nedoběhne F3 (odpojené-a-uteklo) |
 | F4.3 — Mute s podpisem | S | 2 dny | **Nízká** | Malý audit-trail přírůstek, žádná nová entita |
-| F4.4 — Chování agenta | S | 1–2 dny | **Nízká** | Textová úprava CLAUDE.md + e2e test konverzace; nejmenší kousek s nejvyšší pákou na grounding (K0.10) |
+| F4.4 — Chování agenta + eval harness | S–M | 3–5 dní | **Nízká–střední** | Textová úprava CLAUDE.md je triviální; rozšířeno V0 ticketem o eval set v CI (golden otázky, baseline vs. se sémantikou, práh `<DOPLNIT>`) — harness samotný je ta práce navíc |
 | F4.5 — Feedback | S–M | 3–4 dny | **Nízká–střední** | Nová tabulka `semantic_feedback` → schema migrace DuckDB+PG, ale malý, izolovaný povrch |
-| F5 — Auto-build trigger | S | 3–4 dny | **Nízká–střední** | Rozhodnutí o scaffoldu (otevřená otázka 4) je produktové, ne technické — pokud padne na variantu (b), odhad roste o 2–3 dny |
+| F5 — Auto-generace (auto-spuštěný chat agent) | S | 3–4 dny | **Nízká–střední** | Mechanismus rozhodnut (K0.11), takže riziko nižší než v předchozím odhadu — hlavní práce je trigger + notifikace, ne nový generátor |
 
-**Součet:** ~35–49 člověko-dní sekvenčně (bez F4 podfází sečtených zvlášť by
-to vypadalo menší, ale F4 je ve skutečnosti pět nezávislých kousků, ne
-jeden). Doporučené paralelní pořadí z §4 (F0+F1+F4.1+F4.4 souběžně → F2+F3
-→ F4.2-4.5 → F5) stlačuje kalendářní čas na zhruba polovinu při dvou
+**Součet:** ~39–56 člověko-dní sekvenčně (o Fázi K a rozšířené F4.1/4.4 víc
+než v předchozím odhadu; F4 je pořád pět nezávislých kousků, ne jeden).
+Doporučené paralelní pořadí z §4 (Fáze K + F0 + F4.1 + F4.4 souběžně → F1 →
+F2+F3 → F4.2-4.5 → F5) stlačuje kalendářní čas na zhruba polovinu při dvou
 souběžně pracujících inženýrech (přes `.worktrees/`), protože nejnáročnější
 kousky (F0, F3) neleží na stejné závislostní větvi.
 
@@ -360,62 +438,76 @@ kousky (F0, F3) neleží na stejné závislostní větvi.
 ## 4. Pořadí a závislosti
 
 ```
-F0 (Databricks)      — hned, blokuje DBX obsah všude, kopíruje hotový playbook
-F1 (Cache + TTL)     — paralelně s F0, rozsah zúžen (jen distribuce, ne čtení)
+Fáze K (Kontrakt)    — hned, blokuje F1 i F5, neblokuje F0 (jiná vrstva, K0.11.3)
+F0 (sjednocení)      — hned, souběžně s Fází K, scope čeká na vstup (K0.11.3)
+F1 (Distribuce)      — po Fázi K (render potřebuje zamrzlý layout), nezávislá na F0
 F2 (Provider granty) — po F1 (render dědí brány), malá
 F3 (Detach)          — nezávislá na F1/F2, kdykoli po F0
-F4.1 (Pokrytí)       — nezávislá, může jít hned (zobecnění existujícího)
+F4.1 (Completeness)  — nezávislá, může jít hned (cross-doménová agregace existujícího)
 F4.2-4.5             — po F1 (staleness) a F3 (odpojené-a-uteklo)
-F5                   — po F4.1 (trigger); rozhodnutí o scaffoldu nezávislé, kdykoli
+F5                   — po F4.1 (trigger); mechanismus rozhodnut (K0.11), nezávislý na scaffoldu
 ```
 
-Závislostní graf beze změny, ale K0.10 mění, čemu dát přednost při stejné
-velikosti sousta: **F1 a F4.4 táhnout dřív, ne až v přirozeném pořadí**,
-protože nesou nepoměrně víc rizika/hodnoty než jejich (S) velikost napovídá
-— jsou to vlastnosti, které se nedají nahradit lepším promptem. F2/F3 zůstávají
+Závislostní graf se oproti minulé verzi mění na jednom místě: F1 teď visí na
+Fázi K (potřebuje zamrzlý layout, ne si ho vymýšlet za pochodu), zatímco
+dřív visela jen na sobě. K0.10 dál mění, čemu dát přednost při stejné
+velikosti sousta: **F1 a F4.4 táhnout co nejdřív po svých závislostech**,
+protože nesou nepoměrně víc rizika/hodnoty než jejich velikost napovídá —
+jsou to vlastnosti, které se nedají nahradit lepším promptem. F2/F3 zůstávají
 ve stejném pořadí, ale jejich test před vyhlášením "hotovo" by měl zahrnovat
 záměrný pokus o únik (grant skupině bez přístupu, ověřit 100% odmítnutí),
 ne jen šťastnou cestu.
 
-Doporučení: **F0 + F1 + F4.1 paralelně**, s F4.4 (agent behavior pravidla v
-CLAUDE.md) vytažené do stejné vlny, i když formálně visí na F1 — je to
-textová změna bez závislosti na fyzické distribuci, jen na existující
-CLAUDE.md sekci (K0.2), takže může jet souběžně, ne až po F1 dokončení. Pak
-F2 + F3 (s RBAC-negativním testem výše) → F4.2-4.5 → F5. Wow efekt vzniká
-kombinací F1 (agent má slovník fyzicky) + F4.1 (vidí mezery) + F5 (mezera
-vede k existující chatové autorské ploše, ne k nové); důvěryhodnost navenek
-vzniká kombinací F1+F4.4 (grounding) + F2/F3 bez úniku (governance).
+Doporučení: **Fáze K + F0 + F4.1 paralelně** (tři nezávislé věci — kontrakt,
+úložiště, completeness agregace), F4.4 vytažené do stejné vlny i přes
+formální závislost na existující CLAUDE.md sekci (K0.2), ne na F1. Jakmile
+Fáze K zamrzne (2–4 dny), naskočí **F1**. Pak F2 + F3 (s RBAC-negativním
+testem výše) → F4.2-4.5 → F5. Wow efekt vzniká kombinací F1 (agent má
+slovník fyzicky) + F4.1 (vidí mezery) + F5 (mezera vede k automaticky
+založenému draftu, ne k nové zápisové cestě); důvěryhodnost navenek vzniká
+kombinací F1+F4.4 (grounding) + F2/F3 bez úniku (governance).
 
 ---
 
 ## 5. Otevřené otázky
 
-1. Default TTL cache (24 h? per zdroj podle rozvrhu syncu?) — beze změny.
+1. Default TTL cache — **zúženo K0.11.3**: časová TTL zůstává jen jako
+   fallback instrukce pro dlouho běžící session (viz F1 bod 3), ne jako
+   hlavní invalidační mechanismus. Otevřené: jaký práh pro tenhle fallback
+   (kolik hodin session bez pullu je "moc dlouho")?
 2. Kdo smí ztlumit health kontrolu — admin only, nebo vlastník zdroje? —
    beze změny.
 3. Kde přesně se hlásí špatná odpověď (MCP tool jasný; UI chatů klienta?) —
    beze změny.
-4. **Nová:** scaffold (`data_semantics_scaffold.py`) — zrušit, nebo zúžit na
-   bulk-offline use-case? Rozhoduje produkt, ne kód (F5.2).
-5. **Nová, analogie ke K0.3 z Keboola sequencingu:** závisí nějaká živá
-   instalace na dnešním Databricks `metric_definitions.id` tvaru pod
-   `source='databricks_semantic_layer'`? Stejná otázka jako u Keboola
-   cutoveru (tam zodpovězeno: žádná FK/RBAC vazba, bezpečné přijmout změnu
-   + hint). Pro Databricks to samé ověřit před F0 cutoverem.
+4. Scaffold (`data_semantics_scaffold.py`) — zrušit, nebo zúžit na
+   bulk-offline use-case? **Odděleno od F5 (K0.11)** — auto-generace ve V0
+   jede přes auto-spuštěný chat agent, scaffold už není na kritické cestě.
+   Zůstává otevřené, ale bez termínu.
+5. Analogie ke K0.3 z Keboola sequencingu: závisí nějaká živá instalace na
+   dnešním flat `metric_definitions.id` tvaru pod tím providerem, co F0
+   nakonec sjednotí? Ověřit před cutoverem, ať dopadne scope kamkoli.
 6. Práh pokrytí, od kterého "svítí" health check — beze změny, 100% nebude
    realistické.
-7. Query logy pro F5 (pokud by přece jen scaffold/offline cesta vznikla) —
+7. Query logy pro budoucí bulk-offline scaffold cestu (pokud k ní dojde) —
    beze změny, nezjištěno.
-8. **Nová:** má se stavět odvození N sub-sémantických vrstev z jednoho
-   providera (nezávisle syncovaných a grantovatelných podmnožin) jako řešení
-   K0.8/F2 limitace, nebo se all-or-nothing provider grant v praxi ukáže
-   jako dostatečný? Nerozhodovat teď — sledovat, jestli F2 limitace v reálném
-   nasazení vůbec vadí, a teprve pak scopovat.
-9. **Nová:** má vazba na širší "instance completeness score" (K0.9) vzniknout
-   jako navazující iniciativa hned po F4.1/4.2, nebo zůstat čistě
-   hypotetická, dokud o ni nepožádá konkrétní požadavek? F4 endpoint by měl
-   být navržený tak, aby šel bez přepisu spotřebovat jako jeden ze vstupů,
-   kdyby se na to došlo — ne aby to blokovalo F4 samo.
+8. Má se stavět odvození N sub-sémantických vrstev z jednoho providera
+   (nezávisle syncovaných a grantovatelných podmnožin) jako řešení K0.8/F2
+   limitace? **Blokující termín**: rozhodnutí padá mezi "grant je
+   all-or-nothing" a "jde derivovat sub-vrstvy" — jsou to dva popisy jednoho
+   sporu, ne dvě nezávislé featury, protože derivovaná sub-vrstva JE
+   odebírání. Vlastník rozhodnutí je mimo tenhle dokument, termín
+   `<DOPLNIT: DATUM>` — bez rozhodnutí do té doby ho udělá implementace
+   (tj. spadne k all-or-nothing default, protože je hotový dřív).
+9. **Vyřešeno K0.11.1:** multi-doménový completeness check (dřív "K0.9,
+   mimo scope") je jádro V0 — viz aktualizovaná Fáze 4.1. Zbývá jen
+   podotázka: procentuální skóre + gamifikace (V1) — navrhnout endpoint z
+   4.1 tak, aby šel bez přepisu rozšířit, až přijde na řadu.
+10. **Nová (V0 ticket, §7):** kde přesně (repo/cesta) žije verzované schéma
+    YAMLů z Fáze K? `<DOPLNIT: repo>` v ticketu — potřebuje rozhodnutí před
+    tím, než Fáze K může být "zamrzlá".
+11. **Nová (V0 ticket, §7):** acceptance práh pro eval set (F4.4) —
+    `<DOPLNIT: X% → Y%>` v ticketu, čeká na vstup od týmu/zákazníka, který
+    zadal otázky.
 
 ---
 
@@ -433,3 +525,39 @@ vzniká kombinací F1+F4.4 (grounding) + F2/F3 bez úniku (governance).
   by vytvořily dva zdroje pravdy o tom, co je "draft". Existující fronta
   `authoring_suggestions` + `apply` endpoint už princip 3 respektuje;
   scaffold-based draft mimo frontu by ho porušil.
+
+---
+
+## 7. V0 ticket (2026-08-25) — mapování na fáze
+
+Nezávisle na tomhle dokumentu vznikl konkrétní, timeboxovaný V0 ticket pro
+tuhle práci. Posouvá sémantickou vrstvu na "další level" ve třech osách —
+automatizace (Agnes ji umí dodělat sama), preciznost (agent ji čte
+spolehlivě), UX (uživatel vidí, co chybí a jak to spravit) — a rozhoduje pár
+věcí, které tenhle plán měl jinak (K0.11). Mapování ticketu na fáze výše:
+
+| Bod ticketu | Fáze | Poznámka |
+|---|---|---|
+| Kontrakt pro agenta (adresářová struktura, YAML schéma, progressive disclosure, MCP/API jako sekundární) | **Fáze K** (nová) | Dělá se první, blokuje F1 i F5 — viz K0.11.2 |
+| Semantic adaptéry — co chybí, `unmapped[]` pro lossy mapping | **F0** | Scope čeká na vstup od týmu (K0.11.3), `unmapped[]` doplněno do DoD |
+| Auto-generace z dat (native režim), tabulky ve V0 | **F5** | Mechanismus rozhodnut: auto-spuštěný chat-authoring agent, ne deterministický scaffold (K0.11.2, viz aktualizovaná Fáze 5) |
+| Completeness check napříč sémantikou/metrikami/skillem/agentem/knowledge base/glosářem, seznam s dopadem, bez % a gamifikace | **F4.1** (rozšířeno) | Dřív odhadnuto jako "mimo scope" (K0.9) — ticket to staví jako jádro V0 (K0.11.1) |
+| Evaluace kvality — eval set, baseline vs. se sémantikou, CI | **F4.4** (rozšířeno) | Zároveň test čitelnosti kontraktu z Fáze K |
+| Non-goals: uni-directional, no Keboola two-way, sub-layers → otevřené rozhodnutí, uživatelský reporting → V1, % skóre + gamifikace → V1 | principy 2/3, otevřená otázka 8, F4.5, otevřená otázka 9 | Beze změny — ticket potvrzuje směr, který tenhle plán už měl |
+
+**Otevřené vstupy z ticketu, které tenhle dokument nemůže sám doplnit:**
+- Kde (repo/cesta) žije verzované YAML schéma z Fáze K — otevřená otázka 10.
+- Acceptance práh eval setu (F4.4) — otevřená otázka 11.
+- Termín rozhodnutí o sdílení sémantiky mezi skupinami (otevřená otázka 8) —
+  ticket říká výslovně: bez rozhodnutí do termínu ho udělá implementace
+  (spadne k all-or-nothing default).
+- Přesný scope adaptérové práce (F0) — čeká na vstup od týmu (K0.11.3).
+
+**Definition of done (ticket, beze změny):**
+1. Kontrakt (layout + schéma) zdokumentovaný a zamrzlý pro V0.
+2. Agent čte sémantiku z file systému a použije ji v odpovědi.
+3. Native režim: Agnes vygeneruje sémantiku k datasetu bez existující vrstvy.
+4. Completeness check běží nad všemi datovými zdroji dané instalace.
+5. Eval set v CI, čísla před/po zaznamenaná v ticketu.
+6. Zákazník (pro kterého se V0 dělá) to viděl a potvrdil, že to řeší jeho
+   problém.
