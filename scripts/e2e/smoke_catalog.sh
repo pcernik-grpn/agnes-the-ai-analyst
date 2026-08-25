@@ -43,9 +43,22 @@ agent-browser --session "$SESSION" screenshot "$ARTIFACTS_DIR/catalog-landing.pn
 # segment into the Filter menu when the segment went two-state), and its
 # section disclosures actually work. (This script's previous life asserted
 # catalog_unified.html's kind tabs; that template is gone.)
+#
+# Unlike those retired kind tabs (always rendered, hidden only when a kind
+# had zero rows), a folded-Library section doesn't exist in the DOM at all
+# until it holds at least one row (app/web/router.py builds `grouped` by
+# appending — a kind with zero items never gets a key). Plugins is the one
+# kind a bare, freshly-seeded instance is GUARANTEED to have: the built-in
+# marketplace is seeded unconditionally on every boot and granted to
+# Admin/Everyone (app/main.py → src.marketplace.seed_builtin_marketplace).
+# Recipes carries no such bundled seed — it's pure admin-curated content —
+# so it never renders here. Do not resurrect a "Recipes" needle without
+# first seeding a recipe *and* a RECIPE resource_grants row for the e2e
+# user; asserting it against this fixture is what made the smoke fail
+# nightly from 2026-08-21 rather than catch anything (issues #1497 et al).
 echo "→ snapshot landing — the folded Library, availability filter pre-applied"
 SNAPSHOT="$(agent-browser --session "$SESSION" snapshot -i)"
-for NEEDLE in "Not in stack yet" Plugins Recipes; do
+for NEEDLE in "Not in stack yet" Plugins; do
   if ! grep -qi "$NEEDLE" <<<"$SNAPSHOT"; then
     echo "::error::'${NEEDLE}' missing from the folded /catalog landing (library scope view)."
     echo "$SNAPSHOT" | head -40
