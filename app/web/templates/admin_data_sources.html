@@ -351,11 +351,18 @@
   }
   .ds-table-rows { color: var(--text-secondary, var(--ds-text-secondary)); flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .ds-table-mode {
-    flex: 0 0 auto; display: none; font: inherit; font-size: 11px; padding: 2px 6px;
+    font: inherit; font-size: 11px; padding: 2px 6px;
     border: 1px solid var(--border, var(--ds-border)); border-radius: 6px;
     background: var(--surface, var(--ds-surface)); color: var(--text-secondary, var(--ds-text-secondary));
   }
-  .ds-table-row.is-sel .ds-table-mode { display: block; }
+  /* Show/hide toggling and the flex-item sizing that used to live on
+     .ds-table-mode both move to this wrapper — the paired .ds-dropdown
+     (paper theme) needs the same visibility as the native select, and
+     giving both elements the SAME class here would also hand the select's
+     decorative rules above (font-size, border, background) to the
+     .ds-dropdown wrapper, fighting its own ds_dropdown.css layout. */
+  .ds-table-mode-wrap { flex: 0 0 auto; display: none; align-items: center; gap: 4px; }
+  .ds-table-row.is-sel .ds-table-mode-wrap { display: inline-flex; }
   .ds-table-status { font-size: 11px; flex-shrink: 0; min-width: 90px; text-align: right; }
   .ds-table-status.ok { color: var(--ds-accent-success-ink); }
   .ds-table-status.fail { color: var(--ds-accent-danger-ink); }
@@ -2316,6 +2323,11 @@ async function toggleBrowse(id) {
       return;
     }
     panel.innerHTML = _scopeNote(data) + _renderBucketPicker(id, data.buckets || []);
+    // Once per fresh render only — never inside _syncPicker, which also runs
+    // on every checkbox click against this SAME, still-persisting markup;
+    // re-running dsDropdownInit there would double-register each row's
+    // button click handler.
+    if (window.dsDropdownInit) panel.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
     _syncPicker(panel);
   } catch (e) {
     panel.innerHTML = `<div class="ds-browse-error">Request failed.</div>`;
@@ -2364,6 +2376,7 @@ function _renderBucketPicker(connId, buckets) {
              aria-label="Registered name for ${_esc(t.name)}"
              title="&quot;${_esc(t.name)}&quot; isn't a valid table name — letters, digits, and underscores only. Edit this suggestion before registering.">`
         : `<span class="ds-table-name">${_esc(t.name)}</span>`;
+      const modeId = `ds-tmode-${connId}-${bi}-${ti}`;
       return `
       <div class="ds-table-row" data-search="${_esc((t.name || "").toLowerCase())}">
         <label>
@@ -2373,11 +2386,14 @@ function _renderBucketPicker(connId, buckets) {
           ${nameField}
         </label>
         <span class="ds-table-rows">${(t.rows ?? 0).toLocaleString()} rows</span>
-        <select class="ds-table-mode" data-kb-mode aria-label="How ${_esc(t.name)} is served"
-                title="materialized = scheduled copy on the server; live = every query goes to Keboola Storage">
-          <option value="materialized" selected>materialized</option>
-          <option value="remote">live</option>
-        </select>
+        <span class="ds-table-mode-wrap" title="materialized = scheduled copy on the server; live = every query goes to Keboola Storage">
+          <select id="${modeId}" class="ds-table-mode ds-dropdown-native" data-kb-mode aria-label="How ${_esc(t.name)} is served">
+            <option value="materialized" selected>materialized</option>
+            <option value="remote">live</option>
+          </select>
+          ${_dropdownMarkupHtml(`${modeId}-dd`, modeId, `How ${t.name} is served`,
+            [{ value: "materialized", label: "materialized" }, { value: "remote", label: "live" }], "materialized")}
+        </span>
         <span class="ds-table-status" id="ds-tstatus-${connId}-${bi}-${ti}"></span>
       </div>`;
     }).join("");
@@ -3566,6 +3582,9 @@ async function _loadWizardTables(connId) {
       return;
     }
     body.innerHTML = _scopeNote(data) + _renderBucketPicker(connId, data.buckets || []);
+    // Once per fresh render only — see the matching comment on the other
+    // _renderBucketPicker call site above.
+    if (window.dsDropdownInit) body.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
     // The picker's own "Register selected" button is redundant with the
     // modal's footer button — hide it here to avoid two triggers.
     const inlineBtn = body.querySelector(".ds-browse-actions .btn-primary");
