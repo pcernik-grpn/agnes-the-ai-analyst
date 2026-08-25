@@ -88,7 +88,7 @@ server surface is required for v1.
 | **anonymize** | detect → deterministic pseudonymization (§4) → emit `full` and `redacted` text variants. |
 | **convert** | layout-aware extraction to Markdown as the canonical text representation (Docling-class tooling; same family Agnes uses server-side). |
 | **package** | deterministic zip batches, member paths = source-relative paths. Respect ingest caps: ≤1000 members, ≤1 GiB uncompressed per bundle, ≤100 MiB per upload (`src/ingest/bundle.py`, `src/corpus_allowlist.py`). |
-| **upload** | bundle upload to the two collections via the existing `POST /api/v1/collections/{id}/files` flow, PAT-authenticated. |
+| **upload** | bundle upload to the two collections via the existing `POST /api/collections/{id}/files` flow, PAT-authenticated. |
 | **verify** | reconcile counts (enumerated / selected / uploaded / indexed / rejected) against the collection's ingest stats; emit a JSON run report. |
 
 ### 3.2 Transport: MCP first, native delta APIs second
