@@ -261,6 +261,35 @@ def test_no_env_var_falls_through_to_yaml(tmp_path: Path, monkeypatch):
     assert load_chat_config(y).enabled is True
 
 
+# --- AGNES_CHAT_PROVIDER env override (infra-pinned provider) ---------------
+
+
+def test_provider_env_var_wins_over_yaml(tmp_path: Path, monkeypatch):
+    """Infrastructure pins the provider via env (the customer-instance
+    module's per-VM chat_provider field) — code-reviewed Terraform must beat
+    the hand-edited instance.yaml overlay on the data disk."""
+    monkeypatch.setenv("AGNES_CHAT_PROVIDER", "kai-agent")
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n  provider: e2b\n")
+    assert load_chat_config(y).provider == "kai-agent"
+
+
+def test_provider_env_var_applies_even_without_an_instance_yaml(monkeypatch):
+    """A FRESH machine boots with no instance.yaml yet — the infra-pinned
+    provider must apply there too, or first boot silently runs e2b."""
+    monkeypatch.setenv("AGNES_CHAT_PROVIDER", "kai-agent")
+    assert load_chat_config(Path("/nonexistent")).provider == "kai-agent"
+
+
+def test_provider_blank_env_falls_through_to_yaml(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AGNES_CHAT_PROVIDER", "  ")
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n  provider: docker\n")
+    assert load_chat_config(y).provider == "docker"
+    monkeypatch.delenv("AGNES_CHAT_PROVIDER")
+    assert load_chat_config(y).provider == "docker"
+
+
 def test_approvals_kill_switch_uses_the_shared_truthy_rule(tmp_path: Path):
     """`bool("false")` is True, so a plain truth test would read a quoted YAML
     value — or one produced by an env-substituted template — as "on" and leave

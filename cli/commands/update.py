@@ -16,8 +16,10 @@ Steps, in order, each wrapped so one failure never aborts the rest:
      on Windows, so there is deliberately NO re-exec. Steps 2-6 run on the
      current binary.
   2. Workspace template — OVERRIDE: safe 3-way merge (backs up analyst edits to
-     `.bak`) only when the server template SHA moved; DEFAULT: refresh the
-     server-rendered CLAUDE.md, backing it up before overwrite.
+     `.bak`, retaining only the most recent few) only when the server template
+     SHA moved; DEFAULT: refresh the server-rendered CLAUDE.md, backing it up
+     (with the same retention) before overwrite — unless the only difference
+     from the on-disk copy is a date-rollover stamp (#1476).
   3. Agnes-owned settings — hooks / statusLine / managed slash-commands. Agnes
      owns these in BOTH modes and (re)asserts them authoritatively; foreign
      hook entries and a user statusLine are preserved.
@@ -52,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -81,6 +84,24 @@ def _agnes_version() -> str:
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _mask_volatile_dates(text: str) -> str:
+    """Replace ISO ``YYYY-MM-DD`` date substrings with a fixed placeholder.
+
+    ``GET /api/welcome`` re-renders the workspace-prompt template on every
+    call. The shipped default template (and any admin-authored override) can
+    end with a "generated {{ today }}" stamp, so an otherwise-unchanged
+    instance still renders different bytes at every UTC date rollover
+    (#1476). Masking date-shaped substrings before the content-equality
+    check in :func:`_refresh_default_claude_md` keeps a pure date rollover
+    from counting as a real change; a genuine content change still differs
+    after masking and still triggers the normal backup-then-overwrite.
+    """
+    return _ISO_DATE_RE.sub("<date>", text)
 
 
 def _resolve_workspace() -> Optional[Path]:
@@ -406,7 +427,7 @@ def _step_workspace(workspace: Path, *, server_url: str, token: str, report: lis
 def _refresh_default_claude_md(workspace: Path, *, server_url: str, token: str, report: list[dict]) -> None:
     from cli.client import api_get
     from cli.lib.pull import _override_server_env
-    from src.initial_workspace import _unique_bak_path
+    from src.initial_workspace import _prune_backups, _unique_bak_path
 
     with _override_server_env(server_url, token):
         resp = api_get("/api/welcome", params={"server_url": server_url})
@@ -416,14 +437,21 @@ def _refresh_default_claude_md(workspace: Path, *, server_url: str, token: str, 
         report.append({"stage": "workspace", "status": "skipped", "detail": "empty /api/welcome content"})
         return
     claude_md = workspace / "CLAUDE.md"
-    if claude_md.exists() and claude_md.read_text(encoding="utf-8") == content:
-        report.append({"stage": "workspace", "status": "ok", "detail": "CLAUDE.md already current"})
-        return
+    if claude_md.exists():
+        on_disk = claude_md.read_text(encoding="utf-8")
+        # #1476: a pure date rollover (the shipped template's "generated
+        # {{ today }}" stamp, or a date in an admin override) must not by
+        # itself count as a change — mask date-shaped substrings before
+        # comparing. A genuine content change still differs after masking.
+        if on_disk == content or _mask_volatile_dates(on_disk) == _mask_volatile_dates(content):
+            report.append({"stage": "workspace", "status": "ok", "detail": "CLAUDE.md already current"})
+            return
     backup_name = ""
     if claude_md.exists():
         bak = _unique_bak_path(claude_md.with_name(f"CLAUDE.md.bak.{_utc_stamp()}"))
         bak.write_bytes(claude_md.read_bytes())
         backup_name = bak.name
+        _prune_backups(claude_md)
     claude_md.write_text(content, encoding="utf-8")
     report.append(
         {

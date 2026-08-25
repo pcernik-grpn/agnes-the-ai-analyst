@@ -31,7 +31,7 @@ ENV_APPS_RUNNER_TOKEN = "APPS_RUNNER_TOKEN"
 # Machine-readable LLM-failure reasons. Shared by the admin "test connection"
 # probe and the runtime broker forward path so both classify an auth/credit/
 # outage failure identically (#884).
-LLM_REASON_AUTH = "auth_invalid"        # 401/403 — key invalid, expired, or lacking permission
+LLM_REASON_AUTH = "auth_invalid"  # 401/403 — key invalid, expired, or lacking permission
 LLM_REASON_CREDIT = "credit_exhausted"  # 400 "credit balance too low" — valid key, unfunded account
 LLM_REASON_PROVIDER = "provider_error"  # network / rate-limit / provider outage / other
 
@@ -55,6 +55,7 @@ def secret_status(chat_config: Any) -> dict:
     provider = getattr(chat_config, "provider", "e2b") or "e2b"
     e2b_needed = enabled and provider == "e2b"
     docker_needed = enabled and provider == "docker"
+    kai_agent_needed = enabled and provider == "kai-agent"
     # In workload_identity mode there is intentionally NO static ANTHROPIC_API_KEY
     # — don't flag it as a missing secret in the admin UI.
     llm_auth = getattr(chat_config, "llm_auth", "api_key")
@@ -78,14 +79,37 @@ def secret_status(chat_config: Any) -> dict:
             "set": bool(getattr(chat_config, "docker_image", None)),
             "required": docker_needed,
         },
+        # kai-agent provider: the shared engine JWT secret is the one boot
+        # requirement (_chat_kai_agent_ok mirrors this) — without it every
+        # session mint 503s, so the admin banner must show it as missing.
+        "kai_host_jwt_secret": {"set": _is_set("KAI_HOST_JWT_SECRET"), "required": kai_agent_needed},
     }
     missing = sorted(k for k, v in secrets.items() if v["required"] and not v["set"])
+
+    # Two cost caps read `chat_messages.tokens_in/out`, which only a frame
+    # carrying usage writes. The engine's stream carries none, so on this
+    # provider `daily_anthropic_spend_usd` and `max_session_tokens` are inert
+    # — and both ship LIVE defaults ($20/day, 200k/session), so flipping one
+    # YAML key silently removes two budgets instance-wide. Surfaced rather
+    # than left to be discovered from a bill: the operator can still cap
+    # spend per agent via `token_budget_monthly`, which the broker enforces
+    # on the engine's `llm` ticket.
+    unmetered = [
+        name
+        for name, live in (
+            ("daily_anthropic_spend_usd", getattr(chat_config, "daily_anthropic_spend_usd", None)),
+            ("max_session_tokens", getattr(chat_config, "max_session_tokens", None)),
+        )
+        if provider == "kai-agent" and live
+    ]
+
     return {
         "enabled": enabled,
         "provider": provider,
         "secrets": secrets,
         "missing": missing,
         "ready": enabled and not missing,
+        "unmetered_caps": unmetered,
     }
 
 

@@ -643,10 +643,14 @@ def _run_distribution_mirror(payload: dict) -> None:
     (``cli/lib/pull.py``): ``sync_state`` rows whose registry
     ``query_mode`` is ``local`` or ``materialized``, excluding
     ``server_only`` rows (kept fresh server-side, never distributed as a
-    parquet) — joined by ``table_registry.name`` the same way
-    ``app/api/sync.py::_build_manifest_for_user`` does (``sync_state.table_id``
-    is sourced from ``_meta.table_name``, which equals registry ``name``,
-    not ``id``).
+    parquet). Joined against ``table_registry`` by id first, name second
+    (B1 — ``sync_state.table_id`` is the registry id when a matching row
+    existed at write time, ``src.sync_state_key``); either way, the STEM
+    used for the on-disk lookup and the object-store key is always
+    ``table_registry.name`` — the extractor / materialize pass's filename
+    contract, a separate convention this key migration does not touch —
+    the same resolution ``app/api/sync.py::_build_manifest_for_user`` does
+    for the manifest's flat ``tables{}`` dict.
 
     **Single-file tables only.** A partitioned table (``sync_state.parts`` set)
     is a directory of per-period parquets and has no single object to mirror or
@@ -706,7 +710,9 @@ def _run_distribution_mirror(payload: dict) -> None:
     from src.object_store import hash_file_md5
     from src.repositories import sync_state_repo, table_registry_repo
 
-    registry_by_name = {t["name"]: t for t in table_registry_repo().list_all()}
+    all_tables = table_registry_repo().list_all()
+    registry_by_id = {t["id"]: t for t in all_tables}
+    registry_by_name = {t["name"]: t for t in all_tables}
 
     uploaded = 0
     skipped = 0
@@ -715,8 +721,16 @@ def _run_distribution_mirror(payload: dict) -> None:
     mirrored: dict[str, str] = {}
 
     for state in sync_state_repo().get_all_states():
-        table_id = state["table_id"]
-        reg = registry_by_name.get(table_id, {})
+        raw_table_id = state["table_id"]
+        # B1: sync_state.table_id is the registry id when a matching row
+        # existed at write time (src.sync_state_key); a legacy/unmatched
+        # row is still name-keyed. Either way, the parquet actually on disk
+        # is named after `table_registry.name` (the extractor / materialize
+        # pass's own filename contract, unrelated to this key), so every
+        # filesystem / object-store touch below resolves that STEM off the
+        # registry row, never off the raw sync_state key.
+        reg = registry_by_id.get(raw_table_id) or registry_by_name.get(raw_table_id) or {}
+        stem = reg.get("name") or raw_table_id
         query_mode = reg.get("query_mode") or "local"
         if query_mode not in ("local", "materialized"):
             continue
@@ -742,25 +756,25 @@ def _run_distribution_mirror(payload: dict) -> None:
             # operators a healthy table's sync was broken.
             logger.debug(
                 "distribution mirror: %s is partitioned, distributed via the app-served part route",
-                table_id,
+                stem,
             )
             continue
-        parquet_path = resolve_local_parquet(table_id, reg.get("source_type"))
+        parquet_path = resolve_local_parquet(stem, reg.get("source_type"))
         if parquet_path is None:
-            logger.warning("distribution mirror: no on-disk parquet found for %s, skipping", table_id)
+            logger.warning("distribution mirror: no on-disk parquet found for %s, skipping", stem)
             continue
 
-        key = f"{table_id}.parquet"
+        key = f"{stem}.parquet"
         try:
             existing_md5 = store.head_md5(key)
         except Exception:
-            logger.exception("distribution mirror: head_md5 failed for %s", table_id)
+            logger.exception("distribution mirror: head_md5 failed for %s", stem)
             failed += 1
             continue
 
         if existing_md5 == current_md5:
             skipped += 1
-            mirrored[table_id] = current_md5
+            mirrored[stem] = current_md5
             continue
 
         # About to publish — hash the bytes we are actually about to send
@@ -770,7 +784,7 @@ def _run_distribution_mirror(payload: dict) -> None:
         try:
             actual_md5 = hash_file_md5(parquet_path)
         except Exception:
-            logger.exception("distribution mirror: could not hash on-disk parquet for %s", table_id)
+            logger.exception("distribution mirror: could not hash on-disk parquet for %s", stem)
             failed += 1
             continue
 
@@ -784,7 +798,7 @@ def _run_distribution_mirror(payload: dict) -> None:
             logger.info(
                 "distribution mirror: %s changed on disk since sync_state was read, skipping this run "
                 "(sync_state %s, on-disk %s)",
-                table_id,
+                stem,
                 current_md5[:12],
                 actual_md5[:12],
             )
@@ -794,12 +808,12 @@ def _run_distribution_mirror(payload: dict) -> None:
         try:
             store.put_file(parquet_path, key, md5=actual_md5)
         except Exception:
-            logger.exception("distribution mirror: upload failed for %s", table_id)
+            logger.exception("distribution mirror: upload failed for %s", stem)
             failed += 1
             continue
 
         uploaded += 1
-        mirrored[table_id] = actual_md5
+        mirrored[stem] = actual_md5
 
     write_mirror_index(store, mirrored)
 

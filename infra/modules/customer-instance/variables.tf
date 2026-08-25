@@ -129,6 +129,29 @@ variable "prod_instance" {
     kai_agent_mem_limit    = optional(string, "2g")
     kai_agent_cpus         = optional(string, "1.0")
     kai_agent_pg_mem_limit = optional(string, "1g")
+    # Opt-in: let the engine's sandbox reach this instance's own MCP tool
+    # surface. Sets both halves of the pair that only work together — the
+    # app-side ticket-scope switch (KAI_BROKER_MCP_ENABLED=true in the app
+    # .env) and the engine-side broker URL (HOST_BROKER_MCP_URL derived from
+    # the VM's own public origin, the same SERVER_URL the LLM broker line
+    # uses, since the E2B sandbox egresses to it from the public internet).
+    # One flag rather than two knobs because either half alone is a silent
+    # failure: URL without the scope answers 503 kai_mcp_not_enabled on every
+    # tool call (`_require_mcp_surface` is declared ahead of the ticket
+    # dependency so it decides before any credential is inspected), scope
+    # without the URL simply never registers the tool server. Inert unless
+    # kai_agent_enabled is also true on this VM.
+    kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
+    # (app >= 0.85: env > instance.yaml > "e2b"). Codifies which engine runs
+    # /chat sessions IN TERRAFORM instead of a hand-edited instance.yaml on
+    # the data disk — the overlay survives reboots and recreates, but not a
+    # fresh data disk, and it is invisible in review. Empty (the default)
+    # writes NO env line, so the instance keeps whatever instance.yaml says.
+    # "kai-agent" requires kai_agent_enabled on the same VM (validated below):
+    # pinning web chat onto an engine this VM does not run refuses every
+    # session at boot.
+    chat_provider = optional(string, "")
 
     # --- Vendor-neutral per-instance branding (all OPTIONAL) ---
     # Written into the VM's /data/state/instance.yaml on FIRST boot only. The
@@ -233,6 +256,20 @@ variable "prod_instance" {
   # entry in app/switches.py), so a typo here would look applied and do
   # nothing. Catch it at plan time. `classic` is retired for the same reason
   # `topnav` is above — it names a behavior the app no longer has.
+  # The app resolves an unknown chat.provider by REFUSING the ChatManager at
+  # boot (app/main.py provider allowlist) — loud, but only at runtime on the
+  # VM. Catch the typo (and the engine-less kai-agent pin, which would refuse
+  # every session at mint time) at plan time instead.
+  validation {
+    condition     = contains(["", "e2b", "docker", "kai-agent"], var.prod_instance.chat_provider)
+    error_message = "prod_instance.chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+  }
+
+  validation {
+    condition     = var.prod_instance.chat_provider != "kai-agent" || var.prod_instance.kai_agent_enabled
+    error_message = "prod_instance.chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
+  }
+
   validation {
     condition     = contains(["", "redesign"], var.prod_instance.experience)
     error_message = "prod_instance.experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
@@ -297,6 +334,12 @@ variable "dev_instances" {
     kai_agent_mem_limit    = optional(string, "2g")
     kai_agent_cpus         = optional(string, "1.0")
     kai_agent_pg_mem_limit = optional(string, "1g")
+    # Engine → instance MCP tool surface — see prod_instance for the
+    # rationale; same default, inert without kai_agent_enabled.
+    kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
+    # rationale; same default (empty = no env line), same validations below.
+    chat_provider = optional(string, "")
     # See prod_instance for the rationale; same default.
     upgrade_schedule = optional(string, "*/5 * * * *")
 
@@ -370,6 +413,21 @@ variable "dev_instances" {
       for i in var.dev_instances : contains(["", "redesign"], i.experience)
     ])
     error_message = "each dev_instances[].experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
+  }
+
+  # Same plan-time guards as prod_instance.chat_provider — see there.
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : contains(["", "e2b", "docker", "kai-agent"], i.chat_provider)
+    ])
+    error_message = "each dev_instances[].chat_provider must be \"\", \"e2b\", \"docker\" or \"kai-agent\"."
+  }
+
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : i.chat_provider != "kai-agent" || i.kai_agent_enabled
+    ])
+    error_message = "dev_instances[].chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
   }
 }
 
@@ -543,6 +601,12 @@ variable "enable_watchdog" {
   default     = true
 }
 
+variable "enable_gcp_logging" {
+  description = "Ship every container's stdout/stderr to Google Cloud Logging via Docker's built-in gcplogs driver, in addition to the local dual-logging cache `docker logs` reads from. On: the startup script extracts docker-compose.gcp-logging.yml (baked into the image) into the app directory, which the COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) then includes on every `docker compose` invocation — so logs survive the routine container recreates the auto-upgrade cron performs every 5 minutes, which otherwise destroy the Docker json-file log history. Off: the script removes the file instead, keeping the instance on the default json-file driver (rotated by /etc/docker/daemon.json) — the only supported choice for a non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server credentials."
+  type        = bool
+  default     = true
+}
+
 variable "dispatcher_image" {
   description = <<-EOT
     Image for the opt-in LLM dispatcher (token-arbitrage PoC), e.g.
@@ -671,9 +735,13 @@ variable "kai_agent_env" {
         engine's env validation even though the jwt host path never reads
         them (all LLM traffic transits the Agnes broker); placeholders are
         fine and expected.
-    Optional extras: LLM_MODEL_NAME, HOST_BROKER_MCP_URL (point it at
-    $SERVER_URL/api/kai/mcp only when the instance also enables the app-side
-    `kai.broker_mcp_enabled` switch), LOG_LEVEL, ...
+    Optional extras: LLM_MODEL_NAME, LOG_LEVEL, ...
+
+    HOST_BROKER_MCP_URL is normally NOT set here: the per-VM
+    kai_agent_broker_mcp_enabled flag derives it from this instance's own
+    origin AND sets the app-side switch that makes it work, which is the
+    pairing this key alone cannot complete. Set it here only to override the
+    derived value (split-horizon, say).
 
     Values must be SINGLE-LINE: the map is rendered as KEY=VALUE lines into
     the engine's env_file, where an embedded line break truncates the value

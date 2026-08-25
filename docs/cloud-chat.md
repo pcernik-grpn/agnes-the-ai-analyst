@@ -10,13 +10,17 @@ the same `claude-agent-sdk` Python runner spawned inside a per-session
 sandbox. Users get the full Agnes harness (skills, marketplace, slash
 commands, `agnes` CLI, sub-agents) without installing anything locally.
 
-Two sandbox providers, same feature set:
+Three sandbox providers, one web/Slack surface:
 
 - **`e2b`** (default) — an ephemeral cloud microVM per session, with the
   per-user workspace synced in at spawn time. Needs an E2B account.
 - **`docker`** — a local container per session on the host's own Docker
   daemon, with the workspace bind-mounted instead of uploaded. No cloud
   dependency. See [Docker provider (self-hosted)](#docker-provider-self-hosted).
+- **`kai-agent`** — sessions run on the **embedded kai-agent turn engine**
+  (the same integration `/api/kai/*` hosts, `docs/api-reference.md`) instead
+  of the native `claude-agent-sdk` runner. See
+  [kai-agent provider (embedded turn engine)](#kai-agent-provider-embedded-turn-engine).
 
 Everything below describes the E2B setup unless a section says otherwise.
 
@@ -452,6 +456,92 @@ stdin.
   oversubscribing the host.
 - Leftover containers from a crashed gateway are reconciled by ownership label
   at gateway start and on the reaper tick.
+
+## kai-agent provider (embedded turn engine)
+
+`chat.provider: kai-agent` routes every web/Slack chat session through the
+**embedded kai-agent turn engine** — the integration whose host wiring lives at
+`/api/kai/*` (sessions, per-turn broker tickets, the LLM broker, the workspace
+tarball; see `docs/api-reference.md`). The engine owns the agent loop, the
+conversation transcript (its own Postgres) and the remote execution sandbox,
+so Agnes spawns nothing per session: the provider
+(`app/chat/kai_engine_provider.py`) translates the engine's SSE turn stream
+into the same runner frame protocol the native providers speak, and the web
+client renders it over the existing WebSocket with no frontend changes —
+history, mid-turn reconnect replay, message-rate limits and the per-user
+concurrency cap all behave as with the native providers. (Token-derived caps
+do not — see the limitations below.)
+
+```yaml
+chat:
+  enabled: true
+  provider: kai-agent
+  kai_agent_url: "http://kai-agent:3000"   # default; the engine's compose service
+```
+
+Requirements and semantics:
+
+- **`KAI_HOST_JWT_SECRET` must be set** (the same shared secret that turns on
+  `/api/kai/*`). The boot gate refuses the manager without it. Each session
+  authenticates to the engine with a host-minted session JWT
+  (`mint_engine_session_token`, the `POST /api/kai/sessions` claim contract),
+  re-minted automatically as it nears expiry.
+- **The engine's own env decides the rest** — LLM provider/upstream, E2B key,
+  `HOST_BROKER_MCP_URL` for the instance's MCP tool surface (paired with
+  `kai.broker_mcp_enabled`, see `docs/feature-flags.md`). `ANTHROPIC_API_KEY`
+  on the Agnes server is still required: the engine's LLM traffic rides
+  `/api/broker/anthropic`.
+- **Session ids are UUIDs.** The engine stores the chat id in a uuid column,
+  so engine-backed sessions are created with uuid ids (both the web path and
+  the Slack producer path). A conversation created under a native provider
+  (`chat_<hex>` id) cannot be resumed after switching the provider —
+  reopening it answers every message with a clear error card; users start a
+  new conversation.
+- **Tool approvals round-trip.** The engine raises approval-requiring tool
+  calls as events; they render as the normal web approval card, and the
+  decision is delivered to the engine's approval endpoint. `allow_session`
+  collapses to a plain allow (the engine has no per-session grant), and
+  `chat.approvals_enabled: false` auto-denies each request instantly — the
+  same kill-switch semantics as the native gate.
+- **Pause/resume is bookkeeping only.** There is no Agnes-side sandbox to
+  snapshot; a paused session simply drops its engine connection and a resume
+  re-attaches by chat id — the transcript and agent state live in the engine.
+- **Not per-conversation.** The provider is an instance-level choice; native
+  sandbox chat and engine chat do not run side by side on one instance.
+- **Pin it in infrastructure, not by hand.** `AGNES_CHAT_PROVIDER` in the
+  server env overrides `chat.provider` in `instance.yaml` (env > yaml >
+  `e2b` default, the standard precedence). The `customer-instance` module's
+  per-VM `chat_provider` field writes it, so the choice lives in
+  code-reviewed Terraform and survives a fresh data disk — a hand-edited
+  `instance.yaml` overlay survives reboots and VM recreates but not that,
+  and is invisible in review.
+
+Limitations specific to this provider (each also noted in the module
+docstring):
+
+- **Token-derived caps are not metered.** The engine's stream carries no
+  usage numbers, so `chat.daily_anthropic_spend_usd` and
+  `chat.max_session_tokens` never trip on engine sessions, and the admin
+  spend view reads zero for them. Message-rate (`rate_messages_per_hour`)
+  and per-user concurrency caps still apply. Cost control belongs on the
+  engine's own limits and the LLM broker.
+- **Per-session personas do not reach the engine.** The engine's workspace
+  comes from `GET /api/kai/workspace` (the instance-wide template), so agent
+  profiles, agent memories and the co-drive grant-intersection workspace are
+  not materialized into engine turns. The two narrowed session kinds fail
+  **closed**, not open: `POST /api/kai/mcp` answers a co-session or a
+  scope-limited agent `403` (`mcp_not_available_to_co_session` /
+  `mcp_not_available_to_scoped_agent`) rather than resolving it to the owner,
+  and `GET /api/kai/workspace` ships the unfiltered bundled `CLAUDE.md`
+  instead of the owner's RBAC-filtered Workspace Prompt. So a collaborator's
+  engine turn reaches **no** Agnes tool surface — it cannot inherit the
+  owner's wider authority. Co-drive on this provider is therefore a
+  conversation without host data access, not an unscoped one.
+- **`chat.per_tool_call_seconds` and `chat.tool_calls_per_turn_budget` are
+  inert** — the engine enforces its own tool policies.
+- **Single-gateway deployments only** (like the docker provider): the
+  cross-gateway takeover path assumes a destroyable remote sandbox, which
+  this provider does not have.
 
 ## Operator setup details
 

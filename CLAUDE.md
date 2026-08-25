@@ -165,12 +165,36 @@ uvicorn app.main:app --reload
 # code, and CI runs both; `tests/` alone silently skips them)
 .venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
 
+# Locally `-n auto` is capped at 6 workers (each is a ~430 MB process, and the
+# suite is I/O-bound past that). Raise or lower it for a one-off run:
+AGNES_TEST_MAX_WORKERS=12 .venv/bin/pytest tests/ -n auto -q
+
 # Trigger sync manually
 curl -X POST http://localhost:8000/api/sync/trigger
 
 # Docker
 docker compose up
 ```
+
+### Writing tests: never build the app per test
+
+A function-scoped fixture must NOT call `create_app()` — it measures ~430 ms,
+which for most API tests dwarfs the test itself. Request the session-shared
+**`shared_app`** fixture instead, or **`seeded_app`** when you also want the
+four seeded role users and their tokens:
+
+```python
+@pytest.fixture
+def my_client(tmp_path, monkeypatch, shared_app):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))   # isolation still per-test
+    return TestClient(shared_app)
+```
+
+Per-test isolation is unaffected: repositories read `DATA_DIR` at call time, so
+redirecting it in the fixture body still gives each test its own state. Use
+`seeded_app_fresh` only when the test runs the ASGI lifespan itself, GETs
+`/uploads/...`, or asserts on app construction. `tests/test_shared_app_contract.py`
+enforces this and names the fix when it fails.
 
 ### Parallel Claude Code worktrees
 

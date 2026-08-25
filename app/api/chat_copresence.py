@@ -48,6 +48,26 @@ def _get_manager(request: Request):
     return mgr
 
 
+def _engine_session_id(request: Request):
+    """A caller-owned uuid when the instance runs the embedded engine, else None.
+
+    A fork is a session CREATOR. `chat.provider: kai-agent` needs every session
+    id to be a uuid, and a fork that mints the repo's `chat_<hex>` on such an
+    instance produces a row that can never spawn — co-drive would be dead on
+    arrival, telling the user the conversation "predates" a provider it is
+    seconds younger than. Reads the manager's own config so the decision is
+    made in exactly one place (`app.chat.manager.engine_session_id`).
+
+    Degrades to None when chat is not configured: this is called on paths that
+    already resolved a manager, so that only happens in tests.
+    """
+    from app.chat.manager import engine_session_id
+
+    mgr = getattr(request.app.state, "chat_manager", None)
+    cfg = getattr(mgr, "_config", None)
+    return engine_session_id(cfg) if cfg is not None else None
+
+
 @router.get("/{session_id}/messages")
 async def co_session_messages(
     session_id: str,
@@ -132,6 +152,7 @@ async def invite(
         invitee_email=invitee_email,
         invitee_user_id=inv_user_id,
         seed_summary=seed,
+        session_id=_engine_session_id(request),
     )
 
     from app.chat.audit import write_audit
@@ -228,5 +249,9 @@ async def fork(
     parts = repo.get_session_participants(session_id)
     if not any(p.user_email == user["email"] and p.left_at is None for p in parts):
         raise HTTPException(403, "not a participant")
-    new_id = repo.fork_co_session_to_private(source_session_id=session_id, owner_email=user["email"])
+    new_id = repo.fork_co_session_to_private(
+        source_session_id=session_id,
+        owner_email=user["email"],
+        session_id=_engine_session_id(request),
+    )
     return {"session_id": new_id}

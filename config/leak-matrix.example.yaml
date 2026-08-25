@@ -1,0 +1,48 @@
+# Persona x resource leak sweep — example config.
+#
+#   python scripts/leak_matrix.py --config leak-matrix.yaml
+#
+# Copy this file, fill in your own personas, and keep it OUT of git if the
+# resource ids are sensitive. Tokens are never written here: `env:NAME` is
+# read from the environment, so no secret lands in the file or in argv.
+#
+# Reference: docs/leak-matrix.md
+
+base_url: https://<your-host>
+
+# Distinctive strings from documents that must not surface for the wrong
+# person. Listing a collection and reading its contents are separate gates,
+# so content is probed directly rather than inferred from the listing.
+canaries:
+  - text: <a distinctive phrase from a restricted document>
+    visible_to: [analyst-with-package]
+
+personas:
+  # A user outside the allowed domain. Declares nothing: anything that
+  # answers is a leak.
+  - name: wrong-domain-user
+    token: env:LEAK_TOKEN_WRONGDOMAIN
+    expect_tables: []
+    expect_collections: []
+
+  # Authenticated, but in no group and subscribed to no data package.
+  # "Sees nothing" is the correct result here, and worth pinning: this is
+  # the persona a too-broad Everyone grant makes interesting.
+  - name: user-without-package
+    token: env:LEAK_TOKEN_NOPACKAGE
+    expect_tables: []
+    expect_collections: []
+
+  # The ordinary case — exactly one package, so exactly its tables.
+  - name: analyst-with-package
+    token: env:LEAK_TOKEN_ANALYST
+    expect_tables: [<table-id>, <table-id>]
+    expect_collections: [<collection-id>]
+
+  # An agent PAT. Agent PATs only authenticate /api/v1/*, so the analyst
+  # probes are skipped by design and reported as not probed rather than
+  # counted as denials.
+  - name: rfp-agent
+    kind: agent_pat
+    token: env:LEAK_TOKEN_AGENT
+    expect_tables: [<table-id>]

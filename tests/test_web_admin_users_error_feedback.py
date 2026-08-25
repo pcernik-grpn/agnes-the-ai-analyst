@@ -34,7 +34,7 @@ _TEMPLATE = _ROOT / "app" / "web" / "templates" / "admin_users.html"
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     """Same shape as the one in ``test_web_ui`` — declared here rather than
     imported, because importing a fixture by name trips ruff's F811 on every
     test that takes it as a parameter."""
@@ -47,9 +47,8 @@ def web_client(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 

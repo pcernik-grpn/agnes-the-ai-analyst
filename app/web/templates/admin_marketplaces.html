@@ -688,6 +688,17 @@ async function openDetails(id, name) {
         : (p.is_system
           ? `<span class="plugin-system-pill" title="Mandatory for every user — managed below">SYSTEM</span>`
           : "");
+      // Curator-side lifecycle: marketplace-metadata.json marks the plugin
+      // deprecated. Sync auto-disables it; the pill explains WHY it is (or
+      // keeps becoming) disabled, incl. the curator's note + replacement.
+      const depTitle = [
+        "Upstream marketplace-metadata.json marks this plugin deprecated — sync re-disables it automatically.",
+        p.deprecation_note || "",
+        p.replacement ? `Replacement: ${p.replacement}` : "",
+      ].filter(Boolean).join(" ");
+      const depPill = p.deprecated === true
+        ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
+        : "";
       const sysBtnLabel = p.is_system ? "Unmark system" : "Mark as system";
       const sysBtnTitle = isDisabled
         ? "Plugin is disabled. Re-enable it before marking as system."
@@ -704,7 +715,7 @@ async function openDetails(id, name) {
          </svg>`;
       return `<div class="plugin-item">
         <div class="plugin-item-head">
-          <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}
+          <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
           <span class="spacer"></span>
           <label class="plugin-disable-toggle" title="${esc(isDisabled
               ? "Plugin is admin-disabled and hidden everywhere. Toggle off to re-enable."
@@ -874,10 +885,16 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
         <li>It drops out of every user's my-stack.</li>
         <li>It is removed from the synthetic served marketplace.</li>
       </ul>
-      <p style="margin: 0; font-size: 12px; color: var(--text-secondary, #6b7280);">
+      <p style="margin: 0 0 10px; font-size: 12px; color: var(--text-secondary, #6b7280);">
         If this plugin is marked as <strong>system</strong>, disabling also clears the system flag.
         Re-enabling later does not restore it.
-      </p>`;
+      </p>
+      <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 13px;">
+        <input type="checkbox" id="disable-revoke-grants" style="margin-top: 2px;">
+        <span>Also revoke <strong>all group grants</strong> for this plugin
+          (permanent retirement — re-enabling later will not bring it back for
+          anyone until groups are re-granted)</span>
+      </label>`;
     okBtn.textContent = "Disable plugin";
     okBtn.classList.remove("btn-primary");
     okBtn.classList.add("btn-danger");
@@ -892,27 +909,45 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
   // later fire on a different plugin.)
   okBtn.onclick = async () => {
     okBtn.onclick = null;
+    // Read the retirement checkbox BEFORE closing — closeModal leaves the DOM
+    // in place, but the next open rebuilds bodyEl.innerHTML, so the value only
+    // exists at confirm time. Present in the disable direction only.
+    const revokeGrants = !isDisabled && !!document.getElementById("disable-revoke-grants")?.checked;
     closeModal("disable-confirm-modal");
-    await performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled);
+    await performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled, revokeGrants);
   };
 
   openModal("disable-confirm-modal");
 }
 
-async function performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled) {
+async function performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled, revokeGrants = false) {
   const pluginName = el.dataset.plugin;
   const path = isDisabled ? "enable" : "disable";
   el.disabled = true;
   try {
     const url = `${API}/${encodeURIComponent(marketplaceId)}/plugins/${encodeURIComponent(pluginName)}/${path}`;
-    const r = await fetch(url, { method: "POST", credentials: "include" });
+    const opts = { method: "POST", credentials: "include" };
+    if (!isDisabled && revokeGrants) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify({ revoke_grants: true });
+    }
+    const r = await fetch(url, opts);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       toast(`Toggle failed: ${err.detail || r.status}`, "error");
       el.disabled = false;
       return;
     }
-    toast(isDisabled ? `Enabled ${pluginName}` : `Disabled ${pluginName}`, "success");
+    const data = await r.json().catch(() => ({}));
+    const revoked = data.revoked_grants || 0;
+    toast(
+      isDisabled
+        ? `Enabled ${pluginName}`
+        : revoked
+          ? `Disabled ${pluginName} — revoked ${revoked} grant${revoked === 1 ? "" : "s"}`
+          : `Disabled ${pluginName}`,
+      "success",
+    );
     // Re-render the modal so the pill, locked system button, and switch
     // state all refresh from a fresh fetch.
     openDetails(marketplaceId, marketplaceName);

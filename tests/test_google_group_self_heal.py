@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
@@ -33,9 +33,8 @@ def env(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=True)
 
     # Reset the in-process cooldown cache so tests don't bleed into each other.

@@ -28,13 +28,12 @@ def _basic(username: str, password: str) -> str:
 
 
 @pytest.fixture
-def git_env(e2e_env, monkeypatch):
+def git_env(e2e_env, monkeypatch, shared_app):
     """Identical setup to the ZIP fixture but returns raw PAT strings usable
     as HTTP Basic passwords. A valid PAT requires a real row in
     personal_access_tokens (the PAT resolver does a DB round-trip), so we
     create two: one admin, one analyst with group membership via
     user_group_members + resource_grants."""
-    from app.main import create_app
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.users import UserRepository
@@ -151,7 +150,7 @@ def git_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
     return {
         "app": app,

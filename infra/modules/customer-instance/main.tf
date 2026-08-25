@@ -504,6 +504,9 @@ resource "google_compute_instance" "vm" {
     # still asking for "topnav" fails the plan instead of silently getting rail.
     theme      = each.value.theme
     experience = each.value.experience
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — "" writes no env line and
+    # the instance follows instance.yaml / the app default.
+    chat_provider = each.value.chat_provider
     # Vendor-neutral branding for the FIRST-boot instance.yaml (logo/brand/
     # theme colours/custom_scripts), pre-rendered to a base64'd YAML fragment —
     # "" when the caller set no branding on this VM.
@@ -522,6 +525,7 @@ resource "google_compute_instance" "vm" {
     data_apps_enabled               = each.value.data_apps_enabled
     data_apps_runtime_image         = var.data_apps_runtime_image
     enable_watchdog                 = var.enable_watchdog
+    enable_gcp_logging              = var.enable_gcp_logging
     alert_webhook_url               = var.alert_webhook_url
     watchdog_files_b64              = local.watchdog_files_b64
     dispatcher_enabled              = each.value.dispatcher_enabled
@@ -533,6 +537,7 @@ resource "google_compute_instance" "vm" {
     kai_agent_mem_limit             = each.value.kai_agent_mem_limit
     kai_agent_cpus                  = each.value.kai_agent_cpus
     kai_agent_pg_mem_limit          = each.value.kai_agent_pg_mem_limit
+    kai_agent_broker_mcp_enabled    = each.value.kai_agent_broker_mcp_enabled
     kai_agent_image                 = var.kai_agent_image
     kai_agent_jwt_secret            = var.kai_agent_jwt_secret
     kai_agent_e2b_key_secret        = var.kai_agent_e2b_key_secret

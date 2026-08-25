@@ -236,10 +236,11 @@ class KaiSessionResponse(BaseModel):
     expires_at: int
 
 
-def _create_session_and_credential(user_email: str) -> tuple[str, str]:
+def _create_session_and_credential(user_email: str) -> tuple[str, str, int]:
     """The synchronous DB half of session minting: the ``chat_sessions`` row
-    plus the credential bound to it. Split out so the route can offload it off
-    the event loop in one hop.
+    plus the signed token bound to it (via :func:`mint_engine_session_token`,
+    so the route and the embedded provider share one claims definition).
+    Split out so the route can offload it off the event loop in one hop.
 
     The id is a **UUID**, not the repo's default ``chat_<hex>``. The engine
     accepts a client-supplied ``body.id`` — that is what lets both sides key
@@ -317,15 +318,20 @@ def _create_session_and_credential(user_email: str) -> tuple[str, str]:
     disappearance verified on-branch by ZdenekSrotyr, whose reading was right
     where an earlier version of this note (and my reply defending it) was not.
     """
+    # Refuse BEFORE the row insert: with two independent env reads (here and
+    # inside the token helper) a secret cleared in between would otherwise
+    # leave an orphan untitled session behind a 503.
+    _secret()
     session = chat_session_repo().create_session(
         user_email=user_email,
         surface=Surface.WEB,
         session_id=str(uuid.uuid4()),
     )
-    # The credential is minted against the session, so resolving it later
-    # yields the identity + session without the engine ever sending either.
-    credential = ticket_repo().mint(session.id, _CREDENTIAL_SCOPE, ttl_seconds=_SESSION_TTL_SECONDS)
-    return session.id, credential
+    # The credential is minted against the session (inside the token helper),
+    # so resolving it later yields the identity + session without the engine
+    # ever sending either.
+    token, expires_at = mint_engine_session_token(user_email, session.id)
+    return session.id, token, expires_at
 
 
 #: Both credential-returning routes answer with `no-store`: their bodies are a
@@ -334,6 +340,45 @@ def _create_session_and_credential(user_email: str) -> tuple[str, str]:
 #: `no-store` (not merely `no-cache`) is the directive that forbids writing it
 #: down at all. Found by Copilot on this PR.
 _NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def mint_engine_session_token(user_email: str, session_id: str) -> tuple[str, int]:
+    """Sign a fresh engine session JWT for an EXISTING ``chat_sessions`` row.
+
+    The claims contract of ``POST /api/kai/sessions`` minus the row create:
+    mints the ``kai_session`` credential the token carries, signs, returns
+    ``(token, expires_at)``. The embedded provider
+    (``app/chat/kai_engine_provider.py``) authenticates every engine call
+    with this — one definition, so its tokens and the route's cannot drift.
+
+    Synchronous (the credential mint is a repo write); event-loop callers go
+    through ``asyncio.to_thread``, same as the route does for its DB half.
+    Raises the same 503 as every route here when ``KAI_HOST_JWT_SECRET`` is
+    unset. Re-minting never revokes an earlier token for the session — each
+    is valid to its own ``exp`` (``kai_session`` sits in
+    ``SWEEP_EXEMPT_SCOPES``, so lifecycle sweeps do not reap it either).
+    """
+    secret = _secret()
+    credential = ticket_repo().mint(session_id, _CREDENTIAL_SCOPE, ttl_seconds=_SESSION_TTL_SECONDS)
+    now = int(time.time())
+    expires_at = now + _SESSION_TTL_SECONDS
+    token = _sign_session_jwt(
+        claims={
+            "sub": user_email,
+            "tenant": _tenant_id(),
+            "scope_id": session_id,
+            "downstream_credential": credential,
+            # The engine reads this as its `isReadOnly` turn gate; Agnes has
+            # no read-only chat mode, so every session is read-write.
+            "read_only": False,
+            "iss": _issuer(),
+            "aud": _audience(),
+            "iat": now,
+            "exp": expires_at,
+        },
+        secret=secret,
+    )
+    return token, expires_at
 
 
 @router.post(
@@ -376,28 +421,7 @@ async def create_kai_session(response: Response, user: dict = Depends(require_ch
     ("Failed to stop profiling … same thread" → 500 in local dev). Every other
     route in this family is async for the same reason.
     """
-    secret = _secret()
-    session_id, credential = await asyncio.to_thread(_create_session_and_credential, user["email"])
-    now = int(time.time())
-    expires_at = now + _SESSION_TTL_SECONDS
-    token = _sign_session_jwt(
-        claims={
-            "sub": user["email"],
-            "tenant": _tenant_id(),
-            "scope_id": session_id,
-            "downstream_credential": credential,
-            # The engine reads this as its `isReadOnly` turn gate. Agnes has
-            # no read-only chat mode today, so it is always a read-write
-            # session; stated explicitly rather than relying on the engine's
-            # default so the claim set is complete on the wire.
-            "read_only": False,
-            "iss": _issuer(),
-            "aud": _audience(),
-            "iat": now,
-            "exp": expires_at,
-        },
-        secret=secret,
-    )
+    session_id, token, expires_at = await asyncio.to_thread(_create_session_and_credential, user["email"])
     response.headers.update(_NO_STORE)
     return KaiSessionResponse(chat_id=session_id, token=token, expires_at=expires_at)
 

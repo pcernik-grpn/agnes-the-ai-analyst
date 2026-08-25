@@ -846,6 +846,118 @@ class TestRemoteRowLiveSample:
         assert data["rows"] == [{"s": "admin-visible"}]
 
 
+class TestParquetKeyedByRegistryName:
+    """The write side keys the parquet FILENAME by `table_registry.name`
+    (`app/api/sync.py::_run_materialized_pass`: "the parquet filename [is]
+    keyed by `table_registry.name`"; the extractors' `tc["name"]`), while the
+    read surfaces receive the registry `id` off the request path. The
+    register handler derives the id by slugifying the name
+    (`name.strip().lower().replace(" ", "_")`), so the two routinely differ —
+    and then the id-keyed lookup misses a healthy, fully-synced table, which
+    `build_sample` reported as "the first sync is pending or failing"
+    (observed live: uppercase Keboola source-table names registered through
+    the Data-sources wizard)."""
+
+    ID = "orders_90d"
+    NAME = "Orders 90d"  # the exact pair the register handler's slugify produces
+
+    def _register(self, conn):
+        _ensure_admin1(conn)
+        from src.repositories.table_registry import TableRegistryRepository
+
+        TableRegistryRepository(conn).register(
+            id=self.ID,
+            name=self.NAME,
+            source_type="keboola",
+            bucket="in.c-main",
+            source_table="ORDERS_90D",
+            query_mode="materialized",
+        )
+
+    def _write_parquet_by_name(self, data_dir):
+        import duckdb as _duckdb
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        parquet_path = data_dir / f"{self.NAME}.parquet"
+        c = _duckdb.connect(":memory:")
+        try:
+            c.execute(f"COPY (SELECT 1 AS order_id, 'EUR' AS currency) TO '{parquet_path}' (FORMAT PARQUET)")
+        finally:
+            c.close()
+
+    def test_glob_resolver_prefers_the_registry_name_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        self._write_parquet_by_name(tmp_path / "extracts" / "keboola" / "data")
+
+        from app.utils import resolve_local_parquet_glob
+
+        # Pin the gap the keyword exists for: the bare id-keyed lookup misses.
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        target = resolve_local_parquet_glob(self.ID, "keboola", registry_name=self.NAME)
+        assert target is not None and target.endswith(f"{self.NAME}.parquet"), target
+
+    def test_partitioned_directory_keyed_by_name_resolves_too(self, tmp_path, monkeypatch):
+        """The partitioned sync writes `data/<name>/` — same keying convention,
+        same miss."""
+        import pandas as pd
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        part_dir = tmp_path / "extracts" / "keboola" / "data" / self.NAME
+        part_dir.mkdir(parents=True)
+        pd.DataFrame({"amount": [1, 2]}).to_parquet(part_dir / "2026_01.parquet")
+
+        from app.utils import resolve_local_parquet_glob
+
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        target = resolve_local_parquet_glob(self.ID, "keboola", registry_name=self.NAME)
+        assert target is not None and target.endswith("*.parquet"), target
+
+    def test_unset_registry_name_changes_nothing(self, tmp_path, monkeypatch):
+        """Callers that don't pass the keyword keep the exact old behavior."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        self._write_parquet_by_name(tmp_path / "extracts" / "keboola" / "data")
+
+        from app.utils import resolve_local_parquet_glob
+
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        assert resolve_local_parquet_glob(self.ID, "keboola", registry_name=None) is None
+
+    def test_sample_resolves_when_wizard_id_differs_from_name(self, reload_db):
+        from app.api import v2_sample
+        from app.utils import get_data_dir
+
+        self._write_parquet_by_name(get_data_dir() / "extracts" / "keboola" / "data")
+        conn = reload_db.get_system_db()
+        try:
+            self._register(conn)
+            user = {"id": "admin1", "email": "a@x.com"}
+            data = v2_sample.build_sample(conn, user, self.ID, n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert data["table_id"] == self.ID
+        assert data["rows"] == [{"order_id": 1, "currency": "EUR"}]
+
+    def test_not_synced_detail_reads_sync_state_under_the_name_key(self, reload_db):
+        """sync_state is keyed by the registry NAME (same write-side
+        convention), so the 404 detail's last-sync-error lookup must try the
+        name too — keyed by id it never surfaced the recorded failure for a
+        wizard-registered row."""
+        from app.api import v2_sample
+        from src.repositories.sync_state import SyncStateRepository
+
+        conn = reload_db.get_system_db()
+        try:
+            self._register(conn)  # no parquet written — genuinely unsynced
+            SyncStateRepository(conn).set_error(self.NAME, "export-async -> HTTP 403: token lacks bucket access")
+            user = {"id": "admin1", "email": "a@x.com"}
+            with pytest.raises(v2_sample.TableNotSyncedError) as exc_info:
+                v2_sample.build_sample(conn, user, self.ID, n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert "last sync error" in exc_info.value.detail, exc_info.value.detail
+        assert "HTTP 403" in exc_info.value.detail
+
+
 class TestSampleAccessPolicyBqBranch:
     """Task 13 (§8 ratchet) — the BQ live-query branch of `build_sample` had
     NO access-policy enforcement at all: `_fetch_bq_sample` pushes straight

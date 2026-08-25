@@ -1279,3 +1279,70 @@ class TestExternalPluginSourceClassifier:
         from src.marketplace import is_external_plugin_source
 
         assert not is_external_plugin_source(source)
+
+
+def test_refresh_plugin_cache_auto_disables_deprecated(clean_env, monkeypatch):
+    """A plugin marked ``"deprecated": true`` in marketplace-metadata.json is
+    admin-disabled automatically at sync — one upstream commit retires it on
+    every consuming instance. One-way: removing the flag later must NOT
+    auto-re-enable (the admin decides whether a retired plugin comes back)."""
+    from src.db import get_system_db
+    from src.marketplace import _refresh_plugin_cache
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    slug = "deprecate-test"
+    repo_root = clean_env / "marketplaces" / slug
+    (repo_root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+
+    (repo_root / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": slug,
+                "owner": {"name": "T"},
+                "plugins": [
+                    {"name": "old", "version": "1.0", "source": "./plugins/old"},
+                    {"name": "fresh", "version": "1.0", "source": "./plugins/fresh"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    meta_path = repo_root / ".claude-plugin" / "marketplace-metadata.json"
+    meta_path.write_text(
+        json.dumps({"version": 1, "plugins": {"old": {"deprecated": True}}}),
+        encoding="utf-8",
+    )
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(
+            id=slug,
+            name="deprecate test",
+            url="https://example.com/x.git",
+            curator_name="C",
+            curator_email="c@example.com",
+        )
+    finally:
+        conn.close()
+
+    def _disabled_flags():
+        conn = get_system_db()
+        try:
+            rows = conn.execute(
+                "SELECT name, admin_disabled FROM marketplace_plugins WHERE marketplace_id = ?",
+                [slug],
+            ).fetchall()
+        finally:
+            conn.close()
+        return dict(rows)
+
+    assert _refresh_plugin_cache(slug) == 2
+    flags = _disabled_flags()
+    assert flags["old"] is True, "deprecated plugin must be auto-disabled at sync"
+    assert flags["fresh"] is False, "non-deprecated sibling must stay enabled"
+
+    # One-way: drop the flag upstream, re-sync — the plugin STAYS disabled.
+    meta_path.write_text(json.dumps({"version": 1, "plugins": {}}), encoding="utf-8")
+    assert _refresh_plugin_cache(slug) == 2
+    flags = _disabled_flags()
+    assert flags["old"] is True, "removing the flag must never auto-re-enable"

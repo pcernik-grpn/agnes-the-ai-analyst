@@ -30,11 +30,19 @@ class SlackConfig:
 @dataclass(frozen=True)
 class ChatConfig:
     enabled: bool = False
-    # Sandbox provider id. ``e2b`` (cloud microVMs) and ``docker``
-    # (self-hosted containers, driven through the apps-runner sidecar)
-    # are the production-supported values; a further variant would
-    # extend the gate in ``app/main.py``.
+    # Sandbox provider id. ``e2b`` (cloud microVMs), ``docker``
+    # (self-hosted containers, driven through the apps-runner sidecar) and
+    # ``kai-agent`` (the embedded kai-agent turn engine — sessions run on the
+    # engine's own agent loop + sandbox, see app/chat/kai_engine_provider.py;
+    # requires the KAI_HOST_JWT_SECRET host wiring from app/api/kai.py) are
+    # the production-supported values; a further variant would extend the
+    # gate in ``app/main.py``.
     provider: str = "e2b"
+    # Where the embedded engine listens, for ``provider: kai-agent`` only.
+    # The default is the compose service name the customer-instance module
+    # materializes; the engine is loopback/compose-network-only by design,
+    # so this is never a public URL.
+    kai_agent_url: str = "http://kai-agent:3000"
     # Agent harness id — which engine drives the in-sandbox session
     # (app/chat/harness.py seam; validated against APPROVED_HARNESSES at
     # boot). ``claude-code`` is the only production harness today.
@@ -316,15 +324,62 @@ def _resolve_chat_enabled(raw: dict) -> bool:
     return coerce_flag_value(raw.get("enabled"), default=False)
 
 
+def _resolve_chat_provider(raw: dict) -> str:
+    """``chat.provider`` resolution: ``AGNES_CHAT_PROVIDER`` env > the
+    ``provider`` key in the parsed ``chat:`` block > ``"e2b"``.
+
+    The env override exists so INFRASTRUCTURE can pin the provider durably:
+    the deployment env rides code-reviewed Terraform (the ``customer-instance``
+    module's per-VM ``chat_provider`` field writes it into the app env), while
+    ``instance.yaml`` is a hand-edited overlay on the data disk that a fresh
+    machine starts without. Same precedence convention as
+    ``_resolve_chat_enabled`` above; a blank env value means unset (a key
+    written with nothing after it must not override the yaml, mirroring
+    ``_raw_str``'s treatment of blank yaml values).
+    """
+    env = (os.environ.get("AGNES_CHAT_PROVIDER") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "provider", "e2b")
+
+
+def _resolve_kai_agent_url(raw: dict) -> str:
+    """``chat.kai_agent_url`` resolution: ``AGNES_CHAT_KAI_AGENT_URL`` env >
+    the ``kai_agent_url`` key > ``"http://kai-agent:3000"``.
+
+    Same precedence convention and same motivation as
+    :func:`_resolve_chat_provider` — the provider it configures is pinned from
+    the deployment env, so its endpoint has to be pinnable the same way or the
+    pair can only ever be half-configured from infrastructure. It also makes
+    the provider reachable from a laptop: the default names a compose service,
+    which does not resolve outside the compose network, and the local-dev flow
+    deliberately runs without an ``instance.yaml`` (see
+    ``docs/kai-agent-local-dev.md``).
+    """
+    env = (os.environ.get("AGNES_CHAT_KAI_AGENT_URL") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "kai_agent_url", "http://kai-agent:3000")
+
+
 def load_chat_config(instance_yaml: Path) -> ChatConfig:
     if not instance_yaml.exists():
-        return ChatConfig(enabled=_resolve_chat_enabled({}), approvals_enabled=_resolve_chat_approvals({}))
+        return ChatConfig(
+            enabled=_resolve_chat_enabled({}),
+            # A fresh machine (no instance.yaml yet) must still honour an
+            # infra-pinned provider — without this the first boot ran e2b
+            # regardless of the deployment env.
+            provider=_resolve_chat_provider({}),
+            kai_agent_url=_resolve_kai_agent_url({}),
+            approvals_enabled=_resolve_chat_approvals({}),
+        )
     data = yaml.safe_load(instance_yaml.read_text()) or {}
     raw = data.get("chat", {}) or {}
     detach_linger_seconds = _raw_int(raw, "detach_linger_seconds", 60)
     return ChatConfig(
         enabled=_resolve_chat_enabled(raw),
-        provider=_raw_str(raw, "provider", "e2b"),
+        provider=_resolve_chat_provider(raw),
+        kai_agent_url=_resolve_kai_agent_url(raw),
         harness=_raw_str(raw, "harness", "claude-code"),
         concurrency_per_user=_raw_int(raw, "concurrency_per_user", 3),
         idle_ttl_seconds=_raw_int(raw, "idle_ttl_seconds", 30 * 60),

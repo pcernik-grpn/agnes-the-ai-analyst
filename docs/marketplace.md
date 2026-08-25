@@ -73,9 +73,25 @@ grant/group join runs, a plugin an admin disables via the `/admin/marketplaces`
 Details modal (`marketplace_plugins.admin_disabled = TRUE`) is removed
 instance-wide for everyone, regardless of grants: it disappears from the served
 feed, the browse page, every user's my-stack, the synthetic served marketplace,
-the group Access tab's grant UI, and the v2 `/skills` endpoint. The only surface
-that still shows a disabled plugin is the Details modal, where it can be
-re-enabled. Disabling also clears `is_system` (re-enabling does **not** restore
+the group Access tab's grant UI, the v2 `/skills` endpoint, and the Library
+page. The per-plugin curated endpoints treat it as nonexistent — the detail
+page, its inner skill/agent pages, served docs, and the install action all
+answer 404, for admins too.
+
+**One deliberate exception: the two cover-art paths** (`…/asset/{path}` and
+`…/mirrored/{key}`) keep serving a disabled plugin's images. Both are
+login-only with *no* per-plugin RBAC, because the content is curator-designed
+marketing visuals carrying no PII, source or secrets — so any authenticated
+caller could already fetch them without a grant, and a disable check would
+hide nothing from anyone who could not already read it. It would, however, put
+one serialized DuckDB round-trip per image back on a render-blocking path
+those endpoints were explicitly stripped of DB work for (12-20 covers per
+`/marketplace` grid render). A disabled plugin appears on no listing, so the
+URL is reachable only by a caller who already knows it. Pinned by
+`tests/test_admin_disabled_curated_surfaces.py`.
+
+The only surface that still shows a disabled plugin in the UI is the Details
+modal, where it can be re-enabled. Disabling also clears `is_system` (re-enabling does **not** restore
 it), and the disabled state survives nightly sync and the built-in re-seed on
 boot (the `replace_for_marketplace` upsert never resets `admin_disabled`), so a
 disabled plugin stays disabled across restarts.
@@ -83,10 +99,32 @@ disabled plugin stays disabled across restarts.
 Because a disabled plugin is also hidden from the group Access tab's grant UI, its
 existing `resource_grants` rows are preserved but not editable there while it is
 disabled — they are inert (the plugin is filtered out of every served surface
-regardless of grants) and are restored intact on re-enable. To revoke them
-permanently, re-enable the plugin, revoke on the group's Access tab, then disable again
-if still wanted. This is deliberate: "disabled" means invisible everywhere
-except the re-enable control, not "grants deleted".
+regardless of grants) and are restored intact on re-enable. This is deliberate:
+"disabled" means invisible everywhere except the re-enable control, not "grants
+deleted". To retire a plugin permanently, tick **"Also revoke all group
+grants"** in the disable dialog (or POST the disable endpoint with
+`{"revoke_grants": true}`) — the grants are deleted in the same action and the
+response reports the count as `revoked_grants`.
+
+The disable/enable pair is also scriptable: `agnes admin marketplace
+disable-plugin <marketplace>/<plugin> [--revoke-grants]` and
+`enable-plugin <marketplace>/<plugin>`, alongside `list` and `sync <slug>`
+(admin PAT required; marketplace registration/deletion stay web-UI-only
+because they carry a git token).
+
+**Curator-side deprecation.** A plugin whose `marketplace-metadata.json`
+section carries the literal boolean `"deprecated": true` (optionally with
+single-line `deprecation_note` and `replacement` strings) is admin-disabled
+automatically on every sync — one upstream commit retires the plugin on every
+Agnes instance consuming the repo. The flag is one-way: removing it later never
+auto-re-enables, and re-enabling a still-flagged plugin only lasts until the
+next sync re-disables it. The admin Details modal shows a DEPRECATED pill with
+the curator's note; grants are untouched (pair the flag with the retirement
+checkbox above when they should go too). Plain Claude Code consumers of the
+same repo ignore the metadata file entirely, so the field degrades gracefully
+outside Agnes. See
+[`docs/curated-marketplace-format.md`](curated-marketplace-format.md) for the
+field reference.
 
 On-disk layout in the served ZIP / git tree uses a slug-prefixed directory
 (`plugins/<slug>-<plugin>/`) so two marketplaces shipping a same-named plugin

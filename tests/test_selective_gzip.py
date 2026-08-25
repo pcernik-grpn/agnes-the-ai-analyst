@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def isolated_client(tmp_path, monkeypatch):
+def isolated_client(tmp_path, monkeypatch, shared_app):
     """Fresh FastAPI app with its own tmp DATA_DIR so DuckDB locks don't
     collide with a concurrently-running dev container."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
@@ -20,8 +20,7 @@ def isolated_client(tmp_path, monkeypatch):
     (tmp_path / "extracts").mkdir()
     from src.db import close_system_db
     close_system_db()
-    from app.main import create_app
-    yield TestClient(create_app())
+    yield TestClient(shared_app)
     close_system_db()
 
 

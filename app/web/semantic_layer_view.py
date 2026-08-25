@@ -235,6 +235,19 @@ def model_glossary(model: dict) -> list[dict]:
     return entries
 
 
+def dialect_skipped_count(model: dict) -> int:
+    """How many of the model's metrics never made it into the flat
+    projection (``metric_definitions``) because none of their declared
+    dialects is one this instance can run (SNOWFLAKE-only, DATABRICKS-only,
+    etc.) — the same check ``src/semantic/projection.py`` makes at write
+    time, recomputed here since a stored ``semantic_models`` row carries no
+    column of its own to persist it in.
+    """
+    from src.semantic.dialect import count_dialect_skipped_metrics
+
+    return count_dialect_skipped_metrics(model.get("metrics") or [])
+
+
 def object_counts(model: dict) -> dict[str, int]:
     """Per-type object counts for the model-list row."""
     return {
@@ -381,6 +394,7 @@ __all__ = [
     "ai_groups",
     "ai_instructions_and_examples",
     "dataset_field_rows",
+    "dialect_skipped_count",
     "find_object",
     "is_imported",
     "metric_expressions",

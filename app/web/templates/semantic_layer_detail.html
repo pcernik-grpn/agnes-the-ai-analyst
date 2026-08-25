@@ -77,6 +77,9 @@
     {% if status == 'invalid' %}
     <span class="badge badge--danger">Invalid</span>
     {% endif %}
+    {% if dialect_skipped_count %}
+    <span class="badge badge--warn">{{ dialect_skipped_count }} metric{{ 's' if dialect_skipped_count != 1 else '' }} skipped (unsupported dialect)</span>
+    {% endif %}
 </div>
 {{ ds.tabs(items=tabs, aria_label='Semantic model object types') }}
 {% endblock %}

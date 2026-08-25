@@ -8,6 +8,7 @@ download your own entries. All commands authenticate via the configured PAT
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -237,6 +238,7 @@ def entity_status(
     entity_id: str = typer.Argument(..., help="Store entity id (from `agnes store upload` output)"),
     wait: bool = typer.Option(False, "--wait", help="Poll until the review reaches a terminal state"),
     timeout: int = typer.Option(600, "--timeout", help="Max seconds to wait with --wait"),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Show the review-pipeline status of your uploaded entity.
 
@@ -245,6 +247,10 @@ def entity_status(
     passes. Use `--wait` to block until the verdict lands. Exit codes:
     0 = live (approved/overridden), 1 = blocked or review error,
     2 = still pending (timeout with --wait, or non-terminal without).
+
+    With --json, exactly one JSON document (the final state) is emitted on
+    stdout — even under --wait, where the human-readable path reprints per
+    poll — so the output is always parseable with a single json.loads().
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -253,17 +259,28 @@ def entity_status(
         except V2ClientError as e:
             typer.echo(str(e), err=True)
             raise typer.Exit(1)
-        status = _print_status(body)
+        if as_json:
+            # Per-poll output is suppressed in JSON mode; the single final
+            # document is emitted below once the loop terminates.
+            sub = body.get("submission") or {}
+            status = sub.get("status") or body.get("visibility_status") or "unknown"
+        else:
+            status = _print_status(body)
         if status in ("approved", "overridden"):
-            raise typer.Exit(0)
-        if status in _TERMINAL_SUBMISSION_STATUSES:
-            raise typer.Exit(1)
-        if not wait:
-            raise typer.Exit(2)
-        if time.monotonic() >= deadline:
+            exit_code = 0
+        elif status in _TERMINAL_SUBMISSION_STATUSES:
+            exit_code = 1
+        elif not wait:
+            exit_code = 2
+        elif time.monotonic() >= deadline:
             typer.echo(f"Review still {status} after {timeout}s — giving up.", err=True)
-            raise typer.Exit(2)
-        time.sleep(5)
+            exit_code = 2
+        else:
+            time.sleep(5)
+            continue
+        if as_json:
+            typer.echo(json.dumps(body, indent=2))
+        raise typer.Exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +307,7 @@ def pull_my_entities(
         "--unpack",
         help="Instead of saving the ZIP, unpack it into this directory.",
     ),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Download a bundle of every Flea Market entity you own (created).
 
@@ -317,7 +335,10 @@ def pull_my_entities(
                 zf.extractall(unpack)
         finally:
             _shutil.rmtree(scratch, ignore_errors=True)
-        typer.echo(f"Unpacked your Store entities → {unpack}")
+        if as_json:
+            typer.echo(json.dumps({"unpacked_to": str(unpack)}))
+        else:
+            typer.echo(f"Unpacked your Store entities → {unpack}")
         return
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -326,7 +347,10 @@ def pull_my_entities(
     except V2ClientError as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
-    typer.echo(f"Wrote {size:,} bytes → {out}")
+    if as_json:
+        typer.echo(json.dumps({"bytes": size, "path": str(out)}))
+    else:
+        typer.echo(f"Wrote {size:,} bytes → {out}")
 
 
 @store_app.command("rate")

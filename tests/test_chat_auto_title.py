@@ -163,6 +163,99 @@ def test_generate_title_swallows_sync_exceptions(monkeypatch):
         asyncio.run(auto_title.generate_title("hi"))
 
 
+# --- #1526: missing-credential visibility ------------------------------------
+
+
+class TestNoCredentialWarning:
+    """When no Anthropic credential can be obtained, `generate_title` must
+    still return ``None`` cleanly (never raise — a missing title is
+    cosmetic) but say so at WARNING once per process, instead of the old
+    `logger.debug` that left a keyless/misconfigured instance silently
+    stuck on 'Untitled chat' forever (#1526)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warn_once(self):
+        """`_no_credential_warned` is a module-global once-per-process
+        guard — reset it before/after every test in this class so test
+        order can't suppress the warning a later test asserts on."""
+        auto_title._no_credential_warned = False
+        yield
+        auto_title._no_credential_warned = False
+
+    @staticmethod
+    def _clear_credential_env(monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        for var in auto_title._WIF_REQUIRED_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("ANTHROPIC_IDENTITY_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_IDENTITY_TOKEN_FILE", raising=False)
+
+    def test_warns_once_and_leaves_title_none(self, monkeypatch, caplog):
+        """(a) No credential at all: exactly one WARNING naming the cause
+        and the fix, and the turn's return value stays ``None`` (the
+        caller leaves the session 'Untitled chat', it does not raise)."""
+        import logging
+
+        self._clear_credential_env(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="app.chat.auto_title"):
+            title = asyncio.run(auto_title.generate_title("Show me revenue last week"))
+        assert title is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"expected exactly one WARNING, got {[r.getMessage() for r in warnings]}"
+        msg = warnings[0].getMessage()
+        assert "auto-title" in msg.lower()
+        assert "ANTHROPIC_API_KEY" in msg
+
+    def test_no_warning_when_credential_present(self, monkeypatch, caplog):
+        """(b) A working credential must not regress: title is produced
+        as before and no credential warning fires."""
+        import logging
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(auto_title, "_generate_title_sync", lambda *a, **kw: "Weekly revenue")
+        with caplog.at_level(logging.WARNING, logger="app.chat.auto_title"):
+            title = asyncio.run(auto_title.generate_title("Show me revenue last week"))
+        assert title == "Weekly revenue"
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_warning_does_not_repeat_across_calls(self, monkeypatch, caplog):
+        """(c) A keyless/misconfigured instance must not get one WARNING
+        per conversation — auto-title runs on every session's first
+        assistant turn."""
+        import logging
+
+        self._clear_credential_env(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="app.chat.auto_title"):
+            asyncio.run(auto_title.generate_title("First session"))
+            asyncio.run(auto_title.generate_title("Second session"))
+            asyncio.run(auto_title.generate_title("Third session"))
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"expected the warning once, got {len(warnings)}"
+
+    def test_configured_but_minting_failed_warns_every_time(self, monkeypatch, caplog):
+        """A credential that IS configured (WIF env vars present) but
+        fails to mint (expired rule, revoked SA, transient network error)
+        is a different, ongoing condition from 'nothing configured' — it
+        must stay visible on every occurrence, not just the first."""
+        import logging
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_test")
+        monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "org_test")
+        monkeypatch.setenv("ANTHROPIC_SERVICE_ACCOUNT_ID", "svac_test")
+        monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN", "fake-oidc-jwt")
+
+        def fake_get_token():
+            raise RuntimeError("token exchange failed: HTTP 401 invalid_grant")
+
+        monkeypatch.setattr("app.auth.wif.get_federated_access_token", fake_get_token)
+        with caplog.at_level(logging.WARNING, logger="app.chat.auto_title"):
+            asyncio.run(auto_title.generate_title("First session"))
+            asyncio.run(auto_title.generate_title("Second session"))
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, f"expected a warning on every mint failure, got {len(warnings)}"
+
+
 # --- ChatRepository ----------------------------------------------------------
 
 

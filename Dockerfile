@@ -55,6 +55,8 @@ COPY . .
 #   - post-deploy-smoke-test.sh — deploy gate (docs/ONBOARDING.md step 8):
 #     public API + new-instance doctor + host-side consistency checks
 #   - docker-compose.{yml,prod.yml,host-mount.yml,tls.yml} — host runtime
+#   - docker-compose.gcp-logging.yml — opt-out gcplogs overlay (removed by
+#     startup-script.sh.tpl when enable_gcp_logging=false; see its own header)
 #   - Caddyfile — TLS reverse proxy config
 #   - static/maintenance.html — Caddy's handle_errors 502/503 fallback page
 #
@@ -78,6 +80,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
        /app/docker-compose.host-mount.yml /app/docker-compose.tls.yml \
        /app/docker-compose.postgres.yml \
        /app/docker-compose.postgres-host-mount.yml \
+       /app/docker-compose.gcp-logging.yml \
        /app/Caddyfile /opt/agnes-host/ && \
     cp /app/static/maintenance.html /opt/agnes-host/static/ && \
     chmod 0755 /opt/agnes-host/agnes-auto-upgrade.sh \
@@ -94,6 +97,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
               /opt/agnes-host/docker-compose.tls.yml \
               /opt/agnes-host/docker-compose.postgres.yml \
               /opt/agnes-host/docker-compose.postgres-host-mount.yml \
+              /opt/agnes-host/docker-compose.gcp-logging.yml \
               /opt/agnes-host/Caddyfile \
               /opt/agnes-host/scripts/ops/agnes-compose-file.sh \
               /opt/agnes-host/static/maintenance.html
@@ -107,7 +111,21 @@ RUN uv build --wheel --out-dir /app/dist
 # inbound transport works out-of-the-box in the server image (HTTP-only
 # deployments simply never enable it; the import stays lazy + fail-closed).
 # See [project.optional-dependencies] in pyproject.toml.
-RUN uv pip install --system --no-cache ".[server,slack-socket,telegram]"
+#
+# EXTRA_EXTRAS appends optional extras to the SAME install, for image variants
+# that need them. It is empty by default on purpose: `[docling]` and
+# `[embeddings]` each pull torch, which adds gigabytes to every VM's disk and
+# image pull — a cost the whole fleet would carry for a capability only some
+# instances use. Build the rich variant explicitly instead:
+#
+#   docker build --build-arg EXTRA_EXTRAS=",docling,embeddings" .
+#
+# `.github/workflows/image-rich.yml` does exactly that and publishes it under
+# a `-rich` tag suffix, so an instance opts in by pointing its image_tag at
+# that tag. Note the leading comma — the value is concatenated inside the
+# bracket list.
+ARG EXTRA_EXTRAS=""
+RUN uv pip install --system --no-cache ".[server,slack-socket,telegram${EXTRA_EXTRAS}]"
 
 # Run as non-root user for container hardening (C13).
 # uid/gid pinned to 999 so host-side chown in startup-script.sh.tpl can match

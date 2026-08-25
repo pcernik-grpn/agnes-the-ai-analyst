@@ -15,7 +15,7 @@ import pytest
 
 
 @pytest.fixture
-def _fresh_app(state_backend, tmp_path, monkeypatch):
+def _fresh_app(state_backend, tmp_path, monkeypatch, shared_app):
     """A fresh app (no users) on the active backend. System groups exist
     (DuckDB seeds them on connect; the PG fixture pre-seeds them), so bootstrap
     can find Admin to grant membership."""
@@ -31,9 +31,8 @@ def _fresh_app(state_backend, tmp_path, monkeypatch):
 
     from fastapi.testclient import TestClient
 
-    from app.main import create_app
 
-    return TestClient(create_app()), state_backend
+    return TestClient(shared_app), state_backend
 
 
 def test_bootstrap_grants_admin_on_both_backends(_fresh_app):

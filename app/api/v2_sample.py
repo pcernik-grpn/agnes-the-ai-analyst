@@ -91,9 +91,16 @@ def _not_previewable_detail(table_id: str, *, query_mode: str) -> str:
     )
 
 
-def _not_synced_detail(table_id: str) -> str:
+def _not_synced_detail(table_id: str, *, registry_name: str | None = None) -> str:
     """Explain a registered-but-dataless table, with the last sync error
-    when sync_state recorded one."""
+    when sync_state recorded one.
+
+    ``sync_state.table_id`` is keyed by the registry ``name`` — the same
+    write-side convention the parquet filename follows (see
+    `app/utils.py::_physical_key_candidates`) — so the error lookup tries the
+    name first and the id as a fallback. Keyed by id alone, the recorded
+    failure never surfaced for a row whose id was slugified from its name.
+    """
     detail = (
         f"table {table_id!r} is registered but has no synced data yet — "
         "the first sync is pending or failing (see the sync status on "
@@ -102,8 +109,14 @@ def _not_synced_detail(table_id: str) -> str:
     try:
         from src.repositories import sync_state_repo
 
-        state = sync_state_repo().get_table_state(table_id) or {}
-        err = state.get("error") or ""
+        err = ""
+        for key in dict.fromkeys((registry_name, table_id)):
+            if not key:
+                continue
+            state = sync_state_repo().get_table_state(key) or {}
+            err = state.get("error") or ""
+            if err:
+                break
         if err:
             detail += f"; last sync error: {str(err)[:300]}"
     except Exception:
@@ -419,7 +432,12 @@ def build_sample(
         # having a pending or failing first sync (Devin Review on #1189).
         from app.utils import LOCAL_PARQUET_READ_EXPR, resolve_local_parquet_glob
 
-        parquet = resolve_local_parquet_glob(table_id, source_type)
+        # `registry_name`: the write side keys the parquet filename by the
+        # row's `name`, not its `id` — see `_physical_key_candidates` in
+        # app/utils.py. Without it, any row whose id was slugified from the
+        # name (the register handler lowercases + underscores it) read as
+        # "no synced data yet" while fully synced.
+        parquet = resolve_local_parquet_glob(table_id, source_type, registry_name=row.get("name"))
         if parquet is None:
             # The registry row exists (checked above), so this is never "no
             # such table" — and `query_mode='remote'` never reaches this
@@ -427,7 +445,12 @@ def build_sample(
             # parquet here is genuinely "no data has landed yet" — including
             # for `server_only`, which suppresses distribution to analyst
             # laptops, not materialization here.
-            raise TableNotSyncedError(table_id, _not_synced_detail(table_id))
+            #
+            # `registry_name`: sync_state is keyed by the row's `name`, the
+            # same write-side convention the parquet filename follows, so the
+            # last-sync-error lookup must try the name first. Keyed by id
+            # alone, a recorded failure never surfaced for a slugified row.
+            raise TableNotSyncedError(table_id, _not_synced_detail(table_id, registry_name=row.get("name")))
 
         # Table access policies (§5): this connection is a throwaway
         # :memory: DB with nothing but the parquet attached — no analytics

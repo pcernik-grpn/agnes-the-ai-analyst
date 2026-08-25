@@ -195,6 +195,13 @@ class PluginResponse(BaseModel):
     # v78: surfaced so the admin Details modal renders the "Disable plugin"
     # toggle + greys out the system button for admin-disabled plugins.
     admin_disabled: bool = False
+    # Curator-side lifecycle, read on demand from the cloned repo's
+    # marketplace-metadata.json (not persisted): the Details modal renders a
+    # DEPRECATED pill + the curator's note. The sync pipeline is what acts on
+    # the flag (auto-disable); this is display only.
+    deprecated: bool = False
+    deprecation_note: Optional[str] = None
+    replacement: Optional[str] = None
 
 
 class SystemFlagResponse(BaseModel):
@@ -255,6 +262,23 @@ async def list_plugins(
     if not marketplace_registry_repo().get(marketplace_id):
         raise HTTPException(status_code=404, detail="marketplace not found")
     rows = marketplace_plugins_repo().list_for_marketplace(marketplace_id)
+
+    # Curator-side deprecation is read from the cloned working tree at request
+    # time (same read-on-demand contract as the rich detail-page fields) so a
+    # curator commit shows up on the next modal open, not the next sync.
+    #
+    # `marketplace_id` is a Starlette `[^/]+` path param used verbatim to build
+    # a filesystem root, so it gets the at-use containment check the security
+    # playbook mandates alongside the at-ingest one — the registry lookup above
+    # already implies a valid slug today, but this call site must not silently
+    # become traversable if a future registry writer skips slug validation.
+    from app.utils import get_marketplaces_dir
+    from src.marketplace import is_safe_plugin_name
+    from src.marketplace_metadata import plugin_deprecation, read_marketplace_metadata
+
+    if not is_safe_plugin_name(marketplace_id or ""):
+        raise HTTPException(status_code=404, detail="marketplace not found")
+    metadata = read_marketplace_metadata(get_marketplaces_dir() / marketplace_id)
     return [
         PluginResponse(
             name=r["name"],
@@ -267,6 +291,7 @@ async def list_plugins(
             source_spec=r.get("source_spec"),
             is_system=bool(r.get("is_system")),
             admin_disabled=bool(r.get("admin_disabled")),
+            **plugin_deprecation(metadata, r["name"]),
         )
         for r in rows
     ]
@@ -733,12 +758,28 @@ def unmark_plugin_system(
 # ---------------------------------------------------------------------------
 
 
+class DisablePluginRequest(BaseModel):
+    """Optional body of the disable endpoint.
+
+    ``revoke_grants=True`` turns the disable into a one-action retirement:
+    every ``marketplace_plugin`` grant on the plugin is deleted in the same
+    call. Without it (or with no body at all — the pre-existing call shape)
+    grants are left intact, so a later re-enable restores the plugin for the
+    same groups.
+    """
+
+    revoke_grants: bool = False
+
+
 class AdminDisableResponse(BaseModel):
     """Return shape of the enable/disable plugin endpoints."""
 
     marketplace_id: str
     plugin_name: str
     admin_disabled: bool
+    # Number of resource_grants rows deleted by ``revoke_grants=True``;
+    # always 0 on enable and on a plain disable.
+    revoked_grants: int = 0
 
 
 @router.post(
@@ -748,6 +789,7 @@ class AdminDisableResponse(BaseModel):
 async def disable_plugin(
     marketplace_id: str,
     plugin_name: str,
+    payload: Optional[DisablePluginRequest] = None,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -757,15 +799,52 @@ async def disable_plugin(
     regardless of their RBAC grants. Distinct from per-user opt-outs.
     Primarily intended for built-in plugins (is_builtin=TRUE registry row),
     but works on any registered plugin.
+
+    Optional JSON body ``{"revoke_grants": true}`` additionally deletes every
+    group grant on the plugin (one-action retirement) — without it the grants
+    stay, so re-enabling restores the plugin for the same groups. The response
+    reports the number of grants removed as ``revoked_grants``.
     """
     if not marketplace_registry_repo().get(marketplace_id):
         raise HTTPException(status_code=404, detail="marketplace not found")
+    # ORDER MATTERS: set_admin_disabled clears is_system in the same UPDATE.
+    # `DELETE /api/access/grants/{id}` refuses to revoke a grant on a
+    # still-system plugin (409 cannot_revoke_system_grant) so nobody punches a
+    # hole in a mandatory-tier plugin; the bulk delete below does not consult
+    # that guard, and is only safe because is_system is already FALSE by the
+    # time it runs — the same state a manual unmark-system → revoke sequence
+    # would reach. Keep the disable flip strictly before the grant deletion.
     found = marketplace_plugins_repo().set_admin_disabled(marketplace_id, plugin_name, True)
     if not found:
         raise HTTPException(status_code=404, detail="plugin not found")
-    _audit(conn, user["id"], "marketplace.plugin.disable", f"{marketplace_id}/{plugin_name}", None)
+    requested = payload is not None and payload.revoke_grants
+    revoked = 0
+    if requested:
+        # Exact-equality delete on the composed resource_id — no prefix/LIKE
+        # hazard (unlike delete_for_marketplace_plugins), and neither half can
+        # contain '/': slugs are charset-validated at registration and plugin
+        # names at sync ingestion (is_safe_plugin_name).
+        revoked = resource_grants_repo().delete_by_resource(
+            ResourceType.MARKETPLACE_PLUGIN.value,
+            f"{marketplace_id}/{plugin_name}",
+        )
+    # Both keys always logged: a retirement that found zero grants and a plain
+    # disable are different admin intents and must not produce identical audit
+    # rows (`revoked_grants` alone cannot tell them apart).
+    _audit(
+        conn,
+        user["id"],
+        "marketplace.plugin.disable",
+        f"{marketplace_id}/{plugin_name}",
+        {"revoke_grants_requested": requested, "revoked_grants": revoked},
+    )
     _invalidate_marketplace_etag()
-    return AdminDisableResponse(marketplace_id=marketplace_id, plugin_name=plugin_name, admin_disabled=True)
+    return AdminDisableResponse(
+        marketplace_id=marketplace_id,
+        plugin_name=plugin_name,
+        admin_disabled=True,
+        revoked_grants=revoked,
+    )
 
 
 @router.post(

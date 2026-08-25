@@ -33,6 +33,40 @@ logger = logging.getLogger(__name__)
 _GLOSSARY_VENDOR = "agnes"
 
 
+# Provenance of a hand-authored model stored through the admin API
+# (app/api/semantic_models.py) — the one document source whose name collides
+# with an EXISTING `column_metadata.source` value: the admin metadata API
+# (app/api/metadata.py) writes the same `(table_id, column_name)` PK with
+# `source='manual'` too, and a manual dataset's `source` IS an Agnes table id
+# (that binding is what surfaces its field descriptions in /api/v2/schema).
+_MANUAL_DOCUMENT_SOURCE = "manual"
+
+# The distinct `column_metadata.source` a manual model's projection writes
+# — and prunes — under instead, so `_prune_columns` scoped to it can never
+# delete an admin-authored `source='manual'` row. See `_column_source`.
+MANUAL_MODEL_COLUMN_SOURCE = "semantic_model"
+
+
+def _column_source(source: str) -> str:
+    """The ``column_metadata.source`` value a document with provenance
+    ``source`` writes (and prunes) its dataset fields under.
+
+    Identity for every synced source (``ossie_git``/``ossie_upload``/
+    ``ossie_connection``, ``keboola_metastore``, …) — their provenance never
+    collides with another ``column_metadata`` writer. Only the manual admin
+    API path is remapped: keeping ``source='manual'`` there would make the
+    projection's upsert overwrite — and its prune delete — admin-authored
+    rows the metadata API stores under the very same key and source.
+    Precedence is write-time and explicit: an existing row owned by any
+    OTHER writer (admin ``'manual'``, ``'profiler'``, ``'ai_enrichment'``)
+    wins over a manual model's projection and is left untouched (see the
+    guard in :func:`project_document`); since ``(table_id, column_name)``
+    holds a single row, that write-time precedence is also what every reader
+    (e.g. ``/api/v2/schema``) sees.
+    """
+    return MANUAL_MODEL_COLUMN_SOURCE if source == _MANUAL_DOCUMENT_SOURCE else source
+
+
 def _is_agnes_vendor(vendor_name) -> bool:
     """Case-insensitive match against the Agnes vendor tag — the same
     casefolded posture the query validator and the browse view take."""
@@ -356,6 +390,12 @@ def project_document(
     binder = _table_binder()
     kb_lookups = _keboola_lookups()
 
+    # The `column_metadata.source` this document's dataset fields are written
+    # and pruned under — identical to `source` for every synced source, but a
+    # distinct value for the manual admin-API path, whose `source='manual'`
+    # collides with the admin metadata API's own rows (see `_column_source`).
+    column_source = _column_source(source)
+
     # One id prefix per model projected here. Used only when ``partial`` — see
     # the docstring — to keep the prune off models this call never saw.
     model_prefixes: set[str] = set()
@@ -460,12 +500,26 @@ def project_document(
                 column_name = column.get("name")
                 if not column_name:
                     continue
+                if column_source != source:
+                    # Manual path only (`_column_source` remapped it): a
+                    # manual dataset's `source` is an Agnes table id, i.e.
+                    # the SAME `(table_id, column_name)` key the admin
+                    # metadata API, the profiler and ai_enrichment write.
+                    # A row any of those already owns wins — the upsert
+                    # would otherwise silently overwrite an admin-authored
+                    # description (frequently blanking it, since model
+                    # fields often carry none). Skipped rows are also out
+                    # of `_prune_columns`'s reach, which is scoped to
+                    # `column_source`.
+                    existing = column_metadata_repo().get(table_id, column_name)
+                    if existing is not None and (existing.get("source") or "") != column_source:
+                        continue
                 column_metadata_repo().save(
                     table_id=table_id,
                     column_name=column_name,
                     basetype=column.get("datatype"),
                     description=column.get("description"),
-                    source=source,
+                    source=column_source,
                 )
                 field_names.add(column_name)
                 report.columns_written += 1
@@ -511,14 +565,156 @@ def project_document(
     report.glossary_pruned = _prune_glossary(
         source, source_ref, written_glossary_ids, safe_prune=safe_prune, scope_prefixes=prune_prefixes
     )
-    # `_prune_columns` needs no narrowing: it only visits tables THIS call
-    # wrote to, so a dropped model's tables are out of its reach already.
-    _prune_columns(source, written_columns_by_table)
+    # Scoped to `column_source`, not `source` — for the manual path the two
+    # differ precisely so this prune can never delete an admin-authored
+    # `source='manual'` row for the same table (see `_column_source`).
+    # A `partial` call additionally spares the columns SIBLING models of
+    # this scope still claim: `column_metadata` rows carry no model
+    # identity, so visiting a table two in-scope models share would
+    # otherwise prune the absent model's live rows (`_sibling_column_claims`
+    # is the column analogue of `model_prefixes` above). A full call needs
+    # no such read — it carries the whole scope by definition.
+    if partial:
+        sibling_claims = _sibling_column_claims(source, source_ref, seen_model_keys)
+        if sibling_claims is None:
+            logger.warning(
+                "Semantic projection (%s/%s): skipping the column prune — sibling claims unavailable, "
+                "and pruning without them could delete a sibling model's live rows.",
+                source,
+                source_ref,
+            )
+        else:
+            _prune_columns(column_source, written_columns_by_table, keep_by_table=sibling_claims)
+    else:
+        _prune_columns(column_source, written_columns_by_table)
 
     if report.glossary_written or report.glossary_pruned:
         glossary_repo().refresh_search_index()
 
     return report
+
+
+def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) -> ProjectionReport:
+    """Delete everything :func:`project_document` previously wrote for the
+    model(s) declared in ``document_json`` — the write path's inverse, for
+    when the document ITSELF is being deleted (not merely re-projected
+    smaller, which ``project_document(..., partial=True)`` already handles
+    by rewriting-then-pruning).
+
+    Scoped exactly the way ``partial=True`` narrows a projection's prune:
+    per model, to ``<source>/<source_ref or '_'>/<model_key>/`` — reusing
+    the SAME ``_model_key``/``_scoped_id`` helpers ``project_document``
+    itself uses to compute that prefix, so the two can never disagree on
+    what one model "owns". A sibling model sharing ``(source, source_ref)``
+    — every ``source='manual'`` row does — is therefore never touched, the
+    identical guarantee a ``partial=True`` projection call gives on the
+    write side.
+
+    Column metadata is pruned per the model's OWN dataset table_ids —
+    ``(table_id, source)`` — additionally sparing every column a SIBLING
+    model of the same scope still claims (``_sibling_column_claims``):
+    ``column_metadata`` rows carry no model identity, so two models binding
+    the same ``table_id`` are otherwise indistinguishable there, and
+    deleting model A must not take model B's projected columns with it.
+    """
+    report = ProjectionReport()
+    models = [m for m in document_json.get("semantic_model") or [] if isinstance(m, dict)]
+    # This call deletes ONE document while sibling models of the same scope
+    # may live on — the delete analogue of a `partial` projection — so the
+    # column prune must spare what those siblings still claim (a shared
+    # `table_id`'s rows carry no model identity to tell them apart by).
+    # `None` (read failure) skips the column prune entirely: stale leftover
+    # rows beat deleting a sibling's live ones. Metric/glossary prunes are
+    # unaffected either way — their rows carry the model-id prefix.
+    sibling_claims = _sibling_column_claims(source, source_ref, {_model_key(m) for m in models})
+    if sibling_claims is None:
+        logger.warning(
+            "Semantic projection (%s/%s): skipping the column prune on model delete — sibling claims "
+            "unavailable, and pruning without them could delete a sibling model's live rows.",
+            source,
+            source_ref,
+        )
+    for model in models:
+        prefix = _scoped_id(source, source_ref, _model_key(model)) + "/"
+        report.metrics_pruned += _prune_metrics(source, source_ref, set(), scope_prefixes={prefix})
+        report.glossary_pruned += _prune_glossary(source, source_ref, set(), scope_prefixes={prefix})
+
+        written_by_table = {
+            (dataset.get("source") or dataset.get("name") or ""): set()
+            for dataset in model.get("datasets") or []
+            if isinstance(dataset, dict)
+        }
+        if written_by_table and sibling_claims is not None:
+            # Same `column_source` remapping as the write side: a manual
+            # model's rows live under `MANUAL_MODEL_COLUMN_SOURCE`, so this
+            # prune deletes exactly what `project_document` wrote and can
+            # never reach an admin-authored `source='manual'` row.
+            _prune_columns(_column_source(source), written_by_table, keep_by_table=sibling_claims)
+
+    if report.glossary_pruned:
+        glossary_repo().refresh_search_index()
+
+    return report
+
+
+def _sibling_column_claims(
+    source: str, source_ref: Optional[str], exclude_model_keys: set[str]
+) -> Optional[dict[str, set[str]]]:
+    """``table_id -> field names`` still claimed by the OTHER currently-stored
+    valid models of this ``(source, source_ref)`` scope — the column prune's
+    analogue of the ``model_prefixes`` narrowing the metric/glossary prunes
+    get on a ``partial`` call.
+
+    ``column_metadata`` rows carry no model identity (single ``source``
+    column, no ``source_ref``), so a partial call cannot tell a SIBLING
+    model's live rows from this model's stale ones by looking at the table
+    alone. Two manual models binding datasets to the same ``table_id`` all
+    write under one ``(source='manual' -> MANUAL_MODEL_COLUMN_SOURCE,
+    source_ref=None)`` scope, and each admin-API write is its own
+    ``partial=True`` projection — so without this read, re-projecting model
+    A would prune model B's projected columns for the shared table. The
+    claims are rebuilt from the stored documents themselves
+    (``semantic_models``), excluding the models THIS call carries
+    (``exclude_model_keys``, matched via the same :func:`_model_key` the
+    writer uses) so a model's own dropped fields are still pruned.
+
+    Returns ``None`` when the read fails — the caller must then SKIP the
+    column prune rather than treat "unknown" as "no claims", because
+    pruning against an empty claim set is exactly the sibling-deleting bug
+    this helper exists to prevent (a stale leftover row beats a deleted
+    live one).
+    """
+    try:
+        from src.repositories import semantic_model_repo
+
+        rows = semantic_model_repo().list_all(source=source, source_ref=source_ref)
+        if source_ref is None:
+            # `list_all(source_ref=None)` means "unfiltered", not "the NULL
+            # origin" — same narrowing `src/semantic/importer.py` applies.
+            rows = [r for r in rows if not r.get("source_ref")]
+    except Exception:
+        logger.warning(
+            "Semantic projection (%s/%s): could not read sibling models to scope the column prune.",
+            source,
+            source_ref,
+        )
+        return None
+    claims: dict[str, set[str]] = {}
+    for row in rows:
+        if row.get("status") != "valid" or not row.get("document_json"):
+            continue
+        for model in row["document_json"].get("semantic_model") or []:
+            if not isinstance(model, dict) or _model_key(model) in exclude_model_keys:
+                continue
+            for dataset in model.get("datasets") or []:
+                if not isinstance(dataset, dict):
+                    continue
+                table_id = dataset.get("source") or dataset.get("name") or ""
+                names = claims.setdefault(table_id, set())
+                for column in dataset.get("fields") or []:
+                    if isinstance(column, dict) and column.get("name"):
+                        names.add(column["name"])
+    return claims
 
 
 def _in_prune_scope(row_id: str, scope_prefixes: Optional[set[str]]) -> bool:
@@ -602,7 +798,11 @@ def _prune_glossary(
     return pruned
 
 
-def _prune_columns(source: str, written_by_table: dict[str, set[str]]) -> None:
+def _prune_columns(
+    source: str,
+    written_by_table: dict[str, set[str]],
+    keep_by_table: Optional[dict[str, set[str]]] = None,
+) -> None:
     """Prune fields dropped from a table this document still mentions.
 
     ``column_metadata`` has no ``source_ref`` column (schema predates this
@@ -615,11 +815,18 @@ def _prune_columns(source: str, written_by_table: dict[str, set[str]]) -> None:
     dropped from the document entirely (not just emptied of fields) leaves
     its old columns in place, since there is no ``column_metadata`` read
     that enumerates "every table a given source has ever written to".
+
+    ``keep_by_table`` spares additional columns per table — the claims of
+    SIBLING models sharing this scope (:func:`_sibling_column_claims`),
+    which a partial call must not treat as stale. ``None`` means "this call
+    carries the whole scope": everything in-source not written here is
+    genuinely stale.
     """
     repo = column_metadata_repo()
     for table_id, field_names in written_by_table.items():
+        keep = field_names | (keep_by_table or {}).get(table_id, set())
         for existing in repo.list_for_table(table_id):
             if (existing.get("source") or "") != source:
                 continue
-            if existing["column_name"] not in field_names:
+            if existing["column_name"] not in keep:
                 repo.delete(table_id, existing["column_name"])

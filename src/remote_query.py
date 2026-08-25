@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import duckdb
 
 from src.remote_engines import strip_one_trailing_semicolon
+
+if TYPE_CHECKING:
+    from connectors.bigquery.access import BqAccess
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 
@@ -92,6 +95,18 @@ _BLOCKED_KEYWORDS: List[str] = [
     "duckdb_views",
     "duckdb_indexes",
     "duckdb_schemas",
+    # SQLite-compat catalog views — `SELECT sql FROM sqlite_master` returns
+    # every view's CREATE VIEW body, disclosing the absolute parquet paths the
+    # orchestrator bakes into master views (`read_parquet('/data/extracts/…')`).
+    # This engine executes against a local DuckDB connection that may carry
+    # those views (the hybrid BQ+local join path), so the leak applies here too.
+    # Kept in lockstep with app/api/query.py's `_BLOCKED_SQL_TOKENS`.
+    "sqlite_master",
+    "sqlite_schema",
+    "sqlite_temp_master",
+    "sqlite_temp_schema",
+    # Leaks cached external file paths (absolute parquet paths) directly.
+    "duckdb_external_file_cache",
     "pragma_table_info",
     "pragma_storage_info",
     # Relative path traversal

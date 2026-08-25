@@ -89,17 +89,41 @@ class FileCorporaRepository:
         self,
         *,
         search: Optional[str] = None,
+        created_by: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        """List live (non-soft-deleted) corpora, name-ordered."""
+        """List live (non-soft-deleted) corpora, name-ordered.
+
+        ``created_by`` filters to one creator in SQL. The agent-scope
+        intersection needs exactly that set and runs once per brokered
+        request; without the predicate it read the whole table under a
+        100k cap and filtered in Python, on the authorization path.
+        """
         query = f"SELECT {self._SELECT} FROM file_corpora WHERE deleted_at IS NULL"
         params: List[Any] = []
         if search:
             query += " AND name ILIKE ?"
             params.append(f"%{search}%")
+        if created_by:
+            query += " AND created_by = ?"
+            params.append(created_by)
         query += " ORDER BY name LIMIT ?"
         params.append(limit)
         rows = self.conn.execute(query, params).fetchall()
+        return [dict(zip(self._COLS, r)) for r in rows]
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every live corpus, name-ordered — no cap.
+
+        The unbounded twin of :meth:`list`, whose ``limit`` defaults to 200.
+        Callers that need the whole set rather than a page — an authorization
+        input, a full listing, an id→name map — must use this: a silent
+        truncation inside an access decision fails *closed*, which surfaces as
+        "the grant is broken" rather than "the list was cut off".
+        """
+        rows = self.conn.execute(
+            f"SELECT {self._SELECT} FROM file_corpora WHERE deleted_at IS NULL ORDER BY name"
+        ).fetchall()
         return [dict(zip(self._COLS, r)) for r in rows]
 
     def soft_delete(self, corpus_id: str) -> None:

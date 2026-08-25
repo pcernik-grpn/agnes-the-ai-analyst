@@ -35,7 +35,7 @@ TOOLBAR_JS = STATIC / "js" / "filter_toolbar.js"
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
@@ -45,10 +45,9 @@ def web_client(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
-    # create_app() does not run the startup hook that normally builds these (the
+    app = shared_app
+    # shared_app does not run the startup hook that normally builds these (the
     # TestClient is used without its lifespan, like every other web-page test
     # here), so wire the two pieces the page + its endpoints read: a real repo
     # over the test system DB, and a manager whose only method they touch is

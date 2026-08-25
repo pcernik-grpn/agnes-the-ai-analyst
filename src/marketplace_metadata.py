@@ -85,7 +85,9 @@ def read_marketplace_metadata(marketplace_root: Path) -> Dict[str, Any]:
     if size > MARKETPLACE_METADATA_MAX_BYTES:
         logger.warning(
             "marketplace-metadata: %s exceeds %d-byte cap (%d bytes), refusing to read",
-            path, MARKETPLACE_METADATA_MAX_BYTES, size,
+            path,
+            MARKETPLACE_METADATA_MAX_BYTES,
+            size,
         )
         return {}
     try:
@@ -103,13 +105,16 @@ def read_marketplace_metadata(marketplace_root: Path) -> Dict[str, Any]:
         # doesn't abort the whole sync.
         logger.warning(
             "marketplace-metadata: %s parse failed (%s), treating as empty: %s",
-            path, type(e).__name__, e,
+            path,
+            type(e).__name__,
+            e,
         )
         return {}
     if not isinstance(data, dict):
         logger.warning(
             "marketplace-metadata: %s top-level must be an object, got %s",
-            path, type(data).__name__,
+            path,
+            type(data).__name__,
         )
         return {}
     return data
@@ -180,7 +185,9 @@ def _validated_string(raw: Any, field_name: str, log_prefix: str) -> str:
     if not isinstance(raw, str):
         logger.warning(
             "%s %s rejected: not a string (got %s)",
-            log_prefix, field_name, type(raw).__name__,
+            log_prefix,
+            field_name,
+            type(raw).__name__,
         )
         return ""
     return raw.strip()
@@ -208,14 +215,19 @@ def _validated_markdown(raw: Any, field_name: str, log_prefix: str) -> str:
     if not isinstance(raw, str):
         logger.warning(
             "%s %s rejected: not a string (got %s)",
-            log_prefix, field_name, type(raw).__name__,
+            log_prefix,
+            field_name,
+            type(raw).__name__,
         )
         return ""
     encoded_len = len(raw.encode("utf-8"))
     if encoded_len > MARKETPLACE_METADATA_FIELD_MAX_BYTES:
         logger.warning(
             "%s %s truncated: %d bytes exceeds per-field cap %d",
-            log_prefix, field_name, encoded_len, MARKETPLACE_METADATA_FIELD_MAX_BYTES,
+            log_prefix,
+            field_name,
+            encoded_len,
+            MARKETPLACE_METADATA_FIELD_MAX_BYTES,
         )
         # Truncate to the cap measured in UTF-8 bytes; use a generous slice
         # of CHARS first, then bisect down on bytes (cheap; runs once when
@@ -246,36 +258,42 @@ def _validated_use_cases(raw: Any, log_prefix: str) -> List[Dict[str, str]]:
     if not isinstance(raw, list):
         logger.warning(
             "%s use_cases rejected: not a list (got %s)",
-            log_prefix, type(raw).__name__,
+            log_prefix,
+            type(raw).__name__,
         )
         return []
     out: List[Dict[str, str]] = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
             logger.warning(
-                "%s use_cases[%d] rejected: not an object", log_prefix, i,
+                "%s use_cases[%d] rejected: not an object",
+                log_prefix,
+                i,
             )
             continue
         title = entry.get("title")
         description = entry.get("description")
         prompt = entry.get("prompt")
-        if not all(isinstance(v, str) and v.strip()
-                   for v in (title, description, prompt)):
+        if not all(isinstance(v, str) and v.strip() for v in (title, description, prompt)):
             logger.warning(
                 "%s use_cases[%d] rejected: missing title/description/prompt",
-                log_prefix, i,
+                log_prefix,
+                i,
             )
             continue
-        out.append({
-            "title": title.strip(),                       # type: ignore[union-attr]
-            "description": description.strip(),           # type: ignore[union-attr]
-            "prompt": prompt.strip(),                     # type: ignore[union-attr]
-        })
+        out.append(
+            {
+                "title": title.strip(),  # type: ignore[union-attr]
+                "description": description.strip(),  # type: ignore[union-attr]
+                "prompt": prompt.strip(),  # type: ignore[union-attr]
+            }
+        )
     return out
 
 
 def _validated_sample_interaction(
-    raw: Any, log_prefix: str,
+    raw: Any,
+    log_prefix: str,
 ) -> Optional[Dict[str, str]]:
     """Validate ``sample_interaction``: ``{user, assistant}`` both required.
 
@@ -288,13 +306,13 @@ def _validated_sample_interaction(
     if not isinstance(raw, dict):
         logger.warning(
             "%s sample_interaction rejected: not an object (got %s)",
-            log_prefix, type(raw).__name__,
+            log_prefix,
+            type(raw).__name__,
         )
         return None
     user = raw.get("user")
     assistant = raw.get("assistant")
-    if not (isinstance(user, str) and user.strip()
-            and isinstance(assistant, str) and assistant.strip()):
+    if not (isinstance(user, str) and user.strip() and isinstance(assistant, str) and assistant.strip()):
         logger.warning(
             "%s sample_interaction rejected: user/assistant both required",
             log_prefix,
@@ -306,7 +324,9 @@ def _validated_sample_interaction(
     return {
         "user": user.strip(),
         "assistant": _validated_markdown(
-            assistant, "sample_interaction.assistant", log_prefix,
+            assistant,
+            "sample_interaction.assistant",
+            log_prefix,
         ),
     }
 
@@ -344,6 +364,12 @@ def resolve_plugin_metadata(
 
     * ``raw_section`` — the original dict (for the inner-detail path that
       needs to drill into ``skills`` / ``agents``).
+
+    Lifecycle (acted on at sync time, surfaced by the admin API):
+    * ``deprecated`` — present (and ``True``) only when the section carries
+      the literal boolean ``true``; see :func:`plugin_deprecation_from_section`.
+    * ``deprecation_note`` / ``replacement`` — optional single-line strings,
+      only alongside ``deprecated``.
     """
     section = get_plugin_section(metadata, plugin_name)
     if not section:
@@ -381,17 +407,23 @@ def resolve_plugin_metadata(
     # Rich user-facing fields (added 2026-05-12 for plugin-level rich content
     # rendering). All optional — UI sections only render when present.
     display_name = _validated_string(
-        section.get("display_name"), "display_name", log_prefix,
+        section.get("display_name"),
+        "display_name",
+        log_prefix,
     )
     if display_name:
         out["display_name"] = display_name
     tagline = _validated_string(
-        section.get("tagline"), "tagline", log_prefix,
+        section.get("tagline"),
+        "tagline",
+        log_prefix,
     )
     if tagline:
         out["tagline"] = tagline
     description = _validated_markdown(
-        section.get("description"), "description", log_prefix,
+        section.get("description"),
+        "description",
+        log_prefix,
     )
     if description:
         out["description"] = description
@@ -399,12 +431,67 @@ def resolve_plugin_metadata(
     if use_cases:
         out["use_cases"] = use_cases
     sample_interaction = _validated_sample_interaction(
-        section.get("sample_interaction"), log_prefix,
+        section.get("sample_interaction"),
+        log_prefix,
     )
     if sample_interaction is not None:
         out["sample_interaction"] = sample_interaction
 
+    out.update(plugin_deprecation_from_section(section, log_prefix))
+
     return out
+
+
+def plugin_deprecation_from_section(
+    section: Dict[str, Any],
+    log_prefix: str,
+) -> Dict[str, Any]:
+    """Validate the curator-side lifecycle fields of one plugin section.
+
+    Returns ``{}`` unless the section carries the literal boolean
+    ``"deprecated": true`` — any other value (``"true"``, ``1``, …) is
+    rejected with a warning so a curator typo can never retire a plugin.
+    With the flag present, optional single-line ``deprecation_note`` and
+    ``replacement`` strings ride along. The sync pipeline admin-disables
+    flagged plugins (one-way — removing the flag never auto-re-enables);
+    the admin API reads the same fields on demand for the Details modal.
+    """
+    deprecated = section.get("deprecated")
+    if deprecated is None or deprecated is False:
+        return {}
+    if deprecated is not True:
+        logger.warning(
+            "%s deprecated rejected: must be the literal boolean true (got %s)",
+            log_prefix,
+            type(deprecated).__name__,
+        )
+        return {}
+    out: Dict[str, Any] = {"deprecated": True}
+    note = _validated_string(section.get("deprecation_note"), "deprecation_note", log_prefix)
+    if note:
+        out["deprecation_note"] = note
+    replacement = _validated_string(section.get("replacement"), "replacement", log_prefix)
+    if replacement:
+        out["replacement"] = replacement
+    return out
+
+
+def plugin_deprecation(
+    metadata: Dict[str, Any],
+    plugin_name: str,
+) -> Dict[str, Any]:
+    """Lifecycle-only view of :func:`resolve_plugin_metadata`.
+
+    For request-time callers (the admin plugin listing) that need just the
+    deprecation fields — skips doc-link/cover validation and its log noise.
+    """
+    section = get_plugin_section(metadata, plugin_name)
+    if not section:
+        return {}
+    return plugin_deprecation_from_section(
+        section,
+        f"marketplace-metadata plugin={plugin_name}:",
+    )
 
 
 def resolve_inner_metadata(
@@ -426,9 +513,7 @@ def resolve_inner_metadata(
     if not section:
         return {}
 
-    log_prefix = (
-        f"marketplace-metadata plugin={plugin_name} {kind[:-1]}={inner_name}:"
-    )
+    log_prefix = f"marketplace-metadata plugin={plugin_name} {kind[:-1]}={inner_name}:"
     out: Dict[str, Any] = {"raw_section": section}
 
     cover = section.get("cover_photo")
@@ -452,12 +537,16 @@ def resolve_inner_metadata(
     # the 2026-05-12 redesign). All optional — UI hides each section when
     # the corresponding field is absent.
     display_name = _validated_string(
-        section.get("display_name"), "display_name", log_prefix,
+        section.get("display_name"),
+        "display_name",
+        log_prefix,
     )
     if display_name:
         out["display_name"] = display_name
     tagline = _validated_string(
-        section.get("tagline"), "tagline", log_prefix,
+        section.get("tagline"),
+        "tagline",
+        log_prefix,
     )
     if tagline:
         out["tagline"] = tagline
@@ -466,12 +555,16 @@ def resolve_inner_metadata(
     # the fallback so existing skill/agent pages don't lose their badge
     # until curators opt in to per-item categorization.
     category = _validated_string(
-        section.get("category"), "category", log_prefix,
+        section.get("category"),
+        "category",
+        log_prefix,
     )
     if category:
         out["category"] = category
     description = _validated_markdown(
-        section.get("description"), "description", log_prefix,
+        section.get("description"),
+        "description",
+        log_prefix,
     )
     if description:
         out["description"] = description
@@ -479,12 +572,15 @@ def resolve_inner_metadata(
     if use_cases:
         out["use_cases"] = use_cases
     sample_interaction = _validated_sample_interaction(
-        section.get("sample_interaction"), log_prefix,
+        section.get("sample_interaction"),
+        log_prefix,
     )
     if sample_interaction is not None:
         out["sample_interaction"] = sample_interaction
     when_to_use = _validated_markdown(
-        section.get("when_to_use"), "when_to_use", log_prefix,
+        section.get("when_to_use"),
+        "when_to_use",
+        log_prefix,
     )
     if when_to_use:
         out["when_to_use"] = when_to_use
@@ -493,7 +589,9 @@ def resolve_inner_metadata(
     # the API/template falls back to the computed
     # "<manifest_name>:<inner_name>" so legacy items still show a chip.
     invocation = _validated_string(
-        section.get("invocation"), "invocation", log_prefix,
+        section.get("invocation"),
+        "invocation",
+        log_prefix,
     )
     if invocation:
         out["invocation"] = invocation
@@ -548,9 +646,10 @@ def collect_all_external_urls(
             continue
         for inner_name in inner_map.keys():
             inner_resolved = resolve_inner_metadata(
-                metadata, plugin_name, kind, inner_name,
+                metadata,
+                plugin_name,
+                kind,
+                inner_name,
             )
             out.extend(collect_external_urls(inner_resolved))
     return out
-
-

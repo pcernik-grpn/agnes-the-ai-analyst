@@ -123,6 +123,25 @@ def test_prepare_session_dir_without_profile_symlinks_claude_md(workdir_mgr: Wor
     assert (sdir / "CLAUDE.md").is_symlink()
 
 
+def test_prepare_session_dir_replaces_dangling_symlinks(workdir_mgr: WorkdirManager):
+    """Regression: re-preparing a session dir that holds a DANGLING symlink
+    (e.g. created under a relative DATA_DIR, whose target resolves against the
+    link's own directory) must replace it, not die with FileExistsError —
+    ``exists()`` follows the link and reports False, so the recreate fired on
+    a path that was already occupied. Hit live on the post-restart resume
+    path (`_resume_from_row` → prepare_session_dir)."""
+    workdir_mgr.ensure_user_workdir("u@x")
+    sdir = workdir_mgr.prepare_session_dir("u@x", "chat_dangle")
+    link = sdir / "CLAUDE.md"
+    assert link.is_symlink()
+    link.unlink()
+    link.symlink_to("data/nonexistent/CLAUDE.md")  # dangling
+    assert link.is_symlink() and not link.exists()
+    sdir2 = workdir_mgr.prepare_session_dir("u@x", "chat_dangle")  # must not raise
+    assert sdir2 == sdir
+    assert (sdir / "CLAUDE.md").exists()  # re-pointed at the real workspace file
+
+
 def test_purge_user_removes_root(workdir_mgr: WorkdirManager):
     workdir_mgr.ensure_user_workdir("u@x")
     n = workdir_mgr.purge_user("u@x")

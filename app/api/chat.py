@@ -510,6 +510,12 @@ async def list_messages(
             "role": m.role,
             "content": m.content,
             "tool_calls": m.tool_calls,
+            # The turn's ordered shape, so a reload renders prose and tool
+            # cards in the sequence they actually happened (#1504). NULL for a
+            # row written before schema v123 — the client falls back to the
+            # positionless `tool_calls` above and renders those after the
+            # answer, which is all the old row can honestly support.
+            "parts": m.parts,
             # The composer reads this for two filters, both of which are dead
             # without it: the ArrowUp prompt-recall stack (a co-drive peer's
             # prompt must not surface under the owner's history) and

@@ -590,3 +590,90 @@ def test_web_uploaded_metrics_are_a_distinct_writer(seeded_app):
     row = metric_repo().get("ops/uploaded")
     assert row is not None
     assert row["source"] == "web_upload", "an upload must not claim to be the CLI's yaml_import"
+
+
+#: The door itself, asserted as a LINK — the page's own CSS legitimately
+#: names the path in a comment, so a bare substring check would pass on
+#: styling alone and never notice a missing anchor.
+_DOOR = 'href="/semantic-layer"'
+
+
+class TestCatalogSemanticsDoorToTheDocument:
+    """This page renders the FLAT projection (`metric_definitions` +
+    `glossary_terms`); the stored Ossie document itself is browsed at
+    `/semantic-layer`. Both are titled "Semantic layer", and this is the more
+    reachable of the two, so a model with datasets and relationships but no
+    metrics rendered "No metrics registered yet" here with nothing pointing at
+    the document — the page read as "there is no semantic layer" while there
+    was one. `/library`'s Definitions block already offers the door on exactly
+    this condition (`has_semantic_models`); the standalone page did not.
+
+    Gated on the same `_can_read_model` tier as the browse pages, NOT on the
+    projection's counts: a caller who can read no model must not be sent to an
+    empty page.
+    """
+
+    def _seed_model(self, *, slug: str = "retail", status: str = "valid") -> dict:
+        from src.repositories import semantic_model_repo
+
+        return semantic_model_repo().upsert(
+            id=f"manual/_/{slug}",
+            slug=slug,
+            name=slug,
+            description="Retail domain: orders and customers.",
+            document="# fixture",
+            document_json={
+                "semantic_model": [
+                    {
+                        "name": slug,
+                        "datasets": [{"name": "orders", "source": "db.public.orders", "fields": []}],
+                    }
+                ]
+            },
+            spec_version="0.2.0.dev0",
+            content_hash=f"hash-{slug}",
+            source="manual",
+            source_ref=None,
+            status=status,
+            validation_errors=None,
+            validated_at=None,
+        )
+
+    def _body(self, seeded_app, token_key: str) -> str:
+        resp = seeded_app["client"].get("/catalog/semantics", headers=_auth(seeded_app[token_key]))
+        assert resp.status_code == 200
+        return resp.text
+
+    def test_no_door_when_the_instance_has_no_model(self, seeded_app):
+        body = self._body(seeded_app, "admin_token")
+        assert _DOOR not in body, (
+            "offered the browse page with no model to browse — the link must be "
+            "gated on a readable document, not rendered unconditionally"
+        )
+
+    def test_door_is_offered_when_a_readable_model_exists(self, seeded_app):
+        self._seed_model()
+        body = self._body(seeded_app, "admin_token")
+        assert _DOOR in body
+
+    def test_empty_state_names_the_document_instead_of_only_the_import_command(self, seeded_app):
+        """The exact confusion this fixes: zero metrics is the DEFAULT state of
+        a converted document (an upstream model may declare datasets and
+        relationships and no aggregations at all), so the empty state must
+        explain the split rather than imply nothing was imported."""
+        self._seed_model()
+        body = self._body(seeded_app, "admin_token")
+        assert "No metrics registered yet" in body
+        assert _DOOR in body
+        assert "agnes admin metrics import docs/metrics/" in body, (
+            "the import hint is still the right next step for an instance that "
+            "wants metrics — the document link is added beside it, not instead of it"
+        )
+
+    def test_analyst_without_a_grant_is_not_sent_to_a_page_they_cannot_read(self, seeded_app):
+        """`_can_read_model` is not admin-only, but it is not open either: an
+        analyst with neither a direct model grant nor a Data Package grant
+        would get a 404/empty browse page, so they must not see the door."""
+        self._seed_model()
+        body = self._body(seeded_app, "analyst_token")
+        assert _DOOR not in body

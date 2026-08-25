@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-import duckdb
 import pytest
+import sqlalchemy as sa
 
 
 # ---------------------------------------------------------------------------
@@ -24,9 +24,17 @@ import pytest
 
 def _make_duckdb_repo(tmp_path):
     from src.db import _ensure_schema
+    from src.duckdb_conn import _open_duckdb
     from src.repositories.audit import AuditRepository
 
-    conn = duckdb.connect(str(tmp_path / "duck.duckdb"))
+    # Route through _open_duckdb (not a bare duckdb.connect()) so this
+    # connection gets the same `SET GLOBAL TimeZone='UTC'` pin every
+    # production connection gets (src/duckdb_conn.py). prune_older_than
+    # is the first audit method whose correctness hinges on DB-server
+    # `current_timestamp` arithmetic rather than a Python-supplied
+    # cutoff, so the boundary tests below need production's timezone
+    # guarantee to be meaningful.
+    conn = _open_duckdb(str(tmp_path / "duck.duckdb"))
     _ensure_schema(conn)
     return AuditRepository(conn), conn
 
@@ -401,6 +409,7 @@ def _as_dict(v):
 # include_self_reads filters (same semantics both backends)
 # ---------------------------------------------------------------------------
 
+
 def _seed_parity_rows(repo):
     repo.log(user_id="u1", action="table.read", result="success", client_kind="cli")
     repo.log(user_id="u1", action="table.read", result="ok", client_kind="cli")
@@ -487,17 +496,117 @@ def test_log_autofills_duration_from_request_context(audit_repo):
     assert by_action["in.scope"] is not None and by_action["in.scope"] >= 0
 
 
+# ---------------------------------------------------------------------------
+# B8: prune_older_than — retention-based audit_log pruning
+# ---------------------------------------------------------------------------
+
+
+def _backdate(audit_repo_tuple, entry_id: str, ts: datetime) -> None:
+    """Rewrite one row's ``timestamp`` directly — ``log()`` always stamps
+    ``now()``, so the prune tests need an implementation-specific path to
+    plant an old row, exactly like ``test_query_time_range``'s docstring
+    notes for the same reason."""
+    repo, conn, backend = audit_repo_tuple
+    if backend == "duckdb":
+        conn.execute("UPDATE audit_log SET timestamp = ? WHERE id = ?", [ts, entry_id])
+    else:
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text("UPDATE audit_log SET timestamp = :ts WHERE id = :id"),
+                {"ts": ts, "id": entry_id},
+            )
+
+
+def test_prune_older_than_deletes_only_old_rows(audit_repo):
+    repo, _, _ = audit_repo
+    old_id = repo.log(action="old.one")
+    new_id = repo.log(action="new.one")
+    _backdate(audit_repo, old_id, datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 1
+    rows, _ = repo.query(limit=10)
+    ids = {r["id"] for r in rows}
+    assert old_id not in ids
+    assert new_id in ids
+
+
+def test_prune_older_than_returns_zero_when_nothing_qualifies(audit_repo):
+    repo, _, _ = audit_repo
+    repo.log(action="recent.one")
+    repo.log(action="recent.two")
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 0
+    rows, _ = repo.query(limit=10)
+    assert len(rows) == 2
+
+
+def test_prune_older_than_boundary_is_strict_less_than_on_both_backends(audit_repo):
+    """Pins the DELETE's cutoff semantics at the boundary — both engines run
+    ``timestamp < (current_timestamp - INTERVAL 'N days')`` (see
+    ``AuditRepository.prune_older_than`` / ``AuditPgRepository.prune_older_than``),
+    where ``current_timestamp`` is evaluated by the DATABASE SERVER at
+    DELETE-execution time, not supplied by Python. That distinction is the
+    whole point of this test: a Python-computed "exact cutoff" isn't the same
+    instant the SQL sees, so the boundary case needs its own assertion rather
+    than trusting the 400-day-old / 0-day-old cases above to generalize.
+
+    Three rows around one nominal cutoff (``now - retention_days``, using a
+    single Python ``datetime.now(timezone.utc)`` reference captured before
+    any row is written):
+      - ``+1 minute`` (inside the retention window)  -> must survive
+      - ``-1 minute`` (outside the retention window)  -> must be pruned
+      - exactly the nominal cutoff                    -> must be pruned
+
+    The exact-cutoff row's fate is NOT a coin flip pinned arbitrarily: real
+    wall-clock time elapses between capturing the Python ``now`` reference
+    and the DELETE actually running (three ``log()`` INSERTs, three backdating
+    UPDATEs, then the DELETE itself), so the database's own
+    ``current_timestamp`` at DELETE time is always strictly LATER than the
+    Python reference — which pushes the DB-computed cutoff (``db_now - N
+    days``) strictly later than the row's timestamp (``python_now - N
+    days``), landing the row on the strict-``<`` (pruned) side every time.
+    Both backends must agree on this, since they share the identical
+    ``timestamp < cutoff`` shape.
+    """
+    retention_days = 30
+    repo, _, _ = audit_repo
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=retention_days)
+
+    survivor_id = repo.log(action="survivor")
+    exact_boundary_id = repo.log(action="exact-boundary")
+    pruned_id = repo.log(action="just-past-cutoff")
+
+    _backdate(audit_repo, survivor_id, cutoff + timedelta(minutes=1))
+    _backdate(audit_repo, exact_boundary_id, cutoff)
+    _backdate(audit_repo, pruned_id, cutoff - timedelta(minutes=1))
+
+    pruned_count = repo.prune_older_than(retention_days)
+
+    rows, _ = repo.query(limit=10)
+    remaining_ids = {r["id"] for r in rows}
+
+    assert survivor_id in remaining_ids
+    assert pruned_id not in remaining_ids
+    # Boundary-semantics pin: strict `<` against the DB server's own clock
+    # (not the Python reference) puts the exact-cutoff row on the PRUNED
+    # side — identically on DuckDB and Postgres.
+    assert exact_boundary_id not in remaining_ids
+    assert pruned_count == 2
+
+
 def test_upload_filenames_since_parses_params_on_both_engines(audit_repo):
     """PR-C: the reconciliation source — distinct session.upload filenames.
     Exercises the JSONB-vs-JSON-string params divergence between engines."""
     repo, _, _ = audit_repo
     since = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    repo.log(user_id="u1", action="session.upload",
-             params={"bytes": 1, "filename": "aaa.jsonl"})
-    repo.log(user_id="u1", action="session.upload",
-             params={"bytes": 2, "filename": "aaa.jsonl"})  # dup → distinct
-    repo.log(user_id="u2", action="session.upload",
-             params={"bytes": 3, "filename": "bbb.jsonl"})
+    repo.log(user_id="u1", action="session.upload", params={"bytes": 1, "filename": "aaa.jsonl"})
+    repo.log(user_id="u1", action="session.upload", params={"bytes": 2, "filename": "aaa.jsonl"})  # dup → distinct
+    repo.log(user_id="u2", action="session.upload", params={"bytes": 3, "filename": "bbb.jsonl"})
     repo.log(user_id="u2", action="session.upload", params={"bytes": 4})  # no filename
     repo.log(user_id="u2", action="other.action", params={"filename": "zzz.jsonl"})
     assert repo.upload_filenames_since(since) == ["aaa.jsonl", "bbb.jsonl"]

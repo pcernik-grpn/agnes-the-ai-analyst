@@ -13,6 +13,14 @@
 {% set page_hero_title = "Audit log" %}
 {% set page_hero_subtitle = "Every admin and user-mutating action — RBAC writes, sync triggers, marketplace edits, …" %}
 
+{# B8: fan-out to the other audit-trail viewers this page does NOT cover —
+   CLI session transcripts and tool/skill telemetry. Real links, not an
+   embedded re-implementation; each destination keeps its own page and URL. #}
+{% block toolbar %}
+{{ ds.button('Analyst sessions', variant='secondary', size='sm', href='/admin/sessions') }}
+{{ ds.button('Telemetry', variant='secondary', size='sm', href='/admin/telemetry') }}
+{% endblock %}
+
 {% block page %}
 {# Design-system component macros — the buttons (Reset, Load more, side-panel
    close + quick-filter actions) render via `ds.button` (auto-imported by

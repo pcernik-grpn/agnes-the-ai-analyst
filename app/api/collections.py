@@ -209,7 +209,7 @@ def _accessible_corpus_ids(user) -> list[str]:
     (no raw DuckDB conn) → correct on the Postgres backend.
     """
     allowed = accessible_collection_ids(user)
-    rows = file_corpora_repo().list()
+    rows = file_corpora_repo().list_all()
     if allowed is None:
         return [r["id"] for r in rows]
     return [r["id"] for r in rows if r["id"] in allowed]
@@ -221,7 +221,7 @@ async def list_collections(
 ):
     """List collections accessible to the caller (fail-closed)."""
     allowed = accessible_collection_ids(user)  # None => admin
-    rows = [r for r in file_corpora_repo().list() if allowed is None or r["id"] in allowed]
+    rows = [r for r in file_corpora_repo().list_all() if allowed is None or r["id"] in allowed]
     return {"items": [_collection_out(r) for r in rows]}
 
 

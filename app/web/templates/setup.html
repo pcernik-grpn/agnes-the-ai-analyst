@@ -9,6 +9,19 @@
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<style>
+  /* Honest guidance pane (Step 2) — same shape as the CSV guidance already
+     shipped on /admin/data-sources (`.ds-wguide` in admin_data_sources.html):
+     there is no CSV connector, so instead of a dead-end tile the wizard
+     points at the Library. */
+  .ds-wguide {
+    border: 1px solid var(--ds-border); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px;
+    background: var(--ds-surface-dim); font-size: 13px;
+    color: var(--ds-text-secondary);
+  }
+  .ds-wguide a { color: var(--ds-primary); }
+</style>
 {% endblock %}
 
 {% block content %}
@@ -71,7 +84,6 @@
                         style="width: 100%; padding: 10px 12px; border: 1px solid var(--ds-border); border-radius: 6px; margin-bottom: 12px; font-size: 14px; box-sizing: border-box; background: var(--ds-surface); color: var(--ds-text-primary);">
                         <option value="keboola">Keboola</option>
                         <option value="bigquery">BigQuery</option>
-                        <option value="local">Local / CSV</option>
                     </select>
                     {{ ds.dropdown(
                         id='data-source-dd', target='data-source',
@@ -79,9 +91,18 @@
                         options=[
                           {'value': 'keboola', 'label': 'Keboola'},
                           {'value': 'bigquery', 'label': 'BigQuery'},
-                          {'value': 'local', 'label': 'Local / CSV'},
                         ],
                     ) }}
+
+                    {# Honest guidance: there is no CSV connector (files enter
+                       through Library Collections). Was a dead-end "Local /
+                       CSV" tile that landed on Step 4's "Start First Sync"
+                       with no upload UI. #}
+                    <div class="ds-wguide">
+                        <p>Need to load files instead? There's no CSV connector —
+                           skip this step and upload documents into a Collection in
+                           the <a href="/library">Library</a> once you're signed in.</p>
+                    </div>
 
                     <div id="keboola-fields">
                         <label style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Keboola URL</label>
@@ -262,11 +283,7 @@ async function configureSource(e) {
         }
         if (!saved.ok) throw new Error(window.apiDetailText(saved.data.detail, 'Request failed'));
         showStatus('Connection verified!', 'success');
-        if (src === 'local') {
-            goToStep(4);
-        } else {
-            goToStep(3);
-        }
+        goToStep(3);
     } catch (err) {
         showStatus(err.message, 'error');
     } finally {

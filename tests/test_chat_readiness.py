@@ -454,3 +454,64 @@ def test_secrets_endpoints_require_admin(monkeypatch):
     assert client.get("/admin/chat/readiness").status_code == 403
     assert client.post("/admin/chat/secrets", json={"e2b_api_key": "x"}).status_code == 403
     assert client.post("/admin/chat/secrets/test").status_code == 403
+
+
+# --- kai-agent: the two cost caps the engine cannot feed ---
+
+
+def _kai_cfg(**over):
+    from types import SimpleNamespace
+
+    base = dict(
+        enabled=True,
+        provider="kai-agent",
+        kai_agent_url="http://kai-agent:3000",
+        e2b_template_id=None,
+        docker_image=None,
+        daily_anthropic_spend_usd=20.0,
+        max_session_tokens=200_000,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_readiness_names_the_caps_the_engine_cannot_meter(monkeypatch):
+    """`daily_anthropic_spend_usd` and `max_session_tokens` are enforced off
+    `chat_messages.tokens_in/out`, which only a usage-carrying frame writes.
+    The engine's SSE stream carries none, so on this provider both are inert —
+    and both ship LIVE defaults, so flipping one YAML key silently removes two
+    budgets instance-wide. An operator should not learn that from a bill.
+    """
+    from app.chat.readiness import secret_status
+
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
+    out = secret_status(_kai_cfg())
+    assert set(out["unmetered_caps"]) == {"daily_anthropic_spend_usd", "max_session_tokens"}
+
+
+def test_a_cap_explicitly_disabled_is_not_reported_as_unmetered(monkeypatch):
+    """Only a cap the operator actually set is worth warning about — one
+    already turned off is not a surprise waiting to happen."""
+    from app.chat.readiness import secret_status
+
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
+    out = secret_status(_kai_cfg(daily_anthropic_spend_usd=0, max_session_tokens=0))
+    assert out["unmetered_caps"] == []
+
+
+def test_other_providers_meter_normally(monkeypatch):
+    """Non-vacuity: the native runner writes usage, so its caps are live and
+    must not be reported as inert."""
+    from types import SimpleNamespace
+
+    from app.chat.readiness import secret_status
+
+    cfg = SimpleNamespace(
+        enabled=True,
+        provider="e2b",
+        e2b_template_id="t",
+        docker_image=None,
+        daily_anthropic_spend_usd=20.0,
+        max_session_tokens=200_000,
+    )
+    assert secret_status(cfg)["unmetered_caps"] == []

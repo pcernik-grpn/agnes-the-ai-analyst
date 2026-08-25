@@ -495,6 +495,7 @@ class ChatRepository:
         role: str,
         content: str,
         tool_calls: Optional[list[dict]] = None,
+        parts: Optional[list[dict]] = None,
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         model: Optional[str] = None,
@@ -506,6 +507,7 @@ class ChatRepository:
                 role=role,
                 content=content,
                 tool_calls=tool_calls,
+                parts=parts,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 model=model,
@@ -525,14 +527,15 @@ class ChatRepository:
         # read-time-derivation approach for both columns for consistency.
         self._conn.execute(
             "INSERT INTO chat_messages "
-            "(id, session_id, role, content, tool_calls, tokens_in, tokens_out, model, sender_email, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, model, sender_email, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 msg_id,
                 session_id,
                 role,
                 content,
                 json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(parts) if parts else None,
                 tokens_in,
                 tokens_out,
                 model,
@@ -546,6 +549,7 @@ class ChatRepository:
             role=role,
             content=content,
             tool_calls=tool_calls,
+            parts=parts,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             model=model,
@@ -569,7 +573,7 @@ class ChatRepository:
             cutoff = None
 
         q = (
-            "SELECT id, session_id, role, content, tool_calls, tokens_in, tokens_out, "
+            "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
             "model, sender_email, created_at FROM chat_messages WHERE session_id = ?"
         )
         params: list = [session_id]
@@ -587,11 +591,12 @@ class ChatRepository:
                 role=r[2],
                 content=r[3],
                 tool_calls=json.loads(r[4]) if r[4] else None,
-                tokens_in=r[5],
-                tokens_out=r[6],
-                model=r[7],
-                sender_email=r[8],
-                created_at=r[9],
+                parts=json.loads(r[5]) if r[5] else None,
+                tokens_in=r[6],
+                tokens_out=r[7],
+                model=r[8],
+                sender_email=r[9],
+                created_at=r[10],
             )
             for r in rows
         ]
@@ -607,7 +612,7 @@ class ChatRepository:
         if self._messages_pg is not None:
             return self._messages_pg.list_recent_messages(session_id, limit=limit)
         rows = self._conn.execute(
-            "SELECT id, session_id, role, content, tool_calls, tokens_in, tokens_out, "
+            "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, tokens_out, "
             "model, sender_email, created_at FROM chat_messages WHERE session_id = ? "
             "ORDER BY created_at DESC LIMIT ?",
             [session_id, limit],
@@ -619,11 +624,12 @@ class ChatRepository:
                 role=r[2],
                 content=r[3],
                 tool_calls=json.loads(r[4]) if r[4] else None,
-                tokens_in=r[5],
-                tokens_out=r[6],
-                model=r[7],
-                sender_email=r[8],
-                created_at=r[9],
+                parts=json.loads(r[5]) if r[5] else None,
+                tokens_in=r[6],
+                tokens_out=r[7],
+                model=r[8],
+                sender_email=r[9],
+                created_at=r[10],
             )
             for r in rows
         ]
@@ -735,6 +741,7 @@ class ChatRepository:
         invitee_email: str,
         invitee_user_id: str,
         seed_summary: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> ChatSession:
         """Create a fresh co-session (is_co_session=TRUE, ephemeral=TRUE) with
         the owner + invitee as participants. Never blind-clones the source
@@ -753,8 +760,9 @@ class ChatRepository:
                 invitee_email=invitee_email,
                 invitee_user_id=invitee_user_id,
                 seed_summary=seed_summary,
+                session_id=session_id,
             )
-        chat_id = _gen_id("chat")
+        chat_id = session_id or _gen_id("chat")
         now = datetime.now(timezone.utc)
         self._conn.execute(
             "INSERT INTO chat_sessions "
@@ -790,6 +798,7 @@ class ChatRepository:
         *,
         source_session_id: str,
         owner_email: str,
+        session_id: Optional[str] = None,
     ) -> str:
         """Fork a co-session into a private non-ephemeral session for ``owner_email``.
 
@@ -804,8 +813,9 @@ class ChatRepository:
             return self._participants_pg.fork_co_session_to_private(
                 source_session_id=source_session_id,
                 owner_email=owner_email,
+                session_id=session_id,
             )
-        chat_id = _gen_id("chat")
+        chat_id = session_id or _gen_id("chat")
         now = datetime.now(timezone.utc)
         self._conn.execute(
             "INSERT INTO chat_sessions "

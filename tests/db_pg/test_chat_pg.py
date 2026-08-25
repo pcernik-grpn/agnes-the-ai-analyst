@@ -216,6 +216,42 @@ def test_tool_calls_round_trip(sessions, messages):
     assert got.tool_calls == payload
 
 
+def test_parts_round_trip(sessions, messages):
+    """The turn's ordered shape (schema v123) must survive the store on BOTH
+    backends — it is what keeps prose and tool cards interleaved after a
+    reload, so a backend that silently dropped it would resurrect #1504 on
+    that engine only."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    parts = [
+        {"type": "text", "text": "Checking."},
+        {
+            "type": "tool",
+            "tool_use_id": "c1",
+            "tool": "Bash",
+            "args": {"command": "agnes catalog"},
+            "state": "output-available",
+            "result": {"columns": ["a"], "rows": [[1]]},
+            "is_error": False,
+        },
+        {"type": "text", "text": "Two tables."},
+    ]
+    messages.append_message(session_id=s.id, role="assistant", content="Checking.\n\nTwo tables.", parts=parts)
+    got = messages.list_messages(s.id)[0]
+    assert got.parts == parts, "order, nesting and the tool's state must all round-trip"
+    assert [p["type"] for p in got.parts] == ["text", "tool", "text"]
+    assert got.parts[1]["state"] == "output-available"
+
+
+def test_parts_default_to_null_not_an_empty_list(sessions, messages):
+    """A message written without parts (a user turn, or a pre-v123 writer)
+    leaves the column NULL, which is what the client reads as "fall back to
+    tool_calls" rather than "this turn had no content"."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    messages.append_message(session_id=s.id, role="user", content="hi")
+    got = messages.list_messages(s.id)[0]
+    assert got.parts is None
+
+
 def test_get_first_user_message(sessions, messages):
     s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
     messages.append_message(session_id=s.id, role="assistant", content="greeting")
@@ -855,3 +891,60 @@ def test_session_responses_carry_agent_id_on_postgres(engine, monkeypatch):
     assert listed.status_code == 200, listed.text
     row = next(s for s in listed.json() if s["id"] == created.json()["id"])
     assert row["agent_id"] == agent_id
+
+
+# --- Both forks are session CREATORS: they must honour a caller-owned id ---
+
+
+def test_both_forks_honour_an_explicit_session_id_pg(sessions, participants):
+    """`chat.provider: kai-agent` requires every session id to be a uuid (the
+    engine's own chat column is one), so `ChatManager.create_session` and the
+    Slack twin thread `engine_session_id(config)` into the repo.
+
+    A fork is a creator too. Both fork methods used to mint `chat_<hex>`
+    unconditionally on BOTH backends, so on an engine instance co-drive was
+    dead on arrival — the forked row could never spawn, and the error card
+    told the user the conversation "predates" a provider it was seconds
+    younger than. The id decision has to reach every creator, not the two that
+    happened to be in view.
+    """
+    import uuid
+
+    s0 = sessions.create_session(user_email="o@x.com", surface=Surface.WEB)
+
+    co_id = str(uuid.uuid4())
+    co = participants.fork_session_as_co_session(
+        s0.id,
+        owner_email="o@x.com",
+        owner_user_id="u-o",
+        invitee_email="c@x.com",
+        invitee_user_id="u-c",
+        session_id=co_id,
+    )
+    assert co.id == co_id
+    assert uuid.UUID(co.id)
+
+    priv_id = str(uuid.uuid4())
+    got = participants.fork_co_session_to_private(
+        source_session_id=co.id,
+        owner_email="o@x.com",
+        session_id=priv_id,
+    )
+    assert got == priv_id
+    assert uuid.UUID(got)
+
+
+def test_both_forks_still_mint_the_default_shape_without_one_pg(sessions, participants):
+    """Non-vacuity: omitting the id keeps the repo's own `chat_<hex>`, so this
+    is a threading change rather than a change of default."""
+    s0 = sessions.create_session(user_email="o@x.com", surface=Surface.WEB)
+    co = participants.fork_session_as_co_session(
+        s0.id,
+        owner_email="o@x.com",
+        owner_user_id="u-o",
+        invitee_email="c@x.com",
+        invitee_user_id="u-c",
+    )
+    assert co.id.startswith("chat_")
+    priv = participants.fork_co_session_to_private(source_session_id=co.id, owner_email="o@x.com")
+    assert priv.startswith("chat_")

@@ -5,38 +5,35 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def fresh_client(tmp_path, monkeypatch):
+def fresh_client(tmp_path, monkeypatch, shared_app):
     """Client with EMPTY database — no users."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     return TestClient(app)
 
 
 @pytest.fixture
-def seeded_client(tmp_path, monkeypatch):
+def seeded_client(tmp_path, monkeypatch, shared_app):
     """Client with one existing seed user (no password_hash — like SEED_ADMIN_EMAIL seeding)."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
 
     conn = get_system_db()
     UserRepository(conn).create(id="existing", email="existing@test.com", name="E")
     conn.close()
-    return TestClient(create_app())
+    return TestClient(shared_app)
 
 
 @pytest.fixture
-def duplicate_variants_client(tmp_path, monkeypatch):
+def duplicate_variants_client(tmp_path, monkeypatch, shared_app):
     """Two case-variant rows for one person, the OLDER one sorting SECOND by
     email. Returns (client, older_id, newer_id)."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
 
@@ -49,17 +46,16 @@ def duplicate_variants_client(tmp_path, monkeypatch):
     conn.execute("UPDATE users SET created_at = ? WHERE id = ?", ["2025-01-01 00:00:00", "older"])
     conn.execute("UPDATE users SET created_at = ? WHERE id = ?", ["2026-06-01 00:00:00", "newer"])
     conn.close()
-    return TestClient(create_app()), "older", "newer"
+    return TestClient(shared_app), "older", "newer"
 
 
 @pytest.fixture
-def password_user_client(tmp_path, monkeypatch):
+def password_user_client(tmp_path, monkeypatch, shared_app):
     """Client with a user who already has a password set — bootstrap must be disabled."""
     from argon2 import PasswordHasher
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
 
@@ -71,18 +67,17 @@ def password_user_client(tmp_path, monkeypatch):
         password_hash=PasswordHasher().hash("pre-existing-pass"),
     )
     conn.close()
-    return TestClient(create_app())
+    return TestClient(shared_app)
 
 
 @pytest.fixture
-def admin_member_client(tmp_path, monkeypatch):
+def admin_member_client(tmp_path, monkeypatch, shared_app):
     """Client with a password-less user who IS in the Admin group — the OAuth /
     magic-link deployment shape (seed admin auto-promoted at startup, no
     password ever set). Bootstrap must be locked here even though no user has a
     password_hash (the pre-hardening hole)."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
-    from app.main import create_app
     from src.db import SYSTEM_ADMIN_GROUP, get_system_db
     from src.repositories.user_group_members import UserGroupMembersRepository
     from src.repositories.user_groups import UserGroupsRepository
@@ -98,7 +93,7 @@ def admin_member_client(tmp_path, monkeypatch):
         added_by="test",
     )
     conn.close()
-    return TestClient(create_app())
+    return TestClient(shared_app)
 
 
 class TestBootstrap:

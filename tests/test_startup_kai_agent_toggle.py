@@ -180,6 +180,46 @@ def test_engine_caps_are_per_vm_fields():
         assert line in tbody, line
 
 
+def test_broker_mcp_toggle_is_per_vm_field():
+    # The engine→instance MCP surface is opt-in PER VM (like
+    # kai_agent_enabled itself), not module-global: it hands the engine's
+    # sandbox the caller's tool surface, so a dev-first enable must not
+    # widen prod.
+    vbody = (MODULE / "variables.tf").read_text()
+    decls = re.findall(r"kai_agent_broker_mcp_enabled\s*=\s*optional\(bool,\s*false\)", vbody)
+    assert len(decls) == 2, f"expected kai_agent_broker_mcp_enabled optional on prod+dev object types, got {len(decls)}"
+    assert not re.search(r'variable\s+"kai_agent_broker_mcp_enabled"\s*\{', vbody)
+    mbody = (MODULE / "main.tf").read_text()
+    assert re.search(r"kai_agent_broker_mcp_enabled\s*=\s*each\.value\.kai_agent_broker_mcp_enabled", mbody)
+
+
+def test_tpl_broker_mcp_halves_are_flag_gated_and_paired():
+    body = TPL.read_text()
+    # One flag renders BOTH halves of a pair that only works together: the
+    # engine-side broker URL and the app-side ticket-scope switch. Either
+    # half alone is a silent runtime failure (URL without the scope 503s
+    # every tool call; scope without the URL never registers the server).
+    assert body.count("%{ if kai_agent_broker_mcp_enabled ~}") == 2
+    assert "!kai_agent_broker_mcp_enabled" not in body
+    url_line = "HOST_BROKER_MCP_URL=$SERVER_URL/api/kai/mcp"
+    app_line = "KAI_BROKER_MCP_ENABLED=true"
+    assert url_line in body
+    assert app_line in body
+    # The E2B sandbox egresses to the MCP broker from the public internet —
+    # the URL must ride the PUBLIC origin (SERVER_URL), same as the LLM
+    # broker line, never the compose-DNS app address.
+    assert "HOST_BROKER_MCP_URL=http://app:8000" not in body
+    # Engine half: inside the materialization gate (where SERVER_URL is
+    # verified non-empty) and BEFORE the kai_agent_env append, so the
+    # caller's map can still override the derived URL (env_file last-wins).
+    gate = body.index('if [ "$KAI_AGENT_MATERIALIZE" = "1" ]; then')
+    assert gate < body.index(url_line) < body.index('echo "${kai_agent_env_b64}" | base64 -d')
+    # App half: inside the app .env's kai block, so a VM without the engine
+    # renders neither line.
+    kai_block_start = body.index("KAI_HOST_JWT_SECRET=$KAI_HOST_JWT_SECRET", body.index('cat > "$APP_DIR/.env" <<ENVEOF'))
+    assert kai_block_start < body.index(app_line) < body.index("COMPOSE_FILE=$COMPOSE_FILE_VALUE")
+
+
 def test_kai_agent_env_rejects_multiline_values():
     body = (MODULE / "variables.tf").read_text()
     # The map becomes KEY=VALUE lines in the engine's env_file; an embedded
@@ -408,3 +448,49 @@ def test_two_runs_are_stable(tmp_path):
     first, keyfile, _ = _run_block(tmp_path)
     second, _, _ = _run_block(tmp_path, keyfile_content=keyfile.read_text())
     assert first == second
+
+
+def test_the_documented_half_configured_failure_code_matches_the_code():
+    """The operator-facing text must name the status an operator will actually
+    see, because it is the string they grep when a pairing is half-configured.
+
+    `_require_mcp_surface` (`app/api/kai.py`) is declared AHEAD of the ticket
+    dependency precisely so an unconfigured instance answers 503
+    `kai_mcp_not_enabled` rather than `401 missing_broker_ticket` — its own
+    docstring records that 401 was the pre-fix behavior. Two tests in
+    `tests/test_kai_host.py` pin the 503. So a doc claiming 401 describes a
+    surface that no longer exists.
+    """
+    from pathlib import Path
+
+    handler = Path("app/api/kai.py").read_text()
+    surface = handler[handler.index("def _require_mcp_surface") :]
+    surface = surface[: surface.index("\n@router")]
+    assert 'status_code=503, detail="kai_mcp_not_enabled"' in surface, (
+        "the surface's refusal changed — update the docs this test guards"
+    )
+
+    vbody = (MODULE / "variables.tf").read_text()
+    block = vbody[: vbody.index("kai_agent_broker_mcp_enabled = optional")]
+    block = block[-900:]
+    assert "401" not in block, "the flag's own comment names a status the surface does not return"
+    assert "kai_mcp_not_enabled" in block
+
+    changelog = Path("CHANGELOG.md").read_text()
+    entry = changelog[changelog.index("per-VM `kai_agent_broker_mcp_enabled` flag") :][:2000]
+    assert "401s every tool call" not in entry
+    assert "kai_mcp_not_enabled" in entry
+
+
+def test_kai_agent_env_docs_point_at_the_flag_not_the_manual_pairing():
+    """`kai_agent_env` used to instruct operators to hand-set
+    HOST_BROKER_MCP_URL "only when the instance also enables the app-side
+    switch" — a pairing the module offered no way to complete until this
+    flag existed. It must point at the flag, not at the dead manual path."""
+    vbody = (MODULE / "variables.tf").read_text()
+    block = vbody[vbody.index('variable "kai_agent_env"') :]
+    block = block[: block.index("type ")]
+    assert "kai_agent_broker_mcp_enabled" in block, (
+        "the kai_agent_env docs must point at the flag that completes the pairing"
+    )
+    assert "only when the instance also enables the app-side" not in block

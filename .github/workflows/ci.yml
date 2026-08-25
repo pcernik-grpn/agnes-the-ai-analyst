@@ -106,6 +106,12 @@ jobs:
     # Advisory only (continue-on-error) — ruff + mypy surface issues but
     # never gate. Split out of release.yml's old test job; runs without the
     # full dependency install since neither tool needs it.
+    #
+    # The mypy step below is NOT a gate and cannot be made one without
+    # clearing years of backlog first. Type checking that *does* block runs
+    # over a curated typed core (scripts/typecheck-core.sh), driven from the
+    # test suite by tests/test_exhaustiveness_gate.py so it rides the
+    # already-required `test` check. Tighten that list, not this step.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -203,6 +209,60 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t data-analyst:test .
+
+  rich-extras:
+    # The extras-present half of tests/test_ingest_optional_extras.py. Every
+    # other job installs `.[dev,server]`, where the docling tests skip
+    # themselves — so without this job the claim "a docx ingests in the rich
+    # image" would never be executed anywhere, and the `-rich` variant could
+    # ship broken while CI stayed green.
+    #
+    # Not part of the default matrix: both extras pull torch, so this install
+    # is minutes and gigabytes. Scheduled + manual, like docker-e2e, plus any
+    # PR that touches the ingest path or the image's extras.
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'rich-extras')
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Free disk space
+        # torch does not fit alongside the runner's preinstalled toolchains;
+        # without this the install dies with a bare "no space left".
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Install dependencies with the heavy extras
+        run: uv pip install --system ".[dev,server,docling,embeddings]"
+
+      - name: Assert the extras are actually active
+        # The gated tests SKIP when an extra is missing, so a failed install
+        # would otherwise read as a pass.
+        run: |
+          python - <<'PY'
+          from src.ingest.retrieval import retrieval_mode
+          from src.ingest.text_extract import docling_capability
+          assert docling_capability(), "docling not importable — the extras install did not take"
+          assert retrieval_mode() == "hybrid", f"expected hybrid, got {retrieval_mode()}"
+          print("extras active: docling=True retrieval=hybrid")
+          PY
+
+      - name: Run the ingest + retrieval suites
+        run: |
+          pytest tests/test_ingest_optional_extras.py tests/test_ingest_text_extract.py \
+                 tests/test_ingest_runner.py tests/test_ingest_retrieval.py \
+                 --tb=short -q
 
   docker-e2e:
     runs-on: ubuntu-latest

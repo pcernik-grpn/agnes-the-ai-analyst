@@ -329,3 +329,56 @@ def test_hard_delete_removes_participants_first(tmp_path):
         0
     ]
     assert remaining == 0
+
+
+def test_both_forks_honour_an_explicit_session_id(tmp_path):
+    """DuckDB twin of `tests/db_pg/test_chat_pg.py::
+    test_both_forks_honour_an_explicit_session_id_pg`.
+
+    A fork is a session CREATOR. `chat.provider: kai-agent` needs every id to
+    be a uuid, and both forks used to mint `chat_<hex>` unconditionally — so
+    on an engine instance a brand-new co-drive session could never spawn, and
+    the error card claimed it "predates" a provider it was seconds younger
+    than.
+    """
+    import uuid
+
+    import duckdb
+
+    from app.chat.persistence import ChatRepository
+    from app.chat.types import Surface
+    from src.db import _ensure_schema
+
+    conn = duckdb.connect(":memory:")
+    _ensure_schema(conn)
+    repo = ChatRepository(conn)
+    s0 = repo.create_session(user_email="o@x.com", surface=Surface.WEB)
+
+    co_id = str(uuid.uuid4())
+    co = repo.fork_session_as_co_session(
+        s0.id,
+        owner_email="o@x.com",
+        owner_user_id="u-o",
+        invitee_email="c@x.com",
+        invitee_user_id="u-c",
+        session_id=co_id,
+    )
+    assert co.id == co_id and uuid.UUID(co.id)
+
+    priv_id = str(uuid.uuid4())
+    got = repo.fork_co_session_to_private(
+        source_session_id=co.id,
+        owner_email="o@x.com",
+        session_id=priv_id,
+    )
+    assert got == priv_id and uuid.UUID(got)
+
+    # Non-vacuity: without an explicit id the repo keeps its own shape.
+    plain = repo.fork_session_as_co_session(
+        s0.id,
+        owner_email="o@x.com",
+        owner_user_id="u-o",
+        invitee_email="c2@x.com",
+        invitee_user_id="u-c2",
+    )
+    assert plain.id.startswith("chat_")

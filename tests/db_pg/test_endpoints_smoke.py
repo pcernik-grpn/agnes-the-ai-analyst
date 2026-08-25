@@ -999,12 +999,13 @@ class TestAdminRegistrySmoke:
 class TestAdminDoctorSmoke:
     COVERED_ROUTES = {
         "POST /api/admin/doctor/new-instance",
+        "GET /api/admin/doctor/support",
     }
 
     def test_new_instance_doctor_report_shape(self, seeded_app_both):
         """The doctor reads users/groups/grants/agents through the repo
         factories, so running it on both backends is a genuine parity check —
-        a backend-split read inside any of the five checks would surface here."""
+        a backend-split read inside any of the six checks would surface here."""
         r = seeded_app_both["client"].post(
             "/api/admin/doctor/new-instance",
             headers=_admin_headers(seeded_app_both),
@@ -1014,7 +1015,14 @@ class TestAdminDoctorSmoke:
         body = r.json()
         assert body["status"] in ("ok", "warning", "error")
         names = [c["name"] for c in body["checks"]]
-        assert names == ["login-door", "email-delivery", "chat-grant", "agent-scope", "branding"]
+        assert names == [
+            "login-door",
+            "email-delivery",
+            "chat-grant",
+            "agent-scope",
+            "app-state-backend",
+            "branding",
+        ]
         for check in body["checks"]:
             assert check["status"] in ("ok", "warning", "error", "info")
             # A crashed check reports itself; a backend-split bug in a repo
@@ -1027,6 +1035,53 @@ class TestAdminDoctorSmoke:
             headers=_analyst_headers(seeded_app_both),
             json={},
         )
+        assert r.status_code == 403
+
+    def test_support_bundle_sections_resolve_on_both_backends(self, seeded_app_both):
+        """The support doctor's two backend-sensitive collectors, proven live.
+
+        ``schema`` takes an entirely different branch per backend (PG compares
+        ``alembic_version`` against the migration head, DuckDB the
+        ``schema_version`` table), and ``sync`` reads sync_state ×
+        table_registry through the repo factories — where PG hands back
+        tz-aware timestamps and DuckDB naive ones. Either divergence would
+        show up here as a crashed section on one backend only, which is
+        exactly what a section-isolated collector would otherwise hide.
+        """
+        from src.repositories import sync_state_repo, table_registry_repo
+
+        table_registry_repo().register(id="doctor_ok", name="doctor_ok", source_type="keboola")
+        # id != name on purpose: sync_state is keyed on NAME (table_id is
+        # sourced from _meta.table_name), so a row whose registry id differs
+        # is exactly what an id-keyed lookup would silently miss — and the
+        # keying lives in the repo read, so it is worth pinning per backend.
+        table_registry_repo().register(id="doctor_bad", name="Doctor Bad", source_type="keboola")
+        sync_state_repo().update_sync("doctor_ok", rows=1, file_size_bytes=10, hash="h")
+        sync_state_repo().set_error("Doctor Bad", "sync failed on both backends alike")
+
+        r = seeded_app_both["client"].get("/api/admin/doctor/support", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        for section in ("build", "schema", "retrieval", "sync", "disk", "process", "secrets"):
+            assert section in body, sorted(body)
+            detail = body[section].get("detail", "") if isinstance(body[section], dict) else ""
+            assert "section crashed" not in detail, (section, detail)
+
+        assert body["schema"]["backend"] in ("duckdb", "postgres")
+        assert body["schema"]["status"] == "ok", body["schema"]
+
+        keboola = body["sync"]["sources"]["keboola"]
+        assert keboola["tables"] >= 2
+        assert keboola["errors"] >= 1
+        # Found by name, reported by registry id — the id is what an operator
+        # types into `agnes catalog`/`agnes schema`, so that is what the
+        # bundle names.
+        failing = {e["table_id"] for e in keboola["last_errors"]}
+        assert "doctor_bad" in failing, keboola
+
+    def test_support_bundle_non_admin_is_403(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/api/admin/doctor/support", headers=_analyst_headers(seeded_app_both))
         assert r.status_code == 403
 
 
@@ -2295,6 +2350,12 @@ KNOWN_UNTESTED = {
     "GET /auth/email/verify",
     "GET /auth/password/reset",
     "GET /auth/password/setup",
+    # Self-serve change-password (B6) — session-only credential rotation,
+    # covered end-to-end (success/failure/CSRF/rate-limit/PAT-rejection) in
+    # tests/test_password_change.py, same as the other password sub-flows
+    # below being covered outside this PG smoke harness.
+    "GET /auth/password/change",
+    "POST /auth/password/change",
     "POST /auth/email/send-link",
     "POST /auth/email/send-link/web",
     "POST /auth/email/verify",
@@ -2499,6 +2560,13 @@ KNOWN_UNTESTED = {
     "POST /api/admin/metadata/{table_id}",
     "POST /api/admin/metrics",
     "POST /api/admin/run-blocked-purge",
+    # B8 audit-trail seam — scheduler-driven audit_log retention prune, mirrors
+    # run-knowledge-digests. The new repo method (AuditRepository/AuditPgRepository
+    # .prune_older_than) IS dual-backend proven, by
+    # tests/db_pg/test_audit_contract.py::test_prune_older_than_*. Endpoint
+    # behaviour (config gate, logging, audit row) covered single-backend in
+    # tests/test_audit_retention.py.
+    "POST /api/admin/run-audit-prune",
     "POST /api/admin/run-bq-metadata-refresh",
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",
@@ -2883,6 +2951,7 @@ class TestSemanticLayerSmoke:
         "POST /api/semantic-models/validate-query",
         "GET /api/semantic-models/context",
         "GET /api/semantic-models/schema",
+        "POST /api/semantic-models/apply",
     }
 
     def test_model_crud_and_export(self, seeded_app_both):
@@ -2937,6 +3006,40 @@ class TestSemanticLayerSmoke:
         assert "Dataset" in schema.json()["$defs"]
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
+
+    def test_apply_branches_on_authority(self, seeded_app_both):
+        """The one write surface (chat-first authoring): an admin's document
+        applies directly; a non-admin's lands in the moderation queue and
+        never touches ``semantic_models`` before approval."""
+        c = seeded_app_both["client"]
+        doc = _SEMANTIC_DOC.replace("smoke_model", "apply_model")
+
+        applied = c.post(
+            "/api/semantic-models/apply",
+            json={"document": doc},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert applied.status_code == 200
+        assert applied.json()["outcome"] == "applied"
+        assert applied.json()["model"]["slug"] == "apply_model"
+
+        queued = c.post(
+            "/api/semantic-models/apply",
+            json={"document": _SEMANTIC_DOC.replace("smoke_model", "proposed_model")},
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert queued.status_code == 200
+        assert queued.json()["outcome"] == "submitted_for_review"
+        assert (
+            c.get("/api/semantic-models/proposed_model.yaml", headers=_admin_headers(seeded_app_both)).status_code
+            == 404
+        )
+
+        model_id = applied.json()["model"]["id"]
+        assert (
+            c.delete(f"/api/admin/semantic-models/{model_id}", headers=_admin_headers(seeded_app_both)).status_code
+            == 204
+        )
 
     def test_source_crud_and_sync(self, seeded_app_both):
         c = seeded_app_both["client"]

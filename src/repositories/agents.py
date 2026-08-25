@@ -288,6 +288,27 @@ class AgentsRepository:
         ).fetchall()
         return self._rows_to_dicts(rows)
 
+    def get_scope_for_agents(self, agent_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """``{agent_id: [{item_type, item_id}, ...]}`` for many agents at once.
+
+        The list endpoint projects every agent's declaration, which needs the
+        scope rows when the JSON columns are empty; calling :meth:`get_scope`
+        per row made that an N+1 (Devin Review on #1520). Ids with no rows are
+        absent from the mapping, so callers should use ``.get(id, [])``.
+        """
+        if not agent_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in agent_ids)
+        rows = self.conn.execute(
+            f"SELECT agent_id, item_type, item_id FROM agent_scope "
+            f"WHERE agent_id IN ({placeholders}) ORDER BY agent_id, item_type, item_id",
+            list(agent_ids),
+        ).fetchall()
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for agent_id, item_type, item_id in rows:
+            out.setdefault(agent_id, []).append({"item_type": item_type, "item_id": item_id})
+        return out
+
     def agent_for_scope_item(self, item_type: str, item_id: str) -> Optional[Dict[str, Any]]:
         """The non-deleted agent holding scope item ``(item_type, item_id)``,
         or None. Routing lookup (e.g. Slack `slack_channel` bindings) — the

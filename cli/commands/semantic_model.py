@@ -17,6 +17,7 @@ Package or direct model grant, not admin-only).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import List, Optional
 
 import typer
@@ -26,6 +27,61 @@ from cli.client import api_get, api_post
 semantic_model_app = typer.Typer(help="Read the semantic layer: validate queries, browse context, inspect schema")
 
 _SEMANTIC_TYPES = ("dataset", "metric", "relationship")
+
+
+@semantic_model_app.command("apply")
+def apply(
+    path: str = typer.Argument(..., help="Path to an Ossie document (YAML)"),
+    description: Optional[str] = typer.Option(None, "--description", help="Listing description for the model"),
+    expect_hash: Optional[str] = typer.Option(
+        None,
+        "--expect-hash",
+        help="For edits: the content_hash the edit was based on — a mismatch refuses instead of overwriting.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Apply a hand-authored semantic-model document — create or edit.
+
+    The outcome depends on your authority and is always labeled: admins get
+    ``Applied`` (the model is live); everyone else gets ``Submitted for
+    review`` (an admin approves or rejects it — the model is NOT live until
+    then). Offline pre-check without a server or token:
+    `agnes admin semantic-model validate <file>`.
+    """
+    p = Path(path)
+    if not p.exists():
+        typer.echo(f"File not found: {path}", err=True)
+        raise typer.Exit(1)
+
+    payload: dict = {"document": p.read_text()}
+    if description is not None:
+        payload["description"] = description
+    if expect_hash is not None:
+        payload["expected_content_hash"] = expect_hash
+
+    resp = api_post("/api/semantic-models/apply", json=payload)
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        typer.echo(f"Failed: {detail}", err=True)
+        if isinstance(detail, dict) and detail.get("code") == "invalid_document":
+            typer.echo("  Pre-check locally: agnes admin semantic-model validate <file>", err=True)
+        raise typer.Exit(1)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    if body.get("outcome") == "applied":
+        model = body.get("model") or {}
+        typer.echo(f"Applied: {model.get('slug', '?')} (live)")
+    else:
+        typer.echo(
+            f"Submitted for review: {body.get('suggestion_id', '?')} — "
+            "an admin will approve or reject it; the model is not live yet."
+        )
 
 
 @semantic_model_app.command("validate-query")

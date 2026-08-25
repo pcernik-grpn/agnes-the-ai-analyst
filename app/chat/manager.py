@@ -22,6 +22,7 @@ from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
 from app.chat.frame_seq import stamp_frame
+from app.chat.message_parts import build_message_parts, parts_to_tool_calls
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.provider import SandboxHandle, SandboxProvider
@@ -187,6 +188,27 @@ def agnes_server_url() -> str:
     """
     url = os.environ.get("SERVER_URL") or os.environ.get("AGNES_INTERNAL_URL") or "http://127.0.0.1:8000"
     return url.rstrip("/")
+
+
+def engine_session_id(config) -> Optional[str]:
+    """A caller-owned session id when the configured provider is the embedded
+    kai-agent engine, else None (repo generates its usual ``chat_<hex>``).
+
+    Engine-backed sessions share their id with the engine's own chat row,
+    whose Postgres column is a uuid — ``chat_<hex>`` is rejected there
+    outright (the same constraint ``POST /api/kai/sessions`` documents).
+    Decided at CREATE time so every downstream surface (WS URL, repo row,
+    engine ``body.id``) carries one key — and shared between
+    ``ChatManager.create_session`` and its producer twin
+    ``resolve_or_create_slack_session``, because a Slack DM row minted in the
+    old shape on an engine instance would de-dupe to a permanently
+    unspawnable session.
+    """
+    if getattr(config, "provider", "") != "kai-agent":
+        return None
+    import uuid
+
+    return str(uuid.uuid4())
 
 
 class ConcurrencyCapHit(Exception):
@@ -625,6 +647,8 @@ class ChatManager:
             slack_thread_ts=slack_thread_ts,
             title=title,
             agent_id=agent_id,
+            # uuid-shaped on engine instances — see engine_session_id.
+            session_id=engine_session_id(self._config),
         )
         if profile is not None:
             self._session_profiles[created.id] = profile
@@ -1078,7 +1102,7 @@ class ChatManager:
             except Exception:
                 logger.exception("_spawn_live: clear_sandbox_ref failed for %s", chat_id)
             try:
-                ticket_repo().revoke_session(chat_id)
+                self._revoke_native_tickets(chat_id)
             except Exception:
                 logger.exception("_spawn_live: ticket revoke failed for %s", chat_id)
             # Release the routing lease claimed above, mirroring kill() — else a
@@ -1325,7 +1349,7 @@ class ChatManager:
                 # mint would delete the ticket _respawn_fresh just pushed. Without
                 # this, the old tickets linger (redeemable) until their TTL even
                 # though the old sandbox is gone. (Devin review on #851)
-                ticket_repo().revoke_session(live.chat_id)
+                self._revoke_native_tickets(live.chat_id)
                 await self._respawn_fresh(live)
                 return
             if session.sandbox_id is None or session.runner_pid is None:
@@ -1337,7 +1361,7 @@ class ChatManager:
                 handle = await self._provider.resume(
                     sandbox_id=session.sandbox_id,
                     runner_pid=session.runner_pid,
-                    env={},
+                    env=self._provider_resume_env(session),
                 )
             except Exception:
                 logger.warning("resume failed for %s — fresh spawn fallback", live.chat_id)
@@ -1352,7 +1376,7 @@ class ChatManager:
             # forwarded. Revoke the old ones FIRST: revoke_session deletes by
             # session_id, so revoking after the fresh mint would delete the
             # tickets _push_ticket_frame just pushed.
-            ticket_repo().revoke_session(live.chat_id)
+            self._revoke_native_tickets(live.chat_id)
             await self._push_ticket_frame(live)
             pump_task = asyncio.create_task(self._pump_subprocess_to_ws(live))
             wait_task = asyncio.create_task(self._wait_for_exit_and_respawn(live, live.session_dir or Path("/tmp")))
@@ -1406,7 +1430,7 @@ class ChatManager:
             handle = await self._provider.resume(
                 sandbox_id=session.sandbox_id,
                 runner_pid=session.runner_pid,
-                env={},
+                env=self._provider_resume_env(session),
             )
         except Exception:
             logger.warning(
@@ -1450,7 +1474,7 @@ class ChatManager:
         # session (the legacy branch above returns early), but the runner's
         # relay memory does not survive the pause/resume round trip, so it
         # still needs a fresh ticket before serving messages.
-        ticket_repo().revoke_session(session.id)
+        self._revoke_native_tickets(session.id)
         await self._push_ticket_frame(live)
         pump_task = asyncio.create_task(self._pump_subprocess_to_ws(live))
         wait_task = asyncio.create_task(self._wait_for_exit_and_respawn(live, session_dir))
@@ -1627,7 +1651,7 @@ class ChatManager:
         # spawn mints+pushes new ones (revoke_session deletes by
         # session_id, so revoking AFTER would delete the ones we just
         # pushed).
-        ticket_repo().revoke_session(chat_id)
+        self._revoke_native_tickets(chat_id)
         if session.is_co_session:
             parts = self._repo.get_session_participants(chat_id)
             emails = [p.user_email for p in parts if p.left_at is None]
@@ -2062,6 +2086,42 @@ class ChatManager:
                 session.id,
             )
 
+    def _provider_resume_env(self, session: "ChatSession") -> dict:
+        """The env a provider's ``resume()`` receives: session identity plus
+        the operator knobs a rebuilt handle must not lose.
+
+        The engine provider reads all four (identity to re-mint its session
+        JWT, ``AGNES_APPROVALS``/``AGNES_APPROVAL_TIMEOUT_SECONDS`` to keep the
+        approvals kill-switch and card label sticky across pause/resume —
+        identity alone silently flipped approvals back ON after any resume);
+        the sandbox providers ignore env on resume.
+        """
+        return {
+            "AGNES_SESSION_ID": session.id,
+            "AGNES_USER_EMAIL": session.user_email,
+            "AGNES_APPROVAL_TIMEOUT_SECONDS": str(self._config.approval_timeout_seconds),
+            "AGNES_APPROVALS": "on" if self._config.approvals_enabled else "off",
+        }
+
+    def _revoke_native_tickets(self, chat_id: str) -> None:
+        """``revoke_session``, skipped for a provider that owns its own
+        credential lifecycle.
+
+        The scope-blind sweep and ``_push_ticket_frame`` are a PAIR on the
+        native paths — revoke, then immediately re-mint. For an engine-backed
+        session (``provides_own_credentials``) the mint half is a no-op, so an
+        unguarded sweep is pure loss: it deletes the engine's live per-turn
+        ``llm``/``kai_mcp`` tickets mid-answer (a resume during an in-flight
+        turn 401s it dead) and nothing re-mints until the engine's next turn.
+        The long-lived ``kai_session`` credential was already sweep-exempt;
+        this extends the same reasoning to the per-turn scopes, which are the
+        engine's to mint and expire (1 h TTL). Same literal-True rule as the
+        push guard — a MagicMock provider must not flip this off.
+        """
+        if getattr(self._provider, "provides_own_credentials", False) is True:
+            return
+        ticket_repo().revoke_session(chat_id)
+
     async def _push_ticket_frame(self, live: "LiveSession") -> None:
         """Mint fresh main+mcp+data_apps broker tickets and push them to the
         sandbox's in-process relay over stdin (chat sandbox secret broker,
@@ -2075,6 +2135,19 @@ class ChatManager:
         for a legacy (pre-broker) runner (AC-G-resume-legacy).
         """
         assert live.handle is not None
+        # `is True`, not truthiness — the same duck-typed-double rule as
+        # _file_stager's iscoroutinefunction check: a MagicMock provider's
+        # every attribute exists and is truthy, and this must not flip the
+        # native ticket push off for such doubles.
+        if getattr(self._provider, "provides_own_credentials", False) is True:
+            # Engine-backed sessions (app/chat/kai_engine_provider.py): the
+            # handle authenticates with the session JWT it mints itself, and
+            # the engine mints its own per-turn egress tickets at
+            # /api/kai/tickets — the native scopes below would be live
+            # credentials nothing can ever redeem. Still mark the session
+            # current-protocol: the resume path gates provider.resume() on it.
+            self._known_protocol_sessions.add(live.chat_id)
+            return
         main = ticket_repo().mint(live.chat_id, "main")
         mcp = ticket_repo().mint(live.chat_id, "mcp")
         # Minted unconditionally even when data_apps.enabled=false — harmless:
@@ -2139,11 +2212,19 @@ class ChatManager:
                 # It is also the shape `chat.js::formatToolCall` already
                 # expects, and the shape `verify()` serialises into its
                 # haystack.
-                frame["tool_calls"] = [
-                    {"tool": f.get("tool"), "args": f.get("args") or {}}
-                    for f in live.turn_buffer
-                    if f.get("type") == "tool_call" and isinstance(f.get("tool"), str)
-                ] or None
+                # The turn's ORDERED shape: text and tool entries in the
+                # sequence they arrived, with each tool's result folded onto
+                # the entry where its call already sits. That is what lets a
+                # reloaded conversation keep prose and tool cards interleaved,
+                # and a replayed card show its real outcome instead of only a
+                # name (#1504). `tool_calls` below is now its positionless
+                # projection, derived from the same source so the two cannot
+                # disagree about which calls a turn made — it stays on the
+                # frame and the row for readers that predate `parts` (the
+                # transcript export, the sources verdict, `verify()`'s
+                # haystack) and for rows written before schema v123.
+                frame["parts"] = build_message_parts(live.turn_buffer)
+                frame["tool_calls"] = parts_to_tool_calls(frame["parts"])
                 frame["sources"] = sources_verdict(frame.get("content", "") or "", frame.get("tool_calls")).to_dict()
             await self._broadcast(live, frame)
             ftype = frame.get("type")
@@ -2198,6 +2279,7 @@ class ChatManager:
                     role="assistant",
                     content=frame.get("content", ""),
                     tool_calls=frame.get("tool_calls"),
+                    parts=frame.get("parts"),
                     tokens_in=frame.get("tokens_in"),
                     tokens_out=frame.get("tokens_out"),
                     model=frame.get("model"),
@@ -3349,7 +3431,7 @@ class ChatManager:
         # security fix). Runs before the early-return so a not-live session
         # still gets its stale tickets cleared. (Devin review on #849.)
         try:
-            ticket_repo().revoke_session(chat_id)
+            self._revoke_native_tickets(chat_id)
         except Exception:
             logger.warning("broker ticket revocation failed for %s on kill (non-fatal)", chat_id)
         # Wave 3C Q4 (spec §7): SessionEnd hard cap on any `data-app-preview:*`
@@ -4187,6 +4269,11 @@ def resolve_or_create_slack_session(
         slack_thread_ts=slack_thread_ts,
         title=None,
         agent_id=agent_id,
+        # uuid-shaped on engine instances — see engine_session_id. Without
+        # this the producer path minted chat_<hex> rows that the engine
+        # provider can never spawn, and the Slack de-dupe pinned the DM to
+        # that dead row forever.
+        session_id=engine_session_id(config),
     )
 
 

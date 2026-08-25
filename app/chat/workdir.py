@@ -381,6 +381,13 @@ class WorkdirManager:
             target = ws / entry
             if not target.exists():
                 continue
+            if link.is_symlink() and not link.exists():
+                # Dangling (e.g. created under a relative DATA_DIR, whose
+                # target resolves against the link's own directory): replace
+                # it, or the recreate below dies with FileExistsError —
+                # exists() follows the link and reports False, so a re-run of
+                # this method (post-restart resume) was not idempotent.
+                link.unlink()
             if not link.exists():
                 link.symlink_to(target)
         if profile is not None:

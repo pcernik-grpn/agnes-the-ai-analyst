@@ -54,19 +54,37 @@
 
 ## Docker Deployment
 
+The default install runs app-state on the bundled Postgres side-car
+(`docker-compose.postgres.yml`), not single-file DuckDB. Set
+`POSTGRES_PASSWORD` in `.env` (`config/.env.template` already ships
+`COMPOSE_FILE=docker-compose.yml:docker-compose.postgres.yml`, so plain
+`docker compose up` includes the overlay automatically):
+
 ```bash
-# Start app + scheduler
+# Start app + scheduler + Postgres side-car
 docker compose up
 
 # Include telegram bot
 docker compose --profile full up
 
 # HTTPS mode — Caddy + corporate-CA certs
-docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tls.yml \
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml -f docker-compose.tls.yml \
     --profile tls up -d
 ```
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full server setup instructions.
+
+### Legacy fallback: single-file DuckDB (existing installs)
+
+Existing instances that predate the Postgres default keep running app-state
+on single-file DuckDB — nothing changes for them. To run a **new** instance
+this way (not recommended — see [DEPLOYMENT.md](DEPLOYMENT.md)), unset
+`POSTGRES_PASSWORD` and `COMPOSE_FILE` in `.env` and start without the
+overlay:
+
+```bash
+docker compose -f docker-compose.yml up
+```
 
 ## Using with Claude Code
 
@@ -100,6 +118,20 @@ setup instructions.
 1. Sync latest data: `curl -X POST https://data.example.com/api/sync/trigger`
 2. Open Claude Code in your workspace directory
 3. Ask Claude to analyze your data using DuckDB
+
+### When something goes wrong
+
+Run `agnes doctor`. It writes one redacted file (`agnes-doctor-<timestamp>.md`)
+holding what a support request needs answered up front: CLI version, server and
+auth state, workspace and last-pull state, recent client errors — plus, when an
+admin runs it, the server side (image tag, migration verdict, per-source sync
+failures, disk, whether retrieval has silently degraded to lexical-only). Secret
+values are never collected, only whether each one is set, so the file is safe to
+attach as-is.
+
+It always produces the file: run it offline, or without admin rights, and the
+parts it could not reach say so explicitly rather than going quiet. Use
+`agnes diagnose` when you want live checks and a verdict instead of an artifact.
 
 ## Hackathon
 

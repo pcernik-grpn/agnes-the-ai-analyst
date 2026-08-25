@@ -230,6 +230,10 @@ _CREATOR_POST_ALLOWLIST = frozenset(
         "/auth/email/verify",
         "/auth/password/reset",
         "/auth/password/setup",
+        # Self-serve password change (B6) — mutates the caller's own
+        # existing account, not a resource create; GET on the same path
+        # renders the change-password page/form.
+        "/auth/password/change",
         # CLI browser-loopback auth — POST confirms authorization and 303-
         # redirects the freshly-minted exchange code to the CLI's localhost
         # loopback. Not a JSON resource create; conventional auth-flow shape.

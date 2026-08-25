@@ -58,9 +58,9 @@ def _fresh_pgserver_url():
     ``pg_engine``) — this file needs to name a database that does NOT
     exist yet on the server, which a shared/reused server can't
     guarantee across test order."""
-    from tests.db_pg.conftest import _start_pgserver
+    from tests.db_pg.conftest import _start_dedicated_pgserver
 
-    yield from _start_pgserver()
+    yield from _start_dedicated_pgserver()
 
 
 @pytest.fixture

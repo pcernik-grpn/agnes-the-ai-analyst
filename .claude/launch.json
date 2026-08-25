@@ -1,0 +1,52 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "agnes-dev",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "LOCAL_DEV_MODE=1",
+        "TESTING=1",
+        "AGNES_CHAT_ENABLED=true",
+        ".venv/bin/uvicorn",
+        "app.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9000"
+      ],
+      "port": 9000
+    },
+    {
+      "name": "agnes-dev-kai",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "LOCAL_DEV_MODE=1",
+        "TESTING=1",
+        "AGNES_CHAT_ENABLED=true",
+        "AGNES_CHAT_PROVIDER=kai-agent",
+        "AGNES_CHAT_KAI_AGENT_URL=http://127.0.0.1:3000",
+        "KAI_HOST_JWT_SECRET=local-dev-secret",
+        ".venv/bin/uvicorn",
+        "app.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9000"
+      ],
+      "port": 9000
+    },
+    {
+      "name": "kai-engine-stub",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "KAI_HOST_JWT_SECRET=local-dev-secret",
+        "KAI_STUB_HOST=127.0.0.1",
+        ".venv/bin/python",
+        "-m",
+        "services.kai_engine_stub"
+      ],
+      "port": 3000
+    }
+  ]
+}

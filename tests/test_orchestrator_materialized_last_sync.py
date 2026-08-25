@@ -172,7 +172,13 @@ def test_fallback_publish_preserves_gate_when_id_differs_from_name(tmp_path):
     """Regression: _record_fallback_sync_state previously called
     table_registry_repo().get(table_id) which queries WHERE id = ?. When
     registry id != name (parquet filename stem), the lookup returned None,
-    is_materialized was False, and last_sync was bumped — starving retries."""
+    is_materialized was False, and last_sync was bumped — starving retries.
+
+    B1: sync_state.table_id is now the registry id (resolved via
+    get_by_name, same lookup this test already exercised) rather than the
+    name/filename-stem parameter, so the pre-seeded "before" row — and the
+    read after the fallback publish — use the registry id `mat_001`, not
+    the name `orders_daily_econ`."""
     db_path = tmp_path / "system.duckdb"
     conn = duckdb.connect(str(db_path))
     try:
@@ -190,11 +196,9 @@ def test_fallback_publish_preserves_gate_when_id_differs_from_name(tmp_path):
         )
         from src.repositories.sync_state import SyncStateRepository
 
-        SyncStateRepository(conn).update_sync(
-            table_id="orders_daily_econ", rows=100, file_size_bytes=1000, hash="a" * 32
-        )
-        SyncStateRepository(conn).set_error("orders_daily_econ", "killed mid-run")
-        before = SyncStateRepository(conn).get_table_state("orders_daily_econ")
+        SyncStateRepository(conn).update_sync(table_id="mat_001", rows=100, file_size_bytes=1000, hash="a" * 32)
+        SyncStateRepository(conn).set_error("mat_001", "killed mid-run")
+        before = SyncStateRepository(conn).get_table_state("mat_001")
     finally:
         conn.close()
     assert before["last_sync"] is not None
@@ -215,7 +219,7 @@ def test_fallback_publish_preserves_gate_when_id_differs_from_name(tmp_path):
         orch._record_fallback_sync_state(view_conn, "orders_daily_econ", pq)
     view_conn.close()
 
-    after = _get_state(db_path, "orders_daily_econ")
+    after = _get_state(db_path, "mat_001")
     assert after["last_sync"] == before["last_sync"], (
         "fallback publish bumped last_sync for a materialized row with id != name; "
         "get_by_name must be used so the schedule gate stays open"

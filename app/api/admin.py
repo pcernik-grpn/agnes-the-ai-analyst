@@ -2274,14 +2274,23 @@ def _feature_flags_inventory() -> List[Dict[str, Any]]:
             # there warns about). Same row shape as the leading experience
             # row: value_label carries the mode, effective mirrors
             # "resolved away from the default".
-            from app.switches import switch_value
-
-            value = str(switch_value(flag.name))
-            if os.environ.get(flag.env_var) is not None:
-                source = "env"
+            if flag.name in _CHAT_RUNTIME_FLAGS:
+                # A select that is ALSO chat-runtime-resolved (chat_provider):
+                # switch_value() raises for runtime_view switches by design —
+                # the runtime reads the overlay file alone, via
+                # load_chat_config — so its string comes from the same view
+                # the boolean chat flags use below.
+                value_raw, source = _chat_flag_runtime_view(flag)
+                value = str(value_raw)
             else:
-                probe = get_value(*flag.config_keys, default=_UNSET)
-                source = "default" if probe is _UNSET else "config"
+                from app.switches import switch_value
+
+                value = str(switch_value(flag.name))
+                if os.environ.get(flag.env_var) is not None:
+                    source = "env"
+                else:
+                    probe = get_value(*flag.config_keys, default=_UNSET)
+                    source = "default" if probe is _UNSET else "config"
             out.append(
                 {
                     "name": flag.name,
@@ -2368,7 +2377,14 @@ def _chat_flag_runtime_view(flag) -> tuple:
     key = _CHAT_RUNTIME_FLAGS[flag.name]
     overlay_path = _state_dir() / "instance.yaml"
     effective = getattr(load_chat_config(overlay_path), key)
-    if os.environ.get(flag.env_var) is not None:
+    env_raw = os.environ.get(flag.env_var)
+    # The "env" label must mirror each flag's own resolver: the boolean chat
+    # flags coerce ANY set value (blank included), but the select resolver
+    # (`_resolve_chat_provider`) treats a blank env as unset and falls
+    # through to yaml/default — labeling that "env" would tell the operator
+    # a pin exists where none does.
+    env_set = env_raw is not None and (flag.kind != "select" or env_raw.strip() != "")
+    if env_set:
         return effective, "env"
     try:
         raw = yaml.safe_load(overlay_path.read_text()) or {}
@@ -4119,16 +4135,20 @@ async def list_registry(
     tables = repo.list_all()
 
     # Single batched read of sync_state — avoid N+1 GETs against
-    # `sync_state` for large registries. The sync_state row is keyed on
-    # `table_id` which mirrors `table_registry.name` (see comment in
-    # _run_materialized_pass / _build_manifest_for_user about name vs id).
-    state_by_name: Dict[str, Dict[str, Any]] = {}
+    # `sync_state` for large registries. B1: writers resolve `table_id` to
+    # the registry `id` when a matching row exists at write time (see
+    # `src.sync_state_key.resolve_sync_state_key`), so the join below tries
+    # `id` first. A row still keyed by `name` — a legacy row the backfill
+    # migration hasn't reached yet, or a fallback write for a table whose
+    # `_meta.table_name` had no registry match — is picked up by name so it
+    # doesn't silently vanish from this view.
+    state_by_key: Dict[str, Dict[str, Any]] = {}
     try:
         rows = sync_state_repo().get_all_states()
         for row in rows:
             tid = row.get("table_id")
             if tid:
-                state_by_name[tid] = row
+                state_by_key[tid] = row
     except Exception:
         # Defensive: if sync_state is unreadable for any reason, the
         # registry response still serializes — operators just lose the
@@ -4136,8 +4156,7 @@ async def list_registry(
         logger.exception("Failed to read sync_state for registry")
 
     for t in tables:
-        # Sync_state.table_id == table_registry.name by convention.
-        state = state_by_name.get(t.get("name"))
+        state = state_by_key.get(t.get("id")) or state_by_key.get(t.get("name"))
         status = state.get("status") if state else None
         error = state.get("error") if state else None
         ls = state.get("last_sync") if state else None
@@ -5244,6 +5263,35 @@ async def update_table(
     # old "null = no-op" semantics for some field, it should omit the field
     # from the body instead of sending null — that's the canonical PUT shape.
     updates = request.model_dump(exclude_unset=True)
+    # View-name / id collision guard, mirrored from register_table's
+    # `existing_by_name` check. `table_registry.name` has no DB-level
+    # uniqueness constraint and register_table only pre-checks it against
+    # OTHER names on the way in (a duplicate matching another row's ID is
+    # already caught there, indirectly, by the derived-id collision check —
+    # PUT never re-derives an id, so that protection doesn't carry over
+    # here). Left unchecked, a rename could collide with another table's
+    # `name` (the original register_table concern: a silent view overwrite
+    # at next rebuild) OR — since B1 — with another table's `id`: every
+    # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
+    # the distribution mirror job in `app/worker/kinds.py`, this module's
+    # own `list_registry`) tries a raw key against the registry BY ID
+    # before falling back to name, so a legacy name-keyed sync_state row
+    # sharing that string would resolve to the WRONG registry entry.
+    if "name" in updates and updates["name"] != existing.get("name"):
+        new_name = updates["name"]
+        collision = next(
+            (
+                r
+                for r in repo.list_all()
+                if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
+            ),
+            None,
+        )
+        if collision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
+            )
     # Run BQ-shape validation BEFORE persisting whenever the merged record
     # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
     # or the patch touches BQ-relevant fields on an already-BQ row). Without
@@ -8227,6 +8275,41 @@ async def run_blocked_purge(
         action="run_blocked_purge",
         resource="job:store-blocked-purge",
         params={"ttl_days": ttl, "purged": result.get("purged", 0), "skipped": result.get("skipped", False)},
+    )
+    return {"ok": True, "details": result}
+
+
+# ---------------------------------------------------------------------------
+# B8: scheduled retention pruning of audit_log
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run-audit-prune")
+async def run_audit_prune(
+    user: dict = Depends(require_admin),
+):
+    """Trigger the retention-based ``audit_log`` prune.
+
+    Wraps :func:`src.audit_retention.prune_audit_log`. The scheduler service
+    hits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the
+    corporate-memory + blocked-purge jobs); admins can also run it on demand.
+
+    ``retention_days`` comes from ``audit.retention_days`` (default 365, 0
+    keeps rows forever). Only ``audit_log`` has a retention policy — see
+    docs/observability.md for the other audit/observability trails.
+    """
+    from app.instance_config import get_audit_retention_days
+    from src.audit_retention import prune_audit_log
+
+    retention_days = get_audit_retention_days()
+    result = prune_audit_log(retention_days=retention_days)
+
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="run_audit_prune",
+        resource="job:audit-prune",
+        params={"retention_days": retention_days, **result},
     )
     return {"ok": True, "details": result}
 

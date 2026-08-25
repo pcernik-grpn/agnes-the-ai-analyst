@@ -267,6 +267,36 @@ services:
       retries: 3
       start_period: 10s
 
+  # Development stand-in for the kai-agent turn engine, which lives outside
+  # this repository — so `chat.provider: kai-agent` had no way to be exercised
+  # locally at all, and the frame path it drives (renderer included) could
+  # only be tested by hand. Speaks the engine's SSE contract with scripted
+  # turns; no model, no key, no database. See docs/kai-agent-local-dev.md.
+  #
+  # Named `kai-agent` so the default `chat.kai_agent_url`
+  # (http://kai-agent:3000) resolves to it with no extra configuration, and
+  # gated behind its own profile so it can never appear in a stack that did
+  # not ask for it by name. NEVER enable this profile in production: it
+  # answers every turn with a canned script.
+  kai-agent:
+    build: .
+    command: python -m services.kai_engine_stub
+    profiles: ["kai-stub"]
+    environment:
+      # Must match the Agnes process, or the stub rejects the host-minted
+      # session JWT exactly as the real engine would. Soft-default (`:-`)
+      # rather than required (`:?`): compose validates interpolation for the
+      # whole file before filtering profiles, so a hard requirement here
+      # would break every `docker compose up` that never selects this
+      # profile (the lesson from the apps-runner token, rolled back in #1007).
+      - KAI_HOST_JWT_SECRET=${KAI_HOST_JWT_SECRET:-}
+      - KAI_HOST_JWT_ISSUER=${KAI_HOST_JWT_ISSUER:-agnes}
+      - KAI_HOST_JWT_AUDIENCE=${KAI_HOST_JWT_AUDIENCE:-kai-agent}
+      # Pause between SSE records — the interleaving is the thing under
+      # observation, so it defaults to human-visible rather than instant.
+      - KAI_STUB_STEP_DELAY=${KAI_STUB_STEP_DELAY:-0.35}
+    restart: unless-stopped
+
   telegram-bot:
     build: .
     command: python -m services.telegram_bot

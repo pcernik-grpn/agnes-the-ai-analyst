@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
@@ -16,9 +16,8 @@ def web_client(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 
@@ -687,6 +686,9 @@ class TestUnauthenticatedHtmlRedirects:
         """/login/email (magic link) must extract ?next from the URL and
         emit it into the hidden form field so it round-trips to the POST."""
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")  # mail transport → page renders
+        # Email is opt-in-only by default (B6) — this test exercises the page
+        # itself, not the default-offering policy, so name it explicitly.
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         resp = web_client.get("/login/email?next=/catalog")
         assert resp.status_code == 200
         body = resp.text
@@ -697,6 +699,7 @@ class TestUnauthenticatedHtmlRedirects:
         """Hostile ?next values (e.g. //evil) must be sanitized away before
         the hidden field is rendered."""
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         resp = web_client.get("/login/email?next=//evil.example/")
         assert resp.status_code == 200
         body = resp.text
@@ -710,6 +713,7 @@ class TestUnauthenticatedHtmlRedirects:
         under an `auth.providers: [email]` allowlist — that mismatch used
         to lock the whole web UI out (regression)."""
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         resp = web_client.get("/login/email")
         assert resp.status_code == 200
         body = resp.text
@@ -723,6 +727,9 @@ class TestUnauthenticatedHtmlRedirects:
         (Devin review on #1288)."""
         for var in ("SMTP_HOST", "SENDGRID_API_KEY", "LOCAL_DEV_MODE"):
             monkeypatch.delenv(var, raising=False)
+        # Email is allowed (reaches the mail-transport check this test is
+        # about) but not available — allowed and available are independent.
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         resp = web_client.get("/login/email", follow_redirects=False)
         assert resp.status_code == 302
         assert resp.headers["location"] == "/login?error=email_not_configured"
@@ -734,6 +741,7 @@ class TestUnauthenticatedHtmlRedirects:
         a lie: delivery is silently skipped (Devin Review on PR #1288)."""
         for var in ("SMTP_HOST", "SENDGRID_API_KEY", "LOCAL_DEV_MODE"):
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         resp = web_client.post(
             "/auth/email/send-link/web",
             data={"email": "someone@example.com"},
@@ -751,6 +759,7 @@ class TestUnauthenticatedHtmlRedirects:
         from app.auth.providers.email import MAGIC_LINK_EXPIRY
 
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "email,password")
         monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
         resp = web_client.post(
             "/auth/email/send-link/web",

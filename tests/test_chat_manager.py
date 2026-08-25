@@ -1972,7 +1972,21 @@ def test_resume_from_row_reconnects_after_restart(manager: ChatManager, monkeypa
         live = await manager._resume_from_row(row)
 
         assert live is not None
-        manager._provider.resume.assert_awaited_once_with(sandbox_id="sbx-restart", runner_pid=555, env={})
+        # env carries the session identity AND the approval knobs for
+        # providers whose resumed handle needs them (the kai-agent engine
+        # re-mints its session JWT from the identity and keeps the approvals
+        # kill-switch sticky across pause/resume); the sandbox providers
+        # ignore env on resume.
+        manager._provider.resume.assert_awaited_once_with(
+            sandbox_id="sbx-restart",
+            runner_pid=555,
+            env={
+                "AGNES_SESSION_ID": s.id,
+                "AGNES_USER_EMAIL": s.user_email,
+                "AGNES_APPROVAL_TIMEOUT_SECONDS": str(manager._config.approval_timeout_seconds),
+                "AGNES_APPROVALS": "on",
+            },
+        )
         manager._provider.spawn.assert_not_awaited()
         assert live.state == SessionState.ACTIVE
         await manager.kill(s.id, reason="test_done")
@@ -4296,14 +4310,10 @@ def test_question_answer_local_delivery(manager: ChatManager):
         live._stdin_lock = asyncio.Lock()
         manager._live[s.id] = live
         with patch("app.chat.inbound.publish_control", new=AsyncMock()) as pub:
-            await manager.deliver_question_answer(
-                s.id, "ques-1", answers={"Which color?": "Red"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer(s.id, "ques-1", answers={"Which color?": "Red"}, sender_email="u@x")
         pub.assert_not_called()
         written = _question_answers_written(handle)
-        assert written == [
-            {"type": "question_answer", "request_id": "ques-1", "answers": {"Which color?": "Red"}}
-        ]
+        assert written == [{"type": "question_answer", "request_id": "ques-1", "answers": {"Which color?": "Red"}}]
 
     asyncio.run(_run())
 
@@ -4319,9 +4329,7 @@ def test_question_answer_hardens_junk_to_dismissed(manager: ChatManager):
         live.handle = handle
         live._stdin_lock = asyncio.Lock()
         manager._live[s.id] = live
-        await manager.deliver_question_answer(
-            s.id, "ques-2", answers={"k": 42, 3: "v", "s": "   "}, sender_email="u@x"
-        )
+        await manager.deliver_question_answer(s.id, "ques-2", answers={"k": 42, 3: "v", "s": "   "}, sender_email="u@x")
         written = _question_answers_written(handle)
         assert written == [{"type": "question_answer", "request_id": "ques-2", "dismissed": True}]
 
@@ -4338,9 +4346,7 @@ def test_question_answer_forwarded_to_remote_owner(manager: ChatManager):
             patch("app.chat.routing.this_gateway_id", return_value="gw-me"),
             patch("app.chat.inbound.publish_control", new=AsyncMock()) as pub,
         ):
-            await manager.deliver_question_answer(
-                "chat_remote", "ques-3", answers={"q": "a"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer("chat_remote", "ques-3", answers={"q": "a"}, sender_email="u@x")
         pub.assert_awaited_once()
         assert pub.await_args.args[1] == "question"
         extra = pub.await_args.kwargs["extra"]
@@ -4366,9 +4372,7 @@ def test_question_answer_publish_failure_does_not_escape(manager: ChatManager):
                 new=AsyncMock(side_effect=inbound.InboundPublishFailed("down")),
             ),
         ):
-            await manager.deliver_question_answer(
-                "chat_remote", "ques-4", answers={"q": "a"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer("chat_remote", "ques-4", answers={"q": "a"}, sender_email="u@x")
 
     asyncio.run(_run())
 

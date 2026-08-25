@@ -212,6 +212,30 @@ def test_init_force_backs_up_existing_claude_md(tmp_path, monkeypatch):
     assert "Backed up" in r.output, r.output
 
 
+def test_init_force_prunes_old_claude_md_backups(tmp_path, monkeypatch):
+    """#1476: repeated `--force` runs must not accumulate `.bak.*` files
+    forever — retention caps the count at the module's `_MAX_BACKUPS_PER_FILE`."""
+    from src.initial_workspace import _MAX_BACKUPS_PER_FILE
+
+    monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "_cfg"))
+    api_get = _make_api_get()
+    monkeypatch.setattr("cli.commands.init.api_get", api_get, raising=False)
+    monkeypatch.setattr("cli.lib.pull.api_get", api_get, raising=False)
+
+    (tmp_path / "CLAUDE.md").write_text("# AI Data Analyst\n\ncurrent\n")
+    for stamp in ["20260810T000000Z", "20260811T000000Z", "20260812T000000Z", "20260813T000000Z"]:
+        (tmp_path / f"CLAUDE.md.bak.{stamp}").write_text(stamp)
+
+    r = runner.invoke(
+        init_app,
+        ["--server-url", "http://x", "--token", "t", "--workspace", str(tmp_path), "--force"],
+    )
+    assert r.exit_code == 0, r.output
+
+    backups = list(tmp_path.glob("CLAUDE.md.bak.*"))
+    assert len(backups) == _MAX_BACKUPS_PER_FILE, [p.name for p in backups]
+
+
 def test_init_deletes_bootstrap_token_file(tmp_path, monkeypatch):
     """#580 Finding 1: `agnes init` clears the transient `~/.agnes/token`
     once it has consumed it — the raw PAT must not linger in a plaintext

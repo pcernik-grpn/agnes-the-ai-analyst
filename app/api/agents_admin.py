@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import is_user_admin, require_agent_profiles_enabled
-from app.auth.dependencies import _get_db, require_session_token
+from app.auth.dependencies import _get_db, require_session_or_user_pat, require_session_token
 from app.auth.jwt import create_access_token
 from src.object_store import object_store
 from src.repositories import (
@@ -66,7 +66,15 @@ _SELECTED_MODE_FIELDS = ("plugins_mode", "connections_mode", "tables_mode", "mem
 # agent (services/slack_bot/events.py). The scope-intersection axes each read
 # their own item_type, so a binding grants no plugin/table/connection reach.
 # At most one non-deleted agent may hold a given channel — enforced below.
-_ITEM_TYPES = frozenset({"plugin", "connection", "table", "memory_domain", "slack_channel"})
+# `data_package` and `collection` are DATA-authority items governed by
+# `tables_mode`, exactly like `table` — they are what the /agents builder
+# declares (`app/api/agents.py::_KNOWLEDGE_ITEM_TYPES`), and a declared
+# package additionally stands for its member tables (expanded live in
+# `src/agent_scope_intersection.py`). Accepted here so the governance API and
+# the builder describe one scope model rather than two.
+_ITEM_TYPES = frozenset(
+    {"plugin", "connection", "table", "data_package", "collection", "memory_domain", "slack_channel"}
+)
 
 _SCOPE_MODE_VALUES = frozenset({"all", "selected"})
 _MEMORY_WRITE_MODE_VALUES = frozenset({"off", "propose", "auto"})
@@ -287,7 +295,7 @@ async def create_agent(
 
 
 @router.get("")
-async def list_agents(user: dict = Depends(require_session_token)):
+async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True))):
     rows = agents_repo().list_for_user(user["id"])
     return {"data": [_serialize(r) for r in rows], "has_more": False, "next_cursor": None}
 
@@ -295,7 +303,7 @@ async def list_agents(user: dict = Depends(require_session_token)):
 @router.get("/{agent_id}")
 async def get_agent(
     agent_id: str,
-    user: dict = Depends(require_session_token),
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     row = _load_agent(agent_id, user, conn, require_owner=False)
@@ -509,8 +517,7 @@ async def set_agent_scope(
             raise _err(
                 409,
                 "slack_channel_taken",
-                f"slack channel '{item_id}' is already bound to {who} — "
-                f"unbind it there first (one agent per channel)",
+                f"slack channel '{item_id}' is already bound to {who} — unbind it there first (one agent per channel)",
             )
 
     agents_repo().set_scope(agent_id, items)
@@ -641,7 +648,7 @@ def _load_agent_memory(agent_id: str, memory_id: str) -> Dict[str, Any]:
 async def list_agent_memories(
     agent_id: str,
     status: Optional[str] = None,
-    user: dict = Depends(require_session_token),
+    user: dict = Depends(require_session_or_user_pat()),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     # Read-only — admins may inspect (require_owner=False), mirrors get_agent.
