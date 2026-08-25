@@ -162,19 +162,32 @@
   <section class="obs-filters" aria-label="Filter usage">
     <div class="obs-filter">
       <label for="u-user">User</label>
-      <select id="u-user" class="obs-select"><option value="">Any</option></select>
+      {# Options are built at runtime from the facets endpoint (fillSelect()
+         below); the paired .ds-dropdown is kept in sync by
+         syncFacetDropdown() (see below), using ds_dropdown.js's exported
+         re-init hook (#1473). Same for #u-tool / #u-source / #u-event-type
+         below. #}
+      <select id="u-user" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='u-user-dd', target='u-user', aria_label='Filter by user',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="u-tool">Tool</label>
-      <select id="u-tool" class="obs-select"><option value="">Any</option></select>
+      <select id="u-tool" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='u-tool-dd', target='u-tool', aria_label='Filter by tool',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="u-source">Source</label>
-      <select id="u-source" class="obs-select"><option value="">Any</option></select>
+      <select id="u-source" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='u-source-dd', target='u-source', aria_label='Filter by source',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="u-event-type">Event type</label>
-      <select id="u-event-type" class="obs-select"><option value="">Any</option></select>
+      <select id="u-event-type" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='u-event-type-dd', target='u-event-type', aria_label='Filter by event type',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter obs-filter-grow">
       <label for="u-q">Search (tool / skill / subagent / command)</label>
@@ -346,6 +359,36 @@
       sel.appendChild(o);
     });
     if (current) sel.value = current;
+    syncFacetDropdown(sel);
+  }
+
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from a facet
+  // select's own freshly-set <option>s, then re-runs ds_dropdown.js's init
+  // via the exported `dsDropdownInit` hook — needed because fillSelect()
+  // above rebuilds the whole option list (not just its selection), unlike
+  // u-window/u-groupby's static lists which syncDropdownFromSelect handles
+  // by mutating the EXISTING items in place. The button is rebuilt too, not
+  // just the menu: init() isn't idempotent for its per-element listeners, so
+  // leaving the same persisting <button> node across two init() calls (one
+  // from ds_dropdown.js's own DOMContentLoaded bootstrap, one from here)
+  // double-registers its click handler — the second open()/close() undoes
+  // the first, and the menu never appears to open. Recreating the button
+  // discards that stale listener along with the old node.
+  function syncFacetDropdown(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+    if (!dd) return;
+    const ddId = sel.id + '-dd';
+    const opts = Array.from(sel.options);
+    const currentOpt = opts.find(o => o.value === sel.value) || opts[0];
+    const menuEl = dd.querySelector('.ds-dropdown-menu');
+    const ariaLabel = menuEl ? menuEl.getAttribute('aria-label') || '' : '';
+    const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="${ddId}-name">${escapeHtml(ariaLabel)}</span>` : '';
+    const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : '';
+    const items = opts
+      .map(o => `<li class="ds-dropdown-menu-item${o === currentOpt ? ' is-selected' : ''}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${escapeHtml(o.value)}">${escapeHtml(o.textContent)}</li>`)
+      .join('');
+    dd.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${currentOpt ? escapeHtml(currentOpt.textContent.trim()) : ''}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${escapeHtml(ariaLabel || 'Options')}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(dd);
   }
 
   // --- KPIs ---------------------------------------------------------------

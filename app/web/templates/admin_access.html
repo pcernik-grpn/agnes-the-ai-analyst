@@ -77,6 +77,7 @@
    this person in"). People and Access are two of them here, so a group and
    a person are read the same way. #}
 <link rel="stylesheet" href="{{ static_url('css/section_card.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {# Creating and renaming a group — the shared drawer
    (js/components/group_drawer.js), which opens over this page so neither
    job costs the selection or the scroll. It asks for a name and stops:
@@ -822,7 +823,13 @@
       <div>
         <label for="ax-sim-user">Person</label>
         <span class="fbar-select">
-          <select id="ax-sim-user"><option value="">Loading people…</option></select>
+          {# Options are fetched once and the <select> rebuilt entirely
+             client-side (loadUsers() below); the paired .ds-dropdown is kept
+             in sync by syncSimUserDropdown() (see below), using
+             ds_dropdown.js's exported re-init hook (#1473). #}
+          <select id="ax-sim-user" class="ds-dropdown-native"><option value="">Loading people…</option></select>
+          {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
+                         options=[{'value': '', 'label': 'Loading people…'}]) }}
         </span>
       </div>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
@@ -836,6 +843,7 @@
 
 {# The create / rename flow. #}
 <script src="{{ static_url('js/components/group_drawer.js') }}"></script>
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   "use strict";
@@ -2030,6 +2038,51 @@
 
   /* ── Simulate ── */
 
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from ax-sim-user's
+  // own freshly-set <option>s, then re-runs ds_dropdown.js's init via the
+  // exported `dsDropdownInit` hook — needed because loadUsers() rebuilds the
+  // whole option list once from a fetch. The button is rebuilt too, not just
+  // the menu: init() isn't idempotent for its per-element listeners, so
+  // leaving the same persisting <button> node across two init() calls (one
+  // from ds_dropdown.js's own DOMContentLoaded bootstrap, one from here)
+  // double-registers its click handler — the second open()/close() undoes
+  // the first, and the menu never appears to open. Recreating the button
+  // discards that stale listener along with the old node.
+  function syncSimUserDropdown(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="ax-sim-user"]');
+    if (!dd) return;
+    const opts = Array.from(sel.options);
+    const currentOpt = opts.find((o) => o.value === sel.value) || opts[0];
+    const menuEl = dd.querySelector(".ds-dropdown-menu");
+    const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
+    const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="ax-sim-user-dd-name">${esc(ariaLabel)}</span>` : "";
+    const labelledBy = ariaLabel ? ` aria-labelledby="ax-sim-user-dd-name ax-sim-user-dd-btn-label"` : "";
+    const items = opts
+      .map((o) => `<li class="ds-dropdown-menu-item${o === currentOpt ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${esc(o.value)}">${esc(o.textContent)}</li>`)
+      .join("");
+    dd.innerHTML = `<button type="button" class="ds-dropdown-btn" id="ax-sim-user-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="ax-sim-user-dd-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="ax-sim-user-dd-btn-label">${currentOpt ? esc(currentOpt.textContent) : ""}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="ax-sim-user-dd-menu" role="menu" aria-label="${esc(ariaLabel || "Options")}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(dd);
+  }
+
+  // Lighter counterpart for when only the SELECTED value changes and the
+  // option list itself is untouched (a real click already updated the
+  // dropdown's own visuals via ds_dropdown.js; the `?user=` deep link below
+  // sets `.value` + dispatches "change" straight from code, which needs this
+  // to catch the paper-theme dropdown up). Mutates the EXISTING items in
+  // place rather than rebuilding — no button churn on every plain click.
+  function syncSimUserSelection(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="ax-sim-user"]');
+    if (!dd) return;
+    const label = dd.querySelector(".ds-dropdown-btn-label");
+    const opt = sel.options[sel.selectedIndex];
+    dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach((item) => {
+      const isSelected = item.dataset.value === sel.value;
+      item.classList.toggle("is-selected", isSelected);
+      item.setAttribute("aria-checked", isSelected ? "true" : "false");
+    });
+    if (label && opt) label.textContent = opt.textContent.trim();
+  }
+
   async function loadUsers() {
     if (users.length) return;
     try {
@@ -2042,9 +2095,11 @@
       .filter((u) => u.active !== false)
       .map((u) => `<option value="${esc(u.id)}">${esc(u.name || u.email)} — ${esc(u.email)}</option>`)
       .join("");
+    syncSimUserDropdown(sel);
   }
 
   el("ax-sim-user").addEventListener("change", async (e) => {
+    syncSimUserSelection(e.target);
     const uid = e.target.value;
     // The picked person lives in the URL (?user=) so the preview survives a
     // round trip — "Share it →" leaves for the package page and its back

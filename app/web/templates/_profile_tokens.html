@@ -633,7 +633,7 @@
            rest. The old chips revealed direction only after the key was
            already active, behind a second click on the same target. -->
       <div class="fbar-select">
-        <select id="tok-sort" aria-label="Sort tokens">
+        <select id="tok-sort" class="ds-dropdown-native" aria-label="Sort tokens">
           <option value="created_at:desc" selected>Newest first</option>
           <option value="created_at:asc">Oldest first</option>
           <option value="last_used_at:desc">Recently used</option>
@@ -641,6 +641,18 @@
           <option value="expires_at:asc">Expiring soonest</option>
           <option value="expires_at:desc">Expiring latest</option>
         </select>
+        {{ ds.dropdown(
+          id='tok-sort-dd', target='tok-sort',
+          aria_label='Sort tokens', selected='created_at:desc',
+          options=[
+            {'value': 'created_at:desc', 'label': 'Newest first'},
+            {'value': 'created_at:asc', 'label': 'Oldest first'},
+            {'value': 'last_used_at:desc', 'label': 'Recently used'},
+            {'value': 'last_used_at:asc', 'label': 'Least recently used'},
+            {'value': 'expires_at:asc', 'label': 'Expiring soonest'},
+            {'value': 'expires_at:desc', 'label': 'Expiring latest'},
+          ],
+        ) }}
       </div>
 
       <!-- Status: ONE segmented control on its own row, not five loose pills.
@@ -1204,7 +1216,7 @@ function setSort(key, dir) {
   sort.key = key;
   sort.dir = dir;
   const sel = document.getElementById("tok-sort");
-  if (sel) sel.value = `${key}:${dir}`;
+  if (sel) { sel.value = `${key}:${dir}`; syncDropdownFromSelect(sel); }
   renderList();
 }
 const sortEl = document.getElementById("tok-sort");
