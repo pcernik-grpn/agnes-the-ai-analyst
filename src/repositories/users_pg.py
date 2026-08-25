@@ -193,6 +193,22 @@ class UsersPgRepository:
         with self._engine.connect() as conn:
             return conn.execute(sa.text("SELECT COUNT(*) FROM users")).scalar() or 0
 
+    def any_password_holder(self, exclude_email: Optional[str] = None) -> bool:
+        """PG sibling of the DuckDB ``any_password_holder`` — a
+        ``SELECT 1 … LIMIT 1`` existence probe for a usable password holder,
+        with the same predicate (NULL/empty hash never counts; ``IS DISTINCT
+        FROM`` keeps a NULL email counted when an exclusion is given). Backs
+        the zero-door email rescue's hot unauthenticated path, which must not
+        enumerate the users table."""
+        sql = "SELECT 1 FROM users WHERE password_hash IS NOT NULL AND password_hash <> ''"
+        params: Dict[str, Any] = {}
+        if exclude_email is not None:
+            sql += " AND email IS DISTINCT FROM :exclude_email"
+            params["exclude_email"] = exclude_email
+        sql += " LIMIT 1"
+        with self._engine.connect() as conn:
+            return conn.execute(sa.text(sql), params).first() is not None
+
     def create(
         self,
         id: str,

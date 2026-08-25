@@ -95,6 +95,10 @@ _COHORT: dict[str, tuple[str, str]] = {
     # tier as search/export/validate-query.
     "/api/semantic-models/context": ("semantic-model context", "get_semantic_context"),
     "/api/semantic-models/schema": ("semantic-model schema", "get_semantic_schema"),
+    # Chat-first authoring (spec 2026-08-24) — the one semantic-layer write
+    # surface with outcome branching (admin → applied, non-admin → queued
+    # for moderation).
+    "/api/semantic-models/apply": ("semantic-model apply", "apply_semantic_model"),
     # Contributed-skill triple-surface (GET list + DELETE; POST contribute is _EXEMPT below).
     "/api/admin/contributed-skills": ("admin skill list", "list_contributed_skills"),
     "/api/admin/contributed-skills/{name}": ("admin skill delete", "delete_contributed_skill"),
@@ -539,11 +543,19 @@ _LIBRARY_MOVE_REASON = (
 )
 
 _AGENTS_REGISTRY_REASON = (
-    "Web Agent-builder CRUD (v103 `agents` registry). The builder at /agents is "
-    "the only producer and the Library the only consumer; an agent cannot yet be "
-    "RUN on any surface, so there is no analyst CLI/MCP workflow to mirror. "
-    "Revisit when agents become runnable — then `agnes agent …` + an MCP tool "
-    "become the triple-surface obligation."
+    "Web Agent-builder CRUD (v103 `agents` registry) — a second registry over "
+    "the same `agents` table as `/api/v1/agents`, which IS runnable and already "
+    "carries full triple-surface coverage (`/api/v1/agents/{slug}/responses` "
+    "in _COHORT, reachable via `agnes chat` / `agent ask`). The builder at "
+    "/agents is the only producer of this registry and the Library the only "
+    "consumer; it writes decorative knowledge/plugins fields the runtime never "
+    "reads and never sets `agent_scope`, so a builder-created agent stays in "
+    "the default all-mode and cannot be issued a PAT (`agent_not_selected_mode` "
+    "until `agnes agent scope set` runs) — unreachable via API by construction, "
+    "not because agents cannot be run. Two registries pending the agent-core "
+    "consolidation program (remediation Track C, 'one agent model'), which "
+    "deletes `/api/agents` and re-points the builder at `/api/v1/agents` — at "
+    "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
 _LIBRARY_SHARING_REASON = (
@@ -934,6 +946,11 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven Databricks semantic layer (Unity Catalog metric "
         "views) sync trigger — admin/scheduler maintenance op, mirrors the "
         "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/run-audit-prune": (
+        "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
+        "seam) — admin/scheduler maintenance op, mirrors the run-blocked-purge "
+        "/ run-reap-stuck-reviews exemptions; no analyst CLI/MCP analogue"
     ),
     "/api/chat/journey": (
         "chat-driven onboarding backend foundation — internal state read/write "

@@ -744,7 +744,15 @@ def _enforce_non_admin_sql_rbac(analytics, sql_lower: str, allowed) -> None:
         return
     from src.rbac import table_not_in_stack_message
 
-    sql_lower_masked = _mask_backticks(sql_lower)
+    # Layer (a)'s regex scans raw text, so it must run over a copy with
+    # string/dollar-quoted literals and comments blanked first — otherwise a
+    # literal or comment merely CONTAINING a catalog name (`SELECT
+    # 'keboola.com' AS x`) 403s as if it referenced the catalog (#1394).
+    # `_mask_sql_for_guard` leaves quoted IDENTIFIERS visible (a genuine
+    # catalog-qualified reference), so that evasion stays caught. Backtick
+    # masking (BQ full-path noise, issue #201) runs AFTER — not before — so a
+    # stray backtick inside an already-blanked string literal can't desync it.
+    sql_lower_masked = _mask_backticks(_mask_sql_for_guard(sql_lower, mask_comments=True))
     references = _sql_reference_test(sql_lower)
 
     # (a) #868 catalog gate
@@ -931,6 +939,179 @@ _SQL_IDENT_PATH = re.compile(
 )
 
 
+# DuckDB dollar-quoted string literal opener: `$$` or `$tag$`, where a tag
+# must start with a letter/underscore (matching DuckDB's own rule — verified
+# empirically: `$1$…$1$` is a parser error, `$tag1$…$tag1$` is not). Anchored
+# via `.match(sql, i)` (never `.search`), so this is one bounded attempt per
+# `$` encountered, not a scan — no catastrophic backtracking (security
+# playbook rule #5: the body has no nested/overlapping quantifiers, so a
+# failed match backtracks the trailing `\w*` at most once, linearly).
+_DOLLAR_QUOTE_OPEN_RE = re.compile(r"\$([A-Za-z_]\w*)?\$")
+
+
+class _UnterminatedSqlLiteralError(ValueError):
+    """A quoted span (string literal, quoted identifier, dollar-quoted
+    string) or a block comment never closed before end-of-string.
+
+    DuckDB itself refuses every one of these shapes as a parser error
+    (`unterminated quoted string` / `unterminated quoted identifier` /
+    `unterminated dollar-quoted string` / `unterminated /* comment` —
+    verified empirically against 1.5.2), so a query built like this can
+    never actually execute. Silently treating "everything after the opening
+    delimiter is inside it" would still be wrong for a GUARD, though: it
+    would mask whatever real SQL happens to follow the truncated token —
+    hiding it from a security check that runs BEFORE DuckDB ever sees the
+    statement, on the strength of "DuckDB would reject it anyway" alone.
+    Guard call sites (`_mask_sql_for_guard`) turn this into a 400 instead —
+    fail closed. The non-security caller (`_mask_sql_noise`, best-effort
+    audit-tagging only, never gates access) keeps the old permissive
+    "run to end of string" behaviour so a malformed query never crashes
+    telemetry.
+    """
+
+
+def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
+    """One left-to-right, linear-time pass recognizing every span DuckDB
+    itself treats as opaque, blanking the ones each caller (``_mask_sql_noise``,
+    ``_mask_sql_for_guard``) needs blanked while preserving length and offsets.
+
+    Handles, in priority order at each position (order matters — see below):
+
+    * ``"`` / `` ` `` quoted identifiers — stepped over WITHOUT blanking.
+      Never masked, in any mode: an identifier is always a real name (a
+      catalog/schema/table qualifier, or an alias), never data. This is the
+      one property both call sites below share and the reason this function
+      exists in the first place — see ``_mask_sql_for_guard``'s docstring
+      for why that distinction is the crux of the #1394 fix.
+    * ``'`` single-quoted string literals, with ``''`` escape handling —
+      blanked (delimiters included).
+    * ``$$…$$`` / ``$tag$…$tag$`` dollar-quoted string literals (DuckDB
+      supports these; unlike a single-quoted literal, their body can
+      contain an unescaped ``'``) — blanked. Checked BEFORE the plain
+      single-quote branch reaches any of its body: a ``'`` inside a
+      dollar-quoted span must never be read as opening a *different* string,
+      which would desync the rest of the scan (the same class of bug
+      documented on ``connectors/internal/access.py``'s escape-string
+      regex).
+    * ``--`` line comments and nested ``/* */`` block comments — blanked
+      only when ``mask_comments`` is true. DuckDB nests block comments
+      (verified empirically: ``/* a /* b */ c */`` parses as ONE comment,
+      ``/* a /* b */`` alone is a parser error), so the depth counter below
+      is required for correctness, not just extra caution — a non-nesting
+      scanner would close on the first inner ``*/`` and un-comment real SQL
+      that DuckDB itself still treats as commented out.
+
+    ``strict`` — see ``_UnterminatedSqlLiteralError``.
+    """
+    out = list(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ('"', "`"):
+            close = sql.find(ch, i + 1)
+            if close == -1:
+                if strict:
+                    raise _UnterminatedSqlLiteralError("unterminated quoted identifier")
+                i = n
+            else:
+                i = close + 1
+        elif (
+            ch in ("E", "e")
+            and i + 1 < n
+            and sql[i + 1] == "'"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):
+            # DuckDB E-strings: `E'...'` / `e'...'` accept BACKSLASH escapes
+            # on top of the usual `''` (verified against the engine:
+            # `SELECT E'\''` yields `'`, and `SELECT E'a\'` is a parser
+            # error because the `\'` escapes the quote and the literal
+            # never closes). A scanner that ignored the prefix would read
+            # `E'\''` as an unterminated literal and refuse a valid query,
+            # and would end `E'\'; DROP TABLE x --'` early — exposing text
+            # DuckDB itself treats as data. Both mismatches fail CLOSED
+            # (a 400/403 on a valid query, never a hidden statement), but
+            # false positives are exactly what this masking exists to
+            # remove. The identifier guard on the preceding character keeps
+            # a trailing `e` of some longer word from starting an E-string.
+            j = i + 2
+            closed = False
+            while j < n:
+                if sql[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed and strict:
+                raise _UnterminatedSqlLiteralError("unterminated E-string literal")
+            end = j + 1 if closed else n
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "'":
+            j = i + 1
+            closed = False
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":  # '' escape
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed and strict:
+                raise _UnterminatedSqlLiteralError("unterminated string literal")
+            end = j + 1 if closed else n
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "$" and (m := _DOLLAR_QUOTE_OPEN_RE.match(sql, i)) is not None:
+            delim = m.group(0)
+            close = sql.find(delim, m.end())
+            if close == -1:
+                if strict:
+                    raise _UnterminatedSqlLiteralError("unterminated dollar-quoted string")
+                end = n
+            else:
+                end = close + len(delim)
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            if mask_comments:
+                for k in range(i, j):
+                    out[k] = " "
+            i = j
+        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if sql[j] == "/" and j + 1 < n and sql[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                elif sql[j] == "*" and j + 1 < n and sql[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            if depth > 0 and strict:
+                raise _UnterminatedSqlLiteralError("unterminated block comment")
+            end = j if depth == 0 else n
+            if mask_comments:
+                for k in range(i, end):
+                    out[k] = " "
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
+
 def _mask_sql_noise(sql: str) -> str:
     """Blank string literals and comments, preserving length and offsets.
 
@@ -941,42 +1122,70 @@ def _mask_sql_noise(sql: str) -> str:
     and backticked spans are identifiers, not literals, so they are skipped
     over intact: their contents stay matchable as part of a table path, and a
     quote inside them can't open a phantom literal.
+
+    Thin, non-strict wrapper over ``_scan_and_mask_sql`` — this caller is
+    best-effort audit tagging, not a security guard, so an unterminated span
+    degrades to "mask to end of string" instead of raising (see
+    ``_UnterminatedSqlLiteralError``).
     """
-    out = list(sql)
-    i, n = 0, len(sql)
-    while i < n:
-        ch = sql[i]
-        if ch in ('"', "`"):
-            # Quoted identifier — step over it without blanking.
-            close = sql.find(ch, i + 1)
-            i = n if close == -1 else close + 1
-        elif ch == "'":
-            j = i + 1
-            while j < n:
-                if sql[j] == "'":
-                    if j + 1 < n and sql[j + 1] == "'":  # '' escape
-                        j += 2
-                        continue
-                    break
-                j += 1
-            for k in range(i, min(j + 1, n)):
-                out[k] = " "
-            i = j + 1
-        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
-            j = sql.find("\n", i)
-            j = n if j == -1 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
-            j = sql.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        else:
-            i += 1
-    return "".join(out)
+    return _scan_and_mask_sql(sql, mask_comments=True, strict=False)
+
+
+def _mask_sql_for_guard(sql: str, *, mask_comments: bool) -> str:
+    """The masking every raw-text SQL guard in this module runs input
+    through — shared by ``_assert_select_only``'s keyword blocklist scan
+    (#1513) and ``_assert_no_ungranted_catalog_ref`` (#1394's layer (a),
+    reached via ``_enforce_non_admin_sql_rbac``), so the masking logic
+    exists exactly once rather than hand-copied per guard (this module's
+    recurring drift class — see e.g. the pre-#201 backtick-masking
+    duplication this file used to carry).
+
+    Both guards previously scanned RAW SQL text, so a string literal or
+    comment merely CONTAINING a registered catalog name (#1394) or a
+    DML/DDL-shaped English word (#1513, e.g. ``'load failed'``) was refused
+    as if it were the real thing. Masking string/dollar-quoted literals
+    before either guard's own regex/substring scan fixes both — a value is
+    never SQL syntax.
+
+    They disagree on ``mask_comments``, which is why this takes it as a
+    parameter instead of hard-coding a choice:
+
+    * #1394's catalog gate treats a comment the same as a literal — inert
+      text DuckDB never executes, so a catalog name inside one is noise, not
+      a real reference. ``mask_comments=True``.
+    * #1513's keyword blocklist deliberately keeps comments SCANNED — the
+      blocklist substring scan is the ONLY boundary for DML/DDL keywords (no
+      parser backs it the way the file-table-source and
+      SQL-string-table-function checks do), so a comment must not be able to
+      smuggle one past it (pinned by
+      ``test_blocked_keyword_in_leading_comment_still_blocked``).
+      ``mask_comments=False``.
+
+    Quoted identifiers (``"..."``, `` `...` ``) are NEVER masked, in either
+    mode — see ``_scan_and_mask_sql``'s docstring. For the catalog gate this
+    is the whole point: ``"keboola"."x"`` is a genuine catalog-qualified
+    reference (pinned by ``test_quoted_catalog_qualified_ref_is_403``), not
+    data, and masking it would trade a false-positive bug for a real bypass.
+    One consequence worth being explicit about: an alias like
+    ``AS "keboola.com"`` (a dot INSIDE one quoted segment, not a path of two
+    quoted segments) still 403s after this fix, same as before it — fixing
+    that would require keying the catalog gate off parsed table references
+    instead of a text scan at all (the issue's alternate suggested fix), a
+    larger change than "mask what's actually data" this PR intentionally
+    does not make. Failing closed on that residual case is the safe
+    direction for a security guard to be wrong in.
+
+    Raises ``HTTPException(400)`` instead of letting an unterminated quoted
+    span or comment silently swallow whatever real SQL follows it — see
+    ``_UnterminatedSqlLiteralError``.
+    """
+    try:
+        return _scan_and_mask_sql(sql, mask_comments=mask_comments, strict=True)
+    except _UnterminatedSqlLiteralError:
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed SQL: an unterminated string literal, quoted identifier, or comment",
+        ) from None
 
 
 def _enclosing_calls(masked: str, positions: list) -> dict:
@@ -1351,7 +1560,15 @@ def _assert_select_only(sql_lower: str) -> None:
     # statement. A ";" that remains after stripping it is a genuine
     # multi-statement attempt and still blocked below.
     body = strip_one_trailing_semicolon(sql_lower)
-    if any(keyword in body for keyword in _BLOCKED_SQL_TOKENS):
+    # The blocklist below scans for plain substrings, so it must run over a
+    # copy with string/dollar-quoted literals blanked first — otherwise a
+    # literal that merely CONTAINS an ordinary word like "load " or "delete "
+    # (`SELECT 'load failed' AS x`), or a URL, 400s as if it were the keyword
+    # (#1513). Comments stay SCANNED on purpose — see `_mask_sql_for_guard`'s
+    # docstring — this blocklist is the only boundary for DML/DDL keywords,
+    # so `-- drop this table` must still be caught.
+    masked_body = _mask_sql_for_guard(body, mask_comments=False)
+    if any(keyword in masked_body for keyword in _BLOCKED_SQL_TOKENS):
         raise HTTPException(status_code=400, detail="Only single SELECT queries are allowed")
     # File-path table source anywhere in the FROM graph (direct / comma-list /
     # glob), detected precisely via sqlglot — the position regex is used only as

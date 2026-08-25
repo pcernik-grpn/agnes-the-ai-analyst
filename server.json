@@ -3,7 +3,7 @@
   "name": "io.github.keboola/agnes",
   "title": "Agnes",
   "description": "Governed access to your company's data and memory: catalog, schema, SQL and skills.",
-  "version": "0.86.0",
+  "version": "0.87.0",
   "websiteUrl": "https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/README.md",
   "repository": {
     "url": "https://github.com/keboola/agnes-the-ai-analyst",

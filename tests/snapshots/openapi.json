@@ -6165,6 +6165,24 @@
         "title": "PassthroughToolDTO",
         "type": "object"
       },
+      "PasswordChangeRequest": {
+        "properties": {
+          "current_password": {
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "PasswordChangeRequest",
+        "type": "object"
+      },
       "PasswordLoginRequest": {
         "properties": {
           "email": {
@@ -7942,6 +7960,41 @@
           }
         },
         "title": "SecretsRequest",
+        "type": "object"
+      },
+      "SemanticModelApply": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "document": {
+            "title": "Document",
+            "type": "string"
+          },
+          "expected_content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Content Hash"
+          }
+        },
+        "required": [
+          "document"
+        ],
+        "title": "SemanticModelApply",
         "type": "object"
       },
       "SemanticModelCreate": {
@@ -11299,7 +11352,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.84.8"
+    "version": "0.86.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -17555,7 +17608,7 @@
     },
     "/api/admin/doctor/new-instance": {
       "post": {
-        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``branding``. Optional body ``{\"email_to\": ...}`` makes the\nemail-delivery check send a real test message.",
+        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``app-state-backend``, ``branding``. Optional body ``{\"email_to\": ...}``\nmakes the email-delivery check send a real test message.",
         "operationId": "doctor_new_instance_api_admin_doctor_new_instance_post",
         "parameters": [
           {
@@ -24613,6 +24666,60 @@
         "summary": "Get Resource Types",
         "tags": [
           "access"
+        ]
+      }
+    },
+    "/api/admin/run-audit-prune": {
+      "post": {
+        "description": "Trigger the retention-based ``audit_log`` prune.\n\nWraps :func:`src.audit_retention.prune_audit_log`. The scheduler service\nhits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the\ncorporate-memory + blocked-purge jobs); admins can also run it on demand.\n\n``retention_days`` comes from ``audit.retention_days`` (default 365, 0\nkeeps rows forever). Only ``audit_log`` has a retention policy \u2014 see\ndocs/observability.md for the other audit/observability trails.",
+        "operationId": "run_audit_prune_api_admin_run_audit_prune_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Audit Prune",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -42718,6 +42825,70 @@
         ]
       }
     },
+    "/api/semantic-models/apply": {
+      "post": {
+        "description": "Apply a hand-authored Ossie document \u2014 the one semantic-layer write\nsurface for chat, CLI, and the studio builder.\n\nWhat \"apply\" means depends on the caller's authority, and the response\nlabels the outcome so callers (human or agent) never have to guess:\n\n- **admin** \u2192 the document is validated, stored as a ``source='manual'``\n  model (create-or-replace by slug), and projected into the flat tables.\n  Response: ``{\"outcome\": \"applied\", \"model\": {...}}``.\n- **non-admin** \u2192 the document is validated, then queued as an\n  ``authoring_suggestions`` row (domain ``semantic-layer``) for admin\n  moderation \u2014 it never touches ``semantic_models`` before approval.\n  Response: ``{\"outcome\": \"submitted_for_review\", \"suggestion_id\": ...}``.\n\nShared guards, both roles: schema-invalid documents 422; a slug owned by\nan imported source 409 ``source_owned``; a supplied\n``expected_content_hash`` that no longer matches 409 ``stale_document``.\nThe non-admin branch additionally 409s ``duplicate_pending`` while an\nearlier proposal for the same slug awaits review, and 403s\n``studio_disabled`` when the instance-level Studio toggle is off (the\nadmin branch is a plain admin write, not Studio-gated).",
+        "operationId": "apply_semantic_model_endpoint_api_semantic_models_apply_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelApply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Semantic Model Endpoint",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/semantic-models/context": {
       "get": {
         "description": "Typed context lookup over the caller's accessible semantic models \u2014\nthe ``get_semantic_context`` parity tool.\n\nWraps the pure ``src.semantic_context.get_semantic_context`` over the\nsame ``_accessible_valid_documents`` RBAC tier as search/export/\nvalidate-query. An empty result (no accessible model, or no object of\nthe requested type/id) is not an error \u2014 this endpoint has no\nmisleading \"all clear\" to gate against, unlike ``validate-query``.",
@@ -50725,6 +50896,112 @@
           }
         },
         "summary": "Microsoft Login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/password/change": {
+      "get": {
+        "description": "Self-serve change-password page, linked from the account menu.",
+        "operationId": "password_change_page_auth_password_change_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change Page",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Change the caller's own password. Session token only (PAT rejected by\n`require_session_token`, matching `/auth/tokens` and every other door\nthat mints or rotates a credential).\n\nDouble-submit CSRF (F2) is checked FIRST, before anything else runs \u2014\nincluding the no-password-hash lookup below. A cookie-authenticated JSON\nPOST is not automatically CSRF-safe (the cookie fallback in\n`get_current_user` means an ordinary cross-site fetch would still carry\nthe session), so the caller must echo the `web_csrf` cookie value in the\n`X-CSRF-Token` header (same mechanism as `me_profile_refetch_groups`).\nChecking it first \u2014 rather than after the account-state read \u2014 closes a\nresponse-shape leak (Devin Review on PR #1548): a caller with no CSRF\ntoken would otherwise get a different status for an SSO-only account\n(400) than a password account (403 from the CSRF check), letting a\nsame-site page without the token distinguish the two account types.\nNothing here is safe to do before proving the caller sent this request\non purpose. The GET page mints the `web_csrf` cookie unconditionally \u2014\neven for an SSO-only account with no form to submit \u2014 so this ordering\nnever blocks a legitimate caller who visited it first.\n\nExisting sessions and PATs are NOT invalidated by a password change \u2014\nthis endpoint only replaces the password hash. Revoking sessions/PATs is\na separate action (`DELETE /auth/tokens/{id}`), same as every other\npassword door in this module (reset, setup, admin reset).",
+        "operationId": "password_change_auth_password_change_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change",
         "tags": [
           "auth"
         ]

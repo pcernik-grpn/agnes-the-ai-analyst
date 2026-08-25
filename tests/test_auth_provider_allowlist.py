@@ -1,5 +1,8 @@
-"""auth.providers allowlist: unset = today's behavior; set = allowlist ∩ availability;
-excluded providers' endpoints 404 — including the shared-router POST /auth/token."""
+"""auth.providers allowlist: unset = every provider except email (B6); set =
+allowlist ∩ availability; excluded providers' endpoints 404 — including the
+shared-router POST /auth/token. The unset default is pinned in more depth by
+tests/test_auth_provider_defaults.py; this file keeps the allowlist mechanics
+(narrowing, lockout rescue, endpoint gating) that B6 did not change."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,11 +30,12 @@ def make_client(tmp_path, monkeypatch, shared_app):
 
 
 class TestRegistry:
-    def test_unset_allows_everything(self, monkeypatch):
+    def test_unset_allows_everything_except_email(self, monkeypatch):
         monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
         from app.auth.provider_registry import provider_allowed
 
-        assert all(provider_allowed(p) for p in ("google", "email", "password", "keboola", "microsoft"))
+        assert all(provider_allowed(p) for p in ("google", "password", "keboola", "microsoft"))
+        assert provider_allowed("email") is False
 
     def test_microsoft_is_known(self):
         from app.auth.provider_registry import KNOWN_PROVIDERS
@@ -200,9 +204,24 @@ class TestEndpointGating:
         assert "Sign in with Email Link" in html
         assert "Sign in with Email &amp; Password" not in html and "Sign in with Email & Password" not in html
 
-    def test_login_page_unset_is_todays_behavior(self, make_client):
+    def test_login_page_unset_offers_password_not_email(self, make_client):
+        # A password holder must exist so password is a genuinely USABLE
+        # door — otherwise this is the zero-usable-door state where email
+        # is kept as a rescue instead of excluded (see
+        # tests/test_auth_provider_defaults.py::TestZeroDoorEmailRescue).
+        from argon2 import PasswordHasher
+
+        from src.repositories import users_repo
+
         client = make_client(None)
+        users_repo().create(
+            id="pw-holder-allowlist",
+            email="allowlist-holder@test.com",
+            name="Holder",
+            password_hash=PasswordHasher().hash("x" * 12),
+        )
         html = client.get("/login").text
-        # No Google credentials in the test env → password + email link, exactly as before.
+        # No Google credentials in the test env → password only; the magic
+        # link is opt-in (B6) and is not offered without an explicit listing.
         assert "Sign in with Email & Password" in html or "Sign in with Email &amp; Password" in html
-        assert "Sign in with Email Link" in html
+        assert "Sign in with Email Link" not in html

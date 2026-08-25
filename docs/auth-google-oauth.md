@@ -1,6 +1,6 @@
 # Google OAuth — operator gotchas
 
-The Google OAuth provider (`app/auth/providers/google.py`) reads `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` straight from environment variables. If either is empty, `is_available()` returns `False` and the login page falls back to email / password auth without complaint.
+The Google OAuth provider (`app/auth/providers/google.py`) reads `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` straight from environment variables. If either is empty, `is_available()` returns `False` and the login page falls back to password auth without complaint (the email magic link is opt-in only — add `email` to `auth.providers` to also offer it).
 
 ## Env vars
 

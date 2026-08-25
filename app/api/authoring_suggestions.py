@@ -196,11 +196,31 @@ def _replay_marketplace(payload: dict, by: str, submitted_by: Optional[str] = No
     return req.slug
 
 
+def _replay_semantic_model(payload: dict, by: str, submitted_by: Optional[str] = None) -> str:
+    """Apply a proposed Ossie document through the SAME pipeline the admin
+    ``/api/semantic-models/apply`` branch uses — full document re-validation
+    plus the source-ownership guard run again here, so a payload that rotted
+    while pending (or a slug an imported model claimed meanwhile) fails the
+    approve with 409 ``create_failed`` and the suggestion reopens, rather
+    than shadowing an imported model or storing a half-valid document.
+    ``SemanticApplyError`` is a ``ValueError``, so the caller's generic
+    exception mapping needs nothing special."""
+    from app.api.semantic_models import apply_manual_model
+
+    row = apply_manual_model(
+        document=payload["document"],
+        description=payload.get("description"),
+        expected_content_hash=payload.get("expected_content_hash"),
+    )
+    return row["id"]
+
+
 _SAFE_REPLAY = {
     "data-package": _replay_data_package,
     "corporate-memory": _replay_corporate_memory,
     "mcp": _replay_mcp,
     "marketplace": _replay_marketplace,
+    "semantic-layer": _replay_semantic_model,
 }
 
 public_router = APIRouter(prefix="/api/studio", tags=["authoring-suggestions"])

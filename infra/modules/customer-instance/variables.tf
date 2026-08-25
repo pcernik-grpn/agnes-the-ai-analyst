@@ -601,6 +601,12 @@ variable "enable_watchdog" {
   default     = true
 }
 
+variable "enable_gcp_logging" {
+  description = "Ship every container's stdout/stderr to Google Cloud Logging via Docker's built-in gcplogs driver, in addition to the local dual-logging cache `docker logs` reads from. On: the startup script extracts docker-compose.gcp-logging.yml (baked into the image) into the app directory, which the COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) then includes on every `docker compose` invocation — so logs survive the routine container recreates the auto-upgrade cron performs every 5 minutes, which otherwise destroy the Docker json-file log history. Off: the script removes the file instead, keeping the instance on the default json-file driver (rotated by /etc/docker/daemon.json) — the only supported choice for a non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server credentials."
+  type        = bool
+  default     = true
+}
+
 variable "dispatcher_image" {
   description = <<-EOT
     Image for the opt-in LLM dispatcher (token-arbitrage PoC), e.g.

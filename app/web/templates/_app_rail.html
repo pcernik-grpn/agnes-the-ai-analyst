@@ -657,6 +657,14 @@
                 </div>
                 {# ── About you ── #}
                 <a class="app-user-menu-item {% if _path == '/me/profile' %}is-active{% endif %}" role="menuitem" href="/me/profile">Profile</a>
+                {# Self-serve change-password (B6) — password auth had no
+                   in-app way to rotate a credential you already know, only
+                   token-based reset (forgot it) and admin reset. Placed next
+                   to Profile since it's the same "about you" account-state
+                   group; the route itself 404s if this instance excludes
+                   the password provider (require_provider("password")), so
+                   no extra gating is needed here. #}
+                <a class="app-user-menu-item {% if _path == '/auth/password/change' %}is-active{% endif %}" role="menuitem" href="/auth/password/change">Change password</a>
                 {# My connections (#919/#1086) — per-user MCP OAuth self-service.
                    Same placement contract as the topnav user dropdown
                    (tests/test_web_nav_me_connections.py, which runs over BOTH

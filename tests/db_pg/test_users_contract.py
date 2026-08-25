@@ -193,6 +193,51 @@ def test_count_all_increments_on_create(users_repo):
     assert after == before + 1
 
 
+# ---------------------------------------------------------------------------
+# any_password_holder — cheap existence probe (zero-door email rescue, PR #1548)
+#
+# Backs `provider_registry._has_usable_password_holder`, which runs on every
+# unauthenticated /login render of a no-OAuth instance — hence an existence
+# probe with LIMIT 1 rather than a list_all() scan. The predicate must mirror
+# the Python filter it replaced: truthiness of the hash (NULL and '' both
+# read as "no password") and an email exclusion for the synthetic scheduler
+# account.
+# ---------------------------------------------------------------------------
+
+
+def test_any_password_holder_false_on_empty_table(users_repo):
+    repo, _, _ = users_repo
+    assert repo.any_password_holder() is False
+
+
+def test_any_password_holder_true_once_a_user_holds_a_hash(users_repo):
+    repo, _, _ = users_repo
+    _make_user(repo, id="user-nohash", email="a@example.com")
+    assert repo.any_password_holder() is False
+    _make_user(repo, id="user-hash", email="b@example.com", password_hash="argon2id$xxxx")
+    assert repo.any_password_holder() is True
+
+
+def test_any_password_holder_empty_string_hash_does_not_count(users_repo):
+    """The Python predicate this probe replaced tested truthiness, so an
+    empty-string hash never counted as a password; the SQL must agree."""
+    repo, _, _ = users_repo
+    _make_user(repo, password_hash="")
+    assert repo.any_password_holder() is False
+
+
+def test_any_password_holder_excludes_the_given_email(users_repo):
+    """A synthetic account (the scheduler user) may carry a hash but cannot
+    sign in interactively — with `exclude_email` set it must not count as a
+    holder, while any OTHER holder still does."""
+    repo, _, _ = users_repo
+    _make_user(repo, id="user-sched", email="scheduler@internal.invalid", password_hash="argon2id$sched")
+    assert repo.any_password_holder() is True
+    assert repo.any_password_holder(exclude_email="scheduler@internal.invalid") is False
+    _make_user(repo, id="user-human", email="human@example.com", password_hash="argon2id$human")
+    assert repo.any_password_holder(exclude_email="scheduler@internal.invalid") is True
+
+
 def test_delete_removes_user(users_repo):
     repo, _, _ = users_repo
     _make_user(repo)

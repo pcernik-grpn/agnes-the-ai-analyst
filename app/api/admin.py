@@ -8284,6 +8284,41 @@ async def run_blocked_purge(
     return {"ok": True, "details": result}
 
 
+# ---------------------------------------------------------------------------
+# B8: scheduled retention pruning of audit_log
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run-audit-prune")
+async def run_audit_prune(
+    user: dict = Depends(require_admin),
+):
+    """Trigger the retention-based ``audit_log`` prune.
+
+    Wraps :func:`src.audit_retention.prune_audit_log`. The scheduler service
+    hits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the
+    corporate-memory + blocked-purge jobs); admins can also run it on demand.
+
+    ``retention_days`` comes from ``audit.retention_days`` (default 365, 0
+    keeps rows forever). Only ``audit_log`` has a retention policy — see
+    docs/observability.md for the other audit/observability trails.
+    """
+    from app.instance_config import get_audit_retention_days
+    from src.audit_retention import prune_audit_log
+
+    retention_days = get_audit_retention_days()
+    result = prune_audit_log(retention_days=retention_days)
+
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="run_audit_prune",
+        resource="job:audit-prune",
+        params={"retention_days": retention_days, **result},
+    )
+    return {"ok": True, "details": result}
+
+
 @router.post("/run-reap-stuck-reviews")
 async def run_reap_stuck_reviews(
     user: dict = Depends(require_admin),

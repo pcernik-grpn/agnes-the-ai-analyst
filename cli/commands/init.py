@@ -327,8 +327,7 @@ def _maybe_declare_marketplace_trust(host: str, decision: Optional[bool], server
     pruned = prune_stale_loopback_declarations(settings_path, host)
     if pruned:
         typer.echo(
-            f"Removed stale auto-mode declarations for previous local ports from {settings_path}: "
-            + ", ".join(pruned)
+            f"Removed stale auto-mode declarations for previous local ports from {settings_path}: " + ", ".join(pruned)
         )
 
     if decision is False:
@@ -1075,9 +1074,13 @@ def init(
         # ------------------------------------------------------------------
         if claude_md.exists() and force:
             try:
+                from src.initial_workspace import _prune_backups, _unique_bak_path
+
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                backup_path = workspace / f"CLAUDE.md.bak.{ts}"
+                backup_path = _unique_bak_path(workspace / f"CLAUDE.md.bak.{ts}")
                 backup_path.write_bytes(claude_md.read_bytes())
+                # #1476: bound backup growth — keep only the most recent few.
+                _prune_backups(claude_md)
                 typer.echo(f"Backed up existing CLAUDE.md → {backup_path.name}")
             except OSError as exc:
                 typer.echo(

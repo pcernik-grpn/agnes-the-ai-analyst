@@ -55,6 +55,8 @@ COPY . .
 #   - post-deploy-smoke-test.sh — deploy gate (docs/ONBOARDING.md step 8):
 #     public API + new-instance doctor + host-side consistency checks
 #   - docker-compose.{yml,prod.yml,host-mount.yml,tls.yml} — host runtime
+#   - docker-compose.gcp-logging.yml — opt-out gcplogs overlay (removed by
+#     startup-script.sh.tpl when enable_gcp_logging=false; see its own header)
 #   - Caddyfile — TLS reverse proxy config
 #   - static/maintenance.html — Caddy's handle_errors 502/503 fallback page
 #
@@ -78,6 +80,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
        /app/docker-compose.host-mount.yml /app/docker-compose.tls.yml \
        /app/docker-compose.postgres.yml \
        /app/docker-compose.postgres-host-mount.yml \
+       /app/docker-compose.gcp-logging.yml \
        /app/Caddyfile /opt/agnes-host/ && \
     cp /app/static/maintenance.html /opt/agnes-host/static/ && \
     chmod 0755 /opt/agnes-host/agnes-auto-upgrade.sh \
@@ -94,6 +97,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
               /opt/agnes-host/docker-compose.tls.yml \
               /opt/agnes-host/docker-compose.postgres.yml \
               /opt/agnes-host/docker-compose.postgres-host-mount.yml \
+              /opt/agnes-host/docker-compose.gcp-logging.yml \
               /opt/agnes-host/Caddyfile \
               /opt/agnes-host/scripts/ops/agnes-compose-file.sh \
               /opt/agnes-host/static/maintenance.html

@@ -9,9 +9,9 @@
 #   1. Public API checks — health, DB schema, CLI wheel. No token needed.
 #   2. Authenticated API checks — query/catalog/marketplace, plus the
 #      new-instance doctor (POST /api/admin/doctor/new-instance): login-door,
-#      email-delivery, chat-grant, agent-scope, branding. Needs an admin
-#      bearer: $AGNES_PAT, or (on a VM) SCHEDULER_API_TOKEN read from
-#      $AGNES_OPT_DIR/.env.
+#      email-delivery, chat-grant, agent-scope, app-state-backend, branding.
+#      Needs an admin bearer: $AGNES_PAT, or (on a VM) SCHEDULER_API_TOKEN
+#      read from $AGNES_OPT_DIR/.env.
 #   3. Host-side consistency checks — COMPOSE_FILE ↔ instance.yaml backend,
 #      TLS predicate agreement. Run only when $AGNES_OPT_DIR/.env exists
 #      (i.e. on a deployed VM); skipped elsewhere. These catch states the

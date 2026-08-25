@@ -73,6 +73,11 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # /api/semantic-models/schema + `agnes semantic-model context/schema`.
     "get_semantic_context",
     "get_semantic_schema",
+    # Chat-first authoring (spec 2026-08-24) — the ONE semantic-layer write
+    # surface. Outcome branches on the caller's authority: admin → applied
+    # directly, non-admin → queued for admin moderation. Triple-surface with
+    # POST /api/semantic-models/apply + `agnes semantic-model apply`.
+    "apply_semantic_model",
     "collections_reingest",
     "schema",
     "describe",
@@ -589,6 +594,62 @@ def register_foundation_tools(
                 f"{base_url}/api/semantic-models/schema",
                 headers=headers_fn(),
                 params={"semantic_types": semantic_types},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False, idempotent=True)
+    async def apply_semantic_model(
+        document: str,
+        description: str | None = None,
+        expected_content_hash: str | None = None,
+    ) -> dict:
+        """Apply a hand-authored Ossie semantic-model document — create or edit.
+
+        The one semantic-layer write surface. What "apply" means depends on
+        YOUR authority, and the response labels it — report the outcome
+        honestly, never claim a queued proposal is live:
+
+        - admin caller → ``{"outcome": "applied", "model": {...}}`` — the
+          model is validated, stored (create-or-replace by slug), and live.
+        - non-admin caller → ``{"outcome": "submitted_for_review",
+          "suggestion_id": ...}`` — the document went to the admin
+          moderation queue and is NOT live until approved.
+
+        Draft with `get_semantic_schema` (the document contract) and
+        `get_semantic_context` (what already exists); show the user the full
+        document and get an explicit go-ahead before calling this. To edit an
+        existing model, read it with `semantic_model_get`, modify, and pass
+        ``expected_content_hash`` (the model's current hash) so a concurrent
+        change 409s (``stale_document``) instead of being overwritten.
+        Mirrors ``POST /api/semantic-models/apply`` and `agnes semantic-model
+        apply`.
+
+        Args:
+            document: The full Ossie document (YAML) — must declare one named
+                ``semantic_model`` entry; its name becomes the slug.
+            description: Optional listing description.
+            expected_content_hash: For edits — the ``content_hash`` the edit
+                was based on; a mismatch 409s rather than overwriting.
+
+        Errors: 422 ``invalid_document`` (schema errors — fix and retry),
+        409 ``source_owned`` (the slug belongs to an imported model — it is
+        edited at its source, not here), 409 ``stale_document``, 409
+        ``duplicate_pending`` (an earlier proposal for this slug awaits
+        review), 403 ``studio_disabled`` (non-admin queue closed on this
+        instance).
+        """
+        payload: dict[str, Any] = {"document": document}
+        if description is not None:
+            payload["description"] = description
+        if expected_content_hash is not None:
+            payload["expected_content_hash"] = expected_content_hash
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/semantic-models/apply",
+                json=payload,
+                headers=headers_fn(),
                 timeout=30,
             )
             r.raise_for_status()

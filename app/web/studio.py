@@ -116,6 +116,35 @@ STUDIO_DOMAINS: dict[str, StudioDomain] = {
             ),
         ),
     ),
+    "semantic-layer": StudioDomain(
+        slug="semantic-layer",
+        profile="semantic-model-builder",
+        title="Semantic Model Builder",
+        subtitle="Author an Ossie semantic-model document — datasets, metrics, and AI context for your data.",
+        endpoint="/api/semantic-models/apply",
+        # The endpoint itself branches on authority (admin → applied,
+        # non-admin → moderation queue), but the studio page's non-admin
+        # Submit still routes through /api/studio/suggestions like every
+        # other moderated domain — both roads land in the same queue.
+        fields=(
+            StudioField(
+                "document",
+                "Ossie document (YAML)",
+                type="textarea",
+                required=True,
+                placeholder=(
+                    "version: '0.2.0.dev0'\n"
+                    "semantic_model:\n"
+                    "  - name: my-model\n"
+                    "    datasets:\n"
+                    "      - name: orders\n"
+                    "        source: db.public.orders\n"
+                    "        fields: []\n"
+                ),
+            ),
+            StudioField("description", "Description", type="textarea", placeholder="What this model covers."),
+        ),
+    ),
     "skill": StudioDomain(
         slug="skill",
         profile="skill-author",

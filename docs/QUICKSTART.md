@@ -54,19 +54,37 @@
 
 ## Docker Deployment
 
+The default install runs app-state on the bundled Postgres side-car
+(`docker-compose.postgres.yml`), not single-file DuckDB. Set
+`POSTGRES_PASSWORD` in `.env` (`config/.env.template` already ships
+`COMPOSE_FILE=docker-compose.yml:docker-compose.postgres.yml`, so plain
+`docker compose up` includes the overlay automatically):
+
 ```bash
-# Start app + scheduler
+# Start app + scheduler + Postgres side-car
 docker compose up
 
 # Include telegram bot
 docker compose --profile full up
 
 # HTTPS mode — Caddy + corporate-CA certs
-docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tls.yml \
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml -f docker-compose.tls.yml \
     --profile tls up -d
 ```
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full server setup instructions.
+
+### Legacy fallback: single-file DuckDB (existing installs)
+
+Existing instances that predate the Postgres default keep running app-state
+on single-file DuckDB — nothing changes for them. To run a **new** instance
+this way (not recommended — see [DEPLOYMENT.md](DEPLOYMENT.md)), unset
+`POSTGRES_PASSWORD` and `COMPOSE_FILE` in `.env` and start without the
+overlay:
+
+```bash
+docker compose -f docker-compose.yml up
+```
 
 ## Using with Claude Code
 

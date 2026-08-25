@@ -2,7 +2,13 @@
 
 Four production backends + one future placeholder:
 
-  * ``DUCKDB``        — single-process DuckDB (fresh-install default, $0)
+  * ``DUCKDB``        — single-process DuckDB ($0, zero external deps). Was
+                        the fresh-install default; since A1 a VM-provisioned
+                        fresh install seeds ``SIDE_CAR`` instead (see
+                        ``infra/modules/customer-instance/startup-script.sh.tpl``).
+                        DUCKDB remains fully supported — the persisted state
+                        for existing instances, and the module's own safe
+                        fallback (below) when no state is configured at all.
   * ``SIDE_CAR``      — Postgres container on-VM, app+scheduler reach it
                         over the compose network (multi-process safe today)
   * ``CLOUD``         — managed Postgres (Cloud SQL / RDS / Supabase / …)
@@ -208,7 +214,13 @@ def read_backend_state() -> tuple[BackendState, str | None]:
 
     Memoized for the life of the process; see the module note on
     ``_STATE_CACHE``. Returns (BackendState.DUCKDB, None) when the overlay
-    is missing or the ``database`` key is absent — the fresh-install default.
+    is missing or the ``database`` key is absent — a safe zero-config
+    fallback, NOT the fresh-install default (since A1 a VM-provisioned
+    fresh install writes ``backend: side_car`` into the overlay before the
+    app ever starts — see ``infra/modules/customer-instance/startup-script.sh.tpl``).
+    This branch only fires when no state is configured at all (e.g. local
+    dev without ``instance.yaml``); it deliberately does not assume
+    Postgres, since nothing here confirms one is actually reachable.
     """
     global _STATE_CACHE
     cached = _STATE_CACHE

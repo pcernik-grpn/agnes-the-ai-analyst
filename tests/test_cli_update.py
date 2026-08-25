@@ -314,6 +314,83 @@ def test_default_mode_converges_and_writes_report(monkeypatch, tmp_path):
     assert push_step == {"stage": "push", "status": "ok", "detail": "2 session(s) + CLAUDE.local.md"}
 
 
+# --- _refresh_default_claude_md — #1476 date-rollover churn + retention ---------
+
+
+def test_refresh_default_claude_md_ignores_pure_date_rollover(tmp_path, monkeypatch):
+    """A date-only diff (the shipped template's trailing 'generated
+    {{ today }}' stamp rolling to a new UTC day, or the same in an admin
+    override) must not count as a real change: no rewrite, no `.bak`."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    old_content = "# Welcome\n\n_Hello Ann — generated 2026-08-13._\n"
+    new_content = "# Welcome\n\n_Hello Ann — generated 2026-08-14._\n"
+    (workspace / "CLAUDE.md").write_text(old_content, encoding="utf-8")
+
+    import cli.commands.update as upd
+
+    monkeypatch.setattr("cli.client.api_get", lambda *a, **k: _FakeResp(new_content))
+
+    report: list[dict] = []
+    upd._refresh_default_claude_md(workspace, server_url="http://server", token="tok", report=report)
+
+    assert (workspace / "CLAUDE.md").read_text(encoding="utf-8") == old_content, (
+        "a pure date-rollover diff must not touch the on-disk file at all"
+    )
+    assert list(workspace.glob("CLAUDE.md.bak.*")) == []
+    assert report == [{"stage": "workspace", "status": "ok", "detail": "CLAUDE.md already current"}]
+
+
+def test_refresh_default_claude_md_rewrites_and_backs_up_real_change(tmp_path, monkeypatch):
+    """A genuine content change — not just the date — still rewrites the
+    file and still backs up the old content."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    old_content = "# Welcome\n\nOld instructions.\n\n_Hello Ann — generated 2026-08-13._\n"
+    new_content = "# Welcome\n\nNEW instructions.\n\n_Hello Ann — generated 2026-08-14._\n"
+    (workspace / "CLAUDE.md").write_text(old_content, encoding="utf-8")
+
+    import cli.commands.update as upd
+
+    monkeypatch.setattr("cli.client.api_get", lambda *a, **k: _FakeResp(new_content))
+
+    report: list[dict] = []
+    upd._refresh_default_claude_md(workspace, server_url="http://server", token="tok", report=report)
+
+    assert (workspace / "CLAUDE.md").read_text(encoding="utf-8") == new_content
+    baks = list(workspace.glob("CLAUDE.md.bak.*"))
+    assert len(baks) == 1
+    assert baks[0].read_text(encoding="utf-8") == old_content
+    assert report[0]["status"] == "refreshed"
+
+
+def test_refresh_default_claude_md_prunes_old_backups(tmp_path, monkeypatch):
+    """Retention: a refresh that writes a new `.bak` prunes older ones down
+    to the retention cap."""
+    from src.initial_workspace import _MAX_BACKUPS_PER_FILE
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "CLAUDE.md").write_text("OLD current content\n", encoding="utf-8")
+    stale_stamps = ["20260810T000000Z", "20260811T000000Z", "20260812T000000Z", "20260813T000000Z"]
+    for stamp in stale_stamps:
+        (workspace / f"CLAUDE.md.bak.{stamp}").write_text(stamp, encoding="utf-8")
+
+    import cli.commands.update as upd
+
+    monkeypatch.setattr("cli.client.api_get", lambda *a, **k: _FakeResp("NEW real content\n"))
+
+    report: list[dict] = []
+    upd._refresh_default_claude_md(workspace, server_url="http://server", token="tok", report=report)
+
+    baks = list(workspace.glob("CLAUDE.md.bak.*"))
+    assert len(baks) == _MAX_BACKUPS_PER_FILE
+    # The two oldest of the pre-existing stale backups are pruned; the
+    # freshest pre-existing ones plus the new one from this refresh survive.
+    assert (workspace / "CLAUDE.md.bak.20260810T000000Z") not in baks
+    assert (workspace / "CLAUDE.md.bak.20260811T000000Z") not in baks
+
+
 def test_update_backfills_workspace_root_for_legacy_workspace(monkeypatch, tmp_path):
     """`agnes update` (now the sole SessionStart entry) must backfill the
     `workspace_root` anchor that the retired `agnes self-upgrade` hook used to

@@ -1,5 +1,17 @@
 # Observability — PostHog integration
 
+## Audit & activity trails (retention status)
+
+Agnes keeps seven distinct records of "who did what": `audit_log` (admin/API
+actions, viewer: `/admin/activity`), chat transcripts (`chat_messages`, no
+admin viewer — privacy decision), CLI session JSONLs (viewer:
+`/admin/sessions`), usage rollups (`usage_events`, viewer: `/admin/telemetry`),
+`sync_history` (folded into `/admin/activity`), `llm_usage`, and agent-runtime
+forensics. Only `audit_log` has a retention policy today —
+`audit.retention_days` in `instance.yaml` (default 365, `0` = forever),
+enforced by the daily `audit-prune` scheduler job. Retention for the other
+six trails is an open Track E decision, not an oversight.
+
 Optional integration that wires four signals into a single PostHog project:
 
 1. **Backend exceptions** — every unhandled FastAPI exception, plus rebuild
