@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 # Reused rather than re-implemented: the queue-backed reader is the exact
 # StreamReader shim ChatManager's pump expects, and its readline() buffering is
 # subtle enough that a second copy would drift.
-from app.chat.e2b_provider import SANDBOX_WORKDIR, _StreamReaderAdapter
+from app.chat.provider import SANDBOX_WORKDIR, _StreamReaderAdapter
 
 # Module-level so unit tests can ``patch("app.chat.docker_provider.SandboxRunnerClient")``.
 from app.chat.config import sandbox_can_reach_directly

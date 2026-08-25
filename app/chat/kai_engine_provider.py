@@ -88,7 +88,7 @@ import httpx
 # The shared queue+EOF StreamReader shim and the str→bytes write coercion —
 # the same cross-provider imports docker_provider.py already makes, so all
 # three providers' handle streams behave identically for host-side readers.
-from app.chat.e2b_provider import _coerce_to_bytes, _StreamReaderAdapter
+from app.chat.provider import _coerce_to_bytes, _StreamReaderAdapter
 
 logger = logging.getLogger(__name__)
 

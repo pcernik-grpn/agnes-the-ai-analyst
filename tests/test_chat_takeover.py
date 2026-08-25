@@ -339,7 +339,7 @@ def test_takeover_claims_lease_destroys_old_spawns_fresh_restores_context(two_ga
         # Continuity travels as the restored-context transcript uploaded to
         # the fresh sandbox — NOT as raw user_msg frames on stdin (each of
         # which ran a full LLM turn and dropped all assistant context).
-        from app.chat.e2b_workspace_sync import SANDBOX_CONTEXT_RESTORE
+        from app.chat.sandbox_staging import SANDBOX_CONTEXT_RESTORE
 
         ctx = [d for p, d in context_writes if p == SANDBOX_CONTEXT_RESTORE]
         assert ctx, f"expected a restore-context upload; writes: {[p for p, _ in context_writes]}"

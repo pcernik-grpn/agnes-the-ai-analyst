@@ -1887,7 +1887,6 @@ class ChatManager:
 
     async def _spawn_runner(self, session: ChatSession, session_dir: Path):
         from app.auth.access import mint_session_jwt, mint_co_session_jwt
-        from app.chat.e2b_workspace_sync import SANDBOX_WORKSPACE_READY
 
         if session.is_co_session:
             # SR-5: NO seed fallback for co-sessions. A mint failure re-raises
@@ -1941,15 +1940,12 @@ class ChatManager:
             # entry would have left the switch unsettable anywhere while the
             # docs still advertised it (Devin Review on #1157).
             "AGNES_APPROVALS": "on" if self._config.approvals_enabled else "off",
-            # Sandbox path of the workspace-upload sentinel the runner must
-            # wait on before spawning the agent CLI (the CLI reads CLAUDE.md
-            # and .claude settings from /work at startup, and upload_workspace
-            # finishes AFTER the runner process starts). Empty when the
-            # provider mounts the workspace itself (syncs_workspace=True) —
-            # then there is nothing to wait for and the runner skips the wait.
-            "AGNES_WORKSPACE_SYNC_SENTINEL": (
-                "" if getattr(self._provider, "syncs_workspace", False) else SANDBOX_WORKSPACE_READY
-            ),
+            # Both surviving providers own their workspace delivery
+            # (syncs_workspace=True: docker bind-mounts it, the kai engine
+            # fetches the tarball itself), so there is never an upload to
+            # wait for. The env key stays for runner protocol compat —
+            # runner.py skips the wait when it's empty.
+            "AGNES_WORKSPACE_SYNC_SENTINEL": "",
             # No ANTHROPIC_API_KEY / AGNES_TOKEN here (chat sandbox secret
             # broker hardening, 2026-07-14): the real Anthropic key never
             # enters the sandbox env. The runner's own ``_start_relay``
@@ -1971,45 +1967,16 @@ class ChatManager:
             "LANG": "C.UTF-8",
             "PYTHONUNBUFFERED": "1",
         }
-        # Under E2B the in-sandbox runner is uploaded as a single file
-        # (provider does ``files.write("/work/runner.py", ...)`` at spawn
-        # time per the agnes-chat template tradeoff), so we invoke it
-        # directly as a script. The legacy ``python -m app.chat.runner``
-        # form relied on the host's installed package — there is no
-        # ``app.chat.runner`` module inside the sandbox.
+        # The in-sandbox runner is staged as a single file (present in the
+        # sandbox image / staged at spawn time), so we invoke it directly as
+        # a script. The legacy ``python -m app.chat.runner`` form relied on
+        # the host's installed package — there is no ``app.chat.runner``
+        # module inside the sandbox.
         argv = ["python3", "/work/runner.py", "--session-id", session.id]
         handle = await self._provider.spawn(workdir=session_dir, env=env, argv=argv)
         # Provider-mediated file staging — runs for EVERY provider, including
         # the ones that mount the workspace themselves.
         await self._stage_boot_files(handle, session)
-        # Only the workspace tarball is actually workspace sync: a provider
-        # that declares ``syncs_workspace = True`` bind-mounts it instead. For
-        # E2B we hold the workspace locally and push it after spawn — Q1's
-        # full-push strategy.
-        if not getattr(self._provider, "syncs_workspace", False):
-            from app.chat.e2b_workspace_sync import (
-                WorkspaceTooLarge,
-                upload_workspace,
-            )
-
-            max_bytes = getattr(self._config, "e2b_workspace_max_bytes", 100 * 1024 * 1024)
-            sandbox = getattr(handle, "_sandbox", None)
-            if sandbox is not None:
-                try:
-                    # Finishes by writing SANDBOX_WORKSPACE_READY, which the
-                    # runner waits on before spawning the agent CLI (the CLI
-                    # reads CLAUDE.md/.claude from /work at startup).
-                    await upload_workspace(sandbox, session_dir, max_bytes=max_bytes)
-                except WorkspaceTooLarge as e:
-                    logger.error("workspace upload refused: %s", e)
-                    # Tear down the sandbox; surfacing the failure to the
-                    # caller lets attach() emit a user-facing error
-                    # frame.
-                    try:
-                        await handle.kill(grace_sec=1.0)
-                    except Exception:
-                        logger.exception("kill after upload-refusal failed")
-                    raise
         return handle
 
     def _file_stager(self, handle):
@@ -2017,8 +1984,8 @@ class ChatManager:
         or ``None`` when this provider cannot stage files.
 
         Capability is declared by an async ``stage_file`` on the provider
-        (``E2BProvider`` writes through the SDK file API, the docker provider
-        through the apps-runner sidecar). The ``iscoroutinefunction`` check —
+        (the docker provider writes through the apps-runner sidecar). The
+        ``iscoroutinefunction`` check —
         rather than a bare ``getattr`` — is what makes a duck-typed test double
         (whose every attribute exists and is truthy) opt out cleanly.
         """
@@ -2042,21 +2009,18 @@ class ChatManager:
 
         Order matters: the restore-context goes FIRST, before the wheel's
         ``.ready`` sentinel. That sentinel is the only pre-boot barrier every
-        provider shares — a ``syncs_workspace=True`` provider skips the
-        workspace-ready wait entirely — and the runner reads the context file
-        strictly after its sentinel-gated install, so context-before-``.ready``
-        is what makes "a respawned runner sees its transcript" a
-        happens-before instead of a timing accident (under E2B the
-        workspace-ready sentinel used to provide that barrier; bind-mounting
-        providers have no later one). The context file is small, so the
-        in-sandbox ``pip install`` still overlaps the (much slower) workspace
-        push. Both stages are best-effort: a failure degrades the session (no
-        prior context, no CLI) but never blocks the spawn.
+        provider shares, and the runner reads the context file strictly after
+        its sentinel-gated install, so context-before-``.ready`` is what makes
+        "a respawned runner sees its transcript" a happens-before instead of a
+        timing accident. The context file is small, so the in-sandbox ``pip
+        install`` starts promptly. Both stages are best-effort: a failure
+        degrades the session (no prior context, no CLI) but never blocks the
+        spawn.
         """
         stage = self._file_stager(handle)
         if stage is None:
             return
-        from app.chat.e2b_workspace_sync import SANDBOX_CONTEXT_RESTORE, stage_agnes_wheel
+        from app.chat.sandbox_staging import SANDBOX_CONTEXT_RESTORE, stage_agnes_wheel
 
         # Restored-conversation transcript for a fresh sandbox of a chat that
         # already has history (crash respawn, post-restart spawn, takeover):

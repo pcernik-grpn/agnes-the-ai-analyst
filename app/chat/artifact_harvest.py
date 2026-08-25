@@ -200,11 +200,7 @@ async def harvest_session_artifacts(
     /api/v1/sessions/{id}` teardown) and must not create duplicate rows
     for files it already harvested.
     """
-    # Local import: app.chat.e2b_provider pulls in the e2b SDK (~250ms) at
-    # its own module top for the `AsyncSandbox`/`ALL_TRAFFIC` patch points
-    # (see its module docstring) — needlessly heavy for the plain string
-    # constant this function actually needs.
-    from app.chat.e2b_provider import SANDBOX_WORKDIR
+    from app.chat.provider import SANDBOX_WORKDIR
 
     store = object_store()
     if store is None:
