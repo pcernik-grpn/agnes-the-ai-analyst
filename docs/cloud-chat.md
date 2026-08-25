@@ -212,6 +212,49 @@ ecosystem — skills, marketplace re-serving, hooks — so a second adapter
 is a when-needed decision, not a roadmap item. The seam exists so that
 decision doesn't require an architecture change.
 
+### Marketplace plugins in a chat session
+
+A plugin in the user's stack reaches their chat session whole — skills, agents,
+slash commands, hooks and MCP servers — not just its skills. Agnes ships the
+caller's RBAC-filtered marketplace from the server (same content builder as the
+served ZIP an analyst's `agnes refresh-marketplace` downloads, so a sandbox and
+a laptop get byte-identical plugins), in one of two shapes:
+
+| Provider | Shape | How |
+|---|---|---|
+| `e2b`, `docker` | **real plugins** | the marketplace is written into the workspace as a directory (`.claude/agnes-marketplace/`) and the sandbox's own CLI installs from it *offline* — `claude plugin marketplace add <dir>` + `claude plugin install <name>@agnes --scope user` (`app/chat/runner.py::_register_workspace_marketplace`) |
+| `kai-agent` | **flattened components** | Agnes never enters that provider's sandbox, and a plugin install writes the CLI's own HOME registry — out of reach. The components ride the workspace tarball as project files instead (`app/api/kai.py`) |
+
+Both shapes deliver every component type. What differs is the invocation token,
+because Claude Code namespaces a plugin's components but not a project's —
+verified against the CLI's init handshake, not assumed:
+
+| Component | Installed as a plugin | Flattened to project |
+|---|---|---|
+| skill | `/keboola-cli` | `/keboola-cli` |
+| slash command | `/kbl:kbl-ship` | `/kbl-ship` |
+| agent (Task tool) | `kbl:kbl-reviewer` | `kbl-reviewer` |
+| MCP server | `plugin:kbl:probe-mcp` | `probe-mcp` |
+
+`GET /api/chat/skills` reports the token for the running provider, which is what
+keeps the composer's slash menu honest. Two notes on the flattened shape: a
+plugin hook whose command needs `${CLAUDE_PLUGIN_ROOT}` is dropped (there is no
+installed plugin root to resolve, so shipping it would fail mid-turn instead),
+and its MCP servers are added to `enabledMcpjsonServers` — without that
+allow-list entry the CLI never spawns a project-scope server, and nobody can
+approve one interactively in a headless sandbox.
+
+Delivery is gated by `chat.bootstrap_marketplace` (the
+`chat_bootstrap_marketplace` switch), **on** by default. Turning it off also
+removes marketplace entries from the slash menu — the menu never offers what
+nothing delivers, which is the bug this replaced: it listed skills while nothing
+installed them, so picking one answered `Unknown command: /<skill>`. The earlier
+attempt ran `agnes refresh-marketplace --bootstrap` *inside* the sandbox to
+clone the marketplace, which cannot work from there — the git endpoint is
+PAT-gated, the sandbox deliberately holds no PAT, and the in-sandbox relay
+routes no marketplace path. Shipping the marketplace as files is what makes the
+install offline, and therefore possible.
+
 ## Security model
 
 Single-tenant: all users in one Agnes instance trust each other. The

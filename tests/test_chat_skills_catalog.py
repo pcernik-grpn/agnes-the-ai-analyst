@@ -16,8 +16,9 @@ import pytest
 
 from app.chat.skills_catalog import (
     list_bundled_skills,
+    list_marketplace_commands,
     list_marketplace_skills,
-    list_recognized_commands,
+    merged_commands,
     merged_skills,
 )
 
@@ -377,12 +378,283 @@ class TestMergedSkills:
 
 
 # ---------------------------------------------------------------------------
-# list_recognized_commands
+# marketplace slash commands — the token depends on the delivery mode
 # ---------------------------------------------------------------------------
 
 
-def test_list_recognized_commands_is_empty():
-    """Nothing is currently backend-recognized — see the docstring for what
-    was checked. Locks the contract so a future PR can't silently start
-    inventing entries without updating this test."""
-    assert list_recognized_commands() == []
+def _write_command_md(path: Path, *, description: str | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    if description is not None:
+        lines.append(f"description: {description}")
+    lines += ["---", "", "Body."]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+class TestMarketplaceCommands:
+    """Verified against the sandboxed CLI (Claude Code 2.1.218): a plugin's
+    command is advertised as `/<plugin>:<command>` while a plugin's SKILL is
+    advertised bare — so the menu has to namespace one and not the other, and
+    only when the plugin was really installed."""
+
+    def _seed(self, db_conn, tmp_path, monkeypatch, *, command: str = "kbl-ship") -> None:
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "kbl", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="kbl")
+
+        from app.utils import get_marketplaces_dir
+
+        plugin_dir = get_marketplaces_dir() / "mkt" / "plugins" / "kbl"
+        _write_command_md(plugin_dir / "commands" / f"{command}.md", description="Ship it.")
+
+    def test_plugin_delivery_namespaces_the_command(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_PLUGIN
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        out = list_marketplace_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_PLUGIN)
+
+        assert out == [{"name": "kbl:kbl-ship", "description": "Ship it.", "source": "marketplace"}]
+
+    def test_flattened_delivery_leaves_the_command_bare(self, db_conn, tmp_path, monkeypatch):
+        """kai-agent gets loose project files, where a command has no plugin
+        namespace to be reached through."""
+        from app.chat.skills_catalog import DELIVERY_PROJECT
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        out = list_marketplace_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_PROJECT)
+
+        assert [c["name"] for c in out] == ["kbl-ship"]
+
+    def test_delivery_none_offers_no_commands(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_NONE
+
+        self._seed(db_conn, tmp_path, monkeypatch)
+
+        assert merged_commands(db_conn, {"id": "u1"}, delivery=DELIVERY_NONE) == []
+
+    def test_no_plugins_yields_no_commands(self, db_conn):
+        assert merged_commands(db_conn, {"id": "nobody"}) == []
+
+    def test_agents_are_delivered_but_never_offered_as_commands(self, db_conn, tmp_path, monkeypatch):
+        """An agent is dispatched by the Task tool, so a menu entry for one would
+        insert a token nothing resolves."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "kbl", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="kbl")
+
+        from app.utils import get_marketplaces_dir
+
+        plugin_dir = get_marketplaces_dir() / "mkt" / "plugins" / "kbl"
+        _write_command_md(plugin_dir / "agents" / "kbl-reviewer.md", description="Reviews things.")
+
+        assert merged_commands(db_conn, {"id": "u1"}) == []
+
+
+# ---------------------------------------------------------------------------
+# Delivery gate + naming contract (#1552)
+# ---------------------------------------------------------------------------
+
+
+class _Cfg:
+    def __init__(self, bootstrap_marketplace: bool, provider: str = "e2b"):
+        self.bootstrap_marketplace = bootstrap_marketplace
+        self.provider = provider
+
+
+class TestMarketplaceDelivery:
+    def test_no_chat_runtime_delivers_nothing(self):
+        """No config loaded → nothing to deliver into. Offering the skills anyway
+        is the failure mode, so `None` must not resolve to a delivering value."""
+        from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
+
+        assert marketplace_delivery(None) == DELIVERY_NONE
+
+    def test_flag_off_delivers_nothing(self):
+        from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(False)) == DELIVERY_NONE
+
+    @pytest.mark.parametrize("provider", ["e2b", "docker"])
+    def test_a_sandbox_agnes_enters_gets_real_plugins(self, provider):
+        """Agnes ships the marketplace as a directory and the sandbox's own CLI
+        installs from it offline — so hooks, MCP servers and the `<plugin>:<name>`
+        namespace all survive."""
+        from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(True, provider)) == DELIVERY_PLUGIN
+
+    def test_the_embedded_engine_gets_flattened_components(self):
+        """kai-agent runs the agent in a sandbox Agnes never enters, so a plugin
+        install (which writes the CLI's HOME registry) is out of reach; the
+        components ride the workspace tarball as loose project files instead."""
+        from app.chat.skills_catalog import DELIVERY_PROJECT, marketplace_delivery
+
+        assert marketplace_delivery(_Cfg(True, "kai-agent")) == DELIVERY_PROJECT
+
+
+class TestMenuNeverOffersAnUndeliveredSkill:
+    def test_delivery_none_omits_the_marketplace_source(self, db_conn, tmp_path, monkeypatch):
+        """The bug this change exists to remove: with nothing delivering
+        marketplace skills, a menu row for one inserts `/name` and the agent
+        answers "Unknown command"."""
+        from app.chat.skills_catalog import DELIVERY_NONE
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        template = tmp_path / "bundled"
+        _write_skill_md(template / ".claude" / "skills" / "bundled-one" / "SKILL.md", name="bundled-one")
+
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = merged_skills(template, db_conn, {"id": "u1"}, delivery=DELIVERY_NONE)
+
+        assert [s["name"] for s in out] == ["bundled-one"]
+
+    def test_delivery_project_offers_them(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.skills_catalog import DELIVERY_PROJECT
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = merged_skills(tmp_path / "empty", db_conn, {"id": "u1"}, delivery=DELIVERY_PROJECT)
+
+        assert [s["name"] for s in out] == ["keboola-cli"]
+
+
+class TestSkillNamesStayBare:
+    def test_a_marketplace_skill_is_named_without_its_plugin(self, db_conn, tmp_path, monkeypatch):
+        """Verified against the sandboxed CLI (Claude Code 2.1.218): a plugin's
+        skill is advertised as `{"name": "keboola-cli", "description":
+        "(demo-plugin) …"}` — the owning plugin appears in the DESCRIPTION, never
+        in the command token. Prefixing the name here (`demo-plugin:keboola-cli`)
+        is what would make the menu insert an unknown command, so this locks the
+        bare form in."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "demo-plugin", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="demo-plugin")
+
+        from app.utils import get_marketplaces_dir
+
+        _write_skill_md(
+            get_marketplaces_dir() / "mkt" / "plugins" / "demo-plugin" / "skills" / "keboola-cli" / "SKILL.md",
+            name="keboola-cli",
+        )
+
+        out = list_marketplace_skills(db_conn, {"id": "u1"})
+
+        assert [s["name"] for s in out] == ["keboola-cli"]
+        assert all(":" not in s["name"] for s in out)
+
+
+class TestOneWalkFeedsMenuAndDelivery:
+    """The invariant that keeps the surfaces from drifting: what the composer
+    offers and what the flattened delivery writes come from ONE walk
+    (`plugin_skill_entries`). When they were two, a plugin whose SKILL.md sits at
+    its root was listed by the menu and skipped by the delivery — a menu entry
+    nothing answers to. Found by Devin Review on #1552."""
+
+    def _seed(self, db_conn, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+        _make_user(db_conn, user_id="u1", email="u1@x")
+        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+
+        from app.utils import get_marketplaces_dir
+
+        return get_marketplaces_dir() / "mkt" / "plugins" / "p1"
+
+    def test_nested_skills_are_named_and_delivered_alike(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "alpha" / "SKILL.md", name="alpha")
+        _write_skill_md(plugin_dir / "skills" / "beta" / "SKILL.md", name="beta")
+
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert menu == ["alpha", "beta"]
+        for name in menu:
+            assert f".claude/skills/{name}/SKILL.md" in files
+
+    def test_a_root_level_skill_is_delivered_not_just_offered(self, db_conn, tmp_path, monkeypatch):
+        """Single-skill plugins (e.g. the built-in marketplace) ship SKILL.md at
+        the plugin root. The menu has always found those; the delivery must too."""
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "SKILL.md", name="root-level")
+
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert menu == ["root-level"]
+        assert files[".claude/skills/root-level/SKILL.md"] == plugin_dir / "SKILL.md"
+
+    def test_a_root_level_skill_does_not_drag_the_plugin_in(self, db_conn, tmp_path, monkeypatch):
+        """Its "directory" is the whole plugin — for a root-source plugin, the
+        whole marketplace clone — so only the SKILL.md itself may travel."""
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "SKILL.md", name="root-level")
+        (plugin_dir / "commands").mkdir(parents=True, exist_ok=True)
+        (plugin_dir / "commands" / "unrelated.md").write_text("---\n---\nBody.", encoding="utf-8")
+
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        skill_members = [k for k in files if k.startswith(".claude/skills/root-level/")]
+        assert skill_members == [".claude/skills/root-level/SKILL.md"]
+        # The command is still delivered — as a command, in its own place.
+        assert ".claude/commands/unrelated.md" in files
+
+    def test_delivery_folder_follows_the_frontmatter_not_the_source_folder(self, db_conn, tmp_path, monkeypatch):
+        """Verified against the CLI: a skill in `folder-name/` whose frontmatter
+        says `frontmatter-name` is invoked as `/frontmatter-name`. So the folder
+        it is delivered INTO must carry the frontmatter name, or the offered token
+        and the delivered directory disagree. Found by Devin Review on #1552."""
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "folder-name" / "SKILL.md", name="frontmatter-name")
+
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert menu == ["frontmatter-name"]
+        assert ".claude/skills/frontmatter-name/SKILL.md" in files
+        assert not any(k.startswith(".claude/skills/folder-name/") for k in files)
+
+    def test_supporting_files_travel_under_the_new_name(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "folder-name" / "SKILL.md", name="frontmatter-name")
+        (plugin_dir / "skills" / "folder-name" / "references").mkdir(parents=True, exist_ok=True)
+        (plugin_dir / "skills" / "folder-name" / "references" / "deep.md").write_text("detail", encoding="utf-8")
+
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert ".claude/skills/frontmatter-name/references/deep.md" in files

@@ -152,6 +152,26 @@ SWITCHES: tuple[Switch, ...] = (
         description="Cloud-hosted chat (E2B sandbox agent sessions). New feature — off by default.",
     ),
     Switch(
+        name="chat_bootstrap_marketplace",
+        config_keys=("chat", "bootstrap_marketplace"),
+        env_var="AGNES_CHAT_BOOTSTRAP_MARKETPLACE",
+        kind="bool",
+        default=True,
+        effect="restart",
+        category="product",
+        editable=True,
+        runtime_view="bootstrap_marketplace",
+        description=(
+            "Deliver the caller's RBAC-filtered marketplace skills into chat sessions so a "
+            "stack skill is invokable as `/<skill-name>`. On `e2b`/`docker` the runner installs "
+            "them as Claude Code plugins in the sandbox (~10-15 s per spawn); on `kai-agent` "
+            "they ride the workspace tarball the engine materializes. Off makes the composer's "
+            "slash menu stop offering marketplace skills rather than advertise ones the agent "
+            "was never given. Resolved by `load_chat_config` (env > instance.yaml > default) at "
+            "boot, not through `switch_value` — hence `runtime_view`."
+        ),
+    ),
+    Switch(
         name="chat_provider",
         config_keys=("chat", "provider"),
         env_var="AGNES_CHAT_PROVIDER",

@@ -714,6 +714,17 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Resolved from the same overlay-only source as chat.enabled."
             ),
         },
+        "bootstrap_marketplace": {
+            "kind": "bool",
+            "default": _flag_default("chat", "bootstrap_marketplace", True),
+            "hint": (
+                "ON by default: the skills in a user's stack are materialized into "
+                "their chat session, so the composer's /<skill-name> menu entries "
+                "actually resolve. Turning it OFF removes marketplace skills from "
+                "that menu too — the menu never offers what nothing delivers. "
+                "Resolved from the same overlay-only source as chat.enabled."
+            ),
+        },
     },
     "studio": {
         "enabled": {

@@ -1540,3 +1540,257 @@ def test_a_deleted_conversation_cannot_spend_budget_with_an_issued_llm_ticket(se
         f"a deleted conversation's llm ticket still reached the LLM broker ({resp.status_code})"
     )
     assert resp.json()["detail"] == "ticket_session_gone"
+
+
+# ---------------------------------------------------------------------------
+# workspace payload — marketplace skills (#1552)
+#
+# The kai-agent provider spawns no runner of ours, so this tarball IS the
+# engine's project scope. Before this, a user's stack skills reached every
+# surface except the embedded engine: the composer offered `/keboola-cli` and
+# the engine answered "Unknown command".
+# ---------------------------------------------------------------------------
+
+
+def _grant_marketplace_skill(
+    *, plugin: str, skill: str, body: str = "Body.", extra_file: str = "", full: bool = False
+) -> None:
+    """Grant + subscribe the seeded analyst to a marketplace plugin shipping one
+    skill, and write that plugin to the marketplace clone on disk.
+
+    ``full=True`` also gives it an agent, a slash command, a hook and an MCP
+    server — the component types that make it a plugin rather than a skill."""
+    from datetime import datetime, timezone
+
+    from app.utils import get_marketplaces_dir
+    from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
+    from src.repositories import (
+        resource_grants_repo,
+        user_curated_subscriptions_repo,
+        user_groups_repo,
+    )
+
+    conn = get_system_db()
+    try:
+        # Idempotent: a test may stack two plugins from the same marketplace.
+        if not conn.execute("SELECT 1 FROM marketplace_registry WHERE id = 'mkt'").fetchone():
+            conn.execute(
+                "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
+                ["mkt", "MKT", "https://example.test/mkt.git", datetime.now(timezone.utc)],
+            )
+        conn.execute(
+            "INSERT INTO marketplace_plugins (marketplace_id, name, version, raw, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ["mkt", plugin, "1.0", json.dumps({"name": plugin, "version": "1.0"}), datetime.now(timezone.utc)],
+        )
+    finally:
+        conn.close()
+
+    everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+    resource_grants_repo().create(everyone["id"], "marketplace_plugin", f"mkt/{plugin}")
+    user_curated_subscriptions_repo().subscribe("analyst1", "mkt", plugin)
+
+    plugin_root = get_marketplaces_dir() / "mkt" / "plugins" / plugin
+    skill_dir = plugin_root / "skills" / skill
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {skill}\n---\n\n{body}", encoding="utf-8")
+    if extra_file:
+        (skill_dir / extra_file).write_text("extra", encoding="utf-8")
+    if not full:
+        return
+    (plugin_root / "agents").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "agents" / "kbl-reviewer.md").write_text(
+        "---\nname: kbl-reviewer\ndescription: Agent.\n---\n\nBody.", encoding="utf-8"
+    )
+    (plugin_root / "commands").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "commands" / "kbl-ship.md").write_text("---\ndescription: Command.\n---\n\nBody.", encoding="utf-8")
+    (plugin_root / "hooks").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "hooks" / "hooks.json").write_text(
+        json.dumps({"hooks": {"PostToolUse": [{"hooks": [{"type": "command", "command": "true"}]}]}}),
+        encoding="utf-8",
+    )
+    (plugin_root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"probe-mcp": {"command": "echo", "args": ["noop"]}}}), encoding="utf-8"
+    )
+
+
+def _workspace_names(seeded_app) -> list[str]:
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200, resp.text
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        return [m.name for m in tar.getmembers()]
+
+
+def test_the_engine_gets_the_callers_marketplace_skills(seeded_app, kai_env):
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli", extra_file="reference.md")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names, (
+        "the composer offers /keboola-cli; without this member the engine has never been given it"
+    )
+    # A skill's supporting files are part of it.
+    assert ".claude/skills/keboola-cli/reference.md" in names
+
+
+def test_marketplace_skills_are_omitted_when_the_switch_is_off(seeded_app, kai_env, monkeypatch):
+    """With delivery off the composer stops offering them, so the archive must
+    stop shipping them — one switch, both sides."""
+    monkeypatch.setenv("AGNES_CHAT_BOOTSTRAP_MARKETPLACE", "0")
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" not in names
+    assert "CLAUDE.md" in names, "the rest of the workspace must still ship"
+
+
+def test_a_marketplace_skill_shadows_the_bundled_one_wholesale(seeded_app, kai_env):
+    """`merged_skills`'s rule is "marketplace wins name clashes". Merging the two
+    directories instead would leave the loser's files inside the winner, and the
+    agent would read them."""
+    from app.chat.skills_catalog import BUNDLED_TEMPLATE_DIR
+
+    bundled_names = [p.name for p in (BUNDLED_TEMPLATE_DIR / ".claude" / "skills").iterdir() if p.is_dir()]
+    assert bundled_names, "the bundled template ships no skills — nothing to shadow"
+    victim = sorted(bundled_names)[0]
+    _grant_marketplace_skill(plugin="demo-plugin", skill=victim, body="MARKETPLACE VERSION")
+
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        names = [m.name for m in tar.getmembers()]
+        body = tar.extractfile(f".claude/skills/{victim}/SKILL.md").read().decode()
+
+    assert "MARKETPLACE VERSION" in body
+    assert names.count(f".claude/skills/{victim}/SKILL.md") == 1, "a duplicate member is a malformed tar"
+    # Nothing of the bundled copy survives inside the winner.
+    assert [n for n in names if n.startswith(f".claude/skills/{victim}/")] == [f".claude/skills/{victim}/SKILL.md"]
+
+
+def test_the_archive_stays_byte_stable_with_marketplace_skills(seeded_app, kai_env):
+    """The engine re-fetches on every SDK respawn — the overlay must not
+    reintroduce the churn the mtime pinning exists to prevent."""
+    _grant_marketplace_skill(plugin="demo-plugin", skill="keboola-cli")
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    headers = {"Authorization": f"Bearer {credential}"}
+
+    with mock.patch("time.time", return_value=1_700_000_000.0):
+        first = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
+    with mock.patch("time.time", return_value=1_700_000_042.0):
+        second = seeded_app["client"].get("/api/kai/workspace", headers=headers).content
+
+    assert first == second
+
+
+def _workspace_member(seeded_app, arcname: str) -> str:
+    import tarfile as _tarfile
+
+    credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+    resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+    assert resp.status_code == 200, resp.text
+    with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+        return tar.extractfile(arcname).read().decode()
+
+
+def test_the_engine_gets_every_component_type_not_just_skills(seeded_app, kai_env):
+    """A plugin is its agents, commands, hooks and MCP servers too — delivering
+    only skills would leave most of a user's stack unreachable on this provider.
+    Agnes cannot install real plugins here (that writes the CLI's HOME registry
+    in a sandbox Agnes never enters), so they arrive as project-scope files."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names
+    assert ".claude/agents/kbl-reviewer.md" in names
+    assert ".claude/commands/kbl-ship.md" in names
+    # Hooks and MCP servers have no installed plugin to live in, so they have to
+    # become project config or they do not exist for the agent at all.
+    assert ".claude/settings.json" in names
+    assert ".mcp.json" in names
+
+
+def test_plugin_hooks_merge_into_the_templates_settings(seeded_app, kai_env):
+    """Merged, not replaced: the bundled template's own settings (the org safety
+    hook among them) must survive a marketplace plugin arriving."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    before = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert "PostToolUse" in before.get("hooks", {})
+    # Whatever else the template declared at the top level is still there.
+    assert set(before) >= {"hooks"}
+
+
+def test_plugin_mcp_servers_reach_the_project(seeded_app, kai_env):
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    mcp = json.loads(_workspace_member(seeded_app, ".mcp.json"))
+
+    assert "probe-mcp" in mcp["mcpServers"]
+
+
+def test_no_components_no_synthesized_config(seeded_app, kai_env):
+    """A stack with no hooks/MCP must not gain an empty settings or .mcp.json
+    that was never in the template — the payload is byte-compared by the engine
+    on every respawn."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli")
+
+    names = _workspace_names(seeded_app)
+
+    assert ".claude/skills/keboola-cli/SKILL.md" in names
+    assert ".mcp.json" not in names
+
+
+def test_flattened_mcp_servers_are_pre_approved(seeded_app, kai_env):
+    """A project `.mcp.json` server is untrusted-by-default: without an
+    allow-list entry the CLI never spawns it (verified against Claude Code
+    2.1.218 by watching for the server process), and no one can approve it
+    interactively in a headless sandbox. On the sibling providers the same
+    servers arrive inside an installed plugin and need no approval at all."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert settings["enabledMcpjsonServers"] == ["probe-mcp"]
+    # The template's own hook survives the merge.
+    assert "PreToolUse" in settings["hooks"]
+
+
+def test_no_mcp_servers_no_allow_list(seeded_app, kai_env):
+    """The allow-list names exactly what Agnes put there — it is not a blanket
+    `enableAllProjectMcpServers`, which would also pre-approve anything a future
+    template or an operator's own `.mcp.json` adds."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli")
+
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    assert "enabledMcpjsonServers" not in settings
+
+
+def test_merged_config_bytes_do_not_depend_on_plugin_order(seeded_app, kai_env):
+    """The engine re-fetches this archive on every SDK respawn and compares
+    bytes. The merged `hooks` / `mcpServers` blocks are built by iterating
+    plugins, so their serialization must not carry that order — otherwise
+    stability rests on a guarantee three modules away."""
+    _grant_marketplace_skill(plugin="kbl", skill="keboola-cli", full=True)
+    _grant_marketplace_skill(plugin="aaa-first", skill="other-skill", full=True)
+
+    mcp = json.loads(_workspace_member(seeded_app, ".mcp.json"))
+    settings = json.loads(_workspace_member(seeded_app, ".claude/settings.json"))
+
+    raw_mcp = _workspace_member(seeded_app, ".mcp.json")
+    raw_settings = _workspace_member(seeded_app, ".claude/settings.json")
+
+    # Key-sorted at every level we synthesize, so a different merge order
+    # produces identical bytes.
+    assert list(mcp) == sorted(mcp)
+    assert list(mcp["mcpServers"]) == sorted(mcp["mcpServers"])
+    assert list(settings) == sorted(settings)
+    assert raw_mcp == _workspace_member(seeded_app, ".mcp.json")
+    assert raw_settings == _workspace_member(seeded_app, ".claude/settings.json")
