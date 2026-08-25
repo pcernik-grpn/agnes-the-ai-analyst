@@ -52,6 +52,7 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    cat > .env <<EOF
    JWT_SECRET_KEY=$(openssl rand -hex 32)
    AGNES_VAULT_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+   POSTGRES_PASSWORD=$(openssl rand -hex 16)
    DATA_DIR=/data
    DATA_SOURCE=keboola
    KEBOOLA_STORAGE_TOKEN=<your-token>
@@ -71,21 +72,49 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    (The Terraform module generates and persists this key automatically; this
    manual step matters only on self-provisioned hosts.)
 
+   `POSTGRES_PASSWORD` is the default install's app-state Postgres side-car
+   password (A1) — required by the `docker-compose.postgres.yml` overlay
+   included below. A legacy DuckDB-only install (existing instances, or a
+   deliberate opt-out for a new one) skips it and the overlay entirely — see
+   *Legacy fallback* at the end of this section.
+
 3. Mount a persistent disk at `/data` (optional but recommended — survives host rebuild). If you do, use the overlay:
 
    ```bash
    docker compose \
        -f docker-compose.yml \
+       -f docker-compose.postgres.yml \
        -f docker-compose.prod.yml \
        -f docker-compose.host-mount.yml \
+       -f docker-compose.postgres-host-mount.yml \
        up -d
    ```
+
+   The last file is required whenever `docker-compose.postgres.yml` and
+   `docker-compose.host-mount.yml` are combined (see its own header comment)
+   — it rebinds `postgres`'s data directory and `data-migrate`'s source
+   mount straight to the host `/data`, instead of the empty named volumes
+   the other two overlays would otherwise leave in place. Without it,
+   Postgres persistence silently reverts to a Docker-managed volume tied to
+   the boot disk, and `data-migrate` reads no rows at all. Also `mkdir -p
+   /data/postgres && chown -R 70:70 /data/postgres` on the host beforehand —
+   customer-instance VMs get this from the Terraform startup script, but a
+   self-provisioned host does not.
 
    Without a persistent disk (data on Docker named volume, tied to boot disk):
 
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml up -d
    ```
+
+   **Legacy fallback (existing installs / explicit DuckDB opt-out):** drop
+   `-f docker-compose.postgres.yml` from either command above (and, in the
+   persistent-disk command, also drop `-f docker-compose.postgres-host-mount.yml`
+   — it references services `docker-compose.postgres.yml` defines, so
+   keeping it without the postgres overlay fails compose validation) and
+   don't set `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
+   instance did before A1. Not recommended for a new install (see
+   [postgres-cutover-runbook.md](postgres-cutover-runbook.md) for why).
 
 4. Bootstrap your admin password via `POST /auth/bootstrap`:
 

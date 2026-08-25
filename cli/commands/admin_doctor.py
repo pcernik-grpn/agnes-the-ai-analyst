@@ -24,7 +24,10 @@ def doctor(
     new_instance: bool = typer.Option(
         False,
         "--new-instance",
-        help="Run the new-instance deployment checks (login-door, email-delivery, chat-grant, agent-scope, branding)",
+        help=(
+            "Run the new-instance deployment checks (login-door, email-delivery, "
+            "chat-grant, agent-scope, app-state-backend, branding)"
+        ),
     ),
     email_to: str = typer.Option(
         "",

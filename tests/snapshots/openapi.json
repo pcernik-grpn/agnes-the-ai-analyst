@@ -17555,7 +17555,7 @@
     },
     "/api/admin/doctor/new-instance": {
       "post": {
-        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``branding``. Optional body ``{\"email_to\": ...}`` makes the\nemail-delivery check send a real test message.",
+        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``app-state-backend``, ``branding``. Optional body ``{\"email_to\": ...}``\nmakes the email-delivery check send a real test message.",
         "operationId": "doctor_new_instance_api_admin_doctor_new_instance_post",
         "parameters": [
           {

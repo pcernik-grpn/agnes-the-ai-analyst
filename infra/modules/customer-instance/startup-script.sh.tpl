@@ -97,18 +97,25 @@ if [ -b "$DATA_DEV" ]; then
     chown 999:999 "$DATA_MNT"
 fi
 
-# Initial instance.yaml::database = {backend: "duckdb"} so the app starts in
-# DuckDB mode even before any admin migration. The DB-backend state machine
-# (see scripts/ops/agnes-state-applier.sh + app/api/admin_db_migrate.py)
-# reads this file at boot to decide which compose overlay set to run.
-# Idempotent: never clobber an existing file — an operator-initiated
-# migration may have already flipped backend to "postgres".
+# Initial instance.yaml::database = {backend: "side_car"} so a fresh
+# instance boots straight onto the bundled Postgres side-car app-state (A1).
+# The compose-file resolver (scripts/ops/agnes-compose-file.sh) reads this
+# file at boot and, for "side_car", assembles the postgres overlays; the
+# POSTGRES_PASSWORD mint + DATABASE_URL write further below are already
+# unconditional, so no other change is needed for a new VM to come up on PG.
+# The DB-backend state machine (see scripts/ops/agnes-state-applier.sh +
+# app/api/admin_db_migrate.py) can still migrate a "side_car" install to any
+# other persisted backend later — this only seeds day-zero state.
+# Idempotent: never clobber an existing file — this seed is for brand-new
+# instances only; an existing instance keeps its persisted backend
+# (including "duckdb", which remains a fully supported legacy state) exactly
+# as-is across every reboot and redeploy.
 INSTANCE_YAML="$DATA_MNT/state/instance.yaml"
 if [ ! -f "$INSTANCE_YAML" ]; then
     mkdir -p "$DATA_MNT/state"
     cat > "$INSTANCE_YAML" <<'YAML'
 database:
-  backend: duckdb
+  backend: side_car
 YAML
     # Vendor-neutral per-instance branding (logo_svg / brand / subtitle /
     # copyright / favicon / theme colours / custom_scripts) from the Terraform variables,

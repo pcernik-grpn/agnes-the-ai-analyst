@@ -1005,7 +1005,7 @@ class TestAdminDoctorSmoke:
     def test_new_instance_doctor_report_shape(self, seeded_app_both):
         """The doctor reads users/groups/grants/agents through the repo
         factories, so running it on both backends is a genuine parity check —
-        a backend-split read inside any of the five checks would surface here."""
+        a backend-split read inside any of the six checks would surface here."""
         r = seeded_app_both["client"].post(
             "/api/admin/doctor/new-instance",
             headers=_admin_headers(seeded_app_both),
@@ -1015,7 +1015,14 @@ class TestAdminDoctorSmoke:
         body = r.json()
         assert body["status"] in ("ok", "warning", "error")
         names = [c["name"] for c in body["checks"]]
-        assert names == ["login-door", "email-delivery", "chat-grant", "agent-scope", "branding"]
+        assert names == [
+            "login-door",
+            "email-delivery",
+            "chat-grant",
+            "agent-scope",
+            "app-state-backend",
+            "branding",
+        ]
         for check in body["checks"]:
             assert check["status"] in ("ok", "warning", "error", "info")
             # A crashed check reports itself; a backend-split bug in a repo
