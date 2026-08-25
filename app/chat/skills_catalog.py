@@ -183,53 +183,57 @@ def _plugin_dirs(plugin: dict) -> list[Path]:
     return [plugin_dir] if plugin_dir is not None else []
 
 
+def plugin_skill_entries(plugin_dir: Path) -> list[tuple[str, Optional[str], Path]]:
+    """``[(name, description, skill_md)]`` for one plugin root.
+
+    THE definition of "what skills does this plugin have, and what are they
+    called", shared by the composer's menu (:func:`list_marketplace_skills`) and
+    the flattened delivery path
+    (``app.chat.marketplace_payload.materialize_plugin_components``). One
+    definition on purpose: when the two walked separately, a plugin whose
+    ``SKILL.md`` sits at its ROOT was listed by the menu (this walk finds it
+    anywhere) and skipped by the delivery (which only looked under ``skills/``)
+    — a menu entry nothing answers to, the exact bug class this change exists to
+    remove. Found by Devin Review on #1552.
+
+    ``name`` is the frontmatter name with the directory name as fallback, which
+    is what Claude Code invokes: verified against the CLI with a mismatched pair
+    (folder ``folder-name``, frontmatter ``frontmatter-name`` → the command is
+    ``/frontmatter-name``). So the folder a skill is delivered INTO must be named
+    after the frontmatter, not after where it came from.
+
+    A plugin's ``SKILL.md`` may live directly at its root (single-skill plugins,
+    e.g. the built-in marketplace) or under ``skills/<name>/SKILL.md``
+    (multi-skill plugins, the curated-marketplace and Store convention) — this
+    looks anywhere under the plugin root, mirroring
+    ``src/store_guardrails/manifest_check.py``'s same defensive scan.
+    """
+    out: list[tuple[str, Optional[str], Path]] = []
+    for skill_md in sorted(plugin_dir.rglob("SKILL.md")):
+        try:
+            name, description = _read_skill_md(skill_md)
+        except OSError:
+            logger.warning("chat skills: unreadable marketplace SKILL.md %s", skill_md, exc_info=True)
+            continue
+        out.append((name, description, skill_md))
+    return out
+
+
 def _marketplace_skill_entries(conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:
     """``[{name, description, dir}]`` for every marketplace skill the caller has.
 
-    The single walk both consumers share: :func:`list_marketplace_skills` turns
-    it into menu rows and :func:`iter_marketplace_skill_dirs` hands the
-    directories to ``app/api/kai.py``'s workspace archive. Sharing the walk is
-    what makes the ``project`` delivery path ship exactly the set the menu
-    advertises, instead of two scans that can disagree.
-
-    ``name`` is the frontmatter name (directory-name fallback), i.e. the
-    ``/<name>`` token — so a copy made under that name has its directory,
-    frontmatter and slash command all agreeing. ``dir`` is the SKILL.md's
-    parent, so a skill's own ``references/`` files travel with it.
-
-    A plugin's ``SKILL.md`` may live directly at its root (single-skill
-    plugins, e.g. the built-in marketplace) or under ``skills/<name>/
-    SKILL.md`` (multi-skill plugins, the curated-marketplace and Store
-    convention) — this looks anywhere under the plugin root, mirroring
-    ``src/store_guardrails/manifest_check.py``'s same defensive scan.
-
-    Order is the resolver's (deterministic), then path, so a duplicate name
-    resolves the same way in both consumers.
+    Per-plugin work lives in :func:`plugin_skill_entries`; this adds the RBAC
+    resolution around it. Order is the resolver's (deterministic), then path, so
+    a duplicate name resolves the same way in every consumer.
     """
     out: list[dict] = []
     for plugin in resolve_user_marketplace(conn, user):
         for plugin_dir in _plugin_dirs(plugin):
             if plugin_dir is None or not plugin_dir.is_dir():
                 continue
-            for skill_md in sorted(plugin_dir.rglob("SKILL.md")):
-                try:
-                    name, description = _read_skill_md(skill_md)
-                except OSError:
-                    logger.warning("chat skills: unreadable marketplace SKILL.md %s", skill_md, exc_info=True)
-                    continue
+            for name, description, skill_md in plugin_skill_entries(plugin_dir):
                 out.append({"name": name, "description": description, "dir": skill_md.parent})
     return out
-
-
-def iter_marketplace_skill_dirs(conn: duckdb.DuckDBPyConnection, user: dict) -> list[tuple[str, Path]]:
-    """``[(skill_name, skill_dir)]`` for the ``project`` delivery path.
-
-    Used by ``app/api/kai.py`` to overlay the caller's marketplace skills into
-    the workspace tarball the kai-agent engine materializes into its project
-    scope — that provider spawns no runner of ours, so this archive is the only
-    project scope Agnes controls there.
-    """
-    return [(e["name"], e["dir"]) for e in _marketplace_skill_entries(conn, user)]
 
 
 def list_marketplace_skills(conn: duckdb.DuckDBPyConnection, user: dict) -> list[dict]:

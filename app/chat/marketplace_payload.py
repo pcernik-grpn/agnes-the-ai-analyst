@@ -139,12 +139,19 @@ def _within(path: Path, base: Path) -> bool:
 
 
 #: Per-component-type destination inside a project scope, for the loose-file
-#: shape. Keyed by the plugin's own subdirectory.
+#: shape. Keyed by the plugin's own subdirectory. Skills are deliberately NOT
+#: here: they are placed by ``app.chat.skills_catalog.plugin_skill_entries``,
+#: the same walk the composer's menu names them from — a plugin may keep its
+#: ``SKILL.md`` at the root rather than under ``skills/``, and the delivered
+#: folder must be named after the frontmatter (what the CLI invokes) rather
+#: than after wherever it came from.
 _COMPONENT_DIRS = {
-    "skills": ".claude/skills",
     "agents": ".claude/agents",
     "commands": ".claude/commands",
 }
+
+#: Where a flattened skill lands.
+_SKILLS_DEST = ".claude/skills"
 
 
 def materialize_plugin_components(
@@ -185,6 +192,8 @@ def materialize_plugin_components(
     hooks: dict = {}
     mcp_servers: dict = {}
 
+    from app.chat.skills_catalog import plugin_skill_entries
+
     for plugin in plugins:
         for root in _plugin_roots(plugin):
             if root is None or not root.is_dir():
@@ -201,10 +210,38 @@ def materialize_plugin_components(
                     if is_unserved_path(rel.parts) or escapes_base(path, bases):
                         continue
                     files[f"{dest_dir}/{rel.as_posix()}"] = path
+            for name, _description, skill_md in plugin_skill_entries(root):
+                files.update(_skill_files(name, skill_md, root, bases))
             _merge_json_block(root / "hooks" / "hooks.json", "hooks", hooks, plugin)
             _merge_json_block(root / ".mcp.json", "mcpServers", mcp_servers, plugin)
 
     return files, hooks, mcp_servers
+
+
+def _skill_files(name: str, skill_md: Path, plugin_root: Path, bases: "list[Path]") -> dict[str, Path]:
+    """``{arcname: source}`` for one skill, placed under its invocation name.
+
+    A skill in its own directory travels whole, so its ``references/`` files
+    come along. A plugin whose ``SKILL.md`` sits at the plugin ROOT is the
+    exception: its "directory" is the entire plugin (for a root-source plugin,
+    the entire marketplace clone), so only the ``SKILL.md`` itself is taken —
+    sweeping the root would drag every other component, and the clone's own
+    files, into one skill folder.
+    """
+    from src.marketplace_filter import escapes_base, is_unserved_path
+
+    dest = f"{_SKILLS_DEST}/{name}"
+    if skill_md.parent.resolve() == plugin_root.resolve():
+        return {f"{dest}/SKILL.md": skill_md}
+    out: dict[str, Path] = {}
+    for path in sorted(skill_md.parent.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(skill_md.parent)
+        if is_unserved_path(rel.parts) or escapes_base(path, bases):
+            continue
+        out[f"{dest}/{rel.as_posix()}"] = path
+    return out
 
 
 def _plugin_roots(plugin: dict) -> Iterable[Optional[Path]]:

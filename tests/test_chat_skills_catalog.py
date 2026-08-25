@@ -569,13 +569,13 @@ class TestSkillNamesStayBare:
 
 
 class TestOneWalkFeedsMenuAndDelivery:
-    """The invariant that keeps the three surfaces from drifting: what the
-    composer offers, what `app/chat/workdir.py` writes into the workspace and
-    what `app/api/kai.py` packs into the tarball all come from one walk."""
+    """The invariant that keeps the surfaces from drifting: what the composer
+    offers and what the flattened delivery writes come from ONE walk
+    (`plugin_skill_entries`). When they were two, a plugin whose SKILL.md sits at
+    its root was listed by the menu and skipped by the delivery — a menu entry
+    nothing answers to. Found by Devin Review on #1552."""
 
-    def test_names_and_dirs_agree(self, db_conn, tmp_path, monkeypatch):
-        from app.chat.skills_catalog import iter_marketplace_skill_dirs
-
+    def _seed(self, db_conn, tmp_path, monkeypatch):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
         _make_user(db_conn, user_id="u1", email="u1@x")
@@ -583,36 +583,78 @@ class TestOneWalkFeedsMenuAndDelivery:
 
         from app.utils import get_marketplaces_dir
 
-        root = get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills"
-        _write_skill_md(root / "alpha" / "SKILL.md", name="alpha")
-        _write_skill_md(root / "beta" / "SKILL.md", name="beta")
+        return get_marketplaces_dir() / "mkt" / "plugins" / "p1"
+
+    def test_nested_skills_are_named_and_delivered_alike(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "alpha" / "SKILL.md", name="alpha")
+        _write_skill_md(plugin_dir / "skills" / "beta" / "SKILL.md", name="beta")
 
         menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
-        delivered = iter_marketplace_skill_dirs(db_conn, {"id": "u1"})
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
 
-        assert menu == [name for name, _dir in delivered] == ["alpha", "beta"]
-        for name, skill_dir in delivered:
-            assert (skill_dir / "SKILL.md").is_file()
-            assert skill_dir.name == name
+        assert menu == ["alpha", "beta"]
+        for name in menu:
+            assert f".claude/skills/{name}/SKILL.md" in files
 
-    def test_the_directory_is_named_by_the_frontmatter_not_the_folder(self, db_conn, tmp_path, monkeypatch):
-        """The delivered directory must be named by the token the menu offers.
-        When frontmatter and folder disagree, frontmatter wins in the menu — so
-        `iter_marketplace_skill_dirs` reports that name and the copy lands
-        under it, keeping directory, frontmatter and slash command in agreement."""
-        from app.chat.skills_catalog import iter_marketplace_skill_dirs
+    def test_a_root_level_skill_is_delivered_not_just_offered(self, db_conn, tmp_path, monkeypatch):
+        """Single-skill plugins (e.g. the built-in marketplace) ship SKILL.md at
+        the plugin root. The menu has always found those; the delivery must too."""
+        from app.chat.marketplace_payload import materialize_plugin_components
 
-        monkeypatch.setenv("DATA_DIR", str(tmp_path))
-        _register_marketplace(db_conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
-        _make_user(db_conn, user_id="u1", email="u1@x")
-        _grant_and_subscribe(db_conn, user_id="u1", marketplace="mkt", plugin="p1")
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "SKILL.md", name="root-level")
 
-        from app.utils import get_marketplaces_dir
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
 
-        _write_skill_md(
-            get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "folder-name" / "SKILL.md",
-            name="frontmatter-name",
-        )
+        assert menu == ["root-level"]
+        assert files[".claude/skills/root-level/SKILL.md"] == plugin_dir / "SKILL.md"
 
-        assert [n for n, _ in iter_marketplace_skill_dirs(db_conn, {"id": "u1"})] == ["frontmatter-name"]
-        assert [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})] == ["frontmatter-name"]
+    def test_a_root_level_skill_does_not_drag_the_plugin_in(self, db_conn, tmp_path, monkeypatch):
+        """Its "directory" is the whole plugin — for a root-source plugin, the
+        whole marketplace clone — so only the SKILL.md itself may travel."""
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "SKILL.md", name="root-level")
+        (plugin_dir / "commands").mkdir(parents=True, exist_ok=True)
+        (plugin_dir / "commands" / "unrelated.md").write_text("---\n---\nBody.", encoding="utf-8")
+
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        skill_members = [k for k in files if k.startswith(".claude/skills/root-level/")]
+        assert skill_members == [".claude/skills/root-level/SKILL.md"]
+        # The command is still delivered — as a command, in its own place.
+        assert ".claude/commands/unrelated.md" in files
+
+    def test_delivery_folder_follows_the_frontmatter_not_the_source_folder(self, db_conn, tmp_path, monkeypatch):
+        """Verified against the CLI: a skill in `folder-name/` whose frontmatter
+        says `frontmatter-name` is invoked as `/frontmatter-name`. So the folder
+        it is delivered INTO must carry the frontmatter name, or the offered token
+        and the delivered directory disagree. Found by Devin Review on #1552."""
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "folder-name" / "SKILL.md", name="frontmatter-name")
+
+        menu = [s["name"] for s in list_marketplace_skills(db_conn, {"id": "u1"})]
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert menu == ["frontmatter-name"]
+        assert ".claude/skills/frontmatter-name/SKILL.md" in files
+        assert not any(k.startswith(".claude/skills/folder-name/") for k in files)
+
+    def test_supporting_files_travel_under_the_new_name(self, db_conn, tmp_path, monkeypatch):
+        from app.chat.marketplace_payload import materialize_plugin_components
+
+        plugin_dir = self._seed(db_conn, tmp_path, monkeypatch)
+        _write_skill_md(plugin_dir / "skills" / "folder-name" / "SKILL.md", name="frontmatter-name")
+        (plugin_dir / "skills" / "folder-name" / "references").mkdir(parents=True, exist_ok=True)
+        (plugin_dir / "skills" / "folder-name" / "references" / "deep.md").write_text("detail", encoding="utf-8")
+
+        files, _hooks, _mcp = materialize_plugin_components(db_conn, {"id": "u1"})
+
+        assert ".claude/skills/frontmatter-name/references/deep.md" in files
