@@ -181,6 +181,38 @@ class TestZeroDoorEmailRescue:
         # Short-circuits on email's own unavailability — never touches the DB.
         assert called["holder_checked"] is False
 
+    def test_warning_logs_once_per_activation_not_once_ever(self, monkeypatch, caplog):
+        """The rescue's warning dedups per ACTIVATION: while it stays active
+        the line must not repeat per request, but after it deactivates (a
+        password holder appears) and later reactivates (the holder is gone
+        again) the operator must hear about it AGAIN — the early returns
+        clear the dedup marker (Devin Review on PR #1548)."""
+        import logging
+
+        monkeypatch.delenv("AGNES_AUTH_PROVIDERS", raising=False)
+        from app.auth import provider_registry
+        from app.auth.provider_registry import provider_allowed
+
+        monkeypatch.setattr(provider_registry, "_ZERO_DOOR_EMAIL_RESCUE_ACTIVE", False)
+        monkeypatch.setattr(provider_registry, "_provider_available", lambda name: name == "email")
+        holder = {"exists": False}
+        monkeypatch.setattr(provider_registry, "_has_usable_password_holder", lambda: holder["exists"])
+
+        def _warnings() -> int:
+            return sum("only usable login door" in r.message for r in caplog.records)
+
+        with caplog.at_level(logging.WARNING, logger="app.auth.provider_registry"):
+            assert provider_allowed("email") is True
+            assert _warnings() == 1
+            assert provider_allowed("email") is True
+            assert _warnings() == 1, "still active — no duplicate line per request"
+
+            holder["exists"] = True  # another door opens → rescue deactivates
+            assert provider_allowed("email") is False
+            holder["exists"] = False  # …and closes again → rescue reactivates
+            assert provider_allowed("email") is True
+            assert _warnings() == 2, "a reactivation must warn again"
+
     def test_c_explicit_allowlist_is_never_rescued(self, monkeypatch):
         monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
         from app.auth.provider_registry import provider_allowed

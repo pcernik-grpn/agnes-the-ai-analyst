@@ -256,6 +256,15 @@ def _has_usable_password_holder() -> bool:
     ``instance_doctor`` already imports FROM this module
     (:func:`probe_providers`), so importing back would be circular.
 
+    Runs as an existence probe (``users_repo().any_password_holder``, a
+    ``SELECT 1 … LIMIT 1``), NOT ``list_all()``: this backs
+    ``provider_allowed("email")`` on every unauthenticated ``/login``
+    render and ``/auth/email/*`` request of a no-OAuth instance, so
+    loading the whole users table here would hand any unauthenticated
+    caller a repeatable full-table scan (Devin Review on PR #1548). No
+    cache on top on purpose — a fresh password grant must open/close the
+    door without a restart, and the probe is a cheap indexed-table read.
+
     On any error this reads as "no holder" — a fail-open direction on
     purpose: this function backs a rescue whose whole job is to avoid
     losing a working door, so a transient DB fault should widen (keep email
@@ -267,7 +276,7 @@ def _has_usable_password_holder() -> bool:
     from src.repositories import users_repo
 
     try:
-        return any(u.get("password_hash") and u.get("email") != SCHEDULER_USER_EMAIL for u in users_repo().list_all())
+        return users_repo().any_password_holder(exclude_email=SCHEDULER_USER_EMAIL)
     except Exception:
         logger.warning(
             "could not check for password holders (zero-door email rescue) — treating as none", exc_info=True
@@ -306,14 +315,17 @@ def _email_default_offering() -> bool:
     the instance's only usable login door, in which case it stays enabled
     — see the module docstring's third rescue. The moment another door
     becomes usable the default exclusion re-applies on the very next call;
-    there is nothing to "undo" since this holds no state beyond the log
-    dedup marker above.
+    the only state is the log-dedup marker above, which the early returns
+    clear so a LATER reactivation warns again instead of staying silent
+    (Devin Review on PR #1548).
     """
+    global _ZERO_DOOR_EMAIL_RESCUE_ACTIVE
     if not _provider_available("email"):
+        _ZERO_DOOR_EMAIL_RESCUE_ACTIVE = False
         return False
     if _other_login_door_usable():
+        _ZERO_DOOR_EMAIL_RESCUE_ACTIVE = False
         return False
-    global _ZERO_DOOR_EMAIL_RESCUE_ACTIVE
     if not _ZERO_DOOR_EMAIL_RESCUE_ACTIVE:
         _ZERO_DOOR_EMAIL_RESCUE_ACTIVE = True
         logger.warning(

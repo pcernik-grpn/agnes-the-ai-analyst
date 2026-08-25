@@ -296,6 +296,29 @@ class UserRepository:
     def count_all(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
+    def any_password_holder(self, exclude_email: Optional[str] = None) -> bool:
+        """Whether at least one user row holds a password hash — a
+        ``SELECT 1 … LIMIT 1`` existence probe, NOT an enumeration.
+
+        Backs the zero-door email rescue in ``app.auth.provider_registry``,
+        which runs on every unauthenticated ``/login`` render of a no-OAuth
+        instance — the whole point of this method is that such a hot,
+        unauthenticated path must not pull the entire users table the way a
+        ``list_all()`` scan would. ``exclude_email`` skips a synthetic
+        account (the scheduler user) that carries a hash but cannot sign in
+        interactively; the predicate mirrors the caller's previous Python
+        filter exactly: a NULL or empty hash does not count, and a NULL
+        email is never equal to the exclusion (``IS DISTINCT FROM``, which
+        both engines support with identical semantics).
+        """
+        sql = "SELECT 1 FROM users WHERE password_hash IS NOT NULL AND password_hash <> ''"
+        params: List[Any] = []
+        if exclude_email is not None:
+            sql += " AND email IS DISTINCT FROM ?"
+            params.append(exclude_email)
+        sql += " LIMIT 1"
+        return self.conn.execute(sql, params).fetchone() is not None
+
     def create(
         self,
         id: str,
