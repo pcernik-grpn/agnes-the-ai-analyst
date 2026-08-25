@@ -1263,6 +1263,7 @@ and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
 
 ### `/api/admin/run-*` — Background job triggers
 
+- /api/admin/run-audit-prune
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory

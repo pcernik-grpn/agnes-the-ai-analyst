@@ -326,8 +326,7 @@ class AuditRepository:
         def _bucket(select: str, extra: str = "", group: str = "1") -> list:
             clause = w + (f" AND {extra}" if (w and extra) else (f"WHERE {extra}" if extra else ""))
             return self.conn.execute(
-                f"SELECT {select}, COUNT(*) AS n FROM audit_log {clause} "
-                f"GROUP BY {group} ORDER BY n DESC LIMIT ?",
+                f"SELECT {select}, COUNT(*) AS n FROM audit_log {clause} GROUP BY {group} ORDER BY n DESC LIMIT ?",
                 params + [limit],
             ).fetchall()
 
@@ -345,6 +344,22 @@ class AuditRepository:
             "resources": [{"value": r[0], "count": r[1]} for r in resources],
             "sources": [{"value": r[0], "count": r[1]} for r in source_rows],
         }
+
+    def prune_older_than(self, days: int) -> int:
+        """Delete ``audit_log`` rows older than ``days``. Returns the
+        deleted-row count.
+
+        The caller (``src/audit_retention.py``) owns the "0/negative days =
+        keep forever, skip entirely" short-circuit — this method always
+        executes the DELETE it's given, no matter the value. Reads the
+        count off ``fetchone()`` rather than ``res.rowcount`` — DuckDB's
+        DBAPI ``rowcount`` is always ``-1`` for DML, but a DELETE's result
+        set carries a single ``Count`` column with the real number."""
+        res = self.conn.execute(
+            f"DELETE FROM audit_log WHERE timestamp < (current_timestamp - INTERVAL '{int(days)} days')"
+        )
+        row = res.fetchone()
+        return int(row[0]) if row else 0
 
     def last_scheduler_tick(self) -> "datetime | None":
         """Most recent ``run_%`` or ``marketplace.sync_all`` audit row
@@ -417,8 +432,11 @@ class AuditRepository:
         ).fetchone()
         if row is None:
             return {
-                "events_total": 0, "active_users": 0, "errors": 0,
-                "p95": None, "duration_coverage": 0.0,
+                "events_total": 0,
+                "active_users": 0,
+                "errors": 0,
+                "p95": None,
+                "duration_coverage": 0.0,
             }
         total = int(row[5] or 0)
         return {

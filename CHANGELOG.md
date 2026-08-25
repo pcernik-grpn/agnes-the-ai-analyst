@@ -35,6 +35,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - **BREAKING: the email magic link is opt-in only.** When `auth.providers` is unset, the login page now offers every configured provider EXCEPT `email` (its `GET /auth/email/verify` consumes the single-use token on the request, so a corporate mail scanner opening the link before the human clicks silently burns it). Instances that relied on the implicit magic-link offering must add `email` to `auth.providers` to keep it. The misconfiguration lockout rescue (an allowlist naming only unconfigured providers falls back to password + email) is unchanged. A second, narrower rescue protects an already-deployed instance from this default flip itself: when `auth.providers` is unset, email is configured (SMTP), and no OTHER door is usable (no OAuth provider configured and no user holds a password), email stays enabled and a one-time warning is logged — the moment another door becomes usable, the default exclusion applies again.
+### Added
+
+- **Audit trail viewer seam.** `/admin/activity` (the Activity Center) now links out to the other two admin audit-trail viewers it doesn't cover — Analyst sessions (`/admin/sessions`) and Telemetry (`/admin/telemetry`) — real links, not embedded re-implementations. `audit_log` gets its first retention policy: `audit.retention_days` in `instance.yaml` (default 365, `0` keeps rows forever), enforced by a new daily `audit-prune` scheduler job (`POST /api/admin/run-audit-prune`, `src/audit_retention.py`) that logs the pruned-row count. The other six audit/observability trails (chat transcripts, CLI session JSONLs, usage rollups, `sync_history`, `llm_usage`, agent-runtime forensics) remain undocumented-retention on purpose — see `docs/observability.md`.
 
 ## [0.86.0] - 2026-08-24
 

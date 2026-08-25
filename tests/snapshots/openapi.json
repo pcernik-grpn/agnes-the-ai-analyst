@@ -24634,6 +24634,60 @@
         ]
       }
     },
+    "/api/admin/run-audit-prune": {
+      "post": {
+        "description": "Trigger the retention-based ``audit_log`` prune.\n\nWraps :func:`src.audit_retention.prune_audit_log`. The scheduler service\nhits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the\ncorporate-memory + blocked-purge jobs); admins can also run it on demand.\n\n``retention_days`` comes from ``audit.retention_days`` (default 365, 0\nkeeps rows forever). Only ``audit_log`` has a retention policy \u2014 see\ndocs/observability.md for the other audit/observability trails.",
+        "operationId": "run_audit_prune_api_admin_run_audit_prune_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Audit Prune",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/run-blocked-purge": {
       "post": {
         "description": "Trigger the TTL purge of blocked bundle bytes.\n\nWraps :func:`src.store_guardrails.purge.purge_blocked_bundles`. The\nscheduler service hits this endpoint daily (under\n``SCHEDULER_API_TOKEN`` like the corporate-memory + verification\njobs); admins can also run it on demand from the UI.\n\n``purge_blocked_bundles`` resolves its repositories from the\n``src.repositories`` factory (backend-agnostic), so no DuckDB\nconnection is threaded through this handler anymore.",

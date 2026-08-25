@@ -935,6 +935,11 @@ _EXEMPT: dict[str, str] = {
         "views) sync trigger — admin/scheduler maintenance op, mirrors the "
         "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/run-audit-prune": (
+        "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
+        "seam) — admin/scheduler maintenance op, mirrors the run-blocked-purge "
+        "/ run-reap-stuck-reviews exemptions; no analyst CLI/MCP analogue"
+    ),
     "/api/chat/journey": (
         "chat-driven onboarding backend foundation — internal state read/write "
         "for the in-chat onboarding UI (a follow-up task), self-scoped to the "
