@@ -5,6 +5,12 @@ Slack delivers events over an outbound WebSocket instead of an HTTPS
 webhook, so there is **no `request_url`** — that's the whole point of the
 two-stanza split (a stale `request_url` is a common foot-gun).
 
+The scope set is identical to the HTTP manifest (see
+`docs/slack-manifest-http.md` for the per-scope rationale — bot-token only,
+no user scopes, no hand-picking). The canonical copy lives at
+`services/slack_bot/manifest.yaml`; `tests/test_slack_manifest_sync.py`
+keeps this file in sync with it.
+
 ```yaml
 display_information:
   name: Agnes
@@ -21,20 +27,29 @@ features:
 oauth_config:
   scopes:
     bot:
-      - app_mentions:read
-      - chat:write
-      - im:history
-      - im:write
-      - reactions:write
-      - users:read
-      - users:read.email
+      - app_mentions:read # event: app_mention
+      - chat:write # chat.postMessage / chat.postEphemeral / chat.update
+      - im:history # event: message.im (DMs with the bot)
+      - im:write # conversations.open (opening the DM channel)
+      - reactions:write # reactions.add (ack emoji; degrades to a log warning)
+slash_commands:
+  - command: /agnes
+    description: Ask Agnes a data question
+    usage_hint: "<your question> | help"
+    should_escape: false
+  - command: /agnes-new
+    description: Archive your Agnes session and start fresh
+    should_escape: false
+  - command: /agnes-status
+    description: Show your active Agnes session count and cap
+    should_escape: false
 settings:
   event_subscriptions:
     bot_events:
       - app_mention
       - message.im
   interactivity:
-    is_enabled: false
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

@@ -37,6 +37,119 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Three more dynamic-options selects still carried the pre-0.83.99 "no re-init hook" exclusion comment as their reason for staying plain `<select>`s on the paper theme**, now stale since `dsDropdownInit` was exported: the Git-file picker on `/admin/prompts` (per-card, `git-path-select-{install,workspace}`), the group picker on `/admin/people/{id}` (`add-group-select`), and the User/Action/Source facet filters on `/admin/activity` (`f-user`/`f-action`/`f-source` — the Result/Resource filters on the same page were already converted since their option lists are static). Each gets a `sync*Dropdown()` helper matching the `/admin/linked-apps` shape, called every time its select's options are rebuilt. One pitfall hit and fixed across all three: the helper must rebuild the dropdown's `<button>` element too, not just its `<ul>` menu — `ds_dropdown.js`'s `init()` isn't idempotent for the same button node, so leaving it in place across the page's own DOMContentLoaded bootstrap and a later sync call double-registers its click handler, and the second toggle silently cancels the first (the menu never visibly opens).
 - **The derived Keboola card on `/admin/data-sources` was a navigation dead end.** An instance whose Keboola connection was configured the old way (`data_source.keboola.*` + a token, no `source_connections` row) rendered a card whose only action opened server-config — which has no route back into table browsing or registration. The card now offers "Import as managed connection", a one-click POST of the existing `stack_url` + `token_env` to the connection registry; the card immediately flips to a real, fully-interactive connection with the inline browse-and-register panel, and existing tables registered against the legacy instance-level connection keep resolving exactly as before. The button only renders when the instance is actually credentialed (a `stack_url` alone has nothing to import), and when the working credential isn't independently resolvable by the new connection on its own — the instance-level vault, or the generic `KEBOOLA_STORAGE_TOKEN` env var behind some OTHER custom configured `token_env` — the import now seeds that same token into the new connection's own vault slot — preflighted against the Storage API — instead of creating a connection that badges "env" but cannot actually reach Keboola; a stale vault token reports `token_seeded: false` instead of a silent false-success toast.
 - **Bulk Keboola table registration 422ed on hyphenated names with no way to fix them.** Names like `inventory-items` (common in Shopify exports) fail the registry's identifier check — correct, intentional, unchanged — but the bulk table picker gave the operator no way to retype a name before submitting, so a whole batch failed with nothing to click. Rows whose raw name would fail now render an editable input pre-filled with a suggested valid identifier (`inventory-items` → `inventory_items`); the suggestion is shown, not silently applied, and the register call sends whatever the operator leaves in the field.
+### Changed
+
+- **Slack app manifests trimmed to the minimal bot-token scope set.** The
+  three shipped manifests (`services/slack_bot/manifest.yaml` + the two
+  transport variants in `docs/`) had drifted; they now carry the same five
+  bot scopes with a per-scope justification and no user scopes. Dropped the
+  dead `users:read` + `users:read.email` (identity binds via the `/setup`
+  code flow — the bot never reads Slack profiles), added the missing
+  `reactions:write` to the canonical manifest (the ack-emoji call silently
+  degraded to a log warning without it), and brought slash commands +
+  interactivity to the docs variants. `tests/test_slack_manifest_sync.py`
+  now pins all three copies together. The admin "Slack bot secrets" panel
+  links to the manifests so operators create the Slack app from a manifest
+  instead of hand-picking scopes (hand-picked scope lists are what trips
+  workspace-admin approval and customer security reviews).
+
+### Fixed
+
+- **`chat.provider: kai-agent` no longer fails every turn on a freshly booted
+  deployment.** The local-dev stand-in engine was named `kai-agent` — the same
+  name a deployment gives the real turn engine (the `customer-instance`
+  module's `docker-compose.kai-agent.yml` overlay). Compose merges same-named
+  services across the files in `COMPOSE_FILE` and the later file inherits every
+  key it does not itself restate, so the overlay's `image:` won while the
+  stub's `command: python -m services.kai_engine_stub` came along for the ride.
+  The real engine image was launched as the fixture, node died on `Cannot find
+  module '/app/python'`, and the crash loop took the service out of compose DNS
+  — surfacing to users as `engine_error — engine turn failed: [Errno -3]
+  Temporary failure in name resolution` on every message. The stub's
+  `profiles: ["kai-stub"]` gate did not help: naming a service on the `up`
+  command line auto-activates its profiles.
+
+  The stub is now `kai-agent-stub` and the real engine keeps `kai-agent`, so the
+  default `chat.kai_agent_url` (`http://kai-agent:3000`) resolves to the real
+  engine in every deployment with no configuration — the fixture is what needs
+  an override now, not production. Renaming the deployment's service instead
+  would have inverted that: the only chat engine running under a name chosen to
+  dodge a test fixture, `AGNES_CHAT_KAI_AGENT_URL` mandatory everywhere, and two
+  repos obliged to agree on the non-obvious name. Local dev's compose flow gains
+  `AGNES_CHAT_KAI_AGENT_URL=http://kai-agent-stub:3000` (one env var in a flow
+  that already sets `KAI_HOST_JWT_SECRET`); the host-process flow already set it.
+  `docker-compose.prod.yml`'s source-less-host `image:` pin follows the stub to
+  its new name.
+
+  Two paired tests keep the names apart from both sides, asserting DISJOINTNESS
+  rather than specific names:
+  `test_stub_does_not_squat_the_real_engine_service_name` (no
+  `docker-compose.yml` service may be called `kai-agent`, and the default
+  endpoint must still resolve to it) and
+  `test_overlay_service_names_are_disjoint_from_the_base_compose_file` (no
+  overlay service may collide with a base one) — so the next dev-only service
+  added under a colliding name fails in CI instead of in production.
+
+  Note why this hid: the stub landed in `docker-compose.yml` in 0.86.0, but an
+  engine container created before that keeps running across app upgrades (the
+  auto-upgrade tick does not recreate it unless the pinned engine image
+  changes). Only a VM recreate — or an engine image bump — exposed it, which is
+  why a deployment that had been serving engine turns for days broke the moment
+  it was replaced. No infra module change and no VM recreate are needed to pick
+  this up: `docker-compose.yml` and `docker-compose.prod.yml` are both in the
+  auto-upgrade tick's `CONFIG_FILES`, refetched every tick, and the content
+  drift triggers the recreate itself.
+
+## [0.87.1] - 2026-08-25
+
+### Fixed
+
+- **A marketplace plugin in your stack now actually reaches your chat session —
+  whole.** The composer's slash menu offered `/<skill-name>` for every skill in
+  the caller's stack while nothing delivered those plugins into the session, so
+  picking one came back `Unknown command: /<skill>` on every provider. Three
+  causes, all fixed: (1) `chat.bootstrap_marketplace` was **off by default**, so
+  nothing was attempted; it is now **on**, with a new
+  `chat_bootstrap_marketplace` switch (`AGNES_CHAT_BOOTSTRAP_MARKETPLACE`,
+  editable in `/admin/server-config`). (2) The e2b/docker path it gated could
+  not have worked where it ran: the runner shelled out to `agnes
+  refresh-marketplace --bootstrap` *inside* the sandbox, where the marketplace
+  git endpoint is unreachable — it is PAT-gated, the sandbox deliberately holds
+  no PAT, and the in-sandbox relay routes no marketplace path — so the clone
+  401'd behind a `check=False` subprocess. Agnes now writes the caller's filtered
+  marketplace into the workspace as a directory and the sandbox's own CLI
+  installs from it **offline** (`claude plugin marketplace add` + `claude plugin
+  install --scope user`), which is a real plugin install: agents, slash commands,
+  hooks and MCP servers all arrive, `${CLAUDE_PLUGIN_ROOT}` keeps working, and
+  components keep the `<plugin>:<name>` namespace the usage-event attribution
+  reads. (3) The `kai-agent` provider was never wired at all — Agnes never enters
+  that sandbox, so a plugin install (which writes the CLI's HOME registry) is out
+  of reach; its plugins are now flattened into project-scope files in the
+  workspace tarball `GET /api/kai/workspace` serves, covering the same component
+  types. The marketplace content comes from the same builder as the served ZIP an
+  analyst's `agnes refresh-marketplace` downloads, so a sandbox and a laptop get
+  byte-identical plugins.
+
+  With delivery off, the slash menu omits marketplace entries instead of
+  advertising undelivered ones. `GET /api/chat/skills` now also returns the
+  plugins' slash **commands**, and reports each token as the running provider
+  actually exposes it — a plugin's skill is bare (`/keboola-cli`) but its command
+  is namespaced (`/kbl:kbl-ship`), while both are bare in the flattened shape.
+  Verified against the CLI's own init handshake rather than assumed. Two honest
+  costs of the flattened shape, both stated in `docs/cloud-chat.md`: a hook whose
+  command needs `${CLAUDE_PLUGIN_ROOT}` is dropped rather than shipped to fail
+  mid-turn, and the flattened MCP servers are added to `enabledMcpjsonServers`
+  because a project-scope server is never spawned without that allow-list entry
+  and nobody can approve one interactively in a headless sandbox. Reference:
+  `docs/cloud-chat.md` → *Marketplace plugins in a chat session*.
+
+### Removed
+
+- `AGNES_BOOTSTRAP_MARKETPLACE` (the chat sandbox's env var) and the runner's
+  in-sandbox marketplace *clone*. It could not clone from inside a sandbox (see
+  Fixed above); the sandbox now installs from a directory the server shipped.
+  The operator-facing `chat.bootstrap_marketplace` config key keeps its name and
+  gates the whole feature.
 
 ## [0.87.0] - 2026-08-25
 

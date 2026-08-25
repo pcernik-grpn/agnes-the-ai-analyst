@@ -1691,6 +1691,51 @@ async def lifespan(app):
                         if conn is not None:
                             conn.close()
 
+                def _export_marketplace(user_email: str, dest: Path) -> "list[str]":
+                    """Write the user's RBAC-filtered marketplace tree at `dest`.
+
+                    Returns the plugin names written — the `<name>@agnes` refs
+                    the sandbox installs offline. The content comes from the same
+                    builder the served marketplace ZIP uses, so a chat sandbox
+                    and an analyst's laptop get byte-identical plugins.
+
+                    Returns [] when nothing installs from a tree: the operator
+                    has `chat.bootstrap_marketplace` off (the composer's menu
+                    omits the plugins too, so the two agree), the provider
+                    delivers flattened components instead (`kai-agent` — it gets
+                    them from the workspace tarball, so exporting a tree here
+                    would copy the whole marketplace per convergence for nothing),
+                    or the user row is gone. In those cases any tree a previous
+                    provider left behind is removed, and the [] return also
+                    prunes the `@agnes` enabledPlugins entries — there are no
+                    installed plugins to enable. Found by Devin Review on #1552.
+
+                    Conn resolution mirrors `_render_workspace_prompt` above:
+                    handed in under DuckDB, None on Postgres (where opening the
+                    system DuckDB is a forbidden invariant) — the resolver reads
+                    its state through the repo factory either way.
+                    """
+                    import shutil
+
+                    from app.chat.marketplace_payload import export_marketplace_tree
+                    from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
+                    from src.db import get_system_db
+                    from src.repositories import use_pg, users_repo
+
+                    if marketplace_delivery(app.state.chat_config) != DELIVERY_PLUGIN:
+                        shutil.rmtree(dest, ignore_errors=True)
+                        return []
+                    user = users_repo().get_by_email(user_email)
+                    if user is None:
+                        shutil.rmtree(dest, ignore_errors=True)
+                        return []
+                    conn = None if use_pg() else get_system_db()
+                    try:
+                        return export_marketplace_tree(conn, dict(user), dest)
+                    finally:
+                        if conn is not None:
+                            conn.close()
+
                 workdir_mgr = WorkdirManager(
                     data_dir=_chat_data_dir,
                     repo=app.state.chat_repo,
@@ -1701,6 +1746,7 @@ async def lifespan(app):
                     get_template_status=_server_template_status,
                     fetch_template_zip=_fetch_local_template_zip,
                     render_workspace_prompt=_render_workspace_prompt,
+                    export_marketplace=_export_marketplace,
                     marketplace_sha_debounce_seconds=app.state.chat_config.marketplace_sha_debounce_seconds,
                 )
                 if app.state.chat_config.provider == "docker":

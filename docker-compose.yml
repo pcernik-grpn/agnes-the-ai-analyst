@@ -273,12 +273,21 @@ services:
   # only be tested by hand. Speaks the engine's SSE contract with scripted
   # turns; no model, no key, no database. See docs/kai-agent-local-dev.md.
   #
-  # Named `kai-agent` so the default `chat.kai_agent_url`
-  # (http://kai-agent:3000) resolves to it with no extra configuration, and
-  # gated behind its own profile so it can never appear in a stack that did
-  # not ask for it by name. NEVER enable this profile in production: it
+  # NOT named `kai-agent`: that name belongs to the real engine, which a
+  # deployment runs as a compose service of its own (see the
+  # customer-instance module's docker-compose.kai-agent.yml overlay), and
+  # which the default `chat.kai_agent_url` (http://kai-agent:3000) therefore
+  # resolves to with no configuration at all. A fixture must not squat the
+  # production name: compose merges same-named services across the files in
+  # COMPOSE_FILE and the overlay would inherit the `command` below, launching
+  # the real engine image as this stub. Local dev points at the stub with
+  # `AGNES_CHAT_KAI_AGENT_URL` instead — one env var in a flow that already
+  # sets `KAI_HOST_JWT_SECRET`; see docs/kai-agent-local-dev.md.
+  #
+  # Gated behind its own profile too, so it can never appear in a stack that
+  # did not ask for it by name. NEVER enable this profile in production: it
   # answers every turn with a canned script.
-  kai-agent:
+  kai-agent-stub:
     build: .
     command: python -m services.kai_engine_stub
     profiles: ["kai-stub"]

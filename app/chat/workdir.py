@@ -110,6 +110,88 @@ def _reconcile_feature_gated_skills(ws: Path, bundled_template_dir: Path, *, all
             logger.warning("workdir: could not restore skill %s", skill_name, exc_info=True)
 
 
+def _reconcile_marketplace_tree(ws: Path, export: "Callable[[Path], list[str]]") -> list[str]:
+    """Put the caller's whole marketplace in the workspace; return plugin names.
+
+    Not just skills. A plugin ships agents, slash commands, hooks and MCP
+    servers too, and the point of a stack is that all of it reaches the agent —
+    so what lands here is the filtered marketplace TREE, laid out exactly as the
+    served ZIP (`app/chat/marketplace_payload.py`). The runner then registers it
+    with the sandbox's own CLI (`claude plugin marketplace add <dir>` +
+    `claude plugin install <name>@agnes --scope project`), which is a purely
+    offline operation against a local directory — no network, no PAT.
+
+    That is why this exists at all: the previous design ran `agnes
+    refresh-marketplace --bootstrap` INSIDE the sandbox, where the clone is
+    impossible (the marketplace git endpoint is PAT-gated, the sandbox
+    deliberately holds no PAT, and the in-sandbox relay routes no marketplace
+    path), so it 401'd behind a `check=False` subprocess and delivered nothing
+    while the composer's slash menu advertised the skills anyway. See #1552.
+
+    Runs on every convergence, not only on reinit: `needs_reinit` compares the
+    global marketplace-ingest SHA and the Agnes version, neither of which moves
+    when THIS user subscribes to a plugin.
+    """
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    names = export(ws / MARKETPLACE_TREE_SUBDIR)
+    _enable_stack_plugins(ws, names)
+    return names
+
+
+def _enable_stack_plugins(ws: Path, names: "list[str]") -> None:
+    """Write `enabledPlugins` for the stack into the workspace settings.
+
+    `claude plugin install --scope project` records the install in the CLI's own
+    HOME registry but does NOT enable the plugin for the project, so without
+    this every stack plugin loads disabled. Same contract as the analyst-side
+    writer (`cli/commands/refresh_marketplace.py::_enable_plugins_in_workspace_
+    settings`), including its two asymmetries: the stack is the source of truth,
+    so a locally disabled stack plugin is re-enabled; and only `@agnes` keys are
+    ours to prune — an entry from another marketplace is never touched.
+
+    Idempotent: writes only when something actually changed, because this file
+    rides the workspace upload on every spawn.
+    """
+    import json
+
+    from app.chat.marketplace_payload import MARKETPLACE_NAME
+
+    settings_path = ws / ".claude" / "settings.json"
+    try:
+        cfg = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except (OSError, ValueError):
+        logger.warning("workdir: %s is not valid JSON; skipping plugin enable", settings_path)
+        return
+    if not isinstance(cfg, dict):
+        logger.warning("workdir: %s top-level is not an object; skipping plugin enable", settings_path)
+        return
+    enabled = cfg.setdefault("enabledPlugins", {})
+    if not isinstance(enabled, dict):
+        logger.warning("workdir: %s enabledPlugins is not an object; skipping plugin enable", settings_path)
+        return
+
+    suffix = f"@{MARKETPLACE_NAME}"
+    wanted = {f"{name}{suffix}" for name in names}
+    changed = False
+    for key in sorted(wanted):
+        if enabled.get(key) is not True:
+            enabled[key] = True
+            changed = True
+    for key in [k for k in list(enabled) if k.endswith(suffix) and k not in wanted]:
+        del enabled[key]
+        changed = True
+
+    if not changed:
+        return
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        logger.info("workdir: enabled %d stack plugin(s) in %s", len(wanted), settings_path)
+    except OSError:
+        logger.warning("workdir: could not write %s", settings_path, exc_info=True)
+
+
 def _prune_disabled_feature_skills(ws: Path) -> None:
     """Remove bundled skills whose feature is off on THIS instance.
 
@@ -167,6 +249,7 @@ class WorkdirManager:
         get_template_status: Callable[[], Optional[TemplateStatus]],
         fetch_template_zip: Optional[Callable[[], bytes]] = None,
         render_workspace_prompt: Optional[Callable[[str], Optional[str]]] = None,
+        export_marketplace: Optional[Callable[[str, Path], "list[str]"]] = None,
         marketplace_sha_debounce_seconds: int = 0,
     ) -> None:
         self._data_dir = data_dir
@@ -185,6 +268,16 @@ class WorkdirManager:
         # cloud chat consistent with a local install instead of diverging onto
         # the static bundled CLAUDE.md. Returns None → keep the static file.
         self._render_workspace_prompt = render_workspace_prompt
+        # Optional ``(user_email, dest) -> [plugin_name]`` hook: writes the
+        # caller's RBAC-filtered marketplace tree at ``dest`` and returns the
+        # plugin names it wrote (``[]`` when the stack is empty, or when the
+        # operator has ``chat.bootstrap_marketplace`` off). Injected rather than
+        # resolved here for the same reason as the prompt renderer — this module
+        # stays free of DB/RBAC coupling, and tests drive it with a stub.
+        # ``None`` means "no marketplace wiring on this instance": the reconcile
+        # is skipped entirely, leaving whatever is on disk alone rather than
+        # pruning it on a half-configured manager.
+        self._export_marketplace = export_marketplace
         # Debounce cache for the marketplace-SHA lookup. Operators set
         # ``marketplace_sha_debounce_seconds`` in instance.yaml to bound
         # how often the (potentially-slow) SHA source is consulted; this
@@ -272,13 +365,36 @@ class WorkdirManager:
             _reconcile_feature_gated_skills(
                 ws, self._bundled_template_dir, allow_restore=not self._template_override_active()
             )
+            self._reconcile_marketplace(ws, user_email)
             return ws
 
         self.run_init(user_email, ws)
         _reconcile_feature_gated_skills(
             ws, self._bundled_template_dir, allow_restore=not self._template_override_active()
         )
+        self._reconcile_marketplace(ws, user_email)
         return ws
+
+    def _reconcile_marketplace(self, ws: Path, user_email: str) -> None:
+        """Converge this workspace's marketplace tree — best-effort.
+
+        Both convergence branches call it (a fresh workspace and an already-
+        initialized one), for the same reason the feature-gate reconcile does:
+        a stack change is not something ``needs_reinit`` can see.
+
+        A failure here must never deny someone their chat session — they lose
+        their marketplace plugins for this spawn, not the session. The
+        composer's menu reads the stack independently, so a persistent failure
+        shows up as a menu entry that does nothing; the warning is the
+        breadcrumb.
+        """
+        export = self._export_marketplace
+        if export is None:
+            return
+        try:
+            _reconcile_marketplace_tree(ws, lambda dest: export(user_email, dest))
+        except Exception:
+            logger.warning("workdir: marketplace reconcile failed for %s", user_email, exc_info=True)
 
     def run_init(self, user_email: str, workspace: Optional[Path] = None) -> None:
         ws = workspace or self.user_workspace(user_email)

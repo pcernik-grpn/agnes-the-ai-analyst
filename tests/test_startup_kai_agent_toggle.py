@@ -322,6 +322,39 @@ def test_tpl_engine_services_are_bounded():
     assert kai_yaml.count("no-new-privileges:true") == 3
 
 
+def test_overlay_service_names_are_disjoint_from_the_base_compose_file():
+    """No service the engine overlay defines may share a name with one in
+    ``docker-compose.yml``.
+
+    Compose merges same-named services across the files in ``COMPOSE_FILE``
+    and the later file inherits every key it does not itself restate. The
+    local-dev stub used to be named ``kai-agent``, exactly like the overlay's
+    engine, so the engine silently ran with the stub's
+    ``command: python -m services.kai_engine_stub`` -- node died on
+    ``Cannot find module '/app/python'``, the crash loop took the service out
+    of compose DNS, and every turn failed with
+    ``engine_error -- [Errno -3] Temporary failure in name resolution``.
+    Naming a service on the ``up`` command line auto-activates its profiles,
+    so the stub's ``profiles:`` gate did not prevent any of it.
+
+    The paired assertion lives in
+    ``tests/test_kai_engine_stub.py::test_stub_does_not_squat_the_real_engine_service_name``;
+    this side catches a NEW dev-only service landing on a name the overlay
+    already uses.
+    """
+    body = TPL.read_text()
+    kai_yaml = body[body.index("<<'KAIYAML'") : body.index("\nKAIYAML")]
+    overlay = set(re.findall(r"^  ([a-z0-9-]+):$", kai_yaml, re.M))
+    assert overlay, "could not parse the overlay's service names"
+
+    base = set(re.findall(r"^  ([a-z0-9-]+):$", Path("docker-compose.yml").read_text(), re.M))
+    collisions = overlay & base
+    assert not collisions, (
+        f"overlay service name(s) {sorted(collisions)} also exist in docker-compose.yml; "
+        "compose merges them and the overlay inherits keys it never set"
+    )
+
+
 def test_tpl_engine_env_derivation():
     body = TPL.read_text()
     # Sandbox-facing broker URL rides the PUBLIC origin; server-to-server
