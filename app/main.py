@@ -1699,24 +1699,35 @@ async def lifespan(app):
                     builder the served marketplace ZIP uses, so a chat sandbox
                     and an analyst's laptop get byte-identical plugins.
 
-                    Returns [] when the operator has `chat.bootstrap_marketplace`
-                    off (the composer's menu omits them too, so the two agree) or
-                    when the user row is gone.
+                    Returns [] when nothing installs from a tree: the operator
+                    has `chat.bootstrap_marketplace` off (the composer's menu
+                    omits the plugins too, so the two agree), the provider
+                    delivers flattened components instead (`kai-agent` — it gets
+                    them from the workspace tarball, so exporting a tree here
+                    would copy the whole marketplace per convergence for nothing),
+                    or the user row is gone. In those cases any tree a previous
+                    provider left behind is removed, and the [] return also
+                    prunes the `@agnes` enabledPlugins entries — there are no
+                    installed plugins to enable. Found by Devin Review on #1552.
 
                     Conn resolution mirrors `_render_workspace_prompt` above:
                     handed in under DuckDB, None on Postgres (where opening the
                     system DuckDB is a forbidden invariant) — the resolver reads
                     its state through the repo factory either way.
                     """
+                    import shutil
+
                     from app.chat.marketplace_payload import export_marketplace_tree
-                    from app.chat.skills_catalog import DELIVERY_NONE, marketplace_delivery
+                    from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
                     from src.db import get_system_db
                     from src.repositories import use_pg, users_repo
 
-                    if marketplace_delivery(app.state.chat_config) == DELIVERY_NONE:
+                    if marketplace_delivery(app.state.chat_config) != DELIVERY_PLUGIN:
+                        shutil.rmtree(dest, ignore_errors=True)
                         return []
                     user = users_repo().get_by_email(user_email)
                     if user is None:
+                        shutil.rmtree(dest, ignore_errors=True)
                         return []
                     conn = None if use_pg() else get_system_db()
                     try:
