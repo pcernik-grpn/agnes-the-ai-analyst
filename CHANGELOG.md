@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.87.1] - 2026-08-25
+
 ### Fixed
 
 - **A marketplace plugin in your stack now actually reaches your chat session —
