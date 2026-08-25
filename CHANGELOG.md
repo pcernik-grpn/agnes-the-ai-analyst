@@ -10,6 +10,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Changed
+
+- **Slack app manifests trimmed to the minimal bot-token scope set.** The
+  three shipped manifests (`services/slack_bot/manifest.yaml` + the two
+  transport variants in `docs/`) had drifted; they now carry the same five
+  bot scopes with a per-scope justification and no user scopes. Dropped the
+  dead `users:read` + `users:read.email` (identity binds via the `/setup`
+  code flow — the bot never reads Slack profiles), added the missing
+  `reactions:write` to the canonical manifest (the ack-emoji call silently
+  degraded to a log warning without it), and brought slash commands +
+  interactivity to the docs variants. `tests/test_slack_manifest_sync.py`
+  now pins all three copies together. The admin "Slack bot secrets" panel
+  links to the manifests so operators create the Slack app from a manifest
+  instead of hand-picking scopes (hand-picked scope lists are what trips
+  workspace-admin approval and customer security reviews).
+
 ### Fixed
 
 - **`chat.provider: kai-agent` no longer fails every turn on a freshly booted
