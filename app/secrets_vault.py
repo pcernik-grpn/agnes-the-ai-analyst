@@ -327,7 +327,7 @@ class SystemSecretsRepository:
         ``app.secrets.persist_overlay_token`` (wave 2C task 6) — the caller
         needs to discover which env vars are vault-managed without knowing
         the full set up front (it's admin-driven: marketplace PATs, the
-        E2B/Anthropic chat keys, the initial-workspace template PAT). Uses
+        Anthropic chat key, the initial-workspace template PAT). Uses
         ``position(... IN ...)`` rather than ``LIKE`` so the prefix is
         matched literally — ``LIKE`` would need ``%``/``_`` escaping since
         ``env_overlay/`` itself contains an underscore. Does not decrypt.

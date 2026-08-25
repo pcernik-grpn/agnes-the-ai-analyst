@@ -460,7 +460,7 @@ class TestMarketplaceCommands:
 
 
 class _Cfg:
-    def __init__(self, bootstrap_marketplace: bool, provider: str = "e2b"):
+    def __init__(self, bootstrap_marketplace: bool, provider: str = "docker"):
         self.bootstrap_marketplace = bootstrap_marketplace
         self.provider = provider
 
@@ -478,14 +478,13 @@ class TestMarketplaceDelivery:
 
         assert marketplace_delivery(_Cfg(False)) == DELIVERY_NONE
 
-    @pytest.mark.parametrize("provider", ["e2b", "docker"])
-    def test_a_sandbox_agnes_enters_gets_real_plugins(self, provider):
+    def test_a_sandbox_agnes_enters_gets_real_plugins(self):
         """Agnes ships the marketplace as a directory and the sandbox's own CLI
         installs from it offline — so hooks, MCP servers and the `<plugin>:<name>`
         namespace all survive."""
         from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
 
-        assert marketplace_delivery(_Cfg(True, provider)) == DELIVERY_PLUGIN
+        assert marketplace_delivery(_Cfg(True, "docker")) == DELIVERY_PLUGIN
 
     def test_the_embedded_engine_gets_flattened_components(self):
         """kai-agent runs the agent in a sandbox Agnes never enters, so a plugin

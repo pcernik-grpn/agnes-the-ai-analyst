@@ -1,6 +1,6 @@
 """chat_sessions sandbox pause/resume refs (DuckDB v73 parity).
 
-Three nullable columns tracking the E2B sandbox ID, the runner PID,
+Three nullable columns tracking the provider sandbox ID, the runner PID,
 and the time the session was paused. Un-indexed by design — DuckDB 1.5.3
 raises a false FK violation when UPDATE-ing indexed columns of
 ``chat_sessions`` after any ``chat_messages`` INSERT.

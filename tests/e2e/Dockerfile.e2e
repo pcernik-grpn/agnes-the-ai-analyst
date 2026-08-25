@@ -1,9 +1,12 @@
 # Dockerfile.e2e — Linux Agnes server for the cloud-chat E2E suite.
 #
-# Under the E2B-provider model the in-container isolation stack (nsjail,
-# iptables, dedicated sandbox uid) is gone — chat sandboxes run in E2B's
-# cloud microVMs, not on this host. All this image needs is the FastAPI
-# app + sample data; no NET_ADMIN, no host uid mapping, no nsjail build.
+# No in-container isolation stack (nsjail, iptables, dedicated sandbox
+# uid) — chat sandboxes are sibling containers spawned by the apps-runner
+# sidecar (see docker-compose.e2e.yml), never processes inside this image.
+# All this image needs is the FastAPI app + sample data; no NET_ADMIN, no
+# host uid mapping, no nsjail build. The same image doubles as the sidecar
+# (`/opt/venv/bin/python -m services.apps_runner` — the `docker` SDK rides
+# in the server extra).
 #
 # The container still exists rather than running uvicorn naked from the
 # tests because the sample-data loader and DuckDB init need a stable

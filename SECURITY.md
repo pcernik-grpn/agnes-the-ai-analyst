@@ -139,11 +139,18 @@ PAT `surface` narrows authority further: a token with an unrecognized surface
 
 ### Sandbox isolation
 
-Chat sessions run in per-session microVMs. Egress is enforced **at the VM level**,
-independent of anything inside the sandbox: `deny_out=[ALL_TRAFFIC]` plus a host
-allowlist that defaults to the Agnes host, loopback, and the LLM and package
-endpoints the agent needs (`app/chat/e2b_provider.py`). Operators can tighten it
-via `chat.egress_allow_out`. Killing a session destroys the whole VM.
+Chat sessions run in per-session sandboxes: under the `docker` provider a
+hardened container created by the apps-runner sidecar (non-root, `cap_drop:
+ALL`, `no-new-privileges`, resource limits, no Docker socket inside —
+`app/chat/docker_provider.py`); under the default `kai-agent` provider, the
+embedded engine's own remote execution sandbox. The in-sandbox
+`pre_tool_use.py` hook is **advisory only** (fail-open, Bash-only, agent-
+rewritable); the enforcing egress layers sit outside the sandbox's reach —
+the docker provider's `chat.docker_egress_mode` (`none` joins an internal
+network with no route off the host; `allowlist` adds the egress-proxy
+sidecar, whose compose-owned `EGRESS_ALLOW_HOSTS` is the enforcing copy) and,
+on kai-agent, the engine's own sandbox policy. Killing a session destroys
+its sandbox.
 
 ### Untrusted input
 

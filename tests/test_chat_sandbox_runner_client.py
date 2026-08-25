@@ -1,6 +1,6 @@
 """SandboxRunnerClient unit tests — mock the sidecar at the HTTP boundary.
 
-Mirrors `tests/test_chat_e2b_provider.py`'s "fake SDK under the real code"
+Uses the "fake SDK under the real code"
 approach: an `httpx.MockTransport` stands in for the apps-runner sidecar so the
 real client code (paths, headers, base64 framing, error mapping) runs.
 """

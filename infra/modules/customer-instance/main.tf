@@ -83,8 +83,8 @@ locals {
   # Opt-in embedded kai-agent turn engine: same shape as the dispatcher —
   # per-VM flag, module-wide config, secretAccessor only when some instance
   # actually enables it. Secrets already granted through runtime_secret_env
-  # OR runtime_secrets are subtracted: a caller reusing the app's own E2B
-  # secret for the engine would otherwise declare the same (project, secret,
+  # OR runtime_secrets are subtracted: a caller reusing one of the app's own
+  # secrets for the engine would otherwise declare the same (project, secret,
   # role, member) IAM binding twice and the second apply errors with
   # "already exists" — the same duplicate-binding trap
   # oauth_secret_name_template documents.
@@ -265,7 +265,7 @@ resource "google_secret_manager_secret_iam_member" "vm_runtime" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
-# Grant read access to secrets that get auto-injected as .env entries (E2B,
+# Grant read access to secrets that get auto-injected as .env entries (Anthropic,
 # Anthropic, Slack, etc.) per var.runtime_secret_env. The startup script
 # iterates this map and writes one `<env_var>=$(gcloud secrets ...)` line
 # per entry to /opt/agnes/.env.

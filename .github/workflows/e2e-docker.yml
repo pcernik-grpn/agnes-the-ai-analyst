@@ -1,0 +1,141 @@
+# e2e-docker.yml — opt-in CI workflow that runs the cloud-chat E2E suite
+# against real docker-provider sandboxes (the apps-runner sidecar + the
+# operator-built agnes-chat-sandbox image).
+#
+# Replaces .github/workflows/e2e-e2b.yml, removed 2026-08 together with the
+# e2b chat provider. Sandboxes are local containers on the runner's own
+# Docker daemon — no third-party sandbox account, no per-minute billing.
+# The only paid leg is the optional real-LLM job, gated on the
+# ANTHROPIC_API_KEY secret; the fake-agent job runs with a placeholder key
+# (the compose file requires the var to be set, but deterministic-echo mode
+# never calls Anthropic).
+
+name: e2e-docker
+
+on:
+  workflow_dispatch:
+  # Disabled by default — uncomment for per-PR runs (cheap but slow: two
+  # image builds + a full compose stack per run).
+  # pull_request:
+  #   paths:
+  #     - 'app/chat/**'
+  #     - 'services/apps_runner/**'
+  #     - 'tests/e2e/**'
+  #     - 'app/initial_workspace_default/docker-sandbox/**'
+
+permissions:
+  contents: read
+
+env:
+  # Shared secret between the agnes app, the apps-runner sidecar, and the
+  # host-side smoke suite. Test-stack-only value, not a real credential.
+  APPS_RUNNER_TOKEN: e2e-apps-runner-token
+  # Where host-side suites reach the sidecar (loopback publish in
+  # tests/e2e/docker-compose.e2e.yml).
+  APPS_RUNNER_URL: http://localhost:8600
+  # The compose network sandboxes must join (fixed name in the compose file).
+  AGNES_DOCKER_SANDBOX_NETWORK: agnes-e2e
+
+jobs:
+  # Deterministic leg — no Anthropic spend. The runner inside each sandbox
+  # runs in fake-agent (echo) mode; real sandboxes are still spawned, so
+  # this proves the sidecar, the image, the bind-mount translation, and the
+  # ws/session plumbing end to end.
+  e2e-fake-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AGNES_E2E: '1'
+      AGNES_E2E_DOCKER: '1'
+      AGNES_E2E_FAKE_AGENT: '1'
+      # Placeholder — required non-empty by docker-compose.e2e.yml, never
+      # sent to Anthropic in fake-agent mode (AGNES_E2E_ANTHROPIC stays
+      # unset, so every @real_llm test skips).
+      ANTHROPIC_API_KEY: sk-ant-placeholder-fake-agent-mode
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev,server]"
+
+      - name: Build the chat-sandbox image
+        run: docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
+
+      - name: Bring up the e2e compose stack
+        run: docker compose -f tests/e2e/docker-compose.e2e.yml up -d --build --wait
+
+      - name: Run docker-sandbox smoke (real sidecar + real image)
+        run: .venv/bin/pytest tests/e2e/test_docker_sandbox_smoke.py -v --tb=short
+
+      - name: Run sandbox-backed F.* scenarios (fake agent)
+        run: |
+          .venv/bin/pytest \
+            tests/e2e/test_workspace_init.py \
+            tests/e2e/test_chat_web.py \
+            tests/e2e/test_adversarial.py \
+            -v --tb=short
+
+      - name: Tear down compose stack
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.e2e.yml down -v
+
+  # Real-LLM leg — needs the ANTHROPIC_API_KEY repo/org secret. Every step
+  # is gated on the secret being present so the job stays green (no-op)
+  # on forks and secretless repos instead of failing the dispatch.
+  e2e-real-llm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AGNES_E2E: '1'
+      AGNES_E2E_DOCKER: '1'
+      AGNES_E2E_ANTHROPIC: '1'
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Note when the Anthropic secret is missing
+        if: env.ANTHROPIC_API_KEY == ''
+        run: echo "::notice::ANTHROPIC_API_KEY secret not set — skipping the real-LLM leg"
+
+      - uses: actions/checkout@v7
+        if: env.ANTHROPIC_API_KEY != ''
+
+      - name: Set up Python 3.11
+        if: env.ANTHROPIC_API_KEY != ''
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev,server]"
+
+      - name: Build the chat-sandbox image
+        if: env.ANTHROPIC_API_KEY != ''
+        run: docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
+
+      - name: Bring up the e2e compose stack
+        if: env.ANTHROPIC_API_KEY != ''
+        run: docker compose -f tests/e2e/docker-compose.e2e.yml up -d --build --wait
+
+      - name: Run real-agent F.* scenarios (incl. the section-F broker gate)
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          .venv/bin/pytest \
+            tests/e2e/test_workspace_init.py \
+            tests/e2e/test_chat_web.py \
+            tests/e2e/test_adversarial.py \
+            -v --tb=short
+
+      - name: Tear down compose stack
+        if: always() && env.ANTHROPIC_API_KEY != ''
+        run: docker compose -f tests/e2e/docker-compose.e2e.yml down -v

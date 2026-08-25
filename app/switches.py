@@ -149,7 +149,7 @@ SWITCHES: tuple[Switch, ...] = (
         category="product",
         editable=True,
         runtime_view="enabled",
-        description="Cloud-hosted chat (E2B sandbox agent sessions). New feature — off by default.",
+        description="Cloud-hosted chat (sandboxed agent sessions). New feature — off by default.",
     ),
     Switch(
         name="chat_bootstrap_marketplace",
@@ -163,7 +163,7 @@ SWITCHES: tuple[Switch, ...] = (
         runtime_view="bootstrap_marketplace",
         description=(
             "Deliver the caller's RBAC-filtered marketplace skills into chat sessions so a "
-            "stack skill is invokable as `/<skill-name>`. On `e2b`/`docker` the runner installs "
+            "stack skill is invokable as `/<skill-name>`. On `docker` the runner installs "
             "them as Claude Code plugins in the sandbox (~10-15 s per spawn); on `kai-agent` "
             "they ride the workspace tarball the engine materializes. Off makes the composer's "
             "slash menu stop offering marketplace skills rather than advertise ones the agent "
@@ -176,21 +176,21 @@ SWITCHES: tuple[Switch, ...] = (
         config_keys=("chat", "provider"),
         env_var="AGNES_CHAT_PROVIDER",
         kind="select",
-        options=("e2b", "docker", "kai-agent"),
-        default="e2b",
+        options=("docker", "kai-agent"),
+        default="kai-agent",
         effect="restart",
         category="product",
         editable=True,
         runtime_view="provider",
         description=(
-            "Which engine runs web/Slack chat sessions: `e2b` (cloud microVM per session, the "
-            "default), `docker` (self-hosted container per session) or `kai-agent` (the embedded "
-            "kai-agent turn engine — see docs/cloud-chat.md). Resolved by `load_chat_config` "
+            "Which engine runs web/Slack chat sessions: `kai-agent` (the embedded kai-agent "
+            "turn engine, the default — see docs/cloud-chat.md) or `docker` (self-hosted "
+            "container per session). Resolved by `load_chat_config` "
             "(env > instance.yaml > default) at boot, not through `switch_value` — hence "
             "`runtime_view`. Editable because the whole `chat` section is (a raw section edit "
             "could always write it); the real guards sit elsewhere: every provider rides "
-            "deployment-provisioned backing (E2B key/template, apps-runner sidecar, kai-agent "
-            "sidecar + KAI_HOST_JWT_SECRET), and app/main.py's boot gates refuse a provider "
+            "deployment-provisioned backing (kai-agent sidecar + KAI_HOST_JWT_SECRET, or the "
+            "apps-runner sidecar), and app/main.py's boot gates refuse a provider "
             "whose backing is absent, loudly, at the restart the save already requires. Pin "
             "it in infrastructure via the customer-instance module's per-VM `chat_provider` "
             "(AGNES_CHAT_PROVIDER) so a fresh data disk boots into the right engine."

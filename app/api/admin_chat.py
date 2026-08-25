@@ -16,12 +16,10 @@ from app.auth.dependencies import _get_db
 from src.repositories import audit_repo
 from app.chat.readiness import (
     ENV_ANTHROPIC,
-    ENV_E2B,
     get_llm_runtime_diagnostic,
     secret_status,
     test_anthropic_key,
     test_docker_sandbox,
-    test_e2b_key,
     test_wif_credentials,
 )
 from app.coordination.base import CoordinationUnavailable
@@ -97,8 +95,9 @@ async def list_active(request: Request, admin: dict = Depends(require_admin)):
 # --------------------------------------------------------------------------
 # Chat readiness — secret presence + live key validation
 # --------------------------------------------------------------------------
-# Chat needs ANTHROPIC_API_KEY + (for the e2b provider) E2B_API_KEY in the
-# server env, plus a real JWT_SECRET_KEY. When any is missing the startup
+# Chat needs ANTHROPIC_API_KEY in the server env, plus a real
+# JWT_SECRET_KEY (and per-provider backing: KAI_HOST_JWT_SECRET for
+# kai-agent, APPS_RUNNER_TOKEN for docker). When any is missing the startup
 # gates leave chat_manager=None and chat 503s. These admin-only endpoints
 # surface that state (presence, never the value), let an admin set the keys
 # from the UI (persisted to the env-overlay), and live-test that the keys
@@ -107,7 +106,6 @@ async def list_active(request: Request, admin: dict = Depends(require_admin)):
 
 
 class ChatSecretsBody(BaseModel):
-    e2b_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
 
 
@@ -143,9 +141,6 @@ async def set_chat_secrets(
     from app.secrets import persist_overlay_token
 
     changed: list[str] = []
-    if body.e2b_api_key and body.e2b_api_key.strip():
-        persist_overlay_token(ENV_E2B, body.e2b_api_key.strip())
-        changed.append("e2b_api_key")
     if body.anthropic_api_key and body.anthropic_api_key.strip():
         persist_overlay_token(ENV_ANTHROPIC, body.anthropic_api_key.strip())
         changed.append("anthropic_api_key")
@@ -179,11 +174,11 @@ async def test_chat_secrets(request: Request, _admin: dict = Depends(require_adm
     (mint a token + confirm the API accepts it) in ``workload_identity`` mode —
     so the admin "test connection" surface works in both modes.
 
-    The sandbox slot is provider-aware: ``e2b_api_key`` on an E2B deployment,
-    ``docker_sandbox`` (sidecar + daemon + image, via the apps-runner probe) on
-    a self-hosted one. Only the relevant one is returned — a docker instance has
-    no E2B account, and a red row for a credential it will never use is noise,
-    not a signal.
+    The sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +
+    image, via the apps-runner probe) on a docker deployment; a kai-agent
+    deployment gets only the anthropic probe — the engine owns its own sandbox
+    backing, and a red row for a credential the instance will never use is
+    noise, not a signal.
     """
     chat_config = getattr(request.app.state, "chat_config", None)
     llm_auth = getattr(chat_config, "llm_auth", "api_key")
@@ -192,10 +187,8 @@ async def test_chat_secrets(request: Request, _admin: dict = Depends(require_adm
     else:
         anthropic_probe = await test_anthropic_key()
     result: dict = {"anthropic_api_key": anthropic_probe}
-    if getattr(chat_config, "provider", "e2b") == "docker":
+    if getattr(chat_config, "provider", "kai-agent") == "docker":
         result["docker_sandbox"] = await test_docker_sandbox(getattr(chat_config, "docker_image", ""))
-    else:
-        result["e2b_api_key"] = await test_e2b_key()
     return result
 
 
@@ -217,9 +210,9 @@ async def admin_debug(
 
     Used by the E2E suite (notably ``tests/e2e/test_bq_budget.py``) to
     read counters that previously had to be poked via ``docker exec
-    python -c ...`` against module globals. Under the E2B-provider
-    model there is no ``docker exec`` into the runner — the runner is
-    a remote E2B microVM — so the test reads from this endpoint
+    python -c ...`` against module globals. Under a remote-sandbox
+    provider there is no ``docker exec`` into the runner, so the test
+    reads from this endpoint
     instead. The shape is intentionally narrow: just the counters the
     suite needs to assert on.
     """

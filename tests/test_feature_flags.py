@@ -300,20 +300,20 @@ class TestServerConfigFeatureFlagsInventory:
         monkeypatch.delenv("AGNES_CHAT_PROVIDER", raising=False)
         flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
         row = flags["chat_provider"]
-        assert row["value_label"] == "e2b"
+        assert row["value_label"] == "kai-agent"
         assert row["effective"] is False
         assert row["source"] == "default"
-        monkeypatch.setenv("AGNES_CHAT_PROVIDER", "kai-agent")
+        monkeypatch.setenv("AGNES_CHAT_PROVIDER", "docker")
         flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
         row = flags["chat_provider"]
-        assert row["value_label"] == "kai-agent"
+        assert row["value_label"] == "docker"
         assert row["effective"] is True
         assert row["source"] == "env"
         # Blank env = unset for the select resolver — the label must agree.
         monkeypatch.setenv("AGNES_CHAT_PROVIDER", "  ")
         flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
         row = flags["chat_provider"]
-        assert row["value_label"] == "e2b"
+        assert row["value_label"] == "kai-agent"
         assert row["source"] == "default"
 
     def test_preset_coupled_flag_resolves_and_labels_preset_source(self, seeded_app, monkeypatch):

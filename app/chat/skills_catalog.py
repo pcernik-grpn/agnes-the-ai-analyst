@@ -37,7 +37,7 @@ the menu insert an unknown command.
 **Delivery** (:func:`marketplace_delivery`) is the other half of the contract:
 a marketplace skill is only invokable if something actually put it in the
 agent's project scope. Agnes materializes the skill directories server-side —
-into the per-user chat workspace for e2b/docker (``app/chat/workdir.py``), into
+into the per-user chat workspace for docker (``app/chat/workdir.py``), into
 the workspace tarball for kai-agent (``app/api/kai.py``) — from this module's
 own walk, so all three surfaces name the same set. With
 ``chat.bootstrap_marketplace`` off nothing is materialized, delivery is
@@ -68,7 +68,7 @@ BUNDLED_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "app" / "initial_wo
 #: ``marketplace_delivery`` results — HOW the caller's stack plugins reach the
 #: agent, which decides what a component is called once it is there.
 #:
-#: ``plugin``  — e2b / docker: the server writes the filtered marketplace as a
+#: ``plugin``  — docker: the server writes the filtered marketplace as a
 #:               directory in the workspace and the sandbox's own CLI installs
 #:               real plugins from it, offline (``app/chat/marketplace_payload
 #:               .export_marketplace_tree`` + ``app/chat/runner.py::
@@ -98,7 +98,7 @@ def marketplace_delivery(chat_config: object) -> str:
 
     One resolver for every consumer that must agree: ``GET /api/chat/skills``
     (what the composer offers, and under which token), ``app/chat/workdir.py``
-    (what an e2b/docker workspace receives) and ``app/api/kai.py``'s workspace
+    (what a docker workspace receives) and ``app/api/kai.py``'s workspace
     archive (what the engine's project scope receives). Splitting the decision
     would let the menu offer a token no sandbox answers to — the drift this
     whole change exists to remove.

@@ -449,10 +449,10 @@ GOOGLE_CLIENT_ID=$(gcloud secrets versions access latest --secret="$${OAUTH_ID_S
 GOOGLE_CLIENT_SECRET=$(gcloud secrets versions access latest --secret="$${OAUTH_SECRET_NAME}" 2>/dev/null || echo "")
 
 # Optional app-level secrets injected via the caller's `runtime_secret_env` map
-# (e.g. E2B_API_KEY, ANTHROPIC_API_KEY, SLACK_BOT_TOKEN). Module auto-grants
+# (e.g. ANTHROPIC_API_KEY, SLACK_BOT_TOKEN). Module auto-grants
 # secretAccessor for each map key. Missing / 403 / empty -> silent fallback to ""
 # so the operator can wire a secret name before the value exists; the app
-# surfaces its own missing-key error at startup (e.g. _chat_e2b_api_key_ok).
+# surfaces its own missing-key error at startup (e.g. _chat_anthropic_key_ok).
 %{ for secret_name, env_name in runtime_secret_env ~}
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null || echo "")
 %{ endfor ~}

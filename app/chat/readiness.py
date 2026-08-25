@@ -2,11 +2,11 @@
 
 The chat feature depends on server-env secrets:
   - ``ANTHROPIC_API_KEY``  — the agent (and auto-title) call Claude with it.
-  - ``E2B_API_KEY``        — the sandbox provider spawns microVMs with it
-                             (only when ``provider='e2b'``).
   - ``APPS_RUNNER_TOKEN``  — authenticates the gateway to the apps-runner
                              sidecar that owns the Docker socket (only when
                              ``provider='docker'``).
+  - ``KAI_HOST_JWT_SECRET``— the embedded engine's shared secret (only when
+                             ``provider='kai-agent'``).
   - ``JWT_SECRET_KEY``     — desktop / WS auth tokens are signed with it.
 
 The startup gates in ``app/main.py`` refuse to build ``ChatManager`` when any
@@ -24,7 +24,6 @@ from typing import Any, Optional
 
 # Env-var names chat reads — the single source of truth for what it needs.
 ENV_ANTHROPIC = "ANTHROPIC_API_KEY"
-ENV_E2B = "E2B_API_KEY"
 ENV_JWT = "JWT_SECRET_KEY"
 ENV_APPS_RUNNER_TOKEN = "APPS_RUNNER_TOKEN"
 
@@ -52,8 +51,7 @@ def secret_status(chat_config: Any) -> dict:
     distinctly from "unset and that's fine".
     """
     enabled = bool(getattr(chat_config, "enabled", False))
-    provider = getattr(chat_config, "provider", "e2b") or "e2b"
-    e2b_needed = enabled and provider == "e2b"
+    provider = getattr(chat_config, "provider", "kai-agent") or "kai-agent"
     docker_needed = enabled and provider == "docker"
     kai_agent_needed = enabled and provider == "kai-agent"
     # In workload_identity mode there is intentionally NO static ANTHROPIC_API_KEY
@@ -66,14 +64,9 @@ def secret_status(chat_config: Any) -> dict:
 
     secrets = {
         "anthropic_api_key": {"set": _is_set(ENV_ANTHROPIC), "required": anthropic_key_needed},
-        "e2b_api_key": {"set": _is_set(ENV_E2B), "required": e2b_needed},
         "jwt_secret_key": {"set": jwt_ok, "required": enabled},
-        "e2b_template_id": {
-            "set": bool(getattr(chat_config, "e2b_template_id", None)),
-            "required": e2b_needed,
-        },
         # Docker provider: the sidecar credential (a real secret) plus the
-        # sandbox image tag. Neither is needed on an e2b deployment.
+        # sandbox image tag. Neither is needed on a kai-agent deployment.
         "apps_runner_token": {"set": _is_set(ENV_APPS_RUNNER_TOKEN), "required": docker_needed},
         "chat_docker_image": {
             "set": bool(getattr(chat_config, "docker_image", None)),
@@ -216,34 +209,8 @@ def get_llm_runtime_diagnostic(app_state: Any) -> Optional[dict]:
     return getattr(app_state, _LLM_DIAG_ATTR, None)
 
 
-async def test_e2b_key(api_key: Optional[str] = None, *, timeout: float = 8.0) -> dict:
-    """Probe the E2B API key with a cheap authenticated call.
-
-    Uses ``AsyncSandbox.list`` (lists running sandboxes) — it hits the E2B
-    API and authenticates without spinning up a microVM. Returns
-    ``{ok, detail}``. Falls back to the env key when ``api_key`` is omitted.
-
-    Note: on the modern e2b SDK ``AsyncSandbox.list`` is NOT a coroutine — it
-    synchronously returns an ``AsyncSandboxPaginator``; the authenticated round
-    trip happens when its first page is awaited. Awaiting ``list`` itself
-    raises ``TypeError: object AsyncSandboxPaginator can't be used in 'await'
-    expression``, so we await ``next_items()`` instead.
-    """
-    key = (api_key or os.environ.get(ENV_E2B, "")).strip()
-    if not key:
-        return {"ok": False, "detail": "E2B_API_KEY not set"}
-    try:
-        from e2b import AsyncSandbox
-
-        paginator = AsyncSandbox.list(api_key=key, request_timeout=timeout)
-        await paginator.next_items()
-    except Exception as exc:  # noqa: BLE001 — classify, never raise to the admin
-        return {"ok": False, "detail": _classify(exc)}
-    return {"ok": True, "detail": "E2B API key valid"}
-
-
 async def test_docker_sandbox(image: Optional[str] = None, *, timeout: float = 8.0) -> dict:
-    """Probe the docker chat-sandbox runner. The sibling of ``test_e2b_key``.
+    """Probe the docker chat-sandbox runner.
 
     One round trip to the apps-runner sidecar's ``/sandboxes/probe`` — the
     gateway never talks to the Docker socket itself — which answers whether the

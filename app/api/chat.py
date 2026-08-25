@@ -439,7 +439,7 @@ async def list_skills(
     full rationale): skills shipped in the bundled chat workspace template
     (``source="bundled"``) and the caller's RBAC-filtered marketplace/store
     plugin skills (``source="marketplace"``) — the same set that is materialized
-    into the session's project scope, by ``app/chat/workdir.py`` (e2b/docker)
+    into the session's project scope, by ``app/chat/workdir.py`` (docker)
     or by the workspace archive ``app/api/kai.py`` serves (kai-agent). **Shadowing**: when a skill name is
     present in both sources, the marketplace entry wins (it is the more
     user-specific grant). Either source failing to list degrades non-fatally —
@@ -458,7 +458,7 @@ async def list_skills(
     ``commands`` carries the slash commands the caller's stack plugins ship
     (``commands/*.md``). Their token, unlike a skill's, depends on how the
     plugin was delivered — ``/<plugin>:<command>`` where Agnes installed a real
-    plugin (e2b/docker), ``/<command>`` where it could only flatten the plugin
+    plugin (docker), ``/<command>`` where it could only flatten the plugin
     into project files (kai-agent). ``list_marketplace_commands`` documents the
     CLI handshake that table was verified against. Plugin AGENTS are delivered
     but deliberately not listed: they are dispatched by the Task tool, not by a
@@ -663,7 +663,7 @@ async def ws_stream(ws: WebSocket, chat_id: str, ticket: str, last_seq: int = 0)
                 if kind == "user_msg":
                     # The client may send ``user_msg`` as soon as the WS is
                     # TCP-open, but ``attach()`` hasn't necessarily finished
-                    # ``_spawn_runner`` (E2B sandbox creation can take ~5 s),
+                    # ``_spawn_runner`` (sandbox creation can take ~5 s),
                     # so ``live[chat_id]`` may not exist yet. Wait briefly
                     # for ``attach`` to populate it before raising — without
                     # this, an early ``user_msg`` triggers SessionNotFound,

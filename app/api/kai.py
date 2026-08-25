@@ -38,7 +38,7 @@ tree as one gzipped tarball, which the engine materializes into its sandbox's
 project scope. That is what gives the embedded engine Agnes's CLAUDE.md, org
 safety hook and bundled skills instead of a bare Claude Code.
 
-The security posture is inherited, not re-invented: the E2B sandbox holds no
+The security posture is inherited, not re-invented: the chat sandbox holds no
 credential, only a per-turn ticket, and every LLM and MCP byte transits our
 broker where it is already authorized, model-gated, budgeted and metered.
 
@@ -955,7 +955,7 @@ async def kai_mcp(
 #: than how to work inside one. They are meaningless in another engine's
 #: sandbox — it has its own image — so they are not shipped. Everything else in
 #: the template is workspace content and goes as-is.
-_WORKSPACE_EXCLUDED_TOPLEVEL = frozenset({"e2b-template", "docker-sandbox"})
+_WORKSPACE_EXCLUDED_TOPLEVEL = frozenset({"docker-sandbox"})
 
 #: Hard ceiling mirroring the engine's own (100 MiB, wire and extracted). The
 #: bundled template is ~160 KiB, so this only fires if an operator's override
@@ -1150,7 +1150,7 @@ def _marketplace_components(
         # `kai-agent`: this route exists to serve the engine, so if it is being
         # called the engine is in play, and the flattened shape is the only one
         # it can receive. Reading the provider here would ALSO refuse the
-        # content on an instance whose `chat.provider` still says `e2b` while
+        # content on an instance whose `chat.provider` still says `docker` while
         # the engine is configured — a distinction the caller has already
         # settled by fetching this.
         #

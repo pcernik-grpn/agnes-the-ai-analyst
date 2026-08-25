@@ -362,26 +362,28 @@ def test_admin_debug_forbidden_for_non_admin(
 # ---------------------------------------------------------------------------
 
 
-def test_test_connections_probes_e2b_for_the_e2b_provider(api_client: TestClient, logged_in_admin, monkeypatch):
-    api_client.app.state.chat_config = ChatConfig(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
-    monkeypatch.setattr(
-        "app.api.admin_chat.test_e2b_key",
-        AsyncMock(return_value={"ok": True, "detail": "E2B API key valid"}),
-    )
+def test_test_connections_probes_only_anthropic_for_the_kai_agent_provider(
+    api_client: TestClient, logged_in_admin, monkeypatch
+):
+    """The engine owns its own sandbox backing — a kai-agent instance gets
+    only the anthropic probe, never a sandbox row for infrastructure it does
+    not use."""
+    api_client.app.state.chat_config = ChatConfig(enabled=True, provider="kai-agent")
     monkeypatch.setattr(
         "app.api.admin_chat.test_anthropic_key",
         AsyncMock(return_value={"ok": True, "detail": "Anthropic API key valid"}),
     )
     body = api_client.post("/admin/chat/secrets/test").json()
-    assert body["e2b_api_key"]["ok"] is True
+    assert body["anthropic_api_key"]["ok"] is True
     assert "docker_sandbox" not in body
+    assert "e2b_api_key" not in body
 
 
 def test_test_connections_probes_the_docker_sandbox_for_the_docker_provider(
     api_client: TestClient, logged_in_admin, monkeypatch
 ):
-    """A self-hosted instance has no E2B account — the surface must report the
-    sidecar/daemon/image instead, not a red row for a key it will never use."""
+    """A docker instance must report the sidecar/daemon/image, not a red row
+    for a credential it will never use."""
     api_client.app.state.chat_config = ChatConfig(enabled=True, provider="docker", docker_image="agnes-chat-sandbox:1")
     probe = AsyncMock(return_value={"ok": True, "detail": "docker sandbox runner ready"})
     monkeypatch.setattr("app.api.admin_chat.test_docker_sandbox", probe)
