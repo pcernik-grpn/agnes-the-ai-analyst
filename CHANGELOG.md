@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-08-25
+
 ### Added
 
 - **New `/agnes-review` reviewer: `agnes-reviewer-adversarial`.** The existing reviewers (rules/architecture/rbac/parity) are pattern-matching checklists against a fixed rule list — none of them re-derive a PR's own claims, sweep for the same bug at a sibling call site the diff didn't touch, tell a test that proves behavior apart from one that only greps its own source for a string, or check that the CI behind a "green checks" claim actually ran the suite. The new reviewer does all four: verifies factual premises in the PR body/commit messages against the base ref instead of trusting the diff in isolation, greps the whole repo for structurally similar call sites left unfixed, traces whether a new guard's data is actually produced end-to-end rather than accepting a source-existence test as proof, and checks that the CI run behind a "green checks" claim actually ran the test suite (not just a build/release workflow) on a base ref current enough to mean anything. Opt-in via `/agnes-review --adversarial` — its checks are slow (real test runs, whole-repo greps, CI history), so it doesn't fire by default.
