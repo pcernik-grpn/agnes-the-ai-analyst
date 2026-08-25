@@ -402,6 +402,60 @@ fronty:
 frontě (ne jen k výzvě, ať to člověk sám napíše); žádná nová zápisová cesta
 do `semantic_models` vedle `/apply`.
 
+**Závislosti ověřené (2026-08-25):** F5 nezávisí na Fázi K ani F0 — jsou to
+jiné vrstvy (K = distribuce schválených modelů na disk, downstream od
+tvorby; F0 = sjednocení *mirrored* providerů, F5 = *native* tabulky bez
+jakékoli vrstvy). Na F4.1 závisí jen tence: stačí spočítat "má tahle tabulka
+nula řádků v `semantic_models`, co ji referencují" inline, bez čekání na
+plný cross-doménový engine — přepojit na skutečný F4.1 endpoint jde později.
+
+**Technický návrh mechanismu (rozhodnuto: znovupoužít stejný chat runner,
+ne stavět lehký samostatný job):**
+
+`ChatManager.attach(chat_id, sink)` přijímá libovolný duck-typed sink (jen
+`send_json`), takže headless trigger nepotřebuje fakeovat WebSocket:
+1. `create_session(profile="semantic-model-builder", surface=Surface.API,
+   user_email=<systémová identita>)` — `create_session` i `Surface` enum už
+   podporují netriviální `user_email`/`surface`, žádná změna signatury.
+2. `attach(session.id, <no-op sink>)` — reálně nastartuje sandboxovaný
+   runner (`_spawn_live`), stejně jako živý WS klient.
+3. `send_user_message(session.id, <trigger prompt s kontextem tabulky>,
+   sender_email=<systémová identita>)` — spustí tah agenta; ten doběhne
+   sám a zavolá `apply`, přesně jak by to udělal člověk v chatu.
+
+Tři nové kusy, co tenhle mechanismus potřebuje a dnes nikde nejsou:
+
+1. **Systémová identita, nutně non-admin.** Auto-spuštěná session nesmí jet
+   pod admin identitou — jinak `/apply` jde admin větví a zapisuje rovnou
+   do `semantic_models`, což by rozbilo invariant "vždy review" (princip 3).
+   Potřeba: reálný řádek v `users`, nikdy členem skupiny Admin.
+2. **Trigger jako periodický sweep (`services/scheduler`), ne synchronní
+   hook na registraci.** Míst, kde tabulka/data package vzniká, je víc
+   (admin API, CLI, auto-registrace konektorem) — sweep je jednodušší a
+   odolnější (vynechaný běh dožene příští tick) než hledat a upravovat
+   každé místo zvlášť. Bonus: **existující `concurrency_per_user` cap na
+   téhle jedné systémové identitě dá zadarmo přesně to škrcení**, co by se
+   jinak muselo stavět — hromadný import 10 tabulek nespustí 10 sandboxů
+   naráz.
+3. **Dedup přes malý stavový sloupec, ne parsování fronty.** `409
+   duplicate_pending` v `/apply` existující duplicitu sice odmítne, ale to
+   by znamenalo zbytečně nastartovat celý sandbox jen aby skončil na 409.
+   Levnější: `table_registry.semantic_draft_pending_at` (nebo obdobně
+   scoped sloupec), který sweep čte před spuštěním, ne mutace generické
+   `authoring_suggestions` fronty (ta zůstává doménově neutrální pro
+   všechny fronty, ne jen semantic-layer).
+
+**Vedlejší dopad na moderaci:** `authoring_suggestions.created_by` =
+systémová identita v principu stačí k rozlišení, ale Studio fronta by měla
+auto-draftované návrhy vizuálně odlišit ("Auto-drafted"), ať admin
+nezaměňuje systémový návrh za lidské podání — malá UI úprava, ne nová
+tabulka.
+
+**Cenová poznámka pro F4.2 (health):** každý trigger je plný sandboxovaný
+runner (Docker/E2B), ne levné LLM volání — stejná cena jako lidská session.
+Sweep + concurrency cap to drží v mezích, ale stojí za sledování v health
+výstupu (kolik auto-draftů běží/čeká), ne za řešení uvnitř F5 samotné.
+
 ---
 
 ## 3a. Odhad náročnosti
