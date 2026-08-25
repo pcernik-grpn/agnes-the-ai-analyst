@@ -474,14 +474,14 @@ the right tool:
 |---|---|---|
 | Chart a large, foggy effort — destination known, too many decisions open to write a plan | `agnes-wayfinder` | a map + numbered decision tickets as markdown under `docs/superpowers/maps/<effort>/`; resolve one per session (`research` excepted) until the route is clear, then hand off to `superpowers:writing-plans` → `/agnes-build`. Explicit invocation only; if you can already state the steps, skip it. |
 | Verify a change before claiming it's done | `verify-agnes-change` | cheapest-first loop: `scripts/verify_syncmap.py` (instant, the sync-map rows no test guards) → the guards your diff touches → full suite → `/agnes-review`. Fix and re-run each gate until it passes. |
-| Review a change before merge | `/agnes-review` | scope-gated review **team** (rules / architecture / rbac / parity — only the in-scope subset fires) + `agnes-review-consolidator` → one advisory report (`file:line` + severity, ≤15 findings). Read-only working tree; optional comment-only PR post. |
+| Review a change before merge | `/agnes-review` | scope-gated review **team** (rules always fires; adversarial is opt-in via `--adversarial`; architecture / rbac / parity fire only in-scope) + `agnes-review-consolidator` → one advisory report (`file:line` + severity, ≤15 findings). Read-only working tree; optional comment-only PR post. |
 | Implement a whole plan in parallel | `/agnes-build` | decomposes a plan into independent tasks (sync-map coupling), builds each in its own git worktree via `agnes-builder`, integrates (migration serialized last), then runs `/agnes-review`. |
 | Implement a feature (connector / endpoint / web page / repo method / migration) | `agnes-builder` | disciplined implementer (TDD-first, DuckDB↔PG parity in the same change, migration-ladder sync, CHANGELOG, vendor-agnostic, scope discipline). Routes to the `agnes-conventions` playbooks. |
 | Cut a release / tag | `agnes-releaser` | per the release process. |
 | Deep knowledge while editing a subsystem | `agnes-*` knowledge skills | auto-loaded by description. |
 
-**Agents** (`.claude/agents/`): `agnes-reviewer-rules`, `agnes-reviewer-architecture`,
-`agnes-reviewer-rbac`, `agnes-reviewer-parity`
+**Agents** (`.claude/agents/`): `agnes-reviewer-rules`, `agnes-reviewer-adversarial`,
+`agnes-reviewer-architecture`, `agnes-reviewer-rbac`, `agnes-reviewer-parity`
 + `agnes-review-consolidator` (the review team), `agnes-builder` (implementer),
 `agnes-decomposer` + `agnes-integrator` (the build team),
 `agnes-releaser` (release).

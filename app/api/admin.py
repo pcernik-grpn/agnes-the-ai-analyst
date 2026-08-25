@@ -4023,14 +4023,12 @@ async def discover_tables(
             from app.instance_config import get_value
             from connectors.keboola.client import KeboolaClient
 
+            from app.datasource_secrets import keboola_instance_token
+
             url = get_value("data_source", "keboola", "stack_url", default="")
             token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-            token = os.environ.get(token_env, "") if token_env else ""
-            if not token:
-                from app.datasource_secrets import datasource_secret
-
-                token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-            client = KeboolaClient(token=token, url=url)
+            token, _provenance = keboola_instance_token(token_env)
+            client = KeboolaClient(token=token or "", url=url)
             tables = client.discover_all_tables()
             return {"tables": tables, "count": len(tables), "source": "keboola"}
 
@@ -7012,17 +7010,14 @@ def _discover_and_register_tables(
         }
 
     from connectors.keboola.client import KeboolaClient
+    from app.datasource_secrets import keboola_instance_token
 
     # Read from data_source.keboola (matches what /api/admin/configure writes)
     url = get_value("data_source", "keboola", "stack_url", default="")
     token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-    token = os.environ.get(token_env, "") if token_env else ""
-    if not token:
-        from app.datasource_secrets import datasource_secret
+    token, _provenance = keboola_instance_token(token_env)
 
-        token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-
-    client = KeboolaClient(token=token, url=url)
+    client = KeboolaClient(token=token or "", url=url)
     discovered = client.discover_all_tables()
 
     plan = _build_keboola_discovery_plan(conn, discovered)

@@ -3,7 +3,16 @@
 Surface (all gated by ``Depends(require_admin)``):
 
   GET    /api/admin/source-connections              — list (?source_type=)
-  POST   /api/admin/source-connections              — create; 409 on duplicate name
+  POST   /api/admin/source-connections              — create; 409 on duplicate name.
+                                                       Keboola + ``seed_from_instance_credentials=true``:
+                                                       copy the instance-level Keboola token into this
+                                                       new connection's own vault slot, unless that token
+                                                       resolves under the EXACT ``token_env`` name this
+                                                       new row inherited (only then does the row's own
+                                                       resolver already find it unaided) — see
+                                                       ``app.datasource_secrets.keboola_instance_token``.
+                                                       Response gains ``token_seeded``/``token_seed_error``
+                                                       when this ran and something was actually seeded.
   GET    /api/admin/source-connections/{id}         — detail; 404 if missing
   PUT    /api/admin/source-connections/{id}         — update config / token_env; 404 if missing
   DELETE /api/admin/source-connections/{id}         — delete; 404 if missing
@@ -113,6 +122,14 @@ class CreateConnectionBody(BaseModel):
     config: Dict[str, Any]
     token_env: Optional[str] = None
     is_default: bool = False
+    # Keboola-only, opt-in: seed the new connection's own vault slot from
+    # the instance-level credential unless that credential is resolvable
+    # under the EXACT token_env name this new row inherited (see
+    # `_seed_keboola_instance_credential`). Set by the derived Keboola card's
+    # "Import as managed connection" button — every other caller (the "Add
+    # data source" wizard, the CLI, third-party API clients) leaves this
+    # False and gets exactly today's behavior.
+    seed_from_instance_credentials: bool = False
 
 
 class UpdateConnectionBody(BaseModel):
@@ -430,7 +447,10 @@ async def create_connection(
         is_default=body.is_default,
         created_by=_user.get("id"),
     )
-    return _with_secret_status(repo.get(conn_id))
+    row = _with_secret_status(repo.get(conn_id))
+    if body.source_type == "keboola" and body.seed_from_instance_credentials and row is not None:
+        row = await _seed_keboola_instance_credential(conn_id, row)
+    return row
 
 
 @router.get("/{connection_id}")
@@ -640,38 +660,22 @@ async def delete_connection(
         logger.debug("no master vault secret for connection %s (expected)", connection_id)
 
 
-@router.put("/{connection_id}/secret", status_code=204)
-async def set_connection_secret(
-    connection_id: str,
-    body: SecretBody,
-    _user: dict = Depends(require_admin),
-):
-    """Store (or rotate) the vault secret for a connection token.
+async def _store_connection_secret(connection_id: str, row: Dict[str, Any], value: str, kind: str) -> None:
+    """Preflight (Keboola: ``verify_token`` + project-mismatch guard), persist
+    to the vault, propagate to any chat-tools copy, and record the verified
+    project identity. Raises ``HTTPException`` on any failure — a doomed
+    write, a vault that cannot store secrets, or a token the Storage API
+    rejects.
 
-    ``kind="storage"`` (default): the plain Storage API token used for pulls.
-    For a Keboola connection it is preflighted like the master token, and the
-    project it opens (``owner.id``/``owner.name``) is recorded on the
-    connection — that identity is what later tokens are checked against.
-    400 ``project_mismatch`` if the token opens a different project than the
-    one this connection is already bound to; a connection is one project.
-    ``kind="master"``: a *separate* slot for a Keboola master (owner) Storage
-    API token, required by the semantic-layer sync (Metastore API rejects
-    non-master tokens). 400 if the connection isn't ``source_type="keboola"``,
-    if the token fails a live ``verify_token`` preflight (not a master token),
-    or if the Storage API refuses the token outright (4xx — an invalid or
-    expired token is the admin's to fix, not a gateway failure). 502 only when
-    the Storage API is unreachable or answers 5xx.
-
-    409 if AGNES_VAULT_KEY is not configured on the server — checked FIRST, so
-    an instance that cannot store secrets says so instead of spending an
-    upstream round-trip and reporting a token problem it never had.
+    The single implementation behind ``PUT .../secret`` and the Keboola
+    "Import as managed connection" vault-seeding step
+    (``_seed_keboola_instance_credential``), so a future fix to the
+    preflight/identity-recording behavior lands in exactly one place instead
+    of two copies drifting apart.
     """
-    row = source_connections_repo().get(connection_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="connection_not_found")
-    if not body.value:
+    if not value:
         raise HTTPException(status_code=400, detail="secret value required")
-    if body.kind not in ("storage", "master"):
+    if kind not in ("storage", "master"):
         raise HTTPException(status_code=400, detail="invalid_kind")
 
     # Refuse a doomed write before asking Keboola anything. Both branches below
@@ -688,7 +692,7 @@ async def set_connection_secret(
     # is what the identity-recording step below keys off.
     info: Optional[Dict[str, Any]] = None
 
-    if body.kind == "master":
+    if kind == "master":
         if row.get("source_type") != "keboola":
             raise HTTPException(status_code=400, detail="master_token_only_for_keboola")
         config = row.get("config") or {}
@@ -696,7 +700,7 @@ async def set_connection_secret(
         # outbound preflight call (same rationale as /test and /tables).
         _validate_stack_url(config, required=True)
         stack_url = (config.get("stack_url") or "").rstrip("/")
-        client = KeboolaStorageClient(url=stack_url, token=body.value)
+        client = KeboolaStorageClient(url=stack_url, token=value)
         try:
             info = await run_in_threadpool(client.verify_token)
         except (StorageApiError, requests.RequestException) as exc:
@@ -755,7 +759,7 @@ async def set_connection_secret(
             if (config.get("stack_url") or "").strip():
                 _validate_stack_url(config, required=True)
                 stack_url = (config.get("stack_url") or "").rstrip("/")
-                client = KeboolaStorageClient(url=stack_url, token=body.value)
+                client = KeboolaStorageClient(url=stack_url, token=value)
                 try:
                     info = await run_in_threadpool(client.verify_token)
                 except (StorageApiError, requests.RequestException) as exc:
@@ -772,13 +776,13 @@ async def set_connection_secret(
         key = connection_id
 
     try:
-        connection_secrets_repo().upsert(key, body.value)
+        connection_secrets_repo().upsert(key, value)
     except VaultKeyNotConfiguredError as exc:
         raise HTTPException(
             status_code=409,
             detail="vault_key_not_configured: set AGNES_VAULT_KEY on the server before storing secrets",
         ) from exc
-    if body.kind != "master":
+    if kind != "master":
         # Rotation propagates to the agent's copy, symmetrically with the
         # clear above. Copy-not-reference is a deliberate design, but it made
         # the two halves of the same admin intent behave differently: clearing
@@ -798,7 +802,7 @@ async def set_connection_secret(
             # out. The source is what says chat tools are on.
             # (Devin Review on this PR.)
             if mcp_sources_repo().get(derived) is not None:
-                shared_secrets_repo().upsert(derived, body.value)
+                shared_secrets_repo().upsert(derived, value)
         except Exception:  # noqa: BLE001 — the primary store already succeeded
             logger.warning(
                 "stored a new token for connection %s but could not re-sync the chat-tools copy",
@@ -820,6 +824,100 @@ async def set_connection_secret(
                 connection_id,
                 exc_info=True,
             )
+
+
+async def _seed_keboola_instance_credential(connection_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """For the derived Keboola card's "Import as managed connection" button:
+    a freshly-created connection has no vault entry of its own, so unless the
+    instance-level credential is resolvable under the EXACT ``token_env`` name
+    this new row inherited, its own ``_resolve_token`` finds nothing and the
+    "import" produced a connection that cannot actually reach Keboola.
+
+    Resolves via ``app.datasource_secrets.keboola_instance_token`` — the exact
+    3-step fallback ``_keboola_credentialed()`` (``app/web/router.py``) checks,
+    kept in one place so the two can never drift apart. Only
+    ``provenance == "env_token_env"`` needs no seeding: that is the one case
+    where the value was found under the row's own configured ``token_env``
+    name, which is process-global and so already resolvable by the new row on
+    its own. ``"env_generic"`` (found via the generic ``KEBOOLA_STORAGE_TOKEN``
+    fallback name, while the row's own ``token_env`` is some OTHER, custom
+    name) and ``"vault"`` both need seeding — in neither case will the new
+    row's ``_resolve_token`` independently rediscover the value.
+
+    Never raises — a failed or skipped seed must not turn a successful
+    ``POST`` into an error response; instead annotates
+    ``row["token_seeded"]`` / ``row["token_seed_error"]`` so the caller can
+    report the truth instead of a plain success.
+    """
+    from app.datasource_secrets import keboola_instance_token
+
+    value, provenance = keboola_instance_token(row.get("token_env") or "")
+    if provenance in (None, "env_token_env"):
+        # Either nothing is credentialed anywhere (`provenance is None` — the
+        # button that reaches this path is gated on `_keboola_credentialed()`
+        # so this should not happen in practice, but a direct API call could
+        # still hit it), or the credential is already resolvable under the
+        # exact env var name the new row inherited. Either way, nothing to
+        # seed.
+        return row
+
+    try:
+        await _store_connection_secret(connection_id, row, value, "storage")
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        logger.warning(
+            "Keboola import for connection %s: could not seed the instance-vault token: %s",
+            connection_id,
+            detail,
+        )
+        row["token_seeded"] = False
+        row["token_seed_error"] = detail
+        return row
+    except Exception as exc:  # noqa: BLE001 — the connection row already landed; never fail the POST
+        logger.warning(
+            "Keboola import for connection %s: could not seed the instance-vault token",
+            connection_id,
+            exc_info=True,
+        )
+        row["token_seeded"] = False
+        row["token_seed_error"] = str(exc)
+        return row
+
+    refreshed = _with_secret_status(source_connections_repo().get(connection_id)) or row
+    refreshed["token_seeded"] = True
+    return refreshed
+
+
+@router.put("/{connection_id}/secret", status_code=204)
+async def set_connection_secret(
+    connection_id: str,
+    body: SecretBody,
+    _user: dict = Depends(require_admin),
+):
+    """Store (or rotate) the vault secret for a connection token.
+
+    ``kind="storage"`` (default): the plain Storage API token used for pulls.
+    For a Keboola connection it is preflighted like the master token, and the
+    project it opens (``owner.id``/``owner.name``) is recorded on the
+    connection — that identity is what later tokens are checked against.
+    400 ``project_mismatch`` if the token opens a different project than the
+    one this connection is already bound to; a connection is one project.
+    ``kind="master"``: a *separate* slot for a Keboola master (owner) Storage
+    API token, required by the semantic-layer sync (Metastore API rejects
+    non-master tokens). 400 if the connection isn't ``source_type="keboola"``,
+    if the token fails a live ``verify_token`` preflight (not a master token),
+    or if the Storage API refuses the token outright (4xx — an invalid or
+    expired token is the admin's to fix, not a gateway failure). 502 only when
+    the Storage API is unreachable or answers 5xx.
+
+    409 if AGNES_VAULT_KEY is not configured on the server — checked FIRST, so
+    an instance that cannot store secrets says so instead of spending an
+    upstream round-trip and reporting a token problem it never had.
+    """
+    row = source_connections_repo().get(connection_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="connection_not_found")
+    await _store_connection_secret(connection_id, row, body.value, body.kind)
 
 
 @router.delete("/{connection_id}/secret", status_code=204)

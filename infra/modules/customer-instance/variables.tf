@@ -263,7 +263,7 @@ variable "prod_instance" {
   # every session at mint time) at plan time instead.
   validation {
     condition     = contains(["", "docker", "kai-agent"], var.prod_instance.chat_provider)
-    error_message = "prod_instance.chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.88.0."
+    error_message = "prod_instance.chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.89.0."
   }
 
   validation {
@@ -421,7 +421,7 @@ variable "dev_instances" {
     condition = alltrue([
       for i in var.dev_instances : contains(["", "docker", "kai-agent"], i.chat_provider)
     ])
-    error_message = "each dev_instances[].chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.88.0."
+    error_message = "each dev_instances[].chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.89.0."
   }
 
   validation {

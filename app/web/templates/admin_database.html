@@ -6,8 +6,11 @@
   /* /admin/database — DB backend state machine. Mirrors the
      /admin/tokens hero pattern (gradient header + chip-style summary
      row) so this page reads as a peer of the other admin landings,
-     not a bolt-on. Card body, transition buttons, and progress
-     panel use ds-card + ds.button for visual consistency. */
+     not a bolt-on. The card body carries `.ds-card`; the transition
+     buttons are built by db_state.js (shared across this page and the
+     legacy embedded view) as real `.btn.btn-primary` elements rather
+     than the `ds.button()` macro, since JS-templated markup has no
+     Jinja to call — the warn banner uses `--ds-accent-warn-*` tokens. */
   .db-page {
     font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
   }
@@ -68,21 +71,18 @@
     50%      { opacity: 0.45; }
   }
 
-  .db-actions-card {
-    background: var(--surface, #fff);
-    border: 1px solid var(--border, #e5e7eb);
-    border-radius: 12px;
-    padding: 24px 24px 22px;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  }
+  /* Background/border/radius/shadow come from the shared `.ds-card` class
+     on the element itself now — only this page's own layout/typography
+     tweaks stay page-local. Buttons in #db-actions are built by
+     db_state.js as real `.btn.btn-primary` elements (shared, token-based
+     styling), so there is no page-local button rule left to carry. */
   .db-actions-card h2 {
     margin: 0 0 6px;
     font-size: 18px;
     font-weight: 600;
-    color: var(--text-primary, #111827);
   }
   .db-actions-card .help {
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     font-size: 13px;
     margin: 0 0 18px;
     max-width: 720px;
@@ -92,27 +92,8 @@
     gap: 10px;
     flex-wrap: wrap;
   }
-  .db-actions-card .actions .btn {
-    padding: 9px 16px;
-    border-radius: 8px;
-    font-weight: 500;
-    font-size: 13px;
-    border: 1px solid var(--ds-primary);
-    background: var(--ds-primary);
-    color: #fff;
-    cursor: pointer;
-    transition: filter 0.12s ease;
-  }
-  .db-actions-card .actions .btn:hover { filter: brightness(1.05); }
-  .db-actions-card .actions .btn:disabled,
-  .db-actions-card .actions .btn[disabled] {
-    background: var(--surface-muted, #f3f4f6);
-    color: var(--text-muted, #9ca3af);
-    border-color: var(--border, #e5e7eb);
-    cursor: default;
-  }
   .db-actions-card .no-actions {
-    color: var(--text-muted, #9ca3af);
+    color: var(--ds-text-muted);
     font-style: italic;
     font-size: 13px;
   }
@@ -121,11 +102,11 @@
   #db-migration-progress {
     margin-top: 16px;
     padding: 14px 18px;
-    background: #fff7ed;
-    border: 1px solid #fdba74;
+    background: var(--ds-accent-warn-bg);
+    border: 1px solid var(--ds-accent-warn-line);
     border-radius: 10px;
     font-size: 13px;
-    color: #9a3412;
+    color: var(--ds-accent-warn-ink);
   }
   #db-migration-progress .row {
     display: flex;
@@ -189,7 +170,7 @@
     </dl>
   </section>
 
-  <div class="db-actions-card">
+  <div class="db-actions-card ds-card">
     <h2>Migrate to another backend</h2>
     <p class="help" id="db-actions-help">Loading available transitions…</p>
     <div class="actions" id="db-actions"></div>

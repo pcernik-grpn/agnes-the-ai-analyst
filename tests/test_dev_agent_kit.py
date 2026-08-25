@@ -81,6 +81,7 @@ def test_required_reviewers_present_for_command():
     # The command's roster must all exist as agents.
     roster = {
         "agnes-reviewer-rules",
+        "agnes-reviewer-adversarial",
         "agnes-reviewer-architecture",
         "agnes-reviewer-rbac",
         "agnes-reviewer-parity",
@@ -94,6 +95,7 @@ def test_required_reviewers_present_for_command():
     "agent",
     [
         "agnes-reviewer-rules",
+        "agnes-reviewer-adversarial",
         "agnes-reviewer-architecture",
         "agnes-reviewer-rbac",
         "agnes-reviewer-parity",

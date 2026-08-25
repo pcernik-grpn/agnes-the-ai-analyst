@@ -133,7 +133,7 @@ def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path,
 
 def test_removed_kill_flag_is_warned_and_ignored(tmp_path: Path, caplog):
     """`chat.e2b_kill_on_ws_disconnect` was removed with the e2b provider
-    (0.88.0). A stale key no longer implies `on_detach: kill` — it warns and
+    (0.89.0). A stale key no longer implies `on_detach: kill` — it warns and
     the config gets the `pause` default; an explicit `on_detach` still wins."""
     y = tmp_path / "instance.yaml"
     y.write_text("chat:\n  enabled: true\n  e2b_kill_on_ws_disconnect: true\n")

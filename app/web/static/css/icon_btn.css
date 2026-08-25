@@ -1,0 +1,22 @@
+/* .icon-btn — small outline text/icon button (borderless-until-hover, with
+   `.primary`/`.danger` tinted-outline variants) — shared component.
+
+   Extracted from four near-identical copies that had drifted into
+   admin_knowledge_digests.html, admin_marketplaces.html,
+   admin_mcp_source_detail.html and admin_mcp_sources.html (a copy-paste
+   chain — admin_mcp_sources.html's own prior comment said it was
+   "mirroring admin_marketplaces.html"). Distinct from `.btn-secondary
+   .btn-sm` (flat, single tone): this component needs the tinted-outline
+   `.primary`/`.danger` states those don't carry, so it stays its own class
+   rather than folding into that pair. */
+.icon-btn {
+    background: transparent; border: 1px solid var(--ds-border); border-radius: 6px;
+    padding: 5px 10px; font-size: 12px; cursor: pointer;
+    color: var(--ds-text-secondary); transition: all 0.15s;
+    text-decoration: none; line-height: 1.4; white-space: nowrap;
+}
+.icon-btn:hover { color: var(--ds-text-primary); border-color: var(--ds-border); background: var(--ds-surface-dim); }
+.icon-btn.primary { color: var(--ds-primary); border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent); }
+.icon-btn.primary:hover { background: var(--ds-primary-light); }
+.icon-btn.danger:hover { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
+.icon-btn[disabled] { opacity: 0.5; cursor: wait; }

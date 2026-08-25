@@ -71,7 +71,7 @@ all chat endpoints return 503 `chat_disabled`.
 
 ## Removed: the `e2b` provider
 
-The E2B cloud-microVM provider was **removed in 0.88.0**. An instance
+The E2B cloud-microVM provider was **removed in 0.89.0**. An instance
 whose config still says `provider: e2b` boots with chat disabled and
 logs:
 

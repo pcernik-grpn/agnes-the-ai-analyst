@@ -11,6 +11,12 @@
    panel inside /admin/server-config; it now owns this standalone page. The
    .cfg-* / .section-* / .iw-form-field rules and the modal chrome are lifted
    so the relocated markup + JS render identically. #}
+<!-- The Auto-sync frequency control pairs a native <select> with the
+     `.ds-dropdown` paper-theme replacement (#1055) — same pattern as
+     admin_package_detail.html's sort control. Neither stylesheet is part of
+     the admin-page base bundle, so it must be pulled in explicitly here. -->
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   /* ── Status card (lifted .cfg-section family) ── */
   .iw-card {
@@ -124,6 +130,103 @@
   .modal-card h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
   .modal-card p.sub { margin: 0 0 18px; font-size: 13px; color: var(--text-secondary, #6b7280); }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  /* .modal-close (lifted from admin_tables.html — never made a shared rule,
+     same per-page-duplication convention this file's header comment already
+     documents for the rest of the modal chrome). Was previously unstyled
+     here: the class existed on the close button with no matching CSS, so it
+     rendered as a bare UA-default button. */
+  .modal-close {
+    width: 32px; height: 32px; border: none; background: none; cursor: pointer;
+    border-radius: 6px; display: flex; align-items: center; justify-content: center;
+    color: var(--text-secondary, #6b7280); transition: background 0.15s, color 0.15s;
+  }
+  .modal-close:hover { background: var(--border-light, #f3f4f6); color: var(--text-primary, #111827); }
+  .modal-close:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+
+  /* ── IW "Link template repository" modal v2 chrome ──
+     Once this look is confirmed it becomes the reusable modal-form macro
+     (icon-headed modal, required-field marker, icon-prefixed inputs,
+     collapsible "Advanced settings", token reveal toggle) — see the PR
+     description for the follow-up. Keep new rules scoped under .iw-* so
+     nothing here leaks onto the other modals in this file. */
+  .iw-modal-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 4px; }
+  .iw-modal-icon {
+    flex: none; width: 36px; height: 36px; border-radius: 999px;
+    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .iw-modal-headtext { flex: 1; min-width: 0; }
+  .iw-modal-headtext h3 { margin: 4px 0 4px; }
+  .iw-modal-headtext p.sub { margin: 0; }
+  .iw-modal-head .modal-close { flex: none; margin-top: 2px; }
+
+  .iw-required { color: var(--ds-accent-danger-ink, #dc2626); margin-left: 2px; }
+
+  .iw-input-icon { position: relative; }
+  .iw-input-icon-svg {
+    position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+    color: var(--text-secondary, #6b7280); pointer-events: none;
+  }
+  /* The [type="text"] qualifier isn't for matching (the field IS text) —
+     it's what pushes this above style-custom.css's `.modal-card
+     input[type="text"]` (padding: 9px 12px), which otherwise ties this
+     rule's specificity and wins on cascade order. That's what let the
+     GitHub icon sit on top of the placeholder text (#722 manual-test
+     finding). */
+  .iw-form-field .iw-input-icon input[type="text"] { padding-left: 32px; }
+
+  .iw-divider { height: 1px; background: var(--border, #e5e7eb); margin: 18px 0; }
+
+  .iw-advanced-toggle {
+    width: 100%; display: flex; align-items: center; justify-content: space-between;
+    background: none; border: none; padding: 0 0 14px; cursor: pointer;
+    font-size: 13px; font-weight: 600; color: var(--text-primary, #111827);
+    border-radius: 4px;
+  }
+  .iw-advanced-toggle:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  .iw-advanced-chevron { transition: transform 0.15s; color: var(--text-secondary, #6b7280); }
+  .iw-advanced-toggle[aria-expanded="false"] .iw-advanced-chevron { transform: rotate(-90deg); }
+  .iw-advanced-body[hidden] { display: none; }
+
+  .iw-schedule-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .iw-schedule-mode-wrap.fbar-select { flex: 1 1 140px; min-width: 0; display: flex; }
+  .iw-schedule-mode-wrap .ds-dropdown { width: 100%; }
+  .iw-schedule-mode-wrap .ds-dropdown-btn { min-width: 0; width: 100%; }
+  .iw-time-wrap { position: relative; flex: 1 1 120px; min-width: 0; }
+  .iw-time-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text-secondary, #6b7280); pointer-events: none; }
+  .iw-time-wrap input[type="time"] {
+    width: 100%; box-sizing: border-box; padding: 8px 10px 8px 32px; border-radius: 6px;
+    border: 1px solid var(--border, #e5e7eb); background: var(--surface, #fff); font-size: 13px; font-family: inherit;
+  }
+  .iw-utc-label { flex: none; font-size: 12px; color: var(--text-secondary, #6b7280); }
+  .iw-custom-wrap { margin-top: 8px; }
+  .iw-custom-wrap input {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--border, #e5e7eb); background: var(--surface, #fff); font-size: 13px; font-family: inherit;
+  }
+
+  .iw-token-wrap { position: relative; }
+  /* Same specificity fix as .iw-input-icon above — .modal-card
+     input[type="password"]/[type="text"] would otherwise win and put the
+     eye button on top of the token text. Both type selectors are needed:
+     the eye toggle flips #iw-token between password and text at runtime. */
+  .iw-form-field .iw-token-wrap input[type="password"],
+  .iw-form-field .iw-token-wrap input[type="text"] { padding-right: 36px; }
+  .iw-token-eye {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    width: 26px; height: 26px; border: none; background: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; border-radius: 4px;
+    color: var(--text-secondary, #6b7280);
+  }
+  .iw-token-eye:hover { background: var(--border-light, #f3f4f6); color: var(--text-primary, #111827); }
+  .iw-token-eye:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  .iw-eye-hide[hidden] { display: none; }
+
+  .iw-secure-note {
+    display: flex; align-items: center; gap: 6px; font-size: 11px;
+    color: var(--text-secondary, #6b7280); margin-top: 2px;
+  }
 </style>
 {% endblock %}
 
@@ -189,48 +292,118 @@
   </div>
 </section>
 
-<!-- Initial Workspace Template — register / edit modal. Lifted verbatim. -->
+<!-- Initial Workspace Template — register / edit modal. 520px (not the
+     480px base default) — matches the other richer-form modals in this file
+     and admin_server_config.html/admin_marketplaces.html. 480px was cramped
+     once Advanced settings landed: the Auto-sync row alone packs a dropdown,
+     a time input and a "UTC" label into one line, and 480px minus the
+     modal's 24px side padding left too little room for that to breathe. -->
 <div class="modal-backdrop" id="iw-modal" role="dialog" aria-modal="true" aria-labelledby="iw-modal-title">
-  <div class="modal-card" style="max-width: 480px;">
-    <h3 id="iw-modal-title">Link to Template Repository</h3>
-    <p class="sub" id="iw-modal-sub">Register a Git repo whose contents will replace the default <code>agnes init</code> workspace skeleton.</p>
-
-    <div class="iw-form-field">
-      <label for="iw-url">Repository URL (HTTPS)</label>
-      <input type="text" id="iw-url" placeholder="https://github.com/your-org/agnes-workspace-template" autocomplete="off">
-      <div class="field-help">Must be <code>https://</code>. Public repo or PAT-authed private.</div>
-    </div>
-
-    <div class="iw-form-field">
-      <label for="iw-branch">Branch <span class="iw-optional">(optional)</span></label>
-      <input type="text" id="iw-branch" placeholder="main" autocomplete="off">
-      <div class="field-help">Leave empty to track the remote's default branch.</div>
-    </div>
-
-    <div class="iw-form-field">
-      <label for="iw-schedule">Auto-sync schedule <span class="iw-optional">(optional)</span></label>
-      <input type="text" id="iw-schedule" placeholder="daily 03:30" autocomplete="off">
-      <div class="field-help">
-        Nightly auto-sync cadence. Grammar: <code>daily HH:MM</code> (UTC) or
-        <code>every Nm</code>/<code>every Nh</code> (see <code>src/scheduler.py</code>).
-        Leave empty to disable auto-sync. Takes effect on the next scheduler restart.
+  <div class="modal-card" style="max-width: 520px;">
+    <div class="iw-modal-head">
+      <div class="iw-modal-icon" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+        </svg>
       </div>
+      <div class="iw-modal-headtext">
+        <h3 id="iw-modal-title">Link template repository</h3>
+        <p class="sub" id="iw-modal-sub">Connect a Git repository to use as the initial workspace template.</p>
+      </div>
+      <button type="button" class="modal-close" data-close-modal="iw-modal" aria-label="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
     </div>
 
     <div class="iw-form-field">
-      <label for="iw-token">GitHub PAT <span class="iw-optional">(optional)</span></label>
-      <input type="password" id="iw-token" placeholder="ghp_••• (leave blank to keep existing)" autocomplete="off">
-      <div class="field-help">
-        Required only for private repos. Stored at <code>.env_overlay</code>
-        (chmod 600), never in the YAML overlay. Leave blank to keep an
-        existing PAT; type a value to rotate.
+      <label for="iw-url">Repository URL<span class="iw-required" aria-hidden="true">*</span></label>
+      <div class="iw-input-icon">
+        <svg class="iw-input-icon-svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+        </svg>
+        <input type="text" id="iw-url" placeholder="https://github.com/org/repository" autocomplete="off" required aria-required="true">
+      </div>
+      <div class="field-help">Must be an HTTPS Git repository.</div>
+    </div>
+
+    <div class="iw-form-field">
+      <label for="iw-branch">Branch <span class="badge">Optional</span></label>
+      <input type="text" id="iw-branch" placeholder="Use repository default" autocomplete="off">
+      <div class="field-help">Leave empty to use the repository's default branch.</div>
+    </div>
+
+    <div class="iw-divider"></div>
+
+    <button type="button" class="iw-advanced-toggle" id="iw-advanced-toggle" aria-expanded="true" aria-controls="iw-advanced-body">
+      <span>Advanced settings</span>
+      <svg class="iw-advanced-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="iw-advanced-body" id="iw-advanced-body">
+      <div class="iw-form-field">
+        <label for="iw-schedule-mode">Auto-sync <span class="badge">Optional</span></label>
+        <div class="iw-schedule-row">
+          <div class="fbar-select iw-schedule-mode-wrap">
+            <select id="iw-schedule-mode" class="ds-dropdown-native" aria-label="Auto-sync frequency">
+              <option value="daily">Daily</option>
+              <option value="disabled">Disabled</option>
+              <option value="custom">Custom</option>
+            </select>
+            {{ ds.dropdown(
+              id='iw-schedule-mode-dd', target='iw-schedule-mode',
+              aria_label='Auto-sync frequency', selected='daily',
+              options=[
+                {'value': 'daily', 'label': 'Daily'},
+                {'value': 'disabled', 'label': 'Disabled'},
+                {'value': 'custom', 'label': 'Custom'},
+              ],
+            ) }}
+          </div>
+          <div class="iw-time-wrap" id="iw-time-wrap">
+            <svg class="iw-time-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+            <input type="time" id="iw-schedule-time" value="03:30" aria-label="Auto-sync time">
+          </div>
+          <span class="iw-utc-label" id="iw-utc-label">UTC</span>
+        </div>
+        <div class="iw-custom-wrap" id="iw-custom-wrap" hidden>
+          <input type="text" id="iw-schedule-custom" placeholder="e.g. every 15m, every 2h, daily 03:00,15:00" autocomplete="off">
+        </div>
+        <div class="field-help">How often the template repository is synced.</div>
+      </div>
+
+      <div class="iw-form-field">
+        <label for="iw-token">Personal access token <span class="badge">Optional</span></label>
+        <div class="iw-token-wrap">
+          <input type="password" id="iw-token" placeholder="ghp_••• (leave blank to keep existing)" autocomplete="off">
+          <button type="button" class="iw-token-eye" id="iw-token-eye" aria-label="Show token" aria-pressed="false" aria-controls="iw-token">
+            <svg class="iw-eye-show" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+            <svg class="iw-eye-hide" hidden width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.8 21.8 0 0 1 5.06-6.06M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a21.77 21.77 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+              <line x1="1" y1="1" x2="23" y2="23"/>
+            </svg>
+          </button>
+        </div>
+        <div class="field-help">Required for private repositories.</div>
+      </div>
+
+      <div class="iw-secure-note">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        Stored securely · Never written to repository files.
       </div>
     </div>
 
     <div class="modal-actions">
       {{ ds.button('Cancel', variant='secondary',
                    attrs='data-close-modal="iw-modal"') }}
-      {{ ds.button('Save', variant='primary', id='iw-modal-save') }}
+      {{ ds.button('Link repository', variant='primary', id='iw-modal-save') }}
     </div>
   </div>
 </div>
@@ -260,6 +433,7 @@
   </div>
 </div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 // ════════════════════════════════════════════════════════════════════════
 // Initial Workspace Template — standalone page lifecycle (#622 Slice 3 PR-B).
@@ -299,15 +473,56 @@ function hideBanner() {
   document.getElementById("iw-banner").className = "iw-banner";
 }
 
-function openModal(id) { document.getElementById(id).classList.add("is-open"); }
-function closeModal(id) { document.getElementById(id).classList.remove("is-open"); }
+// Focus management (mirrors modal.js's dialog pattern for these static,
+// already-in-DOM modals): remember what had focus before opening so it can
+// be restored on close, and trap Tab inside the topmost open modal so
+// keyboard users can't tab into the dimmed page behind it.
+const _modalOpener = {};
+
+function _focusableIn(el) {
+  return Array.from(el.querySelectorAll(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )).filter(node => node.offsetParent !== null);
+}
+
+function openModal(id, focusEl) {
+  const el = document.getElementById(id);
+  _modalOpener[id] = document.activeElement;
+  el.classList.add("is-open");
+  const target = focusEl || _focusableIn(el)[0];
+  if (target) target.focus();
+}
+
+function closeModal(id) {
+  const el = document.getElementById(id);
+  el.classList.remove("is-open");
+  const opener = _modalOpener[id];
+  delete _modalOpener[id];
+  if (opener && typeof opener.focus === "function") {
+    try { opener.focus(); } catch (_) { /* element gone */ }
+  }
+}
+
 document.querySelectorAll("[data-close-modal]").forEach(el =>
   el.addEventListener("click", () => closeModal(el.dataset.closeModal)));
 document.querySelectorAll(".modal-backdrop").forEach(el => {
-  el.addEventListener("click", e => { if (e.target === el) el.classList.remove("is-open"); });
+  el.addEventListener("click", e => { if (e.target === el) closeModal(el.id); });
 });
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") document.querySelectorAll(".modal-backdrop.is-open").forEach(m => m.classList.remove("is-open"));
+  if (e.key === "Escape") {
+    document.querySelectorAll(".modal-backdrop.is-open").forEach(m => closeModal(m.id));
+  } else if (e.key === "Tab") {
+    const open = document.querySelector(".modal-backdrop.is-open");
+    if (!open) return;
+    const f = _focusableIn(open);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault(); first.focus();
+    }
+  }
 });
 
 // Promise-based confirm via the #iw-confirm-modal (replaces server-config's
@@ -439,21 +654,105 @@ function iwRender(data) {
   document.getElementById("iw-delete-btn").addEventListener("click", iwDelete);
 }
 
+// ── Auto-sync schedule mode (Daily / Disabled / Custom) ──
+// The scheduler grammar (src/scheduler.py) is richer than a single daily
+// time — "every Nm"/"every Nh", and "daily HH:MM" accepts a comma-separated
+// list of times. Anything that doesn't match the plain single-time "daily
+// HH:MM" shape round-trips through "Custom" (raw text) instead of being
+// silently narrowed or dropped.
+function parseSchedule(raw) {
+  if (!raw) return { mode: "disabled", time: "03:30", custom: "" };
+  const m = /^daily (\d{2}:\d{2})$/.exec(raw.trim());
+  if (m) return { mode: "daily", time: m[1], custom: "" };
+  return { mode: "custom", time: "03:30", custom: raw };
+}
+
+function buildSchedule(mode, time, custom) {
+  if (mode === "disabled") return "";
+  if (mode === "daily") return `daily ${time}`;
+  return custom.trim();
+}
+
+// Sets a ds.dropdown's visible state (label + is-selected/aria-checked) and
+// the paired native <select>'s value, without relying on user interaction —
+// ds_dropdown.js only wires the select→dropdown direction on click/keydown.
+function setDsDropdownValue(hostId, value) {
+  const select = document.getElementById(hostId.replace(/-dd$/, ""));
+  if (select) select.value = value;
+  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${hostId.replace(/-dd$/, "")}"]`);
+  if (!host) return;
+  const label = host.querySelector(".ds-dropdown-btn-label");
+  const items = host.querySelectorAll('[role="menuitemradio"]');
+  items.forEach((item) => {
+    const selected = item.dataset.value === value;
+    item.classList.toggle("is-selected", selected);
+    item.setAttribute("aria-checked", selected ? "true" : "false");
+    if (selected && label) label.textContent = item.textContent.trim();
+  });
+}
+
+function iwApplyScheduleMode(mode) {
+  document.getElementById("iw-time-wrap").hidden = mode !== "daily";
+  document.getElementById("iw-utc-label").hidden = mode !== "daily";
+  document.getElementById("iw-custom-wrap").hidden = mode !== "custom";
+}
+
+document.getElementById("iw-schedule-mode").addEventListener("change", (e) => {
+  iwApplyScheduleMode(e.target.value);
+});
+
+document.getElementById("iw-advanced-toggle").addEventListener("click", () => {
+  const btn = document.getElementById("iw-advanced-toggle");
+  const body = document.getElementById("iw-advanced-body");
+  const open = btn.getAttribute("aria-expanded") === "true";
+  btn.setAttribute("aria-expanded", open ? "false" : "true");
+  body.hidden = open;
+});
+
+document.getElementById("iw-token-eye").addEventListener("click", () => {
+  const input = document.getElementById("iw-token");
+  const btn = document.getElementById("iw-token-eye");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  btn.setAttribute("aria-pressed", showing ? "false" : "true");
+  btn.setAttribute("aria-label", showing ? "Show token" : "Hide token");
+  btn.querySelector(".iw-eye-show").hidden = !showing;
+  btn.querySelector(".iw-eye-hide").hidden = showing;
+});
+
 function iwOpenModal(editing, data) {
   document.getElementById("iw-modal-title").textContent =
-    editing ? "Edit Template Repository" : "Link to Template Repository";
+    editing ? "Edit template repository" : "Link template repository";
+  document.getElementById("iw-modal-sub").textContent = editing
+    ? "Update this repository's connection settings."
+    : "Connect a Git repository to use as the initial workspace template.";
+  document.getElementById("iw-modal-save").textContent = editing ? "Save changes" : "Link repository";
   document.getElementById("iw-url").value = (editing && data) ? (data.url || "") : "";
   document.getElementById("iw-branch").value = (editing && data) ? (data.branch || "") : "";
   iwOriginalSchedule = (editing && data) ? (data.sync_schedule || "") : "";
-  document.getElementById("iw-schedule").value = iwOriginalSchedule;
+  const parsed = parseSchedule(iwOriginalSchedule);
+  setDsDropdownValue("iw-schedule-mode-dd", parsed.mode);
+  document.getElementById("iw-schedule-time").value = parsed.time;
+  document.getElementById("iw-schedule-custom").value = parsed.custom;
+  iwApplyScheduleMode(parsed.mode);
   document.getElementById("iw-token").value = "";  // Never prefill PAT
-  openModal("iw-modal");
+  document.getElementById("iw-token").type = "password";
+  document.getElementById("iw-token-eye").setAttribute("aria-pressed", "false");
+  document.getElementById("iw-token-eye").setAttribute("aria-label", "Show token");
+  document.getElementById("iw-token-eye").querySelector(".iw-eye-show").hidden = false;
+  document.getElementById("iw-token-eye").querySelector(".iw-eye-hide").hidden = true;
+  document.getElementById("iw-advanced-toggle").setAttribute("aria-expanded", "true");
+  document.getElementById("iw-advanced-body").hidden = false;
+  openModal("iw-modal", document.getElementById("iw-url"));
 }
 
 async function iwSave() {
   const url = document.getElementById("iw-url").value.trim();
   const branch = document.getElementById("iw-branch").value.trim();
-  const schedule = document.getElementById("iw-schedule").value.trim();
+  const scheduleMode = document.getElementById("iw-schedule-mode").value;
+  const scheduleTime = document.getElementById("iw-schedule-time").value;
+  const scheduleCustom = document.getElementById("iw-schedule-custom").value;
+  const schedule = buildSchedule(scheduleMode, scheduleTime, scheduleCustom);
   const token = document.getElementById("iw-token").value;
   if (!url) {
     showBanner("Repository URL is required.", "error");

@@ -243,7 +243,7 @@ def test_secret_status_anthropic_not_required_in_wif_mode():
 
 
 # ---------------------------------------------------------------------------
-# Removed-provider refusal (the e2b provider was removed in 0.88.0)
+# Removed-provider refusal (the e2b provider was removed in 0.89.0)
 # ---------------------------------------------------------------------------
 
 

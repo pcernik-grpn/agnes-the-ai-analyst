@@ -1549,7 +1549,7 @@ async def lifespan(app):
                 if app.state.chat_config.provider == "e2b":
                     logger.error(
                         "chat.provider=e2b is no longer supported — the E2B "
-                        "provider was removed in 0.88.0. Set chat.provider in "
+                        "provider was removed in 0.89.0. Set chat.provider in "
                         "instance.yaml (or AGNES_CHAT_PROVIDER / the "
                         "customer-instance module's chat_provider field) to "
                         "'kai-agent' (the embedded turn engine) or 'docker' "

@@ -35,7 +35,7 @@ class ChatConfig:
     # wiring from app/api/kai.py) and ``docker`` (self-hosted containers,
     # driven through the apps-runner sidecar) are the production-supported
     # values; a further variant would extend the gate in ``app/main.py``.
-    # The ``e2b`` provider was removed in 0.88.0 — a stale ``provider: e2b``
+    # The ``e2b`` provider was removed in 0.89.0 — a stale ``provider: e2b``
     # boots with chat disabled and an actionable error log.
     provider: str = "kai-agent"
     # Where the embedded engine listens, for ``provider: kai-agent`` only.
@@ -267,7 +267,7 @@ def _parse_on_detach(raw: dict) -> str:
         if on_detach:
             logger.warning("unknown chat.on_detach %r — falling back to 'pause'", on_detach)
         if raw.get("e2b_kill_on_ws_disconnect") is not None:
-            # Removed alias (0.88.0, with the e2b provider): it used to imply
+            # Removed alias (0.89.0, with the e2b provider): it used to imply
             # ``on_detach: kill``. Warn-and-ignore — the stale key now gets
             # the ``pause`` default.
             logger.warning("chat.e2b_kill_on_ws_disconnect is removed; use chat.on_detach: kill")
