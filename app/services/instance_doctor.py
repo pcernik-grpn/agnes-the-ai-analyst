@@ -23,9 +23,12 @@ environment and a real page render.
   owner-grants ∩ scope; an empty intersection means the agent answers every
   data question with 403 "not in your stack".
 - ``app-state-backend`` — since A1, fresh installs run app-state on Postgres
-  (``side_car``/``cloud``); DuckDB is legacy-only for new deploys. This
-  check is a NEW-instance gate — an existing instance still on DuckDB
-  failing it here is correct and informative, not a bug.
+  (``side_car``/``cloud``); DuckDB is legacy-only for new deploys. Graded:
+  an existing instance that predates the Postgres default (or was
+  deliberately migrated back) reports ``warning`` — supported, informative,
+  and non-fatal to the post-deploy gate; ``error`` fires only for a
+  day-zero fresh install that came up on DuckDB despite both install
+  paths defaulting to Postgres.
 - ``branding`` — when ``instance.brand`` is customized, the *rendered* login
   page no longer shows a default title (the title reads ``instance.name``, a
   different knob, so setting brand alone leaves the default visible).
@@ -291,9 +294,19 @@ async def check_branding(app) -> dict:
 
 def check_app_state_backend() -> dict:
     """Since A1, fresh installs run app-state on Postgres — DuckDB is
-    legacy-only for new deploys. This is a NEW-instance gate: an existing
-    instance still persisted on DuckDB is expected to fail this check;
-    that is correct and informative, not a bug.
+    legacy-only for NEW deploys. A DuckDB verdict is therefore graded, not
+    flat: an instance that predates the Postgres default — or was
+    deliberately migrated back (PG → DuckDB is a supported state-machine
+    transition) — is a fully supported legacy state and reports ``warning``;
+    ``error`` is reserved for the one state A1's contract genuinely forbids,
+    a day-zero fresh install that somehow came up on DuckDB anyway (both
+    install paths default to Postgres: the VM startup script seeds
+    ``backend: side_car`` and ``config/.env.template`` composes
+    ``docker-compose.postgres.yml``). The grading matters operationally:
+    ``scripts/ops/post-deploy-smoke-test.sh`` maps any ``error`` row to a
+    FAIL of the whole post-deploy gate, so a flat error here would fail
+    every existing DuckDB instance's upgrade — a fleet-wide regression, not
+    a doctor hint. Legacy detection: :func:`_duckdb_predates_pg_default`.
 
     Uses ``use_pg()`` (src/repositories/__init__.py) rather than reading
     ``instance.yaml::database.backend`` directly: ``use_pg()`` also honors
@@ -309,13 +322,49 @@ def check_app_state_backend() -> dict:
     if use_pg():
         backend = get_database_config()["backend"]
         return _row("app-state-backend", "ok", f"app-state backend is Postgres (persisted backend={backend!r})")
+    if _duckdb_predates_pg_default():
+        return _row(
+            "app-state-backend",
+            "warning",
+            "app-state backend is DuckDB — a supported legacy state for instances that "
+            "predate the Postgres default (or were deliberately migrated back). Fresh "
+            "installs run Postgres since A1; see docs/DEPLOYMENT.md for the "
+            "DuckDB → Postgres migration path.",
+        )
     return _row(
         "app-state-backend",
         "error",
-        "app-state backend is DuckDB — fresh installs must run Postgres app-state "
-        "(see docs/QUICKSTART.md); DuckDB is legacy-only. If this is an existing instance "
-        "that predates the Postgres default, this failure is expected and can be ignored.",
+        "app-state backend is DuckDB on what looks like a day-zero fresh install "
+        "(no persisted database state, no non-system users) — fresh installs must come "
+        "up on Postgres (the VM startup script seeds backend=side_car; the Docker "
+        "default composes docker-compose.postgres.yml — see docs/QUICKSTART.md). "
+        "Something bypassed both defaults.",
     )
+
+
+def _duckdb_predates_pg_default() -> bool:
+    """Does this DuckDB verdict belong to a legacy (pre-A1) instance?
+
+    Mirrors the install path's own fresh-install marker: the VM startup
+    script seeds day-zero state only when ``instance.yaml`` does not exist,
+    so a persisted overlay means the state predates A1's ``side_car`` seed
+    (the pre-A1 script wrote ``backend: duckdb``) or was operator-chosen via
+    the state machine. With no persisted state at all (the zero-config
+    fallback), fall back to evidence of prior service: a non-system user in
+    the users table means the instance was already running before this check
+    — it did not just materialize on the wrong backend. (The synthetic
+    scheduler user is excluded because it is auto-seeded at boot, same as in
+    ``check_login_door``.)
+    """
+    import src.db_state_machine as _sm
+    from app.auth.scheduler_token import SCHEDULER_USER_EMAIL
+    from src.repositories import users_repo
+
+    if _sm._OVERLAY_PATH.exists():
+        # use_pg() returned False, so an existing overlay necessarily reads
+        # as DuckDB — a persisted legacy or deliberately-migrated state.
+        return True
+    return any(u.get("email") != SCHEDULER_USER_EMAIL for u in users_repo().list_all())
 
 
 def _isolated(name: str, fn: Callable[[], dict]) -> dict:

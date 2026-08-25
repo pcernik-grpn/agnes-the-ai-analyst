@@ -313,6 +313,13 @@ jobs:
           timeout 120 bash -c 'until curl -sf http://localhost:8000/api/health | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d[\"status\"]!=\"unhealthy\" else 1)"; do sleep 3; done'
 
       - name: Run smoke tests
+        # EXPECT_APP_STATE_BACKEND turns the script's app-state-backend check
+        # into a hard assertion — this job boots the Postgres overlay chain,
+        # so anything but "postgres" here means A1's default regressed.
+        # (e2e-bind-mount below runs the same script WITHOUT the var: its
+        # stack deliberately has no postgres overlay.)
+        env:
+          EXPECT_APP_STATE_BACKEND: postgres
         run: bash scripts/smoke-test.sh http://localhost:8000
 
       - name: Collect logs on failure
@@ -401,6 +408,9 @@ jobs:
             -f docker-compose.bind-test.yml \
             up -d app
           timeout 60 bash -c 'until curl -sf http://localhost:8000/api/health | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d[\"status\"]!=\"unhealthy\" else 1)"; do sleep 3; done'
+          # No EXPECT_APP_STATE_BACKEND here: this stack deliberately boots
+          # WITHOUT the postgres overlay (legacy DuckDB shape), so the smoke
+          # script's backend check only asserts the endpoint answers.
           bash scripts/smoke-test.sh http://localhost:8000
 
       - name: Collect logs on failure

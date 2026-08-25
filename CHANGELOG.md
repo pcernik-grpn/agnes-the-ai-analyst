@@ -17,8 +17,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   QUICKSTART's compose chain includes `docker-compose.postgres.yml`, which
   requires `POSTGRES_PASSWORD` in `.env`). Existing instances keep their
   persisted backend; DuckDB app-state is now legacy-only for new deploys.
-  The new-instance doctor gains an `app-state-backend` check and the release
-  smoke gate boots the Postgres chain. Also fixes a boot-blocker the flip
+  The new-instance doctor gains an `app-state-backend` check (`warning` for
+  legacy instances still on DuckDB — the post-deploy gate must not fail
+  fleet upgrades — `error` only for a day-zero fresh install that came up
+  on DuckDB) and the release smoke gate boots the Postgres chain and
+  asserts the Postgres backend via `EXPECT_APP_STATE_BACKEND`. Also fixes a boot-blocker the flip
   surfaced: `postgres_data` was an unconditional host bind to `/data/postgres`
   that only exists on Terraform-provisioned VMs — reverted to a plain named
   volume in the base overlay, with the VM-only host bind moved to
