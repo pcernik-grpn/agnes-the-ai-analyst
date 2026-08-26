@@ -273,9 +273,10 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     Any row still stamped with the retired
     ``source='databricks_semantic_layer'`` label is purged within this
     workspace's own scope once at least one metric view's document was
-    actually stored this pass — the same one-time-legacy-retirement guard the
-    Keboola cutover uses, so a broken upstream fetch can never delete the last
-    good copy of a metric.
+    actually stored this pass AND no view was dropped along the way
+    (``partial_composition``) — the same one-time-legacy-retirement guard the
+    Keboola cutover uses, so a broken or partially-broken upstream fetch can
+    never delete the last good copy of a metric.
 
     Pass ``client`` to override construction (tests, future named
     connections); by default the instance's ``data_source.databricks``
@@ -483,8 +484,15 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     # One-time retirement of the pre-cutover source, scoped to this
     # workspace. Gated on this pass having actually stored at least one
     # metric view's document — an empty/failed upstream fetch (0 documents)
-    # must never delete the last good copy of a legacy row.
-    if keep_slugs:
+    # must never delete the last good copy of a legacy row — AND on
+    # `not partial_composition`, the same guard the Keboola twin's purge uses
+    # (`connectors/keboola/semantic_layer.py::_sync_one_source`): when one
+    # view stored fine while another dropped transiently this pass,
+    # `keep_slugs` is non-empty but the dropped view's own document was never
+    # rewritten — purging would delete ITS legacy row too, and nothing this
+    # pass recreates the metric. Idempotent: a later fully-valid sync finds
+    # the rows and retires them.
+    if keep_slugs and not partial_composition:
         legacy_repo = metric_repo()
         for m in legacy_repo.list():
             if (m.get("source") or "") == _LEGACY_SOURCE_LABEL and (m.get("source_ref") or "") == source_ref:

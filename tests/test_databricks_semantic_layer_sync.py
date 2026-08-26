@@ -233,7 +233,11 @@ class TestSyncSemanticLayer:
             return real_validate(text)
 
         with patch("src.semantic.document_validation.validate_document", side_effect=_fail_v2):
-            result = _sync(FakeStatementClient(views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2}))
+            result = _sync(
+                FakeStatementClient(
+                    views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2}
+                )
+            )
 
         assert result["status"] == "ok"
         # "orders_metrics" still composes and projects fine.
@@ -355,6 +359,49 @@ class TestLegacySourceRetirement:
         )
         _sync(FakeStatementClient())
         assert metric_repo().get("databricks/other.workspace/x") is not None
+
+    def test_legacy_rows_survive_a_partial_composition_pass(self, e2e_env):
+        """One view stores fine while another drops transiently in the same
+        pass (`partial_composition` True, `keep_slugs` non-empty): the purge
+        must NOT fire — the dropped view's legacy row is the last good copy
+        of its metric, and nothing this pass rewrites it. Same
+        `not partial_composition` guard the Keboola twin uses
+        (connectors/keboola/semantic_layer.py::_sync_one_source). A later
+        fully-successful pass retires the row as usual."""
+        from src.repositories import metric_repo
+
+        legacy_id = "databricks/main.sales.orders_metrics_v2/Order Count"
+        metric_repo().create(
+            id=legacy_id,
+            name="Order Count v2",
+            display_name="Order Count v2",
+            category="databricks",
+            sql="SELECT MEASURE(`Order Count`) FROM `main`.`sales`.`orders_metrics_v2`",
+            source="databricks_semantic_layer",
+            source_ref="dbc-test.cloud.databricks.com",
+        )
+        two_views = [
+            ("main", "sales", "orders_metrics", "Sales KPIs"),
+            ("main", "sales", "orders_metrics_v2", "Sales KPIs v2"),
+        ]
+
+        # orders_metrics stores fine; orders_metrics_v2 drops inside
+        # extract_documents (SHOW CREATE TABLE yields no parseable YAML) —
+        # a partial pass, so the legacy purge must be skipped.
+        result = _sync(
+            FakeStatementClient(views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": None})
+        )
+        assert result["status"] == "ok"
+        assert result["created_or_updated"] == 1
+        assert result["skipped_unparseable"] == 1
+        assert metric_repo().get(legacy_id) is not None
+
+        # Fully-successful pass: both views store, the retirement fires.
+        result = _sync(
+            FakeStatementClient(views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2})
+        )
+        assert result["status"] == "ok"
+        assert metric_repo().get(legacy_id) is None
 
     def test_legacy_rows_are_not_purged_on_a_zero_write_pass(self, e2e_env):
         """An empty/failed upstream fetch (0 documents stored) must never
