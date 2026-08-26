@@ -190,8 +190,13 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     assert "data-sk-change" in body
     assert ">Change<" in body
     assert "sk-sec--done" in body
-    for n in ("1", "2", "3"):
-        assert f'class="sk-sec-no">{n}<' in body or f'"sk-sec-no">{n}<' in body
+    # Step 1 (Type) is still this page's own markup — it is a decision already
+    # made, with a ✓ and a Change button, not an editable section. Steps 2-4
+    # render through the shared builder shell, so their number badge is the
+    # shell's `ag-sec-no`. The claim is unchanged: one numbering sequence.
+    assert '"sk-sec-no' in body, "step 1 lost its number badge"
+    for n in ("2", "3", "4"):
+        assert f"no: {n}," in body, f"step {n} is not numbered in the shell sections"
     # Access is a required choice before saving: Private or the whole org.
     assert 'name="sk-access"' in body
     assert 'value="private"' in body
