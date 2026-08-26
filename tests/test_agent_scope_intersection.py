@@ -319,6 +319,58 @@ def test_owner_granted_everything_matches_the_old_owner_intersection_shape(monke
     assert out["table"] == frozenset({"t2"})
 
 
+def test_admin_owner_self_granted_row_narrows_to_the_owners_current_access(monkeypatch):
+    """Cutover-safety regression (the bug two reviewers live-reproduced): when
+    the agent's OWNER happens to be an admin, a self-granted row
+    (``granted_by == owner_user_id``) must still narrow to the owner's
+    CURRENT explicit access — it must NOT take the unconditioned
+    admin-granted branch merely because ``_is_user_admin(owner_user_id)`` is
+    true. This is the exact ADMIN-owner analogue of
+    ``test_owner_granted_everything_matches_the_old_owner_intersection_shape``
+    above (which pins ``_admins(set())`` — precisely why an admin owner was
+    never exercised there, and how the bug shipped)."""
+    import src.agent_scope_intersection as mod
+
+    agent = _agent(tables_mode="selected", owner_user_id="u1")
+    _stub_repo(monkeypatch, agent)
+    # Owner (u1) IS an admin, but holds NO explicit grant on t1.
+    monkeypatch.setattr(mod, "_allowed_ids_for_user", _rt_aware({"table": frozenset()}))
+    monkeypatch.setattr(mod, "_agent_scope_rows", _rows({"table": [{"item_id": "t1", "granted_by": "u1"}]}))
+    monkeypatch.setattr(mod, "_is_user_admin", _admins({"u1"}))
+    out = _resolve(agent)
+    assert out.get("table", frozenset()) == frozenset()
+
+
+def test_admin_owner_null_granted_by_narrows_to_the_owners_current_access(monkeypatch):
+    """Same regression via the ``granted_by IS NULL`` fallback (DuckDB
+    always; a defensively-possible NULL row on Postgres) — the implicit
+    granter is the owner, so an admin owner must still narrow, never widen."""
+    import src.agent_scope_intersection as mod
+
+    agent = _agent(tables_mode="selected", owner_user_id="u1")
+    _stub_repo(monkeypatch, agent)
+    monkeypatch.setattr(mod, "_allowed_ids_for_user", _rt_aware({"table": frozenset()}))
+    monkeypatch.setattr(mod, "_agent_scope_rows", _rows({"table": [{"item_id": "t1", "granted_by": None}]}))
+    monkeypatch.setattr(mod, "_is_user_admin", _admins({"u1"}))
+    out = _resolve(agent)
+    assert out.get("table", frozenset()) == frozenset()
+
+
+def test_admin_owner_self_granted_row_resolves_when_owner_actually_holds_it(monkeypatch):
+    """Positive twin: an admin owner WITH an explicit grant for the declared
+    item still resolves it — this is narrowing, not a blanket denial of
+    every admin-owned agent."""
+    import src.agent_scope_intersection as mod
+
+    agent = _agent(tables_mode="selected", owner_user_id="u1")
+    _stub_repo(monkeypatch, agent)
+    monkeypatch.setattr(mod, "_allowed_ids_for_user", _rt_aware({"table": {"t1"}}))
+    monkeypatch.setattr(mod, "_agent_scope_rows", _rows({"table": [{"item_id": "t1", "granted_by": "u1"}]}))
+    monkeypatch.setattr(mod, "_is_user_admin", _admins({"u1"}))
+    out = _resolve(agent)
+    assert out["table"] == frozenset({"t1"})
+
+
 # ---------------------------------------------------------------------------
 # The data axis beyond bare tables: data_package + collection rows, both
 # governed by tables_mode (the builder's "Knowledge" section sells packages

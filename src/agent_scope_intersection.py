@@ -20,26 +20,37 @@ the old ``compute_agent_intersection``): for a ``'selected'`` axis, EACH
 ``agent_scope`` row is resolved on its OWN ``granted_by`` (C2.1), not against
 one fixed "owner" identity:
 
-  - a row whose granter is (currently) an ADMIN resolves UNCONDITIONALLY —
-    the agent has that authority in its own right, pure LD2. A declared
-    ``data_package`` row resolved this way still expands to its member
-    tables live.
-  - a row whose granter is a non-admin resolves narrowed to ``item ∩ that
-    GRANTER's CURRENT access`` — the exact intersection shape this module
-    always enforced, just keyed to whoever wrote the row (``granted_by``)
-    instead of hard-coded to "the owner". Reuses the very same access-reach
-    machinery (``_owner_ids_for_type`` et al.) parameterized by the granter's
-    id — a granter IS, for the row they wrote, playing the same "how far does
-    this identity's access reach" role the owner used to play unconditionally
-    for every row.
+  - a row whose granter is a THIRD PARTY — distinct from the agent's own
+    ``owner_user_id`` — who is (currently) an ADMIN resolves
+    UNCONDITIONALLY — the agent has that authority in its own right, pure
+    LD2. A declared ``data_package`` row resolved this way still expands to
+    its member tables live.
+  - every other row (a non-admin granter, OR a granter who IS the agent's
+    own owner — including an admin owner) resolves narrowed to ``item ∩
+    that GRANTER's CURRENT access`` — the exact intersection shape this
+    module always enforced, just keyed to whoever wrote the row
+    (``granted_by``) instead of hard-coded to "the owner". Reuses the very
+    same access-reach machinery (``_owner_ids_for_type`` et al.)
+    parameterized by the granter's id — a granter IS, for the row they
+    wrote, playing the same "how far does this identity's access reach"
+    role the owner used to play unconditionally for every row. The
+    ``granter_id != owner_user_id`` guard on the admin branch is what keeps
+    an admin OWNER's own agent narrowed (SR-1: an admin owner contributes
+    their explicit grants, never the god-mode short-circuit) — without it,
+    ``_is_user_admin(granter_id)`` would be true merely because the OWNER
+    happens to be an admin, for a row that is not a genuine third-party
+    grant at all.
   - ``granted_by IS NULL`` (DuckDB, which has no such column at all — see
     ``src/repositories/agents.py::AgentsRepository.set_scope`` — or a
     defensively-possible NULL row on Postgres) falls back to the agent's
-    ``owner_user_id`` as the implicit granter. This is what makes the
-    cutover a no-op: migration 0073 backfills every PG row's ``granted_by``
-    to its agent's ``owner_user_id``, and DuckDB never has the column to
-    begin with, so on both backends every row that predates C2 resolves
-    exactly as the old owner-intersection did.
+    ``owner_user_id`` as the implicit granter — which is, by construction,
+    never a "third party" relative to itself, so this always takes the
+    narrowing branch above. This is what makes the cutover a no-op:
+    migration 0073 backfills every PG row's ``granted_by`` to its agent's
+    ``owner_user_id``, and DuckDB never has the column to begin with, so on
+    both backends every row that predates C2 resolves exactly as the old
+    owner-intersection did — including for an agent whose owner is an
+    admin.
 
 Mode ``'all'`` on a modeled axis, and every ``ResourceType`` the agent does
 not model at all (e.g. ``RECIPE``/``CHAT``/...), are NOT itemized —there is
@@ -55,10 +66,11 @@ Fail-closed contract (spec §2, normative — unchanged shape, now per-row):
     missing ``owner_user_id`` -> ``{}`` (deny everything).
   - Mode ``'all'`` (or an unmodeled ``ResourceType``) -> the owner's current
     access, unchanged.
-  - Mode ``'selected'`` -> the union of admin-granted rows (unconditioned)
-    and self-granted rows currently held by their own granter. A scope row
-    naming a resource its granter does NOT (or no longer) hold is silently
-    dropped, never surfaced — an agent can never widen beyond what backs it.
+  - Mode ``'selected'`` -> the union of third-party-admin-granted rows
+    (unconditioned) and self-granted rows — including an admin OWNER's own
+    rows — currently held by their own granter. A scope row naming a
+    resource its granter does NOT (or no longer) hold is silently dropped,
+    never surfaced — an agent can never widen beyond what backs it.
   - An unrecognized (neither ``'all'`` nor ``'selected'``) mode value ->
     ``frozenset()`` for that type. This is the OPPOSITE of
     ``app.chat.agent_profile.compute_effective_scope``'s audit-only
@@ -446,9 +458,17 @@ def resolve_agent_authority(
             if not item_id:
                 continue
             granter_id = row.get("granted_by") or owner_user_id
-            if _is_user_admin(granter_id, conn):
-                # Admin-granted: unconditioned — the agent has this
-                # authority in its own right (pure LD2).
+            if granter_id != owner_user_id and _is_user_admin(granter_id, conn):
+                # Genuine third-party admin grant: unconditioned — the
+                # agent has this authority in its own right (pure LD2).
+                # Deliberately excludes the agent's OWN owner even when the
+                # owner is (also) an admin — ``granted_by`` for a
+                # self-declared / owner-fallback row is not a distinct
+                # granter identity conferring authority, it is the same
+                # person the row is being narrowed against, so an admin
+                # OWNER must never take this branch (SR-1: an admin owner
+                # contributes their explicit grants, never the god-mode
+                # short-circuit).
                 resolved.add(item_id)
                 continue
             granter_set = _owner_ids_for_type(granter_id, rt_value, conn, owner_pkgs=_pkgs_for(granter_id))

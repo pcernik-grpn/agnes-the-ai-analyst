@@ -149,6 +149,62 @@ def test_self_granted_item_stops_resolving_when_the_granter_loses_access(pg_env)
     assert out_after.get("data_package", frozenset()) == frozenset()
 
 
+def test_admin_owner_self_declared_item_resolves_only_once_the_owner_holds_it(pg_env):
+    """Cutover-safety regression, real-Postgres proof: when the agent's OWNER
+    is (also) a real Admin-group member, a self-declared scope row
+    (``granted_by == owner_user_id``, the shape C2.1's backfill produces for
+    every pre-existing agent) must still narrow to the owner's CURRENT
+    explicit grants — ``granted_by`` being (transitively) an admin must NOT
+    take the unconditioned admin-granted branch merely because the OWNER
+    happens to be an admin. Control for
+    ``test_admin_granted_data_package_reaches_the_agent_even_without_owner_
+    grant`` above: same shape, but the granter IS the owner, so this one
+    must resolve to NOTHING until the owner actually holds an explicit
+    grant."""
+    from src.agent_scope_intersection import resolve_agent_authority
+    from src.repositories import (
+        agents_repo,
+        data_packages_repo,
+        resource_grants_repo,
+        user_group_members_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    users_repo().create(id="owner1", email="owner1@test.com", name="Owner")
+    user_group_members_repo().add_member("owner1", _admin_group_id(pg_env), source="system_seed")
+
+    pkg_id = data_packages_repo().create(
+        name="Owner Admin Pkg",
+        slug="c22-owner-admin-pkg",
+        description=None,
+        icon=None,
+        color=None,
+        created_by="owner1",
+    )
+    # Owner (who is also an admin) has ZERO explicit grant on this package.
+
+    agents_repo().create(
+        id="agent1", owner_user_id="owner1", name="A", slug="c22-owner-admin-agent", tables_mode="selected"
+    )
+    agents_repo().set_scope("agent1", [("data_package", pkg_id)], granted_by="owner1")
+
+    out = resolve_agent_authority("agent1")
+    assert out.get("data_package", frozenset()) == frozenset()
+
+    # Grant the owner (still an admin) an explicit group grant on the
+    # package -> the self-declared row now resolves.
+    groups = user_groups_repo()
+    grp = groups.create(name="c22-owner-admin-grp", description="test", created_by="test")
+    user_group_members_repo().add_member("owner1", grp["id"], source="admin", added_by="test")
+    resource_grants_repo().create(
+        group_id=grp["id"], resource_type="data_package", resource_id=pkg_id, assigned_by="test", requirement="required"
+    )
+
+    out_after = resolve_agent_authority("agent1")
+    assert out_after.get("data_package") == frozenset({pkg_id})
+
+
 def test_granted_by_preserved_across_a_replace_resolves_unconditionally_after_owner_edit(pg_env):
     """C2.2 must-handle, exercised through ``resolve_agent_authority`` (not
     just the repo layer covered in ``test_agents_contract.py``): an
