@@ -21,6 +21,7 @@ import pytest
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "agents.html"
 BUILDER_CSS = Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "builder.css"
+SHELL_JS = Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "components" / "builder_shell.js"
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +35,14 @@ def builder_css() -> str:
     so a second builder can load the same sheet. Assertions about LAYOUT read
     this; assertions about behaviour still read the page's script."""
     return BUILDER_CSS.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def shell_js() -> str:
+    """The builder shell's markup, extracted so a second builder page renders
+    the same thing. Assertions about what the SHELL emits read this; the
+    page's own script is still `markup`."""
+    return SHELL_JS.read_text(encoding="utf-8")
 
 
 class TestTheConversationWritesTheConfiguration:
@@ -149,10 +158,13 @@ class TestThePanelShowsOnlyWhatIsConnected:
             assert f"section('{key}'" in markup
             assert "data-ag-add=\"' + addKey + '\"" in markup or f'data-ag-add="{key}"' in markup
 
-    def test_the_picker_is_the_shared_modal_not_a_private_overlay(self, markup):
-        block = re.search(r"function pickerHtml\(a\) \{(.*?)\n  \}", markup, re.S)
-        assert block, "pickerHtml not found"
+    def test_the_picker_is_the_shared_modal_not_a_private_overlay(self, markup, shell_js):
+        """The chrome moved into the shell; the page must still reach for it
+        rather than rolling a private overlay of its own."""
+        block = re.search(r"function picker\(o\) \{(.*?)\n  \}", shell_js, re.S)
+        assert block, "BuilderShell.picker not found"
         assert "modal-backdrop" in block.group(1) and "modal-card" in block.group(1)
+        assert "BuilderShell.picker({" in markup
 
     def test_selecting_in_the_picker_does_not_tear_the_picker_down(self, markup):
         """A full renderBuilder would rebuild #ag-picker under the pointer,
@@ -217,15 +229,14 @@ class TestCollapsingASectionKeepsYourPlace:
             "the scroll position is being thrown away again"
         )
 
-    def test_the_body_is_rendered_even_when_collapsed(self, markup, builder_css):
+    def test_the_body_is_rendered_even_when_collapsed(self, builder_css, shell_js):
         """The in-place toggle is only correct because of this rule; if the
         body were conditionally rendered, opening a section would show nothing.
         """
         assert ".ag-sec.collapsed .ag-sec-body { display: none; }" in builder_css
-        sec = re.search(
-            r"function section\(key, no, title, note, sub, summary, body, addKey\) \{(.*?)\n  \}", markup, re.S
-        )
-        assert sec and "'<div class=\"ag-sec-body\">'" in sec.group(1)
+        sec = re.search(r"function section\(o\) \{(.*?)\n  \}", shell_js, re.S)
+        assert sec, "BuilderShell.section not found"
+        assert "ag-sec-body" in sec.group(1), "the shell no longer always emits the body"
 
 
 class TestEditingIsExplicit:

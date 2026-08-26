@@ -136,6 +136,9 @@
 {% endblock %}
 
 {% block scripts %}
+{# NOT deferred: the builder renders on boot, so BuilderShell has to exist
+   before the page script below runs. Same reason modal.js loads eagerly. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -263,11 +266,9 @@
     }).finally(function () { saving = false; syncHeaderState(); });
   }
   function current() { return agents.find(function (a) { return a.id === currentId; }) || null; }
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
+  /* Delegated, not duplicated: two escapers across two builder pages is two
+     chances for one of them to be the weaker one. */
+  var esc = BuilderShell.esc;
 
   function makeAgent() {
     return {
@@ -520,29 +521,16 @@
      because `closest()` from the button finds the button first. Header rather
      than body so the affordance is reachable while the section is collapsed,
      which is the state most sections are in most of the time. */
+  /* Positional wrapper over BuilderShell.section — all this page adds is
+     where "is it collapsed" lives. NOTE the shell escapes title / note /
+     sub / summary, so they must be passed RAW; a pre-escaped summary would
+     come back out as `&amp;`. */
   function section(key, no, title, note, sub, summary, body, addKey) {
-    var isC = !!collapsed[key];
-    var add = addKey
-      ? '<button type="button" class="ag-addbtn" data-ag-add="' + addKey + '" title="Add by hand" ' +
-        'aria-label="Add to ' + esc(title) + '">+</button>'
-      : '';
-    /* The description leads the BODY, not the header. In the narrower pane a
-       two-line sub under every one of six collapsed titles wrapped to four
-       lines and crowded the summary + actions off the row; and the sentence
-       explaining a section is worth reading when you have opened it to act,
-       not six times over while scanning past. Collapsed, the summary chip
-       ("1 source", "0 enabled") is the state you actually want. */
-    return '<div class="ag-sec' + (isC ? ' collapsed' : '') + '" data-sec="' + key + '">' +
-      '<div class="ag-sec-head" data-ag-toggle-sec="' + key + '" role="button" tabindex="0" aria-expanded="' + (!isC) + '">' +
-        '<span class="ag-sec-no">' + no + '</span>' +
-        '<div class="ag-sec-grow"><h3>' + title + (note ? ' <span class="ag-sec-note">' + note + '</span>' : '') + '</h3></div>' +
-        '<span class="ag-sec-sum">' + (summary || '') + '</span>' + add +
-        '<span class="ag-sec-chev"><svg viewBox="0 0 24 24" fill="none"><path d="M5 8.5l7 7 7-7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>' +
-      '</div>' +
-      '<div class="ag-sec-body">' +
-        (sub ? '<p class="ag-sec-sub">' + sub + '</p>' : '') + body +
-      '</div>' +
-    '</div>';
+    return BuilderShell.section({
+      key: key, no: no, title: title, note: note, sub: sub,
+      summary: summary, body: body, addKey: addKey,
+      collapsed: !!collapsed[key],
+    });
   }
 
   function identityBody(a) {
@@ -566,10 +554,9 @@
      or rebuilds the whole section. `key` names both the query slot and the
      data-rows target. */
   function toolbar(key, placeholder, shown, total) {
-    return '<div class="ag-toolbar">' +
-        '<input type="text" class="ag-search" data-ag-search="' + key + '" value="' + esc(query[key]) + '" placeholder="' + esc(placeholder) + '" autocomplete="off">' +
-        '<span class="ag-toolcount" data-count="' + key + '">' + shown + ' of ' + total + '</span>' +
-      '</div>';
+    return BuilderShell.toolbar({
+      key: key, placeholder: placeholder, shown: shown, total: total, value: query[key],
+    });
   }
 
   /* The empty state for a section that holds nothing yet. It names the
@@ -743,23 +730,21 @@
     if (!picker) return '';
     var def = PICKERS[picker];
     var pool = picker === 'knowledge' ? KNOWLEDGE : (plugins || []);
-    var rows = picker === 'knowledge' ? knowledgeRows(a) : capabilityRows(a);
     var shown = picker === 'knowledge'
       ? KNOWLEDGE.filter(function (k) { return matchesQuery(query.knowledge, [k.name, k.description, KIND_LABEL[k.kind]]); }).length
       : pool.filter(function (p) { return matchesQuery(query.capabilities, [p.name, p.description, p.category, p.type]); }).length;
-    return '<div class="modal-backdrop is-open" data-ag-pick-backdrop>' +
-      '<div class="modal-card ag-pick" role="dialog" aria-modal="true" aria-label="' + esc(def.title) + '">' +
-        '<div class="ag-pick-head">' +
-          '<div><h3>' + esc(def.title) + '</h3><p class="sub">' + esc(def.sub) + '</p></div>' +
-          '<button type="button" class="ag-pick-x" data-ag-pick-close aria-label="Close">✕</button>' +
-        '</div>' +
-        toolbar(picker, def.search, shown, pool.length) +
-        '<div class="ag-pick-rows ag-rows" data-rows="' + picker + '">' + rows + '</div>' +
-        '<div class="ag-note">' + def.foot + '</div>' +
-        '<div class="modal-actions">' +
-          '<button type="button" class="btn btn-primary" data-ag-pick-close>Done</button>' +
-        '</div>' +
-      '</div></div>';
+    return BuilderShell.picker({
+      key: picker,
+      title: def.title,
+      sub: def.sub,
+      searchPlaceholder: def.search,
+      query: query[picker],
+      shown: shown,
+      total: pool.length,
+      rows: picker === 'knowledge' ? knowledgeRows(a) : capabilityRows(a),
+      // Pre-built: the footer carries links to the Catalog.
+      foot: def.foot,
+    });
   }
 
   function openPicker(key) {
@@ -1112,14 +1097,7 @@
     }
   }
 
-  function msgHtml(m) {
-    if (m.role === 'user') {
-      return '<div class="ag-msg ag-msg--me"><div class="ag-msg-text">' + esc(m.text) + '</div></div>';
-    }
-    return '<div class="ag-msg' + (m.busy ? ' ag-msg--busy' : '') + '">' +
-      '<span class="ag-msg-dot" aria-hidden="true"></span>' +
-      '<div class="ag-msg-text">' + esc(m.text) + '</div></div>';
-  }
+  var msgHtml = BuilderShell.message;
 
   var CUBE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>';
 
@@ -1133,59 +1111,52 @@
   }
 
   function convHtml() {
-    var rows = [{ role: 'assistant', text: openingMessage() }].concat(conv);
-    if (convBusy) rows.push({ role: 'assistant', text: 'Thinking…', busy: true });
-    var html = rows.map(msgHtml).join('');
-    if (convErr) html += '<div class="ag-conv-err">' + esc(convErr) + '</div>';
-    return html;
+    return BuilderShell.conversation({
+      id: 'ag-conv',
+      rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
+      busy: convBusy,
+      err: convErr,
+    });
   }
 
+  /* Chips are a create-tab affordance only, and never while a turn is in
+     flight — a suggestion you cannot click is noise. */
   function composerHtml(kind, value, placeholder, busy) {
-    var chips = '';
-    if (kind === 'create' && convChips.length && !convBusy) {
-      chips = '<div class="ag-chips">' + convChips.map(function (c) {
-        return '<button type="button" class="ag-chip" data-ag-chip="' + esc(c) + '">' + esc(c) + '</button>';
-      }).join('') + '</div>';
-    }
-    return '<div class="ag-comp"><div class="ag-comp-in">' + chips +
-      '<div class="ag-comp-box">' +
-        '<textarea rows="1" data-ag-comp="' + kind + '" placeholder="' + esc(placeholder) + '"' +
-          (busy ? ' disabled' : '') + '>' + esc(value) + '</textarea>' +
-        '<button type="button" class="ag-send" data-ag-send="' + kind + '"' + (busy ? ' disabled' : '') + '>' +
-          'Send <span aria-hidden="true">→</span></button>' +
-      '</div></div></div>';
+    return BuilderShell.composer({
+      kind: kind, value: value, placeholder: placeholder, busy: busy,
+      chips: (kind === 'create' && !convBusy) ? convChips : [],
+    });
   }
 
   function createPaneHtml() {
-    return '<div class="ag-conv" id="ag-conv"><div class="ag-conv-in">' + convHtml() + '</div></div>' +
+    return convHtml() +
       composerHtml('create', convDraft, 'Tell me what this agent should do…', convBusy);
   }
 
   function previewPaneHtml(a) {
     var ready = (a.name || '').trim();
     if (!ready) {
-      return '<div class="ag-conv" id="ag-pv-conv"><div class="ag-conv-in">' +
-          '<div class="ag-conv-empty"><span class="ag-conv-empty-ring">' + CUBE_SVG + '</span>' +
-          '<span>Start by defining your agent.</span></div></div></div>' +
-        composerHtml('preview', '', 'Start by defining your agent.', true);
+      return BuilderShell.conversationEmpty({
+        id: 'ag-pv-conv', icon: CUBE_SVG, text: 'Start by defining your agent.',
+      }) + composerHtml('preview', '', 'Start by defining your agent.', true);
     }
     var rows = pv.msgs.slice();
     if (pv.stream) rows.push({ role: 'assistant', text: pv.stream });
-    else if (pv.busy) rows.push({ role: 'assistant', text: 'Thinking…', busy: true });
-    var body = rows.length
-      ? rows.map(msgHtml).join('')
-      : '<div class="ag-conv-empty"><span class="ag-conv-empty-ring">' + CUBE_SVG + '</span>' +
-        '<span>Talk to ' + esc(a.name) + ' the way your team will.</span></div>';
-    if (pv.err) body += '<div class="ag-conv-err">' + esc(pv.err) + '</div>';
-    // Answers render as plain text here (this page has no HTML sanitizer, and
-    // an unsanitized model answer is exactly the innerHTML the security
-    // playbook forbids). The full chat page has the real renderer — tables,
-    // code blocks, tool cards — so link to the same session rather than
-    // reimplementing it in the drawer.
+    var body = rows.length || pv.err || pv.busy
+      ? BuilderShell.conversation({ id: 'ag-pv-conv', rows: rows, busy: pv.busy, err: pv.err })
+      : BuilderShell.conversationEmpty({
+          id: 'ag-pv-conv', icon: CUBE_SVG,
+          text: 'Talk to ' + a.name + ' the way your team will.',
+        });
+    /* Answers render as plain text (this page has no HTML sanitizer, and an
+       unsanitized model answer is exactly the innerHTML the security
+       playbook forbids). The full chat page has the real renderer — tables,
+       code blocks, tool cards — so link to the same session rather than
+       reimplementing it in the drawer. */
     var full = pv.session
       ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
       : '';
-    return '<div class="ag-conv" id="ag-pv-conv"><div class="ag-conv-in">' + body + '</div></div>' +
+    return body +
       '<p class="ag-live-note">A real session with this agent, using the configuration on the right.' + full + '</p>' +
       composerHtml('preview', pv.draft, 'Ask ' + (a.name || 'your agent') + '…', pv.busy);
   }
@@ -1194,7 +1165,7 @@
     var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
     return '<div class="ag-cfg-ava"><span>' + AVA_SVG + '</span></div>' +
       section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
-        (esc(a.name) || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
+        (a.name || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
       section('knowledge', 2, 'Data & resources', 'what it knows',
         'What this agent is allowed to reach. Outside of this it says it cannot help, rather than guessing.',
         a.knowledge.length + ' source' + (a.knowledge.length === 1 ? '' : 's'), knowledgeBody(a), 'knowledge') +
@@ -1260,26 +1231,24 @@
     listView.hidden = true;
     builderView.hidden = false;
     builderView.innerHTML =
-      '<div class="ag-build-head">' +
-        '<button type="button" class="ag-back" data-ag-back>← All agents</button>' +
-        '<div style="min-width:0;flex:1">' +
-          '<h2 id="ag-build-title">' + (esc(a.name) || 'New agent') + '</h2>' +
-        '</div>' +
-        '<div class="ag-build-actions" id="ag-build-actions">' + headActionsHtml(a) + '</div>' +
-      '</div>' +
-      '<div class="ag-work">' +
-        '<div class="ag-pane">' +
-          '<div class="ag-tabs"><div class="ag-tabs-in" role="tablist">' +
-            '<button type="button" class="ag-tab" role="tab" data-ag-tab="create" aria-selected="' + (builderTab === 'create') + '">Create</button>' +
-            '<button type="button" class="ag-tab" role="tab" data-ag-tab="preview" aria-selected="' + (builderTab === 'preview') + '">Preview</button>' +
-          '</div></div>' +
-          (builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a)) +
-        '</div>' +
-        '<div class="ag-pane ag-pane--cfg">' +
-          '<div class="ag-cfg-head"><h3>Configuration</h3><p>what this agent is, editable by hand</p></div>' +
-          '<div class="ag-cfg-body" id="ag-cfg-body">' + cfgBodyHtml(a) + '</div>' +
-        '</div>' +
-      '</div>' +
+      BuilderShell.head({
+        backLabel: 'All agents',
+        title: a.name || 'New agent',
+        titleId: 'ag-build-title',
+        actionsId: 'ag-build-actions',
+        // Which verbs belong here depends on where this agent is in its life.
+        actions: headActionsHtml(a),
+      }) +
+      BuilderShell.workspace({
+        left: BuilderShell.tabs({
+          active: builderTab,
+          tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
+        }) + (builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a)),
+        cfgTitle: 'Configuration',
+        cfgSub: 'what this agent is, editable by hand',
+        cfgBodyId: 'ag-cfg-body',
+        cfg: cfgBodyHtml(a),
+      }) +
       '<div id="ag-picker"></div>';
     syncSkillDropdown();
     flagTouchedFields();

@@ -40,13 +40,23 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "
 def markup() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
 
+@pytest.fixture(scope="module")
+def shell_js() -> str:
+    """The builder shell's markup, extracted so a second builder page renders
+    the same thing. Assertions about what the SHELL emits read this; the
+    page's own script is still `markup`."""
+    return (
+        Path(__file__).resolve().parents[1]
+        / "app" / "web" / "static" / "js" / "components" / "builder_shell.js"
+    ).read_text(encoding="utf-8")
+
 
 class TestPreviewRunsARealTurn:
-    def test_the_preview_composer_is_a_real_control(self, markup):
+    def test_the_preview_composer_is_a_real_control(self, shell_js):
         """The inverse of the old assertion, and the reason this file exists."""
-        assert 'data-ag-comp="' in markup
-        assert "<textarea" in markup
-        assert 'data-ag-send="' in markup
+        assert 'data-ag-comp="' in shell_js
+        assert "<textarea" in shell_js
+        assert 'data-ag-send="' in shell_js
 
     def test_it_opens_a_session_bound_to_this_agent(self, markup):
         """Bound by slug — a preview against the default agent would answer as
@@ -87,14 +97,27 @@ class TestPreviewDoesNotPromiseWhatItCannotDo:
         # The owner is told whose problem it is; the raw kind stays in console.
         assert "an admin sets one up" in markup
 
-    def test_model_output_is_escaped_into_the_dom(self, markup):
-        """Assistant text goes through `esc()`, never raw innerHTML — this page
-        has no sanitizer and the answer is model output."""
-        block = re.search(r"function msgHtml\(m\) \{(.*?)\n  \}", markup, re.S)
-        assert block, "msgHtml not found"
+    def test_model_output_is_escaped_into_the_dom(self, shell_js):
+        """Assistant text goes through `esc()`, never raw innerHTML — neither
+        builder page has a sanitizer and the answer is model output.
+
+        Follows the renderer into builder_shell.js. This is the assertion that
+        must NOT be allowed to quietly stop testing anything: it is the reason
+        a model reply cannot put script in the page."""
+        block = re.search(r"function message\(m\) \{(.*?)\n  \}", shell_js, re.S)
+        assert block, "BuilderShell.message not found"
         body = block.group(1)
         assert "esc(m.text)" in body
         assert body.count("m.text") == body.count("esc(m.text)"), "an unescaped m.text reaches the DOM"
+
+    def test_the_shell_escaper_is_the_pages_escaper(self, markup):
+        """One escaper across both builder pages — a page keeping its own copy
+        is how one of them ends up weaker than the other."""
+        assert "var esc = BuilderShell.esc;" in markup
+
+    def test_the_shell_escaper_covers_every_dangerous_character(self, shell_js):
+        for ch in ("&", "<", ">", '"', "'"):
+            assert f"'{ch}':" in shell_js or f'"{ch}":' in shell_js, f"{ch!r} missing from the escape table"
 
     def test_the_pane_says_the_session_is_real(self, markup):
         """The old card had to disclaim being a chat. This one has the opposite
