@@ -1358,19 +1358,25 @@ the registry that replaced the builder's browser-only draft store. Reads are
 grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
 only the owner or an admin may edit or delete.
 
-`POST /api/agents/{agent_id}/builder/turn` (owner-only) runs one turn of the
-builder's conversation: it sends the message, the transcript so far, and the
-caller's own plugin candidates to the configured LLM, and returns
-`{reply, patch, agent, suggestions}`. The model's output is untrusted — unknown
-fields, ids outside the caller's candidate lists, and invented tones are
-dropped before anything is written, and `status` / the four `*_mode` columns
-are not writable from a conversation at all. Two optional fields serve the
-builder page's unsaved working copy: `apply` (default `true`) writes the patch
-through the ordinary `PATCH /api/agents/{id}` path — pass `false` to get the
-sanitized patch back **without** writing, in which case `agent` is `null`; and
-`config`, the caller's unsaved copy, narrowed to the patchable keys and used
-only to build the prompt. With no AI credential configured the endpoint answers
-`503 builder_llm_unavailable` and the panel stays fully usable by hand.
+`POST /api/agents/{agent_id}/builder/turn` (owner only) runs one turn of the
+builder's conversational assistant: it takes the owner's message plus the
+transcript so far and the caller's own plugin candidates, and asks the
+configured LLM for a configuration patch. When the patch is applied it goes
+through the same `PATCH /api/agents/{agent_id}` path a hand edit uses — so the
+builder-declaration → enforced-scope derivation is identical either way.
+
+The model's proposal is filtered before anything is written: unknown fields,
+knowledge/plugin ids outside the caller's own candidate lists, and tones
+outside the four the UI offers are dropped, and neither `status` nor the
+`*_mode` scope columns are writable from a conversation.
+
+Returns `{reply, patch, agent, suggestions}`. Two optional request fields
+serve the builder page's unsaved working copy: `apply` (default `true`) writes
+the patch as described above — pass `false` to get the sanitized patch back
+**without** writing, in which case `agent` is `null`; and `config`, the
+caller's unsaved copy, narrowed to the patchable keys and used only to build
+the prompt. With no AI credential configured the endpoint answers
+`503 builder_llm_unavailable` and the form stays fully usable by hand.
 
 - /api/agents
 - /api/agents/{agent_id}

@@ -2723,11 +2723,12 @@ KNOWN_UNTESTED = {
     "GET /api/agents/{agent_id}",
     "PATCH /api/agents/{agent_id}",
     "DELETE /api/agents/{agent_id}",
-    # One builder-conversation turn. Behaviourally covered by
-    # tests/test_agent_builder_turns.py — the sanitizer trust boundary, the
-    # apply=false / config working-copy contract, and the no-credential
-    # degradation. It writes only through the PATCH row above, so it adds no
-    # PG-specific persistence of its own to smoke.
+    # Builder-assistant turn — covered by tests/test_agent_builder_turns.py
+    # (DuckDB): the sanitizer trust boundary, the apply=false / config
+    # working-copy contract, and the no-credential degradation. It has no
+    # PG-specific behaviour of its own: every write it makes goes through
+    # PATCH /api/agents/{agent_id} above, whose backend split is already
+    # exercised by tests/db_pg/test_agents_contract.py.
     "POST /api/agents/{agent_id}/builder/turn",
     # One /skills builder turn. Behaviourally covered by
     # tests/test_entity_builder_turns.py. Stateless and writes nothing — no

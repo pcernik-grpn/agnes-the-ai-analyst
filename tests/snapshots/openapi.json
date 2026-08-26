@@ -12834,6 +12834,56 @@
         ]
       }
     },
+    "/admin/data-packages/new": {
+      "get": {
+        "description": "Author a data package, in the same builder shell /agents and /skills use.\n\nA PAGE, not the drawer. The drawer is right where it is used \u2014 mid-sentence\non /admin/tables, assigning a table to a package that does not exist yet \u2014\nbecause it opens over the lens you are standing on and gives it back. A\nworkspace is the opposite: it is where you have gone to do the thing, and\nit should look like the other two places you go to do the thing.\n\nThe FORM is still the drawer component's; this route only gives it a page\nto render into (`mount`), so there is one implementation of a package's\nfields and grants rather than two that drift.",
+        "operationId": "admin_package_builder_admin_data_packages_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Package Builder",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/data-packages/{package_id}": {
       "get": {
         "description": "ONE package, end to end \u2014 what is in it, who can use it, who has it.\n\nThe package is the unit an analyst actually receives, and until this page\nexisted it was the one object in the Data section with no home: its\ncomposition was edited inside the package-grouped layout on /admin/tables,\nits sharing on /admin/data-packages, and the card's own drilldown left the\nadmin area entirely for the analyst-facing /catalog/p/<slug>. Three places,\nnone of them about the package.\n\nEverything here rides EXISTING repositories and endpoints \u2014 the page adds\nno repo method, so there is no DuckDB\u2194Postgres parity sibling to write\n(CLAUDE.md). Composition writes through ``/api/admin/data-packages/{id}\n/tables``; sharing writes the same ``/api/admin/grants`` rows a group's\nAccess tab does, so the two ends of one relationship can never disagree.\n\nThe delivery read-out is the part the product could not draw anywhere:\na grant is a PERMISSION, and the data only lands once `agnes pull` runs.\n``users.last_pull_at`` (stamped by app/api/sync.py on every human pull) is\nwhat turns \"shared with 14 people\" into \"11 of them actually have it\".",
