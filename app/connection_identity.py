@@ -1,8 +1,8 @@
-"""Which ``data_source.<source>`` leaves decide *where* a registration points.
+"""Which leaves decide *where* a registration points.
 
 A registered table stores its upstream coordinates relative to the instance's
 one connection per source: a Snowflake row keeps ``bucket='GOLD'`` and resolves
-the *database* from ``data_source.snowflake.database`` at extract-build time,
+the *database* from the connection's own coordinates at extract-build time,
 baking the result into ``_remote_attach.url`` and into the remote view's
 ``sf."GOLD"."T"``. Repoint that connection and every existing row of the source
 keeps naming a database/schema pair the new upstream does not have: a
@@ -11,8 +11,18 @@ exist``), a materialized sync fails at COPY time, and ``last_sync_status`` goes
 on reporting the last *successful* run — so the instance looks healthy while
 its data is stale.
 
+The leaf NAMES are shared across two writers of the same shape (field names
+match 1:1): the legacy ``data_source.<source>`` server-config yaml overlay
+block (guarded by ``app.api.admin._guard_connection_repoint`` on `POST
+/api/admin/server-config` / `POST /api/admin/configure`), and — since D2.3,
+for Snowflake/Databricks — the connection row's own ``config`` dict (guarded
+by ``app.api.admin_source_connections._guard_row_repoint`` on `PUT
+/api/admin/source-connections/{id}`). Keboola's identity lived on the row
+from the start; BigQuery's row-edit path is not yet guarded (out of scope
+for D2 slice 2).
+
 The leaves listed here are the ones that change *which upstream* answers, as
-opposed to the tuning knobs that live in the same block (scan caps, timeouts,
+opposed to the tuning knobs that live alongside them (scan caps, timeouts,
 pool sizes) and break nothing. Changing a credential-pointer leaf
 (``token_env``, ``private_key_env``) counts: it swaps which secret is
 presented, and therefore which grants apply.
@@ -105,6 +115,8 @@ def identity_changes(
     source: str,
     before: Dict[str, Any] | None,
     after: Dict[str, Any] | None,
+    *,
+    replace_semantics: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return the identity leaves whose value differs between two config blocks.
 
@@ -116,6 +128,21 @@ def identity_changes(
     A leaf that is genuinely unset before and set after counts as a change:
     going from "no role" to a role decides which grants apply, exactly the class
     of edit this guard exists to surface.
+
+    ``replace_semantics`` distinguishes the two writers sharing this leaf
+    shape (module docstring). Default ``False`` is the PATCH-merge caller
+    (``app.api.admin._guard_connection_repoint``): ``after`` is a partial
+    patch merged onto the stored block by the caller, so a leaf ABSENT from
+    ``after`` means the operator did not touch it — nothing to warn about.
+    ``True`` is the ROW endpoint (``app.api.admin_source_connections.
+    _guard_row_repoint``), whose ``config`` REPLACES the stored dict
+    wholesale: there, a leaf present in ``before`` but missing from ``after``
+    was not skipped, it was WIPED — silently dropping to that leaf's default
+    (e.g. an empty ``config: {}`` clearing ``account``/``token_env``), which
+    is exactly the class of repoint this guard exists to catch (RBAC review
+    Finding 2, 2026-08-26: an empty-config REPLACE PUT used to satisfy this
+    function's old "skip if absent" rule regardless of caller and slip the
+    409).
     """
     leaves = CONNECTION_IDENTITY_LEAVES.get(source)
     if not leaves:
@@ -125,7 +152,7 @@ def identity_changes(
     after = after or {}
     changes: List[Dict[str, Any]] = []
     for field in sorted(leaves):
-        if field not in after:
+        if field not in after and not replace_semantics:
             # Absent from the patch-merged block means the operator did not
             # touch it, so there is nothing to warn about.
             continue
