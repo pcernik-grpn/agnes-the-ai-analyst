@@ -60,6 +60,65 @@ agnes_tls_active() {
         && [ -s "$_acf_cdir/Caddyfile" ]
 }
 
+# agnes_gcp_logging_active <compose_dir>
+#
+# True (exit 0) when the GCP Cloud Logging overlay
+# (docker-compose.gcp-logging.yml) should be engaged: the overlay file is
+# present AND the driver probe has left its marker
+# (<compose_dir>/.gcp-logging-ok). File presence alone is NOT enough:
+# Docker refuses to START a container whose log driver cannot initialize,
+# so arming the overlay on a host where gcplogs cannot authenticate (VM
+# service account missing roles/logging.logWriter, or no GCE metadata
+# server at all) turns the next routine container recreate into a full
+# outage — exactly what took a production VM down for 9 minutes (#1557).
+# The marker is written only by agnes_gcp_logging_probe below, and every
+# builder of a COMPOSE_FILE list (the boot startup script's inline append,
+# agnes-auto-upgrade.sh, agnes-state-applier.sh — all via this file) uses
+# this one gate, so boot and the recurring ticks can never disagree about
+# the overlay (#1558).
+agnes_gcp_logging_active() {
+    _acf_cdir=$1
+    [ -f "$_acf_cdir/docker-compose.gcp-logging.yml" ] \
+        && [ -f "$_acf_cdir/.gcp-logging-ok" ]
+}
+
+# agnes_gcp_logging_probe <compose_dir> <image>
+#
+# Verifies the gcplogs docker log driver can actually initialize on this
+# host by starting a no-op container with `--log-driver=gcplogs` (the
+# driver authenticates against the GCE metadata server at container start,
+# which is exactly where an unauthorized production container failed).
+# Arms or clears the shared marker (<compose_dir>/.gcp-logging-ok) that
+# agnes_gcp_logging_active requires, and returns the probe's verdict.
+# With the overlay file absent there is nothing to arm: the marker is
+# cleared without running docker at all, so a deliberately removed overlay
+# (enable_gcp_logging=false) also disarms the gate. The probe is cheap
+# (`/bin/true` in the already-pulled app image, which is Debian-based) but
+# not free — callers run it at boot and on ticks where the marker is
+# missing, not on every resolve.
+agnes_gcp_logging_probe() {
+    _acf_cdir=$1
+    _acf_image=$2
+    if [ ! -f "$_acf_cdir/docker-compose.gcp-logging.yml" ]; then
+        rm -f "$_acf_cdir/.gcp-logging-ok"
+        return 1
+    fi
+    # Cap the probe so an unreachable metadata endpoint hangs a boot/tick
+    # for at most a minute instead of indefinitely. `timeout` ships with
+    # coreutils on every supported VM image; fall back to an uncapped run
+    # where it is missing (dev laptops) rather than failing the probe.
+    _acf_probe="docker run --rm --log-driver=gcplogs --entrypoint /bin/true"
+    if command -v timeout >/dev/null 2>&1; then
+        _acf_probe="timeout 60 $_acf_probe"
+    fi
+    if $_acf_probe "$_acf_image" >/dev/null 2>&1; then
+        touch "$_acf_cdir/.gcp-logging-ok"
+        return 0
+    fi
+    rm -f "$_acf_cdir/.gcp-logging-ok"
+    return 1
+}
+
 # agnes_resolve_compose_file <compose_dir> <state_dir> [backend_override]
 #
 # Prints the colon-separated COMPOSE_FILE value to stdout.
@@ -113,7 +172,8 @@ agnes_resolve_compose_file() {
         _acf_list="$_acf_list:docker-compose.tls.yml"
     fi
 
-    if [ -f "$_acf_compose_dir/docker-compose.gcp-logging.yml" ]; then
+    # File presence AND probe marker — see agnes_gcp_logging_active above.
+    if agnes_gcp_logging_active "$_acf_compose_dir"; then
         _acf_list="$_acf_list:docker-compose.gcp-logging.yml"
     fi
 
