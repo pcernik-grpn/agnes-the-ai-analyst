@@ -36,6 +36,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
 - **PG-first development rule (remediation-program Track A3): the DuckDB
   app-state backend is frozen.** No user-visible change. Development-rule
   change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
@@ -103,6 +105,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Removed
 
+- **BREAKING: the `/api/agents` builder-CRUD router is deleted**
+  (remediation-program Track C1.2 — "one agent model"). `/api/v1/agents*`
+  is now the ONLY agent API; it absorbed every operation the router served
+  in the previous release (Track C1.1). The Agent builder page (`/agents`)
+  is re-pointed at v1 and behaves the same, with two intentional
+  deviations: `POST /api/v1/agents` requires a non-blank `name` (v1's
+  pre-existing rule), so the builder's "New agent" now sends a placeholder
+  (`"Untitled"`) instead of minting a fully blank draft; and a client
+  supplying an explicit `slug` on `PUT /api/v1/agents/{id}` gets a flat 400
+  `slug_immutable` rather than having it silently dropped, closing that gap
+  a notch tighter than the deleted router's own PATCH did. New agent ids
+  are plain UUIDs — the deleted router's `agt_`-prefixed convention (used
+  only to distinguish builder-created rows in one now-completed one-time
+  migration) is retired; existing `agt_`-prefixed rows are unaffected.
+  `POST /api/v1/agents` now also marks the "Create your first agent"
+  onboarding step, closing a gap versus a plain (non-builder-shape) v1
+  create that never did. Direct callers of `/api/agents*` (there were none
+  outside this repo's own web UI) must move to `/api/v1/agents*`; see
+  `docs/api-reference.md`.
 - **Deleted dead config surfaces flagged by the 2026-08 audit.** The
   `jira:` section is gone from both the `/admin/server-config` UI (it never
   had any `instance.yaml` wiring — `connectors/jira/service.py` reads
