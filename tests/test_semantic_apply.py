@@ -249,6 +249,48 @@ def test_approve_refuses_a_since_shadowed_slug(seeded_app):
     assert authoring_suggestions_repo().get(sid)["status"] == "pending"
 
 
+def test_approve_clears_semantic_draft_pending_flag(seeded_app):
+    """semantic-phase5 wave 2: an approved suggestion clears the dedup flag
+    for every table its document covers — approve or reject alike."""
+    from src.repositories import table_registry_repo
+
+    table_registry_repo().register(id="db.public.tickets", name="db.public.tickets", source_type="local")
+    table_registry_repo().mark_semantic_draft_pending("db.public.tickets")
+
+    c = seeded_app["client"]
+    sid = _apply(c, seeded_app["analyst_token"]).json()["suggestion_id"]
+    r = c.post(
+        f"/api/admin/authoring-suggestions/{sid}/approve",
+        headers=_auth(seeded_app["admin_token"]),
+        json={},
+    )
+    assert r.status_code == 200, r.text
+
+    row = table_registry_repo().get("db.public.tickets")
+    assert row["semantic_draft_pending_at"] is None
+
+
+def test_reject_also_clears_semantic_draft_pending_flag(seeded_app):
+    """The reject path must clear the flag too — a rejected draft is just as
+    eligible for a fresh sweep as an approved one."""
+    from src.repositories import table_registry_repo
+
+    table_registry_repo().register(id="db.public.tickets", name="db.public.tickets", source_type="local")
+    table_registry_repo().mark_semantic_draft_pending("db.public.tickets")
+
+    c = seeded_app["client"]
+    sid = _apply(c, seeded_app["analyst_token"]).json()["suggestion_id"]
+    r = c.post(
+        f"/api/admin/authoring-suggestions/{sid}/reject",
+        headers=_auth(seeded_app["admin_token"]),
+        json={"note": "not good enough"},
+    )
+    assert r.status_code == 200, r.text
+
+    row = table_registry_repo().get("db.public.tickets")
+    assert row["semantic_draft_pending_at"] is None
+
+
 def test_non_admin_branch_respects_studio_toggle(seeded_app, monkeypatch):
     import app.api.semantic_models as sm
 

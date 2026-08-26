@@ -312,6 +312,11 @@ class TestToolRegistration:
             # Triple-surface with GET /api/admin/semantic-layer/coverage +
             # `agnes admin semantic-layer coverage`.
             "admin_semantic_layer_coverage",
+            # Source-agnostic zero-coverage check — which registered tables
+            # have NO valid semantic model at all, across every source.
+            # Triple-surface with GET /api/admin/semantic-coverage +
+            # `agnes semantic-model coverage`.
+            "admin_semantic_coverage",
             # Job management for scheduler — list, get, enqueue tasks.
             # Triple-surface with GET /api/jobs + GET /api/jobs/{job_id} +
             # POST /api/jobs + `agnes admin jobs`.

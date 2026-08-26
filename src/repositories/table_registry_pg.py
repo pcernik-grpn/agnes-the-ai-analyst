@@ -336,6 +336,22 @@ class TableRegistryPgRepository:
                 },
             )
 
+    def mark_semantic_draft_pending(self, table_id: str) -> None:
+        """Postgres mirror of ``TableRegistryRepository.mark_semantic_draft_pending``."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE table_registry SET semantic_draft_pending_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(timezone.utc), "id": table_id},
+            )
+
+    def clear_semantic_draft_pending(self, table_id: str) -> None:
+        """Postgres mirror of ``TableRegistryRepository.clear_semantic_draft_pending``."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE table_registry SET semantic_draft_pending_at = NULL WHERE id = :id"),
+                {"id": table_id},
+            )
+
     def set_policy_mapping(self, table_id: str, value: bool) -> None:
         """Postgres mirror of ``TableRegistryRepository.set_policy_mapping``."""
         with self._engine.begin() as conn:

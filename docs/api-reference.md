@@ -1206,6 +1206,28 @@ a Keboola tableId or a plain `dataset.source`/`.name` match against
 CLI: `agnes semantic-model coverage [--limit N] [--json]`. MCP:
 `admin_semantic_coverage`.
 
+### `/api/admin/semantic-auto-draft-sweep` — auto-draft uncovered tables
+
+- /api/admin/semantic-auto-draft-sweep
+
+`POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
+30 minutes) drafts a semantic model for up to a handful of uncovered tables
+(`tables_without_semantic_coverage`, filtered on `table_registry.
+semantic_draft_pending_at IS NULL`) per tick via a headless
+`semantic-model-builder` chat session, authenticated as the non-admin
+`semantic-drafter@system.local` system identity so every draft lands in the
+`authoring_suggestions` moderation queue exactly like a human-submitted
+proposal — never applied directly. Each selected table's
+`semantic_draft_pending_at` is stamped before its session is invoked (not
+after), so a table can never be double-picked by an overlapping tick; the
+flag clears when an admin resolves the resulting suggestion, approve or
+reject alike. A session hitting the chat manager's concurrency cap is
+counted and skipped, never a 500.
+
+Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
+"remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
+same class as the `/api/admin/run-*` jobs below.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a

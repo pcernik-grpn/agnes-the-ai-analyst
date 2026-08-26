@@ -1057,6 +1057,12 @@ _EXEMPT: dict[str, str] = {
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
     ),
+    "/api/admin/semantic-auto-draft-sweep": (
+        "scheduler-driven semantic-layer auto-draft sweep trigger "
+        "(semantic-phase5 wave 2) — admin/scheduler maintenance op, mirrors "
+        "the run-keboola-semantic-layer-refresh / run-audit-prune "
+        "exemptions; no analyst CLI/MCP analogue"
+    ),
 }
 
 

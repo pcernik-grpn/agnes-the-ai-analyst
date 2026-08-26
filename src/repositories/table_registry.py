@@ -401,6 +401,32 @@ class TableRegistryRepository:
             [sql, note, datetime.now(timezone.utc), updated_by, table_id],
         )
 
+    def mark_semantic_draft_pending(self, table_id: str) -> None:
+        """Stamp ``semantic_draft_pending_at`` to now.
+
+        Set BEFORE a headless auto-draft session is invoked for this table
+        (semantic-phase5 wave 2's auto-draft sweep) — never after — so a
+        concurrent or overlapping sweep tick's own coverage read (which
+        already excludes rows with this flag set) can never pick the same
+        table twice.
+        """
+        self.conn.execute(
+            "UPDATE table_registry SET semantic_draft_pending_at = ? WHERE id = ?",
+            [datetime.now(timezone.utc), table_id],
+        )
+
+    def clear_semantic_draft_pending(self, table_id: str) -> None:
+        """Clear the dedup flag ``mark_semantic_draft_pending`` set.
+
+        Called once the ``authoring_suggestions`` row covering this table's
+        draft is resolved — approved or rejected — so a later sweep can
+        draft again if the table is still uncovered.
+        """
+        self.conn.execute(
+            "UPDATE table_registry SET semantic_draft_pending_at = NULL WHERE id = ?",
+            [table_id],
+        )
+
     def set_policy_mapping(self, table_id: str, value: bool) -> None:
         """Mark (or unmark) a table as referenceable from another table's
         access-policy body (a "mapping table", e.g. a user->cost-center

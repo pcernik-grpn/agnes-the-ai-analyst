@@ -654,6 +654,17 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # to review_error so admin can retry. Cheap (one indexed
         # SELECT + N small UPDATEs); short timeout sufficient.
         ("store-reap-stuck-reviews", "every 15m", "/api/admin/run-reap-stuck-reviews", "POST", 60),
+        # Semantic-layer auto-draft sweep (semantic-phase5 wave 2): drafts a
+        # semantic model for a handful of uncovered tables per tick via a
+        # headless chat session, landing each result in the
+        # authoring_suggestions moderation queue. `every 30m` matches the
+        # design doc's V0 cadence; no env override — one more scheduler knob
+        # is unwarranted before this has run in production. 60s timeout is
+        # this HTTP call's own client-side budget only: the endpoint stamps
+        # each table's dedup flag before invoking its session, so a call
+        # that outruns this timeout server-side is never re-triggered for
+        # the same table on the next tick.
+        ("semantic-auto-draft-sweep", "every 30m", "/api/admin/semantic-auto-draft-sweep", "POST", 60),
         # Weekly skill-lint retro-audit (#687). Re-lints published skills,
         # skipping entities whose content is unchanged since their last lint
         # (zero LLM cost on a static store). The endpoint self-guards against
