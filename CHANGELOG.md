@@ -103,74 +103,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   uses `granted_by` to let an admin-shared agent reach items its owner
   personally does not hold.
 
-- **`data_apps.subdomain_base` can now be set from the deployment, not only by
-  hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
-  env override plus a per-VM `data_apps_subdomain_base` field on the
-  `customer-instance` module (both instance object types, `optional(string,
-  "")`, written into that VM's `.env` only when non-empty). Serving apps from
-  their own origin is the supported answer to the 0.89.0 same-origin refusal,
-  but the key had no env override and its section is locked in the
-  server-config overlay — so the only way to set it on a deployed instance was
-  editing the yaml on disk, the same Terraform-says-one-thing-the-box-says-
-  another drift that already bit `data_apps.enabled`. Unlike the sibling
-  `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
-  `enabled` state rather than on the env-enable path, because
-  `session_cookie_domain()` reads it on every login and the value must not
-  depend on whether the operator switched data apps on via env or yaml. While
-  the feature resolves OFF, `subdomain_base` is now dropped entirely — from
-  instance.yaml as much as from `.env`, which also fixes the pre-existing case
-  where `AGNES_DATA_APPS_ENABLED=false` left a yaml base widening the session
-  cookie and routing `<slug>.<base>` hosts for a feature serving nothing. Both
-  readers (`session_cookie_domain()` and `DataAppSubdomainMiddleware`) take the
-  key unconditionally, so this single accessor is where "off" is made to mean
-  "no base". `instance.yaml.example`
-  and the module variable now both carry the base-selection warning: the value
-  widens the session cookie to the base's PARENT domain, so
-  `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
-  session cookie to every unrelated host under it.
-
-- **Hosted data apps can be served from their own origin without a wildcard
-  certificate.** The shipped `Caddyfile.apps-subdomain` vhost now issues ONE
-  certificate per app hostname on first request (Caddy on-demand TLS, HTTP-01)
-  and is wired up automatically: the Dockerfile bakes it into the host
-  artifacts, and the `customer-instance` startup script prepends the required
-  global `on_demand_tls` block and appends the vhost whenever
-  `data_apps_subdomain_base` is set (guarded on its own marker, since the
-  script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
-  parse). `agnes-auto-upgrade.sh` re-applies the identical block on every
-  5-minute tick, right after it re-fetches the pristine `Caddyfile` from main
-  and before it hashes for config drift — without that, a VM lost its vhost and
-  its `on_demand_tls` block on the first tick after boot and hosted apps became
-  unreachable altogether, since same-origin serving is refused by default. The
-  two copies are asserted byte-identical, so the Caddy-parser test that runs one
-  of them covers both; the tick also refreshes the vhost fragment itself, so a
-  VM whose last boot predates it converges without a reboot. A wildcard
-  certificate was the obvious alternative and was rejected
-  on purpose: it can only be validated over DNS-01, which would put a DNS-zone
-  write credential on the very host that runs user-authored app code. Issuance
-  is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
-  (Caddy's `ask` contract — 2xx allows, anything else cancels), which answers
-  2xx for exactly one shape: a registered, non-hidden slug directly under the
-  configured base. It leaks nothing new — `proxy_app` already resolves the row
-  before authenticating, so a real slug is already distinguishable from a
-  made-up one. Compose hands Caddy the base with an inert `apps.invalid`
-  default, mirroring the `DOMAIN_ALIAS` fix: an empty-but-set value would
-  render the site address `*.` and take the primary site down at config parse.
-
-- **Signing in from an app subdomain returns you to the app.** `safe_next_path`
-  now accepts one new shape besides a same-origin absolute path: an absolute
-  http(s) URL on `<single-label>.<data_apps.subdomain_base>`, and only while
-  data apps are enabled and a base is configured. The 401 redirect carries the
-  path the visitor actually asked for (the subdomain middleware now records it
-  before rewriting), so login lands them back where they started instead of on
-  the dashboard. Every classic open-redirect shape is still refused, plus the
-  near-misses that merely look like an app origin — userinfo (`https://evil.com@
-  s.apps.example.com/` and its inverse), backslashes (browsers normalize them,
-  `urlsplit` does not), suffix extension, multi-label names, and non-web
-  schemes. Not verified, deliberately: that the slug is a REAL app — that would
-  put a database lookup in a helper every login calls, to close something that
-  is not a general open redirect, since the target is always this deployment's
-  own infrastructure behind the same RBAC.
 
 - **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
   the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
@@ -263,17 +195,76 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   a legacy-seeded row carries), so it is an identity leaf too, and
   `_guard_row_repoint` now compares it alongside `config`.
 
+- **`data_apps.subdomain_base` can now be set from the deployment, not only by
+  hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
+  env override plus a per-VM `data_apps_subdomain_base` field on the
+  `customer-instance` module (both instance object types, `optional(string,
+  "")`, written into that VM's `.env` only when non-empty). Serving apps from
+  their own origin is the supported answer to the 0.89.0 same-origin refusal,
+  but the key had no env override and its section is locked in the
+  server-config overlay — so the only way to set it on a deployed instance was
+  editing the yaml on disk, the same Terraform-says-one-thing-the-box-says-
+  another drift that already bit `data_apps.enabled`. Unlike the sibling
+  `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
+  `enabled` state rather than on the env-enable path, because
+  `session_cookie_domain()` reads it on every login and the value must not
+  depend on whether the operator switched data apps on via env or yaml. While
+  the feature resolves OFF, `subdomain_base` is now dropped entirely — from
+  instance.yaml as much as from `.env`, which also fixes the pre-existing case
+  where `AGNES_DATA_APPS_ENABLED=false` left a yaml base widening the session
+  cookie and routing `<slug>.<base>` hosts for a feature serving nothing. Both
+  readers (`session_cookie_domain()` and `DataAppSubdomainMiddleware`) take the
+  key unconditionally, so this single accessor is where "off" is made to mean
+  "no base". `instance.yaml.example`
+  and the module variable now both carry the base-selection warning: the value
+  widens the session cookie to the base's PARENT domain, so
+  `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
+  session cookie to every unrelated host under it.
+
+- **Hosted data apps can be served from their own origin without a wildcard
+  certificate.** The shipped `Caddyfile.apps-subdomain` vhost now issues ONE
+  certificate per app hostname on first request (Caddy on-demand TLS, HTTP-01)
+  and is wired up automatically: the Dockerfile bakes it into the host
+  artifacts, and the `customer-instance` startup script prepends the required
+  global `on_demand_tls` block and appends the vhost whenever
+  `data_apps_subdomain_base` is set (guarded on its own marker, since the
+  script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
+  parse). `agnes-auto-upgrade.sh` re-applies the identical block on every
+  5-minute tick, right after it re-fetches the pristine `Caddyfile` from main
+  and before it hashes for config drift — without that, a VM lost its vhost and
+  its `on_demand_tls` block on the first tick after boot and hosted apps became
+  unreachable altogether, since same-origin serving is refused by default. The
+  two copies are asserted byte-identical, so the Caddy-parser test that runs one
+  of them covers both; the tick also refreshes the vhost fragment itself, so a
+  VM whose last boot predates it converges without a reboot. A wildcard
+  certificate was the obvious alternative and was rejected
+  on purpose: it can only be validated over DNS-01, which would put a DNS-zone
+  write credential on the very host that runs user-authored app code. Issuance
+  is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
+  (Caddy's `ask` contract — 2xx allows, anything else cancels), which answers
+  2xx for exactly one shape: a registered, non-hidden slug directly under the
+  configured base. It leaks nothing new — `proxy_app` already resolves the row
+  before authenticating, so a real slug is already distinguishable from a
+  made-up one. Compose hands Caddy the base with an inert `apps.invalid`
+  default, mirroring the `DOMAIN_ALIAS` fix: an empty-but-set value would
+  render the site address `*.` and take the primary site down at config parse.
+
+- **Signing in from an app subdomain returns you to the app.** `safe_next_path`
+  now accepts one new shape besides a same-origin absolute path: an absolute
+  http(s) URL on `<single-label>.<data_apps.subdomain_base>`, and only while
+  data apps are enabled and a base is configured. The 401 redirect carries the
+  path the visitor actually asked for (the subdomain middleware now records it
+  before rewriting), so login lands them back where they started instead of on
+  the dashboard. Every classic open-redirect shape is still refused, plus the
+  near-misses that merely look like an app origin — userinfo (`https://evil.com@
+  s.apps.example.com/` and its inverse), backslashes (browsers normalize them,
+  `urlsplit` does not), suffix extension, multi-label names, and non-web
+  schemes. Not verified, deliberately: that the slug is a REAL app — that would
+  put a database lookup in a helper every login calls, to close something that
+  is not a general open redirect, since the target is always this deployment's
+  own infrastructure behind the same RBAC.
+
 ### Changed
-
-- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
-  `none` (internal-only network, no route to the internet) instead of `open`.
-  The chat agent runs with bypassed tool permissions over a read-write
-  workspace, so an open default was a file-exfiltration surface. Operators who
-  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
-  with `chat.docker_egress_mode: open`, or `allowlist` +
-  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
-  or blank value now fails closed to `none`.
-
 
 - **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
   `none` (internal-only network, no route to the internet) instead of `open`.
@@ -379,44 +370,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   fails loudly on secret saves instead of writing the secret in cleartext.
 
 
-- **A signed-out visitor opening a data-app URL on an app subdomain no longer
-  hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
-  path on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the app-wide
-  401→`/login` redirect — relative, and therefore resolved by the browser
-  against the app's own host — came back as `/apps/<slug>/login`, 401'd again,
-  and looped until the browser gave up (`ERR_TOO_MANY_REDIRECTS`). The handler
-  now sends a subdomain-origin caller to the MAIN host's login absolutely
-  (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
-  order). Anyone already signed in was unaffected — the session cookie is
-  scoped to cover both origins — which is why every existing subdomain test,
-  all of which drive an already-authenticated client, stayed green. The return
-  URL is carried across in `next` — see the `safe_next_path` entry under
-  **Added**, which is the separate, deliberate edit to that open-redirect guard
-  that makes carrying it safe.
-- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
-  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
-  labels now render via `textContent`, keeping the static sort markup trusted.
-- Agent-session principals no longer crash (500) when reaching collection
-  authorization (`accessible_collection_ids`, `require_collection_access`);
-  an `AgentPrincipal` now resolves to its live scoped-collection intersection
-  or a clean 403, matching the existing co-session/agent-session seam and
-  never inheriting owner-owned collections.
-- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
-  the same canonical subpath used for policy and dispatcher classification, and
-  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
-  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
-  path like `/v1/./messages` that classified as a non-message call — skipping
-  its pinned-model allowlist and monthly token budget — while HTTPX
-  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
-  duplicate-slash message paths can likewise no longer route the destination
-  somewhere the authorization decision did not intend.
-- Token persistence refuses to write (instead of silently downgrading to
-  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
-  valid Fernet key; a genuinely unset key still uses the plaintext keyless
-  fallback as before. A previously-silent misconfigured production vault now
-  fails loudly on secret saves instead of writing the secret in cleartext.
-
-
 - Web chat: a user message's hover actions (timestamp + copy) now hang
   BELOW the bubble instead of renting an invisible second row inside it —
   a one-line message no longer renders as a two-row-tall bubble. On touch
@@ -479,14 +432,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   succeeds — the "Add data source" wizard creates a connection row before
   its config is complete.
 
+- **A signed-out visitor opening a data-app URL on an app subdomain no longer
+  hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
+  path on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the app-wide
+  401→`/login` redirect — relative, and therefore resolved by the browser
+  against the app's own host — came back as `/apps/<slug>/login`, 401'd again,
+  and looped until the browser gave up (`ERR_TOO_MANY_REDIRECTS`). The handler
+  now sends a subdomain-origin caller to the MAIN host's login absolutely
+  (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
+  order). Anyone already signed in was unaffected — the session cookie is
+  scoped to cover both origins — which is why every existing subdomain test,
+  all of which drive an already-authenticated client, stayed green. The return
+  URL is carried across in `next` — see the `safe_next_path` entry under
+  **Added**, which is the separate, deliberate edit to that open-redirect guard
+  that makes carrying it safe.
+
 ### Security
-
-- Knowledge-digest generation now frames corpus source chunks as untrusted
-  data — behind an explicit do-not-follow-instructions notice and a per-call
-  nonce-delimited fence — before they reach the LLM, so retrieved content can
-  no longer be elevated into persistent agent instructions through the
-  generated `.claude/rules/ka_<slug>.md` digest.
-
 
 - Knowledge-digest generation now frames corpus source chunks as untrusted
   data — behind an explicit do-not-follow-instructions notice and a per-call
@@ -528,42 +489,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   section). `deployment.role` is unaffected.
 
 ### Internal
-
-- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
-  genuine schema change on an existing DuckDB↔Postgres pair under the A3
-  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
-  schema change on an existing pair's table … follows 'Adding a PG-only
-  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
-  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
-  an identical call shape (accepts the same `granted_by` keyword) but has no
-  column to persist it into. `migrations/versions/
-  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
-  agent's `owner_user_id`.
-
-- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
-
-- **PG-first development rule (remediation-program Track A3): the DuckDB
-  app-state backend is frozen.** No user-visible change. Development-rule
-  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
-  app-state repositories/schema changes to be Postgres-only (a
-  `src/repositories/<name>_pg.py` module registered `PG`-only in the
-  `_REGISTRY` factory table, an Alembic-only migration) — no new
-  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
-  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
-  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
-  Resolving a Postgres-only repository on an instance still running the
-  frozen DuckDB app-state backend now raises a typed
-  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
-  handler into a clean `501` instead of an unhandled `500`. New ratchets:
-  `tests/test_repository_registry_pg_first_ratchet.py`,
-  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
-  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
-  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
-  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
-  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
-  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
-  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
-  dev-kit agents are updated to match.
 
 - **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
   A fast, pure-file-parse test that catches the recurring silent-rebase
