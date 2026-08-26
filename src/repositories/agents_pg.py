@@ -295,17 +295,41 @@ class AgentsPgRepository:
         """Replace the whole scope set for ``agent_id``.
 
         ``granted_by`` is the writer's user id, recorded on every row this
-        call inserts (uniform per call — one write replaces the whole set,
-        so every row it produces has the same writer). Column added by
-        migration 0073 (remediation Track C, C2.1) — see the DuckDB
-        sibling's docstring for why it has no counterpart there.
+        call inserts that is genuinely NEW. Column added by migration 0073
+        (remediation Track C, C2.1) — see the DuckDB sibling's docstring for
+        why it has no counterpart there.
+
+        A ``(item_type, item_id)`` pair that was ALREADY present before this
+        call (a full-replace call re-declaring a row unchanged — the normal
+        shape of ``app/api/agents_builder_shared.py::_sync_builder_scope``'s
+        "preserved" rows, which read the current scope back and pass it
+        straight through) keeps its EXISTING ``granted_by`` instead of being
+        re-attributed to this call's writer. Without this, a later builder
+        save by the (non-admin) owner would silently downgrade an
+        admin-granted row to owner-granted — D-C2's "admin-granted =
+        unconditioned" half only holds if the grant's origin survives an
+        unrelated re-save (remediation-program C2.2 must-handle:
+        ``docs/superpowers/plans/2026-08-26-one-agent-model.md`` §C2.2). A
+        pair that is new (not present before) is attributed to
+        ``granted_by`` exactly as before.
         """
         with self._engine.begin() as conn:
+            existing = (
+                conn.execute(
+                    sa.text("SELECT item_type, item_id, granted_by FROM agent_scope WHERE agent_id = :agent_id"),
+                    {"agent_id": agent_id},
+                )
+                .mappings()
+                .all()
+            )
+            prior_granted_by = {(r["item_type"], r["item_id"]): r["granted_by"] for r in existing}
+
             conn.execute(
                 sa.text("DELETE FROM agent_scope WHERE agent_id = :agent_id"),
                 {"agent_id": agent_id},
             )
             for item_type, item_id in items:
+                row_granted_by = prior_granted_by.get((item_type, item_id), granted_by)
                 conn.execute(
                     sa.text(
                         "INSERT INTO agent_scope (agent_id, item_type, item_id, granted_by) "
@@ -315,7 +339,7 @@ class AgentsPgRepository:
                         "agent_id": agent_id,
                         "item_type": item_type,
                         "item_id": item_id,
-                        "granted_by": granted_by,
+                        "granted_by": row_granted_by,
                     },
                 )
 

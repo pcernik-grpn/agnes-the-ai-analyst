@@ -11,7 +11,7 @@ intersection-agent-scope actually reach the authorization seams. Covers:
   ordinary owner JWT (web-chat regression guard).
 - The resolver's ``typ="agent_session"`` branch: session -> agent_id -> agent
   row -> owner -> ``AgentPrincipal`` whose intersection matches
-  ``compute_agent_intersection`` computed independently.
+  ``resolve_agent_authority`` computed independently.
 - Every fail-closed path, individually: missing session, session with no
   agent_id, missing agent row, soft-deleted agent, missing owner.
 """
@@ -181,8 +181,8 @@ def test_resolver_returns_agent_principal_matching_intersection(e2e_env, monkeyp
     )
     monkeypatch.setattr(
         intersection_mod,
-        "_agent_scope_ids",
-        lambda aid, it, conn=None: frozenset({"t1"}) if it == "table" else frozenset(),
+        "_agent_scope_rows",
+        lambda aid, it, conn=None: [{"item_id": "t1", "granted_by": None}] if it == "table" else [],
     )
 
     owner_id, owner_email = _make_user()
@@ -199,8 +199,7 @@ def test_resolver_returns_agent_principal_matching_intersection(e2e_env, monkeyp
     assert principal.owner_user_id == owner_id
     assert principal.owner_email == owner_email
 
-    agent_row = agents_repo().get_by_id(agent_id)
-    expected = intersection_mod.compute_agent_intersection(owner_id, agent_row)
+    expected = intersection_mod.resolve_agent_authority(agent_id)
     assert principal.intersection == expected
     assert principal.intersection["table"] == frozenset({"t1"})
 

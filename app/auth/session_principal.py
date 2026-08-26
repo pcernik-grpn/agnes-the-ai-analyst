@@ -25,12 +25,19 @@ class SessionPrincipal:
 class AgentPrincipal:
     """Auth subject of a live agent-scoped session (V1d).
 
-    Effective authority = the owner's grants ∩ the agent's declared scope.
-    Never the owner's full set, never the Admin god-mode short-circuit — an
-    agent is a *restriction* of its owner, never an elevation. Like
-    ``SessionPrincipal`` the intersection is rebuilt live per request (the
-    token bakes in no grants), so revoking a grant or narrowing the agent
-    takes effect on the next request with no stale-replay window.
+    Effective authority = the agent's own resolved authority
+    (``resolve_agent_authority``, C2.2) — a *restriction* of its owner's
+    self-declared access, never an elevation of it, and never the Admin
+    god-mode short-circuit: a self-declared item (including one an admin
+    OWNER declared for their own agent) always narrows to that identity's
+    CURRENT explicit grants. The one deliberate exception is an item a
+    THIRD-PARTY admin explicitly granted to the agent (recorded via
+    ``agent_scope.granted_by``, granter distinct from the owner) — that item
+    is the agent's own authority in its own right and MAY exceed what the
+    owner personally holds (D-C2). Like ``SessionPrincipal`` the
+    intersection is rebuilt live per request (the token bakes in no
+    grants), so revoking a grant or narrowing the agent takes effect on the
+    next request with no stale-replay window.
     """
 
     session_id: str
