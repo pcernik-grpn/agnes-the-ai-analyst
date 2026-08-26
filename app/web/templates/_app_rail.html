@@ -531,6 +531,41 @@
        the foot, below the rule that marks off the account zone. See the note on
        it there for why it is not a `.rail-i` destination. #}
 
+
+    </div>{# /.rail-collapsible #}
+
+    {# The foot is the profile row alone — onboarding is a card at the end of
+       the bottom zone (see .rail-getstarted), and "How {brand} works" is an item
+       in the account menu below. It stays outside .rail-collapsible so the
+       profile (and everything in its menu) is reachable in the ≤1024px bar even
+       with the nav collapsed. #}
+    <div class="rail-foot">
+
+        {# "Use {brand} elsewhere" — straight to the section of How-it-works
+           that hands you the MCP endpoint and the CLI install, rather than to
+           the top of a long page you then have to scan.
+
+           It sits in the foot rather than the nav above because it is not a
+           destination inside the product: it is how you take the product
+           somewhere else. Above the profile row, which is the other thing in
+           this zone that is about you rather than about your data.
+
+           Outside .rail-collapsible for the same reason the profile is —
+           it stays reachable in the ≤1024px bar with the nav collapsed. #}
+        {# Plain `rail-i`, not `--muted`: that modifier italicises the label
+           and exists for the "Admin paused" state, which is a condition being
+           reported rather than a place to go. This is a place to go. #}
+        <a class="rail-i{% if _path == '/how-it-works' %} is-active{% endif %}"
+           href="/how-it-works#connect">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.4l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.5 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M14 10.5a4 4 0 0 0-5.7-.4l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.5-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <span class="rail-i-label">Use {{ instance_brand_short }} elsewhere</span>
+        </a>
+
+        {# Onboarding sits BELOW "Use {brand} elsewhere" and above the profile.
+           It moved out of .rail-collapsible to get here, which also makes it
+           reachable in the ≤1024px bar for the same reason the profile is —
+           a setup card you cannot reach while the nav is collapsed is a
+           reminder you cannot act on. #}
     {# NOT on an admin page. This is the ANALYST's journey — connect your tools,
        ask your first question, five steps of learning to use the chat product —
        and it is the only element in the rail carrying a coloured progress arc,
@@ -626,35 +661,6 @@
         </div>
     </div>
     {% endif %}
-
-    </div>{# /.rail-collapsible #}
-
-    {# The foot is the profile row alone — onboarding is a card at the end of
-       the bottom zone (see .rail-getstarted), and "How {brand} works" is an item
-       in the account menu below. It stays outside .rail-collapsible so the
-       profile (and everything in its menu) is reachable in the ≤1024px bar even
-       with the nav collapsed. #}
-    <div class="rail-foot">
-
-        {# "Use {brand} elsewhere" — straight to the section of How-it-works
-           that hands you the MCP endpoint and the CLI install, rather than to
-           the top of a long page you then have to scan.
-
-           It sits in the foot rather than the nav above because it is not a
-           destination inside the product: it is how you take the product
-           somewhere else. Above the profile row, which is the other thing in
-           this zone that is about you rather than about your data.
-
-           Outside .rail-collapsible for the same reason the profile is —
-           it stays reachable in the ≤1024px bar with the nav collapsed. #}
-        {# Plain `rail-i`, not `--muted`: that modifier italicises the label
-           and exists for the "Admin paused" state, which is a condition being
-           reported rather than a place to go. This is a place to go. #}
-        <a class="rail-i{% if _path == '/how-it-works' %} is-active{% endif %}"
-           href="/how-it-works#connect">
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.4l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.5 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M14 10.5a4 4 0 0 0-5.7-.4l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.5-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-            <span class="rail-i-label">Use {{ instance_brand_short }} elsewhere</span>
-        </a>
 
         {# User row + pop-up menu — same ids/classes as the header's user
            menu so app.js wiring (trigger toggle, theme radio group)

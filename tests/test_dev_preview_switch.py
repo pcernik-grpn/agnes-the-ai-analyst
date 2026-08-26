@@ -13,6 +13,7 @@ role-switcher. It changes what RENDERS. It grants nothing.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -153,3 +154,70 @@ class TestUseAgnesElsewhere:
         """"Use Agnes elsewhere" on an instance that calls itself something
         else would be the one place the rename did not reach."""
         assert "Use {{ instance_brand_short }} elsewhere" in rail
+
+
+class TestTheCollapsedRailKeepsItsSearch:
+    """The magnifier survives the collapse; the input leaves the flow.
+
+    `.rail-search` used to join the `visibility: hidden` list wholesale. That
+    list keeps each box in place BY DESIGN, so the collapsed column showed a
+    row-height of nothing where search had been. rail.css's own comment
+    already said the magnifier should stay put — it just never did.
+    """
+
+    @pytest.fixture(scope="class")
+    def rail_css(self) -> str:
+        return (ROOT / "app" / "web" / "static" / "css" / "rail.css").read_text(encoding="utf-8")
+
+    def test_the_row_is_not_hidden_wholesale(self, rail_css):
+        block = re.search(r"\.rail\.rail-icon-mode \.rail-logo-txt,(.*?)\{", rail_css, re.S)
+        assert block, "the collapse hide-list moved"
+        assert ".rail-search," not in block.group(1), "the whole search row is hidden again — its box leaves a gap"
+
+    def test_the_input_leaves_the_flow_rather_than_going_invisible(self, rail_css):
+        """An invisible input still claims its width: 18px of icon and 42px of
+        it were sharing a 39px row, and the icon was pushed to left:-2px."""
+        assert re.search(r"\.rail\.rail-icon-mode \.rail-search-input \{\s*display: none;", rail_css)
+
+    def test_the_icon_refuses_to_shrink(self, rail_css):
+        """Out of `position: absolute` it becomes a flex item, and the collapse
+        mechanism gives items `min-width: 0` so they squeeze to nothing — right
+        for a label, wrong for the one glyph meant to survive."""
+        rule = re.search(r"\.rail\.rail-icon-mode \.rail-search-icon \{(.*?)\}", rail_css, re.S)
+        assert rule, "the collapsed-icon rule is gone"
+        assert "flex: none" in rule.group(1)
+
+    def test_the_peek_hands_back_the_full_box(self, rail_css):
+        assert re.search(r"rail-icon-mode:hover \.rail-search-input", rail_css)
+
+
+class TestTheWizardCanMakeAnAudience:
+    """The Share step asks "who gets this?" — and until now could only be
+    answered with groups someone had thought of earlier. The way out was to
+    abandon the wizard, create the group on /admin/access, and start over."""
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return (ROOT / "app" / "web" / "templates" / "admin_data_sources.html").read_text(encoding="utf-8")
+
+    def test_the_step_offers_a_new_group(self, page):
+        assert 'id="ds-wizard-newgroup"' in page
+
+    def test_it_reuses_the_one_group_drawer(self, page):
+        """Not a wizard-shaped copy of group creation — the same drawer
+        /admin/access opens, so a group comes into existence in one place."""
+        assert "AgnesGroupDrawer.open(" in page
+        assert "js/components/group_drawer.js" in page
+
+    def test_creating_one_does_not_discard_what_is_already_ticked(self, page):
+        """The shares chosen so far live in `_wizardShares`; the callback
+        refreshes the GROUP list and re-renders, and must not reset them."""
+        block = re.search(r"#ds-wizard-newgroup.*?\n  \}", page, re.S)
+        assert block, "the new-group branch moved"
+        body = block.group(0)
+        assert "_wizardGroups =" in body and "_renderShareStep()" in body
+        assert "_wizardShares" not in body, "the in-progress selections are being reset"
+
+    def test_a_failed_refresh_still_leaves_a_usable_step(self, page):
+        block = re.search(r"#ds-wizard-newgroup.*?\n  \}", page, re.S)
+        assert "catch" in block.group(0)

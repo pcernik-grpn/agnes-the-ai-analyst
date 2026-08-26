@@ -1655,7 +1655,6 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i-label,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-user-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-history {
         /* `visibility`, NOT `display` — the whole choreography depends on it.
            `display: none` took every label and the conversation region OUT OF
@@ -2239,3 +2238,56 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     }
 }
 
+
+
+/* Collapsed, the search row keeps its magnifier.
+
+   The row used to be hidden wholesale — `.rail-search` sat in the
+   `visibility: hidden` list, which keeps the BOX in flow by design, so the
+   collapsed column showed a row-height of nothing where the search had been.
+   The comment above that list already said the magnifier should stay put; it
+   just never did.
+
+   So the INPUT is what hides now, and the icon steps into the middle of the
+   narrow column to sit on the same centre line as every other icon in the
+   rail. Hovering the rail peeks it open and hands back the full box, exactly
+   as before. */
+html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search {
+    justify-content: center;
+}
+/* The input LEAVES THE FLOW rather than joining the `visibility: hidden`
+   list. That list keeps each box in place on purpose — which is right for
+   rows that should hold their shape, and wrong here: an invisible 42px input
+   still claims its width, so the 18px magnifier and it were sharing a 39px
+   row and the icon was pushed to left:-2px, clipped against the edge. */
+html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-input {
+    display: none;
+}
+html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-input,
+html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-input {
+    display: block;
+}
+html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-icon {
+    position: static;
+    left: auto;
+    /* `flex: none` is load-bearing. Taken out of `position: absolute` this
+       becomes a flex item, and the collapse mechanism gives items `min-width:
+       0` precisely so they squeeze to nothing in the narrow column — which is
+       right for a label and wrong for the one glyph that is supposed to
+       survive. Without this the icon measures 0px wide and the row is empty
+       again, which is the bug this whole rule set exists to fix. */
+    flex: none;
+    width: 18px;
+    height: 18px;
+    color: var(--ds-text-secondary);
+    transition: opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease);
+}
+/* Peeked open, the full box comes back and the icon returns to its slot. */
+html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-icon,
+html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-icon {
+    position: absolute;
+    left: 9px;
+    width: 15px;
+    height: 15px;
+    color: var(--ds-text-muted);
+}
