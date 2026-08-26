@@ -20,8 +20,16 @@ class ColumnMetadataRepository(ColumnMetadataImportMixin):
         description: Optional[str] = None,
         confidence: str = "manual",
         source: str = "manual",
+        source_ref: Optional[str] = None,
     ) -> dict:
-        """Insert or update column metadata. Returns the saved record."""
+        """Insert or update column metadata. Returns the saved record.
+
+        ``source_ref`` is accepted for signature parity with the Postgres
+        sibling but not persisted here: the DuckDB app-state schema is
+        frozen (A3 PG-first ratchet, see ``docs/migrations.md`` -> "Adding a
+        PG-only feature") and never gained a ``column_metadata.source_ref``
+        column. The capability lands on Postgres only.
+        """
         now = datetime.now(timezone.utc)
         self.conn.execute(
             """INSERT INTO column_metadata (table_id, column_name, basetype, description, confidence, source, updated_at)

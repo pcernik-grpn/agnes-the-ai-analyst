@@ -222,6 +222,45 @@ def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
     return {"rules": rules} if rules else None
 
 
+def _check_name_collision(metric_name: str, metric_id: str, source: str, source_ref: Optional[str]) -> bool:
+    """True when ``metric_name`` is already held by a DIFFERENT metric id
+    from a DIFFERENT (source, source_ref) scope — logged as a WARN, never a
+    skip.
+
+    ``metric_definitions.name`` has no unique constraint (unlike ``id``, its
+    primary key): two writers describing a metric with the same display name
+    both get their own row. That is a pre-existing gap this projector does
+    not close (closing it needs a product decision — which writer wins, or
+    whether both should even be allowed — out of scope here); this is the
+    "don't over-build it" minimum: a same-transaction check that surfaces the
+    collision instead of the write silently proceeding unremarked, so an
+    operator investigating an ambiguous `agnes catalog --metrics` lookup by
+    name has a log line pointing at both ids involved. Scoped on
+    ``(source, source_ref)``, not ``source`` alone: two source_refs of the
+    SAME source (e.g. two Keboola projects) are two independent writers too —
+    each owns its own prune scope and its own metric id — so a name they both
+    happen to use is exactly as ambiguous as one shared across sources.
+    """
+    existing = metric_repo().find_by_name(metric_name)
+    if existing is None or existing.get("id") == metric_id:
+        return False
+    if (existing.get("source") or "") == source and (existing.get("source_ref") or "") == (source_ref or ""):
+        return False
+    logger.warning(
+        "Semantic projection (%s/%s): metric name %r is already used by metric id %r from source %r "
+        "(source_ref=%r); writing %r as a separate row — metric_definitions.name has no uniqueness "
+        "constraint, so both rows will exist and a name-only lookup may be ambiguous.",
+        source,
+        source_ref,
+        metric_name,
+        existing["id"],
+        existing.get("source"),
+        existing.get("source_ref"),
+        metric_id,
+    )
+    return True
+
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -273,6 +312,13 @@ class ProjectionReport:
     columns_written: int = 0
     metrics_pruned: int = 0
     glossary_pruned: int = 0
+    # A written metric's NAME already belonged to a different id under a
+    # different source (see `_check_name_collision`) — `metric_definitions
+    # .name` has no uniqueness constraint (Task: "don't over-build this"), so
+    # this is a same-transaction, non-blocking check: the metric is still
+    # written under its own id, both rows exist, and this only counts how
+    # often that happened this pass.
+    name_collisions: int = 0
     skipped: list[dict] = field(default_factory=list)
 
 
@@ -462,6 +508,8 @@ def project_document(
             grain = grain_by_table.get(table_id)
             notes = [f"dataset grain: {grain}"] if grain else None
             metric_id = _scoped_id(source, source_ref, model_key, metric_name)
+            if _check_name_collision(metric_name, metric_id, source, source_ref):
+                report.name_collisions += 1
             metric_repo().create(
                 id=metric_id,
                 name=metric_name,
@@ -520,6 +568,11 @@ def project_document(
                     basetype=column.get("datatype"),
                     description=column.get("description"),
                     source=column_source,
+                    # Recorded, not yet scoped on: `_prune_columns` still
+                    # prunes on `(table_id, source)` alone (see its
+                    # docstring) — this is the "small housekeeping" of
+                    # capturing the value, not a prune-scope change.
+                    source_ref=source_ref,
                 )
                 field_names.add(column_name)
                 report.columns_written += 1
