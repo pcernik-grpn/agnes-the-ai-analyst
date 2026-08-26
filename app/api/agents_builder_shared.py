@@ -188,12 +188,12 @@ _BUILDER_ITEM_TYPES = frozenset({*_KNOWLEDGE_ITEM_TYPES, "plugin"})
 def _classify_knowledge(ids: List[str]) -> List[tuple]:
     """Map builder knowledge ids onto ``(item_type, item_id)`` scope rows.
 
-    Deliberately does NOT check whether the caller can reach the resource:
-    the runtime intersects every declared id with the granter's live grants
-    (`resolve_agent_authority` / `compute_agent_intersection`), so an id the
-    granter cannot reach is inert rather than dangerous, and refusing it here
-    would 422 a builder save for a package whose grant is merely being
-    reorganized.
+    Does NOT itself check whether the caller can reach the resource — that
+    is `_sync_builder_scope`'s job (the D-C2 write-gate, task C2.1), which
+    runs on the ``(item_type, item_id)`` pairs this returns and 403s a
+    non-admin writer's UNREACHABLE ``data_package``/``collection`` id before
+    it ever reaches `set_scope`. This function only resolves WHICH registry
+    an id belongs to.
 
     An id matching no registry is dropped with a log line — storing it would
     be an enforced-scope row that can never resolve.
@@ -221,7 +221,7 @@ def _classify_knowledge(ids: List[str]) -> List[tuple]:
     return out
 
 
-def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str]) -> None:
+def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str], writer_user_id: str) -> None:
     """Rewrite the agent's builder-owned ``agent_scope`` rows from a
     declaration, preserving every governance-owned row.
 
@@ -229,6 +229,17 @@ def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str])
     read and passed back through — dropping a `slack_channel` binding here
     would silently unroute a channel whose turns then fall back to the
     mentioning user's own authority.
+
+    ``writer_user_id`` is the authenticated caller making THIS save — every
+    row `set_scope` (re-)writes below is attributed to them (C2.1). Both
+    callers of this function (`create_agent`/`update_agent` in
+    `agents_admin.py`) are ownership-gated (`_load_agent(require_owner=
+    True)`), so this is always the agent's owner in practice; it is also the
+    D-C2 write-gate's WRITER — a non-admin ``writer_user_id`` may only
+    declare a ``data_package``/``collection`` id they can currently reach
+    themselves (403 ``scope_item_not_accessible`` otherwise). Preserved
+    governance rows are NOT re-checked here — they were already gated when
+    THEIR writer originally wrote them.
     """
 
     repo = agents_repo()
@@ -239,6 +250,21 @@ def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str])
     ]
     declared = _classify_knowledge(knowledge or [])
     declared += [("plugin", p.strip()) for p in (plugins or []) if (p or "").strip()]
+
+    from src.agent_scope_intersection import first_inaccessible_data_item
+
+    offender = first_inaccessible_data_item(writer_user_id, declared)
+    if offender is not None:
+        item_type, item_id = offender
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "scope_item_not_accessible",
+                "message": f"you do not currently have access to {item_type} '{item_id}' — "
+                "grant yourself access first, or ask an admin to grant it to this agent",
+            },
+        )
+
     # Dedupe, preserving order: `agent_scope`'s composite PK rejects a
     # repeated pair, and `set_scope` inserts row by row.
     seen: set = set()
@@ -248,7 +274,7 @@ def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str])
             continue
         seen.add(pair)
         items.append(pair)
-    repo.set_scope(agent_id, items)
+    repo.set_scope(agent_id, items, granted_by=writer_user_id)
 
 
 def _granted_agent_ids(user_id: str) -> set:

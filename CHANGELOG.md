@@ -12,6 +12,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Shared-agent runtime: a user an agent was shared with can now run it**
+  (remediation program Track C, C2.3). Previously only an agent's OWNER
+  could open a session against it — a `ResourceType.AGENT` grant (the
+  Library's "Share" action) only conveyed builder-read. The runtime
+  resolution sites (`POST /api/v1/agents/{slug|id}/responses`,
+  `.../sessions`, the web chat route's `agent_slug`) now resolve
+  owned-OR-shared (`agents_repo().get_runnable_by_slug` — new dual-backend
+  repo method), addressed by the agent's id for a non-owner since a slug is
+  only unique per-owner. Row-level table access policies
+  (`src/access_policy.py`) now bind `$user_email`/`$user_id`/`$user_groups`
+  to the CALLER of an `AgentPrincipal` turn, not the agent's owner — a
+  shared agent's rows are filtered per grantee, threaded from the chat
+  session's own server-side `user_email` (never a client-suppliable JWT
+  claim). Memory notebooks, PAT issuance, and all agent mutation (scope/
+  config/delete) remain owner-only — a runnable grant is run+read, never
+  manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
+  source for a future runtime agent picker).
+
+- **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
+  subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
+  ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
+  `iconEl(name)` JS helper (`chat_icons.js`). Assistant answers can now use
+  an inline icon vocabulary: `` `icon:<name>` `` tokens render as sprite
+  icons (allowlist-only — an unknown name stays plain text, and the pass
+  runs after the markdown sanitizer, building nodes itself, so it can never
+  introduce markup). The chat system prompt — both the native-sandbox
+  CLAUDE.md render and the embedded-engine workspace tarball, plus the
+  static fallback workspace — now forbids emoji outright and offers exactly
+  the names the UI renders (`chat_icons` template variable;
+  `tests/test_chat_icons.py` keeps sprite, JS allowlist and both prompts in
+  sync). Tool-call cards swap their emoji/text glyphs (⏳ ✓ ⚠ 🛡 › ✕) for
+  sprite icons tinted to the card's status accent, and the tool name drops
+  the monospace face — the header reads as the action it names, not a
+  terminal id.
+
 - **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
   env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
   collection an admin creates via the Library/API is granted to the `Everyone`
@@ -42,6 +77,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
   also cleans up sharing grants on delete, closing a gap versus the
   builder's own delete.
+- **`agent_scope` rows now record who granted them, and a non-admin writer
+  can no longer declare a data item they cannot themselves reach**
+  (remediation-program Track C2.1, staged agent-owned authority — no
+  behavior change for existing agents, a backfill attributes every
+  pre-existing row to its agent's owner). Every write to `PUT
+  /api/v1/agents/{id}/scope` and the builder-shape `knowledge` write
+  (`POST`/`PUT /api/v1/agents`) now records the authenticated caller as
+  `granted_by` (Postgres-only column — see Internal below), and refuses a
+  non-admin caller's `table`/`data_package`/`collection`/`connection` item
+  with `403 scope_item_not_accessible` when they do not currently hold it
+  themselves; an admin caller is unconditioned. `plugin`/`memory_domain`/
+  `slack_channel` items are unaffected. Runtime scope resolution is
+  unchanged by this step (still today's owner intersection) — a later task
+  uses `granted_by` to let an admin-shared agent reach items its owner
+  personally does not hold.
 
 - **`data_apps.subdomain_base` can now be set from the deployment, not only by
   hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
@@ -101,6 +151,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
+
 - **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
 - **PG-first development rule (remediation-program Track A3): the DuckDB
@@ -142,13 +203,102 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `resolve_snowflake_settings`'s read set), and first-boot seeding
   (`app/connections_seed.py`) of default Snowflake and Databricks
   `source_connections` rows from `instance.yaml`, matching the existing
-  Keboola/BigQuery seeding. These rows are not yet consulted at query time —
-  Snowflake/Databricks/BigQuery still resolve from `instance.yaml` until a
-  follow-up makes the row live — see the connection-ownership table in
+  Keboola/BigQuery seeding — see the connection-ownership table in
   `docs/DATA_SOURCES.md`.
+- **The Snowflake/BigQuery/Databricks `source_connections` row is now the
+  live source of truth, resolved fresh on every call** (D2 slice 2):
+  `resolve_snowflake_settings()`/`resolve_databricks_settings()` and
+  `get_bq_access()` check the type's default connection row first, falling
+  back to `data_source.<type>.*` instance-config only when no row is
+  registered yet (byte-compatible with every existing deploy). `get_bq_access()`'s
+  process cache is now keyed on the resolved projects rather than held
+  forever, so an admin's saved connection is visible on the very next call —
+  no restart, no explicit cache-clear, on every process. A Snowflake
+  materialized sync (and every other threaded call site — extract-init,
+  discovery, v2 schema/scan, semantic syncs, card probes) now resolves
+  against exactly the registered connection's coordinates and credential.
+- **Security: a connection's config-embedded `token_env`/`private_key_env`/
+  `private_key_passphrase_env` (Snowflake/Databricks) is now allowlist-checked
+  at write time** (`POST`/`PUT /api/admin/source-connections`), the same
+  guard already applied to the top-level `token_env` field — closing a
+  one-shot exfiltration path where an admin could point one of these at an
+  unrelated secret's env name and have it shipped out as a Snowflake/
+  Databricks credential on the first attach, now that the row is
+  load-bearing. Both connectors' credential resolvers are now allowlist-gated
+  at their single choke point, closing every consumer at once rather than
+  one call site at a time: `connectors/databricks/semantic_layer.py`'s
+  `resolve_databricks_settings()` (the live Unity Catalog ATTACH, `agnes
+  query --remote`, schema/scan discovery, the semantic-layer sync) and
+  `connectors/snowflake/settings.py`'s `resolve_snowflake_settings()` (every
+  Snowflake consumer — the scheduler's materialized pass, the
+  `query_mode='remote'` schema fetch, discovery, the semantic-layer sync, and
+  the extract-init rebuild) — both for a connection row's `token_env` and the
+  legacy `data_source.<type>.*` yaml path. A second RBAC review round
+  (2026-08-26) found Snowflake's first-round fix had only reached
+  `connectors/snowflake/extract_init.py` (now redundant defense-in-depth,
+  checked again immediately before its own ATTACH) and left every other
+  consumer resolving an unchecked env var; the fix moved into
+  `settings.py`'s shared `_resolve_secret`, the one function every named
+  lookup in the module (including the key-pair passphrase) funnels through.
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` was added to the default remote-attach
+  token-env allowlist alongside `SNOWFLAKE_PASSWORD`/`SNOWFLAKE_PRIVATE_KEY`
+  so the module's own default key-pair passphrase path keeps working
+  unconfigured.
+- **Security: the `source_connections` default/identity-repoint guard now
+  covers every way to change WHICH connection (if any) a source_type
+  resolves against — promote, demote, wipe, and delete.** Guarded from the
+  start: `PUT .../{id}` changing a connection-identity leaf in `config`. A
+  first RBAC review round (2026-08-26) added three more paths past the same
+  guard: (1) `POST`/`PUT .../{id}` with `is_default: true` demoting whichever
+  connection currently answers `resolve_source_connection(source_type)`
+  without ever touching that connection's own `config`; (2) `PUT .../{id}`
+  REPLACING `config` wholesale with an identity leaf simply absent from the
+  new config (including an empty `{"config": {}}`), previously read as
+  "untouched" rather than "wiped" (`app.connection_identity.identity_changes`
+  gained a `replace_semantics` flag for this endpoint; the yaml-overlay PATCH
+  caller is unaffected — an absent leaf there still means untouched, correct
+  for its merge semantics). A second review round (same date) closed two
+  more: (3) `PUT .../{id} {"is_default": false}` demoting the CURRENT
+  default to no default at all — `resolve_source_connection(type)` then
+  returns `None` and every unpinned registration silently falls back to the
+  legacy `data_source.<type>.*` yaml, which this slice does not delete; (4)
+  `DELETE .../{id}` on the source_type's current default — the pre-existing
+  `connection_in_use` check only ever caught tables PINNED to the deleted
+  connection via `connection_id`, never the unpinned registrations that
+  resolve through it being the default. All five now share one guard
+  (`_guard_default_repoint` for (1)/(3)/(4), `_guard_row_repoint` for the
+  `config`-identity cases) and the same 409
+  `connection_change_affects_registrations` / `confirm_connection_change`
+  contract — `DELETE` takes it as `?confirm_connection_change=true` (query
+  param, no body) rather than a JSON field. A third review round (same date)
+  closed one more: `PUT .../{id}` with a bare TOP-LEVEL `token_env` (a
+  sibling of `config`, not nested inside it) and no `config`/`is_default`
+  key skipped `_guard_row_repoint` entirely — `connectors.snowflake.
+  settings`/`connectors.databricks.semantic_layer` fall back to this column
+  whenever `config.token_env`/`config.private_key_env` is unset (the shape
+  a legacy-seeded row carries), so it is an identity leaf too, and
+  `_guard_row_repoint` now compares it alongside `config`.
 
 ### Changed
 
+- **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
+  Databricks panes now save the connection onto the `source_connections` ROW
+  (`POST`/`PUT /api/admin/source-connections*` + the row's own vault slot via
+  `.../secret`), not the `data_source.<type>` server-config yaml overlay** (D2
+  slice 2). The "restart the instance so the scheduler and workers pick up
+  connection settings" warning is gone from both panes — a row is read live
+  by every process, so there is nothing left to restart for; the Databricks
+  pane is a straight line to `/admin/tables` again (no held-open second
+  click). The connection-repoint confirmation (409
+  `connection_change_affects_registrations` / `confirm_connection_change`)
+  moves with it, onto `PUT /api/admin/source-connections/{id}` for Snowflake/
+  Databricks rows. **Operators who relied on the old flow**: a
+  `data_source.snowflake.*`/`data_source.databricks.*` yaml block hand-edited
+  via `/admin/server-config` is now IGNORED once a row of that type exists
+  (the row wins) — re-point the connection through `/admin/data-sources` or
+  `/admin/connections` instead. Multi-connection-per-type stays out of scope
+  for this slice — one Snowflake/Databricks connection per instance, as
+  before.
 - **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
   `experience`, `home_route` and `studio_enabled` knobs stop rewriting
   `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
@@ -167,6 +317,37 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   is unaffected (it pins deployment-provisioned backing, not a presentation
   choice, so it is out of scope). See the new "Config ownership map" in
   `docs/CONFIGURATION.md`.
+- **A THIRD-PARTY admin-granted agent scope item now reaches its agent
+  unconditionally, instead of being silently narrowed to the owner's own
+  grants** (remediation-program Track C2.2, consuming C2.1's `granted_by`).
+  `src/agent_scope_intersection.py::resolve_agent_authority` replaces
+  `compute_agent_intersection`: a `'selected'`-mode `agent_scope` row whose
+  `granted_by` is a THIRD PARTY — distinct from the agent's own owner — who
+  is (currently) an admin resolves unconditionally — a `data_package` an
+  admin shared with an agent now expands to its member tables even when the
+  agent's OWNER holds no grant on it at all, closing the "package invisible
+  to an admin-built agent" bug class. Every other row — a non-admin
+  granter, OR a granter who IS the agent's own owner (including an admin
+  owner) — still narrows to `item ∩ that GRANTER's CURRENT access` —
+  today's owner-intersection shape, just keyed to whoever wrote the row
+  instead of hard-coded to the agent's owner, so it now also stops
+  resolving if the ORIGINAL GRANTER (not the owner, not any future caller)
+  later loses access. **On Postgres only** — DuckDB has no `granted_by`
+  column (C2.1), so every row there reads back with no granter and falls
+  back to the agent's owner, making this a no-op on DuckDB and a
+  byte-identical no-op on Postgres for every agent whose scope predates C2
+  (migration 0073 backfilled `granted_by := owner_user_id`) — including for
+  an agent whose owner is itself an admin, which always narrows rather than
+  taking the unconditioned branch.
+  `AgentPrincipal.intersection` (the broker/pat-resolver, chat spawn, and
+  every table/marketplace/MCP seam that reads it) is unaffected in shape —
+  only its computation changed. Also fixes a related gap found while
+  building this: `agent_scope.set_scope`'s full-replace (Postgres) now
+  preserves the EXISTING `granted_by` for a row that is re-declared
+  unchanged, so a later owner save (e.g. the `/agents` builder syncing an
+  unrelated `knowledge`/`plugins` edit, which reads back and re-submits
+  every governance-owned row) can no longer silently downgrade an
+  admin-granted row to owner-granted.
 
 ### Removed
 
@@ -218,6 +399,28 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   targets by design, so post-login return to the app is a separate change to
   that guard rather than a side effect of this one.
 
+- Web chat: a user message's hover actions (timestamp + copy) now hang
+  BELOW the bubble instead of renting an invisible second row inside it —
+  a one-line message no longer renders as a two-row-tall bubble. On touch
+  devices (no hover) the row stays visible and the turn reserves the space.
+- Web chat: on a history reload, a multi-part assistant turn (text → tool
+  card → text) now carries its sources chips, copy/actions row, "Ask again"
+  and collapse cap on the turn's LAST text segment — where the live stream
+  already put them — instead of stapling them after the first segment,
+  mid-turn. The reload timestamp also reads the row's real `created_at` on
+  every segment rather than "now" on continuations.
+- Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
+  The sessions/messages endpoints (incl. copresence) pre-stringified their
+  naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
+  that labels them `+00:00` — the browser then parsed the offset-less
+  string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
+  They now return raw datetimes and the encoder stamps the offset.
+- Web chat: the permanent "Connected." pill is gone — connected is the
+  normal state and reconnection is automatic, so the status surfaces only
+  when something is in progress or wrong ("Resuming session…", warnings,
+  errors), as a pill below the thread header. "Copy transcript" moves to
+  the header's right edge (the removed pill's spot) restyled as a quiet
+  ghost button, and a cleared status no longer leaves an empty dot-pill.
 - **The GCP Cloud Logging overlay can no longer take an instance down**
   (#1557, #1558; observed live as a 9-minute full outage on a routine
   auto-upgrade tick). The gcplogs docker log driver authenticates as the VM

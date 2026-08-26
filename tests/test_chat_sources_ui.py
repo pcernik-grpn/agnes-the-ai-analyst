@@ -85,16 +85,16 @@ def test_the_clipboard_keeps_the_fence():
     (next_actions is stripped — suggestions are chrome; provenance is not.)"""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(primary, stripSourcesFence" not in js
+    assert "attachMessageActions(tailArticle, stripSourcesFence" not in js
 
 
 def test_chips_come_from_the_server_verdict_only():
     """The client has no record of what actually ran; a second opinion derived
     from less information would be worse than none."""
     js = _read(CHAT_JS)
-    assert "renderSourcesChips(bubble, m.sources)" in js
+    assert "renderSourcesChips(tailBubble, m.sources)" in js
     assert 'renderSourcesChips(currentAssistantBody.closest(".msg-bubble"), frame && frame.sources)' in js
 
 

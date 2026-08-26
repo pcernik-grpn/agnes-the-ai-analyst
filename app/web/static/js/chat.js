@@ -8,6 +8,7 @@ import {
   noteTurnEnded as onboardingNoteTurnEnded,
 } from "./chat_onboarding.js";
 import { initChatDashboard, updateDashboardSuggestions } from "./chat_dashboard.js";
+import { applyInlineIcons, iconEl } from "./chat_icons.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -81,6 +82,11 @@ function renderMarkdownSafe(text) {
   // Parsing into a <template> is inert: no network fetches, no handler firing.
   tpl.innerHTML = marked.parse(text || "");
   _sanitizeFragment(tpl.content);
+  // AFTER the sanitizer on purpose: the icon pass builds its <svg><use>
+  // nodes itself from allowlisted names (see chat_icons.js), so it can add
+  // nothing the sanitizer would need to see — while running it earlier would
+  // let the sanitizer's attribute walk touch nodes this pass just vouched for.
+  applyInlineIcons(tpl.content);
   return tpl.innerHTML;
 }
 
@@ -1591,7 +1597,8 @@ async function openSession(chatId, wsUrlOverride) {
   // Show a "Resuming session…" status immediately after the TCP handshake and
   // before the ready frame arrives. For a fresh spawn this reads as a brief
   // connecting state; for a paused session (~1–2 s resume) it tells the user
-  // something is happening. The ready frame handler replaces it with "Connected."
+  // something is happening. The ready frame handler clears it — connected is
+  // the normal state and gets no pill.
   setStatus("Resuming session…", "info");
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
@@ -1635,7 +1642,12 @@ function handleFrame(frame) {
   switch (frame.type) {
     case "ready":
     case "runner_ready":
-      setStatus("Connected.", "ok");
+      // Connected is the NORMAL state — showing a permanent "Connected."
+      // pill told the user about infrastructure they never asked about
+      // (and reconnection is automatic anyway). Clear the transient
+      // "Resuming session…" line instead; the status surfaces only when
+      // something is wrong (warn/error) or in progress (info).
+      setStatus("");
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
@@ -2046,10 +2058,13 @@ function attachMessageActions(article, copyText) {
  *  stream renders card-then-text for the same turn. Order is array order, and
  *  the only way to guarantee that is to never reorder.
  *
- *  The first text bubble is the PRIMARY article — it owns the avatar,
- *  timestamp, sender attribution, sources chips, the copy row and the collapse
- *  cap. Later text parts are continuation bubbles under the card above them,
- *  which is what a sealed live segment looks like.
+ *  The first text bubble is the PRIMARY article — it owns the avatar and the
+ *  sender attribution. The turn's LAST text bubble carries the tail: sources
+ *  chips, the copy/actions row, latest-assistant marking and the collapse cap
+ *  — exactly where finalizeAssistantMessage puts them on the live turn, so a
+ *  reload doesn't move the copy row from the end of the answer to the middle.
+ *  Text parts between the two are continuation bubbles under the card above
+ *  them, which is what a sealed live segment looks like.
  *
  *  A row written before v123 has no `parts`; it falls back to `content` plus
  *  the positionless `tool_calls` after it. That is not a degraded choice but
@@ -2063,26 +2078,25 @@ function renderMessage(m) {
   //: document.
   const nodes = [];
   let primary = null;
+  let tailArticle = null;
 
   const pushTextBubble = (text) => {
-    const isPrimary = primary === null;
-    const article = isPrimary
-      ? createMessageShell({ role: m.role, createdAt: m.created_at })
-      : createMessageShell({ role: m.role });
+    // Every shell gets the row's created_at: whichever bubble ends up
+    // carrying the actions row reads its timestamp from dataset.createdAt,
+    // and the tail of a segmented turn is a continuation, not the primary.
+    const article = createMessageShell({ role: m.role, createdAt: m.created_at });
     const body = article.querySelector(".msg-body");
     body.innerHTML = renderAnswerMarkdown(text || "");
     enhanceCodeBlocks(body);
     enhanceTables(body);
     renderMermaidBlocks(body);
-    if (isPrimary) {
+    if (primary === null) {
       primary = article;
     } else {
-      // A continuation is the same speaker mid-answer: no second avatar, no
-      // second actions row. Both belong to the message, not to a segment.
+      // A continuation is the same speaker mid-answer: no second avatar.
       article.classList.add("is-continuation");
-      const actions = article.querySelector(".msg-actions");
-      if (actions) actions.remove();
     }
+    tailArticle = article;
     nodes.push(article);
     return article;
   };
@@ -2137,20 +2151,24 @@ function renderMessage(m) {
     bubble.insertBefore(who, bubble.querySelector(".msg-body"));
   }
 
-  // Chips stay on the primary bubble, so they read as part of the answer.
-  if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
+  // Chips and the actions row belong to the turn's LAST bubble — where the
+  // live path (finalizeAssistantMessage) puts them — so they read as the end
+  // of the answer on reload too, not a tail stapled after its first segment.
+  const tailBubble = tailArticle.querySelector(".msg-bubble");
+  if (m.role === "assistant") renderSourcesChips(tailBubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
   // only (see the note on stripSourcesFence) — but drops the next_actions
   // trailer: suggestions are chrome, and a copied transcript loses nothing
   // without them. It carries the WHOLE answer, not just this bubble's segment.
-  attachMessageActions(primary, stripNextActionsFence(m.content || ""));
+  attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""));
 
   for (const node of nodes) $("chat-messages").appendChild(node);
-  if (m.role === "assistant") _markLatestAssistant(primary);
-  // Measured after insertion, and against the primary article only: the cards
-  // and continuations are siblings, not part of the answer's height.
-  maybeMakeCollapsible(primary);
+  if (m.role === "assistant") _markLatestAssistant(tailArticle);
+  // Measured after insertion, and against the tail article only: the cards
+  // and earlier segments are siblings, not part of the answer's height —
+  // same as the live turn, which caps only its final segment.
+  maybeMakeCollapsible(tailArticle);
   maybeScrollToBottom();
 }
 
@@ -2723,9 +2741,10 @@ function finalizeAssistantMessage(frame) {
 // markdown; everything else is pretty-printed JSON. A FAILED call opens
 // itself — its output is the diagnosis.
 //
-// Status icons: ⏳ = running, ✓ = done, ⚠ = error, ⊘ = cancelled. The
-// status class on the wrapper tints the left border accordingly so a
-// failed tool call is unmistakable at a glance.
+// Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
+// check = done, triangle-alert = error. The status class on the wrapper
+// tints the left border accordingly so a failed tool call is unmistakable
+// at a glance.
 
 const _TOOL_RESULT_PREVIEW_ROWS = 5;
 const _TOOL_RESULT_TEXT_PREVIEW_CHARS = 280;
@@ -2886,7 +2905,7 @@ function renderApprovalRequest(frame) {
   const icon = document.createElement("span");
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
-  icon.textContent = "\u{1F6E1}️";
+  icon.appendChild(iconEl("shield"));
   head.appendChild(icon);
   const name = document.createElement("span");
   name.className = "cloud-chat-tool-name";
@@ -3246,10 +3265,10 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const icon = document.createElement("span");
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
-  if (status === "running") icon.textContent = "⏳";
-  else if (wrapIsError) icon.textContent = "⚠";
-  else if (state === "output-available") icon.textContent = "✓";
-  if (icon.textContent) head.appendChild(icon);
+  if (status === "running") icon.appendChild(iconEl("hourglass"));
+  else if (wrapIsError) icon.appendChild(iconEl("triangle-alert"));
+  else if (state === "output-available") icon.appendChild(iconEl("check"));
+  if (icon.firstChild) head.appendChild(icon);
 
   // A semantic-layer lookup is the one tool call that is PROVENANCE rather
   // than plumbing: it says the answer you are reading was built on the
@@ -3291,7 +3310,7 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const chevron = document.createElement("span");
   chevron.className = "cloud-chat-tool-chevron";
   chevron.setAttribute("aria-hidden", "true");
-  chevron.textContent = "›";
+  chevron.appendChild(iconEl("chevron-right"));
   head.appendChild(chevron);
 
   wrap.appendChild(head);
@@ -3349,7 +3368,7 @@ function renderToolCallEnd(frame) {
   // is the one body a reader must not have to know to click for.
   if (isError) wrap.open = true;
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
-  if (icon) icon.textContent = isError ? "⚠" : "✓";
+  if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
 
   // Timing meta — "running…" → "1.2s" if we tracked startedAt.
   const meta = wrap.querySelector(".cloud-chat-tool-meta");
@@ -3782,7 +3801,7 @@ function _ensurePreviewPane() {
   closeBtn.type = "button";
   closeBtn.className = "btn btn-ghost btn-sm cloud-chat-preview-close-btn";
   closeBtn.setAttribute("aria-label", "Close preview");
-  closeBtn.textContent = "✕";
+  closeBtn.appendChild(iconEl("x"));
   closeBtn.onclick = () => _teardownPreviewPane();
   head.appendChild(closeBtn);
   pane.appendChild(head);

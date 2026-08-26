@@ -97,6 +97,13 @@ class AgentScope(Base):
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     item_type: Mapped[str] = mapped_column(String, nullable=False)
     item_id: Mapped[str] = mapped_column(String, nullable=False)
+    # Remediation Track C, task C2.1: the user id who wrote this row — PG-only
+    # under the A3 ratchet (migrations/versions/
+    # 0073_agent_scope_granted_by.py), no DuckDB counterpart / no SCHEMA_VERSION
+    # bump. Feeds the D-C2 staged authority split (task C2.2): admin-granted
+    # rows resolve unconditioned, self-granted rows resolve narrowed to the
+    # granter's own live access.
+    granted_by: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (PrimaryKeyConstraint("agent_id", "item_type", "item_id", name="pk_agent_scope"),)
 

@@ -538,7 +538,6 @@
   .ds-wguide a { color: var(--ds-primary); }
 
   .ds-bqcred, .ds-sfcred, .ds-dbxcred { display: flex; align-items: center; gap: 8px; min-height: 26px; }
-  .ds-dbx-saved-notice { margin-top: 4px; font-size: 13px; }
 
   /* ── Step 2 (BigQuery): manual rows editor ── */
   .ds-bqrow, .ds-sfrow { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
@@ -1164,12 +1163,8 @@
             <label for="ds-dbx-token">Token <span style="color:var(--ds-accent-danger-ink)">*</span></label>
             <input type="password" id="ds-dbx-token" placeholder="paste workspace PAT" autocomplete="off">
             <div class="ds-dbxcred" id="ds-dbxcred"><span class="ds-loading" style="padding:4px 0;">Checking credential…</span></div>
-            <div class="field-hint">Stored write-only in the server vault as <code>DATABRICKS_TOKEN</code>.</div>
+            <div class="field-hint">Stored write-only in this connection's own server vault slot.</div>
           </div>
-          {# Post-save notice — restart-required, and where a credential was
-             actually stored. Written by _renderDbxSavedNotice(); this branch of
-             the wizard has no step 2 to carry it on. #}
-          <div class="ds-dbx-saved-notice" id="ds-dbx-saved-notice" style="display:none;"></div>
           <div class="ds-wsl-opt">
             <div class="ds-wsl-opt__head" style="cursor:default;">Live or materialized, SQL warehouse</div>
             <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs on the SQL warehouse) or <strong>materialized</strong>
@@ -1298,7 +1293,6 @@
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
 const API_REGISTER_TABLE = "/api/admin/register-table";
-const API_SERVER_CONFIG = "/api/admin/server-config";
 
 // Error text for a failed register-table call. `register-table` answers a
 // FAILED remote-extract rebuild with 500 + `{status:"rebuild_failed", detail,
@@ -2826,7 +2820,7 @@ function _setWizSource(src) {
     _updateSfAuthUI();
   } else if (src === "databricks") {
     connectBtn.style.display = _wizardStep === 1 ? "" : "none";
-    connectBtn.textContent = _dbxSaveDone ? "Continue to Tables →" : "Save & continue";
+    connectBtn.textContent = "Save & continue";
     _loadDbxConfigAndStatus();
   } else {
     // csv / jira are guidance, not forms — nothing to submit.
@@ -2861,124 +2855,46 @@ function _updateSfAuthUI() {
   _syncDropdownFromSelect(sel);
 }
 
-/* POST /api/admin/server-config answers `restart_required: true` and resets
-   only the IN-PROCESS instance-config cache. This wizard is the first
-   server-config writer outside /admin/server-config (which has its own restart
-   banner), so without surfacing it a role-split deployment (api/gateway/worker
-   as separate processes) would register tables against a config the scheduler
-   has not read yet, with nothing telling the operator to bounce it. */
-let _sfRestartRequired = false;
+/* D2.3: the Snowflake connection (coordinates + auth_type) lives on this
+   row's `config`, not the `data_source.snowflake` server-config yaml overlay
+   — a row is read live by every process, so there is no cross-process
+   staleness left to warn the operator about, and the restart banner this
+   comment used to describe is gone with it. `_sfConnId` is null until the
+   wizard has loaded (or created) the instance's one snowflake connection;
+   the wizard never creates a second one (multi-connection-per-type is out
+   of scope for this slice — see docs/superpowers/plans/
+   2026-08-26-derived-connection-model.md). */
+let _sfConnId = null;
 
-let _sfEnvNames = {
-  token_env: "SNOWFLAKE_PASSWORD",
-  private_key_env: "SNOWFLAKE_PRIVATE_KEY",
-  private_key_passphrase_env: "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
-};
-
-function _defaultSfEnvNames() {
-  return {
-    token_env: "SNOWFLAKE_PASSWORD",
-    private_key_env: "SNOWFLAKE_PRIVATE_KEY",
-    private_key_passphrase_env: "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
-  };
-}
-
-/* GET /api/admin/server-config redacts every key whose name matches
-   `_is_secret_key` — which includes `token_env`, `private_key_env` and
-   `private_key_passphrase_env`, because the KEY signals it points at a
-   credential (app/api/admin.py::_redact). Those fields hold env-var NAMES,
-   not values, but the read cannot tell us which: once the wizard has
-   persisted them, they come back as the `***` sentinel. Taking the value
-   straight through made the next save PUT the password to
-   /api/admin/datasource-secrets/*** — rejected, so a second pass through
-   the wizard could never store or rotate a credential. A name is only
-   accepted if it has the shape of one; anything else falls back. */
-const _ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/* Set when the config carried a credential variable name we had to discard as
-   unreadable. Falling back to the default is right for the overwhelmingly
-   common case (the operator never changed it), but we cannot TELL the default
-   from a custom name through the redaction — and a custom name is env-only by
-   design at every layer: `PUT /api/admin/datasource-secrets/{name}` refuses
-   anything outside `DATA_SOURCE_SECRET_NAMES`, and `datasource_secret()`
-   raises for the same set, so the vault never holds it. Storing under the
-   default there would report "vault" for a credential the backend never reads.
-   So say so rather than guess silently. */
-let _sfEnvNamesRedacted = false;
-
-/* Names a credential was actually stored under during this save, so the step-2
-   banner can say so once rather than warning on every page open. */
-let _sfStoredUnder = [];
-
-/* Shown only after a credential was actually stored, and only then, because
-   `token_env` comes back redacted on EVERY instance that has ever configured
-   Snowflake — a note rendered off `_sfEnvNamesRedacted` alone would fire for the
-   overwhelming majority that use the default names, which is noise that trains
-   operators to ignore it. Phrased as what happened rather than as a warning
-   about what might be wrong. */
-function _storedUnderNote(names) {
-  return (
-    "Credential stored under " + names.join(" / ") + ". If this instance is configured to read a "
-    + "different variable name, that name cannot be shown here (the server redacts it) and cannot be "
-    + "stored either — set the credential in the environment under your own name instead."
-  );
-}
-
-/* Resolve one credential-variable name from the config, reporting whether a
-   value had to be discarded: `[name, redacted]`. Shared by the Snowflake and
-   Databricks paths — the redaction is a property of `_is_secret_key`, not of a
-   connector, so both need the identical guard. */
-function _envNameOr(fromConfig, fallback) {
-  if (_ENV_NAME_RE.test(fromConfig || "")) return [fromConfig, false];
-  return [fallback, !!fromConfig];
-}
-
-function _sfEnvNameOr(fromConfig, fallback) {
-  const [name, redacted] = _envNameOr(fromConfig, fallback);
-  if (redacted) _sfEnvNamesRedacted = true;
-  return name;
-}
-
+/* The connection's own vault slot (`kind="storage"`) holds ONE secret at a
+   time — whichever auth_type is active. Both the password and key-pair
+   badges below read the SAME status: there is nothing to tell apart, unlike
+   the old per-env-var-name status the yaml-overlay path used to fetch. */
 async function _loadSfConfigAndStatus() {
   const hostPassword = document.getElementById("ds-sfcred-password");
   const hostKey = document.getElementById("ds-sfcred-key");
   if (!_sfConfigLoaded) {
     try {
-      const r = await fetch(API_SERVER_CONFIG, { credentials: "include" });
-      const data = r.ok ? await r.json() : { sections: {} };
-      const sf = (data.sections && data.sections.data_source && data.sections.data_source.snowflake) || {};
+      const r = await fetch(`${API_CONNECTIONS}?source_type=snowflake`, { credentials: "include" });
+      const rows = r.ok ? await r.json() : [];
+      const row = rows[0] || null;
+      _sfConnId = row ? row.id : null;
+      const sf = (row && row.config) || {};
       document.getElementById("ds-sf-account").value = sf.account || "";
       document.getElementById("ds-sf-user").value = sf.user || "";
       document.getElementById("ds-sf-database").value = sf.database || "";
       document.getElementById("ds-sf-warehouse").value = sf.warehouse || "";
       document.getElementById("ds-sf-role").value = sf.role || "";
-      const authType = sf.auth_type || "password";
-      document.getElementById("ds-sf-auth-type").value = authType;
-      _sfEnvNames = {
-        token_env: _sfEnvNameOr(sf.token_env, _sfEnvNames.token_env),
-        private_key_env: _sfEnvNameOr(sf.private_key_env, _sfEnvNames.private_key_env),
-        private_key_passphrase_env: _sfEnvNameOr(sf.private_key_passphrase_env, _sfEnvNames.private_key_passphrase_env),
-      };
+      document.getElementById("ds-sf-auth-type").value = sf.auth_type || "password";
       _updateSfAuthUI();
+      const hasSecret = !!(row && row.has_secret);
+      _sfCredStatus = {
+        password: { source: hasSecret ? "vault" : "unset", has_value: hasSecret },
+        key: { source: hasSecret ? "vault" : "unset", has_value: hasSecret },
+      };
       _sfConfigLoaded = true;
     } catch (e) {
       // leave inputs empty and let the admin fill them in
-    }
-  }
-  if (!_sfCredStatus) {
-    try {
-      const r = await fetch("/api/admin/datasource-secrets", { credentials: "include" });
-      const data = r.ok ? await r.json() : { secrets: [] };
-      const secrets = data.secrets || [];
-      _sfCredStatus = {
-        password: secrets.find((s) => s.name === _sfEnvNames.token_env) || { source: "unset", has_value: false },
-        key: secrets.find((s) => s.name === _sfEnvNames.private_key_env) || { source: "unset", has_value: false },
-      };
-    } catch (e) {
-      _sfCredStatus = {
-        password: { source: "unset", has_value: false },
-        key: { source: "unset", has_value: false },
-      };
     }
   }
   _renderSfCredStatus(hostPassword, "password");
@@ -3002,6 +2918,14 @@ function _renderSfCredStatus(host, kind) {
   }
 }
 
+/* D2.3: the passphrase (key-pair auth only) has no slot on the connection
+   row's own vault — that slot holds ONE secret (the password OR the private
+   key, whichever `auth_type` is active) — so it keeps going through the
+   generic named-secret vault under its well-known default name, the same
+   fallback `connectors.snowflake.settings._resolve_secret` reads when the
+   row's `config` does not carry a custom `private_key_passphrase_env`. */
+const _SF_PASSPHRASE_ENV_DEFAULT = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
+
 async function _saveSnowflakeAndContinue() {
   const err = document.getElementById("ds-wizard-error");
   const account = document.getElementById("ds-sf-account").value.trim();
@@ -3020,60 +2944,43 @@ async function _saveSnowflakeAndContinue() {
   }
   if (authType === "password") {
     if ((!_sfCredStatus || !_sfCredStatus.password || !_sfCredStatus.password.has_value) && !password) {
-      err.textContent = `Snowflake password is required. Paste it below or set ${_sfEnvNames.token_env} in Instance secrets.`;
+      err.textContent = "Snowflake password is required.";
       err.style.display = "block";
       return;
     }
   } else {
     if ((!_sfCredStatus || !_sfCredStatus.key || !_sfCredStatus.key.has_value) && !privateKey) {
-      err.textContent = `Snowflake private key is required. Paste it below or set ${_sfEnvNames.private_key_env} in Instance secrets.`;
+      err.textContent = "Snowflake private key is required.";
       err.style.display = "block";
       return;
     }
   }
-  /* Deliberately does NOT write token_env / private_key_env /
-     private_key_passphrase_env. Those keys come back from
-     GET /api/admin/server-config redacted (`_is_secret_key` matches
-     "token"/"private"), so the wizard cannot know which name is configured —
-     and writing its fallback back would REPLACE an operator's custom name with
-     the default, breaking every Snowflake query and sync until someone repaired
-     the config by hand. Before the shape guard the wizard POSTed the `***`
-     sentinel here, which `_strip_redacted_sentinels` dropped server-side, so the
-     write was a harmless no-op; a plausible-looking default is not.
-
-     Omitting them loses nothing: `resolve_snowflake_settings` defaults each name
-     to exactly what this wizard stores the credential under (SNOWFLAKE_PASSWORD
-     / SNOWFLAKE_PRIVATE_KEY / SNOWFLAKE_PRIVATE_KEY_PASSPHRASE), so a first-time
-     setup resolves identically and an instance with its own names keeps them.
-
-     `role` is omitted when blank for the same reason: POST deep-merges per leaf,
-     so a present-but-empty `role` would overwrite a stored one, and the prefill
-     is empty whenever the config read failed. */
-  const sf = { account, user, database, warehouse, auth_type: authType };
-  if (role) sf.role = role;
+  const config = { account, user, database, warehouse, role, auth_type: authType };
   try {
     /* Every leaf this wizard sends is a connection-identity leaf, so on an
-       instance that already has Snowflake rows the server refuses with 409
-       until the operator confirms. saveConnectionConfig shows the blast radius
-       and re-sends on confirm — without it this form would be a dead end for
-       credential rotation on exactly the instances that have data. */
-    const saved = await window.saveConnectionConfig(API_SERVER_CONFIG, {
-      sections: { data_source: { snowflake: sf } },
-    });
+       instance whose Snowflake connection already has registrations the
+       server refuses with 409 until the operator confirms. saveConnectionConfig
+       shows the blast radius and re-sends on confirm — without it this form
+       would be a dead end for credential rotation on exactly the instances
+       that have data. Update the existing row if the wizard found one (one
+       connection per source_type in this slice — see the module-level note
+       on `_sfConnId`); otherwise create it. */
+    const saved = _sfConnId
+      ? await window.saveConnectionConfig(`${API_CONNECTIONS}/${_sfConnId}`, { config }, { method: "PUT" })
+      : await window.saveConnectionConfig(API_CONNECTIONS, {
+          name: "snowflake", source_type: "snowflake", config, is_default: true,
+        });
     if (saved.cancelled) return;
-    if (!saved.ok) throw new Error(window.apiDetailText(saved.data.detail, `server-config save failed (${saved.status})`));
-    const savedCfg = saved.data || {};
-    _sfRestartRequired = !!savedCfg.restart_required;
-    const storedUnder = [];
+    if (!saved.ok) throw new Error(window.apiDetailText(saved.data.detail, `connection save failed (${saved.status})`));
+    _sfConnId = saved.data.id;
     if (!_sfCredStatus) _sfCredStatus = { password: { source: "unset", has_value: false }, key: { source: "unset", has_value: false } };
     if (authType === "password" && password) {
-      const rp = await fetch(`/api/admin/datasource-secrets/${encodeURIComponent(_sfEnvNames.token_env)}`, {
+      const rp = await fetch(`${API_CONNECTIONS}/${_sfConnId}/secret`, {
         method: "PUT", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ value: password }),
+        body: JSON.stringify({ value: password, kind: "storage" }),
       });
       if (!rp.ok) throw new Error("password secret save failed");
-      storedUnder.push(_sfEnvNames.token_env);
       _sfCredStatus.password = { source: "vault", has_value: true };
       // Clear before redrawing: the badge reads "ready to save" off a
       // non-empty input, so rendering first shows a stored credential as
@@ -3082,28 +2989,25 @@ async function _saveSnowflakeAndContinue() {
       _renderSfCredStatus(null, "password");
     }
     if (authType === "key_pair" && privateKey) {
-      const rk = await fetch(`/api/admin/datasource-secrets/${encodeURIComponent(_sfEnvNames.private_key_env)}`, {
+      const rk = await fetch(`${API_CONNECTIONS}/${_sfConnId}/secret`, {
         method: "PUT", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ value: privateKey }),
+        body: JSON.stringify({ value: privateKey, kind: "storage" }),
       });
       if (!rk.ok) throw new Error("private key secret save failed");
-      storedUnder.push(_sfEnvNames.private_key_env);
       _sfCredStatus.key = { source: "vault", has_value: true };
       document.getElementById("ds-sf-private-key").value = "";
       _renderSfCredStatus(null, "key");
     }
     if (authType === "key_pair" && passphrase) {
-      const rpp = await fetch(`/api/admin/datasource-secrets/${encodeURIComponent(_sfEnvNames.private_key_passphrase_env)}`, {
+      const rpp = await fetch(`/api/admin/datasource-secrets/${encodeURIComponent(_SF_PASSPHRASE_ENV_DEFAULT)}`, {
         method: "PUT", credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ value: passphrase }),
       });
       if (!rpp.ok) throw new Error("passphrase secret save failed");
-      storedUnder.push(_sfEnvNames.private_key_passphrase_env);
       document.getElementById("ds-sf-key-passphrase").value = "";
     }
-    _sfStoredUnder = storedUnder;
     _sfConfigLoaded = true;
     _setWizStep(2);
     _renderSfRowsEditor();
@@ -3113,68 +3017,32 @@ async function _saveSnowflakeAndContinue() {
   }
 }
 
-const _DBX_TOKEN_ENV_DEFAULT = "DATABRICKS_TOKEN";
-
-/* The variable name this instance is configured to read (`data_source.
-   databricks.token_env`), which the backend honours — `resolve_databricks_
-   settings` reads THAT env var, never the default, so writing the PAT under
-   the default name while the backend reads another one reports a stored
-   credential the backend can never see. Resolved through the same shape guard
-   the Snowflake path uses, because the config read redacts it. */
-let _dbxTokenEnv = _DBX_TOKEN_ENV_DEFAULT;
-
-/* Set after a save that has something the operator must be told: the config
-   POST always reports `restart_required`, and a stored credential may have
-   landed under a name other than the one this instance reads. Unlike the
-   Snowflake path there is no step 2 to carry the notice on — this wizard's
-   Databricks branch closes and navigates to /admin/tables — so the notice is
-   shown here and the navigation waits for a second, deliberate click. */
-let _dbxSavedNotices = [];
-let _dbxSaveDone = false;
-
-/* The post-save notice, rendered under the token field rather than in the
-   error box: nothing failed, and the red error styling would say otherwise. */
-function _renderDbxSavedNotice() {
-  const host = document.getElementById("ds-dbx-saved-notice");
-  if (!host) return;
-  host.innerHTML = _dbxSavedNotices
-    .map((n) => `<span style="display:block; margin-top:6px; color:${n.tone};">${_esc(n.text)}</span>`)
-    .join("");
-  host.style.display = _dbxSavedNotices.length ? "block" : "none";
-  const btn = document.getElementById("ds-wizard-connect-btn");
-  if (btn) btn.textContent = _dbxSaveDone ? "Continue to Tables →" : "Save & continue";
-}
-
-function _resetDbxSaveDone() {
-  _dbxSaveDone = false;
-  _dbxSavedNotices = [];
-  _renderDbxSavedNotice();
-}
+/* D2.3: the Databricks connection (host/warehouse_id/catalog) lives on this
+   row's `config`, not the `data_source.databricks` server-config yaml
+   overlay — a row is read live by every process, so a save no longer needs
+   the "restart the instance" notice this block used to carry, and the
+   wizard is a straight line to /admin/tables again (see `_saveDatabricksAndContinue`).
+   `_dbxConnId` is null until the wizard has loaded (or created) the
+   instance's one databricks connection — see the identical note on
+   `_sfConnId` above. */
+let _dbxConnId = null;
 
 async function _loadDbxConfigAndStatus() {
   const hostCred = document.getElementById("ds-dbxcred");
   if (!_dbxConfigLoaded) {
     try {
-      const r = await fetch(API_SERVER_CONFIG, { credentials: "include" });
-      const data = r.ok ? await r.json() : { sections: {} };
-      const dbx = (data.sections && data.sections.data_source && data.sections.data_source.databricks) || {};
+      const r = await fetch(`${API_CONNECTIONS}?source_type=databricks`, { credentials: "include" });
+      const rows = r.ok ? await r.json() : [];
+      const row = rows[0] || null;
+      _dbxConnId = row ? row.id : null;
+      const dbx = (row && row.config) || {};
       document.getElementById("ds-dbx-host").value = dbx.host || "";
       document.getElementById("ds-dbx-warehouse").value = dbx.warehouse_id || "";
       document.getElementById("ds-dbx-catalog").value = dbx.catalog || "";
-      _dbxTokenEnv = _envNameOr(dbx.token_env, _DBX_TOKEN_ENV_DEFAULT)[0];
+      _dbxCredStatus = { source: row && row.has_secret ? "vault" : "unset", has_value: !!(row && row.has_secret) };
       _dbxConfigLoaded = true;
     } catch (e) {
       // leave inputs empty and let the admin fill them in
-    }
-  }
-  if (!_dbxCredStatus) {
-    try {
-      const r = await fetch("/api/admin/datasource-secrets", { credentials: "include" });
-      const data = r.ok ? await r.json() : { secrets: [] };
-      const row = (data.secrets || []).find((s) => s.name === _dbxTokenEnv);
-      _dbxCredStatus = row || { source: "unset", has_value: false };
-    } catch (e) {
-      _dbxCredStatus = { source: "unset", has_value: false };
     }
   }
   _renderDbxCredStatus(hostCred);
@@ -3186,8 +3054,7 @@ function _renderDbxCredStatus(host) {
   const hasInput = document.getElementById("ds-dbx-token").value.trim().length > 0;
   if (status.has_value || hasInput) {
     const source = hasInput ? "ready to save" : status.source;
-    const cls = hasInput ? "badge-vault" : (status.source === "env" ? "badge-env" : "badge-vault");
-    host.innerHTML = `<span class="ds-badge ${cls}">token · ${_esc(source)}</span>`;
+    host.innerHTML = `<span class="ds-badge badge-vault">token · ${_esc(source)}</span>`;
   } else {
     host.innerHTML = `<span class="ds-badge badge-unset">not set</span>
        <span style="font-size:12px; color:var(--ds-accent-warn-ink);">Save a token here first — registering tables works, but nothing can query until it's stored.</span>`;
@@ -3240,30 +3107,32 @@ async function _saveDatabricksAndContinue() {
     return;
   }
   if ((!_dbxCredStatus || !_dbxCredStatus.has_value) && !token) {
-    err.textContent = `Databricks token is required. Paste it below or set ${_esc(_dbxTokenEnv)} in Instance secrets.`;
+    err.textContent = "Databricks token is required.";
     err.style.display = "block";
     return;
   }
   try {
     /* Same as the Snowflake branch above: host/warehouse_id/catalog are all
-       connection identity, so a save on an instance with Databricks rows needs
-       the confirmation this helper carries. It also renders an object `detail`
-       (this 409's shape) instead of stringifying it to "[object Object]". */
-    const saved = await window.saveConnectionConfig(API_SERVER_CONFIG, {
-      sections: { data_source: { databricks: { host, warehouse_id: warehouse, catalog } } },
-    });
+       connection identity, so a save on an instance whose Databricks
+       connection already has registrations needs the confirmation this
+       helper carries. Update the existing row if the wizard found one (one
+       connection per source_type in this slice); otherwise create it. */
+    const config = { host, warehouse_id: warehouse, catalog };
+    const saved = _dbxConnId
+      ? await window.saveConnectionConfig(`${API_CONNECTIONS}/${_dbxConnId}`, { config }, { method: "PUT" })
+      : await window.saveConnectionConfig(API_CONNECTIONS, {
+          name: "databricks", source_type: "databricks", config, is_default: true,
+        });
     if (saved.cancelled) return;
     if (!saved.ok) {
-      throw new Error(window.apiDetailText(saved.data.detail, `server-config save failed (${saved.status})`));
+      throw new Error(window.apiDetailText(saved.data.detail, `connection save failed (${saved.status})`));
     }
-    const savedCfg = saved.data || {};
-    if (!_dbxCredStatus) _dbxCredStatus = { source: "unset", has_value: false };
-    let storedUnder = "";
+    _dbxConnId = saved.data.id;
     if (token) {
-      const rt = await fetch(`/api/admin/datasource-secrets/${encodeURIComponent(_dbxTokenEnv)}`, {
+      const rt = await fetch(`${API_CONNECTIONS}/${_dbxConnId}/secret`, {
         method: "PUT", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ value: token }),
+        body: JSON.stringify({ value: token, kind: "storage" }),
       });
       if (!rt.ok) {
         const tBody = await rt.json().catch(() => ({}));
@@ -3271,31 +3140,11 @@ async function _saveDatabricksAndContinue() {
       }
       document.getElementById("ds-dbx-token").value = "";
       _dbxCredStatus = { source: "vault", has_value: true };
-      storedUnder = _dbxTokenEnv;
       _renderDbxCredStatus();
     }
     _dbxConfigLoaded = true;
-    _dbxSavedNotices = [];
-    if (savedCfg.restart_required) {
-      _dbxSavedNotices.push({
-        tone: "var(--ds-accent-warn-ink)",
-        text:
-          "Connection settings are saved, but only this process has re-read them."
-          + " Restart the instance so the scheduler and workers pick them up.",
-      });
-    }
-    if (storedUnder) {
-      _dbxSavedNotices.push({ tone: "var(--ds-text-secondary)", text: _storedUnderNote([storedUnder]) });
-    }
-    if (!_dbxSavedNotices.length) {
-      closeWizard();
-      window.location.href = "/admin/tables";
-      return;
-    }
-    // Something the operator has to read: hold the wizard open, say it, and let
-    // the next click on the same button do the navigating.
-    _dbxSaveDone = true;
-    _renderDbxSavedNotice();
+    closeWizard();
+    window.location.href = "/admin/tables";
   } catch (e) {
     err.textContent = "Could not save Databricks settings: " + (e.message || e);
     err.style.display = "block";
@@ -3315,16 +3164,11 @@ function openWizard(connector) {
   _wizardExistingAdds = [];
   _bqCredStatus = null;
   _sfCredStatus = null;
-  _sfRestartRequired = false;
-  _sfEnvNamesRedacted = false;
-  _sfStoredUnder = [];
-  _sfEnvNames = _defaultSfEnvNames();
+  _sfConnId = null;
   _sfConfigLoaded = false;
   _dbxCredStatus = null;
+  _dbxConnId = null;
   _dbxConfigLoaded = false;
-  _dbxTokenEnv = _DBX_TOKEN_ENV_DEFAULT;
-  _dbxSavedNotices = [];
-  _dbxSaveDone = false;
   _wizardMaxStep = 1;
   _wizardDone = false;
   document.getElementById("ds-new-name").value = "";
@@ -3348,8 +3192,6 @@ function openWizard(connector) {
   document.getElementById("ds-dbx-catalog").value = "";
   document.getElementById("ds-dbx-token").value = "";
   document.getElementById("ds-dbxcred").innerHTML = "";
-  document.getElementById("ds-dbx-saved-notice").style.display = "none";
-  document.getElementById("ds-dbx-saved-notice").innerHTML = "";
   document.getElementById("ds-wizard-error").style.display = "none";
   const share = document.getElementById("ds-wizard-step-share");
   share.querySelector(".ds-wshare").style.display = "";
@@ -3716,16 +3558,7 @@ async function _registerBqRows() {
 function _renderSfRowsEditor() {
   const body = document.getElementById("ds-wizard-tables-body");
   document.getElementById("ds-wizard-connected-banner").innerHTML =
-    "Pick the Snowflake tables to register — or name one by hand if it is not listed."
-    + (_sfRestartRequired
-      ? ` <span style="display:block; margin-top:6px; color:var(--ds-accent-warn-ink);">`
-        + `Connection settings are saved, but only this process has re-read them.`
-        + ` Restart the instance so the scheduler and workers pick them up.</span>`
-      : "")
-    + (_sfStoredUnder.length
-      ? ` <span style="display:block; margin-top:6px; color:var(--ds-text-secondary);">`
-        + `${_esc(_storedUnderNote(_sfStoredUnder))}</span>`
-      : "");
+    "Pick the Snowflake tables to register — or name one by hand if it is not listed.";
   body.innerHTML = `
     <div class="ds-browse-actions" style="margin-bottom:10px; align-items:center;">
       <button type="button" class="btn btn-secondary" id="ds-sf-browse">Reload tables</button>
@@ -4492,11 +4325,6 @@ document.getElementById("ds-wizard-connect-btn").addEventListener("click", () =>
     return;
   }
   if (_wizardSource === "databricks") {
-    if (_dbxSaveDone) {
-      closeWizard();
-      window.location.href = "/admin/tables";
-      return;
-    }
     _saveDatabricksAndContinue();
     return;
   }
@@ -4509,10 +4337,7 @@ document.getElementById("ds-sf-password").addEventListener("input", () => _rende
 document.getElementById("ds-sf-private-key").addEventListener("input", () => _renderSfCredStatus(null, "key"));
 
 // Update the Databricks credential status badge as the admin types.
-document.getElementById("ds-dbx-token").addEventListener("input", () => { _renderDbxCredStatus(null); _resetDbxSaveDone(); });
-document.getElementById("ds-dbx-host").addEventListener("input", _resetDbxSaveDone);
-document.getElementById("ds-dbx-warehouse").addEventListener("input", _resetDbxSaveDone);
-document.getElementById("ds-dbx-catalog").addEventListener("input", _resetDbxSaveDone);
+document.getElementById("ds-dbx-token").addEventListener("input", () => _renderDbxCredStatus(null));
 
 /* The steps strip as a back button. Nothing is re-fetched and nothing is
    re-rendered: every screen's state lives where it was left — the connect

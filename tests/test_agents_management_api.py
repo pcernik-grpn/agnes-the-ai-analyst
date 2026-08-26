@@ -25,6 +25,36 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _grant_table(user_id: str, table_id: str) -> None:
+    """Direct `resource_grants(resource_type='table', ...)` row for
+    `user_id` — the write-gate (C2.1) requires a non-admin writer to
+    currently hold whatever DATA-authority item (table/data_package/
+    collection/connection) they declare in `agent_scope`."""
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    groups = UserGroupsRepository(conn)
+    grp = groups.get_by_name("mgmt-test-table-grants") or groups.create(
+        name="mgmt-test-table-grants", description="test", created_by="test"
+    )
+    members = UserGroupMembersRepository(conn)
+    if not members.has_membership(user_id, grp["id"]):
+        members.add_member(user_id, grp["id"], source="admin", added_by="test")
+    grants = ResourceGrantsRepository(conn)
+    if not grants.has_grant([grp["id"]], "table", table_id):
+        grants.create(
+            group_id=grp["id"],
+            resource_type="table",
+            resource_id=table_id,
+            assigned_by="test",
+            requirement="required",
+        )
+    conn.close()
+
+
 class _AuthedClient:
     """Thin `TestClient` wrapper that injects a bearer token by default, so
     call sites read like `mgmt_client.post(...)` (the task brief's shape)
@@ -468,6 +498,7 @@ def test_scope_put_validates_item_type(mgmt_client):
 def test_scope_put_success(mgmt_client):
     from src.repositories import agents_repo
 
+    _grant_table("owner1", "t1")
     created = mgmt_client.post("/api/v1/agents", json={"name": "A", "slug": "scoped-2"}).json()
     r = mgmt_client.put(
         f"/api/v1/agents/{created['id']}/scope",
@@ -475,8 +506,12 @@ def test_scope_put_success(mgmt_client):
     )
     assert r.status_code == 200
     stored = agents_repo().get_scope(created["id"])
-    assert {"item_type": "plugin", "item_id": "p1"} in stored
-    assert {"item_type": "table", "item_id": "t1"} in stored
+    pairs = {(s["item_type"], s["item_id"]) for s in stored}
+    assert ("plugin", "p1") in pairs
+    assert ("table", "t1") in pairs
+    # `granted_by` is a PG-only column (C2.1, A3 ratchet) — its persistence
+    # is pinned by tests/db_pg/test_agents_contract.py, not here (this suite
+    # runs against the DuckDB-backed test app, where it is always None).
 
 
 def test_agent_detail_includes_scope_items(mgmt_client):
@@ -488,8 +523,9 @@ def test_agent_detail_includes_scope_items(mgmt_client):
         json={"items": [{"item_type": "slack_channel", "item_id": "C42"}, {"item_type": "plugin", "item_id": "p9"}]},
     )
     detail = mgmt_client.get(f"/api/v1/agents/{created['id']}").json()
-    assert {"item_type": "slack_channel", "item_id": "C42"} in detail["scope"]
-    assert {"item_type": "plugin", "item_id": "p9"} in detail["scope"]
+    pairs = {(s["item_type"], s["item_id"]) for s in detail["scope"]}
+    assert ("slack_channel", "C42") in pairs
+    assert ("plugin", "p9") in pairs
 
 
 def test_scope_put_accepts_slack_channel_binding(mgmt_client):
@@ -522,10 +558,13 @@ def test_widening_bound_agent_to_all_all_is_refused(mgmt_client):
     setting every mode to 'all', would land channel turns on the owner's
     plain identity."""
     created = mgmt_client.post("/api/v1/agents", json={"name": "W", "slug": "widen-bound"}).json()
-    assert mgmt_client.put(
-        f"/api/v1/agents/{created['id']}/scope",
-        json={"items": [{"item_type": "slack_channel", "item_id": "C_WIDEN"}]},
-    ).status_code == 200
+    assert (
+        mgmt_client.put(
+            f"/api/v1/agents/{created['id']}/scope",
+            json={"items": [{"item_type": "slack_channel", "item_id": "C_WIDEN"}]},
+        ).status_code
+        == 200
+    )
     r = mgmt_client.put(
         f"/api/v1/agents/{created['id']}",
         json={"plugins_mode": "all", "connections_mode": "all", "tables_mode": "all", "memory_mode": "all"},
@@ -571,15 +610,21 @@ def test_scope_put_slack_channel_freed_by_soft_delete(mgmt_client):
     """Deleting the holder frees the channel for rebinding."""
     a1 = mgmt_client.post("/api/v1/agents", json={"name": "R1", "slug": "router-del"}).json()
     a2 = mgmt_client.post("/api/v1/agents", json={"name": "R2", "slug": "router-new"}).json()
-    assert mgmt_client.put(
-        f"/api/v1/agents/{a1['id']}/scope",
-        json={"items": [{"item_type": "slack_channel", "item_id": "C888"}]},
-    ).status_code == 200
+    assert (
+        mgmt_client.put(
+            f"/api/v1/agents/{a1['id']}/scope",
+            json={"items": [{"item_type": "slack_channel", "item_id": "C888"}]},
+        ).status_code
+        == 200
+    )
     assert mgmt_client.delete(f"/api/v1/agents/{a1['id']}").status_code in (200, 204)
-    assert mgmt_client.put(
-        f"/api/v1/agents/{a2['id']}/scope",
-        json={"items": [{"item_type": "slack_channel", "item_id": "C888"}]},
-    ).status_code == 200
+    assert (
+        mgmt_client.put(
+            f"/api/v1/agents/{a2['id']}/scope",
+            json={"items": [{"item_type": "slack_channel", "item_id": "C888"}]},
+        ).status_code
+        == 200
+    )
 
 
 def test_scope_put_dedupes_duplicate_items(mgmt_client):
@@ -587,6 +632,7 @@ def test_scope_put_dedupes_duplicate_items(mgmt_client):
     the composite PK — it collapses to a single row."""
     from src.repositories import agents_repo
 
+    _grant_table("owner1", "t1")
     created = mgmt_client.post("/api/v1/agents", json={"name": "A", "slug": "scoped-dupe"}).json()
     r = mgmt_client.put(
         f"/api/v1/agents/{created['id']}/scope",

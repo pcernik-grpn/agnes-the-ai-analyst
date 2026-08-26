@@ -393,11 +393,9 @@ def test_builder_agent_cannot_reach_outside_its_declared_scope(builder_env):
 def test_intersection_is_exactly_the_declaration(builder_env):
     """Unit-level cross-check of the same property, so a failure localizes:
     the enforced table set is the declared package's members, nothing more."""
-    from src.agent_scope_intersection import compute_agent_intersection
-    from src.repositories import agents_repo
+    from src.agent_scope_intersection import resolve_agent_authority
 
-    row = agents_repo().get_by_id(builder_env["agent_id"])
-    enforced = compute_agent_intersection("owner1", row)
+    enforced = resolve_agent_authority(builder_env["agent_id"])
     assert enforced.get("table") == frozenset({builder_env["t1_id"]})
     assert builder_env["t2_id"] not in enforced.get("table", frozenset())
     assert enforced.get("data_package") == frozenset({builder_env["pkg1"]})
@@ -415,7 +413,6 @@ def test_agent_cannot_reach_past_the_owners_own_stack_in_classic_mode(builder_en
     exactly that package's tables: strictly more than its owner has, which
     is the one thing the intersection exists to prevent.
     """
-    from src.repositories import agents_repo
     from tests.conftest import grant_table_via_package
 
     monkeypatch.setattr("app.instance_config.get_stack_auto_membership", lambda: False, raising=False)
@@ -459,9 +456,9 @@ def test_agent_cannot_reach_past_the_owners_own_stack_in_classic_mode(builder_en
     owner_may = can_access_table({"id": "owner1", "email": "owner@test.com"}, t3_id)
     assert owner_may is False, "fixture is wrong — the owner must NOT reach this table in classic mode"
 
-    from src.agent_scope_intersection import compute_agent_intersection
+    from src.agent_scope_intersection import resolve_agent_authority
 
-    enforced = compute_agent_intersection("owner1", agents_repo().get_by_id(agent_id))
+    enforced = resolve_agent_authority(agent_id)
     assert t3_id not in enforced.get("table", frozenset()), (
         "the agent reached a table its owner cannot query — the owner side must honour the "
         "stack formula, not raw grants"
