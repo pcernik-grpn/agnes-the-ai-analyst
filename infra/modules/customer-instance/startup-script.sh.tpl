@@ -199,6 +199,19 @@ cd "$APP_DIR"
 #     internet is no longer required for boot.
 #   - Rollback: revert is one tag bump. Curl-from-main has no per-customer
 #     rollback path.
+#
+# Registry auth: when the image lives in GCP Artifact Registry
+# (*-docker.pkg.dev) the VM's own service account authenticates the pull —
+# grant it artifactregistry.reader on the repository. Same helper (and the
+# same best-effort posture) as the kai-agent engine image further down; the
+# credential helper lands in root's docker config, so the recurring
+# agnes-auto-upgrade tick inherits it with no extra step. Any other private
+# registry needs pre-authenticated pull access on the VM.
+IMAGE_HOST="$${IMAGE_REPO%%/*}"
+case "$IMAGE_HOST" in
+    *-docker.pkg.dev) gcloud auth configure-docker "$IMAGE_HOST" --quiet \
+        || echo "WARN: gcloud auth configure-docker $IMAGE_HOST failed — the image pull will likely fail below" >&2 ;;
+esac
 docker pull "$${IMAGE_REPO}:$${IMAGE_TAG}"
 EXTRACT_CONTAINER=$(docker create "$${IMAGE_REPO}:$${IMAGE_TAG}")
 trap "docker rm '$EXTRACT_CONTAINER' >/dev/null 2>&1 || true" EXIT
@@ -1106,6 +1119,7 @@ AGNES_VAULT_KEY=$AGNES_VAULT_KEY
 LOG_LEVEL=info
 DOMAIN=$DOMAIN
 AGNES_TAG=$EFFECTIVE_AGNES_TAG
+AGNES_IMAGE_REPO=$IMAGE_REPO
 AGNES_APP_MEM_LIMIT=${app_mem_limit}
 AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
 AGNES_APP_CPUS=${app_cpus}

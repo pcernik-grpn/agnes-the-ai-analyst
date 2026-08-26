@@ -543,7 +543,19 @@ variable "keboola_stack_url" {
 }
 
 variable "image_repo" {
-  description = "Docker image repo"
+  description = <<-EOT
+    Docker image repo the instance runs (and extracts host artifacts from).
+    Threaded into /opt/agnes/.env as AGNES_IMAGE_REPO, so the compose files
+    and the recurring host scripts (agnes-auto-upgrade.sh,
+    agnes-state-applier.sh) all resolve the same repository.
+
+    Registry access: when the image lives in GCP Artifact Registry
+    (*-docker.pkg.dev) the startup script runs `gcloud auth
+    configure-docker` for that host, so the VM's own service account
+    authenticates every pull — grant it artifactregistry.reader on the
+    repository. Any other private registry needs pre-authenticated pull
+    access on the VM (not provided by this module).
+  EOT
   type        = string
   default     = "ghcr.io/keboola/agnes-the-ai-analyst"
 }
@@ -551,10 +563,10 @@ variable "image_repo" {
 variable "compose_ref" {
   # RETIRED. This never pinned anything: it was threaded to the startup script
   # as COMPOSE_REF and then never read. Compose files are extracted from the
-  # image the operator pinned with `image_tag`, and agnes-auto-upgrade.sh
-  # refreshes them from the repository's main branch on every tick — so a root
-  # setting `compose_ref = "stable-YYYY.MM.N"` believed it had pinned its
-  # compose files and had not.
+  # image the operator pinned with `image_tag` (agnes-auto-upgrade.sh
+  # refreshes them from that same image's /opt/agnes-host/ on every tick) —
+  # so a root setting `compose_ref = "stable-YYYY.MM.N"` believed it had
+  # pinned its compose files and had not.
   #
   # Kept DECLARED, like `ui_layout` above, so that belief fails loudly instead
   # of quietly: a root that still sets it gets a plan-time error naming the
