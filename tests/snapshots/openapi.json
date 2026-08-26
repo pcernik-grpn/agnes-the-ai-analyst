@@ -1460,6 +1460,71 @@
         "title": "BootstrapRequest",
         "type": "object"
       },
+      "BuilderMessage": {
+        "properties": {
+          "role": {
+            "maxLength": 16,
+            "title": "Role",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "BuilderMessage",
+        "type": "object"
+      },
+      "BuilderTurnRequest": {
+        "properties": {
+          "apply": {
+            "default": true,
+            "title": "Apply",
+            "type": "boolean"
+          },
+          "config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "plugin_candidates": {
+            "items": {
+              "$ref": "#/components/schemas/PluginCandidate"
+            },
+            "title": "Plugin Candidates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "BuilderTurnRequest",
+        "type": "object"
+      },
       "BulkUpdateRequest": {
         "description": "Apply ``updates`` to every id in ``item_ids``. Issue #62.",
         "properties": {
@@ -6446,6 +6511,33 @@
           "pinned"
         ],
         "title": "PinSessionBody",
+        "type": "object"
+      },
+      "PluginCandidate": {
+        "description": "A capability the page is offering in its picker.\n\nSent by the client because the marketplace ids the picker uses are\nassembled there (curated \u222a store, with their display prefixes); the\nserver validates the model's choices against this same list. Safe as a\ncandidate set for the reason in the module docstring: a declared scope id\ngrants nothing on its own.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 400,
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 200,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PluginCandidate",
         "type": "object"
       },
       "PluginDetailResponse": {
@@ -11557,7 +11649,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.86.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -14544,7 +14636,7 @@
     },
     "/agents": {
       "get": {
-        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nWork-in-progress surface (rail item carries a WIP badge). The builder's\ningredient lists are REAL and RBAC-scoped: knowledge sources are the data\npackages + memory domains resolved from the caller's stack (same\n``StackResolver`` reads as /stack), and capabilities hydrate client-side\nfrom ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).\nAgent definitions themselves persist in the browser for now \u2014 a server\nregistry is the next iteration, so the page states that plainly rather\nthan pretending drafts are shared.",
+        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artefact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
         "operationId": "agents_page_agents_get",
         "parameters": [
           {
@@ -31045,6 +31137,79 @@
           }
         },
         "summary": "Update Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/agents/{agent_id}/builder/turn": {
+      "post": {
+        "description": "Run one builder turn against an agent the caller owns.",
+        "operationId": "builder_turn_api_agents__agent_id__builder_turn_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuilderTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Builder Turn",
         "tags": [
           "agents"
         ]

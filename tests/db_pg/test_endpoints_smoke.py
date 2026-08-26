@@ -2723,6 +2723,12 @@ KNOWN_UNTESTED = {
     "GET /api/agents/{agent_id}",
     "PATCH /api/agents/{agent_id}",
     "DELETE /api/agents/{agent_id}",
+    # One builder-conversation turn. Behaviourally covered by
+    # tests/test_agent_builder_turns.py — the sanitizer trust boundary, the
+    # apply=false / config working-copy contract, and the no-credential
+    # degradation. It writes only through the PATCH row above, so it adds no
+    # PG-specific persistence of its own to smoke.
+    "POST /api/agents/{agent_id}/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",

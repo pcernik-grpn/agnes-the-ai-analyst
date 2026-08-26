@@ -558,6 +558,21 @@ _AGENTS_REGISTRY_REASON = (
     "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
+_AGENTS_BUILDER_TURN_REASON = (
+    "one turn of the /agents builder's CONVERSATION — web-UI-only by nature. "
+    "It is not an operation on an agent; it is the page asking a model to "
+    "translate a sentence into a patch for the panel the owner is looking at, "
+    "and it only makes sense with that panel in front of you. Its inputs are "
+    "the page's own transient state (the transcript so far, the candidate "
+    "lists the picker is offering, the unsaved working copy), which a CLI "
+    "invocation would have to invent, and its output is a patch the caller is "
+    "expected to review before saving — `apply=false` is what the page sends. "
+    "Everything it can write is already writable through "
+    "`PATCH /api/agents/{id}`, which carries the same exemption above, so no "
+    "capability is reachable here and nowhere else. Retired with the rest of "
+    "`/api/agents` by the agent-core consolidation (remediation Track C)."
+)
+
 _LIBRARY_SHARING_REASON = (
     "Owner-initiated sharing of Library items — a web affordance on /library "
     "(share dialog). The equivalent grant writing already has analyst-facing "
@@ -664,6 +679,7 @@ _EXEMPT: dict[str, str] = {
     "/api/collections/{collection_id}/files/{file_id}/move": _LIBRARY_MOVE_REASON,
     "/api/agents": _AGENTS_REGISTRY_REASON,
     "/api/agents/{agent_id}": _AGENTS_REGISTRY_REASON,
+    "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (
