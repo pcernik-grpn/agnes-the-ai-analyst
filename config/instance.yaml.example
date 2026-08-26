@@ -933,6 +933,10 @@ chat:
   # docker_mem_limit: "2g"
   # docker_cpus: 1.0
   # docker_pids_limit: 512
+  # Default is `none` (fail-closed): the agent runs with bypassed permissions
+  # over a read-write workspace, so unrestricted egress is an exfiltration
+  # surface. Opt into `open`/`allowlist` explicitly when a sandbox needs the
+  # network.
   # open — normal bridge, internet reachable (in-sandbox `pip install` etc.
   #        keep working).
   # none — internal-only network: the sandbox reaches nothing but the
@@ -943,7 +947,7 @@ chat:
   #        connection re-checked post-DNS against link-local/metadata/private
   #        ranges (DNS-rebinding protection). Ignoring the proxy is not a
   #        bypass — the internal network has no other route out.
-  # docker_egress_mode: open
+  # docker_egress_mode: none
   # Hostnames reachable in allowlist mode (exact or *.suffix wildcards).
   # Cloud metadata endpoints stay blocked even if listed.
   # docker_egress_allow_hosts: [pypi.org, "*.pypi.org", files.pythonhosted.org]
