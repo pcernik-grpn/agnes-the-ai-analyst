@@ -159,12 +159,126 @@
          check against the answer they get, rather than a claim they have to
          take on faith. The greeting above it is small on purpose: it locates
          the reader, it is not the message. #}
-      <p class="cld-greet">{{ greeting }}{% if user.name %}, {{ user.name.split(' ')[0] }}{% endif %}</p>
+      {% set _first_name = user.name.split(' ')[0] if user.name else '' %}
+      {% if admin_notice %}
+      {# ZERO STATE, admin. The ordinary heading is "Ask {brand} anything" — a
+         lie on an instance that knows nothing, where every question fails and
+         all four suggested actions below would too. So the page states the
+         goal instead of the invitation, names the consequence rather than just
+         the fact ("so it can answer nothing" is what makes "no data is
+         registered" mean something), and offers the one move that changes it.
+
+         This REPLACES the separate notice bar that used to sit above the
+         heading: with the heading itself carrying the message, the bar was the
+         same sentence twice. #}
+      {% if instance_org %}<p class="cld-greet">{{ instance_org }} &middot; Admin</p>{% endif %}
+      {# Names the task rather than greeting the reader: a heading should say
+         what to do, and the fact belongs one size down where the lede carries
+         it. No first name — the personalized "Let's get {brand} answering,
+         {name}." read as chummy for what is a piece of infrastructure work. #}
+      <h2 class="rdb-ask-heading">Set up {{ instance_brand_short or 'Agnes' }} for your team</h2>
+      {# "your company", not the org name, and deliberately so. `instance.name`
+         is DOCUMENTED as the deploying organization but nothing enforces it,
+         and instances routinely leave it product-shaped — this one is called
+         "AI Data Analyst", which turns the sentence into "it knows nothing
+         about AI Data Analyst yet" and reads as a bug. The name is fine as a
+         LABEL in the eyebrow above (that is what an eyebrow is for); it is not
+         safe inside a claim. "your company" is true on every instance. #}
+      <p class="cld-lede">
+        It knows nothing about your company yet, so it can answer nothing.
+        Connect where your data lives and it can start answering from your own numbers.
+      </p>
+      {# The hero's "Add your first data" chip + "Full checklist" link used to
+         sit here. Removed: with the setup card below carrying a primary button,
+         an admin was offered three ways into the same job and had to pick one.
+         `connect_options` still resolves — the card's button uses it. #}
+
+      {% else %}
+      <p class="cld-greet">{{ greeting }}{% if _first_name %}, {{ _first_name }}{% endif %}</p>
       <h2 class="rdb-ask-heading">Ask {{ instance_brand_short or 'Agnes' }} anything</h2>
       <p class="cld-lede">
         {{ instance_brand_short or 'Agnes' }} answers from your company's own data, documents and
         shared memory &mdash; and shows you where each answer came from.
       </p>
+      {% endif %}
+
+      {# The doors, ABOVE the composer: each is somewhere you go INSTEAD of
+         asking a question, so they belong before the input rather than after
+         it. (They stay clear of the composer-to-suggestions span, which is
+         reserved for context about what the agent can reach.)
+
+         The first card is audience-dependent. An ADMIN gets "Set up {brand}" —
+         the one job only they can do — styled apart from the other two because
+         it is a different KIND of thing: a task they own, not a place to
+         browse. One card serves both states, which is why `admin_setup` is
+         resolved for every admin and not only an empty instance: it reads
+         "connect where your data lives" with nothing registered, and "N of M
+         steps done → Admin overview" once there is. A member gets the Library
+         door instead — the useful first stop for someone who cannot set
+         anything up, and the one place that answers "what is here?". #}
+      {% set _tool_door %}
+        <a class="cld-door" href="/how-it-works#connect">
+          <span class="cld-door-t">Take {{ instance_brand_short or 'Agnes' }} to your own tools</span>
+          <span class="cld-door-d">Same knowledge inside Claude Code, Cursor, VS Code or your terminal</span>
+          <span class="cld-door-tools" aria-hidden="true">
+            <img src="{{ static_url('img/tools/claude-code.ico') }}" alt="" width="15" height="15">
+            <img src="{{ static_url('img/tools/cursor.ico') }}" alt="" width="15" height="15">
+            <img src="{{ static_url('img/tools/vscode.ico') }}" alt="" width="15" height="15">
+          </span>
+        </a>
+        <a class="cld-door" href="/how-it-works">
+          <span class="cld-door-t">How {{ instance_brand_short or 'Agnes' }} works</span>
+          <span class="cld-door-d">Where your data goes, and what stays private</span>
+        </a>
+      {% endset %}
+      <nav class="cld-doors" aria-label="Where to go next">
+        {% if admin_setup %}
+        {# A block, not a wrapping <a>: it holds a button, and an anchor inside
+           an anchor is neither valid nor operable. The other two cards stay
+           whole-card links — they have nothing inside them to click. #}
+        <div class="cld-door cld-door--lead cld-door--setup">
+          <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('rows', 17) }}</span>
+          <span class="cld-door-t">Set up {{ instance_brand_short or 'Agnes' }}</span>
+          {% if admin_notice %}
+          <span class="cld-door-d">Nothing is registered yet, so nobody can ask anything</span>
+          {# The button is the CONNECT action, deliberately not
+             `admin_notice.cta`. That names the journey's current step, which on
+             a partly-set-up instance can be something like "Invite people" —
+             and "nothing is registered yet → Invite people" is incoherent. The
+             first thing to do about no data is add data. #}
+          {% set _go = (connect_options | selectattr('primary') | first) if connect_options else None %}
+          <a class="cld-door-btn" href="{{ _go.href if _go else '/admin/data-sources?add=1' }}">
+            {{ _go.label if _go else 'Add your first data' }} &rarr;
+          </a>
+          {% else %}
+          <span class="cld-door-d">Sources, tables, packages and who they reach</span>
+          <a class="cld-door-btn cld-door-btn--quiet" href="/admin">
+            {%- if admin_setup.complete %}All {{ admin_setup.total }} steps done
+            {%- else %}{{ admin_setup.done }} of {{ admin_setup.total }} steps done{% endif %}
+            &middot; Admin overview &rarr;
+          </a>
+          {% endif %}
+        </div>
+        {% else %}
+        {# The member's counterpart to "Set up {brand}" — same slot, same
+           anatomy (icon, title, one line, one action), because it is the same
+           thing for a different audience: the one move this reader has before
+           they start asking. It was a bare two-line card while the admin's
+           carried an icon and a button, which made the member's landing look
+           like the admin's with the interesting part removed.
+
+           A <span>, not an <a>, for the action: the whole card is the link
+           already and an anchor inside an anchor is neither valid nor
+           operable. It reads as the affordance without being a second one. #}
+        <a class="cld-door cld-door--lead cld-door--know" href="/library">
+          <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('brain', 17) }}</span>
+          <span class="cld-door-t">See what {{ instance_brand_short or 'Agnes' }} knows</span>
+          <span class="cld-door-d">Data packages, skills, memory and agents you can reach</span>
+          <span class="cld-door-btn cld-door-btn--quiet">Browse the library &rarr;</span>
+        </a>
+        {% endif %}
+        {{ _tool_door }}
+      </nav>
       {# A "Browse metrics & glossary" button used to sit here (#1108), the only
          in-page path to /catalog/semantics in the rail chrome. Retired: this is
          the moment of INTENT — the reader came to ask something and the
@@ -231,7 +345,14 @@
           </li>
         </ul>
       </span>
-      <textarea id="chat-input" class="cloud-chat-input" placeholder="Ask {{ instance_brand_short or 'Agnes' }} anything... (try: summarize revenue trends)" rows="1"></textarea>
+      {# The placeholder's example has to be answerable. "try: summarize revenue
+         trends" on an instance with no registered data names the one thing that
+         cannot work, which is the same defect as the four data-shaped suggested
+         actions below. In the zero state it offers what IS answerable — the
+         setup question — without promising the composer can perform the setup
+         itself. #}
+      <textarea id="chat-input" class="cloud-chat-input" rows="1"
+        placeholder="{% if admin_notice %}Ask how to get {{ instance_brand_short or 'Agnes' }} set up…{% else %}Ask {{ instance_brand_short or 'Agnes' }} anything... (try: summarize revenue trends){% endif %}"></textarea>
       <div class="cloud-chat-form-actions">
         <button type="button" id="cancel-btn"
                 class="btn btn-danger cloud-chat-stop-btn" hidden>Stop</button>
@@ -500,35 +621,11 @@
           </div>
         </section>
 
-        {# The three real doors off this page, as labelled links rather than a
-           banner. This is what the retired hero was actually for — and the
-           middle one is the label that feedback killed: "Connect your tools"
-           read as sending your tools' data INTO {brand}, when the direction is
-           the opposite. Naming the direction ("take {brand} to…") is the fix;
-           the tool marks stay because "which tools" is the genuinely useful
-           part of that hero, and they cost one row here instead of a banner.
-
-           Order is by how many readers need them: what {brand} knows, then how
-           to use it elsewhere, then the explanation for whoever wants it. #}
-        <nav class="cld-doors" aria-label="Where to go next">
-          <a class="cld-door" href="/library">
-            <span class="cld-door-t">See what {{ instance_brand_short or 'Agnes' }} knows</span>
-            <span class="cld-door-d">Data packages, skills, memory and agents you can reach</span>
-          </a>
-          <a class="cld-door" href="/how-it-works#connect">
-            <span class="cld-door-t">Take {{ instance_brand_short or 'Agnes' }} to your own tools</span>
-            <span class="cld-door-d">Same knowledge inside Claude Code, Cursor, VS Code or your terminal</span>
-            <span class="cld-door-tools" aria-hidden="true">
-              <img src="{{ static_url('img/tools/claude-code.ico') }}" alt="" width="15" height="15">
-              <img src="{{ static_url('img/tools/cursor.ico') }}" alt="" width="15" height="15">
-              <img src="{{ static_url('img/tools/vscode.ico') }}" alt="" width="15" height="15">
-            </span>
-          </a>
-          <a class="cld-door" href="/how-it-works">
-            <span class="cld-door-t">How {{ instance_brand_short or 'Agnes' }} works</span>
-            <span class="cld-door-d">Where your data goes, and what stays private</span>
-          </a>
-        </nav>
+        {# The doors used to sit HERE, below the suggested actions. They moved
+           above the composer (into #chat-capabilities): they are where you go
+           INSTEAD of asking, so offering them after the input asked the reader
+           to scroll past the thing they came for to find the thing they wanted.
+           See `.cld-doors` in that block. #}
 
         {# The trust caption the retired hero carried. Kept — it is a claim the
            reader cares about — but demoted to one quiet line at the foot
@@ -571,18 +668,12 @@
          it read as part of the product, and its links could only point back
          at /chat, so following any link off this page silently dropped the
          preview. See templates/_dev_preview.html. #}
-      {% if admin_notice %}
-      <div class="cld-notice" role="note">
-        <span class="cld-notice-dot" aria-hidden="true"></span>
-        <span class="cld-notice-txt">
-          <strong>No data is registered yet.</strong>
-          Nobody can ask {{ instance_brand_short or 'Agnes' }} about your company until a source is
-          connected and its tables are shared.
-        </span>
-        <a class="cld-notice-cta" href="{{ admin_notice.href }}">{{ admin_notice.cta }} &rarr;</a>
-        <a class="cld-notice-more" href="/admin">Full checklist &rarr;</a>
-      </div>
-      {% endif %}
+      {# The "no data is registered yet" notice bar used to sit here. Removed,
+         not moved: the zero-state heading and lede above the composer now say
+         the same thing in the page's own voice ("It knows nothing about … yet,
+         so it can answer nothing"), and a bar repeating it directly above was
+         the sentence twice. `admin_notice` still gates that heading — it is the
+         same signal, rendered once. #}
     </div>
 
     {# Shared footer partial, pinned to the very bottom of the empty state.

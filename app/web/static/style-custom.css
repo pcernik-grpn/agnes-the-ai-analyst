@@ -6206,43 +6206,6 @@ details.section-card > summary {
     color: var(--ds-text-secondary);
 }
 
-/* ---- Admin notice: nothing registered ----
-   A line, not a card. Amber rather than red: an empty instance is the expected
-   state on day one, not a fault. It carries its own action so the reader never
-   has to go hunting for where setup lives. */
-.cld-notice {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    padding: 10px 14px;
-    border: 1px solid color-mix(in srgb, var(--ds-accent-warn-line) 45%, transparent);
-    border-radius: 12px;
-    background: color-mix(in srgb, var(--ds-accent-warn-bg) 55%, var(--ds-surface));
-}
-.cld-notice-dot {
-    width: 7px; height: 7px; flex-shrink: 0;
-    border-radius: 50%;
-    background: var(--ds-accent-warn-line);
-}
-.cld-notice-txt {
-    flex: 1 1 320px; min-width: 0;
-    font-size: 13px; line-height: 1.45;
-    color: var(--ds-text-secondary);
-}
-.cld-notice-txt strong { color: var(--ds-text-primary); font-weight: 700; }
-.cld-notice-cta {
-    padding: 6px 13px;
-    border-radius: var(--ds-radius-pill, 999px);
-    background: var(--ds-primary); color: var(--ds-text-inverse);
-    font-size: 13px; font-weight: 650; text-decoration: none;
-    white-space: nowrap;
-    transition: background var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
-}
-.cld-notice-cta:hover { background: var(--ds-primary-dark); }
-.cld-notice-more {
-    font-size: 12.5px; color: var(--ds-text-muted);
-    text-decoration: none; white-space: nowrap;
-}
-.cld-notice-more:hover { color: var(--ds-text-secondary); text-decoration: underline; }
-
 /* ---- The three doors ----
    Plain labelled links in a row: each says where it goes and what is there, so
    nothing needs a banner to explain it. Bordered, not filled — the composer
@@ -6251,12 +6214,19 @@ details.section-card > summary {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 10px;
-    margin: 26px 0 0;
+    /* Above the composer now, not at the foot: tighter top margin and a real
+       bottom one, since the input follows rather than the page ending. */
+    margin: 22px 0 4px;
     text-align: left;
 }
 .cld-door {
     display: flex; flex-direction: column; gap: 3px;
-    padding: 13px 15px;
+    /* Centred, not top-aligned. The grid stretches all three to the tallest,
+       so a two-line card used to be two lines followed by a third of a card
+       of nothing — which read as something failing to load. Centring spends
+       that space on both sides instead of pooling it at the bottom. */
+    justify-content: center;
+    padding: 15px 16px;
     border: 1px solid color-mix(in srgb, var(--ds-border) 75%, transparent);
     border-radius: 14px;
     background: color-mix(in srgb, var(--ds-surface) 70%, transparent);
@@ -6278,6 +6248,143 @@ details.section-card > summary {
 }
 .cld-door-tools { display: flex; align-items: center; gap: 5px; margin-top: 5px; }
 .cld-door-tools img { display: block; object-fit: contain; opacity: .8; }
+
+/* ---- The lead card ----
+   The first door is audience-dependent — "Set up Agnes" for an admin and
+   "See what Agnes knows" for everyone else — and either way it is the one
+   move this reader has before they start asking. So it gets the weight, and both
+   variants get the SAME weight: they are one slot rendered twice, not two
+   cards that happen to sit in the same place.
+
+   The surface is the Knowledge Layer banner's, reused rather than imitated —
+   `.klb`'s own layered fill scaled to card size. That banner is where the
+   product's visual language for "this is Agnes itself" was set, so the card
+   that speaks for Agnes should paint the same thing. Every layer rides
+   `--ds-surface` or a color-mix into it, which is what lets one rule follow
+   every palette theme with no dark-mode override. */
+.cld-door--lead {
+    position: relative;
+    overflow: hidden;
+    border-color: color-mix(in srgb, var(--ds-primary) 34%, transparent);
+    background:
+        radial-gradient(70% 130% at 88% 8%, color-mix(in srgb, var(--ds-kind-agent) 9%, transparent), transparent 62%),
+        radial-gradient(64% 130% at 4% 94%, color-mix(in srgb, var(--ds-primary) 11%, transparent), transparent 62%),
+        radial-gradient(96% 150% at 50% -24%, color-mix(in srgb, var(--ds-assistant) 8%, transparent), transparent 64%),
+        linear-gradient(108deg,
+            color-mix(in srgb, var(--ds-agnes) 6%, var(--ds-surface)) 0%,
+            var(--ds-surface) 50%,
+            color-mix(in srgb, var(--ds-kind-agent) 6%, var(--ds-surface)) 100%);
+    box-shadow:
+        0 1px 2px color-mix(in srgb, var(--ds-text-primary) 4%, transparent),
+        0 16px 34px -26px color-mix(in srgb, var(--ds-primary) 40%, transparent);
+}
+/* The banner's dotted field, in the corner the icon does not occupy. Drawn in
+   a pseudo-element so the card needs no decorative markup — there is nothing
+   here for a reader to reach, and a real element would be one more thing for
+   the template to carry. */
+.cld-door--lead::before {
+    content: "";
+    position: absolute; right: 0; top: 0; width: 132px; height: 96px;
+    background-image: radial-gradient(color-mix(in srgb, var(--ds-primary) 30%, transparent) 1.2px, transparent 1.3px);
+    background-size: 15px 15px;
+    -webkit-mask-image: linear-gradient(232deg, rgba(0, 0, 0, .5), transparent 70%);
+    mask-image: linear-gradient(232deg, rgba(0, 0, 0, .5), transparent 70%);
+    opacity: .5;
+    pointer-events: none;
+}
+/* …and everything real sits above it. */
+.cld-door--lead > * { position: relative; z-index: 1; }
+
+/* The title is solid accent ink, NOT the banner's blue→purple gradient — that
+   was tried here and does not survive the themes at this size.
+   `.klb-headline-grad` runs `--ds-assistant` → `--ds-kind-agent`: fine on a
+   30px/760 headline, which only owes 3:1, and wrong on a 14.5px card title,
+   which owes 4.5:1. `--ds-assistant` is 4.1:1 on the paper surface, and under
+   `data-theme="dark"` `--ds-kind-agent` collapses to 2.4:1 — so the right end
+   of the gradient would be unreadable. No pair of existing accent tokens
+   clears 4.5:1 in BOTH themes, and a per-theme override for one flourish is
+   not what it is worth. `--ds-primary-dark` is 5.9:1 on paper and 5.7:1 in
+   dark; the banner's character is carried by this card's surface, halo and
+   dotted field, none of which have this problem. */
+.cld-door--lead .cld-door-t {
+    font-size: 14.5px;
+    letter-spacing: -0.02em;
+    color: var(--ds-primary-dark, var(--ds-primary));
+}
+.cld-door--lead .cld-door-d { color: var(--ds-text-secondary); }
+
+/* The whole-card link still owes the reader a hover. The setup variant opts
+   back out below — it is not a link. */
+.cld-door--lead:hover {
+    border-color: color-mix(in srgb, var(--ds-primary) 58%, transparent);
+    box-shadow:
+        0 1px 2px color-mix(in srgb, var(--ds-text-primary) 5%, transparent),
+        0 18px 38px -24px color-mix(in srgb, var(--ds-primary) 50%, transparent);
+}
+
+/* The admin's "Set up {brand}" card — the ONE action an admin has on this page.
+   The hero used to carry a chip and a checklist link as well; three routes into
+   one job meant choosing between them before doing any of it, so the card is
+   now the whole offer and holds a real button.
+
+   It is a block rather than a whole-card link (it contains that button), and it
+   is styled apart from its two neighbours because it is a different KIND of
+   thing: a job this reader owns, not a place to browse. Tinted fill, accent
+   edge, its own icon, and the button carries the weight — on an unset-up
+   instance this is the most important element on the page. */
+.cld-door--setup {
+    /* Not a link (it contains a button), so it must not offer the hover the
+       other doors do — the button inside owns the affordance. The card's
+       SURFACE is `.cld-door--lead`'s, shared with the member's variant. */
+    cursor: default;
+}
+.cld-door--setup:hover {
+    border-color: color-mix(in srgb, var(--ds-primary) 34%, transparent);
+    box-shadow:
+        0 1px 2px color-mix(in srgb, var(--ds-text-primary) 4%, transparent),
+        0 16px 34px -26px color-mix(in srgb, var(--ds-primary) 40%, transparent);
+}
+/* The icon tile, with the orb's soft halo behind it rather than a flat chip —
+   the banner's one gesture that survives being shrunk to 32px. */
+.cld-door-ico {
+    display: inline-grid; place-items: center;
+    width: 32px; height: 32px;
+    margin-bottom: 9px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--ds-primary) 13%, var(--ds-surface));
+    color: var(--ds-primary-dark, var(--ds-primary));
+    box-shadow:
+        0 0 0 4px color-mix(in srgb, var(--ds-primary) 6%, transparent),
+        0 6px 14px -8px color-mix(in srgb, var(--ds-primary) 45%, transparent);
+}
+
+/* The card's action. Primary while there is nothing registered (the page's one
+   real move); a quiet text link once the instance is running, where it reports
+   progress rather than urging anything. */
+.cld-door-btn {
+    align-self: flex-start;
+    margin-top: 10px;
+    padding: 8px 14px;
+    border-radius: var(--ds-radius-pill, 999px);
+    background: var(--ds-primary); color: var(--ds-text-inverse);
+    font-size: 13px; font-weight: 650; text-decoration: none;
+    box-shadow: 0 8px 18px -10px color-mix(in srgb, var(--ds-primary) 55%, transparent);
+    transition: background var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease),
+                transform var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+.cld-door-btn:hover { background: var(--ds-primary-dark); }
+.cld-door-btn:active { transform: translateY(1px); }
+.cld-door-btn--quiet {
+    padding: 0;
+    margin-top: 8px;
+    background: none; box-shadow: none;
+    color: var(--ds-primary);
+    font-size: 12.5px; font-weight: 650;
+}
+.cld-door-btn--quiet:hover { background: none; text-decoration: underline; }
+/* On the member's card the quiet action is a <span> inside the card link, so
+   it never receives :hover itself — the card does. */
+.cld-door--know:hover .cld-door-btn--quiet { text-decoration: underline; }
 
 /* The trust caption, demoted from above the composer to the foot. */
 .cld-trust { margin: 16px 0 0; }

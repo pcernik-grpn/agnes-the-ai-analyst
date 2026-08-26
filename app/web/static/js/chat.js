@@ -1209,6 +1209,37 @@ let _currentAgentId = null;
  * exist", because a session row exists the moment you click "+ New chat". */
 let _sessionHasTurns = false;
 
+/** The conversation has started: settle the agent AND raise the thread
+ * header.
+ *
+ * These were two independent decisions and they disagreed. `openSession`
+ * titled every session it opened — "Untitled chat" when there was nothing
+ * better — which put `.has-thread` on the shell and swapped the centred
+ * empty-state layout for the conversation one. But switching agent on an
+ * empty dashboard goes through `newChat()` to get a session for the new
+ * agent, so picking an agent redrew the page as a conversation that did not
+ * exist: thread header, Copy transcript, composer pushed to the foot, and
+ * the dashboard still sitting there underneath.
+ *
+ * The distinction the picker already drew is the right one everywhere — "has
+ * this conversation started", not "does a session row exist" — so the header
+ * is driven from here too, and a session with no turns keeps the empty-state
+ * layout it had before the switch. */
+function _markConversationStarted() {
+  _sessionHasTurns = true;
+  _syncAgentPicker();
+  const meta = _sessionsCache.find(s => s.id === currentChatId);
+  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+}
+
+/** The inverse: no turns, so the empty-state dashboard and the live picker,
+ * and no thread chrome for a transcript that does not exist yet. */
+function _markConversationNotStarted() {
+  _sessionHasTurns = false;
+  _syncAgentPicker();
+  setThreadTitle(null);
+}
+
 /** What to call an agent in the picker. The seeded default agent is named the
  * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
  * answer to "who am I talking to?" — show the instance brand there instead.
@@ -1345,7 +1376,20 @@ function _renderAgentMenu() {
 async function _refreshAgents() {
   try {
     const res = await api("/api/agents");
-    _agentsCache = (res.agents || []).filter(a => a.mine && a.slug);
+    // Ready agents only — a draft is unfinished by its author's own say-so,
+    // and offering one here invites a conversation with something half-built.
+    // The picker is the "who am I talking to" control, not the agent index;
+    // /agents is where drafts belong, beside the thing that finishes them.
+    //
+    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent
+    // is seeded `status: "ready"` and an older draft one is promoted on first
+    // touch (`AgentsRepository.get_or_create_default`), so it passes the
+    // status test on its own. This keeps it from being dropped in the window
+    // before that heal lands — a picker without the default is a one-way
+    // switch, the same dead end the on-open refresh exists to avoid.
+    _agentsCache = (res.agents || []).filter(
+      a => a.mine && a.slug && (a.status === "ready" || a.is_default)
+    );
   } catch (err) {
     console.warn("chat: could not load agents for the picker", err);
   }
@@ -1450,8 +1494,7 @@ async function loadAndRenderHistory(chatId) {
     }
   } else {
     hideCapabilities();
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
     lastAssistantArticle = null;
     lastUserText = "";
     for (const m of history) {
@@ -1542,7 +1585,12 @@ async function openSession(chatId, wsUrlOverride) {
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
-  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // A titled session is necessarily one with turns (titles are derived from
+  // the conversation), so it can raise its header right away, before history
+  // hydrates. An UNTITLED one cannot be judged yet — it is equally a thread
+  // whose title never landed and a session created a moment ago by the agent
+  // picker — so the chrome waits for `loadAndRenderHistory` to say which.
+  setThreadTitle(meta && meta.title ? meta.title : null);
   // Who this conversation runs as. Read from the sidebar row (agent_id is
   // projected by GET /api/chat/sessions) rather than a per-open round-trip;
   // newChat() refreshes that cache before calling us, so a just-created
@@ -3997,8 +4045,7 @@ async function submitUserMessage(text) {
   // session's scope/memory/model/budget are fixed at creation and cannot be
   // re-pointed mid-thread. Disabling here rather than at session creation is
   // what keeps an empty "+ New chat" from dead-ending the picker.
-  _sessionHasTurns = true;
-  _syncAgentPicker();
+  _markConversationStarted();
   const ta = $("chat-input");
   if (ta) {
     ta.value = "";
@@ -4026,8 +4073,7 @@ async function submitUserMessage(text) {
     // openSession saw a session id it had never opened and reset the turns
     // flag — flipping the settled agent label back into a live picker
     // mid-send. The session is new; the conversation is not.
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
@@ -4035,8 +4081,7 @@ async function submitUserMessage(text) {
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
     // began.
-    _sessionHasTurns = false;
-    _syncAgentPicker();
+    _markConversationNotStarted();
     return;
   }
   // 3. Now ``#chat-messages`` is stable — render the user bubble and
@@ -5363,7 +5408,16 @@ function renderCoPresence(host, participants) {
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact
   // same flow as a typed message.
-  initChatDashboard({ submitPrompt: submitUserMessage, openSession });
+  // `capabilities` is the same server-rendered snapshot renderCapabilities()
+  // reads, passed in rather than re-parsed in the dashboard module so the page
+  // has exactly one parser for that blob. The dashboard uses it to decide
+  // which suggestions are honest: with no reachable tables, the four data
+  // starters ("Compare revenue trends", …) would every one of them fail.
+  initChatDashboard({
+    submitPrompt: submitUserMessage,
+    openSession,
+    capabilities: readCapabilitySnapshot(),
+  });
   // Pre-seeded question (/chat?q=… — the detail pages' "Ask Agnes" links):
   // prefill the composer and focus, but never auto-send — a GET must stay
   // side-effect free (a reload would otherwise re-create sessions).

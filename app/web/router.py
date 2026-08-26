@@ -6167,9 +6167,7 @@ async def admin_package_builder(
     # _build_context, not a bare dict — it is what supplies the rail, the
     # theme and the rest of the app chrome. Without it the page renders as a
     # builder floating on nothing.
-    return templates.TemplateResponse(
-        request, "admin_package_builder.html", _build_context(request, user=user)
-    )
+    return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
 
 
 @router.get("/admin/data-packages", response_class=HTMLResponse)
@@ -9067,6 +9065,7 @@ async def chat_page(
     _dev_preview = _resolve_dev_preview(request)
 
     admin_notice = None
+    admin_setup = None
     if _dev_preview != "member" and is_user_admin(user["id"], conn):
         try:
             from app.services.admin_dashboard import resolve_journey
@@ -9086,8 +9085,67 @@ async def chat_page(
                     # Forced preview on an instance that is fully set up: there
                     # is no real "next step" to borrow, so name the first one.
                     admin_notice = {"cta": "Connect a source", "href": "/admin/data-sources?add=1"}
+            # Progress, for EVERY admin rather than only an empty instance: the
+            # "Set up {brand}" card is on the page whether or not there is data,
+            # and on a running instance its whole job is saying how far along the
+            # chain this instance actually is. Two counts, no step list — the
+            # steps themselves live on /admin, which is where the card points.
+            if _setup.get("total"):
+                admin_setup = {
+                    "done": _setup.get("done_count") or 0,
+                    "total": _setup["total"],
+                    "complete": bool(_setup.get("complete")),
+                }
         except Exception:
             logger.exception("chat empty state: admin setup notice failed")
+
+    # The first move an admin can actually make, named after the connector this
+    # instance is configured for. `openWizard(connector)` in
+    # admin_data_sources.html already pre-selects its source from an argument,
+    # so `?add=<type>` opens the wizard ON that connector rather than on its
+    # picker — which is what lets the chip name a system instead of saying
+    # "connect a source" and landing somewhere generic.
+    #
+    # Only the configured type is offered plus one neutral escape: listing every
+    # connector Agnes can theoretically speak to would be a menu of things this
+    # instance has no credentials for.
+    connect_options: list[dict] = []
+    if admin_notice:
+        _source_labels = {
+            "keboola": "Connect a Keboola project",
+            "bigquery": "Connect BigQuery",
+            "databricks": "Connect Databricks",
+            "snowflake": "Connect Snowflake",
+        }
+        # `local` is the DEFAULT type (get_data_source_type falls back to it), so
+        # leaving it out of the map left the commonest instance with no first
+        # move at all. It gets a label but no `?add=<type>` pre-scope: there is
+        # no external system to pre-select, so it opens the picker.
+        _plain_types = {"local", "csv"}
+        try:
+            from app.instance_config import get_data_source_type
+
+            _configured = (get_data_source_type() or "").strip().lower()
+            if _configured in _source_labels:
+                connect_options.append(
+                    {
+                        "label": _source_labels[_configured],
+                        "href": f"/admin/data-sources?add={_configured}",
+                        "primary": True,
+                    }
+                )
+            elif _configured in _plain_types:
+                connect_options.append(
+                    {"label": "Add your first data", "href": "/admin/data-sources?add=1", "primary": True}
+                )
+        except Exception:
+            logger.exception("chat empty state: data source type lookup failed")
+        # A neutral way in, unless the primary already opens the same picker —
+        # two chips pointing at one URL is a choice that isn't one.
+        if not any(o["href"] == "/admin/data-sources?add=1" for o in connect_options):
+            connect_options.append(
+                {"label": "See all the ways in", "href": "/admin/data-sources?add=1", "primary": False}
+            )
 
     ctx = _build_context(
         request,
@@ -9098,6 +9156,14 @@ async def chat_page(
         knowledge_source_count=knowledge_source_count,
         capability_count=capability_count,
         admin_notice=admin_notice,
+        connect_options=connect_options,
+        admin_setup=admin_setup,
+        # The DEPLOYING ORGANIZATION (`instance.name`), used only to say whose
+        # company Agnes knows nothing about yet. Suppressed when it matches the
+        # product brand: operators who leave `name` at a product-shaped default
+        # would otherwise get "It knows nothing about AI Data Analyst yet",
+        # which reads as a bug. Falling back to "your company" is always true.
+        instance_org=_chat_instance_org(),
         dev_preview=_dev_preview,  # same value chrome resolved; kept explicit for this page's own branches
         # The toggle renders only where the switch is honoured, and only for
         # someone who has an admin view to switch away from — a member seeing
@@ -9108,6 +9174,12 @@ async def chat_page(
         dev_preview_available=is_local_dev_mode() and is_user_admin(user["id"], conn),
     )
     ctx["chat_capabilities"] = _chat_capability_snapshot(conn, user)
+    if _dev_preview == "empty":
+        # Render-only, matching the heading it accompanies: without this the
+        # forced preview showed "it knows nothing about your company" above four
+        # suggestions that all need data — a combination no real instance can be
+        # in. No repo read is bypassed and nothing is written.
+        ctx["chat_capabilities"] = {**ctx["chat_capabilities"], "tables_total": 0, "tables_by_source": {}}
     # Deep link: /chat?session=<id>. We DO NOT validate the id here (no
     # 404 on unknown/forbidden) — the page always renders and RBAC is
     # enforced when chat.js calls the session-scoped endpoints
@@ -9116,6 +9188,31 @@ async def chat_page(
     # surfaces an error status in the UI; the page itself still renders.
     ctx["initial_session_id"] = request.query_params.get("session")
     return templates.TemplateResponse(request, "chat.html", ctx)
+
+
+def _chat_instance_org() -> str:
+    """The deploying organization's name, or "" when there isn't a usable one.
+
+    ``instance.name`` is documented as the deploying organization and
+    ``instance.brand`` as the product (config/instance.yaml.example), but
+    nothing enforces the distinction — plenty of instances leave ``name`` at
+    something product-shaped like "AI Data Analyst". Saying "it knows nothing
+    about AI Data Analyst yet" would read as a bug, so an org name that matches
+    the brand (or is absent) resolves to "" and the caller says "your company"
+    instead, which is true on every instance.
+    """
+    try:
+        from app.instance_config import get_value
+
+        org = (get_value("instance", "name", default="") or "").strip()
+        brand = (get_value("instance", "brand", default="") or "").strip()
+        short = (get_value("instance", "brand_short", default="") or "").strip()
+        if not org or org.casefold() in {brand.casefold(), short.casefold()}:
+            return ""
+        return org
+    except Exception:
+        logger.exception("chat empty state: instance org lookup failed")
+        return ""
 
 
 def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> dict:
@@ -9171,6 +9268,10 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     return {
         "tables_total": tables_total,
         "tables_by_source": by_source,
+        # Who the zero-data state should offer what to: an admin can connect a
+        # source, a member can only ask for access. Resolved here because the
+        # snapshot is the one thing the dashboard JS already reads.
+        "is_admin": is_user_admin(user["id"], conn),
         "plugins": plugin_summaries,
         "marketplace_count": marketplace_count,
     }

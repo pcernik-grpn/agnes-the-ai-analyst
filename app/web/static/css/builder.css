@@ -65,18 +65,19 @@ body.ag-building .idx > footer { display: none; }
 .ag-build-actions .ag-del-btn:focus-visible { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 
 /* Numbered collapsible sections. */
-/* Sections sit ON the configuration surface rather than floating as white
-   cards on it. Six stacked cards inside a panel that is itself a distinct
-   surface was two levels of container for one list — the eye reads the card
-   edges before it reads the headings, and the panel ends up looking busier
-   the more of it you fill in. A hairline between sections carries the same
-   separation without the second surface. */
-.ag-sec { border-bottom: 1px solid var(--ds-border); }
-.ag-sec:last-child { border-bottom: none; }
-.ag-sec-head { display: flex; align-items: center; gap: 12px; padding: 15px 4px; cursor: pointer; user-select: none; }
-/* On grey the sunken fill no longer reads as a chip, so the badge takes the
-   page surface instead — it is now the lighter thing, not the darker one. */
-.ag-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+/* Sections ARE cards, restored after a flat pass (cc2247518) that put them on
+   the panel separated only by hairlines. The argument for flattening was real —
+   two levels of container for one list, card edges competing with headings —
+   but the cost was worse: with only a hairline, a section's heading, labels,
+   hints and inputs all sit on one grey field, and the white input boxes become
+   the strongest edges on the panel. That puts the emphasis on the fields
+   instead of the structure, and nothing marks where one section ends and the
+   next begins. A card per section is what makes the column scannable. */
+.ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
+.ag-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; cursor: pointer; user-select: none; }
+/* Back to the sunken fill: on a white card the badge is the darker thing
+   again, which is what makes it read as a step marker rather than a hole. */
+.ag-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
 .ag-sec-head h3 { font-size: 15px; margin: 0; }
 .ag-sec-head h3 .ag-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }
 .ag-sec-sub { margin: 12px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--ds-text-secondary); }
@@ -85,12 +86,12 @@ body.ag-building .idx > footer { display: none; }
 .ag-sec-chev { color: var(--ds-text-muted); transition: transform var(--ds-motion-fast) var(--ds-ease-standard); }
 .ag-sec-chev svg { width: 16px; height: 16px; display: block; }
 .ag-sec.collapsed .ag-sec-chev { transform: rotate(-90deg); }
-/* No top rule: the section header is directly above its own body, and a line
-   between them separated a heading from the thing it names. The rule that
-   matters is the one BETWEEN sections, on .ag-sec. */
-.ag-sec-body { padding: 0 4px 20px; }
+/* The divider comes back with the card: inside a bounded card a rule between
+   the header and the body reads as internal structure, not as a heading cut
+   off from what it names — which is only how it read on the flat panel. */
+.ag-sec-body { padding: 4px 18px 18px; border-top: 1px solid var(--ds-border); }
 .ag-sec.collapsed .ag-sec-body { display: none; }
-.ag-sec.collapsed .ag-sec-head { padding-bottom: 15px; }
+.ag-sec.collapsed .ag-sec-head { padding-bottom: 14px; }
 
 /* Fields. */
 .ag-field { display: block; margin: 14px 0 0; }

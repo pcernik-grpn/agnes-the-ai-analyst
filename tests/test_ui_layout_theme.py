@@ -1522,14 +1522,44 @@ class TestRailDashboard:
         # NOT patched: the tmp_path instance genuinely has no registered table.
         text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
 
-        assert 'class="cld-notice"' in text, "admin notice missing on an instance with no data"
-        assert "No data is registered yet" in text
-        assert 'href="/admin"' in text  # the full chain stays one click away
+        # The message is the page's own heading and lede now, not a bar above
+        # them: a notice repeating the heading directly underneath said it twice.
+        assert "Set up Agnes for your team" in text, "zero-state heading missing on an instance with no data"
+        assert "so it can answer nothing" in text, "the CONSEQUENCE is what makes the fact mean something"
+        # "your company", never the org name — `instance.name` is routinely
+        # product-shaped and turns the sentence into a bug.
+        assert "knows nothing about your company" in text
+        # ONE action, in the setup card. The hero used to carry a chip and a
+        # "Full checklist" link as well; three routes into the same job meant
+        # choosing between them before starting any of it.
+        assert "cld-door--setup" in text, "the setup card is the admin's action now"
+        assert 'class="cld-door-btn"' in text, "…and it carries a primary button"
+        # That button is the CONNECT action, never the journey's current step:
+        # `admin_notice.cta` can read "Invite people" on a partly-set-up
+        # instance, which is incoherent beside "nothing is registered yet".
+        assert "Invite people" not in text
+        assert "/admin/data-sources?add=" in text
+        # The composer must not advertise the one thing that cannot work here.
+        assert "summarize revenue trends" not in text, "the zero state still offers a data example"
         # The retired panel's framing must not come back with it.
         for retired in ('class="cset"', "of 6 done", "Do this next", 'class="cset-steps"'):
             assert retired not in text, f"the retired setup-panel framing is back: {retired}"
         # The composer is still the page's point.
         assert 'id="chat-input"' in text
+
+    def test_zero_state_offers_only_answerable_starters(self, web_client, admin_cookie, monkeypatch):
+        """The four data starters must not be offered where they cannot work.
+
+        "Compare revenue trends" against an instance with no reachable tables
+        can only apologise. The renderer picks its set from the server-rendered
+        capability snapshot, so the page has to ship that snapshot with a
+        truthful `tables_total` for the swap to happen at all — this asserts the
+        SIGNAL, since the swap itself is in chat_dashboard.js.
+        """
+        self._enable_chat(web_client, monkeypatch)
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+        assert '"tables_total": 0' in text, "the snapshot must tell the dashboard there is no data"
+        assert '"is_admin": true' in text, "…and who is looking, so it offers connect vs ask-for-access"
 
     def test_admin_notice_is_silent_once_tables_are_registered(self, web_client, admin_cookie, monkeypatch):
         """Gated on the FACT, not on chain completion — so it goes quiet as soon
@@ -1537,7 +1567,7 @@ class TestRailDashboard:
         self._enable_chat(web_client, monkeypatch)
         self._tables_registered(monkeypatch)
         text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
-        assert 'class="cld-notice"' not in text
+        assert "Set up Agnes for your team" not in text
         # …and the page itself is unchanged: it is the same landing page for
         # everyone, which is the point of retiring the two-hero split.
         assert 'class="cld-doors"' in text
@@ -1573,7 +1603,7 @@ class TestRailDashboard:
         page = web_client.get("/chat", cookies=cookie, follow_redirects=False)
         assert page.status_code == 200, f"member did not reach /chat: {page.status_code}"
         text = page.text
-        assert 'class="cld-notice"' not in text, "a non-admin was shown the admin notice"
+        assert "Set up Agnes for your team" not in text, "a non-admin was shown the admin notice"
         assert "cset-devsw" not in text, "a non-admin was shown the dev audience switch"
         # They get the same landing page as everyone else.
         assert 'class="cld-doors"' in text
@@ -1584,7 +1614,7 @@ class TestRailDashboard:
         self._enable_chat(web_client, monkeypatch)
         self._dev_mode(monkeypatch)
         text = web_client.get("/chat?preview=member", cookies=admin_cookie, follow_redirects=False).text
-        assert 'class="cld-notice"' not in text, "?preview=member did not suppress the admin notice"
+        assert "Set up Agnes for your team" not in text, "?preview=member did not suppress the admin notice"
         # The switch stays on screen so the view is escapable and labelled. It
         # moved out of this page's markup and into the base layout — inline it
         # read as product chrome, and its links could only point back at /chat.
@@ -1599,8 +1629,11 @@ class TestRailDashboard:
         self._dev_mode(monkeypatch)
         self._tables_registered(monkeypatch)  # …so the notice would normally be silent
         text = web_client.get("/chat?preview=empty", cookies=admin_cookie, follow_redirects=False).text
-        assert 'class="cld-notice"' in text
-        assert "No data is registered yet" in text
+        assert "Set up Agnes for your team" in text
+        assert "so it can answer nothing" in text
+        # The forced state must force the DATA signal too, or the heading sits
+        # above four suggestions that need data — a state no instance can be in.
+        assert '"tables_total": 0' in text
 
     def test_dev_preview_is_inert_without_local_dev_mode(self, web_client, admin_cookie, monkeypatch):
         """The switch must not be a production surface. Off the dev gate every
@@ -1612,7 +1645,7 @@ class TestRailDashboard:
         for value in ("member", "empty"):
             text = web_client.get(f"/chat?preview={value}", cookies=admin_cookie, follow_redirects=False).text
             assert "cset-devsw" not in text, f"the dev switch rendered outside LOCAL_DEV_MODE (?preview={value})"
-            assert 'class="cld-notice"' not in text, f"?preview={value} was honoured outside LOCAL_DEV_MODE"
+            assert "Set up Agnes for your team" not in text, f"?preview={value} was honoured outside LOCAL_DEV_MODE"
 
     def test_dev_preview_rejects_an_unknown_value(self, web_client, admin_cookie, monkeypatch):
         """Anything but the known values falls back to the real view rather than
@@ -1621,7 +1654,7 @@ class TestRailDashboard:
         self._dev_mode(monkeypatch)
         self._tables_registered(monkeypatch)
         text = web_client.get("/chat?preview=wat", cookies=admin_cookie, follow_redirects=False).text
-        assert 'class="cld-notice"' not in text
+        assert "Set up Agnes for your team" not in text
 
     def test_rail_dashboard_actions_section(self, web_client, admin_cookie, monkeypatch):
         """One Suggested-next-actions section below the composer: list +

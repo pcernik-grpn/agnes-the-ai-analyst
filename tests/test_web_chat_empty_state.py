@@ -248,11 +248,15 @@ class TestChatEmptyStatePill:
         body = resp.text
         doors = body[body.index('class="cld-doors"') :]
         doors = doors[: doors.index("</nav>")]
-        # All three routes, and each says where it goes.
-        assert 'href="/library"' in doors
+        # All three routes, and each says where it goes. The FIRST card is
+        # audience-dependent: an admin gets "Set up Agnes" (the job only they
+        # can do) where a member gets the Library door, so this test — which
+        # signs in as an admin — expects the setup card, and the member variant
+        # is covered in tests/test_ui_layout_theme.py.
+        assert "cld-door--setup" in doors
+        assert "Set up Agnes" in doors
         assert 'href="/how-it-works#connect"' in doors
         assert 'href="/how-it-works"' in doors
-        assert "See what Agnes knows" in doors
         assert "Take Agnes to your own tools" in doors
         assert "How Agnes works" in doors
         # Links, not buttons — the composer above is the page's only action.

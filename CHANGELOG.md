@@ -90,6 +90,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   wrapping to four lines under all six collapsed titles.
 
 ### Added
+- **The builder's configuration sections are cards again.** They were flattened
+  onto the panel with only a hairline between them, on the argument that six
+  white cards inside a panel that is itself a surface is two levels of
+  container for one list. True, but the cost was worse: with only a hairline a
+  section's heading, labels, hints and inputs all sit on one grey field, the
+  white input boxes become the strongest edges in the column, and nothing marks
+  where one section ends and the next begins. Both builders share the rule, so
+  `/agents` and `/skills` are fixed together, and the skills page's Type step
+  follows — flat among cards is the same mistake inverted.
 
 - **The `/chat` landing page introduces itself in text instead of a banner.**
   The Knowledge Layer hero that led the page is retired: it asserted a category
@@ -102,13 +111,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
   works"), the middle one naming the direction the old CTA got backwards. Same
   page for admins and members.
-- **An admin on an instance with no registered data gets one line saying so.**
-  Nobody can ask about the company until a source is connected and its tables
-  are shared, so the landing page says that, with the next action beside it and
-  a link to the full checklist on `/admin`. Gated on the fact (nothing
-  registered), not on a completion count — it is silent as soon as there is
-  data and never implies setup is finished, because adding another source is
-  always legitimate.
+- **The chat landing page stops offering what it cannot do, and gives an admin
+  one thing to do.** On an instance with no data reachable by the caller the
+  page used to say "Ask Agnes anything", suggest four data starters ("Compare
+  revenue trends", …) that would every one of them fail, and put "try:
+  summarize revenue trends" in the composer. The offer now follows the state.
+  An **admin** with nothing registered gets "Set up Agnes for your team" over
+  "It knows nothing about your company yet, so it can answer nothing", and
+  exactly one action: a *Set up Agnes* card — visually apart from its
+  neighbours, since it is a job the reader owns rather than a place to browse —
+  carrying a primary button that opens the connect wizard *on* the connector
+  this instance is configured for. Its starters become answerable ones ("How do
+  I connect our data?", "What will people be able to ask?"). A **running
+  instance** keeps the same card, reporting progress and pointing at the admin
+  overview, with governance starters in place of the data ones ("Who can see
+  what?", "What can nobody reach?"). A **member** who can reach nothing gets
+  starters aimed at the only thing they can act on ("How do I get access?")
+  rather than at data they have no grant for. Callers with data see the page
+  as before, except the three route cards move above the composer — they are
+  where you go instead of asking, so asking them to be scrolled past was
+  backwards. The "no data is registered yet" notice bar is gone: the heading
+  says it now.
 
 - **The `/agents` builder is now a conversation next to the configuration.**
   Opening an agent gives two panes: a **Create** conversation on the left that

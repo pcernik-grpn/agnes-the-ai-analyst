@@ -200,38 +200,55 @@ class TestThePageBuilderDoesNotPaintOverTheRail:
         assert "position: static" in body
 
 
-class TestTheConfigurationPanelIsOneSurface:
-    """Sections sit ON the grey panel, not as white cards floating on it.
+class TestTheConfigurationSectionsAreCards:
+    """Each section is a bounded card, not a hairline-separated row.
 
-    Six stacked cards inside a panel that is itself a distinct surface was two
-    levels of container for one list: the eye reads the card edges before the
-    headings, and it got busier the more of the form you filled in.
+    This guard was written the other way round (`TestTheConfigurationPanelIsOne
+    Surface`, cc2247518): sections were flattened onto the grey panel because
+    six white cards inside a panel that is itself a surface is two levels of
+    container for one list. That argument was real but the cost was worse — with
+    only a hairline, a section's heading, its labels, its hints and its inputs
+    all sit on one flat field, and the white input boxes become the strongest
+    edges in the column. The emphasis lands on the fields instead of the
+    structure and nothing marks where one section ends and the next starts, so
+    the panel stopped being scannable. Reverted deliberately; this class now
+    pins the cards so a future flattening has to argue with the reason it was
+    undone rather than rediscovering it.
     """
 
-    def test_sections_have_no_card_of_their_own(self, css):
+    def test_each_section_is_its_own_card(self, css):
         rule = re.search(r"\n\.ag-sec \{([^}]*)\}", css)
         assert rule, ".ag-sec rule not found"
         body = rule.group(1)
-        assert "background:" not in body, "the section is painting its own surface again"
-        assert "border-radius" not in body, "the section is a card again"
-        assert "border-bottom" in body, "sections need a hairline to separate them"
+        assert "background:" in body, "the section is not painting a surface — it is flat again"
+        assert "border-radius" in body, "the section has no radius — it is not a card"
+        assert "border:" in body, "the section has no edge"
 
-    def test_the_body_has_no_rule_above_it(self, css):
-        """A line between a heading and the thing it names separates the wrong
-        two things. The rule that matters is BETWEEN sections."""
+    def test_the_body_is_divided_from_its_header(self, css):
+        """Inside a bounded card a rule between header and body reads as
+        internal structure. (It read as a heading cut off from what it names
+        only while the sections were flat on the panel.)"""
         rule = re.search(r"\.ag-sec-body \{([^}]*)\}", css)
-        assert rule and "border-top" not in rule.group(1)
+        assert rule and "border-top" in rule.group(1), "the header/body divider is missing"
 
-    def test_the_last_section_does_not_end_in_a_stray_line(self, css):
-        assert ".ag-sec:last-child { border-bottom: none; }" in css
+    def test_sections_are_separated_by_the_gap_not_a_line(self, css):
+        """Cards are spaced apart, so the between-sections hairline the flat
+        design needed would now draw a line in the gutter between two cards."""
+        rule = re.search(r"\n\.ag-sec \{([^}]*)\}", css)
+        assert rule and "margin-bottom" in rule.group(1), "cards need the gap that separates them"
+        assert ".ag-sec:last-child { border-bottom: none; }" not in css, (
+            "a leftover from the flat design — there is no between-section border to cancel"
+        )
 
     def test_the_skills_type_step_matches(self):
-        """Step 1 keeps its own markup but must not keep its own look — a lone
-        white card in a column of hairline rows."""
+        """Step 1 keeps its own markup but must match the shared sections' look.
+        With cards back, a hairline row here would be the one flat thing in a
+        column of cards — the same mistake inverted."""
         skills = (ROOT / "app" / "web" / "templates" / "skills.html").read_text(encoding="utf-8")
         rule = re.search(r"\n  \.sk-sec \{([^}]*)\}", skills)
         assert rule, ".sk-sec rule not found"
-        assert "background:" not in rule.group(1) and "border-radius" not in rule.group(1)
+        assert "background:" in rule.group(1), "the Type step is flat while the others are cards"
+        assert "border-radius" in rule.group(1), "the Type step is not a card"
 
 
 class TestThePackageBuilderShipsItsOwnControls:
