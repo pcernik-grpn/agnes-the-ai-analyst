@@ -1151,6 +1151,18 @@ async def lifespan(app):
     except Exception:
         logger.exception("Microsoft auth startup check crashed (non-fatal)")
 
+    # Google: unlike Microsoft, there is no tenant to serve as even a partial
+    # identity boundary — an enabled provider without auth.allowed_domain
+    # means ANY Google account can sign in and self-provision. Same wiring as
+    # the Microsoft check above (RBAC review on PR #1569).
+    try:
+        from app.auth.providers.google import startup_warnings as google_startup_warnings
+
+        for warning in google_startup_warnings():
+            logger.warning("Google auth check: %s", warning)
+    except Exception:
+        logger.exception("Google auth startup check crashed (non-fatal)")
+
     # Bring the Postgres schema to the app's expected Alembic head. The
     # DuckDB ladder self-migrates on every connect (src/db.py); Postgres
     # now mirrors that at startup — when the DB is behind, the pending

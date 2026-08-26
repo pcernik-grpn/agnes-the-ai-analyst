@@ -112,6 +112,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   apps. A deployment that serves apps publicly in path-prefix mode (no
   `subdomain_base`) must set `allow_same_origin: true` (trusted authors only) or
   move to subdomain mode; a startup log flags an enabled-but-unservable posture.
+### Added
+
+- **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
+  the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
+  `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
+  of its own, so an enabled provider with no allowed domain means any Google
+  account can sign in and self-provision, and nothing said so at boot. Found
+  during RBAC review of the `config/loader.py` required-fields demotion above:
+  that loader check used to be an accidental loud signal for exactly this gap
+  (a missing `auth.allowed_domain` discarded the whole static config with an
+  ERROR log) and is now a passive warning, so the gap needed its own explicit
+  check.
+
 ### Changed
 
 - **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,

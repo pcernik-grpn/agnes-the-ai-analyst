@@ -40,6 +40,29 @@ def is_available() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
 
+def startup_warnings() -> list[str]:
+    """Operator-facing boot messages, emitted from ``app.main``'s lifespan.
+
+    Silence here means "configured and pinned"; an unconfigured instance says
+    nothing at all (Google login is opt-in) — mirrors
+    ``app.auth.providers.microsoft.startup_warnings``. Unlike Microsoft,
+    Google has no tenant to serve as even a partial identity boundary: with
+    ``auth.allowed_domain`` unset, ANY Google account can sign in and
+    self-provision an Agnes account. That gap had no boot-time signal until
+    now (RBAC review on PR #1569).
+    """
+    if not is_available():
+        return []
+    if not get_allowed_domains():
+        return [
+            "Google sign-in is enabled but auth.allowed_domain is unset. There is no "
+            "tenant or other boundary behind Google OAuth — any Google account can sign "
+            "in and self-provision an account. Pin auth.allowed_domain to the domains "
+            "you own."
+        ]
+    return []
+
+
 def _setup_oauth():
     if not is_available():
         return
