@@ -26,9 +26,9 @@ without the wire contract changing.
 boundary: unknown keys are dropped, ids not present in the candidate lists
 are dropped, tone must be one of the four the UI offers, surfaces must be
 known keys with boolean values, and the survivors are re-validated by
-``AgentUpdate`` (which enforces the column lengths) before anything is
+``UpdateAgentRequest`` (which enforces the column lengths) before anything is
 written. The patch is then applied through the ordinary
-:func:`app.api.agents.update_agent` path, so the builder-declaration →
+:func:`app.api.agents_admin.update_agent` path, so the builder-declaration →
 enforced-scope derivation (`_sync_builder_scope`) runs exactly as it does for
 a hand edit.
 
@@ -53,11 +53,18 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.agents import AgentUpdate, _writable, update_agent
+
+# `app.api.agents` was deleted in C1.2 (/api/agents retired into
+# /api/v1/agents). The three names this module needs live in the v1
+# router now: `AgentUpdate` -> `UpdateAgentRequest`, and `_writable`'s
+# owner-checked load -> `_load_agent(..., require_owner=True)`.
+from app.api.agents_admin import UpdateAgentRequest, _load_agent, update_agent
 from app.auth.access import require_agent_profiles_enabled
+from app.auth.dependencies import _get_db
 from app.auth.dependencies import get_current_user
 from app.services.agent_ingredients import knowledge_sources_for
 
@@ -71,6 +78,25 @@ router = APIRouter(
 
 #: Tones the builder UI offers. The model may not invent a fifth.
 TONES = ("concise", "friendly", "formal", "playful")
+
+#: The placeholder a brand-new agent is created with. `POST /api/v1/agents`
+#: rejects a blank name, so the builder page sends this instead
+#: (agents.html: `payload.name = payload.name || 'Untitled'`). It has to
+#: count as UNNAMED here, or the first turn would decline to name the agent
+#: from the owner's description — the placeholder would occupy the field
+#: forever, which is what the old blank-name create avoided by accident.
+PLACEHOLDER_NAME = "untitled"
+
+#: Column lengths the sanitizer enforces, mirroring the `agents` table. The
+#: retired `AgentUpdate` model owned these; v1's `UpdateAgentRequest` leaves
+#: every string unbounded, so they live here now.
+_PATCH_MAX_LENGTHS = {
+    "name": 120,
+    "role": 200,
+    "tone": 40,
+    "greeting": 500,
+    "instructions": 20000,
+}
 
 #: Surface keys the builder UI offers.
 SURFACES = ("web", "slack", "telegram", "cli", "mcp")
@@ -284,7 +310,22 @@ def _sanitize_patch(
         return {}
     # Second gate: the column-length constraints, enforced by the same model
     # the hand-edit PATCH validates against.
-    return AgentUpdate(**patch).model_dump(exclude_unset=True, exclude_none=True)
+    # Second gate: the column-length constraints. The deleted `AgentUpdate`
+    # carried these as pydantic max_lengths; v1's `UpdateAgentRequest` does
+    # not constrain them at all, so validating through it alone would let a
+    # model-proposed 5000-character name reach the database. Enforced here
+    # instead of trusting the request model — this function IS the trust
+    # boundary, and a patch that violates a column is refused rather than
+    # truncated, because silently storing something other than what the
+    # conversation agreed is worse than an error.
+    for field, limit in _PATCH_MAX_LENGTHS.items():
+        value = patch.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            raise HTTPException(
+                status_code=422,
+                detail={"kind": "field_too_long", "field": field, "limit": limit},
+            )
+    return UpdateAgentRequest(**patch).model_dump(exclude_unset=True, exclude_none=True)
 
 
 def _stub_enabled() -> bool:
@@ -310,7 +351,7 @@ def _stub_turn(message: str, config: Dict[str, Any], knowledge: List[Dict[str, A
         topic, name, tone = "general", "Data Assistant", "concise"
 
     patch: Dict[str, Any] = {}
-    if not (config.get("name") or "").strip():
+    if (config.get("name") or "").strip().casefold() in ("", PLACEHOLDER_NAME):
         patch["name"] = name
         patch["role"] = f"Answers {topic} questions from governed data."
         patch["tone"] = tone
@@ -357,7 +398,7 @@ def _llm_turn(prompt: str) -> Dict[str, Any]:
 
 
 def _current_config(row: dict) -> Dict[str, Any]:
-    from app.api.agents import _decode
+    from app.api.agents_builder_shared import _decode
 
     return {
         "name": row.get("name") or "",
@@ -376,9 +417,10 @@ async def builder_turn(
     agent_id: str,
     payload: BuilderTurnRequest,
     user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Run one builder turn against an agent the caller owns."""
-    row = _writable(agent_id, user)
+    row = _load_agent(agent_id, user, conn, require_owner=True)
     message = (payload.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail={"kind": "empty_message"})
@@ -431,7 +473,7 @@ async def builder_turn(
     )
     agent: Optional[Dict[str, Any]] = None
     if patch and payload.apply:
-        agent = await update_agent(agent_id, AgentUpdate(**patch), user)
+        agent = await update_agent(agent_id, UpdateAgentRequest(**patch), user, conn)
 
     reply = result.get("reply")
     suggestions = result.get("suggestions")

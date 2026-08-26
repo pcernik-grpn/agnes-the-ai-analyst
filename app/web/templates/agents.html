@@ -14,11 +14,14 @@
    same reads as /stack); Capabilities hydrate from
    /api/marketplace/items?tab=my (the caller's subscribed plugins). Agent
    definitions persist SERVER-SIDE in the v103 `agents` registry via
-   /api/agents, so they follow the user across devices — but this page is their
-   only home: they are not Library entries and the UI exposes no sharing
-   affordance yet (the API can read group-granted agents; nothing grants them).
-   (They previously lived in localStorage; the page says plainly what is still
-   missing instead of promising surfaces that don't work yet.) #}
+   /api/v1/agents (this page's own /api/agents adapter router was deleted in
+   the remediation-program's "one agent model" Track C1, Task C1.2 — v1
+   absorbed the builder's wire shape in Task C1.1), so they follow the user
+   across devices — but this page is their only home: they are not Library
+   entries and the UI exposes no sharing affordance yet (the API can read
+   group-granted agents; nothing grants them). (They previously lived in
+   localStorage; the page says plainly what is still missing instead of
+   promising surfaces that don't work yet.) #}
 {% block title %}Agents — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--wide{% endblock %}
 
@@ -147,8 +150,10 @@
 
   /* ── State ─────────────────────────────────────────────────────────────
      Agents live in the server-side v103 registry (`agents` table) behind
-     /api/agents. The in-page `agents` array is a working copy of that: reads
-     hydrate it on boot, and every mutation writes back (debounced PATCH for
+     /api/v1/agents (re-pointed from this page's own now-deleted /api/agents
+     adapter router in Task C1.2 — /api/v1/agents absorbed its wire shape in
+     Task C1.1). The in-page `agents` array is a working copy of that: reads
+     hydrate it on boot, and every mutation writes back (debounced PUT for
      field edits, POST/DELETE for create/remove). The object shape is the one
      the API returns, which is why it needed no reshaping when the registry
      replaced the old localStorage store. */
@@ -242,8 +247,12 @@
     var a = current();
     if (!a || !a.id) return Promise.resolve(null);
     saving = true; syncHeaderState();
-    return fetch('/api/agents/' + encodeURIComponent(a.id), {
-      method: 'PATCH',
+    // `PUT /api/v1/agents/{id}` — re-pointed from this page's own now-deleted
+    // `PATCH /api/agents/{id}` (Task C1.2). v1 takes the same builder wire
+    // fields; `agentPayload` already sends `surfaces` explicitly, which v1
+    // needs because it does not invent the old router's `{web: true}` default.
+    return fetch('/api/v1/agents/' + encodeURIComponent(a.id), {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
       body: JSON.stringify(agentPayload(a))
@@ -505,7 +514,7 @@
     var id = a.id;
     agents = agents.filter(function (x) { return x.id !== id; });
     closeBuilder();
-    fetch('/api/agents/' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' })
+    fetch('/api/v1/agents/' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' })
       .then(function (r) { if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status); })
       .catch(function (err) {
         // The row outlived the attempt to discard it. Put it back rather than
@@ -1426,7 +1435,20 @@
       delete payload.tone;
       delete payload.greeting;
     }
-    return fetch('/api/agents', {
+    // `POST /api/v1/agents` requires a non-blank `name` (400 `invalid_name`)
+    // — unlike this page's own now-deleted `/api/agents`, which let "New
+    // agent" mint a fully blank draft. A placeholder preserves that instant,
+    // no-modal draft flow: the row is still renamed (and its slug re-derived,
+    // `_draft_slug_rename`) on the very next keystroke in the Identity field.
+    payload.name = payload.name || 'Untitled';
+    // …and explicitly a DRAFT. v1's create defaults `status` to 'ready'
+    // where the deleted router made drafts, so without this a brand-new
+    // agent would be Ready before it has a role — it would appear in the
+    // chat composer's agent picker (which filters to ready) as something
+    // nobody has configured, and the header's own "Save as draft" /
+    // "Mark ready" pair would contradict the row's real state.
+    if (!payload.status) payload.status = 'draft';
+    return fetch('/api/v1/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
@@ -1551,7 +1573,7 @@
       agents = agents.filter(function (x) { return x.id !== id; });
       if (currentId === id) { currentId = null; baseline = null; isNewAgent = false; }
       renderList();
-      fetch('/api/agents/' + encodeURIComponent(id), {
+      fetch('/api/v1/agents/' + encodeURIComponent(id), {
         method: 'DELETE', credentials: 'same-origin'
       }).then(function (r) {
         if (!r.ok && r.status !== 204) throw new Error('HTTP ' + r.status);
@@ -1870,9 +1892,9 @@
 
   /* Boot: hydrate the working copy from the registry, then render. A failed
      load renders the empty list rather than a blank page, and says so. */
-  fetch('/api/agents', { credentials: 'same-origin' })
+  fetch('/api/v1/agents', { credentials: 'same-origin' })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    .then(function (d) { agents = (d && d.agents) || []; })
+    .then(function (d) { agents = (d && d.data) || []; })
     .catch(function (e) {
       console.error('agents: load failed', e);
       if (window.appToast) window.appToast({ kind: 'error', msg: 'Could not load your agents.' });

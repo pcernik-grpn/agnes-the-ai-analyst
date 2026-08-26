@@ -15,6 +15,17 @@ pins what it is allowed to do once it gets there:
 
 Plus the crash-surface sweep: every widened seam must return/raise for an
 ``AgentPrincipal`` instead of blowing up on ``user["id"]``.
+
+C2.2 note (remediation Track C, ``docs/superpowers/plans/
+2026-08-26-one-agent-model.md``): every principal below is hand-built with an
+explicit ``intersection=`` dict, so this suite is agnostic to HOW that dict
+was computed — it pins consumption, not production. In real traffic
+``.intersection`` is produced by ``resolve_agent_authority``
+(``src/agent_scope_intersection.py``, replacing ``compute_agent_intersection``)
+rather than an owner-only lookup; the D-C2 admin/self-granted split it
+implements is covered where it is actually produced
+(``tests/test_agent_scope_intersection.py``,
+``tests/db_pg/test_resolve_agent_authority_pg.py``), not here.
 """
 
 from __future__ import annotations
@@ -202,6 +213,53 @@ def test_get_accessible_ids_never_returns_all_for_agent_principal():
     p = _agent_principal(recipe={"r1"})
     assert get_accessible_ids(p, ResourceType.RECIPE.value) == frozenset({"r1"})
     assert get_accessible_ids(p, ResourceType.COLLECTION.value) == frozenset()
+
+
+def test_accessible_collection_ids_uses_intersection_for_agent_principal(monkeypatch):
+    """``accessible_collection_ids`` must never fall into the dict-only
+    ownership branch (``user.get("id")``) for an ``AgentPrincipal`` — a
+    frozen dataclass has no ``.get``, so that branch crashes with an
+    AttributeError instead of returning the live scoped intersection."""
+    import app.auth.access as access
+    import src.repositories as repositories
+
+    monkeypatch.setattr(
+        repositories,
+        "file_corpora_repo",
+        lambda: pytest.fail("file_corpora_repo must not be consulted for an AgentPrincipal"),
+    )
+
+    result = access.accessible_collection_ids(_agent_principal(collection={"c1"}))
+    assert result == frozenset({"c1"})
+
+    empty = access.accessible_collection_ids(_agent_principal())
+    assert empty == frozenset()
+
+
+def test_require_collection_access_uses_intersection_for_agent_principal(monkeypatch):
+    """The collection-scoped gate must route an ``AgentPrincipal`` through
+    ``can_access_session`` (intersection membership), never through
+    ``can_access_collection`` (which would subscript ``user["id"]``)."""
+    import app.auth.access as access
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(
+        access,
+        "can_access_collection",
+        lambda *a, **k: pytest.fail("can_access_collection must not be consulted for an AgentPrincipal"),
+    )
+
+    dep = access.require_collection_access("{collection_id}")
+    request = MagicMock()
+    request.path_params = {"collection_id": "c1"}
+
+    granted = _agent_principal(collection={"c1"})
+    assert dep(request=request, user=granted, conn=None) is granted
+
+    denied = _agent_principal(collection={"c2"})
+    with pytest.raises(HTTPException) as exc:
+        dep(request=request, user=denied, conn=None)
+    assert exc.value.status_code == 403
 
 
 def test_stack_resolver_accepts_agent_principal(monkeypatch):

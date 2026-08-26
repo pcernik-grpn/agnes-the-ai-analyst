@@ -144,10 +144,46 @@ def env(tmp_path, monkeypatch, shared_app):
     }
 
 
+def _grant_package(user_id: str, pkg_id: str) -> None:
+    """Direct `resource_grants(resource_type='data_package', ...)` row for
+    `user_id` — the write-gate (C2.1) requires a non-admin writer to
+    currently hold whatever data_package they declare in `knowledge`."""
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    groups = UserGroupsRepository(conn)
+    grp = groups.get_by_name("v1-parity-pkg-grants") or groups.create(
+        name="v1-parity-pkg-grants", description="test", created_by="test"
+    )
+    members = UserGroupMembersRepository(conn)
+    if not members.has_membership(user_id, grp["id"]):
+        members.add_member(user_id, grp["id"], source="admin", added_by="test")
+    grants = ResourceGrantsRepository(conn)
+    if not grants.has_grant([grp["id"]], "data_package", pkg_id):
+        grants.create(
+            group_id=grp["id"],
+            resource_type="data_package",
+            resource_id=pkg_id,
+            assigned_by="test",
+            requirement="required",
+        )
+    conn.close()
+
+
 def _make_pkg(name: str, slug: str) -> str:
+    """A data package, granted to `owner1` immediately — every test in this
+    file declares it via `owner1`'s `knowledge`, and the write-gate (C2.1)
+    requires that writer to already hold what they declare."""
     from src.repositories import data_packages_repo
 
-    return data_packages_repo().create(name=name, slug=slug, description=None, icon=None, color=None, created_by="test")
+    pkg_id = data_packages_repo().create(
+        name=name, slug=slug, description=None, icon=None, color=None, created_by="test"
+    )
+    _grant_package("owner1", pkg_id)
+    return pkg_id
 
 
 # ---------------------------------------------------------------------------
@@ -201,20 +237,15 @@ def test_v1_create_without_builder_fields_keeps_existing_defaults(env):
     assert created["instructions"] == ""
 
 
-def test_v1_create_knowledge_and_plugins_produce_the_same_scope_rows_as_the_builder(env):
-    """The v1 create and the /agents builder create must call the SAME
-    `_sync_builder_scope` mapping — row-for-row equality between the two
-    surfaces for an equivalent declaration."""
+def test_v1_create_knowledge_and_plugins_produce_the_expected_scope_rows(env):
+    """v1's `knowledge`/`plugins` create fields go through the SAME
+    `_sync_builder_scope` mapping the (now-deleted, Task C1.2) `/agents`
+    builder router used — a declaration lands in `agent_scope`, and every
+    mode axis defaults to `'selected'`, exactly as the builder's own create
+    used to produce."""
     from src.repositories import agents_repo
 
     pkg_id = _make_pkg("Pkg", "v1-parity-pkg")
-
-    via_builder = env["client"].post(
-        "/api/agents",
-        json={"name": "Builder Agent", "knowledge": [pkg_id], "plugins": ["plug-a"]},
-        headers=_auth(env["owner"]["token"]),
-    )
-    assert via_builder.status_code == 201, via_builder.text
 
     via_v1 = env["client"].post(
         "/api/v1/agents",
@@ -224,17 +255,15 @@ def test_v1_create_knowledge_and_plugins_produce_the_same_scope_rows_as_the_buil
     assert via_v1.status_code == 201, via_v1.text
 
     repo = agents_repo()
-    scope_builder = {(i["item_type"], i["item_id"]) for i in repo.get_scope(via_builder.json()["id"])}
     scope_v1 = {(i["item_type"], i["item_id"]) for i in repo.get_scope(via_v1.json()["id"])}
-    assert scope_builder == scope_v1 == {("data_package", pkg_id), ("plugin", "plug-a")}
+    assert scope_v1 == {("data_package", pkg_id), ("plugin", "plug-a")}
 
-    row_builder = repo.get_by_id(via_builder.json()["id"])
     row_v1 = repo.get_by_id(via_v1.json()["id"])
     for field in ("tables_mode", "plugins_mode", "connections_mode", "memory_mode"):
-        assert row_builder[field] == row_v1[field] == "selected"
+        assert row_v1[field] == "selected"
 
-    # And the v1 response itself shows the same decoded declaration the
-    # builder would show — not the opaque JSON text.
+    # And the v1 response itself shows the decoded declaration, not the
+    # opaque JSON text the underlying column stores it as.
     assert via_v1.json()["knowledge"] == [pkg_id]
     assert via_v1.json()["plugins"] == ["plug-a"]
 
@@ -330,15 +359,12 @@ def test_v1_update_knowledge_forces_all_four_modes_to_selected_from_all(env):
         )
 
 
-def test_v1_update_matches_builder_update_forcing_modes_from_all_to_selected(env):
-    """Update-side mirror of the create-side parity test above: given an
-    agent pre-existing at mode='all' on all four axes (the shape the seeded
-    default agent, or any pre-scope-enforcement row, has), a knowledge edit
-    through EITHER surface must land in the exact same place. The builder's
-    own PATCH already forced this unconditionally
-    (`app.api.agents.update_agent`'s `rescope` block); this proves v1's PUT
-    (`app.api.agents_admin.update_agent`) now matches it row-for-row instead
-    of leaving the pre-existing mode columns untouched."""
+def test_v1_update_forces_modes_from_all_to_selected_on_any_pre_existing_row(env):
+    """Same property as the test above, for an agent that reached mode='all'
+    on all four axes some OTHER way than being the seeded default — any
+    pre-scope-enforcement row has this shape, and a knowledge/plugins PUT
+    must narrow it exactly like the (now-deleted, Task C1.2) `/agents`
+    builder router's own PATCH used to."""
     from src.repositories import agents_repo
 
     repo = agents_repo()
@@ -349,17 +375,6 @@ def test_v1_update_matches_builder_update_forcing_modes_from_all_to_selected(env
         "tables_mode": "all",
         "memory_mode": "all",
     }
-
-    via_builder = (
-        env["client"]
-        .post(
-            "/api/agents",
-            json={"name": "Builder All"},
-            headers=_auth(env["owner"]["token"]),
-        )
-        .json()
-    )
-    repo.update(via_builder["id"], **all_modes)
 
     via_v1 = (
         env["client"]
@@ -372,13 +387,6 @@ def test_v1_update_matches_builder_update_forcing_modes_from_all_to_selected(env
     )
     repo.update(via_v1["id"], **all_modes)
 
-    r_builder = env["client"].patch(
-        f"/api/agents/{via_builder['id']}",
-        json={"knowledge": [pkg_id]},
-        headers=_auth(env["owner"]["token"]),
-    )
-    assert r_builder.status_code == 200, r_builder.text
-
     r_v1 = env["client"].put(
         f"/api/v1/agents/{via_v1['id']}",
         json={"knowledge": [pkg_id]},
@@ -386,13 +394,11 @@ def test_v1_update_matches_builder_update_forcing_modes_from_all_to_selected(env
     )
     assert r_v1.status_code == 200, r_v1.text
 
-    row_builder = repo.get_by_id(via_builder["id"])
     row_v1 = repo.get_by_id(via_v1["id"])
     for field in ("plugins_mode", "connections_mode", "tables_mode", "memory_mode"):
-        assert row_builder[field] == row_v1[field] == "selected", (
-            f"{field}: builder={row_builder[field]!r} v1={row_v1[field]!r} — "
-            "both surfaces must force an unset mode axis to 'selected' on a "
-            "knowledge/plugins edit"
+        assert row_v1[field] == "selected", (
+            f"{field}={row_v1[field]!r} — a knowledge/plugins PUT must force an unset "
+            "mode axis to 'selected', or the declared scope is cosmetic"
         )
 
 

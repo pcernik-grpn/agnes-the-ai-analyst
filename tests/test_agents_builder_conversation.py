@@ -77,7 +77,10 @@ class TestTheConversationWritesTheConfiguration:
         block = re.search(r"function saveAgent\(\) \{(.*?)\n  \}", markup, re.S)
         assert block, "saveAgent not found"
         body = block.group(1)
-        assert "method: 'PATCH'" in body
+        # PUT, not PATCH: the save re-pointed to `/api/v1/agents/{id}` when
+        # this page's own `/api/agents` CRUD was deleted (Task C1.2).
+        assert "method: 'PUT'" in body
+        assert "/api/v1/agents/" in body
         assert "if (updated && updated.slug) a.slug = updated.slug;" in body
         assert "setBaseline();" in body, "a successful save does not reset the dirty baseline"
 

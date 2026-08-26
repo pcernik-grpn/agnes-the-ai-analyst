@@ -603,7 +603,7 @@ class TestRailOptIn:
         only Delete lived on the list card, so the detail view was a dead end
         for the one destructive action. It sits LEFT of the status button
         (Mark ready / Back to draft), reuses the list's `data-ag-del` hook and
-        its DELETE /api/agents/{id} handler, and — unlike the list card —
+        its DELETE /api/v1/agents/{id} handler, and — unlike the list card —
         confirms first, because here it is one button away from a primary
         action on the config the caller is looking at."""
         resp = web_client.get("/agents", cookies=admin_cookie)

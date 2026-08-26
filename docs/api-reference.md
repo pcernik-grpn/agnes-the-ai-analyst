@@ -1351,18 +1351,18 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/{session_id}/leave
 - /api/chat/{session_id}/messages
 
-### `/api/agents` — Agent registry (Library items)
+### `/api/agents/{agent_id}/builder/turn` — Agent-builder assistant
 
-Server-side CRUD for the assistants composed in the Agent builder (`/agents`),
-the registry that replaced the builder's browser-only draft store. Reads are
-grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
-only the owner or an admin may edit or delete.
+The `/api/agents` CRUD this section used to document is gone: `/api/v1/agents*`
+absorbed every operation it served and the router was deleted (remediation
+Track C, Task C1.2). One route survives under this prefix — the builder's
+conversational turn.
 
 `POST /api/agents/{agent_id}/builder/turn` (owner only) runs one turn of the
-builder's conversational assistant: it takes the owner's message plus the
-transcript so far and the caller's own plugin candidates, and asks the
-configured LLM for a configuration patch. When the patch is applied it goes
-through the same `PATCH /api/agents/{agent_id}` path a hand edit uses — so the
+builder's assistant: it takes the owner's message plus the transcript so far
+and the caller's own plugin candidates, and asks the configured LLM for a
+configuration patch. When the patch is applied it goes through the same
+`PUT /api/v1/agents/{agent_id}` path a hand edit uses — so the
 builder-declaration → enforced-scope derivation is identical either way.
 
 The model's proposal is filtered before anything is written: unknown fields,
@@ -1378,10 +1378,7 @@ caller's unsaved copy, narrowed to the patchable keys and used only to build
 the prompt. With no AI credential configured the endpoint answers
 `503 builder_llm_unavailable` and the form stays fully usable by hand.
 
-- /api/agents
-- /api/agents/{agent_id}
 - /api/agents/{agent_id}/builder/turn
-
 ### `/api/sharing` — Owner-initiated sharing of Library items
 
 The owner-scoped counterpart to `/api/access` (which is admin-only): the creator
@@ -1965,6 +1962,17 @@ fanned out into group members' installs and cannot be uninstalled
 - /api/users/{user_id}/set-password
 
 ### `/api/v1/agents` — Agent management (owner-scoped CRUD, scope, agent PATs)
+
+This is also the Agent builder's own CRUD surface (`/agents`, client-rendered
+against this API) — `knowledge`/`plugins`/`surfaces`/`role`/`tone`/`greeting`/
+`status`/`template_entity_id` are the builder's wire fields, accepted here
+directly, and `slug` is optional on create (auto-derived from `name` when
+omitted). A dedicated `/api/agents` adapter router served the same shape
+until the remediation-program's "one agent model" Track C1 folded it into
+this API (Task C1.1) and deleted the router (Task C1.2). `GET /api/v1/agents`
+and `GET /api/v1/agents/{agent_id}` are grant-aware (owner ∪ shared into one
+of the caller's groups via `/api/sharing/agent/{id}`); a grant conveys *use*
+only — mutations and token issuance stay owner-or-admin.
 
 `DELETE /api/v1/agents/{agent_id}` cascades: every PAT minted for the agent is revoked, every outbound webhook registration (`/api/v1/agents/{slug}/webhooks`) is removed, and every harvested sandbox artifact row + its object-store blob (`/api/v1/sessions/{id}/artifacts`) is deleted. The object-store blob deletes are best-effort — a single failed delete is logged and skipped rather than blocking the agent delete (an orphaned blob under a deleted agent's `agent-artifacts/` prefix is a cheap, non-sensitive leak).
 

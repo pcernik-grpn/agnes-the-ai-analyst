@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
@@ -37,6 +37,7 @@ from app.auth.access import is_user_admin, require_agent_profiles_enabled
 from app.auth.dependencies import _get_db, require_session_or_user_pat, require_session_token
 from app.auth.jwt import create_access_token
 from app.resource_types import ResourceType
+from app.services.journey import mark_journey
 from src.object_store import object_store
 from src.repositories import (
     access_token_repo,
@@ -71,7 +72,8 @@ _SELECTED_MODE_FIELDS = ("plugins_mode", "connections_mode", "tables_mode", "mem
 # At most one non-deleted agent may hold a given channel — enforced below.
 # `data_package` and `collection` are DATA-authority items governed by
 # `tables_mode`, exactly like `table` — they are what the /agents builder
-# declares (`app/api/agents.py::_KNOWLEDGE_ITEM_TYPES`), and a declared
+# declares (`app/api/agents_builder_shared.py::_KNOWLEDGE_ITEM_TYPES`), and
+# a declared
 # package additionally stands for its member tables (expanded live in
 # `src/agent_scope_intersection.py`). Accepted here so the governance API and
 # the builder describe one scope model rather than two.
@@ -98,7 +100,8 @@ _UPDATABLE_FIELDS = frozenset(
         "memory_mode",
         "memory_write_mode",
         # Builder-shape projections (Task C1.1) — the same superset columns
-        # `app.api.agents.update_agent` writes for the /agents builder.
+        # the retired `/agents` builder router (`app/api/agents.py`, deleted
+        # in Task C1.2) used to write.
         "role",
         "tone",
         "greeting",
@@ -113,8 +116,9 @@ _UPDATABLE_FIELDS = frozenset(
 class CreateAgentRequest(BaseModel):
     name: str
     # Optional (Task C1.1): auto-derived from `name` when omitted, the same
-    # way `app.api.agents._unique_slug` does for the /agents builder — a
-    # caller supplying one explicitly keeps the pre-existing contract.
+    # way `app.api.agents_builder_shared._unique_slug` does for the /agents
+    # builder — a caller supplying one explicitly keeps the pre-existing
+    # contract.
     slug: Optional[str] = None
     description: Optional[str] = None
     system_prompt: Optional[str] = None
@@ -135,9 +139,9 @@ class CreateAgentRequest(BaseModel):
     #: 'draft' | 'ready'. Omitted keeps the pre-existing v1 default
     #: ('ready') — a v1 client that never mentions status is unaffected.
     status: Optional[str] = None
-    #: Start from a Library Agent Template — mirrors
-    #: `app.api.agents.AgentCreate.template_entity_id` (behaviour only, see
-    #: `app.api.agents._template_prefill`).
+    #: Start from a Library Agent Template — the same field name the retired
+    #: `/agents` builder router used (behaviour only, see
+    #: `app.api.agents_builder_shared._template_prefill`).
     template_entity_id: Optional[str] = None
 
 
@@ -191,24 +195,40 @@ def _audit(actor: str, action: str, target: str, params: Optional[dict] = None) 
         pass
 
 
-def _serialize(row: Dict[str, Any], *, scope_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _serialize(
+    row: Dict[str, Any],
+    *,
+    scope_rows: Optional[List[Dict[str, Any]]] = None,
+    uid: Optional[str] = None,
+) -> Dict[str, Any]:
     """Wire shape for one agent row.
 
     Builder-shape projections (Task C1.1): `knowledge`/`plugins`/`surfaces`
     are opaque JSON TEXT columns — decoded here into real lists/dicts so a
-    caller sees the same round-trip shape the /agents builder shows, not an
-    unparsed string. `knowledge`/`plugins` are additionally hydrated from
-    `agent_scope` when the JSON columns are empty (`app.api.agents.
-    _hydrate_builder_axes`) — an agent scoped through `agnes agent scope
-    set` or the `PUT .../scope` route never touches those columns, so
-    without this a v1 read would show "no declaration" for an agent that in
-    fact has real scope. `instructions` aliases the canonical
-    `system_prompt` column under the builder's own field name.
+    caller sees the same round-trip shape the retired `/agents` builder
+    router showed, not an unparsed string. `knowledge`/`plugins` are
+    additionally hydrated from `agent_scope` when the JSON columns are empty
+    (`app.api.agents_builder_shared._hydrate_builder_axes`) — an agent
+    scoped through `agnes agent scope set` or the `PUT .../scope` route
+    never touches those columns, so without this a v1 read would show "no
+    declaration" for an agent that in fact has real scope. `instructions`
+    aliases the canonical `system_prompt` column under the builder's own
+    field name.
     `scope_rows` lets a caller (the list endpoint) supply a batched read so
     hydrating every row does not turn a listing into an N+1 — see
-    `app.api.agents.list_agents`'s own `scope_by_agent` pattern.
+    `list_agents`'s own `scope_by_agent` pattern.
+
+    `uid`, when given, adds `mine` (Task C1.2) — the caller's OWN builder
+    field name for "did I create this row", used by the web chat agent
+    picker (`app/web/static/js/chat.js::_refreshAgents`, pinned by
+    `tests/test_chat_session_as_agent.py::test_the_picker_offers_only_
+    agents_the_caller_owns`) to filter out agents merely SHARED with them —
+    `_resolve_agent_id` in `app/api/chat.py` only ever resolves a slug
+    against the caller's OWN rows, so a shared agent in that menu would 404
+    on click. Every route below passes its caller's id, matching the
+    builder's own `_agent_out`, which computed `mine` unconditionally.
     """
-    from app.api.agents import _decode, _hydrate_builder_axes
+    from app.api.agents_builder_shared import _decode, _hydrate_builder_axes
 
     out = dict(row)
     for key in ("created_at", "updated_at", "deleted_at"):
@@ -224,6 +244,8 @@ def _serialize(row: Dict[str, Any], *, scope_rows: Optional[List[Dict[str, Any]]
     out["knowledge"] = knowledge
     out["plugins"] = plugins
     out["surfaces"] = _decode(row.get("surfaces"), {})
+    if uid is not None:
+        out["mine"] = row.get("owner_user_id") == uid
     return out
 
 
@@ -291,7 +313,8 @@ def _load_agent(
     `require_owner=True` (every mutating route, including token issuance)
     still 403s them on a foreign agent. A grantee (a `ResourceType.AGENT`
     row via one of the caller's groups — the /agents builder's own sharing
-    reach, `app.api.agents._granted_agent_ids`) may likewise only READ:
+    reach, `app.api.agents_builder_shared._granted_agent_ids`) may likewise
+    only READ:
     `require_owner=True` 404s a grantee exactly like any other non-owner,
     non-admin caller — a share conveys *use*, never *manage*.
     """
@@ -304,7 +327,7 @@ def _load_agent(
             if require_owner:
                 raise _err(403, "agent_not_owned", "Admins may inspect but not modify another user's agent")
         else:
-            from app.api.agents import _granted_agent_ids
+            from app.api.agents_builder_shared import _granted_agent_ids
 
             if require_owner or agent_id not in _granted_agent_ids(user["id"]):
                 raise _err(404, "agent_not_found", "Agent not found")
@@ -323,13 +346,14 @@ async def create_agent(
 
     prefill: Dict[str, str] = {}
     if payload.template_entity_id:
-        from app.api.agents import _template_prefill
+        from app.api.agents_builder_shared import _template_prefill
 
         prefill = _template_prefill(payload.template_entity_id, user)
 
     def _field(key: str, given: Optional[str], fallback: str = "") -> str:
-        """Caller's value, else the template's, else a fallback — mirrors
-        `app.api.agents.create_agent`'s own closure of the same name."""
+        """Caller's value, else the template's, else a fallback — mirrored
+        the retired `/agents` builder router's own closure of the same
+        name."""
         if (given or "").strip():
             return given
         return prefill.get(key) or fallback
@@ -340,7 +364,7 @@ async def create_agent(
     else:
         # Auto-derive, exactly like the /agents builder does when the
         # caller has no opinion on the address (Task C1.1).
-        from app.api.agents import _auto_slug, _unique_slug
+        from app.api.agents_builder_shared import _auto_slug, _unique_slug
 
         slug = _unique_slug(_auto_slug(name), user["id"])
 
@@ -382,7 +406,8 @@ async def create_agent(
             memory_mode="selected",
             status=status,
             # Builder-shape projections (Task C1.1) — same columns, same
-            # opaque JSON-text encoding `app.api.agents.create_agent` uses.
+            # opaque JSON-text encoding the retired `/agents` builder router
+            # used.
             role=_field("role", payload.role, ""),
             tone=_field("tone", payload.tone, "concise"),
             greeting=_field("greeting", payload.greeting, ""),
@@ -403,21 +428,46 @@ async def create_agent(
     # enforcement mapping regardless of which surface created the agent.
     # A no-op for a plain (non-builder-shape) create: a brand-new agent has
     # no existing `agent_scope` rows to replace.
-    from app.api.agents import _sync_builder_scope
+    from app.api.agents_builder_shared import _sync_builder_scope
 
-    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [])
+    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [], user["id"])
 
     row = repo.get_by_id(agent_id)
     _audit(user["id"], "agent.create", agent_id, {"slug": slug})
-    return _serialize(row)  # type: ignore[arg-type]
+    # Same "Create your first agent" onboarding step the retired /agents
+    # builder router marked (Task C1.2) — v1 create had never marked it, so
+    # an agent built through the (now sole) v1 path counts toward it too.
+    mark_journey(user["id"], agent_created=True)
+    return _serialize(row, uid=user["id"])  # type: ignore[arg-type]
 
 
 @router.get("")
-async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True))):
+async def list_agents(
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
+    runnable: bool = Query(
+        False,
+        description=(
+            "When true, the response is scoped to exactly the agents the caller may "
+            "start a session against (owned, or shared via a ResourceType.AGENT grant) "
+            "— the data source for a runtime agent picker (e.g. `agnes chat`)."
+        ),
+    ),
+):
     """The caller's own agents plus any shared into a group they belong to
     (Task C1.1 — same reach as the /agents builder's `list_agents`, via the
-    same `ResourceType.AGENT` grant)."""
-    from app.api.agents import _granted_agent_ids
+    same `ResourceType.AGENT` grant).
+
+    ``runnable=true`` (C2.3) additionally filters to rows
+    `agents_repo().get_runnable_by_slug` would actually resolve for this
+    caller — the same owned-or-granted check the runtime routes
+    (`/api/v1/agents/{slug}/...`) enforce, so this list can never claim an
+    agent is runnable that the runtime would then 404. Today that check
+    happens to accept every row this endpoint already returns, but it goes
+    through the real resolver rather than re-deriving "owned or granted" a
+    second time, so the two cannot drift apart later (e.g. a per-agent
+    runtime precondition added down the line).
+    """
+    from app.api.agents_builder_shared import _granted_agent_ids
 
     repo = agents_repo()
     uid = user["id"]
@@ -430,13 +480,15 @@ async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_sta
         if row and row.get("deleted_at") is None:
             rows.append(row)
             seen.add(agent_id)
+    if runnable:
+        rows = [r for r in rows if repo.get_runnable_by_slug(uid, r["id"]) is not None]
     # ONE scope read for the whole page — `_serialize` hydrates an empty
     # knowledge/plugins declaration from `agent_scope`, and per-agent reads
-    # would turn this listing into an N+1 (mirrors `app.api.agents.
-    # list_agents`'s own batched read, Devin Review on #1520).
+    # would turn this listing into an N+1 (mirrors the retired `/agents`
+    # builder router's own batched read, Devin Review on #1520).
     scope_by_agent = repo.get_scope_for_agents([r["id"] for r in rows]) if rows else {}
     return {
-        "data": [_serialize(r, scope_rows=scope_by_agent.get(r["id"], [])) for r in rows],
+        "data": [_serialize(r, scope_rows=scope_by_agent.get(r["id"], []), uid=uid) for r in rows],
         "has_more": False,
         "next_cursor": None,
     }
@@ -452,7 +504,7 @@ async def get_agent(
     # One scope read, reused both for the builder-shape hydration in
     # `_serialize` and for the raw `scope` list below.
     scope_rows = agents_repo().get_scope(agent_id)
-    out = _serialize(row, scope_rows=scope_rows)
+    out = _serialize(row, scope_rows=scope_rows, uid=user["id"])
     # Detail view carries the scope items so callers (the CLI's replace-not-
     # merge warning, the wiring runbooks) can see what a scope PUT would drop
     # without a second bespoke endpoint. List view stays lean.
@@ -476,8 +528,8 @@ async def update_agent(
     # Builder-shape wire fields (Task C1.1): `instructions` aliases the
     # canonical `system_prompt` column (an explicit `system_prompt` in the
     # same payload wins); `knowledge`/`plugins`/`surfaces` are opaque JSON
-    # text on the row, encoded here exactly like `app.api.agents.
-    # update_agent` encodes them for the /agents builder.
+    # text on the row, encoded here exactly like the retired `/agents`
+    # builder router encoded them.
     updates: Dict[str, Any] = {k: v for k, v in supplied.items() if k != "instructions"}
     if "instructions" in supplied and "system_prompt" not in updates:
         updates["system_prompt"] = supplied["instructions"]
@@ -485,10 +537,10 @@ async def update_agent(
         if key in updates:
             updates[key] = json.dumps(updates[key])
 
-    # Same forced-narrowing default as the /agents builder's own PATCH
-    # (`app.api.agents.update_agent`'s `rescope` block) — closing the
-    # reopened half of #1520. A knowledge/plugins edit re-derives the
-    # enforced scope, and any mode axis the caller did NOT set explicitly in
+    # Same forced-narrowing default as the retired /agents builder router's
+    # own PATCH (its `rescope` block) — closing the reopened half of #1520.
+    # A knowledge/plugins edit re-derives the enforced scope, and any mode
+    # axis the caller did NOT set explicitly in
     # THIS request must not keep sitting at 'all' just because this route
     # forgot to touch it — that is exactly how the seeded default agent
     # (born at mode='all' on all four axes,
@@ -550,12 +602,13 @@ async def update_agent(
                 "the owner's plain identity",
             )
 
-    # Renaming a draft re-derives its slug, exactly like the /agents
-    # builder's own PATCH (`app.api.agents._draft_slug_rename`, Task
-    # C1.1). Inert for every pre-existing v1 agent — this route only ever
+    # Renaming a draft re-derives its slug, exactly like the retired
+    # /agents builder router's own PATCH did
+    # (`app.api.agents_builder_shared._draft_slug_rename`, Task C1.1). Inert
+    # for every pre-existing v1 agent — this route only ever
     # created `status='ready'` rows until this task, and 'ready' never
     # re-derives.
-    from app.api.agents import _draft_slug_rename
+    from app.api.agents_builder_shared import _draft_slug_rename
 
     new_slug = _draft_slug_rename(before, updates.get("name"), before.get("owner_user_id") or user["id"])
     if new_slug:
@@ -573,7 +626,7 @@ async def update_agent(
     # (`_hydrate_builder_axes`), not the raw JSON columns, so a PUT
     # touching only one axis cannot silently wipe the other.
     if rescope:
-        from app.api.agents import _decode, _hydrate_builder_axes, _sync_builder_scope
+        from app.api.agents_builder_shared import _decode, _hydrate_builder_axes, _sync_builder_scope
 
         held_knowledge, held_plugins = _hydrate_builder_axes(
             agent_id,
@@ -584,9 +637,10 @@ async def update_agent(
             agent_id,
             supplied.get("knowledge", held_knowledge),
             supplied.get("plugins", held_plugins),
+            user["id"],
         )
 
-    return _serialize(agents_repo().get_by_id(agent_id))  # type: ignore[arg-type]
+    return _serialize(agents_repo().get_by_id(agent_id), uid=user["id"])  # type: ignore[arg-type]
 
 
 @router.delete("/{agent_id}", status_code=204)
@@ -695,6 +749,22 @@ async def set_agent_scope(
         seen.add(key)
         items.append(key)
 
+    # D-C2 staged write-gate (task C2.1): a non-admin writer may only grant
+    # a DATA-authority item (table/data_package/collection/connection) they
+    # currently hold themselves — admins are unconditioned. See
+    # `src.agent_scope_intersection` module docstring for the full contract.
+    from src.agent_scope_intersection import first_inaccessible_data_item
+
+    offender = first_inaccessible_data_item(user["id"], items, conn)
+    if offender is not None:
+        item_type, item_id = offender
+        raise _err(
+            403,
+            "scope_item_not_accessible",
+            f"you do not currently have access to {item_type} '{item_id}' — "
+            "grant yourself access first, or ask an admin to grant it to this agent",
+        )
+
     has_binding = any(item_type == "slack_channel" for item_type, _ in items)
     if has_binding:
         from src.agent_scope_intersection import agent_is_passthrough
@@ -735,7 +805,7 @@ async def set_agent_scope(
                 f"slack channel '{item_id}' is already bound to {who} — unbind it there first (one agent per channel)",
             )
 
-    agents_repo().set_scope(agent_id, items)
+    agents_repo().set_scope(agent_id, items, granted_by=user["id"])
     _audit(user["id"], "agent.scope.set", agent_id, {"count": len(items)})
     return {"items": [{"item_type": t, "item_id": i} for t, i in items]}
 

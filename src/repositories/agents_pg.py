@@ -147,6 +147,30 @@ class AgentsPgRepository:
             )
         return dict(row) if row else None
 
+    def get_runnable_by_slug(self, user_id: str, slug: str) -> Optional[Dict[str, Any]]:
+        """PG mirror of ``AgentsRepository.get_runnable_by_slug`` — see that
+        docstring for the slug-vs-id resolution rule and why the Admin
+        god-mode short-circuit is deliberately not applied here."""
+        owned = self.get_by_slug(user_id, slug)
+        if owned is not None:
+            return owned
+
+        agent = self.get_by_id(slug)
+        if agent is None or agent.get("deleted_at") is not None:
+            return None
+        if agent["owner_user_id"] == user_id:
+            return agent
+
+        from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+
+        # "agent" mirrors ``ResourceType.AGENT.value`` — kept inline, see the
+        # DuckDB sibling's docstring for why the repo layer avoids importing
+        # app.resource_types.
+        granted_ids = ResourceGrantsPgRepository(self._engine).list_resource_ids_for_user(user_id, "agent")
+        if agent["id"] in granted_ids:
+            return agent
+        return None
+
     def list_for_user(self, owner_user_id: str) -> List[Dict[str, Any]]:
         """Every agent this user owns — EXCEPT scratch rows.
 
@@ -311,19 +335,61 @@ class AgentsPgRepository:
         assert result is not None
         return result
 
-    def set_scope(self, agent_id: str, items: List[Tuple[str, str]]) -> None:
+    def set_scope(
+        self,
+        agent_id: str,
+        items: List[Tuple[str, str]],
+        granted_by: Optional[str] = None,
+    ) -> None:
+        """Replace the whole scope set for ``agent_id``.
+
+        ``granted_by`` is the writer's user id, recorded on every row this
+        call inserts that is genuinely NEW. Column added by migration 0073
+        (remediation Track C, C2.1) — see the DuckDB sibling's docstring for
+        why it has no counterpart there.
+
+        A ``(item_type, item_id)`` pair that was ALREADY present before this
+        call (a full-replace call re-declaring a row unchanged — the normal
+        shape of ``app/api/agents_builder_shared.py::_sync_builder_scope``'s
+        "preserved" rows, which read the current scope back and pass it
+        straight through) keeps its EXISTING ``granted_by`` instead of being
+        re-attributed to this call's writer. Without this, a later builder
+        save by the (non-admin) owner would silently downgrade an
+        admin-granted row to owner-granted — D-C2's "admin-granted =
+        unconditioned" half only holds if the grant's origin survives an
+        unrelated re-save (remediation-program C2.2 must-handle:
+        ``docs/superpowers/plans/2026-08-26-one-agent-model.md`` §C2.2). A
+        pair that is new (not present before) is attributed to
+        ``granted_by`` exactly as before.
+        """
         with self._engine.begin() as conn:
+            existing = (
+                conn.execute(
+                    sa.text("SELECT item_type, item_id, granted_by FROM agent_scope WHERE agent_id = :agent_id"),
+                    {"agent_id": agent_id},
+                )
+                .mappings()
+                .all()
+            )
+            prior_granted_by = {(r["item_type"], r["item_id"]): r["granted_by"] for r in existing}
+
             conn.execute(
                 sa.text("DELETE FROM agent_scope WHERE agent_id = :agent_id"),
                 {"agent_id": agent_id},
             )
             for item_type, item_id in items:
+                row_granted_by = prior_granted_by.get((item_type, item_id), granted_by)
                 conn.execute(
                     sa.text(
-                        "INSERT INTO agent_scope (agent_id, item_type, item_id) "
-                        "VALUES (:agent_id, :item_type, :item_id)"
+                        "INSERT INTO agent_scope (agent_id, item_type, item_id, granted_by) "
+                        "VALUES (:agent_id, :item_type, :item_id, :granted_by)"
                     ),
-                    {"agent_id": agent_id, "item_type": item_type, "item_id": item_id},
+                    {
+                        "agent_id": agent_id,
+                        "item_type": item_type,
+                        "item_id": item_id,
+                        "granted_by": row_granted_by,
+                    },
                 )
 
     def get_scope(self, agent_id: str) -> List[Dict[str, Any]]:
@@ -331,7 +397,7 @@ class AgentsPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT item_type, item_id FROM agent_scope "
+                        "SELECT item_type, item_id, granted_by FROM agent_scope "
                         "WHERE agent_id = :agent_id ORDER BY item_type, item_id"
                     ),
                     {"agent_id": agent_id},
@@ -342,15 +408,16 @@ class AgentsPgRepository:
         return [dict(r) for r in rows]
 
     def get_scope_for_agents(self, agent_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-        """``{agent_id: [{item_type, item_id}, ...]}`` — see the DuckDB sibling
-        for why the list endpoint needs a batched read instead of an N+1."""
+        """``{agent_id: [{item_type, item_id, granted_by}, ...]}`` — see the
+        DuckDB sibling for why the list endpoint needs a batched read
+        instead of an N+1."""
         if not agent_ids:
             return {}
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT agent_id, item_type, item_id FROM agent_scope "
+                        "SELECT agent_id, item_type, item_id, granted_by FROM agent_scope "
                         "WHERE agent_id = ANY(:agent_ids) ORDER BY agent_id, item_type, item_id"
                     ),
                     {"agent_ids": list(agent_ids)},
@@ -361,7 +428,7 @@ class AgentsPgRepository:
         out: Dict[str, List[Dict[str, Any]]] = {}
         for r in rows:
             out.setdefault(r["agent_id"], []).append(
-                {"item_type": r["item_type"], "item_id": r["item_id"]}
+                {"item_type": r["item_type"], "item_id": r["item_id"], "granted_by": r["granted_by"]}
             )
         return out
 

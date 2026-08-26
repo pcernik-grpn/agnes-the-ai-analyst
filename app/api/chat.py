@@ -165,11 +165,12 @@ def _default_agent_id(owner_user_id: str) -> str:
 def _resolve_agent_id(agent_slug: str | None, user: dict) -> str:
     """Which agent this session runs as — a named one, else the default.
 
-    Ownership is checked here rather than left to the broker: an agent is a
-    private, scoped identity, so being able to name someone else's slug would
-    hand the caller a persona built on grants that are not theirs. 404 for both
-    "no such slug" and "not yours", so the endpoint does not confirm the
-    existence of another user's agent.
+    Access is checked here rather than left to the broker: an agent is a
+    scoped identity, so naming one this caller neither owns nor was shared
+    (C2.3, `ResourceType.AGENT` grant) would hand them a persona built on
+    grants that are not theirs. 404 for "no such slug/id", "not yours", and
+    "not shared with you" alike, so the endpoint does not confirm the
+    existence of another user's private agent.
 
     Scope enforcement itself is NOT re-implemented — the returned id goes
     through the same ``_load_agent_row``/broker seam as the agent-as-API route,
@@ -178,10 +179,12 @@ def _resolve_agent_id(agent_slug: str | None, user: dict) -> str:
     """
     if not agent_slug:
         return _default_agent_id(user["id"])
-    # The lookup is owner-scoped, so another user's slug simply does not
-    # resolve — there is no window where a foreign row is fetched and then
-    # rejected.
-    row = agents_repo().get_by_slug(user["id"], agent_slug)
+    # `get_runnable_by_slug` resolves `agent_slug` first in the caller's own
+    # slug namespace (owned), else as the target agent's id (shared via a
+    # grant) — see its docstring for why slug alone cannot address someone
+    # else's agent. Either way a non-owner/non-grantee gets no row back —
+    # there is no window where a foreign row is fetched and then rejected.
+    row = agents_repo().get_runnable_by_slug(user["id"], agent_slug)
     if not row:
         raise HTTPException(status_code=404, detail={"kind": "agent_not_found", "hint": agent_slug})
     return str(row["id"])
@@ -226,7 +229,7 @@ async def create_session(
         # Which agent this session runs AS. Always set (an unnamed web session
         # is attributed to the caller's default agent, see _resolve_agent_id),
         # so a client tells "named agent" from "default" by comparing against
-        # the `is_default` row in GET /api/agents rather than by null-checking.
+        # the `is_default` row in GET /api/v1/agents rather than by null-checking.
         # The composer's agent picker needs this to label a session it did not
         # itself create.
         "agent_id": s.agent_id,
@@ -254,8 +257,14 @@ async def list_sessions(
             "id": s.id,
             "surface": s.surface.value,
             "title": s.title,
-            "started_at": s.started_at.isoformat(),
-            "last_message_at": s.last_message_at.isoformat() if s.last_message_at else None,
+            # Raw datetimes, not .isoformat(): DuckDB reads come back naive
+            # (clock value UTC), and pre-stringifying bypasses the app's
+            # datetime encoder (app/serialization.py) that labels them
+            # `+00:00` — the browser then parses the offset-less string as
+            # LOCAL time and every timestamp shifts by the viewer's UTC
+            # offset after a reload.
+            "started_at": s.started_at,
+            "last_message_at": s.last_message_at,
             "message_count": s.message_count,
             "paused": s.sandbox_paused_at is not None,
             # See create_session: lets the composer's agent picker show WHO a
@@ -266,7 +275,7 @@ async def list_sessions(
             # also exposed so a client can order pins itself; the repo already
             # returns pinned-first, so the flag alone is enough for the rail.
             "pinned": s.pinned_at is not None,
-            "pinned_at": s.pinned_at.isoformat() if s.pinned_at else None,
+            "pinned_at": s.pinned_at,
         }
         for s in rows
     ]
@@ -591,7 +600,12 @@ async def list_messages(
             # exposes the field to participants and this route is owner-only
             # (a non-owner 404s above), so it discloses nothing new.
             "sender_email": m.sender_email,
-            "created_at": m.created_at.isoformat(),
+            # Raw datetime, not .isoformat() — the app's datetime encoder
+            # (app/serialization.py) labels the naive-UTC value `+00:00`;
+            # pre-stringified it went out offset-less and the browser
+            # parsed it as local time, shifting every reloaded bubble's
+            # timestamp by the viewer's UTC offset.
+            "created_at": m.created_at,
             # Recomputed on read rather than stored (see app/chat/sources.py):
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a

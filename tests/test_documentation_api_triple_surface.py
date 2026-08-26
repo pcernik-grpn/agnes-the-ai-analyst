@@ -542,22 +542,6 @@ _LIBRARY_MOVE_REASON = (
     "into the intended collection, which already has surfaces."
 )
 
-_AGENTS_REGISTRY_REASON = (
-    "Web Agent-builder CRUD (v103 `agents` registry) — a second registry over "
-    "the same `agents` table as `/api/v1/agents`, which IS runnable and already "
-    "carries full triple-surface coverage (`/api/v1/agents/{slug}/responses` "
-    "in _COHORT, reachable via `agnes chat` / `agent ask`). The builder at "
-    "/agents is the only producer of this registry and the Library the only "
-    "consumer; it writes decorative knowledge/plugins fields the runtime never "
-    "reads and never sets `agent_scope`, so a builder-created agent stays in "
-    "the default all-mode and cannot be issued a PAT (`agent_not_selected_mode` "
-    "until `agnes agent scope set` runs) — unreachable via API by construction, "
-    "not because agents cannot be run. Two registries pending the agent-core "
-    "consolidation program (remediation Track C, 'one agent model'), which "
-    "deletes `/api/agents` and re-points the builder at `/api/v1/agents` — at "
-    "that point this exemption is removed, not converted into a CLI/MCP mirror."
-)
-
 _PACKAGE_BUILDER_TURN_REASON = (
     "one turn of the data-package drawer's CONVERSATION — web-UI-only, same "
     "shape as the two builder-turn endpoints above. It writes NOTHING and has "
@@ -722,8 +706,6 @@ _EXEMPT: dict[str, str] = {
         "/profile; a one-field personal profile edit with no CLI/MCP analogue"
     ),
     "/api/collections/{collection_id}/files/{file_id}/move": _LIBRARY_MOVE_REASON,
-    "/api/agents": _AGENTS_REGISTRY_REASON,
-    "/api/agents/{agent_id}": _AGENTS_REGISTRY_REASON,
     "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
     "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
     "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,

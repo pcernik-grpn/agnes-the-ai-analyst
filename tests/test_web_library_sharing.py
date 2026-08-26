@@ -2,8 +2,12 @@
 
 Three things ship together here and are locked in one place:
 
-  - ``/api/agents`` — the server-side agent registry that replaced the Agent
-    builder's localStorage-only store, so an agent is a real Library item.
+  - ``/api/v1/agents`` — the server-side agent registry that replaced the
+    Agent builder's localStorage-only store, so an agent is a real Library
+    item. The builder's own adapter router (``/api/agents``) served this
+    same registry until the remediation-program's "one agent model" Track
+    C1 folded its wire shape into v1 (Task C1.1) and deleted the router
+    (Task C1.2) — every call below goes straight to v1.
   - ``/api/sharing`` — OWNER-initiated sharing. Everything in
     ``app/api/access.py`` is ``require_admin``; this is the counterpart that
     lets the creator of an item share it with groups they belong to. The
@@ -11,7 +15,7 @@ Three things ship together here and are locked in one place:
   - ``/library`` — the renamed, widened former ``/artefacts``, listing
     artefacts + skills with per-row visibility. Agents are deliberately NOT
     listed there (they have their own home at ``/agents``), but they remain
-    real registry rows whose grants ``/api/agents`` honours.
+    real registry rows whose grants ``/api/v1/agents`` honours.
 
 Skills are deliberately NOT grant-shareable: an approved store entity is
 already readable by every authenticated user, so a grant row on one would be
@@ -44,11 +48,44 @@ def _create_collection(seeded_app, name: str, token: str) -> dict:
 
 
 def _create_agent(seeded_app, token: str, **fields) -> dict:
-    payload = {"name": "Test Agent"}
+    # `surfaces` is sent explicitly, matching the /agents builder's own
+    # create payload (`makeAgent()` in agents.html): v1 does not invent the
+    # `{"web": true}` default the builder's now-deleted router used to for
+    # an omitted one (Task C1.1/C1.2).
+    payload = {"name": "Test Agent", "surfaces": {"web": True}}
     payload.update(fields)
-    r = seeded_app["client"].post("/api/agents", json=payload, headers=_auth(token))
+    r = seeded_app["client"].post("/api/v1/agents", json=payload, headers=_auth(token))
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def _create_blank_agent(owner_user_id: str) -> dict:
+    """A placeholder-name draft — what "New agent" used to POST through the
+    builder's own (now-deleted) `/api/agents` router. `/api/v1/agents`
+    requires a non-blank `name` (400 `invalid_name`, Task C1.1/C1.2), so
+    exercising this precondition means writing the row directly, in the
+    exact shape `create_agent`'s old fallback produced
+    (`_unique_slug(_auto_slug("agent"), owner_user_id)`).
+    """
+    import uuid
+
+    from app.api.agents_builder_shared import _auto_slug, _unique_slug
+    from src.repositories import agents_repo
+
+    agent_id = "agt_" + uuid.uuid4().hex
+    slug = _unique_slug(_auto_slug("agent"), owner_user_id)
+    agents_repo().create(
+        id=agent_id,
+        owner_user_id=owner_user_id,
+        name="",
+        slug=slug,
+        status="draft",
+        plugins_mode="selected",
+        connections_mode="selected",
+        tables_mode="selected",
+        memory_mode="selected",
+    )
+    return agents_repo().get_by_id(agent_id)
 
 
 def _group_with_member(user_id: str, group_name: str) -> str:
@@ -86,22 +123,25 @@ def test_agent_create_list_patch_delete_roundtrip(seeded_app):
     tok = seeded_app["admin_token"]
 
     a = _create_agent(seeded_app, tok, name="Revenue Analyst", role="Finance", knowledge=["col_x"])
-    assert a["id"].startswith("agt_")
+    # Ids are plain UUIDs, not the builder's own `agt_`-prefixed ones — that
+    # distinction retired with the router that minted them (Task C1.2); a
+    # single v1 create path mints ids the SAME way regardless of caller.
+    assert a["id"]
     assert a["slug"] == "revenue-analyst"
     assert a["mine"] is True
     # Web chat is the always-on baseline surface.
     assert a["surfaces"]["web"] is True
 
-    listed = c.get("/api/agents", headers=_auth(tok)).json()["agents"]
+    listed = c.get("/api/v1/agents", headers=_auth(tok)).json()["data"]
     assert any(x["id"] == a["id"] for x in listed)
 
-    patched = c.patch(f"/api/agents/{a['id']}", json={"name": "Renamed", "plugins": ["p1"]}, headers=_auth(tok))
+    patched = c.put(f"/api/v1/agents/{a['id']}", json={"name": "Renamed", "plugins": ["p1"]}, headers=_auth(tok))
     assert patched.status_code == 200
     assert patched.json()["name"] == "Renamed"
     assert patched.json()["plugins"] == ["p1"]
 
-    assert c.delete(f"/api/agents/{a['id']}", headers=_auth(tok)).status_code == 204
-    assert c.get(f"/api/agents/{a['id']}", headers=_auth(tok)).status_code == 404
+    assert c.delete(f"/api/v1/agents/{a['id']}", headers=_auth(tok)).status_code == 204
+    assert c.get(f"/api/v1/agents/{a['id']}", headers=_auth(tok)).status_code == 404
 
 
 def test_agent_slug_collision_gets_suffix_not_conflict(seeded_app):
@@ -129,17 +169,19 @@ def test_agent_slug_freed_name_reuses_suffix_after_delete(seeded_app):
 
     first = _create_agent(seeded_app, tok, name="Recycled")
     assert first["slug"] == "recycled"
-    assert c.delete(f"/api/agents/{first['id']}", headers=_auth(tok)).status_code == 204
+    assert c.delete(f"/api/v1/agents/{first['id']}", headers=_auth(tok)).status_code == 204
 
     # 201, not 500 — and the slug steps around the soft-deleted row.
     second = _create_agent(seeded_app, tok, name="Recycled")
     assert second["slug"] == "recycled-2"
 
     # The unnamed-draft case the builder actually hits (slug falls back to
-    # "agent"), twice over, with a delete in between.
-    d1 = _create_agent(seeded_app, tok, name="")
-    assert c.delete(f"/api/agents/{d1['id']}", headers=_auth(tok)).status_code == 204
-    d2 = _create_agent(seeded_app, tok, name="")
+    # "agent"), twice over, with a delete in between. `/api/v1/agents`
+    # requires a non-blank `name` (Task C1.1/C1.2), so this precondition is
+    # written directly through the repo — see `_create_blank_agent`.
+    d1 = _create_blank_agent("admin1")
+    assert c.delete(f"/api/v1/agents/{d1['id']}", headers=_auth(tok)).status_code == 204
+    d2 = _create_blank_agent("admin1")
     assert d1["slug"] != d2["slug"]
 
 
@@ -153,8 +195,7 @@ def test_agent_default_cannot_be_deleted(seeded_app):
     soft-deleted tombstone — a permanent 500 on ``POST /api/chat/sessions``.
     The repository now revives the tombstone instead of raising, but the delete
     still has no business succeeding: the agent would vanish from the Library
-    and silently reappear on the owner's next chat. `/api/v1/agents` has
-    refused this since the agent-as-API work; the builder router must match.
+    and silently reappear on the owner's next chat.
     """
     from src.repositories import agents_repo
 
@@ -162,16 +203,16 @@ def test_agent_default_cannot_be_deleted(seeded_app):
     tok = seeded_app["admin_token"]
 
     default_id = agents_repo().get_or_create_default("admin1")["id"]
-    listed = c.get("/api/agents", headers=_auth(tok)).json()["agents"]
+    listed = c.get("/api/v1/agents", headers=_auth(tok)).json()["data"]
     assert any(x["id"] == default_id for x in listed), "default agent is reachable in the Library"
 
-    r = c.delete(f"/api/agents/{default_id}", headers=_auth(tok))
+    r = c.delete(f"/api/v1/agents/{default_id}", headers=_auth(tok))
     assert r.status_code == 400
-    assert r.json()["detail"] == "default_agent_undeletable"
+    assert r.json()["detail"]["code"] == "default_agent_undeletable"
 
     # Still live, and still the default.
     assert agents_repo().get_by_id(default_id)["deleted_at"] is None
-    assert c.get(f"/api/agents/{default_id}", headers=_auth(tok)).status_code == 200
+    assert c.get(f"/api/v1/agents/{default_id}", headers=_auth(tok)).status_code == 200
 
 
 def test_agent_wire_shape_marks_the_default_and_page_hides_its_delete(seeded_app):
@@ -192,12 +233,12 @@ def test_agent_wire_shape_marks_the_default_and_page_hides_its_delete(seeded_app
     tok = seeded_app["admin_token"]
     default_id = agents_repo().get_or_create_default("admin1")["id"]
 
-    listed = c.get("/api/agents", headers=_auth(tok)).json()["agents"]
+    listed = c.get("/api/v1/agents", headers=_auth(tok)).json()["data"]
     by_id = {a["id"]: a for a in listed}
     assert by_id[default_id]["is_default"] is True
     # A user-created agent is not the default — the flag has to discriminate.
     mine = _create_agent(seeded_app, tok, name="Ordinary")
-    assert c.get(f"/api/agents/{mine['id']}", headers=_auth(tok)).json()["is_default"] is False
+    assert c.get(f"/api/v1/agents/{mine['id']}", headers=_auth(tok)).json()["is_default"] is False
 
     tpl = Path("app/web/templates/agents.html").read_text(encoding="utf-8")
     assert tpl.count("a.is_default") >= 2, "both the list card and the builder header must branch on is_default"
@@ -219,38 +260,57 @@ def test_agent_named_default_does_not_claim_the_reserved_slug(seeded_app):
 def test_agent_patch_cannot_reassign_ownership(seeded_app):
     """A hostile payload can't move an agent to another owner or hijack a slug.
 
-    `AgentUpdate` has no `slug` field, so a client-supplied one is dropped
-    before the handler sees it. The slug CAN still change here — renaming a
-    draft re-derives it (`app/api/agents.py::_draft_slug_rename`) — but only
-    ever to a value derived from the new name, never to the attacker's.
+    `UpdateAgentRequest` DOES have a `slug` field (unlike the builder's old
+    `AgentUpdate`) — but only to refuse it outright (400 `slug_immutable`,
+    Task C1.1), a stricter guard than the old router's silent drop. `id`/
+    `created_by` aren't real fields on the model either way, so they're
+    dropped by Pydantic like any unknown key. The slug CAN still change
+    without an explicit `slug` in the payload — renaming a draft re-derives
+    it (`app.api.agents_builder_shared._draft_slug_rename`) — but only ever
+    to a value derived from the new name, never to the attacker's.
     """
     tok = seeded_app["admin_token"]
-    a = _create_agent(seeded_app, tok, name="Owned")
-    r = seeded_app["client"].patch(
-        f"/api/agents/{a['id']}",
-        json={"created_by": "analyst1", "slug": "hijacked", "id": "agt_evil", "name": "Still Mine"},
+    client = seeded_app["client"]
+    a = _create_agent(seeded_app, tok, name="Owned", status="draft")
+
+    r = client.put(
+        f"/api/v1/agents/{a['id']}",
+        json={"slug": "hijacked", "name": "Still Mine"},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "slug_immutable"
+
+    r = client.put(
+        f"/api/v1/agents/{a['id']}",
+        json={"created_by": "analyst1", "id": "agt_evil", "name": "Still Mine"},
         headers=_auth(tok),
     )
     assert r.status_code == 200
-    assert r.json()["created_by"] == a["created_by"]
+    assert r.json()["owner_user_id"] == a["owner_user_id"]
     assert r.json()["slug"] == "still-mine", "slug must follow the name, not the payload"
     assert r.json()["name"] == "Still Mine"
 
 
 def test_agent_patch_cannot_hijack_the_slug_of_a_published_agent(seeded_app):
-    """The stronger form: once ready, the slug does not move at all.
-
-    A published agent's slug is an address callers may hold, so neither a
-    supplied `slug` nor a rename may relocate it.
+    """The stronger form: once ready, the slug does not move at all — and
+    `/api/v1/agents` refuses an explicit `slug` in the payload outright
+    (400 `slug_immutable`), so a rename with no `slug` key is the only way
+    to prove the address is frozen.
     """
     tok = seeded_app["admin_token"]
-    a = _create_agent(seeded_app, tok, name="Published Bot")
-    seeded_app["client"].patch(f"/api/agents/{a['id']}", json={"status": "ready"}, headers=_auth(tok))
-    r = seeded_app["client"].patch(
-        f"/api/agents/{a['id']}",
+    client = seeded_app["client"]
+    a = _create_agent(seeded_app, tok, name="Published Bot")  # v1's default status is already 'ready'
+
+    r = client.put(
+        f"/api/v1/agents/{a['id']}",
         json={"slug": "hijacked", "name": "Renamed Bot"},
         headers=_auth(tok),
     )
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "slug_immutable"
+
+    r = client.put(f"/api/v1/agents/{a['id']}", json={"name": "Renamed Bot"}, headers=_auth(tok))
     assert r.status_code == 200
     assert r.json()["slug"] == "published-bot"
 
@@ -260,8 +320,8 @@ def test_agent_is_private_to_owner_until_shared(seeded_app):
     endpoint never confirms it exists)."""
     a = _create_agent(seeded_app, seeded_app["admin_token"], name="Secret Bot")
     other = _auth(seeded_app["analyst_token"])
-    assert seeded_app["client"].get(f"/api/agents/{a['id']}", headers=other).status_code == 404
-    listed = seeded_app["client"].get("/api/agents", headers=other).json()["agents"]
+    assert seeded_app["client"].get(f"/api/v1/agents/{a['id']}", headers=other).status_code == 404
+    listed = seeded_app["client"].get("/api/v1/agents", headers=other).json()["data"]
     assert all(x["id"] != a["id"] for x in listed)
 
 
@@ -278,12 +338,12 @@ def test_shared_agent_becomes_readable_but_not_writable(seeded_app):
     assert r.json()["visibility"] == "shared"
 
     other = _auth(seeded_app["analyst_token"])
-    assert c.get(f"/api/agents/{a['id']}", headers=other).status_code == 200
-    listed = c.get("/api/agents", headers=other).json()["agents"]
+    assert c.get(f"/api/v1/agents/{a['id']}", headers=other).status_code == 200
+    listed = c.get("/api/v1/agents", headers=other).json()["data"]
     assert any(x["id"] == a["id"] and x["mine"] is False for x in listed)
     # Read-only for the grantee.
-    assert c.patch(f"/api/agents/{a['id']}", json={"name": "Hijack"}, headers=other).status_code == 404
-    assert c.delete(f"/api/agents/{a['id']}", headers=other).status_code == 404
+    assert c.put(f"/api/v1/agents/{a['id']}", json={"name": "Hijack"}, headers=other).status_code == 404
+    assert c.delete(f"/api/v1/agents/{a['id']}", headers=other).status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +589,7 @@ def test_library_lists_artefacts_with_visibility_but_not_agents(seeded_app):
 
 def test_shared_agent_visibility_is_reported_by_the_sharing_api(seeded_app):
     """Agents aren't Library rows, so their shared state is asserted where it
-    actually surfaces: the sharing API (and, for use, /api/agents)."""
+    actually surfaces: the sharing API (and, for use, /api/v1/agents)."""
     tok = seeded_app["admin_token"]
     a = _create_agent(seeded_app, tok, name="Shared Bot")
     gid = _group_with_member("analyst1", "lib-vis-grp")
@@ -541,7 +601,7 @@ def test_shared_agent_visibility_is_reported_by_the_sharing_api(seeded_app):
 
 
 def test_agent_shared_with_me_is_not_in_my_library(seeded_app):
-    """A shared agent is usable via /api/agents but must not leak into the
+    """A shared agent is usable via /api/v1/agents but must not leak into the
     grantee's Library listing."""
     a = _create_agent(seeded_app, seeded_app["admin_token"], name="Borrowed Bot")
     gid = _group_with_member("analyst1", "lib-borrow-grp")
@@ -549,7 +609,7 @@ def test_agent_shared_with_me_is_not_in_my_library(seeded_app):
         f"/api/sharing/agent/{a['id']}", json={"group_ids": [gid]}, headers=_auth(seeded_app["admin_token"])
     )
     other = _auth(seeded_app["analyst_token"])
-    listed = seeded_app["client"].get("/api/agents", headers=other).json()["agents"]
+    listed = seeded_app["client"].get("/api/v1/agents", headers=other).json()["data"]
     assert any(x["id"] == a["id"] for x in listed)
     assert "Borrowed Bot" not in seeded_app["client"].get("/library", headers=other).text
 

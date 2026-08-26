@@ -199,8 +199,9 @@ class TestTheTemplatePreviewAgent:
         showing them a thing they cannot explain and did not create."""
         c, token = client
         self._preview(client)
-        listed = c.get("/api/agents", headers=_auth(token)).json()
-        rows = listed.get("agents", listed) if isinstance(listed, dict) else listed
+        # v1 is the only agent list now (/api/agents CRUD deleted, C1.2).
+        listed = c.get("/api/v1/agents", headers=_auth(token)).json()
+        rows = listed["data"] if isinstance(listed, dict) else listed
         assert all(row.get("slug") != "template-preview" for row in rows), (
             "the scratch preview agent is showing up in /agents"
         )

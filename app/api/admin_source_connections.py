@@ -13,9 +13,44 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        ``app.datasource_secrets.keboola_instance_token``.
                                                        Response gains ``token_seeded``/``token_seed_error``
                                                        when this ran and something was actually seeded.
+                                                       Snowflake/Databricks: 409
+                                                       ``connection_change_affects_registrations`` if
+                                                       ``is_default: true`` would demote another connection
+                                                       of the same source_type that already has
+                                                       registrations — resend with
+                                                       ``confirm_connection_change: true`` to apply (RBAC
+                                                       review Finding 1, 2026-08-26; see
+                                                       ``_guard_default_repoint``).
   GET    /api/admin/source-connections/{id}         — detail; 404 if missing
-  PUT    /api/admin/source-connections/{id}         — update config / token_env; 404 if missing
-  DELETE /api/admin/source-connections/{id}         — delete; 404 if missing
+  PUT    /api/admin/source-connections/{id}         — update config / token_env / is_default; 404 if
+                                                       missing. Snowflake/Databricks: 409
+                                                       ``connection_change_affects_registrations`` if the new
+                                                       config changes a connection-identity leaf
+                                                       (``app.connection_identity`` — an identity leaf present
+                                                       in the stored config but omitted from an empty/partial
+                                                       replacement config counts as a change, since this
+                                                       endpoint REPLACES ``config`` wholesale), or if the
+                                                       TOP-LEVEL ``token_env`` field (a sibling of ``config``,
+                                                       not nested inside it — also an identity leaf, since
+                                                       connectors fall back to it when
+                                                       ``config.token_env``/``config.private_key_env`` is
+                                                       unset) changes value with no ``config`` key sent at
+                                                       all, or if ``is_default`` changes WHICH row (if any) is
+                                                       the source_type's default — ``true`` demoting a
+                                                       different connection, or ``false`` demoting the current
+                                                       default to no default at all — and the source already
+                                                       has registrations — resend with
+                                                       ``confirm_connection_change: true`` to apply (D2.3 +
+                                                       RBAC review Findings 1/2, third round 2026-08-26; see
+                                                       ``_guard_row_repoint`` / ``_guard_default_repoint``).
+  DELETE /api/admin/source-connections/{id}         — delete; 404 if missing; 409
+                                                       ``connection_in_use`` if tables are pinned to it, or
+                                                       ``connection_change_affects_registrations`` if it is
+                                                       the source_type's current default and the source has
+                                                       registrations — resend with
+                                                       ``?confirm_connection_change=true`` to apply (RBAC
+                                                       review second round, 2026-08-26; see
+                                                       ``_guard_default_repoint``).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
@@ -130,6 +165,13 @@ class CreateConnectionBody(BaseModel):
     # data source" wizard, the CLI, third-party API clients) leaves this
     # False and gets exactly today's behavior.
     seed_from_instance_credentials: bool = False
+    # RBAC review Finding 1 (2026-08-26): creating a new row with
+    # `is_default: true` for a source_type that already has a default
+    # connection WITH registrations demotes that connection just as surely
+    # as a `PUT` repoint does — same 409 `connection_change_affects_
+    # registrations` override contract as `UpdateConnectionBody`'s field of
+    # the same name. See `_guard_default_repoint`.
+    confirm_connection_change: bool = False
 
 
 class UpdateConnectionBody(BaseModel):
@@ -140,6 +182,12 @@ class UpdateConnectionBody(BaseModel):
     config: Optional[Dict[str, Any]] = None
     token_env: Optional[str] = None
     is_default: Optional[bool] = None
+    # D2.3: Snowflake/Databricks connection identity (account/database/...,
+    # host/warehouse_id/...) moved off the `data_source.<type>` server-config
+    # yaml overlay onto this row — same repoint-confirmation contract as
+    # `app.api.admin.ServerConfigUpdateRequest.confirm_connection_change`,
+    # just re-keyed to the row. See `_guard_row_repoint`.
+    confirm_connection_change: bool = False
 
 
 class SecretBody(BaseModel):
@@ -269,6 +317,233 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
                 "or store the token in the vault via PUT .../secret instead."
             ),
         )
+
+
+#: Secret-ref NAME fields a connection's ``config`` can carry, per source_type.
+#: Snowflake/Databricks resolvers read these to know which env var (or the
+#: connection's own vault slot's env-var fallback) to pull a credential from
+#: — see connectors.snowflake.settings / connectors.databricks.semantic_layer.
+_CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
+    "snowflake": ("token_env", "private_key_env", "private_key_passphrase_env"),
+    "databricks": ("token_env",),
+}
+
+
+def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict[str, Any]]) -> None:
+    """Reject config-EMBEDDED secret-ref env var names that aren't on the
+    remote-attach allowlist — the same guard :func:`_reject_disallowed_token_env`
+    already applies to the request's top-level ``token_env`` field.
+
+    Snowflake needs up to three independent secret-ref NAMES at once
+    (``token_env`` OR ``private_key_env``, plus an optional passphrase), more
+    than the single top-level ``token_env`` column can hold, so
+    ``connectors.snowflake.settings``/``connectors.databricks.semantic_layer``
+    read these from ``config`` once a connection row becomes load-bearing
+    (D2.2). Without this call an admin could set ``config.token_env`` (or
+    ``private_key_env``) to an UNRELATED secret's env name (e.g.
+    ``ANTHROPIC_API_KEY``) plus an attacker-controlled ``account``/``host``,
+    and that secret would ship out as the Snowflake/Databricks credential on
+    the very next attach — `_validate_snowflake`/`_validate_databricks`
+    deliberately pass these fields through unvalidated (they are secret-ref
+    NAMES, not connection identity), so this is the one place that catches
+    it. Called at create/update, same as the top-level field.
+    """
+    fields = _CONFIG_TOKEN_ENV_FIELDS.get(source_type)
+    if not fields:
+        return
+    cfg = config or {}
+    for field in fields:
+        value = cfg.get(field)
+        if value is not None and not isinstance(value, str):
+            continue  # malformed, not a security concern here; the spec validator's problem
+        _reject_disallowed_token_env(value)
+
+
+#: Source types whose connection identity D2.3 relocated onto this row (off
+#: the `data_source.<type>` server-config yaml overlay). Keboola/BigQuery
+#: identity is guarded by their own existing mechanisms (Keboola's
+#: project-mismatch check on every token verify; BigQuery is out of scope
+#: for this slice) — extending the repoint guard to them is a separate change.
+_ROW_REPOINT_GUARDED_SOURCE_TYPES = ("snowflake", "databricks")
+
+
+def _guard_row_repoint(
+    row: Dict[str, Any],
+    new_config: Dict[str, Any],
+    new_token_env: Optional[str],
+    confirmed: bool,
+) -> None:
+    """Refuse an unconfirmed identity-leaf change on a connection row that
+    already has registrations.
+
+    Same 409 ``connection_change_affects_registrations`` contract as
+    ``app.api.admin._guard_connection_repoint`` (which guards the
+    `data_source.<type>` server-config yaml overlay): D2.3 moves Snowflake/
+    Databricks connection identity off that overlay and onto this row, so the
+    repoint guard has to follow it here — a registration still resolves its
+    upstream against the instance's one connection per source
+    (`app/connection_identity.py`), and repointing it silently invalidates
+    every existing row of that source (stale `_remote_attach.url`/view body).
+
+    Fires only when the source already HAS registrations and only for
+    :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES` — first-time setup, a tuning-only
+    edit, or a source outside this slice's identity-relocation all save
+    straight through.
+
+    ``new_token_env`` is the row's TOP-LEVEL ``token_env`` COLUMN — a
+    sibling of ``config``, not nested inside it — after this PUT applies;
+    pass the row's existing value when the request didn't touch it. It is
+    an identity leaf in its own right (third RBAC review round,
+    2026-08-26): ``connectors.snowflake.settings`` / ``connectors.
+    databricks.semantic_layer`` fall back to this column whenever
+    ``config.token_env``/``config.private_key_env`` is unset — exactly the
+    shape a row seeded from a legacy ``data_source.<type>.*`` yaml block
+    (``app.connections_seed``) carries. Compared separately from
+    ``identity_changes`` (which only ever inspects ``config``) because it
+    lives outside ``config`` entirely — a bare ``PUT {token_env: <other>}``
+    with no ``config`` key used to be invisible to this guard.
+    """
+    if confirmed:
+        return
+    source_type = row.get("source_type")
+    if source_type not in _ROW_REPOINT_GUARDED_SOURCE_TYPES:
+        return
+
+    from app.connection_identity import identity_changes
+
+    # replace_semantics=True: this endpoint REPLACES `config` wholesale (see
+    # the module docstring), so an identity leaf present in the stored config
+    # but absent from `new_config` was not "untouched", it was wiped — an
+    # empty `config: {}` PUT on a registrations-backed row must trip this
+    # guard rather than silently dropping account/user/token_env (RBAC
+    # review Finding 2, 2026-08-26).
+    changes = identity_changes(source_type, row.get("config") or {}, new_config, replace_semantics=True)
+
+    old_token_env = row.get("token_env")
+    if new_token_env != old_token_env and not any(c["field"] == "token_env" for c in changes):
+        changes = changes + [{"field": "token_env", "before": old_token_env, "after": new_token_env}]
+
+    if not changes:
+        return
+    try:
+        affected = table_registry_repo().list_by_source(source_type)
+    except Exception:
+        # A registry the guard cannot read is not a reason to block a
+        # config save — the operator may be fixing exactly that.
+        logger.exception("connection-repoint guard: registry lookup failed for %s", source_type)
+        return
+    if not affected:
+        return
+
+    from app.api.admin import _REPOINT_SAMPLE_SIZE, _is_secret_key, _mask
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "connection_change_affects_registrations",
+            "source": source_type,
+            # Same masking rule as the audit diff — the field name carries
+            # the operator-relevant signal, so a credential-pointer leaf
+            # does not need its value echoed to be understood.
+            "changes": [
+                {
+                    "field": c["field"],
+                    "before": _mask(c["before"]) if _is_secret_key(c["field"]) else c["before"],
+                    "after": _mask(c["after"]) if _is_secret_key(c["field"]) else c["after"],
+                }
+                for c in changes
+            ],
+            "affected_tables": len(affected),
+            "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
+            "hint": (
+                f"{len(affected)} registered table(s) resolve against the current "
+                f"{source_type} connection and will stop resolving after this change; "
+                "they need re-registering (or a matching schema on the new "
+                "upstream). Resend with confirm_connection_change=true to apply."
+            ),
+        },
+    )
+
+
+def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirmed: bool) -> None:
+    """Refuse an unconfirmed change of WHICH row is the ``source_type``
+    default (including "no row at all"), on a source that already has
+    registrations (RBAC review Finding 1, 2026-08-26; extended to demote and
+    delete in the second review round, same date).
+
+    ``is_default`` — not any one row's ``config`` — is what
+    ``resolve_source_connection(source_type)`` actually reads
+    (``src.connection_resolver``), so ANY change to which row (if any)
+    answers that call repoints every registration of that source_type just
+    as surely as editing the current default's identity does. Four call
+    sites reach this, none of them through :func:`_guard_row_repoint`:
+
+    - ``create_connection`` with ``is_default=true`` — the repo's
+      ``create()`` unconditionally ``UPDATE ... SET is_default=FALSE WHERE
+      source_type=?`` before inserting the new (already-default) row, with
+      no guard call anywhere in the create path.
+    - ``update_connection`` promoting a DIFFERENT row — ``PUT
+      /{other_id} {is_default: true}`` with no ``config`` key skips the
+      ``if config is not None`` block :func:`_guard_row_repoint` lives in
+      entirely, yet ``other_id`` becomes the default, demoting the current
+      one.
+    - ``update_connection`` demoting the CURRENT default to no default at
+      all — ``PUT /{current_default_id} {is_default: false}``. The repo's
+      ``update()`` False-branch clears the flag without promoting anything
+      else, so the source_type is left with NO default and every unpinned
+      registration silently falls back to the legacy
+      ``data_source.<type>.*`` yaml this slice does not delete.
+    - ``delete_connection`` removing the row that is the current default —
+      same end state as the demote-to-none case (no default left), reached
+      by deleting instead of editing.
+
+    Same 409 ``connection_change_affects_registrations`` contract as
+    :func:`_guard_row_repoint`, and the same notion of "affected
+    registrations" (``table_registry_repo().list_by_source(source_type)`` —
+    legacy rows resolve via the type's default, not a specific
+    connection_id, so every row of that source_type counts).
+
+    ``demoted_id`` is the id of the row that WOULD stop being the default —
+    ``None`` when there is nothing to demote (no current default, the
+    promoted row already IS the current default, or the row being
+    demoted/deleted is not currently the default), in which case this is a
+    no-op call. Scoped to :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES`, same as
+    the config guard — Keboola/BigQuery identity relocation is out of scope
+    for this slice.
+    """
+    if confirmed:
+        return
+    if source_type not in _ROW_REPOINT_GUARDED_SOURCE_TYPES:
+        return
+    if demoted_id is None:
+        return
+
+    try:
+        affected = table_registry_repo().list_by_source(source_type)
+    except Exception:
+        logger.exception("default-repoint guard: registry lookup failed for %s", source_type)
+        return
+    if not affected:
+        return
+
+    from app.api.admin import _REPOINT_SAMPLE_SIZE
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "connection_change_affects_registrations",
+            "source": source_type,
+            "changes": [{"field": "is_default", "before": demoted_id, "after": None}],
+            "affected_tables": len(affected),
+            "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
+            "hint": (
+                f"{len(affected)} registered table(s) resolve against the current "
+                f"{source_type} default connection ({demoted_id}); this change would "
+                "leave them resolving against a different connection (or none at all). "
+                "Resend with confirm_connection_change=true to apply."
+            ),
+        },
+    )
 
 
 def _validate_config_for_source_type(source_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -458,7 +733,14 @@ async def create_connection(
     body: CreateConnectionBody,
     _user: dict = Depends(require_admin),
 ):
-    """Create a named source connection. 409 if the name is already taken."""
+    """Create a named source connection. 409 if the name is already taken.
+
+    Snowflake/Databricks: 409 ``connection_change_affects_registrations`` if
+    ``is_default: true`` would demote the source_type's current default
+    connection and that source already has registrations — resend with
+    ``confirm_connection_change: true`` to apply. See
+    :func:`_guard_default_repoint`.
+    """
     repo = source_connections_repo()
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
@@ -473,6 +755,18 @@ async def create_connection(
     # already checked here. Now it is. (Devin Review on this PR.)
     _validate_stack_url(body.config, required=False, resolve=False)
     config = _validate_config_for_source_type(body.source_type, body.config)
+    _reject_disallowed_config_token_envs(body.source_type, config)
+    if body.is_default:
+        # RBAC review Finding 1: promoting a NEW row to default demotes
+        # whichever row currently answers `resolve_source_connection`, via
+        # the repo's own unconditional demotion UPDATE — a repoint just as
+        # real as a config change, so it needs the same guard.
+        current_default = repo.get_default(body.source_type)
+        _guard_default_repoint(
+            body.source_type,
+            current_default["id"] if current_default else None,
+            body.confirm_connection_change,
+        )
     conn_id = str(uuid4())
     repo.create(
         id=conn_id,
@@ -518,6 +812,30 @@ async def update_connection(
     stack fail ``project_mismatch`` with no way to clear it from the UI. This
     is also the supported way to re-point a bound connection — see the note
     on :func:`project_mismatch_message`.
+
+    Snowflake/Databricks connections (D2.3 — identity relocated here off the
+    ``data_source.<type>`` server-config yaml overlay): a ``config`` change to
+    a connection-identity leaf (``app.connection_identity``) on a connection
+    that already has registrations is refused with 409
+    ``connection_change_affects_registrations`` unless
+    ``confirm_connection_change: true`` — see :func:`_guard_row_repoint`. Since
+    ``config`` here REPLACES the stored dict wholesale, an identity leaf
+    present in the stored config but omitted from the new one (including an
+    empty ``config: {}``) counts as a change too, not as "untouched" (RBAC
+    review Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field — a
+    sibling of ``config``, not nested inside it — is an identity leaf in its
+    own right (connectors fall back to it whenever
+    ``config.token_env``/``config.private_key_env`` is unset, the shape a
+    legacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with
+    no ``config`` key sent at all is guarded the same way (third RBAC review
+    round, 2026-08-26). The same 409/confirm contract also covers
+    ANY change of which row (if any) is the source_type's default — a request
+    body with no ``config`` key at all — for a source that has registrations:
+    ``is_default: true`` demoting a DIFFERENT connection (RBAC review
+    Finding 1), and ``is_default: false`` demoting the CURRENT default to no
+    default at all, which falls back to the legacy
+    ``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See
+    :func:`_guard_default_repoint`.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -532,6 +850,22 @@ async def update_connection(
     config = body.config
     if config is not None:
         config = _validate_config_for_source_type(existing_row.get("source_type"), config)
+        _reject_disallowed_config_token_envs(existing_row.get("source_type"), config)
+    if config is not None or body.token_env is not None:
+        # Third RBAC review round (2026-08-26): this must run even when
+        # `config` is untouched — `PUT {token_env: <other>}` with no
+        # `config` key changes which secret every registration resolves
+        # against just as surely as a `config` replace does (see
+        # `_guard_row_repoint`'s docstring), yet used to skip this block
+        # entirely.
+        new_token_env = body.token_env if body.token_env is not None else existing_row.get("token_env")
+        _guard_row_repoint(
+            existing_row,
+            config if config is not None else (existing_row.get("config") or {}),
+            new_token_env,
+            body.confirm_connection_change,
+        )
+    if config is not None:
         old_config = existing_row.get("config") or {}
         old_stack = (old_config.get("stack_url") or "").rstrip("/")
         new_stack = (config.get("stack_url") or "").rstrip("/")
@@ -566,6 +900,33 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
+    if body.is_default is not None:
+        # RBAC review Finding 1 (2026-08-26): this must run regardless of
+        # whether `config` was sent — `PUT /{other_id} {is_default: true}`
+        # with no `config` key skips the block above entirely, yet still
+        # demotes whichever row is currently the default.
+        #
+        # Second RBAC review round (2026-08-26): `is_default: false` needs
+        # the SAME guard, not just `is_default: true` — `PUT
+        # /{current_default_id} {is_default: false}` demotes the row to NO
+        # default at all (the repo's `update()` False-branch clears the flag
+        # without promoting anything else), and `resolve_source_connection`
+        # then returns `None` for the type, silently falling back to the
+        # legacy `data_source.<type>.*` yaml for every unpinned
+        # registration — the same repoint threat model as promoting a
+        # different row, just landing on "no row" instead of "another row".
+        source_type = existing_row.get("source_type")
+        current_default = repo.get_default(source_type)
+        current_default_id = current_default["id"] if current_default else None
+        if body.is_default:
+            # Promoting THIS row: whichever OTHER row currently holds the
+            # default is what gets demoted (no-op if it's already this row).
+            demoted_id = current_default_id if current_default_id != connection_id else None
+        else:
+            # Demoting THIS row: only a repoint if it IS the current
+            # default — demoting an already-non-default row changes nothing.
+            demoted_id = connection_id if current_default_id == connection_id else None
+        _guard_default_repoint(source_type, demoted_id, body.confirm_connection_change)
     repo.update(
         connection_id,
         name=body.name,
@@ -656,11 +1017,19 @@ def _resync_derived_chat_tools(connection_id: str) -> None:
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
+    confirm_connection_change: bool = False,
     _user: dict = Depends(require_admin),
 ):
-    """Delete a source connection. 404 if not found; 409 if tables still reference it."""
+    """Delete a source connection. 404 if not found; 409 if tables still
+    reference it (``connection_in_use``, pinned tables) or if it is the
+    ``source_type``'s current default and that source has registrations
+    (``connection_change_affects_registrations`` — second RBAC review round,
+    2026-08-26; ``?confirm_connection_change=true`` to apply). See
+    :func:`_guard_default_repoint`.
+    """
     repo = source_connections_repo()
-    if repo.get(connection_id) is None:
+    row = repo.get(connection_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
     # Refuse to orphan tables: a registry row pinned to this connection would
     # start failing its sync with "connection_not_found" once the row is gone.
@@ -674,6 +1043,15 @@ async def delete_connection(
                 "tables": referencing,
             },
         )
+    # Second RBAC review round (2026-08-26): the pinned-table check above
+    # never caught deleting the row that is the source_type's DEFAULT — an
+    # unpinned registration resolves through it (`resolve_source_connection`)
+    # without ever referencing its `connection_id`, so deleting the sole/
+    # default Snowflake/Databricks connection broke every such
+    # registration's resolution with no 409/confirm. Same guard, same
+    # "affected registrations" notion as the `is_default` PUT case.
+    if row.get("is_default"):
+        _guard_default_repoint(row.get("source_type"), connection_id, confirm_connection_change)
     # BEFORE the row goes, not after. A derived chat-tools source outlives its
     # connection otherwise, keeping a live Keboola credential in the vault and
     # still offering the project's tools to the agent — and since this step now

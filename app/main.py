@@ -442,7 +442,9 @@ from app.api.memory_mining import (
 )
 from app.api.uploads import router as admin_uploads_router
 from app.api.collections import router as collections_router  # Slice 2: file corpus upload
-from app.api.agents import router as agents_router  # v103: agent registry (Library items)
+# `app.api.agents` is gone — /api/agents was retired into /api/v1/agents
+# (Task C1.2) and the module deleted on main, so only the builder routers
+# survive this merge.
 from app.api.agent_builder import router as agent_builder_router  # builder assistant turns
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
 from app.api.package_builder import router as package_builder_router  # data-package builder turns
@@ -2793,7 +2795,6 @@ def create_app() -> FastAPI:
     app.include_router(memory_mining_admin_router)
     app.include_router(admin_uploads_router)
     app.include_router(collections_router)
-    app.include_router(agents_router)
     app.include_router(agent_builder_router)
     app.include_router(entity_builder_router)
     app.include_router(package_builder_router)
@@ -2961,11 +2962,11 @@ def create_app() -> FastAPI:
         app.include_router(_plugin_router)
 
     # /agents is served by the paper-theme redesign builder page in
-    # web_router (app/web/router.py). main's minimal agents_page.py builder
-    # was retired at the merge — the two branches shipped competing /agents
-    # pages, and the redesign one (client-rendered against /api/agents) wins
-    # the URL. main's agent-as-API endpoints (/api/v1/agents, agents_admin,
-    # sessions, …) are untouched.
+    # web_router (app/web/router.py), client-rendered against /api/v1/agents.
+    # It used to call its own /api/agents adapter router — deleted in the
+    # remediation-program's "one agent model" Track C1 (Task C1.2): v1
+    # absorbed every builder-shape operation (Task C1.1), so a second
+    # registry over the same `agents` table no longer earns its keep.
 
     # Web UI router (must be last — has catch-all routes)
     app.include_router(web_router)

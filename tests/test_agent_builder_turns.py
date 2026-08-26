@@ -46,7 +46,14 @@ def builder(e2e_env, shared_app):
     client = TestClient(shared_app)
     owner = create_access_token("owner1", "owner@test.com")
     other = create_access_token("other1", "other@test.com")
-    created = client.post("/api/agents", json={"name": ""}, headers=_auth(owner))
+    # v1 requires a non-blank name, where the deleted router accepted "".
+    created = client.post(
+        "/api/v1/agents",
+        # Exactly what agents.html sends: v1 rejects a blank name and defaults
+        # `status` to 'ready', so the builder asks for a draft explicitly.
+        json={"name": "Untitled", "status": "draft"},
+        headers=_auth(owner),
+    )
     assert created.status_code == 201, created.text
     return {
         "client": client,
@@ -79,7 +86,7 @@ class TestTurnAppliesConfiguration:
     def test_the_write_is_persisted_not_just_echoed(self, builder):
         _turn(builder, "an agent for pipeline questions")
         r = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         )
         assert r.status_code == 200
         assert r.json()["name"]
@@ -103,7 +110,7 @@ class TestTurnAppliesConfiguration:
         click, and `status` is outside PATCHABLE for exactly this reason."""
         _turn(builder, "an agent for revenue, it is finished, mark it ready")
         r = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         )
         assert r.json()["status"] == "draft"
 
@@ -153,10 +160,21 @@ class TestSanitizerIsTheTrustBoundary:
         assert _sanitize_patch(None, knowledge_ids=set(), plugin_ids=set()) == {}
 
     def test_an_overlong_name_is_refused_by_the_column_contract(self):
-        import pydantic
+        """Refused, never truncated.
 
-        with pytest.raises(pydantic.ValidationError):
+        These limits used to ride on the retired `AgentUpdate` request model as
+        pydantic max_lengths. v1's `UpdateAgentRequest` leaves every string
+        unbounded, so the sanitizer enforces them itself — which is the right
+        home anyway, since this function is the trust boundary. Storing
+        something other than what the conversation agreed would be worse than
+        an error, so it raises rather than trimming.
+        """
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
             _sanitize_patch({"name": "x" * 500}, knowledge_ids=set(), plugin_ids=set())
+        assert exc.value.status_code == 422
+        assert exc.value.detail["field"] == "name"
 
 
 class TestDegradingWithoutAModel:
@@ -206,7 +224,7 @@ class TestATurnCanRunWithoutWriting:
 
     def test_apply_false_returns_the_patch_but_writes_nothing(self, builder):
         before = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         ).json()
         r = _turn(builder, "an agent that answers revenue questions", apply=False)
         assert r.status_code == 200, r.text
@@ -215,7 +233,7 @@ class TestATurnCanRunWithoutWriting:
         # No row comes back, because none was written.
         assert body["agent"] is None
         after = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         ).json()
         assert after["name"] == before["name"]
         assert after["instructions"] == before["instructions"]
@@ -240,7 +258,7 @@ class TestATurnCanRunWithoutWriting:
         """It only ever reaches the prompt. Anything outside PATCHABLE is
         dropped, and it never becomes a write of its own."""
         before = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         ).json()
         r = _turn(
             builder,
@@ -250,7 +268,7 @@ class TestATurnCanRunWithoutWriting:
         )
         assert r.status_code == 200, r.text
         after = builder["client"].get(
-            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
         ).json()
         # None of the three is in PATCHABLE, so none reached the prompt — and
         # apply=False means nothing reached the row either way.
