@@ -1011,6 +1011,16 @@ data_apps:
   enabled: false
   runtime_image: "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24"
   subdomain_base: ""            # e.g. "apps.example.com"; "" = path-prefix only
+  # Serve hosted apps on the MAIN origin (same origin as the Agnes /api)?
+  # OFF by default (SECURITY): a hosted app runs user-authored JS, and on the
+  # main origin that JS can call /api with the viewer's own session cookie and
+  # read the response (mint a PAT, read admin config) — no response header can
+  # stop same-origin reads. Configure `subdomain_base` above to serve apps from
+  # their own origin instead; requests arriving on a data-app subdomain are
+  # always served. Set this to true only if you accept same-origin serving
+  # (e.g. trusted authors only, or to keep the in-chat app preview working).
+  # Env override: AGNES_DATA_APPS_ALLOW_SAME_ORIGIN.
+  allow_same_origin: false
   default_idle_timeout_s: 1800
   default_sleep_mode: recreate  # recreate | pause
   default_mem_limit: 1g

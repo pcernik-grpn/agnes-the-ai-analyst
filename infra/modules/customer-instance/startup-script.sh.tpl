@@ -1178,6 +1178,54 @@ if [ "$COMPOSE_UP_OK" != "1" ]; then
     echo "ERROR: docker compose up failed after 3 attempts"
     exit 1
 fi
+%{ if data_apps_enabled ~}
+# --- container-metadata-hardening begin (extracted + executed by tests/test_startup_container_metadata_hardening.py) ---
+# Block hosted data-app containers from reaching the cloud metadata server
+# (169.254.169.254). A data app runs user-authored code — RCE inside its own
+# container is by design — and on a plain bridge network it can otherwise read
+# the VM's service-account token from the metadata server and pivot to the
+# entire cloud project. Docker's process hardening (cap_drop, no-new-privileges)
+# does nothing about network reach, so this is enforced at the host firewall
+# where a compromised container cannot undo it.
+#
+# Scoped to the agnes-apps bridge SOURCE subnet, NOT a blanket block: the Agnes
+# app container itself legitimately reaches the metadata server (e.g. BigQuery
+# GCE-metadata auth). The app is multi-homed but `default` is pinned as its
+# highest-priority network (docker-compose.yml `networks.default.priority`), so
+# its egress — metadata included — routes via `default`, its source IP is in the
+# `default` subnet, and this agnes-apps-scoped rule never matches it. DOCKER-USER
+# is the Docker-provided FORWARD hook, evaluated before SNAT/MASQUERADE, so a
+# container's real source IP still matches here. Idempotent (check before insert).
+#
+# Resolved at boot from the live network. If agnes-apps is later recreated with a
+# different subnet (e.g. `docker network prune` + redeploy without a reboot), the
+# rule is stale until the next boot re-runs this block — re-run it (or reboot)
+# after any manual agnes-apps network recreation.
+METADATA_IP="169.254.169.254"
+APPS_NETWORK="agnes-apps"
+# Compose created agnes-apps on `up`; ensure it exists so its subnet resolves
+# even if a future topology defers creation. Harmless when it already exists.
+docker network create "$APPS_NETWORK" >/dev/null 2>&1 || true
+APPS_SUBNETS="$(docker network inspect "$APPS_NETWORK" 2>/dev/null \
+    | grep -oE '"Subnet":[[:space:]]*"[0-9./]+"' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' || true)"
+if ! command -v iptables >/dev/null 2>&1; then
+    echo "WARN: iptables not found; data-app containers can reach $METADATA_IP (cloud metadata) — block it manually, see docs/architecture.md" >&2
+elif [ -z "$APPS_SUBNETS" ]; then
+    echo "WARN: could not resolve $APPS_NETWORK subnet; data-app metadata egress NOT blocked this boot" >&2
+else
+    for subnet in $APPS_SUBNETS; do
+        if iptables -C DOCKER-USER -s "$subnet" -d "$METADATA_IP/32" -j DROP 2>/dev/null; then
+            :  # already present — idempotent
+        elif iptables -I DOCKER-USER -s "$subnet" -d "$METADATA_IP/32" -j DROP 2>/dev/null; then
+            echo "INFO: blocked $subnet -> $METADATA_IP (data-app metadata egress)" >&2
+        else
+            echo "WARN: failed to install DOCKER-USER metadata DROP for $subnet" >&2
+        fi
+    done
+fi
+# --- container-metadata-hardening end ---
+%{ endif ~}
 %{ if kai_agent_enabled ~}
 # Now the engine, tolerantly: the base stack (incl. Caddy/TLS) is up, and the
 # sections below (auto-upgrade cron, watchdog) must install regardless of the

@@ -68,7 +68,7 @@ from app.auth.access import can_access, is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user, reject_keboola_header_credential
 from app.auth.jwt import create_access_token
 from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX
-from app.instance_config import feature_enabled, get_data_apps_config, get_public_url
+from app.instance_config import coerce_flag_value, feature_enabled, get_data_apps_config, get_public_url
 from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
 from src.data_apps.git_repos import fast_forward_live, init_app_repo
@@ -134,6 +134,24 @@ _RECONCILE_PENDING = "reconcile-pending"
 _CONFIG_DEFAULTS = {
     "runtime_image": "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24",
     "subdomain_base": "",
+    # Serve hosted apps on the MAIN origin (same origin as the Agnes `/api`)?
+    # OFF by default, deliberately: a hosted app runs user-authored JS, and on
+    # the main origin that JS shares the viewer's browsing context — it can
+    # `fetch('/api/...', {credentials:'include'})` with the viewer's own Agnes
+    # session cookie and READ the response (mint a PAT, read admin config),
+    # because same-origin reads need no CORS and the `CsrfOriginMiddleware`
+    # only refuses CROSS-origin state changes. No response header closes this
+    # (a same-origin `window.open`/`<iframe>` to `/api` is DOM-readable and
+    # ungoverned by CSP), so the only real fix is origin isolation. Configure
+    # `subdomain_base` to serve apps from their own origin (where the existing
+    # CORS + CsrfOrigin defenses contain the attack); requests that arrive on a
+    # data-app subdomain are always served. The in-chat preview does NOT need
+    # this flag — it is served same-origin only for a caller holding a per-app
+    # `data-app-preview:<slug>` token (see `data_apps_proxy._same_origin_serving_
+    # refused`). This flag is the explicit escape hatch for serving ALL apps
+    # same-origin to everyone (trusted authors only) — see
+    # `app/api/data_apps_proxy.py` and docs/architecture.md#hosted-data-apps.
+    "allow_same_origin": False,
     "default_idle_timeout_s": 1800,
     "default_sleep_mode": "recreate",
     "default_mem_limit": "1g",
@@ -317,6 +335,49 @@ def require_op_lease(slug: str) -> str:
 
 def _effective_config() -> dict:
     return {**_CONFIG_DEFAULTS, **get_data_apps_config()}
+
+
+def same_origin_serving_allowed() -> bool:
+    """Whether hosted apps may be served on the MAIN origin (same origin as
+    the Agnes `/api`), where a hosted app's JS shares the viewer's session.
+
+    Off by default (`data_apps.allow_same_origin`, or
+    ``AGNES_DATA_APPS_ALLOW_SAME_ORIGIN``); see `_CONFIG_DEFAULTS` for why
+    same-origin serving is unsafe. The proxy calls this to decide whether a
+    request that did NOT arrive on a data-app subdomain may be served
+    (`app/api/data_apps_proxy.py`). A request that arrived on a subdomain is
+    already on an isolated origin and is served regardless of this flag.
+    """
+    raw = os.environ.get("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN")
+    if raw is not None:
+        return coerce_flag_value(raw, default=False)
+    return bool(_effective_config().get("allow_same_origin", False))
+
+
+def same_origin_serving_warning() -> Optional[str]:
+    """A startup warning when hosted apps are enabled but will be refused at
+    serve time for lack of an isolated origin, else ``None``.
+
+    Fires when ``data_apps.enabled`` is on, ``allow_same_origin`` is off, and
+    no ``subdomain_base`` is configured — the deployment has no way to serve a
+    hosted app (every request lands on the main origin and is refused by
+    ``data_apps_proxy._same_origin_serving_refused``). Kept pure so it is
+    unit-testable; the app lifespan logs it (`app/main.py`).
+    """
+    if not feature_enabled("data_apps", "enabled", env_var="AGNES_DATA_APPS_ENABLED", default=False):
+        return None
+    if same_origin_serving_allowed():
+        return None
+    if (_effective_config().get("subdomain_base") or "").strip():
+        return None
+    return (
+        "data_apps.enabled is on but hosted apps will NOT be served: same-origin "
+        "serving is disabled and no data_apps.subdomain_base is configured. Serve apps "
+        "from an isolated origin (set data_apps.subdomain_base), or accept same-origin "
+        "serving with data_apps.allow_same_origin=true / "
+        "AGNES_DATA_APPS_ALLOW_SAME_ORIGIN=1 (a hosted app's JS then runs with the "
+        "viewer's session — trusted authors only)."
+    )
 
 
 def _audit(

@@ -104,7 +104,22 @@ services:
     # Joins agnes-apps so the app can reach data-app runtime containers
     # directly (e.g. readiness probes); apps-runner is the only process
     # that talks to the Docker socket, but the app shares the network.
-    networks: [default, agnes-apps, agnes-apps-internal]
+    #
+    # `default` is pinned as the highest-priority network so the app's default
+    # gateway — hence all its egress, including the GCP metadata server for
+    # BigQuery GCE-metadata auth — always routes via `default`, never via
+    # `agnes-apps`. The container-metadata-hardening firewall rule
+    # (infra/modules/customer-instance/startup-script.sh.tpl) DROPs
+    # `agnes-apps -> 169.254.169.254`; without this pin the app is multi-homed
+    # with all endpoints at gw_priority 0 and Docker MAY pick agnes-apps as the
+    # default route, which would send the app's own metadata traffic into that
+    # DROP and break BigQuery auth. The pin makes "the app is spared" a config
+    # guarantee, not an incidental of Docker's tie-break.
+    networks:
+      default:
+        priority: 100
+      agnes-apps: {}
+      agnes-apps-internal: {}
 
   # One-shot: run extractor then rebuild orchestrator views
   extract:

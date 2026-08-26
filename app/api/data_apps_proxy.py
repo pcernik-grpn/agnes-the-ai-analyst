@@ -63,6 +63,7 @@ from app.api.data_apps import (
     _feature_gate,
     preview_cookie_name,
     redeploy_current,
+    same_origin_serving_allowed,
     try_acquire_op_lease,
 )
 from app.auth.dependencies import _get_db, get_current_user
@@ -324,6 +325,58 @@ def _not_running_response(slug: str, state: str, accepts_json: bool) -> Response
     return Response(_STOPPED_HTML.format(state=state), media_type="text/html", status_code=409)
 
 
+_SAME_ORIGIN_DISABLED_HTML = """<!doctype html>
+<title>App unavailable</title>
+<style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0}
+div{max-width:34rem;padding:0 1.5rem;text-align:center}</style>
+<div><h2>This app cannot be served here</h2>
+<p>Hosted apps are not served on this origin because a hosted app's code would
+run with your logged-in session. An administrator must serve them from an
+isolated origin (configure <code>data_apps.subdomain_base</code>) or explicitly
+allow same-origin serving.</p></div>
+"""
+
+
+def _same_origin_serving_refused(request: Request, accepts_json: bool, via_preview: bool) -> Optional[Response]:
+    """Refuse serving a hosted app on the MAIN origin unless explicitly allowed.
+
+    A request rewritten from a data-app subdomain
+    (``scope["agnes_data_app_subdomain"]``) is already on an isolated origin,
+    where the app's JS cannot read the viewer's ``/api`` — served regardless.
+    A request that arrived on the main host serves the app SAME-ORIGIN as the
+    Agnes API: the app's user-authored JS shares the viewer's session cookie
+    and can read ``/api`` (mint a PAT, read admin config). That is refused
+    unless:
+
+    - ``via_preview`` — the caller holds a ``data-app-preview:<slug>`` token
+      (per-app, short-TTL, minted only to someone who already passed
+      ``_can_view`` for THIS slug). The in-chat preview loads the app
+      same-origin in an iframe and needs this; scoping the allowance to the
+      preview token — rather than the instance-global flag below — keeps a
+      plain drive-by navigation to ``/apps/<other-slug>/`` (no preview token)
+      refused, so enabling the preview does NOT re-open same-origin serving for
+      every app. The previewer's own session is still exposed to the app they
+      chose to preview — an inherent, deliberate, per-app preview risk.
+    - the operator set ``data_apps.allow_same_origin`` /
+      ``AGNES_DATA_APPS_ALLOW_SAME_ORIGIN`` — serve ALL apps same-origin
+      (trusted authors only; see ``app/api/data_apps.py::_CONFIG_DEFAULTS`` for
+      why no response header can close a same-origin read).
+
+    Returns the refusal ``Response`` (403) when serving must be refused, else
+    ``None`` to proceed. Runs after RBAC so it never reveals an app's
+    existence to a caller who would otherwise get a plain 401/403.
+    """
+    if request.scope.get("agnes_data_app_subdomain"):
+        return None
+    if via_preview:
+        return None
+    if same_origin_serving_allowed():
+        return None
+    if accepts_json:
+        return JSONResponse({"detail": "data_app_same_origin_disabled"}, status_code=403)
+    return Response(_SAME_ORIGIN_DISABLED_HTML, media_type="text/html", status_code=403)
+
+
 def _readiness_poll_url(request: Request, slug: str) -> str:
     """Where the holding page should poll for readiness.
 
@@ -533,10 +586,18 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
     if not via_preview and not _can_view(user, row):
         raise HTTPException(status_code=403, detail="forbidden")
 
+    accepts_json = _wants_json(request)
+    # Refuse same-origin serving unless the request arrived on a data-app
+    # subdomain (isolated origin), carries a per-app preview token, or the
+    # operator opted in. After RBAC so the refusal never leaks an app's
+    # existence to an unauthorized caller.
+    refused = _same_origin_serving_refused(request, accepts_json, via_preview)
+    if refused is not None:
+        return refused
+
     _touch(row)
 
     state = row["state"]
-    accepts_json = _wants_json(request)
 
     if state == "running":
         try:
@@ -649,6 +710,13 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
 
     if not _can_view(user, row):
         await websocket.close(code=4403, reason="forbidden")
+        return
+
+    # Same-origin serving gate — mirrors the HTTP proxy. A WS on the main
+    # origin shares the viewer's session with app-authored code; refuse unless
+    # the request arrived on a data-app subdomain or the operator opted in.
+    if not websocket.scope.get("agnes_data_app_subdomain") and not same_origin_serving_allowed():
+        await websocket.close(code=4403, reason="same_origin_disabled")
         return
 
     if row["state"] != "running":
