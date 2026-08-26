@@ -222,8 +222,33 @@ works on one is worse than a preview that is honestly unavailable.
 
 Each phase ships on its own and leaves the product coherent.
 
-1. **Extract the shell.** `agents.html` → shared partial + `builder.css`, no
-   visual change. Existing `/agents` guards are the regression net.
+1. **Extract the shell — CSS. ✅ done** (`app/web/static/css/builder.css`).
+   ~230 lines out of `agents.html`'s inline `<style>`, no visual change,
+   verified by computed style. Turned up one thing worth keeping in mind for
+   every later phase: the design-system guards that ban raw hex and legacy
+   `var(--primary)` scan TEMPLATES, so moving rules into a `.css` file escapes
+   them silently. `tests/test_builder_css_tokens.py` now follows them, over a
+   cohort of sheets that may only grow.
+
+1b. **Extract the shell — markup.** Not done, and not what this spec first
+   said. There is no Jinja partial to extract: the shell does not exist in the
+   template at all. It is built at runtime by eleven functions
+   (`renderBuilder`, `renderConvPane`, `renderCfgPane`, `section`,
+   `createPaneHtml`, `composerHtml`, `convHtml`, `msgHtml`, `pickerHtml`,
+   `headActionsHtml`, `toolbar`) inside a 1,841-line inline `<script>`. The
+   reusable artifact is therefore a **JS module** —
+   `app/web/static/js/components/builder_shell.js` — that renders the shell
+   from a config object and calls back into the host page for the parts only
+   it knows: the section list, each section's body, and what a turn does.
+
+   This is the largest single refactor in the plan and the one that decides
+   whether phase 2 is genuinely shared or a second copy. Its hard part is not
+   the extraction but the seam: the eleven functions currently close over the
+   page's module-scope state (`conv`, `pv`, `picker`, `baseline`, `collapsed`,
+   `builderTab`), so the module needs that state passed in or owned, and the
+   explicit-save machinery (`touch` / `isDirty` / `saveAgent` / `leaveBuilder`)
+   has to move with it or the two pages will diverge on the one behaviour
+   users notice most.
 2. **`/skills` adopts the shell.** Two panes, the only-what's-set panel with
    `+` pickers, explicit save with the same header verbs and leave
    confirmation. Still form-authored — no conversation yet. Delivers the
