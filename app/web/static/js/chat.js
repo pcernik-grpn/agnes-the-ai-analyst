@@ -1591,7 +1591,8 @@ async function openSession(chatId, wsUrlOverride) {
   // Show a "Resuming session…" status immediately after the TCP handshake and
   // before the ready frame arrives. For a fresh spawn this reads as a brief
   // connecting state; for a paused session (~1–2 s resume) it tells the user
-  // something is happening. The ready frame handler replaces it with "Connected."
+  // something is happening. The ready frame handler clears it — connected is
+  // the normal state and gets no pill.
   setStatus("Resuming session…", "info");
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
@@ -1635,7 +1636,12 @@ function handleFrame(frame) {
   switch (frame.type) {
     case "ready":
     case "runner_ready":
-      setStatus("Connected.", "ok");
+      // Connected is the NORMAL state — showing a permanent "Connected."
+      // pill told the user about infrastructure they never asked about
+      // (and reconnection is automatic anyway). Clear the transient
+      // "Resuming session…" line instead; the status surfaces only when
+      // something is wrong (warn/error) or in progress (info).
+      setStatus("");
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
@@ -2046,10 +2052,13 @@ function attachMessageActions(article, copyText) {
  *  stream renders card-then-text for the same turn. Order is array order, and
  *  the only way to guarantee that is to never reorder.
  *
- *  The first text bubble is the PRIMARY article — it owns the avatar,
- *  timestamp, sender attribution, sources chips, the copy row and the collapse
- *  cap. Later text parts are continuation bubbles under the card above them,
- *  which is what a sealed live segment looks like.
+ *  The first text bubble is the PRIMARY article — it owns the avatar and the
+ *  sender attribution. The turn's LAST text bubble carries the tail: sources
+ *  chips, the copy/actions row, latest-assistant marking and the collapse cap
+ *  — exactly where finalizeAssistantMessage puts them on the live turn, so a
+ *  reload doesn't move the copy row from the end of the answer to the middle.
+ *  Text parts between the two are continuation bubbles under the card above
+ *  them, which is what a sealed live segment looks like.
  *
  *  A row written before v123 has no `parts`; it falls back to `content` plus
  *  the positionless `tool_calls` after it. That is not a degraded choice but
@@ -2063,26 +2072,25 @@ function renderMessage(m) {
   //: document.
   const nodes = [];
   let primary = null;
+  let tailArticle = null;
 
   const pushTextBubble = (text) => {
-    const isPrimary = primary === null;
-    const article = isPrimary
-      ? createMessageShell({ role: m.role, createdAt: m.created_at })
-      : createMessageShell({ role: m.role });
+    // Every shell gets the row's created_at: whichever bubble ends up
+    // carrying the actions row reads its timestamp from dataset.createdAt,
+    // and the tail of a segmented turn is a continuation, not the primary.
+    const article = createMessageShell({ role: m.role, createdAt: m.created_at });
     const body = article.querySelector(".msg-body");
     body.innerHTML = renderAnswerMarkdown(text || "");
     enhanceCodeBlocks(body);
     enhanceTables(body);
     renderMermaidBlocks(body);
-    if (isPrimary) {
+    if (primary === null) {
       primary = article;
     } else {
-      // A continuation is the same speaker mid-answer: no second avatar, no
-      // second actions row. Both belong to the message, not to a segment.
+      // A continuation is the same speaker mid-answer: no second avatar.
       article.classList.add("is-continuation");
-      const actions = article.querySelector(".msg-actions");
-      if (actions) actions.remove();
     }
+    tailArticle = article;
     nodes.push(article);
     return article;
   };
@@ -2137,20 +2145,24 @@ function renderMessage(m) {
     bubble.insertBefore(who, bubble.querySelector(".msg-body"));
   }
 
-  // Chips stay on the primary bubble, so they read as part of the answer.
-  if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
+  // Chips and the actions row belong to the turn's LAST bubble — where the
+  // live path (finalizeAssistantMessage) puts them — so they read as the end
+  // of the answer on reload too, not a tail stapled after its first segment.
+  const tailBubble = tailArticle.querySelector(".msg-bubble");
+  if (m.role === "assistant") renderSourcesChips(tailBubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
   // only (see the note on stripSourcesFence) — but drops the next_actions
   // trailer: suggestions are chrome, and a copied transcript loses nothing
   // without them. It carries the WHOLE answer, not just this bubble's segment.
-  attachMessageActions(primary, stripNextActionsFence(m.content || ""));
+  attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""));
 
   for (const node of nodes) $("chat-messages").appendChild(node);
-  if (m.role === "assistant") _markLatestAssistant(primary);
-  // Measured after insertion, and against the primary article only: the cards
-  // and continuations are siblings, not part of the answer's height.
-  maybeMakeCollapsible(primary);
+  if (m.role === "assistant") _markLatestAssistant(tailArticle);
+  // Measured after insertion, and against the tail article only: the cards
+  // and earlier segments are siblings, not part of the answer's height —
+  // same as the live turn, which caps only its final segment.
+  maybeMakeCollapsible(tailArticle);
   maybeScrollToBottom();
 }
 

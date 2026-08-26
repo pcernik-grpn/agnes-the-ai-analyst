@@ -229,8 +229,14 @@ async def list_sessions(
             "id": s.id,
             "surface": s.surface.value,
             "title": s.title,
-            "started_at": s.started_at.isoformat(),
-            "last_message_at": s.last_message_at.isoformat() if s.last_message_at else None,
+            # Raw datetimes, not .isoformat(): DuckDB reads come back naive
+            # (clock value UTC), and pre-stringifying bypasses the app's
+            # datetime encoder (app/serialization.py) that labels them
+            # `+00:00` — the browser then parses the offset-less string as
+            # LOCAL time and every timestamp shifts by the viewer's UTC
+            # offset after a reload.
+            "started_at": s.started_at,
+            "last_message_at": s.last_message_at,
             "message_count": s.message_count,
             "paused": s.sandbox_paused_at is not None,
             # See create_session: lets the composer's agent picker show WHO a
@@ -241,7 +247,7 @@ async def list_sessions(
             # also exposed so a client can order pins itself; the repo already
             # returns pinned-first, so the flag alone is enough for the rail.
             "pinned": s.pinned_at is not None,
-            "pinned_at": s.pinned_at.isoformat() if s.pinned_at else None,
+            "pinned_at": s.pinned_at,
         }
         for s in rows
     ]
@@ -566,7 +572,12 @@ async def list_messages(
             # exposes the field to participants and this route is owner-only
             # (a non-owner 404s above), so it discloses nothing new.
             "sender_email": m.sender_email,
-            "created_at": m.created_at.isoformat(),
+            # Raw datetime, not .isoformat() — the app's datetime encoder
+            # (app/serialization.py) labels the naive-UTC value `+00:00`;
+            # pre-stringified it went out offset-less and the browser
+            # parsed it as local time, shifting every reloaded bubble's
+            # timestamp by the viewer's UTC offset.
+            "created_at": m.created_at,
             # Recomputed on read rather than stored (see app/chat/sources.py):
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a

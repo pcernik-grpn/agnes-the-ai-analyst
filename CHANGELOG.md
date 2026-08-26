@@ -173,6 +173,28 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- Web chat: a user message's hover actions (timestamp + copy) now hang
+  BELOW the bubble instead of renting an invisible second row inside it —
+  a one-line message no longer renders as a two-row-tall bubble. On touch
+  devices (no hover) the row stays visible and the turn reserves the space.
+- Web chat: on a history reload, a multi-part assistant turn (text → tool
+  card → text) now carries its sources chips, copy/actions row, "Ask again"
+  and collapse cap on the turn's LAST text segment — where the live stream
+  already put them — instead of stapling them after the first segment,
+  mid-turn. The reload timestamp also reads the row's real `created_at` on
+  every segment rather than "now" on continuations.
+- Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
+  The sessions/messages endpoints (incl. copresence) pre-stringified their
+  naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
+  that labels them `+00:00` — the browser then parsed the offset-less
+  string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
+  They now return raw datetimes and the encoder stamps the offset.
+- Web chat: the permanent "Connected." pill is gone — connected is the
+  normal state and reconnection is automatic, so the status surfaces only
+  when something is in progress or wrong ("Resuming session…", warnings,
+  errors), as a pill below the thread header. "Copy transcript" moves to
+  the header's right edge (the removed pill's spot) restyled as a quiet
+  ghost button, and a cleared status no longer leaves an empty dot-pill.
 - **The GCP Cloud Logging overlay can no longer take an instance down**
   (#1557, #1558; observed live as a 9-minute full outage on a routine
   auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
