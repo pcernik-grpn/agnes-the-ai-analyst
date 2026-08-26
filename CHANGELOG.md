@@ -34,6 +34,65 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
+### Added
+
+- **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
+  the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
+  `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
+  of its own, so an enabled provider with no allowed domain means any Google
+  account can sign in and self-provision, and nothing said so at boot. Found
+  during RBAC review of the `config/loader.py` required-fields demotion above:
+  that loader check used to be an accidental loud signal for exactly this gap
+  (a missing `auth.allowed_domain` discarded the whole static config with an
+  ERROR log) and is now a passive warning, so the gap needed its own explicit
+  check.
+
+### Changed
+
+- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
+  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
+  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
+  `instance.theme` / `instance.experience` / `instance.home_route` /
+  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
+  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
+  UI (`/admin/server-config`) owns them from day 2 onward instead of having
+  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
+  value and permanently shadow the operator's own change. **Existing VMs**:
+  on their next boot the old always-wins `.env` lines disappear; the value
+  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
+  relied on Terraform re-asserting one of these four knobs every boot must
+  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
+  by hand). No app-side precedence change — a hand-set env var still wins
+  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
+  is unaffected (it pins deployment-provisioned backing, not a presentation
+  choice, so it is out of scope). See the new "Config ownership map" in
+  `docs/CONFIGURATION.md`.
+
+### Removed
+
+- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
+  `jira:` section is gone from both the `/admin/server-config` UI (it never
+  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
+  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
+  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
+  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
+  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
+  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
+  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
+  (zero readers — found during a sweep for other dead keys in the same
+  section). `deployment.role` is unaffected.
+
+### Fixed
+
+- **`config/loader.py` no longer raises on a static `instance.yaml` missing
+  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
+  `auth.webapp_secret_key`.** The check never actually gated anything: a
+  provisioned VM ships no static `instance.yaml` at all (the loader raises
+  `FileNotFoundError` first), and `app.instance_config` already caught the
+  `ValueError` and served built-in defaults regardless. It now logs a
+  warning naming the missing field(s) instead of raising, so a direct caller
+  of `config.loader.load_instance_config()` (e.g. a connector script) no
+  longer gets an exception on an otherwise-bootable config.
 
 ## [0.89.1] - 2026-08-26
 
@@ -112,105 +171,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   apps. A deployment that serves apps publicly in path-prefix mode (no
   `subdomain_base`) must set `allow_same_origin: true` (trusted authors only) or
   move to subdomain mode; a startup log flags an enabled-but-unservable posture.
-### Added
-
-- **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
-  the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
-  `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
-  of its own, so an enabled provider with no allowed domain means any Google
-  account can sign in and self-provision, and nothing said so at boot. Found
-  during RBAC review of the `config/loader.py` required-fields demotion above:
-  that loader check used to be an accidental loud signal for exactly this gap
-  (a missing `auth.allowed_domain` discarded the whole static config with an
-  ERROR log) and is now a passive warning, so the gap needed its own explicit
-  check.
-
-### Changed
-
-- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
-  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
-  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
-  `instance.theme` / `instance.experience` / `instance.home_route` /
-  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
-  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
-  UI (`/admin/server-config`) owns them from day 2 onward instead of having
-  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
-  value and permanently shadow the operator's own change. **Existing VMs**:
-  on their next boot the old always-wins `.env` lines disappear; the value
-  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
-  relied on Terraform re-asserting one of these four knobs every boot must
-  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
-  by hand). No app-side precedence change — a hand-set env var still wins
-  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
-  is unaffected (it pins deployment-provisioned backing, not a presentation
-  choice, so it is out of scope). See the new "Config ownership map" in
-  `docs/CONFIGURATION.md`.
-
-### Removed
-
-- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
-  `jira:` section is gone from both the `/admin/server-config` UI (it never
-  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
-  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
-  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
-  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
-  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
-  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
-  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
-  (zero readers — found during a sweep for other dead keys in the same
-  section). `deployment.role` is unaffected.
-
-### Fixed
-
-- **`config/loader.py` no longer raises on a static `instance.yaml` missing
-  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
-  `auth.webapp_secret_key`.** The check never actually gated anything: a
-  provisioned VM ships no static `instance.yaml` at all (the loader raises
-  `FileNotFoundError` first), and `app.instance_config` already caught the
-  `ValueError` and served built-in defaults regardless. It now logs a
-  warning naming the missing field(s) instead of raising, so a direct caller
-  of `config.loader.load_instance_config()` (e.g. a connector script) no
-  longer gets an exception on an otherwise-bootable config.
-
-## [0.89.0] - 2026-08-26
-
-### Added
-
-- **Hosted data-app containers are blocked from the cloud metadata server at
-  the host firewall.** A data app runs user-authored code (RCE inside its own
-  container is by design), and on the `agnes-apps` bridge it could otherwise
-  reach the instance metadata server (`169.254.169.254`), read the VM's
-  service-account token, and pivot to the whole cloud project. The
-  `customer-instance` Terraform module now installs an idempotent `DOCKER-USER`
-  iptables DROP at boot (`container-metadata-hardening` block in
-  `startup-script.sh.tpl`), source-scoped to the `agnes-apps` subnet so the
-  Agnes app container's own metadata use (e.g. BigQuery GCE-metadata auth) is
-  untouched — the `app` service now pins `default` as its highest-priority
-  network (`docker-compose.yml`), so its egress routes off `agnes-apps` and its
-  source IP never matches the rule. Non-Terraform hosts should install the
-  equivalent rule (see `docs/architecture.md#hosted-data-apps`) and
-  least-privilege the VM service account regardless. Fail-soft: a missing
-  `iptables` or an unresolvable subnet warns and never blocks the boot.
-
-### Changed
-
-- **BREAKING: hosted data apps are no longer served on the main Agnes origin by
-  default.** A hosted app's user-authored JS, served same-origin with the Agnes
-  `/api` (the `/apps/<slug>/…` path-prefix form), can call `/api` with the
-  viewer's own session and read the response (mint a PAT, read admin config) —
-  no response header can close a same-origin read. The ingress proxy now
-  refuses to serve an app on the main origin unless the operator either
-  configures `data_apps.subdomain_base` (serve apps from an isolated origin,
-  where the existing CORS + CSRF-origin defenses contain the attack) or
-  explicitly opts into same-origin serving with the new
-  `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (default
-  `false`). Requests that arrive on a data-app subdomain are always served, and
-  the in-chat preview keeps working without the flag — it is served same-origin
-  only to a caller holding a per-app `data-app-preview:<slug>` token, so
-  enabling the preview does not re-open drive-by same-origin serving for other
-  apps. A deployment that serves apps publicly in path-prefix mode (no
-  `subdomain_base`) must set `allow_same_origin: true` (trusted authors only) or
-  move to subdomain mode; a startup log flags an enabled-but-unservable posture.
 
 ### Removed
 
@@ -228,9 +188,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   E2B backing (`kai_agent_e2b_key_secret`) is unaffected. The E2E chat suites
   now run on the docker provider (`AGNES_E2E_DOCKER=1` replaces
   `AGNES_E2E_E2B`; `e2e-docker.yml` replaces `e2e-e2b.yml`).
-
 ### Fixed
-
 - **A corrupt parquet part is no longer distributed, and no longer overwrites
   an analyst's good local copy.** `_hash_table_parts` / `_update_sync_state`
   (`src/orchestrator.py`) now check each part's leading + trailing `PAR1`
