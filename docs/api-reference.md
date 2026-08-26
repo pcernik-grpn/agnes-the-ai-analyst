@@ -1225,10 +1225,14 @@ reject alike. A session hitting the chat manager's concurrency cap is
 counted and skipped, never a 500 — and its stamp is cleared again on the
 way out, since the cap is enforced before the session starts, so no
 suggestion would ever exist to clear it and the table would otherwise be
-excluded from every future sweep permanently.
+excluded from every future sweep permanently. Any OTHER failure from a
+table's session is handled the same way and for the same reason (counted
+in `errored`): the table is un-stamped, logged, and the sweep continues to
+the next table rather than letting one transient error 500 the whole tick
+and abandon the rest of the batch.
 
 Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
-"remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
+"errored", "remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
 same class as the `/api/admin/run-*` jobs below.
 
 Postgres app-state only (A3 PG-first ratchet — the dedup column is a

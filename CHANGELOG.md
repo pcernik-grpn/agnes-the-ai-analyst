@@ -106,6 +106,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **A failed auto-draft session no longer disables its table forever.** The
+  semantic auto-draft sweep stamps each table's `semantic_draft_pending_at`
+  before invoking its session, and only a concurrency-cap hit un-stamped it
+  again. Any other failure — a broker/LLM error, a session-spawn failure —
+  left the flag set with no `authoring_suggestions` row that could ever
+  clear it, so `tables_without_semantic_coverage` dropped that table from
+  every later tick and it was never drafted again, silently; the same
+  exception also 500'd the whole request, abandoning the rest of the batch.
+  Any session failure now clears the flag, is logged, is counted in a new
+  `errored` field on the response, and the sweep continues to the next
+  table. Un-stamping a session that may have survived can at worst cost a
+  duplicate draft (one extra queued suggestion an admin rejects) — bounded
+  and visible, unlike permanent silent exclusion (Devin review).
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.
