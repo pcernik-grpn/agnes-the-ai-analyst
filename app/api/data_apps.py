@@ -68,7 +68,7 @@ from app.auth.access import can_access, is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user, reject_keboola_header_credential
 from app.auth.jwt import create_access_token
 from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX
-from app.instance_config import coerce_flag_value, feature_enabled, get_data_apps_config, get_public_url
+from app.instance_config import feature_enabled, get_data_apps_config, get_public_url
 from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
 from src.data_apps.git_repos import fast_forward_live, init_app_repo
@@ -347,11 +347,16 @@ def same_origin_serving_allowed() -> bool:
     request that did NOT arrive on a data-app subdomain may be served
     (`app/api/data_apps_proxy.py`). A request that arrived on a subdomain is
     already on an isolated origin and is served regardless of this flag.
+
+    Resolved through the switch registry (`app/switches.py::SWITCHES`,
+    entry ``data_apps_allow_same_origin``) rather than a hand-rolled
+    env/config pair — the CONTRIBUTING.md sync-map's "new user-visible
+    switch" rule, and what puts the flag in the `/admin/server-config`
+    inventory with its lock reason.
     """
-    raw = os.environ.get("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN")
-    if raw is not None:
-        return coerce_flag_value(raw, default=False)
-    return bool(_effective_config().get("allow_same_origin", False))
+    from app.switches import switch_value
+
+    return bool(switch_value("data_apps_allow_same_origin"))
 
 
 def same_origin_serving_warning() -> Optional[str]:

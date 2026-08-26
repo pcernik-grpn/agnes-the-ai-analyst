@@ -213,6 +213,34 @@ SWITCHES: tuple[Switch, ...] = (
         description="Hosted user web apps (data apps). New feature — off by default.",
     ),
     Switch(
+        name="data_apps_allow_same_origin",
+        config_keys=("data_apps", "allow_same_origin"),
+        env_var="AGNES_DATA_APPS_ALLOW_SAME_ORIGIN",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="operations",
+        editable=False,
+        lock_reason=(
+            "Deliberate security lock: serving hosted apps on the main origin hands every "
+            "app's user-authored JS the viewer's own session (a same-origin read of /api "
+            "that no response header can close). Accepting that is a deployment decision — "
+            "set it in instance.yaml or AGNES_DATA_APPS_ALLOW_SAME_ORIGIN, next to the "
+            "subdomain_base alternative that avoids it — not a live panel toggle. Its "
+            "section is locked regardless (see data_apps)."
+        ),
+        description=(
+            "Serve hosted data apps on the MAIN origin (same origin as the Agnes /api) for "
+            "ALL apps and callers. Off by default: a hosted app's JS then shares the "
+            "viewer's session and can read /api, so the supported isolation is "
+            "data_apps.subdomain_base (per-app origins); requests arriving on a data-app "
+            "subdomain are always served, and the in-chat preview works without this flag "
+            "via its per-app data-app-preview:<slug> token. Turn on only when every app "
+            "author is trusted with every viewer's session — see "
+            "docs/architecture.md#hosted-data-apps."
+        ),
+    ),
+    Switch(
         name="library_show_unverified_trust",
         config_keys=("library", "show_unverified_trust"),
         env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",

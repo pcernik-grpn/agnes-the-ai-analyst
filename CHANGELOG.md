@@ -10,6 +10,42 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **The in-chat data-app preview works again for logged-in users in the
+  default posture.** The 0.89.0 same-origin gate resolved the caller
+  session-first: a preview iframe carries the viewer's `access_token` session
+  cookie ALONGSIDE its per-app `data-app-preview:<slug>` cookie (browsers
+  attach both), so it authenticated as a plain session and was refused (403)
+  unless the instance-global `data_apps.allow_same_origin` escape hatch was
+  on — breaking the exact flow the preview token exists for. The ingress
+  proxy now tries the preview credential first, trusting it only when its
+  verified scope pins THIS slug; an expired/revoked/wrong-slug preview token
+  grants nothing and falls back to normal session resolution, and the
+  control-plane API still rejects the preview scope. The WebSocket bridge
+  gained the same preview path (it had none), so a WS-based app
+  (Streamlit/Dash) can connect from the in-chat preview too.
+
+### Changed
+
+- The `app` service's compose gateway pin now sets `networks.default.gw_priority`
+  alongside `priority`: on Docker Engine ≥ 28 only `gw_priority` selects a
+  container's gateway network (`priority` deliberately does not), so the pin
+  that keeps the app's egress — including GCP-metadata traffic for BigQuery
+  auth — off the `agnes-apps` bridge and out of the metadata DROP rule's
+  source subnet was not guaranteed there. Sets the minimum Compose CLI at
+  v2.33.1 (older Compose rejects the key at validation; pre-28 engines still
+  honor `priority` via connection order).
+
+### Internal
+
+- `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` now
+  resolves through the switch registry (`app/switches.py`, entry
+  `data_apps_allow_same_origin`) instead of a hand-rolled env/config pair —
+  same resolution order, parsing and default, and the flag now appears
+  (locked, with its reason) in the `/admin/server-config` feature-flag
+  inventory and `docs/feature-flags.md`.
+
 ## [0.89.0] - 2026-08-26
 
 ### Added
