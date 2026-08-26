@@ -571,7 +571,7 @@
        everything bound to it keeps working. */
     var head = document.createElement('div');
     head.innerHTML = BuilderShell.head({
-      backLabel: 'Library',
+      backLabel: (st && st.backLabel) || 'Library',
       title: 'New data package',
       titleId: 'pdw-shell-title',
       actionsId: 'pdw-shell-actions',
@@ -685,6 +685,12 @@
     st = {
       mode: mode,
       builder: !!opts.builder,
+      //: A page container to render into instead of the overlay.
+      mount: opts.mount || null,
+      // The label and the destination are one promise; taking them together
+      // stops the header saying "Library" while the button goes elsewhere.
+      backHref: opts.backHref || '/library',
+      backLabel: opts.backLabel || 'Library',
       pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
@@ -730,9 +736,29 @@
     els.submit.disabled = false;
     applyMode(mode);
 
-    els.root.hidden = false;
-    els.root.classList.add('is-open');
-    document.body.style.overflow = 'hidden';
+    /* PAGE MODE. Given a `mount`, this stops being an overlay: the panel is
+       moved into the page's own container, the backdrop and the modal role go
+       away, and the body keeps its scrolling. Everything else — the fields,
+       the pickers, the requests — is identical, which is the point of doing
+       it this way rather than writing a second package form. */
+    if (st.mount) {
+      els.root.classList.add('is-page');
+      els.root.hidden = false;
+      var panel = els.root.querySelector('.ds-drawer__panel');
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-modal');
+      /* Move the ROOT, not just the panel. Every rule that dresses this thing
+         is scoped from the root (`.ds-drawer--builder .ds-drawer__head`, and
+         so on); relocating the panel alone leaves those selectors matching
+         nothing, and the drawer arrives on the page wearing its overlay
+         chrome and none of its builder chrome. */
+      if (els.root.parentNode !== st.mount) st.mount.appendChild(els.root);
+      document.body.classList.add('ag-building');
+    } else {
+      els.root.hidden = false;
+      els.root.classList.add('is-open');
+      document.body.style.overflow = 'hidden';
+    }
     els.body.scrollTop = 0;
     els.tablesSearch.value = '';
     els.tables.innerHTML = '<p class="ds-drawer__hint">Loading…</p>';
@@ -785,7 +811,12 @@
       /* The shell's back button is this drawer's close. Nothing is lost by
          leaving — the package does not exist until Create, and there is no
          draft store here to preserve — so it does not confirm. */
-      if (e.target.closest('[data-ag-back]')) { close(); return; }
+      if (e.target.closest('[data-ag-back]')) {
+        // On a page there is nothing to close — leaving means navigating.
+        if (st && st.backHref) window.location.href = st.backHref;
+        else close();
+        return;
+      }
       var t = e.target.closest('[data-ag-send],[data-ag-chip]');
       if (!t) return;
       if (t.hasAttribute('data-ag-chip')) { sendTurn(t.getAttribute('data-ag-chip')); return; }
@@ -807,6 +838,7 @@
 
   function close() {
     if (!els) return;
+    if (st && st.mount) return;   // a page is left by navigating, not closed
     els.root.classList.remove('is-open');
     els.root.hidden = true;
     document.body.style.overflow = '';

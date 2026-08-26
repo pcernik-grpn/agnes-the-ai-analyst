@@ -44,7 +44,11 @@
 /* Full-bleed breakout for the builder. Scoped to the body class so the list
    view — which IS a document — keeps the shared index column untouched. */
 body.ag-building .idx-band-inner { max-width: none; padding: 0; }
-body.ag-building .idx-head { padding-bottom: 0; }
+/* Zero, not just the bottom. /agents HIDES this band outright while building,
+   so only its bottom padding ever showed. A builder page whose `page_head`
+   block is empty still RENDERS the band, and its 32px top padding pushed the
+   whole workspace down by exactly that much. */
+body.ag-building .idx-head { padding: 0; }
 /* The head is the only thing still wanting a gutter once the band loses its
    padding; the work area below deliberately has none. */
 body.ag-building .ag-build-head { margin: 0; padding: 14px 28px; }
@@ -331,3 +335,21 @@ body.ag-building #sk-builder-view { display: flex; flex-direction: column; min-h
    own header is compact-only. Both exist in the DOM once the drawer has been
    opened as a builder; the class decides which one is showing. */
 .ds-drawer:not(.ds-drawer--builder) .ag-build-head { display: none; }
+
+/* ── The package builder as a PAGE ──
+   Same component, no overlay. `is-page` undoes the drawer's fixed-position
+   scaffolding so the panel is just content in the page's own column, and the
+   `body.ag-building` rules above then treat it exactly like the other two
+   builders: full-bleed, pinned to the viewport, two panes filling what the
+   header leaves. */
+.ds-drawer.is-page {
+  position: static; inset: auto; background: none;
+  display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
+}
+.ds-drawer.is-page .ds-drawer__backdrop { display: none; }
+.ds-drawer.is-page .ds-drawer__panel {
+  position: static; width: auto; max-width: none; box-shadow: none;
+  border-left: none; transform: none; display: flex; flex-direction: column;
+  min-height: 0; flex: 1 1 auto; background: none;
+}
+body.ag-building #pkg-builder-view { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }

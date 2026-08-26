@@ -15,6 +15,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ROOT / "app" / "web" / "templates" / "skills.html"
 DRAWER = ROOT / "app" / "web" / "static" / "js" / "components" / "package_drawer.js"
+PAGE = ROOT / "app" / "web" / "templates" / "admin_package_builder.html"
+LIBRARY = ROOT / "app" / "web" / "templates" / "library.html"
 CSS = ROOT / "app" / "web" / "static" / "css" / "builder.css"
 
 
@@ -86,7 +88,9 @@ class TestTheDrawerWearsOneHeaderAtATime:
         in a footer under a scrolling form reads as a dialog, and the action
         leaves the screen as soon as the form is long enough to scroll."""
         assert "BuilderShell.head({" in drawer
-        assert "backLabel: 'Library'" in drawer
+        # The label is configurable now (the page and the drawer can name
+        # different destinations), but it still defaults to Library.
+        assert "backLabel: (st && st.backLabel) || 'Library'" in drawer
 
     def test_the_commit_button_is_moved_on_every_open_not_once(self, drawer):
         """One node, one DOM, two sizes. Placed once at build, the button
@@ -107,7 +111,71 @@ class TestTheDrawerWearsOneHeaderAtATime:
     def test_back_closes_without_pretending_there_is_something_to_lose(self, drawer):
         """The package does not exist until Create and there is no draft store
         here, so leaving costs nothing — a confirmation would be theatre."""
-        line = re.search(r".*\[data-ag-back\].*", drawer)
-        assert line, "the shell's back button is not handled — it would do nothing"
-        assert "close()" in line.group(0)
+        block = re.search(r"\[data-ag-back\]'\)\) \{(.*?)\n      \}", drawer, re.S)
+        assert block, "the shell's back button is not handled — it would do nothing"
+        body = block.group(1)
+        # As a page it navigates; as an overlay it closes. Neither confirms.
+        assert "st.backHref" in body and "close()" in body
         assert "confirmModal" not in drawer
+
+
+class TestThePackageBuilderIsAPage:
+    """A grown drawer is still an overlay. Authoring a package is not a detour
+    from another page — it is the thing you came to do — so it looks like the
+    other two places you come to do the thing: rail, shell header, two panes.
+
+    The drawer itself is unchanged and stays where it belongs: /admin/tables,
+    opened mid-sentence while assigning a table to a package that does not
+    exist yet. One component, two mountings, no second package form.
+    """
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return PAGE.read_text(encoding="utf-8")
+
+    def test_the_page_reuses_the_drawer_component(self, page):
+        """Not a second implementation of a package's fields and grants."""
+        assert "package_drawer.js" in page
+        assert "AgnesPackageDrawer.open(" in page
+        assert "mount:" in page
+
+    def test_the_page_loads_the_shared_shell(self, page):
+        assert "builder_shell.js" in page and "css/builder.css" in page
+
+    def test_the_page_head_is_empty_so_the_shell_header_is_the_only_title(self, page):
+        block = re.search(r"\{% block page_head %\}(.*?)\{% endblock %\}", page, re.S)
+        assert block, "page_head block missing"
+        assert "<h1" not in block.group(1) and "<h2" not in block.group(1)
+
+    def test_mounting_moves_the_root_not_just_the_panel(self, drawer):
+        """Every rule that dresses this thing is scoped from the root
+        (`.ds-drawer--builder .ds-drawer__head`). Relocating the panel alone
+        left those selectors matching nothing, and the drawer arrived on the
+        page wearing its overlay chrome and none of its builder chrome."""
+        assert "st.mount.appendChild(els.root)" in drawer
+
+    def test_a_page_cannot_be_closed_like_an_overlay(self, drawer):
+        """There is no backdrop and no Escape to dismiss — leaving is a
+        navigation, and close() would leave a blank page behind."""
+        block = re.search(r"function close\(\) \{(.*?)\n  \}", drawer, re.S)
+        assert block and "st.mount" in block.group(1)
+
+    def test_the_back_label_and_destination_are_taken_together(self, drawer):
+        """They are one promise. Split, the header says Library while the
+        button goes somewhere else."""
+        assert "backLabel: opts.backLabel" in drawer and "backHref: opts.backHref" in drawer
+
+    def test_the_library_navigates_rather_than_opening_a_drawer(self):
+        lib = LIBRARY.read_text(encoding="utf-8")
+        block = re.search(r"data-new-package\][^;]*?\{(.*?)\}\)\);", lib, re.S)
+        assert block, "the + New package handler moved"
+        body = block.group(1)
+        assert "/admin/data-packages/new" in body
+        # A navigation gated on a script being loaded silently does nothing.
+        assert "AgnesPackageDrawer)" not in body
+
+    def test_the_head_band_is_fully_collapsed_while_building(self, css):
+        """/agents hides the band outright, so only its bottom padding ever
+        showed. A builder PAGE renders it empty, and its 32px top padding
+        pushed the whole workspace down by exactly that much."""
+        assert re.search(r"body\.ag-building \.idx-head \{ padding: 0; \}", css)

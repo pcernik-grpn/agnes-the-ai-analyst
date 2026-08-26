@@ -6107,6 +6107,31 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
+@router.get("/admin/data-packages/new", response_class=HTMLResponse)
+async def admin_package_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Author a data package, in the same builder shell /agents and /skills use.
+
+    A PAGE, not the drawer. The drawer is right where it is used — mid-sentence
+    on /admin/tables, assigning a table to a package that does not exist yet —
+    because it opens over the lens you are standing on and gives it back. A
+    workspace is the opposite: it is where you have gone to do the thing, and
+    it should look like the other two places you go to do the thing.
+
+    The FORM is still the drawer component's; this route only gives it a page
+    to render into (`mount`), so there is one implementation of a package's
+    fields and grants rather than two that drift.
+    """
+    # _build_context, not a bare dict — it is what supplies the rail, the
+    # theme and the rest of the app chrome. Without it the page renders as a
+    # builder floating on nothing.
+    return templates.TemplateResponse(
+        request, "admin_package_builder.html", _build_context(request, user=user)
+    )
+
+
 @router.get("/admin/data-packages", response_class=HTMLResponse)
 async def admin_data_packages(
     request: Request,
@@ -8957,6 +8982,71 @@ async def chat_page(
         logger.exception("chat empty state: capability count failed")
         capability_count = 0
 
+    # Admin first landing — ONE line, not a checklist.
+    #
+    # A six-step setup panel lived here and was removed as misleading: it read
+    # as onboarding (hero slot, "0 of 6 done"), it only existed before the first
+    # message, and being gated on "chain incomplete" it vanished for good at 6
+    # of 6 — the moment an admin might still want another source. Setup is
+    # recurring work and its home is /admin, where the chain is one collapsible
+    # card among many.
+    #
+    # What is left is the single claim that is a FACT about the instance rather
+    # than a milestone in a sequence: with nothing registered, nobody can ask
+    # about the company at all. So the gate is "no tables registered", not
+    # "chain unfinished" — true whenever it is true, and silent as soon as
+    # there is data, without ever implying the work is finished.
+    #
+    # Still read off resolve_journey() rather than a new query, so the notice
+    # and the /admin chain cannot disagree about what "registered" means; the
+    # `tables` step already carries exactly that boolean, and the first
+    # unfinished step supplies the action to offer. Best-effort: the journey
+    # does six areas' worth of repo reads and none is worth taking chat down
+    # for.
+    #
+    # `?preview=member` is a LOCAL-DEV-ONLY switch for looking at the other
+    # audience's landing page without a second account: it suppresses the panel
+    # so an admin sees exactly what a member sees. Gated on
+    # ``is_local_dev_mode()`` — under LOCAL_DEV_MODE the whole auth layer is
+    # already bypassed, so this adds no reachable surface to a real deployment,
+    # and on any instance without it the parameter is inert rather than
+    # half-honoured. It changes only which hero renders: no authority, no grant
+    # and no other page behaviour is faked, so it must not be read as a
+    # role-switcher (`_dev_preview` is passed to the template purely so the
+    # toggle can render and say which view you are looking at).
+    from app.auth.dependencies import is_local_dev_mode
+
+    # `empty` is the third value: it forces the "nothing registered" notice on
+    # so the state can be reviewed without registering or deleting real tables
+    # to reach it. It fakes only the RENDER — no repo read is bypassed, nothing
+    # is written, and the instance keeps whatever data it has.
+    _dev_preview = request.query_params.get("preview") if is_local_dev_mode() else None
+    if _dev_preview not in ("member", "admin", "empty"):
+        _dev_preview = None
+
+    admin_notice = None
+    if _dev_preview != "member" and is_user_admin(user["id"], conn):
+        try:
+            from app.services.admin_dashboard import resolve_journey
+
+            _setup = resolve_journey().get("setup") or {}
+            _steps = _setup.get("steps") or []
+            _tables = next((s for s in _steps if s.get("key") == "tables"), None)
+            # A step whose repo read RAISED reports `failed`, and is neither
+            # done nor a safe thing to assert about — staying silent is the
+            # honest reading of "we could not check", not "there is no data".
+            _nothing_registered = bool(_tables) and not _tables.get("done") and not _tables.get("failed")
+            if _nothing_registered or _dev_preview == "empty":
+                _next = next((s for s in _steps if not s.get("done") and not s.get("failed")), None)
+                if _next:
+                    admin_notice = {"cta": _next["cta"], "href": _next["href"]}
+                elif _dev_preview == "empty":
+                    # Forced preview on an instance that is fully set up: there
+                    # is no real "next step" to borrow, so name the first one.
+                    admin_notice = {"cta": "Connect a source", "href": "/admin/data-sources?add=1"}
+        except Exception:
+            logger.exception("chat empty state: admin setup notice failed")
+
     ctx = _build_context(
         request,
         user=user,
@@ -8965,6 +9055,12 @@ async def chat_page(
         greeting=_time_of_day_greeting(),
         knowledge_source_count=knowledge_source_count,
         capability_count=capability_count,
+        admin_notice=admin_notice,
+        dev_preview=_dev_preview,
+        # The toggle renders only where the switch is honoured, and only for
+        # someone who has an admin view to switch away from — a member seeing
+        # "Admin | Member" would be offered a view they can never get.
+        dev_preview_available=is_local_dev_mode() and is_user_admin(user["id"], conn),
     )
     ctx["chat_capabilities"] = _chat_capability_snapshot(conn, user)
     # Deep link: /chat?session=<id>. We DO NOT validate the id here (no

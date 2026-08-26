@@ -2747,6 +2747,10 @@ KNOWN_UNTESTED = {
     "PUT /api/sharing/{resource_type}/{resource_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
+    # Data-package builder page — the same HTML surface, hosting the drawer
+    # component in page mode. No PG-specific behaviour of its own; the
+    # package writes it performs are the /api/admin/data-packages routes.
+    "GET /admin/data-packages/new",
     # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.

@@ -530,9 +530,6 @@
 {% block container_modifier %}container--wide{% endblock %}
 
 {% block head_extra %}
-{# The builder workspace's rules — package_drawer grows into it when
-   opened from "+ New". Without the sheet the two panes stack. #}
-<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
@@ -2312,10 +2309,6 @@
    a reader who cannot create one never downloads the form. #}
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
-{# package_drawer builds the shared builder workspace when opened
-   from "+ New", so the shell has to be defined before it runs. #}
-<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
-<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 {% endif %}
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script src="{{ static_url('js/filter_toolbar.js') }}"></script>
@@ -4269,14 +4262,13 @@
   function uploadShowErr(msg) { uploadErr.textContent = msg; uploadErr.hidden = false; }
   document.querySelectorAll('[data-new-upload]').forEach(b => b.addEventListener('click', openUpload));
 
-  // "New data package" (admin) — the same shared drawer /admin/data-packages
-  // and /admin/tables open. Reload on create so the new package appears in the
-  // Data packages band it was just added to.
+  // "New data package" (admin) — a PAGE, like every other "+ New" in this
+  // menu. The drawer stays where it belongs: on /admin/tables, opened
+  // mid-sentence while assigning a table to a package that does not exist yet.
+  // No `AgnesPackageDrawer` guard here any more — this is a link, and gating a
+  // navigation on a script being present is how it silently does nothing.
   document.querySelectorAll('[data-new-package]').forEach(b => b.addEventListener('click', () => {
-    if (!window.AgnesPackageDrawer) return;
-    // From "+ New" this is authoring, so it opens as the builder. The chip-input
-    // caller on /admin/tables omits the flag and gets the compact drawer.
-    window.AgnesPackageDrawer.open({ builder: true, onCreated: () => window.location.reload() });
+    window.location.href = '/admin/data-packages/new';
   }));
   document.querySelectorAll('[data-close-upload]').forEach(b => b.addEventListener('click', closeUpload));
   document.addEventListener('keydown', e => {
