@@ -100,6 +100,8 @@ TITLE_OVERRIDES: dict[str, str] = {
     "semantic_model_coverage": "Get Cross-Domain Coverage",
     "semantic_model_coverage_tag": "Add Resource Source Tag",
     "semantic_model_coverage_untag": "Remove Resource Source Tag",
+    "flag_semantic_issue": "Open Semantic Layer Issue Report",
+    "semantic_feedback_resolve": "Close Semantic Layer Issue Report",
     "apply_semantic_model": "Apply Semantic Model Document",
     "data_app_git_credential": "Get Data App Git Credential",
     "agnes_data_app_credentials": "Get Data App Credentials",

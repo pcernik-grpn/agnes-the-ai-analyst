@@ -42,6 +42,17 @@ _COVERAGE_DOMAINS = ("semantic", "metrics", "glossary", "skill", "agent", "knowl
 _COVERAGE_TAGGABLE = ("marketplace_plugin", "agent", "memory_domain")
 _STATUS_GLYPHS = {"ok": "ok", "partial": "partial", "missing": "MISSING", "not_applicable": "n/a"}
 
+# Feedback (F4.5) — "that answer looked wrong". `submit` is open to any
+# signed-in caller; `list`/`resolve` are the admin side of the same queue.
+# All three ship together on purpose: a report must be fileable from every
+# surface (UI, chat, MCP, CLI), not only the ones an admin uses.
+feedback_app = typer.Typer(help="Report a wrong/unsupported answer, and work the report queue")
+semantic_model_app.add_typer(feedback_app, name="feedback")
+
+_FEEDBACK_SUBMIT_PATH = "/api/semantic-feedback"
+_FEEDBACK_ADMIN_PATH = "/api/admin/semantic-feedback"
+_FEEDBACK_STATUSES = ("open", "acknowledged", "resolved")
+
 
 @semantic_model_app.command("apply")
 def apply(
@@ -450,3 +461,163 @@ def coverage_untag(
     if resp.status_code not in (200, 204):
         _fail(resp)
     typer.echo(f"Untagged: {tag_id}")
+
+
+# ---------------------------------------------------------------------------
+# Feedback (F4.5) — `agnes semantic-model feedback …`
+# ---------------------------------------------------------------------------
+
+
+def _fail_needs_postgres(resp, what: str) -> None:
+    """Turn the PG-only 501 into the one sentence that names the fix.
+
+    Feedback lives in a Postgres-only table (A3 PG-first ratchet), so an
+    instance still on the frozen DuckDB app-state backend cannot store a
+    report at all. Printing the raw 501 body would leave the reader guessing
+    that their question was malformed.
+    """
+    if resp.status_code != 501:
+        return
+    typer.echo(
+        f"{what} needs the Postgres app-state backend — this instance still runs the frozen "
+        "DuckDB backend. Migrate it (see docs/migrations.md) to use the feedback queue.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+@feedback_app.command("submit")
+def feedback_submit(
+    question: str = typer.Argument(..., help="The question whose answer looked wrong, as it was asked"),
+    sql: Optional[str] = typer.Option(None, "--sql", help="The SQL that produced the suspect answer, if there was one"),
+    metric: Optional[str] = typer.Option(None, "--metric", help="Metric id the answer relied on (e.g. revenue/mrr)"),
+    comment: Optional[str] = typer.Option(None, "--comment", help="What looks wrong about it"),
+    model_hash: Optional[str] = typer.Option(
+        None,
+        "--model-hash",
+        help="content_hash of the semantic model that produced the answer — pins the report to a document "
+        "version, so a later rewrite does not make it look like a complaint about the current text. For "
+        "scripted callers that know it (`agnes admin semantic-model show <slug> --json` reports it).",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Report that an answer looked wrong or unsupported (anyone signed in).
+
+    Not an admin command: the person who ran the analysis is the one who sees
+    the bad number. Only the question is required — a concept nobody ever
+    defined has no SQL and no metric to name, and that is exactly the case
+    most worth reporting.
+
+    Mirrors `POST /api/semantic-feedback` and the MCP `flag_semantic_issue`
+    tool.
+    """
+    payload = {
+        "question": question,
+        "sql": sql,
+        "metric_id": metric,
+        "comment": comment,
+        "model_content_hash": model_hash,
+    }
+    resp = api_post(_FEEDBACK_SUBMIT_PATH, json={k: v for k, v in payload.items() if v is not None})
+    _fail_needs_postgres(resp, "Filing feedback")
+    if resp.status_code not in (200, 201):
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    typer.echo(f"Filed: {body.get('id')} ({body.get('status', 'open')})")
+    typer.echo("  An admin sees it at /admin/semantic-layer?tab=feedback")
+
+
+@feedback_app.command("list")
+def feedback_list(
+    status: Optional[str] = typer.Option(
+        None, "--status", help=f"Only this status ({', '.join(_FEEDBACK_STATUSES)}); omit for all"
+    ),
+    limit: int = typer.Option(0, "--limit", min=0, help="Cap rows shown (0 = no cap)"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """The report queue, newest first (admin only).
+
+    Mirrors `GET /api/admin/semantic-feedback` and the MCP
+    `semantic_feedback_list` tool.
+    """
+    if status is not None and status not in _FEEDBACK_STATUSES:
+        typer.echo(f"Unknown status {status!r} — expected one of {', '.join(_FEEDBACK_STATUSES)}", err=True)
+        raise typer.Exit(1)
+
+    resp = api_get(_FEEDBACK_ADMIN_PATH, params={"status": status} if status else None)
+    _fail_needs_postgres(resp, "The feedback queue")
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    items = body.get("items") or []
+    total = len(items)
+    truncated = limit and limit > 0 and total > limit
+    if truncated:
+        items = items[:limit]
+
+    if as_json:
+        # The JSON surface discloses the cap too — a machine caller must not
+        # read a sliced list as "these are all of them" (command-UX standard).
+        out = {"items": items, "count": len(items)}
+        if truncated:
+            out["truncated"] = {"limit": limit, "total": total}
+        typer.echo(json.dumps(out, indent=2, default=str))
+        return
+
+    if not items:
+        scope = f" with status {status}" if status else ""
+        typer.echo(f"No feedback reports{scope}.")
+        typer.echo('  File one: agnes semantic-model feedback submit "<question>"')
+        return
+
+    for item in items:
+        typer.echo(
+            f"{item.get('id')}  {(item.get('status') or '?'):<12} "
+            f"{(item.get('created_by') or 'unknown'):<28} {item.get('question')}"
+        )
+        if item.get("metric_id"):
+            typer.echo(f"    metric: {item['metric_id']}")
+        if item.get("comment"):
+            typer.echo(f"    comment: {item['comment']}")
+        if item.get("sql"):
+            typer.echo(f"    sql: {item['sql']}")
+        if item.get("resolution_note"):
+            typer.echo(f"    resolved by {item.get('resolved_by')}: {item['resolution_note']}")
+    if truncated:
+        typer.echo(f"… {total - len(items)} more — raise --limit or narrow with --status")
+
+
+@feedback_app.command("resolve")
+def feedback_resolve(
+    feedback_id: str = typer.Argument(..., help="Report id from `agnes semantic-model feedback list`"),
+    note: Optional[str] = typer.Option(None, "--note", help="What was done about it — recorded on the report"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Close one report, on the record (admin only).
+
+    Mirrors `POST /api/admin/semantic-feedback/{id}/resolve` and the MCP
+    `semantic_feedback_resolve` tool.
+    """
+    resp = api_post(f"{_FEEDBACK_ADMIN_PATH}/{feedback_id}/resolve", json={"resolution_note": note})
+    _fail_needs_postgres(resp, "Resolving feedback")
+    if resp.status_code == 404:
+        typer.echo(f"No semantic feedback {feedback_id!r}.", err=True)
+        typer.echo("  Find the id: agnes semantic-model feedback list", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 409:
+        typer.echo(f"Already resolved: {feedback_id}", err=True)
+        typer.echo("  See who closed it: agnes semantic-model feedback list --status resolved", err=True)
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    typer.echo(f"Resolved: {feedback_id} by {body.get('resolved_by')}")

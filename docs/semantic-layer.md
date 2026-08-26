@@ -268,6 +268,36 @@ Three things about it are deliberate:
   feature"), so on the frozen DuckDB app-state backend these routes answer
   `501 requires_postgres_backend`.
 
+## Feedback: "that answer looked wrong"
+
+Coverage says what is undocumented and health says what is broken. Neither can
+see the third failure: the layer looked complete and the **answer** was still
+wrong — a number nothing supports, a metric that means something other than its
+name, a concept nobody defined. Only whoever read the answer knows that, so the
+report channel is open to **any signed-in caller** (`POST
+/api/semantic-feedback`), while the queue behind it is admin-only
+(`/admin/semantic-layer` → **Feedback**).
+
+Four surfaces file the same report, on purpose:
+
+- **UI** — the Feedback tab lists the queue and resolves with a note.
+- **Chat / agent** — the MCP tool `flag_semantic_issue`, whose contract is to
+  *offer* filing when it cannot support its own answer and file only once the
+  user agrees: reporting silently on someone's behalf and waiting for the user
+  to remember are both wrong. (The matching workspace-prompt sentence ships
+  with the agent-grounding rules.)
+- **CLI** — `agnes semantic-model feedback submit/list/resolve`.
+- **REST** — the endpoints above; the only surface that also accepts
+  `model_content_hash`, which pins the report to the document version that
+  produced the answer.
+
+Resolving is a guarded transition: the second admin to close the same report
+gets `409`, so the record of who fixed it and how is never overwritten.
+`semantic_feedback` is **Postgres-only** (see `docs/migrations.md` → "Adding a
+PG-only feature") — on the frozen DuckDB app-state backend every one of these
+surfaces answers `501 requires_postgres_backend` rather than pretending the
+report was filed.
+
 ## Commands
 
 ```bash
@@ -284,6 +314,10 @@ agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
 agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
 agnes semantic-model coverage tag <type> <resource-id> <source-id>
 agnes semantic-model coverage untag <tag-id>
+
+agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
+agnes semantic-model feedback list [--status open] [--json]   # admin
+agnes semantic-model feedback resolve <id> [--note "..."]     # admin
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a

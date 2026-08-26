@@ -312,6 +312,22 @@ class TestToolRegistration:
             # Triple-surface with GET /api/admin/semantic-layer/coverage +
             # `agnes admin semantic-layer coverage`.
             "admin_semantic_layer_coverage",
+            # What each connected source still lacks across all six domains
+            # (F4.1), and the tags the report cannot derive. Triple-surface
+            # with /api/admin/semantic-model/coverage* + `agnes semantic-model
+            # coverage[ tag| untag]`.
+            "semantic_model_coverage",
+            "semantic_model_coverage_tag",
+            "semantic_model_coverage_untag",
+            # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the
+            # one write here an ordinary caller may make — an agent that cannot
+            # ground its answer is the intended reporter; the other two are the
+            # admin side of the same queue. Triple-surface with
+            # /api/semantic-feedback + /api/admin/semantic-feedback* + `agnes
+            # semantic-model feedback submit|list|resolve`.
+            "flag_semantic_issue",
+            "semantic_feedback_list",
+            "semantic_feedback_resolve",
             # Job management for scheduler — list, get, enqueue tasks.
             # Triple-surface with GET /api/jobs + GET /api/jobs/{job_id} +
             # POST /api/jobs + `agnes admin jobs`.

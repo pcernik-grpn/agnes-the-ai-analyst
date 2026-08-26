@@ -16,8 +16,14 @@ the true inverse — the table is new, so dropping it restores the previous
 schema exactly.
 
 Revision ID: 0073_resource_source_tags
-Revises: 0072_sync_state_id_v124
+Revises: 0073_agent_scope_granted_by
 Create Date: 2026-08-26
+
+Re-chained (not renamed) when this branch merged ``main``: ``0073_agent_scope_
+granted_by`` landed there off the same ``0072`` parent, and two revisions
+sharing one parent are two Alembic HEADS — ``upgrade head`` refuses to pick.
+The revision ID is unchanged so an instance that already applied this table
+does not re-run it; only its parent moved.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0073_resource_source_tags"
-down_revision: Union[str, None] = "0072_sync_state_id_v124"
+down_revision: Union[str, None] = "0073_agent_scope_granted_by"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -75,9 +75,10 @@ class TestTheTabStrip:
         assert "?tab=health" in body
 
     def test_another_tab_renders_its_own_placeholder_not_coverage(self, seeded_app):
-        """Health / Mute / Feedback land in later waves. The tab exists so the
-        page's shape is settled, and says plainly that it is empty — an
-        invisible tab would be re-designed from scratch by whoever lands it."""
+        """Health / Mute land in later waves. The tab exists so the page's
+        shape is settled, and says plainly that it is empty — an invisible tab
+        would be re-designed from scratch by whoever lands it. (Feedback is no
+        longer among them — see TestTheFeedbackTab.)"""
         body = (
             seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
         )
@@ -181,6 +182,54 @@ class TestTheTaggingForm:
         )
         assert 'value="conn-a" selected' in body
         assert 'value="agent" selected' in body
+
+
+class TestTheFeedbackTab:
+    """F4.5 — the admin queue of "that answer looked wrong" reports."""
+
+    def _body(self, seeded_app) -> str:
+        return (
+            seeded_app["client"]
+            .get("/admin/semantic-layer?tab=feedback", headers=_auth(seeded_app["admin_token"]))
+            .text
+        )
+
+    def test_it_replaced_its_placeholder(self, seeded_app):
+        body = self._body(seeded_app)
+        assert 'id="sl-feedback"' in body
+        # The class still EXISTS (Health and Mute still use it, and its rule
+        # lives in the shared head block) — what must be gone is any element
+        # on this tab wearing it.
+        assert 'class="sl-placeholder"' not in body
+
+    def test_the_queue_is_filled_from_the_feedback_endpoint(self, seeded_app):
+        """Fetched after paint, like the coverage grid: the queue is
+        Postgres-only, so server-rendering it would refuse to load the whole
+        page on a DuckDB instance."""
+        assert "/api/admin/semantic-feedback" in self._body(seeded_app)
+
+    def test_a_duckdb_instance_is_told_why_the_queue_is_empty(self, seeded_app):
+        """ "No reports" would read as "nobody complained" on an instance that
+        cannot store a report at all."""
+        assert "requires_postgres_backend" in self._body(seeded_app)
+
+    def test_the_status_filter_offers_the_apis_own_vocabulary(self, seeded_app):
+        """Read from `FEEDBACK_STATUSES`, not re-typed: a status the select
+        offers but the endpoint rejects would 400 on click."""
+        from src.models.semantic_feedback import FEEDBACK_STATUSES
+
+        body = self._body(seeded_app)
+        for status in FEEDBACK_STATUSES:
+            assert f'value="{status}"' in body, f"{status} missing from the filter"
+
+    def test_it_says_where_a_report_comes_from(self, seeded_app):
+        """The queue is worked by admins but filed by anyone — the tab names
+        the submit surfaces so an admin does not read it as admin-only."""
+        body = self._body(seeded_app)
+        assert "agnes semantic-model feedback submit" in body
+
+    def test_the_coverage_grid_is_not_rendered_on_this_tab(self, seeded_app):
+        assert 'id="sl-coverage"' not in self._body(seeded_app)
 
 
 class TestTheRetiredKeboolaSpecificSections:

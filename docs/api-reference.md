@@ -1232,6 +1232,47 @@ CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
 MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
 `semantic_model_coverage_untag`.
 
+### `/api/semantic-feedback` — "that answer looked wrong"
+
+- /api/semantic-feedback
+- /api/admin/semantic-feedback
+- /api/admin/semantic-feedback/{feedback_id}/resolve
+
+The one report channel coverage and health structurally cannot cover: they say
+what is undocumented and what is broken, not the case where the layer looked
+complete and the **answer** was still wrong — an unsupported number, a metric
+that means something other than its name, a concept nobody defined.
+
+`POST /api/semantic-feedback` (**any signed-in caller**, deliberately not
+admin) files one: `{question, sql?, metric_id?, model_content_hash?,
+comment?}`. Only `question` is required — a concept nobody defined has no SQL
+and no metric to name, and that is the case most worth reporting. Restricting
+this to admins would mean the only people who can flag a wrong number are the
+ones who never see it inside an analysis. `model_content_hash` pins which
+version of the semantic model produced the answer, so a report filed against a
+since-rewritten document is not confused with one filed against the current
+text.
+
+`GET /api/admin/semantic-feedback[?status=open]` (admin) is the queue, newest
+first; an unrecognized `status` is a `400 unknown_status` rather than an empty
+list, because "nothing to do" is the opposite of the truth when the filter was
+a typo. `POST /api/admin/semantic-feedback/{id}/resolve` (admin,
+`{resolution_note?}`) closes one: `404` when it does not exist, `409` when
+somebody already resolved it — the transition is guarded, so a second admin
+never overwrites who actually fixed it.
+
+**Postgres-only.** All three routes read `semantic_feedback`, which exists on
+Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on an
+instance still running the frozen DuckDB app-state backend they answer `501`
+with `error: "requires_postgres_backend"`.
+
+CLI: `agnes semantic-model feedback submit "<question>" [--sql …] [--metric …]
+[--comment …]`, `… feedback list [--status open] [--json]`,
+`… feedback resolve <id> [--note …]`. MCP: `flag_semantic_issue` (the tool a
+chat agent offers to call when it cannot support its own answer),
+`semantic_feedback_list`, `semantic_feedback_resolve`. UI:
+`/admin/semantic-layer?tab=feedback`.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a

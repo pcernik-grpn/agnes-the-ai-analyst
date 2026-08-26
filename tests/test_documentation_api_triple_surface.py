@@ -98,6 +98,18 @@ _COHORT: dict[str, tuple[str, str]] = {
         "semantic-model coverage untag",
         "semantic_model_coverage_untag",
     ),
+    # Semantic-layer feedback (F4.5) — "that answer looked wrong". Submit is
+    # open to any signed-in caller (and is the tool the chat agent offers when
+    # it cannot ground an answer); the queue and resolve are admin. All three
+    # are in the cohort rather than _EXEMPT: neither standing exemption
+    # (credential-provisioning writes, security-posture diagnostics) covers a
+    # bug report about a metric.
+    "/api/semantic-feedback": ("semantic-model feedback submit", "flag_semantic_issue"),
+    "/api/admin/semantic-feedback": ("semantic-model feedback list", "semantic_feedback_list"),
+    "/api/admin/semantic-feedback/{feedback_id}/resolve": (
+        "semantic-model feedback resolve",
+        "semantic_feedback_resolve",
+    ),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
     # this same endpoint (wraps its raw YAML text into a dict); `agnes admin

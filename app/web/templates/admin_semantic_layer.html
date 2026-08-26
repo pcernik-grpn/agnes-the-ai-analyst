@@ -83,6 +83,31 @@
   .sl-tagform-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   @media (max-width: 720px) { .sl-tagform-row { grid-template-columns: 1fr; } }
 
+  /* Feedback queue — the report list + its inline resolve form. */
+  .sl-fb-filter { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
+  .sl-fb-filter label { font-size: 12px; font-weight: 600; color: var(--ds-text-primary); }
+  .sl-fb-filter select {
+    padding: 6px 10px; font-size: 13px;
+    color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: 8px;
+  }
+  .sl-fb-when { font-size: 11px; color: var(--ds-text-secondary); white-space: nowrap; }
+  .sl-fb-who { font-size: 12px; color: var(--ds-text-secondary); word-break: break-word; }
+  .sl-fb-question { color: var(--ds-text-primary); }
+  .sl-fb-context { display: grid; gap: 2px; margin-top: 4px; }
+  .sl-fb-context span {
+    font-size: 11px; color: var(--ds-text-secondary);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .sl-fb-resolveform { display: grid; gap: 8px; padding: 4px 0 8px; max-width: 720px; }
+  .sl-fb-resolveform input {
+    width: 100%; padding: 7px 10px; font-size: 13px;
+    color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: 8px;
+  }
+  .sl-fb-resolveform .sl-note { margin: 0; }
+
   .sl-placeholder {
     padding: 28px 20px; text-align: center;
     font-size: 13px; color: var(--ds-text-secondary);
@@ -227,10 +252,46 @@
     item stays visible as muted rather than disappearing. Nothing to show here yet.
   </div>
   {% else %}
-  <div class="sl-placeholder" id="sl-feedback">
-    <strong>Feedback</strong> lands in a later wave: the queue of "this answer looked wrong" reports people
-    and agents file against the semantic layer. Nothing to show here yet.
-  </div>
+  <section id="sl-feedback">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Feedback</h2>
+      <span class="apg-sechead__count" id="sl-fb-count"></span>
+    </div>
+    <p class="apg-sec-desc">
+      What people and agents said looked wrong — an unsupported number, a metric that means something other
+      than its name, a concept nobody defined. Coverage and Health cannot see these: the layer looked complete
+      and the answer was still wrong, which only whoever read it knows. Anyone signed in can file one
+      (<span class="sl-mono">agnes semantic-model feedback submit</span>, or the chat agent offers to when it
+      cannot support its own answer).
+    </p>
+
+    <div class="sl-fb-filter">
+      <label for="sl-fb-status">Show</label>
+      <select id="sl-fb-status">
+        <option value="open" selected>Open</option>
+        {% for status in feedback_statuses %}{% if status != 'open' %}
+        <option value="{{ status }}">{{ status|capitalize }}</option>
+        {% endif %}{% endfor %}
+        <option value="">All</option>
+      </select>
+    </div>
+
+    <table class="ds-table" id="sl-fb-table">
+      <thead>
+        <tr>
+          <th>Filed</th>
+          <th>By</th>
+          <th>Question</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="sl-fb-body">
+        <tr><td colspan="5"><span class="sl-note">Loading reports…</span></td></tr>
+      </tbody>
+    </table>
+    <div class="sl-empty" id="sl-fb-empty" hidden></div>
+  </section>
   {% endif %}
 </div>
 
@@ -466,6 +527,198 @@ if (tagForm) {
     }
   });
 }
+</script>
+{% endif %}
+
+{% if active_tab == 'feedback' %}
+<script>
+// The queue is fetched after paint for the same two reasons as the coverage
+// grid: it is Postgres-only (a DuckDB instance must still render the page and
+// say why the list is empty), and the status filter re-queries without a
+// reload.
+//
+// EVERY string below — questions, comments, SQL, emails — was typed by a user
+// or produced by an agent. Nodes are built and filled with textContent;
+// nothing here goes near innerHTML.
+const FB_BADGE_CLASS = {
+  open: "sl-badge sl-badge--missing",
+  acknowledged: "sl-badge sl-badge--partial",
+  resolved: "sl-badge sl-badge--ok",
+};
+
+function fbEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function fbWhen(value) {
+  if (!value) return "";
+  // Server timestamps are UTC-aware; render in the reader's zone rather than
+  // shifting a naive string by the local offset.
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function fbResolveRow(item, columnCount, reload) {
+  const row = fbEl("tr");
+  row.hidden = true;
+  const td = fbEl("td");
+  td.colSpan = columnCount;
+  const form = fbEl("div", "sl-fb-resolveform");
+  form.appendChild(fbEl("p", "sl-note", "What was done about it? Recorded on the report, so the next reader of the same question sees the answer."));
+  const input = fbEl("input");
+  input.type = "text";
+  input.placeholder = "e.g. added revenue/net with the refund exclusion";
+  form.appendChild(input);
+  const confirm = fbEl("button", "btn btn-primary", "Resolve");
+  confirm.type = "button";
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = true;
+    try {
+      const r = await fetch(`/api/admin/semantic-feedback/${encodeURIComponent(item.id)}/resolve`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution_note: input.value.trim() || null }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        showToast("Resolved.", true);
+        reload();
+        return;
+      }
+      const detail = body.detail || {};
+      showToast(detail.message || detail || r.statusText, false);
+    } catch (err) {
+      showToast("Could not resolve: " + err.message, false);
+    } finally {
+      confirm.disabled = false;
+    }
+  });
+  form.appendChild(confirm);
+  td.appendChild(form);
+  row.appendChild(td);
+  return { row, input };
+}
+
+function fbShowEmpty(message, linkHref, linkLabel) {
+  const table = document.getElementById("sl-fb-table");
+  const empty = document.getElementById("sl-fb-empty");
+  table.hidden = true;
+  empty.hidden = false;
+  empty.textContent = message;
+  if (linkHref) {
+    empty.appendChild(document.createTextNode(" "));
+    const link = fbEl("a", null, linkLabel);
+    link.href = linkHref;
+    empty.appendChild(link);
+  }
+}
+
+function fbRender(items, reload) {
+  const table = document.getElementById("sl-fb-table");
+  const empty = document.getElementById("sl-fb-empty");
+  const body = document.getElementById("sl-fb-body");
+  const count = document.getElementById("sl-fb-count");
+  table.hidden = false;
+  empty.hidden = true;
+  body.textContent = "";
+  const columnCount = 5;
+
+  for (const item of items) {
+    const row = fbEl("tr");
+    const whenCell = fbEl("td");
+    whenCell.appendChild(fbEl("span", "sl-fb-when", fbWhen(item.created_at)));
+    row.appendChild(whenCell);
+    const whoCell = fbEl("td");
+    whoCell.appendChild(fbEl("span", "sl-fb-who", item.created_by || "unknown"));
+    row.appendChild(whoCell);
+
+    const questionCell = fbEl("td");
+    questionCell.appendChild(fbEl("div", "sl-fb-question", item.question || ""));
+    const context = fbEl("div", "sl-fb-context");
+    if (item.metric_id) context.appendChild(fbEl("span", null, "metric: " + item.metric_id));
+    if (item.comment) context.appendChild(fbEl("span", null, "comment: " + item.comment));
+    if (item.sql) context.appendChild(fbEl("span", null, "sql: " + item.sql));
+    if (item.model_content_hash) context.appendChild(fbEl("span", null, "model: " + item.model_content_hash));
+    if (item.resolution_note || item.resolved_by) {
+      context.appendChild(fbEl("span", null, `resolved by ${item.resolved_by || "?"}: ${item.resolution_note || "(no note)"}`));
+    }
+    if (context.childNodes.length) questionCell.appendChild(context);
+    row.appendChild(questionCell);
+
+    const statusCell = fbEl("td");
+    statusCell.appendChild(fbEl("span", FB_BADGE_CLASS[item.status] || "sl-badge", item.status || "?"));
+    row.appendChild(statusCell);
+
+    const actionCell = fbEl("td");
+    if (item.status !== "resolved") {
+      const opener = fbEl("button", "btn btn-secondary", "Resolve…");
+      opener.type = "button";
+      opener.setAttribute("aria-expanded", "false");
+      const { row: formRow, input } = fbResolveRow(item, columnCount, reload);
+      opener.addEventListener("click", () => {
+        formRow.hidden = !formRow.hidden;
+        opener.setAttribute("aria-expanded", String(!formRow.hidden));
+        if (!formRow.hidden) input.focus();
+      });
+      actionCell.appendChild(opener);
+      row.appendChild(actionCell);
+      body.appendChild(row);
+      body.appendChild(formRow);
+    } else {
+      row.appendChild(actionCell);
+      body.appendChild(row);
+    }
+  }
+  // The count names the FILTER too: "3 reports" under a status filter reads as
+  // "three in total", which is how a full queue looks empty.
+  const status = document.getElementById("sl-fb-status").value;
+  const noun = `report${items.length === 1 ? "" : "s"}`;
+  count.textContent = status ? `${items.length} ${status} ${noun}` : `${items.length} ${noun}`;
+}
+
+async function fbLoad() {
+  const status = document.getElementById("sl-fb-status").value;
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  try {
+    const r = await fetch("/api/admin/semantic-feedback" + query, { credentials: "include" });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 501 && body.error === "requires_postgres_backend") {
+      // Named rather than hidden: this instance runs the frozen DuckDB
+      // app-state backend, so there is no table to file reports into. "No
+      // reports" here would read as "nobody complained".
+      fbShowEmpty(
+        "Feedback needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to collect reports:",
+        "/admin/database",
+        "Database backend"
+      );
+      return;
+    }
+    if (!r.ok) {
+      fbShowEmpty("Could not load feedback: " + (body.detail || r.statusText));
+      return;
+    }
+    const items = body.items || [];
+    if (!items.length) {
+      fbShowEmpty(
+        status
+          ? `No ${status} reports. Anyone signed in can file one — from chat, the CLI, or an agent.`
+          : "No reports yet. Anyone signed in can file one — from chat, the CLI, or an agent."
+      );
+      document.getElementById("sl-fb-count").textContent = status ? `0 ${status} reports` : "0 reports";
+      return;
+    }
+    fbRender(items, fbLoad);
+  } catch (e) {
+    fbShowEmpty("Could not load feedback: " + e.message);
+  }
+}
+
+document.getElementById("sl-fb-status").addEventListener("change", fbLoad);
+fbLoad();
 </script>
 {% endif %}
 {% endblock %}

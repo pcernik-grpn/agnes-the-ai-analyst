@@ -131,6 +131,15 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "semantic_model_coverage",
     "semantic_model_coverage_tag",
     "semantic_model_coverage_untag",
+    # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
+    # here an ORDINARY caller may use — the agent that cannot ground its own
+    # answer is the intended reporter, which is why it is not admin-gated and
+    # why the workspace prompt tells the agent to offer filing one. The other
+    # two are the admin side of the same queue; same reasoning as the tag/untag
+    # pair above for why they are not MCP-exempt.
+    "flag_semantic_issue",
+    "semantic_feedback_list",
+    "semantic_feedback_resolve",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -1680,6 +1689,109 @@ def register_foundation_tools(
             )
             r.raise_for_status()
             return {"deleted": tag_id}
+
+    @tool(read_only=False, idempotent=False)
+    async def flag_semantic_issue(
+        question: str,
+        sql: str | None = None,
+        metric_id: str | None = None,
+        comment: str | None = None,
+    ) -> dict:
+        """Report that an answer looked wrong or could not be supported by the semantic layer.
+
+        Call this when a number cannot be traced to a documented metric, when a
+        metric's definition contradicts what the question asked for, or when a
+        concept in the question is not defined anywhere in the layer. OFFER it
+        to the user first and file it once they agree — never silently, and
+        never instead of answering.
+
+        This is the only write on this surface an ordinary (non-admin) caller
+        may make, deliberately: whoever read the doubtful answer is the one who
+        knows it was doubtful, and that is rarely an admin. An admin then works
+        the queue (``semantic_feedback_list`` / ``semantic_feedback_resolve``).
+
+        Args:
+            question: The question as asked, in the asker's own words — the
+                evidence for what the semantic layer failed to answer.
+            sql: The SQL that produced the suspect answer, if there was any.
+            metric_id: Metric id the answer relied on (e.g. ``revenue/mrr``).
+            comment: What looks wrong about it.
+
+        Mirrors ``POST /api/semantic-feedback`` and
+        ``agnes semantic-model feedback submit``.
+
+        Requires the Postgres app-state backend (a DuckDB instance answers
+        ``501 requires_postgres_backend``).
+        """
+        payload = {"question": question, "sql": sql, "metric_id": metric_id, "comment": comment}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/semantic-feedback",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_feedback_list(status: str = "") -> dict:
+        """List reported semantic-layer issues (admin only).
+
+        The queue behind ``flag_semantic_issue`` — what people and agents said
+        looked wrong, newest first, each with who filed it and (once closed)
+        who resolved it and how.
+
+        Args:
+            status: Optional filter — ``open``, ``acknowledged`` or
+                ``resolved``. Omit for every report.
+
+        Mirrors ``GET /api/admin/semantic-feedback`` and
+        ``agnes semantic-model feedback list``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-feedback",
+                params={"status": status} if status else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+        # The queue only grows, and each report carries a question, a comment
+        # and possibly a whole query — so it is one of the few admin lists that
+        # can genuinely outgrow a model's context. Refuse loudly rather than
+        # return a silently truncated queue.
+        return ensure_output_size(
+            r.json(),
+            "semantic_feedback_list",
+            hint="narrow with `status='open'`",
+        )
+
+    @tool(read_only=False)
+    async def semantic_feedback_resolve(feedback_id: str, resolution_note: str = "") -> dict:
+        """Close one reported semantic-layer issue, on the record (admin only).
+
+        Args:
+            feedback_id: The report's id, from ``semantic_feedback_list``.
+            resolution_note: What was done about it — stored on the report, so
+                the next reader of the same question can see the answer.
+
+        Mirrors ``POST /api/admin/semantic-feedback/{id}/resolve`` and
+        ``agnes semantic-model feedback resolve``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-feedback/{feedback_id}/resolve",
+                json={"resolution_note": resolution_note or None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
 
     @tool(read_only=True)
     async def admin_knowledge_digests_list() -> dict:

@@ -7489,10 +7489,11 @@ def _keboola_credentialed() -> bool:
     return value is not None
 
 
-# The in-page lenses of /admin/semantic-layer. Only "coverage" is built;
-# the other three are the settled shape of the sections that follow (health,
-# mute, feedback), rendered as named placeholders rather than left invisible —
-# a tab nobody can see is a tab the next author redesigns from scratch.
+# The in-page lenses of /admin/semantic-layer. "coverage" (F4.1) and
+# "feedback" (F4.5) are built; "health" and "mute" are the settled shape of the
+# sections that follow, rendered as named placeholders rather than left
+# invisible — a tab nobody can see is a tab the next author redesigns from
+# scratch.
 _SEMANTIC_LAYER_ADMIN_TABS = ("coverage", "health", "mute", "feedback")
 
 _SEMANTIC_LAYER_ADMIN_TAB_LABELS = {
@@ -7549,9 +7550,17 @@ async def admin_semantic_layer_page(
     options — the latter straight off ``app/resource_types.py``'s
     ``list_blocks`` delegates, the same projection /admin/access renders, so
     the two can never disagree about what is taggable.
+
+    The Feedback tab (F4.5) is the same shape one layer down: the report queue
+    is fetched after paint (also Postgres-only, and its status filter re-queries
+    without a reload), so all this handler renders for it is the filter's
+    vocabulary — read from the API's own ``FEEDBACK_STATUSES`` rather than
+    re-typed, since a status the select offers but the endpoint rejects would
+    400 on click.
     """
     from app.api.keboola_semantic_layer_refresh import get_last_refresh_summary
     from app.resource_types import RESOURCE_TYPES, ResourceType
+    from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
     from src.semantic.coverage import DOMAINS, TAG_RESOURCE_TYPE_BY_DOMAIN
 
@@ -7571,6 +7580,10 @@ async def admin_semantic_layer_page(
     ]
     ctx["active_tab"] = active_tab
     ctx["coverage_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    # The Feedback tab's filter reads the API's own vocabulary rather than a
+    # hand-typed copy: a status the select offers but the endpoint rejects
+    # would 400 on click, and one it drops would hide reports.
+    ctx["feedback_statuses"] = list(FEEDBACK_STATUSES)
 
     # The tagging form: one option group per taggable resource type, each
     # projected by the SAME `list_blocks` delegate the RBAC grant form uses.

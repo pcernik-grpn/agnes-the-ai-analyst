@@ -177,6 +177,8 @@ __all__ = [
     "agent_schedules_repo",
     # Cross-domain semantic coverage (F4.1) — Postgres-only
     "resource_source_tags_repo",
+    # Semantic-layer feedback queue (F4.5) — Postgres-only
+    "semantic_feedback_repo",
 ]
 
 
@@ -578,6 +580,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "resource_source_tags": {
         PG: ("src.repositories.resource_source_tags_pg", "ResourceSourceTagsPgRepository"),
     },
+    # Semantic-layer feedback queue (F4.5) — POSTGRES-ONLY, same reasoning as
+    # the entry above.
+    "semantic_feedback": {
+        PG: ("src.repositories.semantic_feedback_pg", "SemanticFeedbackPgRepository"),
+    },
 }
 
 
@@ -925,3 +932,9 @@ def agent_schedules_repo() -> Any:
 # RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
 def resource_source_tags_repo() -> Any:
     return _build("resource_source_tags")
+
+
+# Semantic-layer feedback queue (F4.5) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
+def semantic_feedback_repo() -> Any:
+    return _build("semantic_feedback")
