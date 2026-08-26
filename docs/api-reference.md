@@ -1254,6 +1254,7 @@ so comments and key order survive.
 - /api/semantic-models/context
 - /api/semantic-models/schema
 - /api/semantic-models/apply
+- /api/semantic-models/bundle
 
 `POST /api/admin/semantic-models` validates the pasted document against the
 vendored Ossie schema (422 with the schema errors on failure) and stores it
@@ -1323,7 +1324,28 @@ matching slice of the vendored Apache Ossie JSON Schema (`$defs` + a
 model existing (it reflects the schema every model is validated against).
 CLI: `agnes semantic-model context <type> [--id ...] [--model ...] [--json]`
 and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
-`get_semantic_context`, `get_semantic_schema`.
+`get_semantic_context`, `get_semantic_schema`. `context`'s response also
+carries `model_hashes` (`{slug: content_hash}`) for every accessible model —
+independent of any `model_ids` restriction on the request — so a caller
+re-verifying an expired local semantic cache (below) can compare hashes
+without a second endpoint.
+
+`GET /api/semantic-models/bundle` is the Fáze 1 physical-distribution
+surface (semantic-layer follow-up plan, "distribuce jako fyzická cache s
+TTL"): `agnes pull` calls it on every run and renders the RBAC-scoped
+response into a read-only local cache under `<workspace>/semantic/<slug>/`
+(`_brief.md`, `tables/*.yml`, `metrics/*.yml`, `glossary.md` when the
+document declares glossary terms — `src/semantic/cache_render.py`). Same
+RBAC tier and `status='valid'` gate as search/export/context. Each entry
+carries the model's own `content_hash` (the same `semantic_models
+.content_hash` every other surface reads); the top-level `ttl_seconds`
+(24h default) is what the CLI stamps into every rendered file's header, and
+what `config/claude_md_template.txt`'s semantic-layer section tells the
+agent to trust the file against before falling back to a live
+`get_semantic_context` call. No MCP/interactive analogue — mirrors the
+`/api/memory/bundle` and `/api/knowledge/digests/{digest_id}/content`
+delivery channels; an agent's live read path is `get_semantic_context`/
+`get_semantic_schema` above.
 
 ### `/api/admin/run-*` — Background job triggers
 

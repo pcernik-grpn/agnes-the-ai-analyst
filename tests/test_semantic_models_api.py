@@ -836,3 +836,80 @@ class TestGetSemanticSchema:
         )
         assert r.status_code == 200
         assert r.json()["unknown_types"] == ["glossary"]
+
+
+# ---------------------------------------------------------------------------
+# get_semantic_context.model_hashes + /api/semantic-models/bundle — Fáze 1
+# physical-distribution cache (semanticlayer/plan.md).
+# ---------------------------------------------------------------------------
+
+
+class TestGetSemanticContextModelHashes:
+    def test_model_hashes_carries_every_accessible_slug(self, seeded_app):
+        row = _upsert_model_with_constraints()
+        c = seeded_app["client"]
+        r = c.get(
+            "/api/semantic-models/context",
+            params={"selections": _selections({"semantic_type": "dataset"})},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200
+        assert r.json()["model_hashes"] == {row["slug"]: row["content_hash"]}
+
+    def test_model_hashes_is_rbac_scoped_same_as_results(self, seeded_app):
+        """A caller with no grant sees neither ``results`` objects nor the
+        model in ``model_hashes`` — the courtesy map does not leak a hash
+        for a model the caller cannot otherwise read."""
+        _upsert_model_with_constraints()
+        c = seeded_app["client"]
+        r = c.get(
+            "/api/semantic-models/context",
+            params={"selections": _selections({"semantic_type": "dataset"})},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 200
+        assert r.json()["model_hashes"] == {}
+
+
+class TestSemanticModelsBundle:
+    def test_bundle_returns_ttl_and_content_hash(self, seeded_app):
+        row = _upsert_model_with_constraints()
+        c = seeded_app["client"]
+        r = c.get("/api/semantic-models/bundle", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ttl_seconds"] > 0
+        assert "generated_at" in body
+        models = {m["slug"]: m for m in body["models"]}
+        assert row["slug"] in models
+        assert models[row["slug"]]["content_hash"] == row["content_hash"]
+        assert models[row["slug"]]["document_json"] == row["document_json"]
+
+    def test_bundle_is_rbac_scoped_same_as_search_and_export(self, seeded_app):
+        _upsert_model_with_constraints()
+        c = seeded_app["client"]
+        r = c.get("/api/semantic-models/bundle", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 200
+        assert r.json()["models"] == []
+
+    def test_bundle_reachable_via_a_linked_package_grant(self, seeded_app):
+        c = seeded_app["client"]
+        from src.repositories import semantic_model_repo
+
+        created = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+        pkg_id = _make_package()
+        _grant_package(pkg_id)
+        semantic_model_repo().link_package(pkg_id, created["id"])
+
+        r = c.get("/api/semantic-models/bundle", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 200
+        assert {m["slug"] for m in r.json()["models"]} == {"retail"}
+
+    def test_bundle_requires_authentication(self, seeded_app):
+        c = seeded_app["client"]
+        r = c.get("/api/semantic-models/bundle")
+        assert r.status_code in (401, 403)

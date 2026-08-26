@@ -558,8 +558,12 @@ def register_foundation_tools(
                 case-insensitively). Omit for every model you can access.
 
         Returns ``{"results": [{"semantic_type", "mode", "objects": [...]}],
-        "unknown_types": [...]}``. Each object carries ``"model"`` (which
-        semantic model it came from) alongside its own attributes.
+        "unknown_types": [...], "model_hashes": {slug: content_hash}}``. Each
+        object carries ``"model"`` (which semantic model it came from)
+        alongside its own attributes. ``model_hashes`` covers every model you
+        can access (not narrowed by ``model_ids``) — use it to check whether
+        a local `semantic/<slug>/…` cache file `agnes pull` wrote (header
+        `content_hash`) is still current once its `ttl_seconds` has elapsed.
         """
         params: dict[str, Any] = {"selections": json.dumps([{"semantic_type": semantic_type, "ids": ids or None}])}
         if model_ids:

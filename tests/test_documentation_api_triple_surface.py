@@ -839,6 +839,15 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/semantic-models/search": _SEMANTIC_MODELS_SEARCH_REASON,
+    "/api/semantic-models/bundle": (
+        "Fáze 1 physical-distribution cache — RBAC-scoped semantic-model "
+        "bundle consumed by `agnes pull` (renders the read-only local cache "
+        "under `<workspace>/semantic/<slug>/…`, `src/semantic/"
+        "cache_render.py`); no MCP/interactive analogue, mirrors the "
+        "/api/memory/bundle and /api/knowledge/digests/{digest_id}/content "
+        "delivery channels — an agent's live read path is already "
+        "`get_semantic_context`/`get_semantic_schema` (in _COHORT above)."
+    ),
     "/api/attachments/{source}/{attachment_id}/download": (
         "connector-catalogued attachment binary download (Jira first) — one-shot "
         "fetch by id consumed by `agnes attachment get`; binary byte-stream with "

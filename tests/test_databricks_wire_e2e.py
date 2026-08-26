@@ -121,9 +121,13 @@ class TestClientOverTheWire:
 
 
 class TestSemanticLayerOverTheWire:
-    def test_metric_views_land_in_metric_definitions(self, warehouse, e2e_env, monkeypatch):
+    def test_metric_views_land_in_semantic_models(self, warehouse, e2e_env, monkeypatch):
+        """Post-cutover: the metric view's Ossie document — not a flat
+        `metric_definitions` row — is what `sync_semantic_layer` writes (see
+        that function's docstring for why every measure here is
+        DATABRICKS-only dialect and never reaches `metric_definitions`)."""
         from connectors.databricks.semantic_layer import sync_semantic_layer
-        from src.repositories import metric_repo
+        from src.repositories import semantic_model_repo
 
         monkeypatch.setattr(
             "connectors.databricks.semantic_layer.resolve_databricks_settings",
@@ -141,11 +145,15 @@ class TestSemanticLayerOverTheWire:
         assert result["metric_views_seen"] == 1
         assert result["created_or_updated"] == 1
 
-        row = metric_repo().get("databricks/main.sales.orders_metrics/order_count")
+        row = semantic_model_repo().get("databricks_metrics/localhost/main.sales.orders_metrics")
         assert row is not None
-        assert row["sql"] == "SELECT MEASURE(`order_count`) FROM `main`.`sales`.`orders_metrics`"
-        assert row["source"] == "databricks_semantic_layer"
+        assert row["source"] == "databricks_metrics"
         assert row["source_ref"] == "localhost"
+        model = row["document_json"]["semantic_model"][0]
+        metric = next(m for m in model["metrics"] if m["name"] == "order_count")
+        dialects = metric["expression"]["dialects"]
+        assert len(dialects) == 1 and dialects[0]["dialect"] == "DATABRICKS"
+        assert dialects[0]["expression"] == "SELECT MEASURE(`order_count`) FROM `main`.`sales`.`orders_metrics`"
 
     def test_discovery_sql_accepts_both_table_type_spellings(self, warehouse):
         """Vocabulary hardening: the emitted predicate must cover the

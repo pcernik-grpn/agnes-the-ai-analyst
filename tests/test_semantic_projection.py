@@ -554,6 +554,53 @@ class TestDuplicateModelName:
         assert "metric_b" not in names
 
 
+class TestNameCollision:
+    """`metric_definitions.name` has no uniqueness constraint (see
+    `src/db.py`'s comment on the table) — a same-named metric from a
+    DIFFERENT source is a same-transaction WARN + count, never a block: both
+    rows are written under their own ids."""
+
+    def _doc(self, model_name: str, metric_name: str) -> dict:
+        return {
+            "semantic_model": [
+                {
+                    "name": model_name,
+                    "datasets": [_stub_dataset(f"{model_name}_ds")],
+                    "metrics": [
+                        {
+                            "name": metric_name,
+                            "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "SUM(x)"}]},
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_same_name_different_source_is_counted_and_both_rows_land(self, system_db):
+        project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        report = project_document(self._doc("second", "revenue"), source="git", source_ref="repo-b")
+
+        assert report.name_collisions == 1
+        assert report.metrics_written == 1
+
+        from src.repositories import metric_repo
+
+        rows = [m for m in metric_repo().list() if m["name"] == "revenue"]
+        assert len(rows) == 2
+        assert {r["source_ref"] for r in rows} == {"repo-a", "repo-b"}
+
+    def test_same_name_same_source_ref_reprojection_is_not_a_collision(self, system_db):
+        """Re-projecting the SAME (source, source_ref)'s own metric under its
+        own id must never count as a collision against itself."""
+        project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        report = project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        assert report.name_collisions == 0
+
+    def test_no_collision_when_name_is_unclaimed(self, system_db):
+        report = project_document(self._doc("first", "brand_new_metric"), source="git", source_ref="repo-a")
+        assert report.name_collisions == 0
+
+
 class TestGlossarySlugCollision:
     """`_scoped_id` keys a glossary row on `_slugify(term)`; two distinct
     terms that slugify identically must not collide and overwrite each
