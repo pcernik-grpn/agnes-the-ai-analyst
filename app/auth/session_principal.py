@@ -25,12 +25,37 @@ class SessionPrincipal:
 class AgentPrincipal:
     """Auth subject of a live agent-scoped session (V1d).
 
-    Effective authority = the owner's grants ∩ the agent's declared scope.
-    Never the owner's full set, never the Admin god-mode short-circuit — an
-    agent is a *restriction* of its owner, never an elevation. Like
-    ``SessionPrincipal`` the intersection is rebuilt live per request (the
-    token bakes in no grants), so revoking a grant or narrowing the agent
-    takes effect on the next request with no stale-replay window.
+    Effective authority = the agent's own resolved authority
+    (``resolve_agent_authority``, C2.2) — a *restriction* of its owner's
+    self-declared access, never an elevation of it, and never the Admin
+    god-mode short-circuit: a self-declared item (including one an admin
+    OWNER declared for their own agent) always narrows to that identity's
+    CURRENT explicit grants. The one deliberate exception is an item a
+    THIRD-PARTY admin explicitly granted to the agent (recorded via
+    ``agent_scope.granted_by``, granter distinct from the owner) — that item
+    is the agent's own authority in its own right and MAY exceed what the
+    owner personally holds (D-C2). Like ``SessionPrincipal`` the
+    intersection is rebuilt live per request (the token bakes in no
+    grants), so revoking a grant or narrowing the agent takes effect on the
+    next request with no stale-replay window.
+
+    ``caller_user_id``/``caller_email`` (C2.3, shared-agent runtime) are the
+    identity of whoever is actually DRIVING this turn — the agent's OWNER
+    when they run their own agent, but a different user when the agent was
+    shared to them via a ``ResourceType.AGENT`` grant. Kept ALONGSIDE
+    ``owner_user_id``/``owner_email`` (never replacing them): the agent's
+    *authority* (``intersection``, above) still derives from the owner/
+    granter per C2.2's ``resolve_agent_authority`` — only *row-level access
+    policies* (``src/access_policy.py``) bind to the caller, so each user
+    sharing one agent sees their own rows. Default ``None`` for callers that
+    construct this dataclass without a distinct caller identity (tests, and
+    any resolution path predating C2.3); ``src/access_policy.py`` falls back
+    to the owner identity in that case, which reproduces the exact pre-C2.3
+    behavior — every REAL production construction site
+    (``app/auth/pat_resolver.py``) always supplies both, derived from the
+    chat session's own stored ``user_email`` (server-side, set at session
+    creation), never from a client-supplied claim, so this fallback is never
+    exercised there.
     """
 
     session_id: str
@@ -38,6 +63,8 @@ class AgentPrincipal:
     owner_user_id: str
     owner_email: str
     intersection: dict[str, frozenset[str]]
+    caller_user_id: str | None = None
+    caller_email: str | None = None
 
 
 #: Either restricted principal. Consumers that mean "not a full user dict —

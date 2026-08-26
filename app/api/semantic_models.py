@@ -36,7 +36,8 @@ from app.auth.access import require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.instance_config import get_studio_enabled
 from app.resource_types import ResourceType
-from src.repositories import semantic_model_repo, semantic_source_repo
+from src.audit_helpers import client_kind_from_user
+from src.repositories import RequiresPostgresBackend, audit_repo, semantic_model_repo, semantic_source_repo, use_pg
 from src.semantic.cache_render import DEFAULT_TTL_SECONDS
 from src.semantic.document_validation import validate_document
 from src.semantic.projection import project_document, prune_model
@@ -45,6 +46,15 @@ from src.semantic_context import get_semantic_schema as _get_semantic_schema
 from src.semantic_validation import validate_query
 
 router = APIRouter(tags=["semantic-models"])
+
+# Auto-draft sweep (semantic-phase5 wave 2) — how many uncovered tables one
+# sweep tick drafts, and how long it waits for each headless session before
+# moving on. Tuning knobs, not magic numbers: a batch of 3 keeps one sweep
+# tick's LLM spend bounded, and the scheduler re-fires every 55 minutes
+# (services/scheduler/__main__.py) so a large backlog drains gradually
+# rather than in one expensive tick.
+_SWEEP_BATCH_SIZE = 3
+_SWEEP_SESSION_TIMEOUT_S = 60
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +300,170 @@ async def list_semantic_models(
 ):
     """List every stored semantic model (any status), admin-only."""
     return semantic_model_repo().list_all(source=source, source_ref=source_ref)
+
+
+@router.get("/api/admin/semantic-coverage")
+async def get_semantic_coverage(user: dict = Depends(require_admin)):
+    """Registered tables with NO valid semantic model describing them.
+
+    Source-agnostic — unlike ``GET /api/admin/semantic-layer/coverage``
+    (Keboola-only, predicts live against one connected project's Metastore),
+    this reads what is already stored in ``semantic_models`` regardless of
+    source (Keboola, git, manual, upload, connection) and answers a
+    narrower question: does a registered table appear in ANY valid model's
+    datasets at all. See ``src.semantic_coverage.tables_without_semantic_
+    coverage`` for the resolution rules.
+
+    Returns ``{"tables": [...]}`` — full ``table_registry`` rows.
+    """
+    from src.semantic_coverage import tables_without_semantic_coverage
+
+    return {"tables": tables_without_semantic_coverage()}
+
+
+@router.post("/api/admin/semantic-auto-draft-sweep")
+async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
+    """Draft a semantic model for tables with zero semantic-layer coverage.
+
+    Scheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)
+    — admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``
+    uncovered, not-already-pending tables (``tables_without_semantic_
+    coverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a
+    headless ``semantic-model-builder`` chat session (``app.chat.headless.
+    run_one_shot``) authenticated as the non-admin ``semantic-drafter``
+    system identity (``app.auth.system_users``) — so every draft it
+    produces lands in the ``authoring_suggestions`` moderation queue
+    exactly like a human-submitted proposal, never applied directly.
+
+    Dedup: each selected table's ``semantic_draft_pending_at`` is stamped
+    BEFORE its session is invoked, not after — a concurrent or overlapping
+    sweep tick can then never pick up the same table twice. The flag
+    clears when an admin resolves the resulting suggestion, approve or
+    reject alike (``app/api/authoring_suggestions.py``).
+
+    A session hitting the chat manager's per-user concurrency cap
+    (``ConcurrencyCapHit``) is counted and skipped, never raised as a
+    500 — and its dedup flag is cleared again on the way out, so the
+    table stays eligible for a later tick. That un-stamping matters: the
+    cap is enforced inside ``ChatManager.create_session``, before the
+    prompt is ever sent, so a capped table's session never started and no
+    suggestion will ever exist to clear the flag on resolution. Left set,
+    the flag would exclude the table from every future sweep permanently.
+
+    Returns ``{"triggered": N, "applied": A, "no_apply_call": X,
+    "skipped_cap": M, "remaining": R}`` — ``applied`` counts a table whose
+    session produced a NEW ``authoring_suggestions`` row before this
+    call's wait ended, detected by diffing the semantic-drafter's pending
+    suggestion count immediately before and after each session (sessions
+    run strictly in order, one at a time, so the diff cannot be confused
+    by another table's suggestion); ``no_apply_call`` is everything else
+    the session actually ran for. ``remaining`` is how many eligible
+    tables were left over after this tick's batch.
+
+    A3 PG-first ratchet: the dedup flag this sweep relies on
+    (``table_registry.mark_semantic_draft_pending`` /
+    ``clear_semantic_draft_pending``) is a Postgres-only capability — the
+    DuckDB app-state ladder is frozen at v124 and never gained the backing
+    column. On a DuckDB-backend instance this raises
+    :class:`~src.repositories.RequiresPostgresBackend`, translated by the
+    app-wide handler in ``app/main.py`` into a clean ``501`` naming the
+    feature, before any real work (no chat session, no table scan) runs.
+    """
+    if not use_pg():
+        raise RequiresPostgresBackend("semantic-auto-draft-sweep")
+
+    from app.auth.system_users import SEMANTIC_DRAFTER_USER_EMAIL, ensure_semantic_drafter_user
+    from app.chat.headless import run_one_shot
+    from app.chat.manager import ConcurrencyCapHit, get_current_chat_manager
+    from src.repositories import authoring_suggestions_repo, table_registry_repo
+    from src.semantic_autodraft import build_trigger_prompt
+    from src.semantic_coverage import tables_without_semantic_coverage
+
+    candidates = [t for t in tables_without_semantic_coverage() if not t.get("semantic_draft_pending_at")]
+
+    manager = get_current_chat_manager()
+    if manager is None:
+        # Chat disabled instance-wide — nothing this tick can do. Leave
+        # every candidate untouched (no pending stamp) for a later tick.
+        result = {"triggered": 0, "applied": 0, "no_apply_call": 0, "skipped_cap": 0, "remaining": len(candidates)}
+        audit_repo().log(
+            user_id=user.get("id"),
+            client_kind=client_kind_from_user(user),
+            action="semantic_auto_draft_sweep",
+            resource="job:semantic-auto-draft-sweep",
+            params=result,
+        )
+        return result
+
+    ensure_semantic_drafter_user()
+
+    batch = candidates[:_SWEEP_BATCH_SIZE]
+    remaining = len(candidates) - len(batch)
+
+    suggestions = authoring_suggestions_repo()
+    registry = table_registry_repo()
+
+    def _pending_count() -> int:
+        return len(
+            suggestions.list(
+                status="pending",
+                domain="semantic-layer",
+                created_by=SEMANTIC_DRAFTER_USER_EMAIL,
+                limit=100_000,
+            )
+        )
+
+    triggered = 0
+    applied = 0
+    no_apply_call = 0
+    skipped_cap = 0
+
+    for table in batch:
+        registry.mark_semantic_draft_pending(table["id"])
+        before = _pending_count()
+        try:
+            await run_one_shot(
+                manager,
+                user_email=SEMANTIC_DRAFTER_USER_EMAIL,
+                agent_id=None,
+                prompt=build_trigger_prompt(table),
+                timeout_s=_SWEEP_SESSION_TIMEOUT_S,
+                profile="semantic-model-builder",
+            )
+        except ConcurrencyCapHit:
+            # The cap is checked inside ``manager.create_session``, which
+            # ``run_one_shot`` calls before the prompt is ever sent — so
+            # this table's session never started and no suggestion will
+            # EVER be created for it, meaning nothing would ever clear the
+            # stamp we just wrote. Left set, the table is excluded from
+            # every future tick's candidates and is never drafted again
+            # without an admin clearing the flag by hand. Clear it here so
+            # the table simply falls back into the pool for a later tick
+            # once the cap has room.
+            registry.clear_semantic_draft_pending(table["id"])
+            skipped_cap += 1
+            continue
+        triggered += 1
+        if _pending_count() > before:
+            applied += 1
+        else:
+            no_apply_call += 1
+
+    result = {
+        "triggered": triggered,
+        "applied": applied,
+        "no_apply_call": no_apply_call,
+        "skipped_cap": skipped_cap,
+        "remaining": remaining,
+    }
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_auto_draft_sweep",
+        resource="job:semantic-auto-draft-sweep",
+        params=result,
+    )
+    return result
 
 
 @router.post("/api/admin/semantic-models", status_code=201)
@@ -783,7 +957,7 @@ async def apply_semantic_model_endpoint(
     admin branch is a plain admin write, not Studio-gated).
     """
     from app.auth.access import is_user_admin
-    from src.repositories import audit_repo, authoring_suggestions_repo
+    from src.repositories import authoring_suggestions_repo
 
     try:
         slug, result = _check_apply(body.document, body.expected_content_hash)

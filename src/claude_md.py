@@ -15,7 +15,8 @@ for every model the user can read — the one-line catalog),
 semantic_layer.cache_ttl_hours (the TTL `agnes pull` stamps into every
 rendered `semantic/<slug>/…` cache file's header,
 src/semantic/cache_render.py), marketplaces (RBAC-filtered list),
-user.{id,email,name,is_admin,groups}, now, today.
+user.{id,email,name,is_admin,groups}, now, today, chat_icons (inline icon
+names the chat UI renders — see src/chat_icons.py).
 
 See also: surfaced as the "Agent Workspace Prompt" admin editor at
 /admin/workspace-prompt.
@@ -24,13 +25,12 @@ See also: surfaced as the "Agent Workspace Prompt" admin editor at
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import duckdb
-from src.prompt_render import make_prompt_env
 
 from app.instance_config import (
     get_data_source_type,
@@ -38,6 +38,8 @@ from app.instance_config import (
     get_instance_subtitle,
     get_sync_interval,
 )
+from src.chat_icons import CHAT_INLINE_ICON_NAMES
+from src.prompt_render import make_prompt_env
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ def _load_default_template() -> str:
     )
 
 
-def _missing_table_excs() -> "tuple[type[BaseException], ...]":
+def _missing_table_excs() -> tuple[type[BaseException], ...]:
     """Exception types that mean 'the backing table doesn't exist yet'
     (e.g. a half-migrated DB) — the graceful-degrade boundary this module
     has tolerated since the original DuckDB-only ``duckdb.CatalogException``
@@ -85,7 +87,7 @@ def _missing_table_excs() -> "tuple[type[BaseException], ...]":
     ``sqlalchemy.exc.ProgrammingError`` (wrapping ``UndefinedTable``), so
     both are caught regardless of which backend the repo factory resolves
     to."""
-    excs: "tuple[type[BaseException], ...]" = (duckdb.CatalogException,)
+    excs: tuple[type[BaseException], ...] = (duckdb.CatalogException,)
     try:
         from sqlalchemy.exc import ProgrammingError
 
@@ -263,7 +265,7 @@ def build_claude_md_context(
     """
     from src.semantic.cache_render import DEFAULT_TTL_SECONDS
 
-    now = datetime.now(timezone.utc) if now is None else now
+    now = datetime.now(UTC) if now is None else now
     parsed = urlparse(server_url)
     tables = _list_tables(conn, user=user)
     semantic_models = _semantic_layer_models(conn, user=user)
@@ -309,6 +311,10 @@ def build_claude_md_context(
         "now": now,
         "today": now.date().isoformat(),
         "is_sandbox": is_sandbox,
+        # The inline icon vocabulary the chat UI renders (#1503) — the
+        # template's "Icons — never emoji" rule lists exactly these names, so
+        # the model is only ever told about icons that actually render.
+        "chat_icons": list(CHAT_INLINE_ICON_NAMES),
     }
 
 

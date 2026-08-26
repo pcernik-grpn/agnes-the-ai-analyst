@@ -24,6 +24,41 @@ external source at all.
 
 Table definitions are stored in the DuckDB `table_registry` table (not in config files). Register tables via the admin API, CLI, or web UI.
 
+## Connection ownership: `source_connections` vs `instance.yaml`
+
+Keboola, BigQuery, Snowflake and Databricks each get one managed row in the
+`source_connections` table, reachable via `POST/GET/PUT/DELETE
+/api/admin/source-connections` (`agnes admin connection …`). A row's `config`
+is validated and normalized at write time by `src/connection_specs.py` — an
+unknown `source_type` or a malformed config (e.g. a non-`https://`
+`stack_url`) is rejected with a 400 naming the field. On first boot,
+`app/connections_seed.py` seeds a row for each type from whatever
+`instance.yaml` / env vars are already configured — a one-time, no-op-if-a-row-
+already-exists copy, not a live sync; editing `instance.yaml` afterwards logs a
+deprecation warning and is otherwise ignored.
+
+The row is the single live source of truth per source type, resolved fresh on
+every call (`resolve_snowflake_settings()` / `resolve_databricks_settings()` /
+`get_bq_access()`), with `instance.yaml` as a fallback only for an
+un-migrated instance that has no row yet:
+
+| Source | Config actually used at query time TODAY | Row seeded on first boot |
+|---|---|---|
+| `keboola` | the `source_connections` row (multi-project, #1530) | yes |
+| `bigquery` | the `source_connections` row; `instance.yaml` (`data_source.bigquery`) only when no row exists | yes |
+| `snowflake` | the `source_connections` row; `instance.yaml` (`data_source.snowflake`) only when no row exists | yes |
+| `databricks` | the `source_connections` row; `instance.yaml` (`data_source.databricks`) only when no row exists | yes |
+
+Every type is fully migrated: the row is load-bearing everywhere, an admin
+edit is visible on the very next call with no restart, and the "Add data
+source" wizard's Snowflake/Databricks panes save onto the row (and its own
+vault slot) directly rather than the `data_source.<type>` yaml overlay. A
+hand-edited `data_source.<type>.*` yaml block is IGNORED (not merely stale)
+once a row of that type exists — `app/connections_seed.py`'s deprecation
+warning names the field. Multi-connection-per-type (more than one Snowflake/
+Databricks/BigQuery connection per instance) is an explicit follow-up — see
+`docs/superpowers/plans/2026-08-26-derived-connection-model.md`.
+
 ## Query Modes
 
 Each table has a `query_mode` that determines how data is accessed:

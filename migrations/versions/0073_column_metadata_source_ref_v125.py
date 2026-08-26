@@ -10,7 +10,7 @@ DuckDB app-state schema, so this column has no DuckDB counterpart —
 for signature parity with the Postgres repo but does not persist it.
 
 Revision ID: 0073_column_meta_source_ref_v125
-Revises: 0072_sync_state_id_v124
+Revises: 0073_agent_scope_granted_by
 Create Date: 2026-08-26
 
 """
@@ -26,7 +26,7 @@ from alembic import op
 # truncates and breaks every later revision's WHERE clause (verified live:
 # StringDataRightTruncation on this exact migration during development).
 revision: str = "0073_column_meta_source_ref_v125"
-down_revision: Union[str, None] = "0072_sync_state_id_v124"
+down_revision: Union[str, None] = "0073_agent_scope_granted_by"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

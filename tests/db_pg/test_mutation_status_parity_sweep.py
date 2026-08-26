@@ -55,20 +55,38 @@ _SKIP_SUBSTR = (
 # (DuckDB has no implementation) — list them here (route -> one-line reason)
 # instead of letting the sweep flag them. `assert_pg_only_exemptions_fail_clean`
 # below still requires each one to fail CLEAN (a typed 501) on DuckDB, not
-# crash or merely return some unrelated 4xx. Empty until the first PG-only
-# route ships (Track C); the mechanism itself is proven in
-# `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
-_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {}
+# crash or merely return some unrelated 4xx. The mechanism itself is proven
+# in `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
+_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "POST /api/admin/semantic-auto-draft-sweep": (
+        "the sweep's dedup flag (table_registry.mark_semantic_draft_pending / "
+        "clear_semantic_draft_pending) is a Postgres-only column (semantic-"
+        "phase5 wave 2, A3 PG-first ratchet) — no DuckDB implementation exists"
+    ),
+}
 
 
 def test_mutation_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods=_METHODS, skip_substr=_SKIP_SUBSTR)
+    # Must run here, before `build_seeded_client("pg", ...)` below repoints
+    # AGNES_DB_URL — the repo factory reads the backend live on every call,
+    # so re-querying `duck_client` after that point would silently exercise
+    # Postgres repos through DuckDB-configured routes.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
+
+    # The fail-clean check MUST run before the pg client is built:
+    # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it
+    # live on every *_repo() call, so after that point requests through the
+    # "DuckDB" client resolve repos on Postgres and the typed-501-on-DuckDB
+    # check would exercise the wrong backend. Ordering pinned by
+    # test_pg_only_route_exemption_mechanism.py::
+    # test_sweeps_run_fail_clean_check_before_pg_client_build.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
 
     pg_client, pg_token = build_seeded_client("pg", tmp_path / "pg", monkeypatch, pg_engine)
     pg = collect_statuses(pg_client, pg_token, methods=_METHODS, skip_substr=_SKIP_SUBSTR)
 
-    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
     divergences = diff_statuses(duck, pg, exempt=_PG_ONLY_ROUTE_EXEMPTIONS)
     assert not divergences, "Mutation status diverges between DuckDB and Postgres (backend-split):\n" + "\n".join(
         f"  {k}: duck={d} pg={g}" for k, (d, g) in sorted(divergences.items())

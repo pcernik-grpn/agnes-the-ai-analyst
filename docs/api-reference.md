@@ -1189,6 +1189,53 @@ semantic layer routinely describes more of a project than an instance registers.
 CLI: `agnes admin semantic-layer coverage [--json]`. MCP:
 `admin_semantic_layer_coverage`.
 
+### `/api/admin/semantic-coverage` — source-agnostic semantic-layer coverage
+
+- /api/admin/semantic-coverage
+
+`GET /api/admin/semantic-coverage` (admin) lists every registered table with
+NO valid semantic model describing it at all — `{"tables": [...]}` of full
+`table_registry` rows. Unlike `/api/admin/semantic-layer/coverage` above
+(Keboola-only, predicted live against one connected project's Metastore),
+this reads what is already stored in `semantic_models` regardless of source
+(Keboola, git, manual, upload, connection): a table is covered the moment
+ANY valid model's dataset resolves to it, whether that dataset is bound via
+a Keboola tableId or a plain `dataset.source`/`.name` match against
+`table_registry.id`/`.name`.
+
+CLI: `agnes semantic-model coverage [--limit N] [--json]`. MCP:
+`admin_semantic_coverage`.
+
+### `/api/admin/semantic-auto-draft-sweep` — auto-draft uncovered tables
+
+- /api/admin/semantic-auto-draft-sweep
+
+`POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
+55 minutes) drafts a semantic model for up to a handful of uncovered tables
+(`tables_without_semantic_coverage`, filtered on `table_registry.
+semantic_draft_pending_at IS NULL`) per tick via a headless
+`semantic-model-builder` chat session, authenticated as the non-admin
+`semantic-drafter@system.local` system identity so every draft lands in the
+`authoring_suggestions` moderation queue exactly like a human-submitted
+proposal — never applied directly. Each selected table's
+`semantic_draft_pending_at` is stamped before its session is invoked (not
+after), so a table can never be double-picked by an overlapping tick; the
+flag clears when an admin resolves the resulting suggestion, approve or
+reject alike. A session hitting the chat manager's concurrency cap is
+counted and skipped, never a 500 — and its stamp is cleared again on the
+way out, since the cap is enforced before the session starts, so no
+suggestion would ever exist to clear it and the table would otherwise be
+excluded from every future sweep permanently.
+
+Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
+"remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
+same class as the `/api/admin/run-*` jobs below.
+
+Postgres app-state only (A3 PG-first ratchet — the dedup column is a
+Postgres-only addition, no DuckDB migration step exists for it): on a
+DuckDB-backend instance this returns `501` (`{"error":
+"requires_postgres_backend"}`) before any work runs.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a
@@ -1360,16 +1407,6 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/{session_id}/join-ticket
 - /api/chat/{session_id}/leave
 - /api/chat/{session_id}/messages
-
-### `/api/agents` — Agent registry (Library items)
-
-Server-side CRUD for the assistants composed in the Agent builder (`/agents`),
-the registry that replaced the builder's browser-only draft store. Reads are
-grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
-only the owner or an admin may edit or delete.
-
-- /api/agents
-- /api/agents/{agent_id}
 
 ### `/api/sharing` — Owner-initiated sharing of Library items
 
@@ -1915,6 +1952,17 @@ fanned out into group members' installs and cannot be uninstalled
 - /api/users/{user_id}/set-password
 
 ### `/api/v1/agents` — Agent management (owner-scoped CRUD, scope, agent PATs)
+
+This is also the Agent builder's own CRUD surface (`/agents`, client-rendered
+against this API) — `knowledge`/`plugins`/`surfaces`/`role`/`tone`/`greeting`/
+`status`/`template_entity_id` are the builder's wire fields, accepted here
+directly, and `slug` is optional on create (auto-derived from `name` when
+omitted). A dedicated `/api/agents` adapter router served the same shape
+until the remediation-program's "one agent model" Track C1 folded it into
+this API (Task C1.1) and deleted the router (Task C1.2). `GET /api/v1/agents`
+and `GET /api/v1/agents/{agent_id}` are grant-aware (owner ∪ shared into one
+of the caller's groups via `/api/sharing/agent/{id}`); a grant conveys *use*
+only — mutations and token issuance stay owner-or-admin.
 
 `DELETE /api/v1/agents/{agent_id}` cascades: every PAT minted for the agent is revoked, every outbound webhook registration (`/api/v1/agents/{slug}/webhooks`) is removed, and every harvested sandbox artifact row + its object-store blob (`/api/v1/sessions/{id}/artifacts`) is deleted. The object-store blob deletes are best-effort — a single failed delete is logged and skipped rather than blocking the agent delete (an orphaned blob under a deleted agent's `agent-artifacts/` prefix is a cheap, non-sensitive leak).
 

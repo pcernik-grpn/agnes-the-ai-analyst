@@ -154,7 +154,7 @@ def test_the_agents_card_launches_itself_once_on_arrival():
 
 
 def test_the_agents_card_waits_for_its_client_rendered_anchor():
-    """`[data-ag-new]` is built once /api/agents resolves, so this fires before it
+    """`[data-ag-new]` is built once /api/v1/agents resolves, so this fires before it
     exists. A single-pass resolve drops the card SILENTLY — nothing looks broken,
     the coach-mark simply never appears — so it opts into the bounded retry, and
     deliberately declares NO fallback selector (a fallback present on the first

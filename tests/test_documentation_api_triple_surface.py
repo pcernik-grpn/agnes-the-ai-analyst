@@ -80,6 +80,10 @@ _COHORT: dict[str, tuple[str, str]] = {
         "admin semantic-layer coverage",
         "admin_semantic_layer_coverage",
     ),
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # source — distinct from the Keboola-only endpoint above.
+    "/api/admin/semantic-coverage": ("semantic-model coverage", "admin_semantic_coverage"),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
     # this same endpoint (wraps its raw YAML text into a dict); `agnes admin
@@ -542,22 +546,6 @@ _LIBRARY_MOVE_REASON = (
     "into the intended collection, which already has surfaces."
 )
 
-_AGENTS_REGISTRY_REASON = (
-    "Web Agent-builder CRUD (v103 `agents` registry) — a second registry over "
-    "the same `agents` table as `/api/v1/agents`, which IS runnable and already "
-    "carries full triple-surface coverage (`/api/v1/agents/{slug}/responses` "
-    "in _COHORT, reachable via `agnes chat` / `agent ask`). The builder at "
-    "/agents is the only producer of this registry and the Library the only "
-    "consumer; it writes decorative knowledge/plugins fields the runtime never "
-    "reads and never sets `agent_scope`, so a builder-created agent stays in "
-    "the default all-mode and cannot be issued a PAT (`agent_not_selected_mode` "
-    "until `agnes agent scope set` runs) — unreachable via API by construction, "
-    "not because agents cannot be run. Two registries pending the agent-core "
-    "consolidation program (remediation Track C, 'one agent model'), which "
-    "deletes `/api/agents` and re-points the builder at `/api/v1/agents` — at "
-    "that point this exemption is removed, not converted into a CLI/MCP mirror."
-)
-
 _LIBRARY_SHARING_REASON = (
     "Owner-initiated sharing of Library items — a web affordance on /library "
     "(share dialog). The equivalent grant writing already has analyst-facing "
@@ -662,8 +650,6 @@ _EXEMPT: dict[str, str] = {
         "/profile; a one-field personal profile edit with no CLI/MCP analogue"
     ),
     "/api/collections/{collection_id}/files/{file_id}/move": _LIBRARY_MOVE_REASON,
-    "/api/agents": _AGENTS_REGISTRY_REASON,
-    "/api/agents/{agent_id}": _AGENTS_REGISTRY_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (
@@ -1061,6 +1047,12 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven idle-app reaper trigger (data-apps platform Task 9) — "
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/semantic-auto-draft-sweep": (
+        "scheduler-driven semantic-layer auto-draft sweep trigger "
+        "(semantic-phase5 wave 2) — admin/scheduler maintenance op, mirrors "
+        "the run-keboola-semantic-layer-refresh / run-audit-prune "
+        "exemptions; no analyst CLI/MCP analogue"
     ),
 }
 

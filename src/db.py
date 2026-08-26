@@ -9017,6 +9017,12 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             # version stamp, which on this branch is what leaves the DB at
             # SCHEMA_VERSION.
             _v123_to_v124(conn)
+            # A3 PG-first ratchet: the ladder is frozen at v124
+            # (FROZEN_DUCKDB_SCHEMA_VERSION) — no further _vN_to_v(N+1) step
+            # is added here. New app-state schema work lands as an
+            # Alembic-only revision; see CLAUDE.md -> "Dual-backend
+            # discipline" and docs/migrations.md -> "Adding a PG-only
+            # feature".
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still

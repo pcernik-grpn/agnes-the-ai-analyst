@@ -1866,6 +1866,16 @@ class TestPrivacyPageSmoke:
 # ---------------------------------------------------------------------------
 
 KNOWN_UNTESTED = {
+    # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
+    # admin-gated, behaviorally covered outside this parameter-free smoke
+    # sweep: GET /api/admin/semantic-coverage in tests/test_semantic_coverage.py
+    # (source-agnostic zero-coverage check, RBAC gate); POST /api/admin/
+    # semantic-auto-draft-sweep in tests/test_semantic_autodraft_sweep.py
+    # (admin gate, DuckDB-backend 501 fail-clean per the A3 ratchet) plus
+    # the PG-only sweep-logic tests in tests/db_pg/test_semantic_autodraft_
+    # sweep_pg.py (dedup, batch limit, concurrency-cap degradation).
+    "GET /api/admin/semantic-coverage",
+    "POST /api/admin/semantic-auto-draft-sweep",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
@@ -2718,11 +2728,13 @@ KNOWN_UNTESTED = {
     # tests/test_web_library_sharing.py (DuckDB) and, for the repository layer,
     # the cross-engine tests/db_pg/test_agents_contract.py; no dedicated PG
     # smoke class yet, same convention as the stack rows below.
-    "GET /api/agents",
-    "POST /api/agents",
-    "GET /api/agents/{agent_id}",
-    "PATCH /api/agents/{agent_id}",
-    "DELETE /api/agents/{agent_id}",
+    #
+    # `/api/agents*` (the builder's own adapter router) is NOT listed here
+    # any more — it was deleted outright by the remediation-program's "one
+    # agent model" Track C1 (Task C1.2), so its routes no longer exist at
+    # all rather than being merely untested. `/api/v1/agents*` (which
+    # absorbed its wire shape in Task C1.1) is the sole surviving surface —
+    # already covered elsewhere, unaffected by that deletion.
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",

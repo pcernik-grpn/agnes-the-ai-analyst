@@ -81,7 +81,8 @@
     return Promise.resolve(window.confirm(opts.title + "\n\n" + opts.message));
   }
 
-  /* POST a connection-config payload, answering the repoint refusal if it comes.
+  /* POST (or PUT — see `options.method`) a connection-config payload,
+   * answering the repoint refusal if it comes.
    *
    * Resolves {ok, status, data, cancelled} — `cancelled: true` means the
    * operator declined the confirmation and NOTHING was written; callers should
@@ -89,11 +90,12 @@
    */
   window.saveConnectionConfig = async function (url, payload, options) {
     var opts = options || {};
+    var method = opts.method || "POST";
     var headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
 
-    async function post(body) {
+    async function send(body) {
       var r = await fetch(url, {
-        method: "POST",
+        method: method,
         credentials: "include",
         headers: headers,
         body: JSON.stringify(body),
@@ -102,12 +104,12 @@
       return { ok: r.ok, status: r.status, data: data };
     }
 
-    var res = await post(payload);
+    var res = await send(payload);
     if (!isRepointRefusal(res.status, res.data)) return res;
 
     var proceed = await askToProceed(res.data.detail);
     if (!proceed) return { ok: false, status: res.status, data: res.data, cancelled: true };
 
-    return post(Object.assign({}, payload, { confirm_connection_change: true }));
+    return send(Object.assign({}, payload, { confirm_connection_change: true }));
   };
 })();

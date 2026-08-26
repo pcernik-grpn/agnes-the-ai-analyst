@@ -181,6 +181,23 @@ Set the env var in `.env`/Terraform, or the YAML path in `instance.yaml`.
 | Corporate Memory block | — | `corporate_memory` | `{}` | `get_corporate_memory_config()` |
 | Hosted data apps block (`enabled`, `runtime_image`, `subdomain_base`, `default_idle_timeout_s`, `default_sleep_mode`, `default_mem_limit`, `default_cpus`, `max_apps_per_user`, `container_pids_limit`, `container_read_only`) — see [`DEPLOYMENT.md`](DEPLOYMENT.md#data-apps) | — | `data_apps` | `{}` (feature off) | `get_data_apps_config()` |
 
+### Connection ownership (`source_connections` vs `instance.yaml`)
+
+Each of `keboola`/`bigquery`/`snowflake`/`databricks` has a row in the
+`source_connections` table (`/api/admin/source-connections`, `agnes admin
+connection …`) that is the live source of truth, resolved fresh on every
+call — the `data_source.{bigquery,snowflake,databricks}` blocks above are
+only consulted as a fallback on an un-migrated instance with no row yet.
+`app/connections_seed.py` seeds one such row per type from whatever
+`instance.yaml` / env vars are already configured on first boot — a
+one-time copy, not a live sync — after which further edits to
+`instance.yaml` for a *seeded* type log a deprecation warning and are
+otherwise ignored (the row wins). The "Add data source" wizard's Snowflake/
+Databricks panes write the row directly, so a saved connection is visible to
+every process on the very next call — no restart. See
+[`DATA_SOURCES.md`](DATA_SOURCES.md#connection-ownership-source_connections-vs-instanceyaml)
+for the per-source table.
+
 ### Flea-market upload guardrails
 
 See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.

@@ -22,7 +22,8 @@ from src.sql_ident import quote_ident
 GROUPS_ONLY_POLICY = "SELECT * FROM invoices WHERE list_contains($user_groups, cost_center)"
 
 # Uses all three known variables -- exercises full identity binding
-# (email + id + groups), notably for the AgentPrincipal owner-identity case.
+# (email + id + groups), notably for the AgentPrincipal caller-identity
+# case (C2.3) -- owner when no distinct caller is set, else the caller.
 FULL_IDENTITY_POLICY = (
     "SELECT * FROM contracts WHERE owner_email = $user_email "
     "AND owner_id = $user_id AND list_contains($user_groups, unit)"
@@ -115,7 +116,12 @@ def _session_principal():
     )
 
 
-def _agent_principal(owner_user_id="u_owner", owner_email="owner@example.com"):
+def _agent_principal(
+    owner_user_id="u_owner",
+    owner_email="owner@example.com",
+    caller_user_id=None,
+    caller_email=None,
+):
     from app.auth.session_principal import AgentPrincipal
 
     return AgentPrincipal(
@@ -124,6 +130,8 @@ def _agent_principal(owner_user_id="u_owner", owner_email="owner@example.com"):
         owner_user_id=owner_user_id,
         owner_email=owner_email,
         intersection={},
+        caller_user_id=caller_user_id,
+        caller_email=caller_email,
     )
 
 
@@ -215,12 +223,20 @@ class TestPatternMetacharacterGroupRejected:
         assert exc_info.value.table_id == "tbl_invoices"
 
 
-class TestAgentPrincipalBindsOwner:
-    """(f) An AgentPrincipal binds its OWNER's identity -- email, id, and
-    live group membership -- never the agent's own scope-derived identity
-    (it has none) and never the Admin bypass (an agent is never admin)."""
+class TestAgentPrincipalBindsCaller:
+    """(f) An AgentPrincipal binds the CALLER's identity (C2.3,
+    shared-agent runtime) -- whoever is actually driving the turn -- never
+    the agent's own scope-derived identity (it has none) and never the
+    Admin bypass (an agent is never admin, whichever identity names one).
 
-    def test_agent_principal_binds_owner_identity(self, policy_env):
+    For an owner running their own agent (no distinct caller supplied),
+    this reproduces the exact pre-C2.3 owner-binding behavior -- see
+    ``test_agent_principal_falls_back_to_owner_identity_when_no_caller_set``.
+    The whole point of C2.3 is the OTHER case: a shared agent's row policy
+    must filter by who is asking, not who built it.
+    """
+
+    def test_agent_principal_falls_back_to_owner_identity_when_no_caller_set(self, policy_env):
         result = policied_relation("tbl_contracts", _agent_principal())
 
         assert result.policied is True
@@ -229,6 +245,19 @@ class TestAgentPrincipalBindsOwner:
         assert result.params["user_email"] == "owner@example.com"
         assert result.params["user_groups"] == ["Finance"]
 
+    def test_agent_principal_binds_a_distinct_caller_not_the_owner(self, policy_env):
+        """A shared agent's principal carries a caller (a grantee, group
+        Marketing+Finance) distinct from its owner (Finance only) -- the
+        bound identity/groups must be the CALLER's, never the owner's."""
+        shared_agent = _agent_principal(caller_user_id="u_solo", caller_email="solo@example.com")
+
+        result = policied_relation("tbl_contracts", shared_agent)
+
+        assert result.policied is True
+        assert result.params["user_id"] == "u_solo"
+        assert result.params["user_email"] == "solo@example.com"
+        assert set(result.params["user_groups"]) == {"Finance", "Marketing"}
+
     def test_agent_principal_never_bypasses_even_when_its_owner_is_admin(self, policy_env):
         """An agent is never the Admin god-mode short-circuit -- not even
         transitively through an owner who happens to be an Admin. Only a
@@ -236,6 +265,18 @@ class TestAgentPrincipalBindsOwner:
         agent_owned_by_admin = _agent_principal(owner_user_id="u_admin", owner_email="admin@example.com")
 
         result = policied_relation("tbl_invoices", agent_owned_by_admin)
+
+        assert result.policied is True
+        assert result.relation_sql == GROUPS_ONLY_POLICY
+
+    def test_agent_principal_never_bypasses_even_when_its_caller_is_admin(self, policy_env):
+        """Symmetric guard on the caller side (C2.3): sharing an agent TO
+        an admin must not let that admin's god-mode leak into row-level
+        filtering -- an AgentPrincipal never takes the dict-shaped
+        admin-bypass branch, regardless of which identity names an admin."""
+        agent_shared_to_admin = _agent_principal(caller_user_id="u_admin", caller_email="admin@example.com")
+
+        result = policied_relation("tbl_invoices", agent_shared_to_admin)
 
         assert result.policied is True
         assert result.relation_sql == GROUPS_ONLY_POLICY

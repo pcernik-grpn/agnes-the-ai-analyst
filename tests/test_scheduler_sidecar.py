@@ -216,6 +216,20 @@ def test_build_jobs_includes_run_due_endpoint():
     assert method == "POST"
 
 
+def test_build_jobs_includes_semantic_auto_draft_sweep():
+    """semantic-phase5 wave 2: the sweep row must POST every 55 minutes to
+    the sweep endpoint, direct-synchronous shape (5-tuple, no enqueue body)."""
+    from services.scheduler.__main__ import build_jobs
+
+    target = next(j for j in build_jobs() if j[0] == "semantic-auto-draft-sweep")
+    assert len(target) == 5
+    name, schedule, endpoint, method, timeout_sec = target
+    assert schedule == "every 55m"
+    assert endpoint == "/api/admin/semantic-auto-draft-sweep"
+    assert method == "POST"
+    assert timeout_sec == 60
+
+
 @pytest.mark.parametrize(
     "seconds,expected",
     [

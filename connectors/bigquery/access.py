@@ -867,38 +867,57 @@ def fetch_bq_columns_full(bq, dataset: str, table: str) -> list[dict] | None:
         return None
 
 
-@functools.cache
-def get_bq_access() -> BqAccess:
-    """Module-level FastAPI Depends target. Resolves projects from config and returns
-    a BqAccess instance with default factories.
+def _resolve_bq_projects() -> BqProjects | None:
+    """Row-first resolution of the projects BqAccess needs, or ``None`` when
+    unconfigured. Cheap: an env-var check, then (usually) a single indexed
+    ``source_connections`` lookup — safe to call on every ``get_bq_access()``.
 
     Resolution order:
       1. BIGQUERY_PROJECT env var → both billing + data (legacy override)
-      2. instance.yaml data_source.bigquery.billing_project → billing
-      3. instance.yaml data_source.bigquery.project → data, and billing if (2) is unset
-
-    Process-cached. Hot-reload of instance.yaml is out of scope; restart the container
-    on config change. functools.cache does NOT cache exceptions, so a failed call is
-    retried on the next invocation.
-
-    Tests inject via `app.dependency_overrides[get_bq_access] = lambda: bq` for
-    endpoints, or construct `BqAccess(...)` directly for non-endpoint code.
-
-    Module-level (not a classmethod) to avoid the @classmethod + @functools.cache
-    stacking footgun and to give FastAPI's dependency introspection a clean signature.
+      2. the default ``source_connections`` row (source_type='bigquery') —
+         D2.2: the row `connections_seed.py` already writes on first boot
+         finally becomes load-bearing
+      3. instance.yaml data_source.bigquery.billing_project/project — legacy
+         fallback for an un-migrated instance with no row yet
     """
     import os
 
     env_project = os.environ.get("BIGQUERY_PROJECT", "").strip()
     if env_project:
-        return BqAccess(BqProjects(billing=env_project, data=env_project))
+        return BqProjects(billing=env_project, data=env_project)
+
+    from src.connection_resolver import resolve_source_connection
+
+    row = resolve_source_connection("bigquery")
+    if row is not None:
+        config = row.get("config") or {}
+        data = str(config.get("project") or "").strip()
+        billing = str(config.get("billing_project") or "").strip() or data
+        return BqProjects(billing=billing, data=data) if data else None
 
     from app.instance_config import get_value
 
     billing = (get_value("data_source", "bigquery", "billing_project", default="") or "").strip()
     data = (get_value("data_source", "bigquery", "project", default="") or "").strip()
-
     if not data:
+        return None
+    if not billing:
+        billing = data
+    return BqProjects(billing=billing, data=data)
+
+
+@functools.lru_cache(maxsize=8)
+def _bq_access_for_projects(projects: BqProjects | None) -> BqAccess:
+    """Build (and cache) the ``BqAccess`` for a resolved ``BqProjects``.
+
+    Cached on the RESOLVED VALUE, not on nothing — so a config or connection
+    row change that resolves to different projects is automatically a cache
+    miss, no explicit invalidation call needed. ``BqProjects`` is a frozen,
+    hashable dataclass, so two calls that resolve identically hit the same
+    cache entry (and return the SAME BqAccess instance, which callers rely
+    on, e.g. `TestGetBqAccess.test_is_cached`).
+    """
+    if projects is None:
         # Return a "not configured" sentinel BqAccess. Construction succeeds so FastAPI
         # Depends(get_bq_access) resolves cleanly on non-BQ instances (Keboola-only,
         # CSV-only) where every v2 endpoint would otherwise 500 during dep-injection
@@ -912,10 +931,11 @@ def get_bq_access() -> BqAccess:
                 "BigQuery project not configured",
                 details={
                     "hint": (
-                        "Set data_source.bigquery.project in instance.yaml "
-                        "(and optionally data_source.bigquery.billing_project for "
-                        "cross-project deployments). BIGQUERY_PROJECT env var also "
-                        "accepted as legacy override."
+                        "Set data_source.bigquery.project in instance.yaml, or "
+                        "register a bigquery connection under /admin/connections "
+                        "(and optionally a billing_project for cross-project "
+                        "deployments). BIGQUERY_PROJECT env var also accepted as "
+                        "legacy override."
                     ),
                 },
             )
@@ -931,10 +951,33 @@ def get_bq_access() -> BqAccess:
             duckdb_session_factory=_raise_not_configured_session,
         )
 
-    if not billing:
-        billing = data
+    return BqAccess(projects)
 
-    return BqAccess(BqProjects(billing=billing, data=data))
+
+def get_bq_access() -> BqAccess:
+    """Module-level FastAPI Depends target. Resolves projects (row-first,
+    see :func:`_resolve_bq_projects`) and returns a cached ``BqAccess``.
+
+    Cache invalidation: keyed on the *resolved value* (see
+    :func:`_bq_access_for_projects`) rather than process-lifetime — an admin
+    saving a different bigquery connection row is a different resolved
+    ``BqProjects``, so the very next call picks it up on every process,
+    with no cross-process staleness and no explicit cache-clear call
+    required. `get_bq_access.cache_clear()` is still exposed (forwarding to
+    the inner cache) for the existing `app.instance_config.reset_cache()`
+    contract and test suite that call it explicitly.
+
+    Tests inject via `app.dependency_overrides[get_bq_access] = lambda: bq` for
+    endpoints, or construct `BqAccess(...)` directly for non-endpoint code.
+    """
+    return _bq_access_for_projects(_resolve_bq_projects())
+
+
+# Preserves the `functools.cache`-style `.cache_clear()` contract every
+# existing caller (tests, `app.instance_config.reset_cache()`) already
+# depends on, even though `get_bq_access` itself is now a plain function
+# delegating to the inner value-keyed cache.
+get_bq_access.cache_clear = _bq_access_for_projects.cache_clear  # type: ignore[attr-defined]
 
 
 def validate_bigquery_startup_config() -> List[str]:
