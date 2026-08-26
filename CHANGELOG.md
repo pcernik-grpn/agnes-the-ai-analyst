@@ -196,7 +196,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config`-identity cases) and the same 409
   `connection_change_affects_registrations` / `confirm_connection_change`
   contract — `DELETE` takes it as `?confirm_connection_change=true` (query
-  param, no body) rather than a JSON field.
+  param, no body) rather than a JSON field. A third review round (same date)
+  closed one more: `PUT .../{id}` with a bare TOP-LEVEL `token_env` (a
+  sibling of `config`, not nested inside it) and no `config`/`is_default`
+  key skipped `_guard_row_repoint` entirely — `connectors.snowflake.
+  settings`/`connectors.databricks.semantic_layer` fall back to this column
+  whenever `config.token_env`/`config.private_key_env` is unset (the shape
+  a legacy-seeded row carries), so it is an identity leaf too, and
+  `_guard_row_repoint` now compares it alongside `config`.
 
 ### Changed
 

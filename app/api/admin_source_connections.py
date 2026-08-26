@@ -29,14 +29,19 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        (``app.connection_identity`` — an identity leaf present
                                                        in the stored config but omitted from an empty/partial
                                                        replacement config counts as a change, since this
-                                                       endpoint REPLACES ``config`` wholesale) or if
-                                                       ``is_default`` changes WHICH row (if any) is the
-                                                       source_type's default — ``true`` demoting a different
-                                                       connection, or ``false`` demoting the current default to
-                                                       no default at all — and the source already has
-                                                       registrations — resend with
+                                                       endpoint REPLACES ``config`` wholesale), or if the
+                                                       TOP-LEVEL ``token_env`` field (a sibling of ``config``,
+                                                       not nested inside it — also an identity leaf, since
+                                                       connectors fall back to it when
+                                                       ``config.token_env``/``config.private_key_env`` is
+                                                       unset) changes value with no ``config`` key sent at
+                                                       all, or if ``is_default`` changes WHICH row (if any) is
+                                                       the source_type's default — ``true`` demoting a
+                                                       different connection, or ``false`` demoting the current
+                                                       default to no default at all — and the source already
+                                                       has registrations — resend with
                                                        ``confirm_connection_change: true`` to apply (D2.3 +
-                                                       RBAC review Findings 1/2, 2026-08-26; see
+                                                       RBAC review Findings 1/2, third round 2026-08-26; see
                                                        ``_guard_row_repoint`` / ``_guard_default_repoint``).
   DELETE /api/admin/source-connections/{id}         — delete; 404 if missing; 409
                                                        ``connection_in_use`` if tables are pinned to it, or
@@ -362,7 +367,12 @@ def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict
 _ROW_REPOINT_GUARDED_SOURCE_TYPES = ("snowflake", "databricks")
 
 
-def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirmed: bool) -> None:
+def _guard_row_repoint(
+    row: Dict[str, Any],
+    new_config: Dict[str, Any],
+    new_token_env: Optional[str],
+    confirmed: bool,
+) -> None:
     """Refuse an unconfirmed identity-leaf change on a connection row that
     already has registrations.
 
@@ -379,6 +389,19 @@ def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirme
     :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES` — first-time setup, a tuning-only
     edit, or a source outside this slice's identity-relocation all save
     straight through.
+
+    ``new_token_env`` is the row's TOP-LEVEL ``token_env`` COLUMN — a
+    sibling of ``config``, not nested inside it — after this PUT applies;
+    pass the row's existing value when the request didn't touch it. It is
+    an identity leaf in its own right (third RBAC review round,
+    2026-08-26): ``connectors.snowflake.settings`` / ``connectors.
+    databricks.semantic_layer`` fall back to this column whenever
+    ``config.token_env``/``config.private_key_env`` is unset — exactly the
+    shape a row seeded from a legacy ``data_source.<type>.*`` yaml block
+    (``app.connections_seed``) carries. Compared separately from
+    ``identity_changes`` (which only ever inspects ``config``) because it
+    lives outside ``config`` entirely — a bare ``PUT {token_env: <other>}``
+    with no ``config`` key used to be invisible to this guard.
     """
     if confirmed:
         return
@@ -395,6 +418,11 @@ def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirme
     # guard rather than silently dropping account/user/token_env (RBAC
     # review Finding 2, 2026-08-26).
     changes = identity_changes(source_type, row.get("config") or {}, new_config, replace_semantics=True)
+
+    old_token_env = row.get("token_env")
+    if new_token_env != old_token_env and not any(c["field"] == "token_env" for c in changes):
+        changes = changes + [{"field": "token_env", "before": old_token_env, "after": new_token_env}]
+
     if not changes:
         return
     try:
@@ -794,7 +822,13 @@ async def update_connection(
     ``config`` here REPLACES the stored dict wholesale, an identity leaf
     present in the stored config but omitted from the new one (including an
     empty ``config: {}``) counts as a change too, not as "untouched" (RBAC
-    review Finding 2, 2026-08-26). The same 409/confirm contract also covers
+    review Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field — a
+    sibling of ``config``, not nested inside it — is an identity leaf in its
+    own right (connectors fall back to it whenever
+    ``config.token_env``/``config.private_key_env`` is unset, the shape a
+    legacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with
+    no ``config`` key sent at all is guarded the same way (third RBAC review
+    round, 2026-08-26). The same 409/confirm contract also covers
     ANY change of which row (if any) is the source_type's default — a request
     body with no ``config`` key at all — for a source that has registrations:
     ``is_default: true`` demoting a DIFFERENT connection (RBAC review
@@ -817,7 +851,21 @@ async def update_connection(
     if config is not None:
         config = _validate_config_for_source_type(existing_row.get("source_type"), config)
         _reject_disallowed_config_token_envs(existing_row.get("source_type"), config)
-        _guard_row_repoint(existing_row, config, body.confirm_connection_change)
+    if config is not None or body.token_env is not None:
+        # Third RBAC review round (2026-08-26): this must run even when
+        # `config` is untouched — `PUT {token_env: <other>}` with no
+        # `config` key changes which secret every registration resolves
+        # against just as surely as a `config` replace does (see
+        # `_guard_row_repoint`'s docstring), yet used to skip this block
+        # entirely.
+        new_token_env = body.token_env if body.token_env is not None else existing_row.get("token_env")
+        _guard_row_repoint(
+            existing_row,
+            config if config is not None else (existing_row.get("config") or {}),
+            new_token_env,
+            body.confirm_connection_change,
+        )
+    if config is not None:
         old_config = existing_row.get("config") or {}
         old_stack = (old_config.get("stack_url") or "").rstrip("/")
         new_stack = (config.get("stack_url") or "").rstrip("/")

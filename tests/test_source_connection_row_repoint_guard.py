@@ -23,6 +23,19 @@ def _register_snowflake_table(table_id: str) -> None:
     )
 
 
+def _register_databricks_table(table_id: str) -> None:
+    from src.repositories import table_registry_repo
+
+    table_registry_repo().register(
+        id=table_id,
+        name=table_id,
+        source_type="databricks",
+        bucket="sales",
+        source_table=table_id.upper(),
+        query_mode="remote",
+    )
+
+
 class TestRowRepointGuard:
     def test_identity_change_with_registrations_is_refused(self, seeded_app):
         c = seeded_app["client"]
@@ -656,3 +669,187 @@ class TestDeleteDefaultConnectionGuard:
 
         resp = c.delete(f"/api/admin/source-connections/{conn_id}", headers=_auth(token))
         assert resp.status_code == 204, resp.text
+
+
+class TestTopLevelTokenEnvRepointGuard:
+    """Third RBAC review round (2026-08-26): ``token_env`` is also a
+    TOP-LEVEL field on ``UpdateConnectionBody`` — a sibling of ``config``,
+    not nested inside it. ``app/connection_identity.py``'s
+    ``CONNECTION_IDENTITY_LEAVES`` already lists ``token_env``/
+    ``private_key_env`` as identity leaves ("swaps which secret is
+    presented, and therefore which grants apply"), and
+    ``connectors.snowflake.settings`` / ``connectors.databricks.
+    semantic_layer`` fall back to this sibling column whenever
+    ``config.token_env``/``config.private_key_env`` is unset — exactly the
+    shape a row seeded from a legacy ``data_source.<type>.*`` yaml block
+    (``app.connections_seed``) carries. ``update_connection`` only ever
+    routed ``config`` (and, separately, ``is_default``) through the 409/
+    confirm contract — a bare ``PUT {token_env: <other>}`` with no
+    ``config``/``is_default`` key skipped both guards and wrote the new
+    value straight through, silently repointing which secret every
+    registration resolves against."""
+
+    def test_bare_token_env_repoint_on_snowflake_row_is_refused(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "SF_ALPHA_TOKEN,SF_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-token-env-repoint",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "token_env": "SF_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        conn_id = create_resp.json()["id"]
+        assert create_resp.json()["config"].get("token_env") is None
+        _register_snowflake_table("token_env_repoint_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "SF_BETA_TOKEN"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "connection_change_affects_registrations"
+        assert detail["source"] == "snowflake"
+
+        # Unconfirmed — the row must still carry the original token_env.
+        row = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert row["token_env"] == "SF_ALPHA_TOKEN"
+
+    def test_bare_token_env_repoint_on_snowflake_row_applies_when_confirmed(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "SF_ALPHA_TOKEN,SF_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-token-env-confirmed",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "token_env": "SF_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+        _register_snowflake_table("token_env_repoint_confirmed_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "SF_BETA_TOKEN", "confirm_connection_change": True},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["token_env"] == "SF_BETA_TOKEN"
+
+    def test_bare_token_env_repoint_on_databricks_row_is_refused(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "DBX_ALPHA_TOKEN,DBX_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "dbx-token-env-repoint",
+                "source_type": "databricks",
+                "config": {"host": "https://acme.cloud.databricks.com", "warehouse_id": "wh1", "catalog": "main"},
+                "token_env": "DBX_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        conn_id = create_resp.json()["id"]
+        assert create_resp.json()["config"].get("token_env") is None
+        _register_databricks_table("dbx_token_env_repoint_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "DBX_BETA_TOKEN"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "connection_change_affects_registrations"
+        assert detail["source"] == "databricks"
+
+        row = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert row["token_env"] == "DBX_ALPHA_TOKEN"
+
+    def test_bare_token_env_repoint_on_databricks_row_applies_when_confirmed(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "DBX_ALPHA_TOKEN,DBX_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "dbx-token-env-confirmed",
+                "source_type": "databricks",
+                "config": {"host": "https://acme.cloud.databricks.com", "warehouse_id": "wh1", "catalog": "main"},
+                "token_env": "DBX_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+        _register_databricks_table("dbx_token_env_repoint_confirmed_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "DBX_BETA_TOKEN", "confirm_connection_change": True},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["token_env"] == "DBX_BETA_TOKEN"
+
+    def test_noop_token_env_put_is_not_guarded(self, seeded_app, monkeypatch):
+        """Resending the SAME token_env is not a repoint — nothing about
+        which secret resolves would actually change."""
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "SF_ALPHA_TOKEN,SF_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-token-env-noop",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "token_env": "SF_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+        _register_snowflake_table("token_env_noop_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "SF_ALPHA_TOKEN"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_token_env_repoint_without_registrations_is_not_guarded(self, seeded_app, monkeypatch):
+        """First-time setup — nothing registered yet — has nothing to break."""
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "SF_ALPHA_TOKEN,SF_BETA_TOKEN")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-token-env-fresh",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "token_env": "SF_ALPHA_TOKEN",
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"token_env": "SF_BETA_TOKEN"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
