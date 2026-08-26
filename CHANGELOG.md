@@ -106,9 +106,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
   `enabled` state rather than on the env-enable path, because
   `session_cookie_domain()` reads it on every login and the value must not
-  depend on whether the operator switched data apps on via env or yaml; it is
-  ignored entirely while the feature is off, so a stale `.env` line can never
-  widen the session cookie for a feature serving nothing. `instance.yaml.example`
+  depend on whether the operator switched data apps on via env or yaml. While
+  the feature resolves OFF, `subdomain_base` is now dropped entirely — from
+  instance.yaml as much as from `.env`, which also fixes the pre-existing case
+  where `AGNES_DATA_APPS_ENABLED=false` left a yaml base widening the session
+  cookie and routing `<slug>.<base>` hosts for a feature serving nothing. Both
+  readers (`session_cookie_domain()` and `DataAppSubdomainMiddleware`) take the
+  key unconditionally, so this single accessor is where "off" is made to mean
+  "no base". `instance.yaml.example`
   and the module variable now both carry the base-selection warning: the value
   widens the session cookie to the base's PARENT domain, so
   `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
@@ -394,10 +399,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
   order). Anyone already signed in was unaffected — the session cookie is
   scoped to cover both origins — which is why every existing subdomain test,
-  all of which drive an already-authenticated client, stayed green. `next` is
-  deliberately not carried across: `safe_next_path` refuses non-same-origin
-  targets by design, so post-login return to the app is a separate change to
-  that guard rather than a side effect of this one.
+  all of which drive an already-authenticated client, stayed green. The return
+  URL is carried across in `next` — see the `safe_next_path` entry under
+  **Added**, which is the separate, deliberate edit to that open-redirect guard
+  that makes carrying it safe.
 
 - Web chat: a user message's hover actions (timestamp + copy) now hang
   BELOW the bubble instead of renting an invisible second row inside it —

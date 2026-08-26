@@ -80,6 +80,62 @@ def test_env_ignored_while_feature_disabled(clean_env, monkeypatch):
     assert ic.session_cookie_domain() is None
 
 
+def test_yaml_base_dropped_when_env_disables_the_feature(clean_env, monkeypatch):
+    """The mirror image of the test above, and the case its first cut missed
+    (Devin Review on #1588): the base sits in instance.yaml and the KILL comes
+    from env. Gating only the env override left the yaml value intact, and
+    neither reader checks `enabled` for itself — so `AGNES_DATA_APPS_ENABLED=
+    false` switched the feature off while the session cookie stayed widened to
+    the parent domain and `<slug>.<base>` hosts kept being routed.
+    """
+    monkeypatch.setattr(ic, "get_value", _yaml({"enabled": True, "subdomain_base": "apps.agnes.example.com"}))
+    monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "false")
+    cfg = ic.get_data_apps_config()
+    assert cfg.get("subdomain_base", "") == ""
+    assert ic.session_cookie_domain() is None
+
+
+def test_yaml_base_dropped_when_yaml_disables_the_feature(clean_env, monkeypatch):
+    """Neither half of the config comes from env here — a `data_apps:` block
+    someone switched off but left a base in still must not widen the cookie."""
+    monkeypatch.setattr(ic, "get_value", _yaml({"enabled": False, "subdomain_base": "apps.agnes.example.com"}))
+    cfg = ic.get_data_apps_config()
+    assert cfg.get("subdomain_base", "") == ""
+    assert ic.session_cookie_domain() is None
+
+
+def test_yaml_base_dropped_when_enabled_key_is_absent(clean_env, monkeypatch):
+    """`enabled` omitted means off (the feature ships off), so a base alone
+    does not switch on the half of the feature that touches every login."""
+    monkeypatch.setattr(ic, "get_value", _yaml({"subdomain_base": "apps.agnes.example.com"}))
+    assert ic.get_data_apps_config().get("subdomain_base", "") == ""
+    assert ic.session_cookie_domain() is None
+
+
+def test_subdomain_routing_off_while_the_feature_is(clean_env, monkeypatch):
+    """The cookie is one reader; `DataAppSubdomainMiddleware` is the other.
+    With the feature off it must be a plain passthrough even for a host that
+    matches the configured base — no path rewrite, and (the part that matters
+    for #1562's same-origin gate) no `agnes_data_app_subdomain` marker, which
+    is precisely what tells the proxy this request may be served.
+    """
+    import asyncio
+
+    import app.data_apps_subdomain as subdomain_mod
+
+    monkeypatch.setattr(ic, "get_value", _yaml({"enabled": False, "subdomain_base": "apps.example.com"}))
+
+    seen = []
+
+    async def inner_app(scope, receive, send):
+        seen.append((scope["path"], scope.get("agnes_data_app_subdomain")))
+
+    middleware = subdomain_mod.DataAppSubdomainMiddleware(inner_app)
+    scope = {"type": "http", "path": "/dash", "headers": [(b"host", b"s.apps.example.com")]}
+    asyncio.run(middleware(scope, None, None))
+    assert seen == [("/dash", None)]
+
+
 def test_env_ignored_when_no_data_apps_block_at_all(clean_env, monkeypatch):
     monkeypatch.setattr(ic, "get_value", lambda *keys, default=None: default)
     monkeypatch.setenv("AGNES_DATA_APPS_SUBDOMAIN_BASE", "apps.agnes.example.com")

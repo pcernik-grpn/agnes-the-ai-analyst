@@ -3191,12 +3191,12 @@ def create_app() -> FastAPI:
             # redirect loop for anyone not already signed in. Send them to the
             # main host, whose login sets a cookie scoped to cover both.
             #
-            # `next` is deliberately dropped here rather than carrying the app
-            # URL: `safe_next_path` refuses anything that is not a same-origin
-            # absolute path, so a cross-host target would be discarded at the far
-            # end anyway. Teaching that guard to allow app subdomains is a change
-            # to an open-redirect guard and belongs in its own change, not as a
-            # side effect of fixing a loop.
+            # The return URL rides along in `next`. That is only safe because
+            # `safe_next_path` (`app/auth/_common.py`) was taught, in this same
+            # change and deliberately as its own reviewed edit to that guard,
+            # to accept exactly one cross-host shape: an absolute http(s) URL on
+            # THIS deployment's own `<slug>.<data_apps.subdomain_base>`. Every
+            # other cross-host target is still discarded at the far end.
             if request.scope.get("agnes_data_app_subdomain"):
                 main_host = _main_host_base_url(request)
                 if main_host:
