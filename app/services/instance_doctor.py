@@ -20,8 +20,8 @@ environment and a real page render.
   resource grant to be visible to ANYONE, admins included; god-mode
   deliberately does not surface the entry point (``_compute_can_chat``).
 - ``agent-scope`` — every table-scoped agent profile has a non-empty
-  owner-grants ∩ scope; an empty intersection means the agent answers every
-  data question with 403 "not in your stack".
+  resolved table authority (``resolve_agent_authority``); an empty result
+  means the agent answers every data question with 403 "not in your stack".
 - ``app-state-backend`` — since A1, fresh installs run app-state on Postgres
   (``side_car``/``cloud``); DuckDB is legacy-only for new deploys. Graded:
   an existing instance that predates the Postgres default (or was
@@ -224,8 +224,8 @@ def check_chat_grant(app) -> dict:
 
 
 def check_agent_scope() -> dict:
-    """Every table-scoped agent has a non-empty owner-grants ∩ scope."""
-    from src.agent_scope_intersection import compute_agent_intersection
+    """Every table-scoped agent has a non-empty resolved table authority."""
+    from src.agent_scope_intersection import resolve_agent_authority
     from src.repositories import agents_repo
 
     repo = agents_repo()
@@ -239,7 +239,7 @@ def check_agent_scope() -> dict:
             # An empty allowlist is a deliberate "no tables", not a misconfig.
             continue
         checked += 1
-        intersection = compute_agent_intersection(agent["owner_user_id"], agent).get("table", frozenset())
+        intersection = resolve_agent_authority(agent["id"]).get("table", frozenset())
         if not intersection:
             label = agent.get("slug") or agent.get("name") or agent["id"]
             broken.append(f"{label} (owner {agent['owner_user_id']}, {len(scoped)} scoped table(s))")
@@ -247,15 +247,15 @@ def check_agent_scope() -> dict:
         return _row(
             "agent-scope",
             "error",
-            f"{len(broken)} agent(s) have an EMPTY owner-grants ∩ scope and will answer every "
+            f"{len(broken)} agent(s) have an EMPTY resolved table authority and will answer every "
             f'data question with 403 "not in your stack": {"; ".join(broken)}. Fix: grant the '
             "scoped tables as per-table resource grants "
-            "(`agnes admin grant create <group> table <table_id>`) to a group the owner belongs "
-            "to — data-package membership alone does not satisfy the agent intersection.",
+            "(`agnes admin grant create <group> table <table_id>`) to a group the granter belongs "
+            "to — data-package membership alone does not satisfy the agent's resolved authority.",
         )
     if checked == 0:
         return _row("agent-scope", "info", "no table-scoped agent profiles to verify")
-    return _row("agent-scope", "ok", f"{checked} table-scoped agent(s) verified — owner grants ∩ scope non-empty")
+    return _row("agent-scope", "ok", f"{checked} table-scoped agent(s) verified — resolved table authority non-empty")
 
 
 async def check_branding(app) -> dict:

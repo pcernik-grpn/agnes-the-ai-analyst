@@ -73,7 +73,7 @@ def _keboola_instance(monkeypatch):
 def _grant_table_direct(conn, table_id: str, user_id: str, group_name: str) -> None:
     """Direct ``resource_grants(resource_type='table', ...)`` row — the
     no-admin-short-circuit grant primitive ``_allowed_ids_for_user`` (and
-    therefore ``compute_agent_intersection``) reads. NOT the stack-gated
+    therefore ``resolve_agent_authority``) reads. NOT the stack-gated
     data_package model an owner's own direct table access goes through (see
     ``grant_table_via_package`` in ``tests/conftest.py``) — this is the
     same simplification the co-session intersection
@@ -309,9 +309,19 @@ def test_default_all_agent_matches_owner_directly(scoped_agent_env):
 def test_audit_snapshot_matches_enforced_intersection(scoped_agent_env):
     """`agent_scope_snapshots` (written at spawn time by
     `app.chat.agent_profile.record_snapshot`) must describe exactly what
-    `compute_agent_intersection` enforces at request time — the audit trail
-    and the live seam can never disagree."""
-    import src.agent_scope_intersection as intersection_mod
+    `resolve_agent_authority` enforces at request time — the audit trail
+    and the live seam can never disagree.
+
+    REQUIRED (c) — snapshot parity, cutover-safety flavor: this fixture's
+    scope row predates C2.2 (backfilled `granted_by := owner_user_id`), so
+    the self-granted-by-owner path applies and this must equal EXACTLY what
+    the old owner-intersection produced — the plan's named cutover-safety
+    property, pinned end to end through a real spawn + real DB rows rather
+    than mocked internals (see `tests/test_agent_scope_intersection.py` for
+    the admin-granted-diverges-from-owner-intersection half of D-C2, which
+    needs a real Postgres backend to observe — `tests/db_pg/
+    test_resolve_agent_authority_pg.py`)."""
+    from src.agent_scope_intersection import resolve_agent_authority
     from app.chat import agent_profile
     from src.repositories import agents_repo
 
@@ -325,7 +335,7 @@ def test_audit_snapshot_matches_enforced_intersection(scoped_agent_env):
     effective = json.loads(snapshots[0]["effective_scope"])
     assert effective["tables"] == [env["t1_id"]]
 
-    enforced = intersection_mod.compute_agent_intersection(env["owner_id"], agent_row)
+    enforced = resolve_agent_authority(env["agent_id"])
     assert enforced.get("table") == frozenset({env["t1_id"]})
     assert set(effective["tables"]) == enforced["table"]
     assert env["t2_id"] not in enforced.get("table", frozenset())

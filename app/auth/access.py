@@ -785,11 +785,11 @@ def mint_agent_session_jwt(session_id: str, *, ttl: int = 3600) -> str:
     UUID or the agent_id) — the same no-baked-in-authority contract as
     ``mint_co_session_jwt``: no grants, no real user id, no agent identity.
 
-    The resolver (``app.auth.pat_resolver``) rebuilds the owner-grants ∩
-    agent-scope intersection live per request
-    (``src.agent_scope_intersection.compute_agent_intersection``), so
-    narrowing an agent or revoking a grant takes effect on the very next
-    request — no stale-replay window.
+    The resolver (``app.auth.pat_resolver``) rebuilds the agent's resolved
+    authority live per request
+    (``src.agent_scope_intersection.resolve_agent_authority``), so narrowing
+    an agent or revoking a grant takes effect on the very next request — no
+    stale-replay window.
 
     Encoded with the canonical auth secret (app/auth/jwt) so verify_token
     decodes it in every env.

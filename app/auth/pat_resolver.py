@@ -202,7 +202,7 @@ def resolve_token_to_user(
             # but names a session/agent/owner that no longer resolves must
             # never fall through to the owner-identity path below.
             from src.repositories import agents_repo, users_repo
-            from src.agent_scope_intersection import compute_agent_intersection
+            from src.agent_scope_intersection import resolve_agent_authority
             from app.auth.session_principal import AgentPrincipal
 
             session = chat_session_repo().get_session(co_session_id)
@@ -222,7 +222,7 @@ def resolve_token_to_user(
                 agent_id=agent_id,
                 owner_user_id=owner["id"],
                 owner_email=owner["email"],
-                intersection=compute_agent_intersection(owner["id"], agent),
+                intersection=resolve_agent_authority(agent_id),
             )
             _stash_payload(request, payload)
             return agent_principal, None

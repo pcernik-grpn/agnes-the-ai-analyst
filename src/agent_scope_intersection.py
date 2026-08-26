@@ -1,9 +1,10 @@
-"""Set-intersection of an agent's owner grants x its declared scope, per
-ResourceType (V1d).
+"""An agent's own resolved authority, per ResourceType (V1d, replaced by
+C2.2's D-C2 resolution — ``docs/superpowers/plans/
+2026-08-26-one-agent-model.md``).
 
 Mirrors ``src/grant_intersection.py``'s shape (fail-closed, builds on
 ``_allowed_ids_for_user``, routed through the repo factory — never raw SQL
-on ``conn``) but for a *single* owner narrowed by a *single* agent's four
+on ``conn``) but for a *single* agent's ``agent_scope`` rows plus its four
 ``*_mode`` columns instead of N co-session participants.
 
 ``tables_mode`` governs the whole DATA axis — ``TABLE`` plus
@@ -14,26 +15,50 @@ declared package therefore also stands for its member tables, expanded LIVE
 per request (``_package_table_ids``) so a package edit reaches every agent
 scoped to it without a re-save.
 
-The OWNER side of two axes is wider than raw ``resource_grants``, because
-that is how owners really hold access (``_owner_ids_for_type``):
-``TABLE`` adds the member tables of the owner's granted data packages (the
-unified-stack model routes analyst table access through packages, so a
-grants-only owner set denied an agent every table its owner reached through
-a package), and ``COLLECTION`` adds collections the owner created (ownership
-grants access, mirroring ``accessible_collection_ids``). Both derivations
-stay god-mode-free: an admin owner contributes their explicit grants, never
-the short-circuit.
+**C2.2 — the D-C2 staged resolution** (``resolve_agent_authority``, replacing
+the old ``compute_agent_intersection``): for a ``'selected'`` axis, EACH
+``agent_scope`` row is resolved on its OWN ``granted_by`` (C2.1), not against
+one fixed "owner" identity:
 
-Fail-closed contract (spec §2, normative):
-  - Missing/empty ``owner_user_id`` or ``agent_row`` -> ``{}`` (deny
-    everything).
-  - Mode ``'all'`` (or a ``ResourceType`` the agent does not model at all,
-    e.g. ``RECIPE``/``CHAT``/...) -> the owner's set, unchanged. The agent
-    narrows only what it declares; every resource type it stays silent on
-    passes through as the owner's authority.
-  - Mode ``'selected'`` -> ``owner_set & agent_scope_set`` for that type. A
-    scope row naming a resource the owner does NOT hold is silently
-    dropped, never surfaced — an agent can never widen beyond its owner.
+  - a row whose granter is (currently) an ADMIN resolves UNCONDITIONALLY —
+    the agent has that authority in its own right, pure LD2. A declared
+    ``data_package`` row resolved this way still expands to its member
+    tables live.
+  - a row whose granter is a non-admin resolves narrowed to ``item ∩ that
+    GRANTER's CURRENT access`` — the exact intersection shape this module
+    always enforced, just keyed to whoever wrote the row (``granted_by``)
+    instead of hard-coded to "the owner". Reuses the very same access-reach
+    machinery (``_owner_ids_for_type`` et al.) parameterized by the granter's
+    id — a granter IS, for the row they wrote, playing the same "how far does
+    this identity's access reach" role the owner used to play unconditionally
+    for every row.
+  - ``granted_by IS NULL`` (DuckDB, which has no such column at all — see
+    ``src/repositories/agents.py::AgentsRepository.set_scope`` — or a
+    defensively-possible NULL row on Postgres) falls back to the agent's
+    ``owner_user_id`` as the implicit granter. This is what makes the
+    cutover a no-op: migration 0073 backfills every PG row's ``granted_by``
+    to its agent's ``owner_user_id``, and DuckDB never has the column to
+    begin with, so on both backends every row that predates C2 resolves
+    exactly as the old owner-intersection did.
+
+Mode ``'all'`` on a modeled axis, and every ``ResourceType`` the agent does
+not model at all (e.g. ``RECIPE``/``CHAT``/...), are NOT itemized —there is
+no ``agent_scope`` row to carry a granter — so they keep passing through the
+OWNER's current access unchanged, exactly as before. This is not a carve-out
+from D-C2: it is equivalent to "every row on this axis is implicitly
+self-granted by the owner", which is exactly the ``granted_by IS NULL``
+fallback above with the owner as the (only possible, today) granter — C2.3
+is what opens a non-owner path to writing scope at all.
+
+Fail-closed contract (spec §2, normative — unchanged shape, now per-row):
+  - Missing/empty ``agent_id``, a missing/soft-deleted agent row, or a
+    missing ``owner_user_id`` -> ``{}`` (deny everything).
+  - Mode ``'all'`` (or an unmodeled ``ResourceType``) -> the owner's current
+    access, unchanged.
+  - Mode ``'selected'`` -> the union of admin-granted rows (unconditioned)
+    and self-granted rows currently held by their own granter. A scope row
+    naming a resource its granter does NOT (or no longer) hold is silently
+    dropped, never surfaced — an agent can never widen beyond what backs it.
   - An unrecognized (neither ``'all'`` nor ``'selected'``) mode value ->
     ``frozenset()`` for that type. This is the OPPOSITE of
     ``app.chat.agent_profile.compute_effective_scope``'s audit-only
@@ -46,7 +71,9 @@ there is no ``ResourceType.CONNECTION`` — per-user MCP connections are
 authorized through a separate mechanism entirely (``tool_registry``
 passthrough grants keyed on groups). Do not "fix" this by inventing a
 resource type here; the axis is enforced at its own seam via
-``agent_scope_filter`` below.
+``agent_scope_filter`` below, which C2.2 leaves untouched (it never
+intersected against an owner's access to begin with — see that function's
+own docstring).
 """
 
 from __future__ import annotations
@@ -56,6 +83,12 @@ from typing import Iterable, Optional, Tuple
 import duckdb
 
 from app.resource_types import ResourceType
+
+#: Return shape of :func:`resolve_agent_authority` — also what
+#: ``AgentPrincipal.intersection`` (``app/auth/session_principal.py``)
+#: carries. Named for what it now IS (an agent's own resolved authority),
+#: not the set-intersection implementation detail the old name described.
+AgentAuthority = dict[str, frozenset[str]]
 
 # agents.<mode column> -> (agent_scope.item_type, ResourceType.value).
 # Reused by the seams (e.g. the sandbox-materialization filter) that need
@@ -81,7 +114,7 @@ TABLES_MODE_EXTRA_TYPES: dict[str, str] = {
 _COLLECTION_SCAN_LIMIT = 100_000
 
 # ResourceType.value -> (mode column, agent_scope.item_type) for every axis
-# ``compute_agent_intersection`` narrows.
+# ``resolve_agent_authority`` narrows.
 _RT_TO_AXIS: dict[str, tuple[str, str]] = {
     **{rt: (mf, it) for mf, (it, rt) in MODE_TO_RESOURCE_TYPE.items()},
     **{rt: ("tables_mode", it) for it, rt in TABLES_MODE_EXTRA_TYPES.items()},
@@ -102,20 +135,45 @@ def _allowed_ids_for_user(
     return _impl(user_id, resource_type, conn)
 
 
-def _agent_scope_ids(
+def _is_user_admin(
+    user_id: str,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> bool:
+    """Module-attribute indirection onto ``app.auth.access.is_user_admin`` —
+    same reason as :func:`_allowed_ids_for_user`: ``resolve_agent_authority``
+    calls it per row (D-C2's admin/self-granted branch), and tests need to
+    control "is this granter an admin" without standing up a real Admin
+    group membership for every scenario."""
+    from app.auth.access import is_user_admin as _impl
+
+    return _impl(user_id, conn)
+
+
+def _agent_scope_rows(
     agent_id: str,
     item_type: str,
     conn: Optional[duckdb.DuckDBPyConnection] = None,
-) -> frozenset[str]:
-    """Set of ``item_id`` the agent's ``agent_scope`` declares for
-    ``item_type``, read through the repo factory. ``conn`` is accepted for
-    signature symmetry with ``_allowed_ids_for_user`` (and to leave room for
-    a future DuckDB-direct fast path) but is currently unused — ``get_scope``
-    is factory-routed, backend-agnostic."""
+) -> list[dict]:
+    """``[{"item_id": ..., "granted_by": ...}, ...]`` the agent's
+    ``agent_scope`` declares for ``item_type``, read through the repo
+    factory. ``conn`` is accepted for signature symmetry with
+    ``_allowed_ids_for_user`` (and to leave room for a future DuckDB-direct
+    fast path) but is currently unused — ``get_scope`` is factory-routed,
+    backend-agnostic.
+
+    Kept as a separate module attribute (not inlined at the call site), like
+    ``_allowed_ids_for_user``, so tests can monkeypatch it. Superseded
+    ``_agent_scope_ids`` (which discarded ``granted_by``) in C2.2 — every
+    caller now needs the granter to resolve a row per D-C2.
+    """
     from src.repositories import agents_repo
 
     items = agents_repo().get_scope(agent_id)
-    return frozenset(item["item_id"] for item in items if item.get("item_type") == item_type)
+    return [
+        {"item_id": item.get("item_id"), "granted_by": item.get("granted_by")}
+        for item in items
+        if item.get("item_type") == item_type
+    ]
 
 
 def _package_table_ids(
@@ -194,9 +252,10 @@ def _owned_collection_ids(owner_user_id: str) -> frozenset[str]:
     try:
         from src.repositories import file_corpora_repo
 
-        # Filter in SQL, not in Python. This runs once per brokered request
-        # (``compute_agent_intersection`` from ``app/auth/pat_resolver.py``),
-        # and reading the whole table to keep one creator's rows put a
+        # Filter in SQL, not in Python. This runs once per identity per
+        # brokered request (``resolve_agent_authority`` from
+        # ``app/auth/pat_resolver.py``), and reading the whole table to keep
+        # one creator's rows put a
         # table-sized scan on the authorization path (Devin Review on #1515).
         #
         # The cap stays explicit and high: ``list()`` defaults to 200, and a
@@ -217,24 +276,32 @@ def _owner_ids_for_type(
     conn: Optional[duckdb.DuckDBPyConnection] = None,
     owner_pkgs: Optional[frozenset[str]] = None,
 ) -> frozenset[str]:
-    """The OWNER side of one axis. Plain group grants for every type, plus
-    the two derivations that reflect how owners actually hold data access —
-    both deliberately god-mode-free (SR-1: an admin owner's agent gets the
-    admin's *explicit* grants, never the short-circuit):
+    """How far ONE identity's access reaches for one axis. Named for its
+    original caller (the owner side of the old owner-intersection), but
+    since C2.2 (D-C2) also called with a ``granted_by`` GRANTER's id — a
+    self-granted ``agent_scope`` row narrows to ``item ∩ this function's
+    result for that row's granter``, not hard-coded to the agent's owner.
+    "Owner" below means "whichever identity this call is checking".
 
-    - TABLE: per-table grants ∪ member tables of the owner's granted data
+    Plain group grants for every type, plus the two derivations that reflect
+    how a real user actually holds data access — both deliberately
+    god-mode-free (SR-1: an admin identity's agent gets the admin's
+    *explicit* grants, never the short-circuit):
+
+    - TABLE: per-table grants ∪ member tables of the identity's granted data
       packages. The unified-stack model routes analyst table access through
       packages (``src/rbac.py::can_access_table``), so grants-only here
-      denied every table to an agent whose owner had a package-shaped stack.
-    - COLLECTION: group grants ∪ collections the owner created (ownership
+      denied every table to an agent whose backing identity had a
+      package-shaped stack.
+    - COLLECTION: group grants ∪ collections the identity created (ownership
       grants access — ``accessible_collection_ids``).
 
-    ``owner_pkgs`` lets the caller pass the owner's package set in when it has
-    already resolved it. :func:`compute_agent_intersection` walks every
-    ``ResourceType`` and needed it on three of them, so leaving each to
-    re-derive it ran the grant read + ``StackResolver`` three times per
-    brokered request (Devin Review on #1515). Omitted, it is resolved here
-    exactly as before.
+    ``owner_pkgs`` lets the caller pass this identity's package set in when it
+    has already resolved it. :func:`resolve_agent_authority` may call this
+    for the owner AND for one or more granters per request, so leaving each
+    call to re-derive it would run the grant read + ``StackResolver`` pass
+    once per (identity, axis) pair (Devin Review on #1515, still true under
+    C2.2 — the caller caches per identity). Omitted, it is resolved here.
     """
     base = _allowed_ids_for_user(owner_user_id, rt_value, conn)
     if rt_value == ResourceType.TABLE.value:
@@ -283,7 +350,7 @@ def agent_scope_filter(
       ``item_id`` set, possibly empty (an empty allowlist is a real answer,
       never a pass-through).
     - ``frozenset()`` — fail closed for a missing / soft-deleted agent row or
-      an unrecognized mode value, mirroring ``compute_agent_intersection``.
+      an unrecognized mode value, mirroring ``resolve_agent_authority``.
     """
     from src.repositories import agents_repo
 
@@ -325,32 +392,79 @@ def agent_is_passthrough(agent_row: dict) -> bool:
     )
 
 
-def compute_agent_intersection(
-    owner_user_id: str,
-    agent_row: Optional[dict],
+def resolve_agent_authority(
+    agent_id: Optional[str],
     conn: Optional[duckdb.DuckDBPyConnection] = None,
-) -> dict[str, frozenset[str]]:
-    """Owner's grants narrowed by the agent's declared scope, per
-    ``ResourceType`` — see module docstring for the full fail-closed
-    contract."""
-    if not owner_user_id or not agent_row:
+) -> AgentAuthority:
+    """An agent's own resolved authority, per ``ResourceType`` — C2.2's
+    replacement for ``compute_agent_intersection``. See the module docstring
+    for the full D-C2 contract this implements.
+
+    Parameterized by ``agent_id`` ALONE (unlike the old owner-parameterized
+    function) — authority now comes from the agent's own ``agent_scope``
+    rows and each row's ``granted_by``, not from a caller-supplied owner
+    identity. The agent row (incl. ``owner_user_id``, needed for the
+    'all'-mode / unmodeled-axis pass-through and as the implicit granter of
+    a ``granted_by IS NULL`` row) is read here.
+    """
+    if not agent_id:
         return {}
 
-    agent_id = agent_row.get("id")
+    from src.repositories import agents_repo
 
-    # Resolved ONCE per call: three axes below need it, and each derivation
-    # is a grant read plus a StackResolver pass. This runs on every brokered
-    # request (app/auth/pat_resolver.py).
-    owner_pkgs = _owner_package_ids(owner_user_id, conn)
+    agent_row = agents_repo().get_by_id(agent_id)
+    if not agent_row or agent_row.get("deleted_at") is not None:
+        return {}
+    owner_user_id = agent_row.get("owner_user_id")
+    if not owner_user_id:
+        return {}
+
+    # One data-package-reach resolve per identity this call touches (the
+    # owner, plus any distinct non-admin granter a 'selected' row names),
+    # cached so a request scoped to N rows from the same granter pays for
+    # the grant read + StackResolver pass once, not N times.
+    pkg_cache: dict[str, frozenset[str]] = {}
+
+    def _pkgs_for(user_id: str) -> frozenset[str]:
+        if user_id not in pkg_cache:
+            pkg_cache[user_id] = _owner_package_ids(user_id, conn)
+        return pkg_cache[user_id]
+
+    owner_pkgs = _pkgs_for(owner_user_id)
+
+    # Per-item_type resolved id cache: TABLE's expansion and DATA_PACKAGE's
+    # own axis both need the declared package set resolved the same way, and
+    # both are reached from the ResourceType loop below — compute it once.
+    selected_cache: dict[str, frozenset[str]] = {}
+
+    def _resolve_selected(item_type: str, rt_value: str) -> frozenset[str]:
+        if item_type in selected_cache:
+            return selected_cache[item_type]
+        resolved: set[str] = set()
+        for row in _agent_scope_rows(agent_id, item_type, conn):
+            item_id = row.get("item_id")
+            if not item_id:
+                continue
+            granter_id = row.get("granted_by") or owner_user_id
+            if _is_user_admin(granter_id, conn):
+                # Admin-granted: unconditioned — the agent has this
+                # authority in its own right (pure LD2).
+                resolved.add(item_id)
+                continue
+            granter_set = _owner_ids_for_type(granter_id, rt_value, conn, owner_pkgs=_pkgs_for(granter_id))
+            if item_id in granter_set:
+                resolved.add(item_id)
+        selected_cache[item_type] = frozenset(resolved)
+        return selected_cache[item_type]
 
     result: dict[str, frozenset[str]] = {}
     for rt in ResourceType:
-        owner_set = _owner_ids_for_type(owner_user_id, rt.value, conn, owner_pkgs=owner_pkgs)
-
         axis = _RT_TO_AXIS.get(rt.value)
         if axis is None:
             # Resource type the agent does not model at all -> pass through
-            # the owner's set verbatim (narrows only what it declares).
+            # the owner's current access, unchanged (no scope row exists to
+            # carry a different granter for it).
+            owner_set = _owner_ids_for_type(owner_user_id, rt.value, conn, owner_pkgs=owner_pkgs)
             if owner_set:
                 result[rt.value] = owner_set
             continue
@@ -358,22 +472,24 @@ def compute_agent_intersection(
         mode_field, item_type = axis
         mode = agent_row.get(mode_field)
         if mode == "all":
+            owner_set = _owner_ids_for_type(owner_user_id, rt.value, conn, owner_pkgs=owner_pkgs)
             if owner_set:
                 result[rt.value] = owner_set
         elif mode == "selected":
-            agent_set = _agent_scope_ids(agent_id, item_type, conn)
+            resolved = _resolve_selected(item_type, rt.value)
             if rt.value == ResourceType.TABLE.value:
                 # A declared data package stands for its member tables: the
-                # builder's Knowledge section offers packages and collections,
-                # not raw table ids, so an agent scoped to a package must be
-                # able to read the tables in it. Expanded live and intersected
-                # with the owner's own reach, so neither a package edit nor a
-                # revoked owner grant can widen the agent.
-                declared_pkgs = _agent_scope_ids(agent_id, "data_package", conn)
-                agent_set = agent_set | _package_table_ids(declared_pkgs & owner_pkgs, conn)
-            narrowed = owner_set & agent_set
-            if narrowed:
-                result[rt.value] = narrowed
+                # builder's Knowledge section offers packages and
+                # collections, not raw table ids, so an agent scoped to a
+                # package must be able to read the tables in it. The package
+                # set is resolved by the SAME admin/self-granted rule as any
+                # other row (a declared package this agent has no real
+                # authority over expands to nothing), so no extra narrowing
+                # is needed here.
+                declared_pkgs = _resolve_selected("data_package", ResourceType.DATA_PACKAGE.value)
+                resolved = resolved | _package_table_ids(declared_pkgs, conn)
+            if resolved:
+                result[rt.value] = resolved
         else:
             # Unrecognized mode -> fail closed. Only record an empty set
             # when the type would otherwise have appeared, to mirror the
@@ -417,9 +533,9 @@ def writer_can_access_item(
     here would 403 a builder save merely reorganizing scope, exactly the
     hazard the pre-C2.1 ``_classify_knowledge`` docstring called out. The
     stack-aware narrowing still applies downstream, at resolve time
-    (``compute_agent_intersection`` today, ``resolve_agent_authority`` from
-    task C2.2 on) — a grant that is not currently "in stack" makes the
-    declared item inert there, never a write-time rejection.
+    (``resolve_agent_authority``, as of C2.2) — a grant that is not
+    currently "in stack" makes the declared item inert there, never a
+    write-time rejection.
 
     Parameterized by the WRITER rather than "the owner": every write path
     that exists today is ownership-gated (``_load_agent(require_owner=
