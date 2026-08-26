@@ -844,6 +844,15 @@ async def lifespan(app):
 
     validate_deployment()
 
+    # Surface an unsafe/no-op data-apps posture at startup: enabled, but
+    # same-origin serving off and no isolated origin configured, so no hosted
+    # app can actually be served (see data_apps_proxy._same_origin_serving_refused).
+    from app.api.data_apps import same_origin_serving_warning
+
+    _same_origin_msg = same_origin_serving_warning()
+    if _same_origin_msg:
+        logger.error("%s", _same_origin_msg)
+
     # Fail-closed: refuse to serve with a weak/absent JWT signing key in
     # production. Cheap, runs before any request is accepted.
     from app.auth.jwt import validate_jwt_secret_or_raise

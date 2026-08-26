@@ -104,7 +104,35 @@ services:
     # Joins agnes-apps so the app can reach data-app runtime containers
     # directly (e.g. readiness probes); apps-runner is the only process
     # that talks to the Docker socket, but the app shares the network.
-    networks: [default, agnes-apps, agnes-apps-internal]
+    #
+    # `default` is pinned as the app's gateway network so its default route —
+    # hence all its egress, including the GCP metadata server for BigQuery
+    # GCE-metadata auth — always leaves via `default`, never via `agnes-apps`.
+    # Why the gateway pin matters: the container-metadata-hardening firewall
+    # rule (infra/modules/customer-instance/startup-script.sh.tpl) DROPs
+    # `agnes-apps -> 169.254.169.254`, source-scoped to the agnes-apps subnet
+    # precisely so the app itself is spared; a multi-homed app whose default
+    # route landed on agnes-apps would send its own metadata traffic into that
+    # DROP and break BigQuery auth. Both pin fields are set because they answer
+    # different questions on different engine generations:
+    #   - `gw_priority` (Compose >= v2.33.1, effective on Docker Engine >= 28,
+    #     where it is the ONLY field that selects the gateway network —
+    #     `priority` deliberately does not; older engines ignore the value):
+    #     the authoritative pin. Without it, Engine 28+ tie-breaks all-zero
+    #     gateway priorities away from this intent.
+    #   - `priority` (older field, controls connection ORDER): keeps `default`
+    #     the first-connected network, which is what pre-28 engines derive the
+    #     default route from.
+    # Either way the pin is a config guarantee, not an incidental of Docker's
+    # tie-break. NOTE: `gw_priority` sets the minimum Compose CLI at v2.33.1
+    # (Feb 2025) — older Compose rejects the key at validation
+    # (`docker compose config` to check yours).
+    networks:
+      default:
+        priority: 100
+        gw_priority: 100
+      agnes-apps: {}
+      agnes-apps-internal: {}
 
   # One-shot: run extractor then rebuild orchestrator views
   extract:
