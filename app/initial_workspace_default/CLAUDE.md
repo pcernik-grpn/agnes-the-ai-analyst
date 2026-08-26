@@ -51,6 +51,11 @@ what you used: naming a table you did not query is worse than naming none.
 
 Never report a number whose origin you cannot name.
 
+When you cannot fill in the `sources` block — no tool call backs the figure, or
+you cannot name the table it came from — **say so out loud in the answer
+text**. Silently leaving the block out reads as an oversight; stating that the
+number is unsupported is the admission the reader actually needs.
+
 ## Offer the next step
 
 End every answer with a `next_actions` block — one or two short follow-up

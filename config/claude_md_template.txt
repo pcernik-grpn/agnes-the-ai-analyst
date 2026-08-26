@@ -69,6 +69,12 @@ Always validate a query you built against this layer before running it —
 whether the metrics you used are executable on the engine you're about to
 run against, and flags a dialect mismatch that would otherwise fail silently
 or return the wrong number.
+
+If a question turns on a term this layer has no dataset, metric, or glossary
+entry for, **ask the user what they mean, or say the term is not defined
+here** — do not invent SQL or a calculation for it. A number computed from a
+definition you made up looks exactly like one computed from a declared metric,
+and the reader cannot tell them apart.
 {% endif %}
 
 ## Say where every number came from
@@ -97,6 +103,11 @@ figure and no block is shown as having declared no source. So claim exactly
 what you used: naming a table you did not query is worse than naming none.
 
 Never report a number whose origin you cannot name.
+
+When you cannot fill in the `sources` block — no tool call backs the figure, or
+you cannot name the table it came from — **say so out loud in the answer
+text**. Silently leaving the block out reads as an oversight; stating that the
+number is unsupported is the admission the reader actually needs.
 
 ## Charts
 

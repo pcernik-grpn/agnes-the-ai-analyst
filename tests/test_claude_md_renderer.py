@@ -1,5 +1,7 @@
 """Unit tests for the analyst-workspace CLAUDE.md renderer (src/claude_md.py)."""
 
+import re
+
 import duckdb
 import pytest
 from jinja2 import TemplateError
@@ -28,6 +30,12 @@ def conn(tmp_path, monkeypatch):
     monkeypatch.setattr("src.repositories.get_system_db", lambda: c)
     yield c
     c.close()
+
+
+def _collapse_ws(text: str) -> str:
+    """Text with runs of whitespace collapsed — prose assertions must not break
+    because a template sentence got re-wrapped at 79 columns."""
+    return re.sub(r"\s+", " ", text)
 
 
 def _user(email="alice@example.com", is_admin=False):
@@ -519,6 +527,27 @@ class TestSemanticLayerSection:
     def test_rendered_section_absent_without_models(self, conn):
         out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
         assert "## Semantic layer" not in out
+
+    def test_section_tells_the_agent_to_ask_about_a_term_outside_the_vocabulary(self, conn):
+        """A layer that defines the vocabulary only helps if the agent notices
+        the questions it does NOT define. Without this rule the agent's failure
+        mode is to invent a plausible calculation for an undefined term
+        ("churn", "ARR") and present it with the same confidence as a declared
+        metric — the one outcome a semantic layer exists to prevent."""
+        _seed_semantic_model(conn)
+        out = _collapse_ws(render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com"))
+        assert re.search(
+            r"no dataset, metric,? or glossary (entry|term).{0,120}(ask|not defined)",
+            out,
+            re.IGNORECASE,
+        ), f"the section must tell the agent to ask rather than guess; got: {out!r}"
+        assert re.search(r"do not invent (SQL|a calculation)", out, re.IGNORECASE)
+
+    def test_the_ask_dont_guess_rule_is_gated_with_the_rest_of_the_section(self, conn):
+        """The rule names this instance's semantic layer, so it must not reach
+        a user who has no readable model — same gate as the section it lives in."""
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "glossary" not in out.lower()
 
 
 # ---------------------------------------------------------------------------
