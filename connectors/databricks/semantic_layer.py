@@ -84,14 +84,69 @@ def _error_result(message: str, code: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_databricks_settings() -> dict[str, Any] | None:
-    """Read the instance's Databricks settings; ``None`` when unconfigured.
+def _resolve_row_token(connection: dict[str, Any], token_env: str) -> str:
+    """Vault-first (this connection's own vault slot), then the named env
+    var / remote-attach vault fallback — same order the legacy
+    instance-config path used, just with the connection's own vault slot
+    checked first."""
+    try:
+        from src.repositories import connection_secrets_repo
 
-    ``data_source.databricks.{host, warehouse_id, catalog}`` from the
-    effective instance.yaml (admin-overlay aware), token from the env var
-    named by ``token_env`` (default ``DATABRICKS_TOKEN``) with the vault
-    (``datasource_secret``) as fallback — the same resolution order the
-    Keboola materialized path uses.
+        vault_value = connection_secrets_repo().get(connection["id"])
+    except Exception:
+        vault_value = None
+    if vault_value:
+        return vault_value
+    token = os.environ.get(token_env, "")
+    if token:
+        return token
+    try:
+        from src.orchestrator_security import resolve_remote_attach_token
+
+        return resolve_remote_attach_token(token_env) or ""
+    except Exception:  # pragma: no cover - vault optional in dev contexts  # noqa: BLE001
+        return ""
+
+
+def _resolve_databricks_from_row(connection: dict[str, Any]) -> dict[str, Any] | None:
+    """Settings from a ``source_connections`` row (``source_type='databricks'``).
+
+    Non-secret coordinates come from ``config``; the token's env-var name is
+    read from ``config`` first (a fresh wizard save), falling back to the
+    row's top-level ``token_env`` column (the shape ``app.connections_seed``
+    writes) and then the module default.
+    """
+    config = connection.get("config") or {}
+    host = str(config.get("host") or "").strip()
+    warehouse_id = str(config.get("warehouse_id") or "").strip()
+    catalog = str(config.get("catalog") or "").strip()
+    token_env = (
+        str(config.get("token_env") or "").strip()
+        or str(connection.get("token_env") or "").strip()
+        or "DATABRICKS_TOKEN"
+    )
+    token = _resolve_row_token(connection, token_env)
+    if not (host and warehouse_id and token):
+        return None
+    catalogs = config.get("semantic_layer_catalogs")
+    if isinstance(catalogs, str):
+        catalogs = [c.strip() for c in catalogs.split(",") if c.strip()]
+    if not catalogs:
+        catalogs = [catalog] if catalog else []
+    return {
+        "host": host,
+        "warehouse_id": warehouse_id,
+        "catalog": catalog,
+        "catalogs": catalogs,
+        "token": token,
+    }
+
+
+def _resolve_databricks_from_instance_config() -> dict[str, Any] | None:
+    """Legacy path: ``data_source.databricks.*`` (instance.yaml / /admin/server-config).
+
+    Kept byte-for-byte so an un-migrated instance (no databricks row yet)
+    keeps resolving exactly as before D2.2.
     """
     from app.instance_config import get_value
 
@@ -121,6 +176,27 @@ def resolve_databricks_settings() -> dict[str, Any] | None:
         "catalogs": catalogs,
         "token": token,
     }
+
+
+def resolve_databricks_settings(connection: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Read the instance's Databricks settings; ``None`` when unconfigured.
+
+    Row-first: with no explicit ``connection``, looks up the type's default
+    ``source_connections`` row (``resolve_source_connection("databricks")``)
+    and resolves from it when one exists — ``config.{host, warehouse_id,
+    catalog}``, token vault-first via :func:`_resolve_row_token`. Falls back
+    to the legacy ``data_source.databricks.*`` instance-config path —
+    byte-compatible — when no row is registered yet, which is also what
+    every existing zero-arg call and monkeypatch-based test exercises on an
+    instance that predates the connection registry.
+    """
+    if connection is None:
+        from src.connection_resolver import resolve_source_connection
+
+        connection = resolve_source_connection("databricks")
+    if connection is not None:
+        return _resolve_databricks_from_row(connection)
+    return _resolve_databricks_from_instance_config()
 
 
 def _source_ref_for_host(host: str) -> str:

@@ -129,13 +129,51 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `resolve_snowflake_settings`'s read set), and first-boot seeding
   (`app/connections_seed.py`) of default Snowflake and Databricks
   `source_connections` rows from `instance.yaml`, matching the existing
-  Keboola/BigQuery seeding. These rows are not yet consulted at query time —
-  Snowflake/Databricks/BigQuery still resolve from `instance.yaml` until a
-  follow-up makes the row live — see the connection-ownership table in
+  Keboola/BigQuery seeding — see the connection-ownership table in
   `docs/DATA_SOURCES.md`.
+- **The Snowflake/BigQuery/Databricks `source_connections` row is now the
+  live source of truth, resolved fresh on every call** (D2 slice 2):
+  `resolve_snowflake_settings()`/`resolve_databricks_settings()` and
+  `get_bq_access()` check the type's default connection row first, falling
+  back to `data_source.<type>.*` instance-config only when no row is
+  registered yet (byte-compatible with every existing deploy). `get_bq_access()`'s
+  process cache is now keyed on the resolved projects rather than held
+  forever, so an admin's saved connection is visible on the very next call —
+  no restart, no explicit cache-clear, on every process. A Snowflake
+  materialized sync (and every other threaded call site — extract-init,
+  discovery, v2 schema/scan, semantic syncs, card probes) now resolves
+  against exactly the registered connection's coordinates and credential.
+- **Security: a connection's config-embedded `token_env`/`private_key_env`/
+  `private_key_passphrase_env` (Snowflake/Databricks) is now allowlist-checked
+  at write time** (`POST`/`PUT /api/admin/source-connections`), the same
+  guard already applied to the top-level `token_env` field — closing a
+  one-shot exfiltration path where an admin could point one of these at an
+  unrelated secret's env name and have it shipped out as a Snowflake/
+  Databricks credential on the first attach, now that the row is
+  load-bearing. `connectors/snowflake/extract_init.py`'s own allowlist check
+  now runs BEFORE the ATTACH (defense in depth), refusing instead of merely
+  warning after the credential had already been sent.
 
 ### Changed
 
+- **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
+  Databricks panes now save the connection onto the `source_connections` ROW
+  (`POST`/`PUT /api/admin/source-connections*` + the row's own vault slot via
+  `.../secret`), not the `data_source.<type>` server-config yaml overlay** (D2
+  slice 2). The "restart the instance so the scheduler and workers pick up
+  connection settings" warning is gone from both panes — a row is read live
+  by every process, so there is nothing left to restart for; the Databricks
+  pane is a straight line to `/admin/tables` again (no held-open second
+  click). The connection-repoint confirmation (409
+  `connection_change_affects_registrations` / `confirm_connection_change`)
+  moves with it, onto `PUT /api/admin/source-connections/{id}` for Snowflake/
+  Databricks rows. **Operators who relied on the old flow**: a
+  `data_source.snowflake.*`/`data_source.databricks.*` yaml block hand-edited
+  via `/admin/server-config` is now IGNORED once a row of that type exists
+  (the row wins) — re-point the connection through `/admin/data-sources` or
+  `/admin/connections` instead. Multi-connection-per-type stays out of scope
+  for this slice — one Snowflake/Databricks connection per instance, as
+  before.
 - **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
   `experience`, `home_route` and `studio_enabled` knobs stop rewriting
   `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s

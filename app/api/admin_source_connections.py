@@ -14,7 +14,14 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        Response gains ``token_seeded``/``token_seed_error``
                                                        when this ran and something was actually seeded.
   GET    /api/admin/source-connections/{id}         — detail; 404 if missing
-  PUT    /api/admin/source-connections/{id}         — update config / token_env; 404 if missing
+  PUT    /api/admin/source-connections/{id}         — update config / token_env; 404 if missing.
+                                                       Snowflake/Databricks: 409
+                                                       ``connection_change_affects_registrations`` if the new
+                                                       config changes a connection-identity leaf
+                                                       (``app.connection_identity``) and the source already has
+                                                       registrations — resend with
+                                                       ``confirm_connection_change: true`` to apply (D2.3; see
+                                                       ``_guard_row_repoint``).
   DELETE /api/admin/source-connections/{id}         — delete; 404 if missing
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
@@ -140,6 +147,12 @@ class UpdateConnectionBody(BaseModel):
     config: Optional[Dict[str, Any]] = None
     token_env: Optional[str] = None
     is_default: Optional[bool] = None
+    # D2.3: Snowflake/Databricks connection identity (account/database/...,
+    # host/warehouse_id/...) moved off the `data_source.<type>` server-config
+    # yaml overlay onto this row — same repoint-confirmation contract as
+    # `app.api.admin.ServerConfigUpdateRequest.confirm_connection_change`,
+    # just re-keyed to the row. See `_guard_row_repoint`.
+    confirm_connection_change: bool = False
 
 
 class SecretBody(BaseModel):
@@ -269,6 +282,123 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
                 "or store the token in the vault via PUT .../secret instead."
             ),
         )
+
+
+#: Secret-ref NAME fields a connection's ``config`` can carry, per source_type.
+#: Snowflake/Databricks resolvers read these to know which env var (or the
+#: connection's own vault slot's env-var fallback) to pull a credential from
+#: — see connectors.snowflake.settings / connectors.databricks.semantic_layer.
+_CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
+    "snowflake": ("token_env", "private_key_env", "private_key_passphrase_env"),
+    "databricks": ("token_env",),
+}
+
+
+def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict[str, Any]]) -> None:
+    """Reject config-EMBEDDED secret-ref env var names that aren't on the
+    remote-attach allowlist — the same guard :func:`_reject_disallowed_token_env`
+    already applies to the request's top-level ``token_env`` field.
+
+    Snowflake needs up to three independent secret-ref NAMES at once
+    (``token_env`` OR ``private_key_env``, plus an optional passphrase), more
+    than the single top-level ``token_env`` column can hold, so
+    ``connectors.snowflake.settings``/``connectors.databricks.semantic_layer``
+    read these from ``config`` once a connection row becomes load-bearing
+    (D2.2). Without this call an admin could set ``config.token_env`` (or
+    ``private_key_env``) to an UNRELATED secret's env name (e.g.
+    ``ANTHROPIC_API_KEY``) plus an attacker-controlled ``account``/``host``,
+    and that secret would ship out as the Snowflake/Databricks credential on
+    the very next attach — `_validate_snowflake`/`_validate_databricks`
+    deliberately pass these fields through unvalidated (they are secret-ref
+    NAMES, not connection identity), so this is the one place that catches
+    it. Called at create/update, same as the top-level field.
+    """
+    fields = _CONFIG_TOKEN_ENV_FIELDS.get(source_type)
+    if not fields:
+        return
+    cfg = config or {}
+    for field in fields:
+        value = cfg.get(field)
+        if value is not None and not isinstance(value, str):
+            continue  # malformed, not a security concern here; the spec validator's problem
+        _reject_disallowed_token_env(value)
+
+
+#: Source types whose connection identity D2.3 relocated onto this row (off
+#: the `data_source.<type>` server-config yaml overlay). Keboola/BigQuery
+#: identity is guarded by their own existing mechanisms (Keboola's
+#: project-mismatch check on every token verify; BigQuery is out of scope
+#: for this slice) — extending the repoint guard to them is a separate change.
+_ROW_REPOINT_GUARDED_SOURCE_TYPES = ("snowflake", "databricks")
+
+
+def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirmed: bool) -> None:
+    """Refuse an unconfirmed identity-leaf change on a connection row that
+    already has registrations.
+
+    Same 409 ``connection_change_affects_registrations`` contract as
+    ``app.api.admin._guard_connection_repoint`` (which guards the
+    `data_source.<type>` server-config yaml overlay): D2.3 moves Snowflake/
+    Databricks connection identity off that overlay and onto this row, so the
+    repoint guard has to follow it here — a registration still resolves its
+    upstream against the instance's one connection per source
+    (`app/connection_identity.py`), and repointing it silently invalidates
+    every existing row of that source (stale `_remote_attach.url`/view body).
+
+    Fires only when the source already HAS registrations and only for
+    :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES` — first-time setup, a tuning-only
+    edit, or a source outside this slice's identity-relocation all save
+    straight through.
+    """
+    if confirmed:
+        return
+    source_type = row.get("source_type")
+    if source_type not in _ROW_REPOINT_GUARDED_SOURCE_TYPES:
+        return
+
+    from app.connection_identity import identity_changes
+
+    changes = identity_changes(source_type, row.get("config") or {}, new_config)
+    if not changes:
+        return
+    try:
+        affected = table_registry_repo().list_by_source(source_type)
+    except Exception:
+        # A registry the guard cannot read is not a reason to block a
+        # config save — the operator may be fixing exactly that.
+        logger.exception("connection-repoint guard: registry lookup failed for %s", source_type)
+        return
+    if not affected:
+        return
+
+    from app.api.admin import _REPOINT_SAMPLE_SIZE, _is_secret_key, _mask
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "connection_change_affects_registrations",
+            "source": source_type,
+            # Same masking rule as the audit diff — the field name carries
+            # the operator-relevant signal, so a credential-pointer leaf
+            # does not need its value echoed to be understood.
+            "changes": [
+                {
+                    "field": c["field"],
+                    "before": _mask(c["before"]) if _is_secret_key(c["field"]) else c["before"],
+                    "after": _mask(c["after"]) if _is_secret_key(c["field"]) else c["after"],
+                }
+                for c in changes
+            ],
+            "affected_tables": len(affected),
+            "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
+            "hint": (
+                f"{len(affected)} registered table(s) resolve against the current "
+                f"{source_type} connection and will stop resolving after this change; "
+                "they need re-registering (or a matching schema on the new "
+                "upstream). Resend with confirm_connection_change=true to apply."
+            ),
+        },
+    )
 
 
 def _validate_config_for_source_type(source_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -473,6 +603,7 @@ async def create_connection(
     # already checked here. Now it is. (Devin Review on this PR.)
     _validate_stack_url(body.config, required=False, resolve=False)
     config = _validate_config_for_source_type(body.source_type, body.config)
+    _reject_disallowed_config_token_envs(body.source_type, config)
     conn_id = str(uuid4())
     repo.create(
         id=conn_id,
@@ -518,6 +649,13 @@ async def update_connection(
     stack fail ``project_mismatch`` with no way to clear it from the UI. This
     is also the supported way to re-point a bound connection — see the note
     on :func:`project_mismatch_message`.
+
+    Snowflake/Databricks connections (D2.3 — identity relocated here off the
+    ``data_source.<type>`` server-config yaml overlay): a ``config`` change to
+    a connection-identity leaf (``app.connection_identity``) on a connection
+    that already has registrations is refused with 409
+    ``connection_change_affects_registrations`` unless
+    ``confirm_connection_change: true`` — see :func:`_guard_row_repoint`.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -532,6 +670,8 @@ async def update_connection(
     config = body.config
     if config is not None:
         config = _validate_config_for_source_type(existing_row.get("source_type"), config)
+        _reject_disallowed_config_token_envs(existing_row.get("source_type"), config)
+        _guard_row_repoint(existing_row, config, body.confirm_connection_change)
         old_config = existing_row.get("config") or {}
         old_stack = (old_config.get("stack_url") or "").rstrip("/")
         new_stack = (config.get("stack_url") or "").rstrip("/")
