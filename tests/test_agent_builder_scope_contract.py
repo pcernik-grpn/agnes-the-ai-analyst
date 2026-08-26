@@ -1,14 +1,16 @@
 """The /agents builder's declaration is the agent's ENFORCED scope.
 
-Before this, ``POST``/``PATCH /api/agents`` wrote only the ``knowledge`` /
-``plugins`` JSON columns and left all four ``*_mode`` columns at the
-repository default ``'all'`` — the passthrough shape. A builder agent the
-page showed as scoped to one data package therefore ran with its owner's
-ENTIRE stack, and could not be issued a PAT at all
-(``agents_admin.py::create_agent_token`` requires all four modes
-``'selected'``). This suite is the contract for the fix, driven end to end
-through the real surfaces: the builder endpoint writes the scope, the broker
-mints an ``AgentPrincipal`` for it, and a brokered query outside the declared
+Before this, ``POST``/``PATCH /api/agents`` (the builder's now-deleted
+adapter router, folded into ``/api/v1/agents`` by the remediation-program's
+"one agent model" Track C1) wrote only the ``knowledge`` / ``plugins`` JSON
+columns and left all four ``*_mode`` columns at the repository default
+``'all'`` — the passthrough shape. A builder agent the page showed as scoped
+to one data package therefore ran with its owner's ENTIRE stack, and could
+not be issued a PAT at all (``agents_admin.py::create_agent_token`` requires
+all four modes ``'selected'``). This suite is the contract for the fix,
+driven end to end through the real surfaces (now ``/api/v1/agents``, the
+builder's own wire shape): the endpoint writes the scope, the broker mints
+an ``AgentPrincipal`` for it, and a brokered query outside the declared
 scope is refused.
 
 Deliberately different from ``tests/test_agent_scope_e2e.py`` in two ways
@@ -24,7 +26,7 @@ that matter:
    catalog still listed them.
 
 Reverting either half of the fix fails a test here: dropping the mode/scope
-write in ``app/api/agents.py`` makes the out-of-scope query return 200
+write in ``app/api/agents_admin.py`` makes the out-of-scope query return 200
 (passthrough), and dropping the package expansion in
 ``src/agent_scope_intersection.py`` makes the in-scope query 403 (the agent
 loses the tables its owner only holds via a package).
@@ -131,7 +133,7 @@ def builder_env(e2e_env, mock_extract_factory, shared_app):
 
     # The builder call under test: declare the package holding t1 only.
     created = client.post(
-        "/api/agents",
+        "/api/v1/agents",
         json={"name": "Scoped Builder Agent", "knowledge": [pkg1], "status": "ready"},
         headers=_auth(owner_jwt),
     )
@@ -201,8 +203,8 @@ def test_builder_patch_rewrites_scope_and_preserves_governance_rows(builder_env)
     existing = [(i["item_type"], i["item_id"]) for i in repo.get_scope(agent_id)]
     repo.set_scope(agent_id, existing + [("slack_channel", "C123"), ("connection", "conn-1")])
 
-    r = builder_env["client"].patch(
-        f"/api/agents/{agent_id}",
+    r = builder_env["client"].put(
+        f"/api/v1/agents/{agent_id}",
         json={"knowledge": [builder_env["pkg2"]]},
         headers=_auth(builder_env["owner_jwt"]),
     )
@@ -223,8 +225,8 @@ def test_patch_that_does_not_touch_the_declaration_leaves_scope_alone(builder_en
 
     agent_id = builder_env["agent_id"]
     before = {(i["item_type"], i["item_id"]) for i in agents_repo().get_scope(agent_id)}
-    r = builder_env["client"].patch(
-        f"/api/agents/{agent_id}",
+    r = builder_env["client"].put(
+        f"/api/v1/agents/{agent_id}",
         json={"name": "Renamed"},
         headers=_auth(builder_env["owner_jwt"]),
     )
@@ -258,9 +260,7 @@ def test_builder_read_shows_cli_set_scope_so_an_edit_cannot_silently_drop_it(bui
     repo.set_scope(agent_id, [("plugin", "plug-a"), ("data_package", pkg)])
     repo.update(agent_id, knowledge="[]", plugins="[]")
 
-    r = builder_env["client"].get(
-        f"/api/agents/{agent_id}", headers=_auth(builder_env["owner_jwt"])
-    )
+    r = builder_env["client"].get(f"/api/v1/agents/{agent_id}", headers=_auth(builder_env["owner_jwt"]))
     assert r.status_code == 200, r.text
     body = r.json()
     assert "plug-a" in body["plugins"], "builder must show the CLI-set plugin scope"
@@ -269,8 +269,8 @@ def test_builder_read_shows_cli_set_scope_so_an_edit_cannot_silently_drop_it(bui
     # And the round trip is lossless: saving back what the screen showed keeps
     # it. (`_classify_knowledge` drops an id matching no registry, by design —
     # so this asserts on ids that really exist, which is the case that matters.)
-    r = builder_env["client"].patch(
-        f"/api/agents/{agent_id}",
+    r = builder_env["client"].put(
+        f"/api/v1/agents/{agent_id}",
         json={"knowledge": body["knowledge"], "plugins": body["plugins"]},
         headers=_auth(builder_env["owner_jwt"]),
     )
@@ -304,8 +304,8 @@ def test_partial_declaration_patch_keeps_the_axis_it_did_not_send(builder_env):
     repo.update(agent_id, knowledge="[]", plugins="[]")
 
     # Touch ONLY the capabilities axis.
-    r = builder_env["client"].patch(
-        f"/api/agents/{agent_id}",
+    r = builder_env["client"].put(
+        f"/api/v1/agents/{agent_id}",
         json={"plugins": ["plug-b"]},
         headers=_auth(builder_env["owner_jwt"]),
     )
@@ -344,14 +344,14 @@ def test_listing_reads_scope_once_for_the_whole_page(builder_env, monkeypatch):
 
     monkeypatch.setattr(type(repo), "get_scope", counting_single)
 
-    r = builder_env["client"].get("/api/agents", headers=_auth(builder_env["owner_jwt"]))
+    r = builder_env["client"].get("/api/v1/agents", headers=_auth(builder_env["owner_jwt"]))
     assert r.status_code == 200, r.text
-    listed = {a["id"] for a in r.json()["agents"]}
+    listed = {a["id"] for a in r.json()["data"]}
     assert {"n1", "n2", "n3"} <= listed
 
     assert calls == [], f"listing must not read scope per agent, got {calls}"
     # …and the batched read really did hydrate: the declaration is not empty.
-    by_id = {a["id"]: a for a in r.json()["agents"]}
+    by_id = {a["id"]: a for a in r.json()["data"]}
     assert by_id["n1"]["plugins"] == ["p-n1"]
 
 
@@ -393,11 +393,9 @@ def test_builder_agent_cannot_reach_outside_its_declared_scope(builder_env):
 def test_intersection_is_exactly_the_declaration(builder_env):
     """Unit-level cross-check of the same property, so a failure localizes:
     the enforced table set is the declared package's members, nothing more."""
-    from src.agent_scope_intersection import compute_agent_intersection
-    from src.repositories import agents_repo
+    from src.agent_scope_intersection import resolve_agent_authority
 
-    row = agents_repo().get_by_id(builder_env["agent_id"])
-    enforced = compute_agent_intersection("owner1", row)
+    enforced = resolve_agent_authority(builder_env["agent_id"])
     assert enforced.get("table") == frozenset({builder_env["t1_id"]})
     assert builder_env["t2_id"] not in enforced.get("table", frozenset())
     assert enforced.get("data_package") == frozenset({builder_env["pkg1"]})
@@ -415,7 +413,6 @@ def test_agent_cannot_reach_past_the_owners_own_stack_in_classic_mode(builder_en
     exactly that package's tables: strictly more than its owner has, which
     is the one thing the intersection exists to prevent.
     """
-    from src.repositories import agents_repo
     from tests.conftest import grant_table_via_package
 
     monkeypatch.setattr("app.instance_config.get_stack_auto_membership", lambda: False, raising=False)
@@ -445,8 +442,8 @@ def test_agent_cannot_reach_past_the_owners_own_stack_in_classic_mode(builder_en
     conn.close()
 
     agent_id = builder_env["agent_id"]
-    r = builder_env["client"].patch(
-        f"/api/agents/{agent_id}",
+    r = builder_env["client"].put(
+        f"/api/v1/agents/{agent_id}",
         json={"knowledge": [pkg_avail]},
         headers=_auth(builder_env["owner_jwt"]),
     )
@@ -459,9 +456,9 @@ def test_agent_cannot_reach_past_the_owners_own_stack_in_classic_mode(builder_en
     owner_may = can_access_table({"id": "owner1", "email": "owner@test.com"}, t3_id)
     assert owner_may is False, "fixture is wrong — the owner must NOT reach this table in classic mode"
 
-    from src.agent_scope_intersection import compute_agent_intersection
+    from src.agent_scope_intersection import resolve_agent_authority
 
-    enforced = compute_agent_intersection("owner1", agents_repo().get_by_id(agent_id))
+    enforced = resolve_agent_authority(agent_id)
     assert t3_id not in enforced.get("table", frozenset()), (
         "the agent reached a table its owner cannot query — the owner side must honour the "
         "stack formula, not raw grants"

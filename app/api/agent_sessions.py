@@ -17,10 +17,11 @@ outright — it would kill the agent-PAT flow this surface must support (per
 `app.auth.pat_resolver`'s `_AGENT_PAT_ALLOWED_PREFIXES`, agent PATs ARE
 allowed against `/api/v1/sessions/*`). `require_session_principal` below is
 the session-scoped auth dependency built for this router: resolve the
-session's owning agent, then allow either the agent's owner (interactive
-session token) or an agent PAT bound to that exact agent — anything else is
-`404`, never `403`, so a non-owner can't distinguish "session exists,
-not yours" from "session doesn't exist".
+session's owning agent, then allow the agent's owner, the session's OWN
+creator (C2.3, shared-agent runtime — a grantee driving a session they
+themselves started against a shared agent), or an agent PAT bound to that
+exact agent — anything else is `404`, never `403`, so a non-owner can't
+distinguish "session exists, not yours" from "session doesn't exist".
 
 The exact AG-UI wire format `_event_stream` below produces (event order,
 lifecycle balance, gap-free `id:` sequencing) is a contract — see
@@ -155,12 +156,22 @@ def require_session_principal(
     A co-session (`SessionPrincipal`) credential carries no single owner
     identity — hard-denied, same posture as
     `require_agent_runtime_principal`. Every other failure (session
-    missing, agent missing/deleted, wrong owner, agent PAT bound to a
+    missing, agent missing/deleted, wrong caller, agent PAT bound to a
     DIFFERENT agent than this session's) collapses to the SAME `404` —
     never `403` — so a non-owner request can't distinguish "no such
     session" from "not yours".
 
-    Once ownership is established, re-check the `ResourceType.CHAT` grant —
+    Access (C2.3, shared-agent runtime): the agent's OWNER may always drive
+    any session bound to their agent; a non-owner may drive only the
+    session THEY THEMSELVES created (`session.user_email == user["email"]`
+    — set server-side at creation time by `ChatManager.create_session`,
+    never client-suppliable). Deliberately narrower than "any current
+    grantee of this agent": a runnable grant lets a user START their own
+    sessions against a shared agent (gated at creation by
+    `require_agent_runtime_principal`'s `get_runnable_by_slug` check), not
+    read or drive a DIFFERENT grantee's session.
+
+    Once identity is established, re-check the `ResourceType.CHAT` grant —
     the same check `require_agent_runtime_principal` applies for
     `/agents/{slug}/sessions` and `/responses` (`can_access(..., "chat")`).
     Sessions can outlive the grant that let their owner create them (a
@@ -185,7 +196,7 @@ def require_session_principal(
     if pat_agent_id is not None:
         if pat_agent_id != agent["id"]:
             raise HTTPException(status_code=404, detail={"code": "session_not_found"})
-    elif agent["owner_user_id"] != user["id"]:
+    elif agent["owner_user_id"] != user["id"] and session.user_email != user["email"]:
         raise HTTPException(status_code=404, detail={"code": "session_not_found"})
 
     if not can_access(user["id"], ResourceType.CHAT.value, "chat", conn):

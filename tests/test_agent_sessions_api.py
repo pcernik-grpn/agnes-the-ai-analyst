@@ -9,6 +9,12 @@ feeds the seated `StreamingSink` a canned `ready -> token -> assistant_message
 `_pump_subprocess_to_ws` do for a real session. Session rows themselves are
 real (`chat_session_repo()`/`chat_message_repo()`) so `require_session_principal`
 exercises its actual DB-backed ownership check, not a mock.
+
+C2.3 (shared-agent runtime) widened session CREATION from owner-only to
+owner-or-runnable-grantee (see the "Shared-agent runtime" section below) —
+session ACCESS stayed narrower than "any current grantee": a grantee may
+only drive the session THEY created, never a different grantee's, which
+`test_a_different_grantee_cannot_drive_someone_elses_session` pins.
 """
 
 from __future__ import annotations
@@ -402,6 +408,70 @@ def test_post_message_cross_owner_returns_404(env, monkeypatch):
         headers=_auth(env["other_token"]),
     )
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Shared-agent runtime (C2.3): a grantee may create AND drive their OWN
+# session against a shared agent, but not someone else's session against
+# that same shared agent — "run+read", never "read anyone's session".
+# ---------------------------------------------------------------------------
+
+
+def _grant_agent_to_group(user_id: str, agent_id: str, group_name: str) -> None:
+    from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo
+
+    grp = user_groups_repo().get_by_name(group_name)
+    if grp is None:
+        grp = user_groups_repo().create(name=group_name, created_by="owner1")
+    user_group_members_repo().add_member(user_id, grp["id"], source="admin", added_by="owner1")
+    if not resource_grants_repo().has_grant([grp["id"]], "agent", agent_id):
+        resource_grants_repo().create(grp["id"], "agent", agent_id, assigned_by="owner1")
+
+
+def test_grantee_can_create_and_drive_their_own_session_against_a_shared_agent(env, monkeypatch):
+    """Pre-C2.3 this 404'd at session creation (`agent_not_found`) — the
+    grantee is neither the owner nor holds a slug in this agent's
+    namespace, so it must be addressed by id."""
+    _grant_agent_to_group("other1", env["agent_id"], "c23-sessions-api-grp")
+
+    session_id = _create_session(env, monkeypatch, slug=env["agent_id"], token=env["other_token"])
+    manager = FakeManager()
+    _patch_manager(monkeypatch, manager)
+
+    r = env["client"].post(
+        f"/api/v1/sessions/{session_id}/messages",
+        json={"input": "hi"},
+        headers=_auth(env["other_token"]),
+    )
+    assert r.status_code == 200, r.text
+    assert manager.sent_messages == [(session_id, "hi", "other@test.com")]
+
+
+def test_a_different_grantee_cannot_drive_someone_elses_session(env, monkeypatch):
+    """Two members of the SAME group both hold a runnable grant on the
+    agent -- that grant lets each of them START their own sessions, not
+    read or drive a DIFFERENT grantee's."""
+    from src.db import get_system_db
+    from src.repositories.users import UserRepository
+
+    conn = get_system_db()
+    UserRepository(conn).create(id="other2", email="other2@test.com", name="Other Two")
+    conn.close()
+    other2_token = create_access_token("other2", "other2@test.com")
+
+    _grant_agent_to_group("other1", env["agent_id"], "c23-sessions-api-grp")
+    _grant_agent_to_group("other2", env["agent_id"], "c23-sessions-api-grp")
+
+    session_id = _create_session(env, monkeypatch, slug=env["agent_id"], token=env["other_token"])
+    manager = FakeManager()
+    _patch_manager(monkeypatch, manager)
+
+    r = env["client"].post(
+        f"/api/v1/sessions/{session_id}/messages",
+        json={"input": "hi"},
+        headers=_auth(other2_token),
+    )
+    assert r.status_code == 404, r.text
 
 
 def test_post_message_revoked_chat_grant_returns_403(env, monkeypatch):

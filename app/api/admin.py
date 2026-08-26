@@ -576,7 +576,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "server": "restart",  # partial and conservative: get_public_url() is read fresh at most call sites, but app.state.public_url is snapshotted ONCE at startup for the Slack Socket-Mode dispatcher (app/main.py — it has no inbound request to derive a host from); no live per-request reader was found for server.host/server.hostname
     "email": "restart",  # conservative: the actual SMTP send path (app/auth/providers/email.py, password.py) reads SMTP_HOST/SMTP_USER/SMTP_PASSWORD straight from os.environ, never from get_value("email", ...) — a save here was not observed to change behavior at all, live or restart; "restart" is the non-overclaiming answer
     "telegram": "restart",  # services/telegram_bot/bot.py reads instance.yaml ONCE at module import, in a separate process — restarting the API alone does not refresh it
-    "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above
+    "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above. NARROWED scope since D2.2/D2.3: this classification covers writes to THIS yaml overlay only — the Add-data wizard's Snowflake/Databricks panes (and every Keboola/BigQuery connection edit) now write the `source_connections` ROW instead (PUT/POST /api/admin/source-connections*), which every process reads live straight off the DB with no cache to bounce, so those saves carry no restart notice at all. A hand-edited `data_source.snowflake.*`/`data_source.databricks.*` yaml block is IGNORED (not merely stale) once a row of that type exists — connections_seed.py's own deprecation-warning pattern, not this restart flag — but still reachable (and still genuinely restart-classified) on an un-migrated instance with no row yet, or for a source this section still owns end-to-end (keboola's stack_url predates the registry too, though its own CRUD long since moved to source_connections as well).
     "corporate_memory": "restart",  # partial: most keys (distribution_mode/approval_mode/sources.*) are read fresh via get_corporate_memory_config() per page render, but corporate_memory.confidence is applied ONCE at startup via services/corporate_memory/confidence.configure() (app/main.py) — conservative for the whole section, same reasoning as auth
     "openmetadata": "live",  # src/catalog_export.py reads instance config fresh at each invocation (a standalone job, not a long-lived cached client)
 }
@@ -1726,6 +1726,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Organization, Verified, or Community. Turn it off to restore "
                 "the older look, where an unverified item is marked only by the "
                 "absence of a marker. Organization and Verified are unaffected."
+            ),
+        },
+        "auto_share_admin_uploads": {
+            "kind": "bool",
+            "default": False,
+            "hint": (
+                "Share a collection an admin creates in the Library with the "
+                "Everyone group at creation, so admin uploads are visible to "
+                "the whole workspace with no manual share step. The grant is "
+                "an ordinary Everyone grant — revocable per collection in the "
+                "Share dialog. Off by default: turning it on changes only "
+                "collections created afterwards. Non-admin uploads and chat "
+                "file drops stay private."
             ),
         },
     },

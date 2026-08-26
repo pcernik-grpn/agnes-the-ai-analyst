@@ -47,6 +47,27 @@ web UI works on a fresh deployment without an offline asset pipeline.
   single-file vendoring cannot serve. This build ends with
   `globalThis["mermaid"] = …`, so a plain script tag is enough.
 
+## lucide-sprite.svg
+
+- **Project:** [Lucide](https://lucide.dev) — icon set
+- **Version:** icon bodies from `@iconify-json/lucide` 1.2.118
+- **License:** ISC (https://github.com/lucide-icons/lucide/blob/main/LICENSE)
+- **Source:** generated — a curated subset of Lucide as one SVG sprite
+  (`<symbol id="<lucide-name>">` per icon). The canonical name list lives in
+  `src/chat_icons.py`; `tests/test_chat_icons.py` fails if the sprite and the
+  list drift.
+- **Used in:** injected inline into every page by
+  `app/web/static/js/icon_sprite.js` (external-document `<use>` only works in
+  Safari 17.1+), then referenced same-document by
+  `app/web/static/js/chat_icons.js` (chat tool-card status icons and the
+  model-facing `icon:<name>` inline vocabulary, #1503) and the
+  `ds.icon(name)` macro in `app/web/templates/_components.html`.
+- **Regenerating** (after editing `src/chat_icons.py`): download
+  `https://cdn.jsdelivr.net/npm/@iconify-json/lucide@<VER>/icons.json`, then
+  for every name in `ALL_ICON_NAMES` emit
+  `<symbol id="<name>" viewBox="0 0 24 24"><body></symbol>` into the sprite
+  (resolve iconify aliases via `aliases[name].parent`).
+
 ## Updating
 
 To refresh a vendored asset:

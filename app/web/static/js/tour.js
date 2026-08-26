@@ -177,8 +177,9 @@ export const TOURS = {
   // on my own", primary reads "Got it"), and autoLaunchTour's localStorage gate
   // means it appears exactly once.
   //
-  // `awaitAnchor`: the list view is client-rendered after /api/agents resolves,
-  // so `[data-ag-new]` is genuinely absent for the first frames after load.
+  // `awaitAnchor`: the list view is client-rendered after /api/v1/agents
+  // resolves, so `[data-ag-new]` is genuinely absent for the first frames
+  // after load.
   // Without the wait the step resolves to nothing and is silently dropped — the
   // failure mode that lets a coach-mark go unnoticed rather than visibly broken.
   // Deliberately NO fallback selector: a fallback present on the first frame
@@ -607,7 +608,7 @@ function _resolveAnchor(step) {
 }
 
 // Some anchors are rendered by their own page's JS after a fetch resolves — the
-// Agents list is built from /api/agents — so on a cross-page hop they are
+// Agents list is built from /api/v1/agents — so on a cross-page hop they are
 // legitimately absent for the first frames after load. Resolving once and
 // dropping the step on a miss turns that race into a step nobody ever sees,
 // which is invisible: the tour just gets shorter. A step that knows its anchor

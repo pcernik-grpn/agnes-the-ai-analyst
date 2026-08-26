@@ -53,9 +53,9 @@ def test_clipboard_strips_next_actions_but_keeps_sources():
     tests/test_chat_sources_ui.py for the full rationale)."""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(primary, stripSourcesFence" not in js
+    assert "attachMessageActions(tailArticle, stripSourcesFence" not in js
 
 
 def test_extract_next_actions_executable():
@@ -689,7 +689,7 @@ def test_no_bare_details_box_rule_can_flatten_a_tool_card():
     that needed such a rule is gone — both paths build the same card. Only
     the code-block rules may stay broad: they paint the highlighted JSON
     INSIDE the cards."""
-    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
     for rule in re.finditer(r"\.(?:cloud-chat-messages|msg-bubble)\s+(?:\.msg-bubble\s+)?details([^{]*)\{", css):
         rest = rule.group(1)
         assert "code" in rest or "pre.code-block-wrap" in rest, (
@@ -725,14 +725,15 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
         "the persisted state maps onto the same is-error / is-done classes a live result produces"
     )
-    assert 'icon.textContent = "✓"' in fn and 'icon.textContent = "⚠"' in fn
+    # Sprite icons since #1503 — check for done, triangle-alert for error.
+    assert 'iconEl("check")' in fn and 'iconEl("triangle-alert")' in fn
     # Neutral only when there is genuinely nothing to report: the fallback
     # class, and an icon appended only when it has content.
     assert 'let statusClass = "is-replayed"' in fn
-    assert "if (icon.textContent) head.appendChild(icon)" in fn, (
+    assert "if (icon.firstChild) head.appendChild(icon)" in fn, (
         "a stateless (pre-v123) part must not get an empty icon slot"
     )
-    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
     replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
     replayed = replayed[: replayed.index("}")]
     assert "accent-success" not in replayed and "accent-info" not in replayed, (
@@ -759,9 +760,9 @@ def test_replayed_cards_are_siblings_in_the_messages_column():
     assert 'for (const node of nodes) $("chat-messages").appendChild(node)' in body, (
         "every node — bubbles and cards alike — is appended to the messages column in order"
     )
-    # The collapse measures the primary article after insertion; the cards and
-    # continuations are siblings, not part of the answer's height.
-    assert body.index('for (const node of nodes)') < body.index("maybeMakeCollapsible(primary)")
+    # The collapse measures the tail article after insertion; the cards and
+    # earlier segments are siblings, not part of the answer's height.
+    assert body.index("for (const node of nodes)") < body.index("maybeMakeCollapsible(tailArticle)")
 
 
 def test_history_renders_parts_in_order_with_nothing_hoisted():
@@ -825,7 +826,6 @@ def test_a_tool_first_turn_reloads_card_before_prose():
     # And the shipped code contains no index-based text selection that would
     # reintroduce the hoist.
     assert "textParts[0]" not in fn
-
 
 
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():

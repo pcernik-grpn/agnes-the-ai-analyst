@@ -50,6 +50,134 @@ def repo(request, tmp_path, pg_engine, monkeypatch):
         yield r
 
 
+def _make_duckdb_stack(tmp_path):
+    from src.db import _ensure_schema
+    from src.duckdb_conn import _open_duckdb
+    from src.repositories.agents import AgentsRepository
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = _open_duckdb(str(tmp_path / "duck.duckdb"))
+    _ensure_schema(conn)
+    return (
+        AgentsRepository(conn),
+        UserGroupsRepository(conn),
+        UserGroupMembersRepository(conn),
+        ResourceGrantsRepository(conn),
+        conn,
+    )
+
+
+def _make_pg_stack(pg_engine, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    engine = db_pg.get_engine()
+
+    from src.repositories.agents_pg import AgentsPgRepository
+    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+    from src.repositories.user_group_members_pg import UserGroupMembersPgRepository
+    from src.repositories.user_groups_pg import UserGroupsPgRepository
+
+    return (
+        AgentsPgRepository(engine),
+        UserGroupsPgRepository(engine),
+        UserGroupMembersPgRepository(engine),
+        ResourceGrantsPgRepository(engine),
+        None,
+    )
+
+
+@pytest.fixture(params=["duckdb", "pg"])
+def stack(request, tmp_path, pg_engine, monkeypatch):
+    """``(agents_repo, user_groups_repo, user_group_members_repo,
+    resource_grants_repo)`` sharing one connection/engine — for tests that
+    need to seed groups + grants alongside agent rows (C2.3
+    ``get_runnable_by_slug``)."""
+    if request.param == "duckdb":
+        agents, groups, members, grants, conn = _make_duckdb_stack(tmp_path)
+        yield agents, groups, members, grants
+        conn.close()
+    else:
+        agents, groups, members, grants, _ = _make_pg_stack(pg_engine, monkeypatch)
+        yield agents, groups, members, grants
+
+
+def test_get_runnable_by_slug_owned(stack):
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    row = agents.get_runnable_by_slug("u1", "finance")
+    assert row is not None and row["id"] == "a1"
+
+
+def test_get_runnable_by_slug_owner_may_also_address_by_id(stack):
+    """ "Runtime paths accept slug or id" holds for the OWNER too, not only
+    a grantee — addressing by id must not require a grant just because it
+    took the id-shaped branch."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    row = agents.get_runnable_by_slug("u1", "a1")
+    assert row is not None and row["id"] == "a1"
+
+
+def test_get_runnable_by_slug_denies_stranger(stack):
+    """Neither the owner's slug nor the agent's id resolve for a user with
+    no ownership and no grant — this is the pre-C2.3 behavior (404
+    everywhere) and must stay true absent a grant."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    assert agents.get_runnable_by_slug("u2", "finance") is None
+    assert agents.get_runnable_by_slug("u2", "a1") is None
+
+
+def test_get_runnable_by_slug_unknown_returns_none(stack):
+    """A slug/id that matches no agent at all resolves to None on both
+    backends — the outright miss branch, distinct from an agent that exists
+    but the caller may not reach."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    assert agents.get_runnable_by_slug("u1", "does-not-exist") is None
+    assert agents.get_runnable_by_slug("u1", "a9999") is None
+
+
+def test_get_runnable_by_slug_via_group_grant_resolves_by_id(stack):
+    """A shared agent is addressed by its id, not the owner's slug — slug
+    is only unique per-owner, so it is meaningless in a grantee's
+    namespace."""
+    agents, groups, members, grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    group = groups.create(name="finance-team", created_by="admin")
+    members.add_member("u2", group["id"], source="admin")
+    grants.create(group["id"], "agent", "a1", assigned_by="admin")
+
+    row = agents.get_runnable_by_slug("u2", "a1")
+    assert row is not None and row["id"] == "a1"
+    # borrowing the OWNER's slug string must not resolve for the grantee
+    assert agents.get_runnable_by_slug("u2", "finance") is None
+
+
+def test_get_runnable_by_slug_excludes_soft_deleted(stack):
+    agents, groups, members, grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    group = groups.create(name="finance-team", created_by="admin")
+    members.add_member("u2", group["id"], source="admin")
+    grants.create(group["id"], "agent", "a1", assigned_by="admin")
+    agents.soft_delete("a1")
+
+    assert agents.get_runnable_by_slug("u2", "a1") is None
+    assert agents.get_runnable_by_slug("u1", "finance") is None
+
+
 def test_create_get_roundtrip(repo):
     repo.create(id="a1", owner_user_id="u1", name="Sales reporter", slug="sales-reporter")
     row = repo.get_by_slug("u1", "sales-reporter")
@@ -140,7 +268,10 @@ def test_scope_replace_all(repo):
     repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
     repo.set_scope("a1", [("plugin", "p1"), ("table", "t1")])
     repo.set_scope("a1", [("plugin", "p2")])
-    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2"}]
+    # `granted_by` defaults to None on both backends when the caller doesn't
+    # pass one (C2.1) — see test_granted_by_* below for the PG-persists /
+    # DuckDB-drops split.
+    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2", "granted_by": None}]
 
 
 def test_get_scope_for_agents_batches_the_same_rows(repo):
@@ -192,7 +323,7 @@ def test_update_whitelists_are_identical_across_backends():
 
 
 def test_slug_is_updatable_on_both_backends(repo):
-    """Renaming a draft re-derives its slug (app/api/agents.py).
+    """Renaming a draft re-derives its slug (app/api/agents_admin.py).
 
     That write goes through ``update``, so ``slug`` must be whitelisted —
     and the row must remain addressable under the NEW slug and gone from
@@ -276,3 +407,76 @@ def test_agent_for_scope_item_skips_deleted_agents(repo):
     repo.set_scope("a-gone", [("slack_channel", "C777")])
     repo.soft_delete("a-gone")
     assert repo.agent_for_scope_item("slack_channel", "C777") is None
+
+
+# ---------------------------------------------------------------------------
+# C2.1 — agent_scope.granted_by. A genuine schema change on an existing pair
+# is PG-only under the A3 ratchet
+# (`.claude/skills/agnes-conventions/references/migration.md` -> "Adding a
+# PG-only feature"; `docs/migrations.md` -> "Extending an EXISTING (frozen
+# pre-A3) pair"): the column lives on Postgres alone, so these two tests are
+# deliberately NOT parametrized over the shared `repo` fixture — each drives
+# its own backend directly to pin the intentional asymmetry (persists on PG,
+# silently dropped on DuckDB, same call shape either way).
+# ---------------------------------------------------------------------------
+
+
+def test_granted_by_persists_on_postgres(pg_engine, monkeypatch):
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.set_scope("a1", [("table", "t1"), ("plugin", "p1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [
+        {"item_type": "plugin", "item_id": "p1", "granted_by": "admin1"},
+        {"item_type": "table", "item_id": "t1", "granted_by": "admin1"},
+    ]
+    # A later replace with a different writer re-attributes every row this
+    # call writes that is NEW — one `set_scope` call has exactly one writer
+    # for the rows it actually introduces. "p2" was never declared before,
+    # so it is attributed to the new writer.
+    repo.set_scope("a1", [("plugin", "p2")], granted_by="owner1")
+    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2", "granted_by": "owner1"}]
+
+
+def test_granted_by_is_preserved_across_a_replace_for_unchanged_rows(pg_engine, monkeypatch):
+    """C2.2 must-handle: a full-replace `set_scope` call that re-declares a
+    row UNCHANGED must not re-attribute it to the new writer.
+
+    `_sync_builder_scope` (`app/api/agents_builder_shared.py`) reads back
+    every governance-owned row it does not itself own (`preserved`) and
+    passes it straight through `set_scope` alongside the builder's own
+    `declared` items — one call, one `granted_by` kwarg. Without this
+    preservation, an admin-granted `data_package` row would silently
+    downgrade to owner-granted (and lose D-C2's unconditioned resolution)
+    the next time the (non-admin) owner saves the builder page for an
+    unrelated reason (adding a plugin, say) — see
+    `docs/superpowers/plans/2026-08-26-one-agent-model.md` C2.2's
+    must-handle note.
+    """
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    repo.create(id="a1", owner_user_id="owner1", name="A", slug="x")
+
+    # Admin grants a data_package.
+    repo.set_scope("a1", [("data_package", "pkg1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [{"item_type": "data_package", "item_id": "pkg1", "granted_by": "admin1"}]
+
+    # Owner later does a full-replace save touching an unrelated axis
+    # (adding a plugin), re-declaring pkg1 unchanged alongside it — the
+    # exact shape `_sync_builder_scope` produces (preserved + declared).
+    repo.set_scope("a1", [("data_package", "pkg1"), ("plugin", "p1")], granted_by="owner1")
+
+    scope = {(r["item_type"], r["item_id"]): r["granted_by"] for r in repo.get_scope("a1")}
+    assert scope[("data_package", "pkg1")] == "admin1"  # UNCHANGED — still admin-granted
+    assert scope[("plugin", "p1")] == "owner1"  # genuinely new -> attributed to this writer
+
+
+def test_granted_by_is_dropped_on_duckdb(tmp_path):
+    """DuckDB has no `granted_by` column: `set_scope` accepts the kwarg so
+    both call sites (`app/api/agents_admin.py`,
+    `app/api/agents_builder_shared.py`) work unmodified regardless of the
+    active backend, but the write is a documented no-op here — the DuckDB
+    side of this pair gains no capability that depends on the column."""
+    repo, conn = _make_duckdb_repo(tmp_path)
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.set_scope("a1", [("table", "t1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [{"item_type": "table", "item_id": "t1", "granted_by": None}]
+    conn.close()

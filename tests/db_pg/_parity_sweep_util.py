@@ -114,8 +114,44 @@ def build_seeded_client(backend, tmp_path, monkeypatch, pg_engine):
     from app.main import create_app
     from fastapi.testclient import TestClient
 
-    client = TestClient(create_app())
+    fastapi_app = create_app()
+    _reregister_requires_pg_handler(fastapi_app)
+    client = TestClient(fastapi_app)
     return client, create_access_token("admin1", "admin@test.com")
+
+
+def _reregister_requires_pg_handler(fastapi_app) -> None:
+    """Re-bind app/main's typed-501 handler to the *current*
+    ``RequiresPostgresBackend`` class.
+
+    ``build_seeded_client`` reloads ``src.repositories``, which rebinds
+    ``RequiresPostgresBackend`` to a NEW class object. ``app.main`` imported
+    the class once, at ITS import time, and ``create_app`` registers the
+    501-translation handler against that original object; Starlette resolves
+    handlers by walking the raised exception's MRO, which never contains the
+    pre-reload class. So without this step, the first real PG-only exemption
+    would raise the post-reload class, miss the handler, and fall through to
+    the catch-all 500 — and ``assert_pg_only_exemptions_fail_clean`` would
+    report a crash where production (which never reloads the module) answers
+    the typed 501. Test-harness repair for a test-harness artifact: the
+    production registration in ``app/main.py`` stays untouched.
+
+    Regression: ``test_pg_only_route_exemption_mechanism.py::
+    test_post_reload_raise_still_translates_to_typed_501``.
+    """
+    import app.main as app_main
+    import src.repositories
+
+    current_cls = src.repositories.RequiresPostgresBackend
+    if current_cls in fastapi_app.exception_handlers:
+        return  # app.main's binding is already the current class — nothing to do
+    handler = fastapi_app.exception_handlers.get(app_main.RequiresPostgresBackend)
+    assert handler is not None, (
+        "app/main.py no longer registers an exception handler for "
+        "RequiresPostgresBackend — the parity sweeps' fail-clean check "
+        "depends on that typed 501 translation"
+    )
+    fastapi_app.add_exception_handler(current_cls, handler)
 
 
 def collect_statuses(client, token, *, methods, skip_substr=()):

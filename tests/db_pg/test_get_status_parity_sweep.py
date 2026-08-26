@@ -47,6 +47,15 @@ def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engin
     # Postgres repos through DuckDB-configured routes.
     assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
 
+    # The fail-clean check MUST run before the pg client is built:
+    # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it
+    # live on every *_repo() call, so after that point requests through the
+    # "DuckDB" client resolve repos on Postgres and the typed-501-on-DuckDB
+    # check would exercise the wrong backend. Ordering pinned by
+    # test_pg_only_route_exemption_mechanism.py::
+    # test_sweeps_run_fail_clean_check_before_pg_client_build.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
+
     pg_client, pg_token = build_seeded_client("pg", tmp_path / "pg", monkeypatch, pg_engine)
     pg = collect_statuses(pg_client, pg_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
 

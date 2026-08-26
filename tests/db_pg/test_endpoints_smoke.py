@@ -2728,11 +2728,13 @@ KNOWN_UNTESTED = {
     # tests/test_web_library_sharing.py (DuckDB) and, for the repository layer,
     # the cross-engine tests/db_pg/test_agents_contract.py; no dedicated PG
     # smoke class yet, same convention as the stack rows below.
-    "GET /api/agents",
-    "POST /api/agents",
-    "GET /api/agents/{agent_id}",
-    "PATCH /api/agents/{agent_id}",
-    "DELETE /api/agents/{agent_id}",
+    #
+    # `/api/agents*` (the builder's own adapter router) is NOT listed here
+    # any more — it was deleted outright by the remediation-program's "one
+    # agent model" Track C1 (Task C1.2), so its routes no longer exist at
+    # all rather than being merely untested. `/api/v1/agents*` (which
+    # absorbed its wire shape in Task C1.1) is the sole surviving surface —
+    # already covered elsewhere, unaffected by that deletion.
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",

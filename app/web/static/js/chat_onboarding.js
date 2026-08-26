@@ -668,7 +668,7 @@ function wireRefreshListener() {
 function greetOnce(synced) {
   if (journey.onboarded) return;
   hooks.renderAssistant(
-    "Hi, I'm **Agnes** 👋 I'll answer using the company knowledge in your Stack, and I'll always say where an answer came from.",
+    "Hi, I'm **Agnes** `icon:hand` I'll answer using the company knowledge in your Stack, and I'll always say where an answer came from.",
   );
   if (synced === false) {
     hooks.renderAssistant(

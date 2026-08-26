@@ -147,6 +147,70 @@ def _file_out(row: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _maybe_auto_share_admin_upload(corpus_id: str, user: dict) -> str:
+    """Auto-share an admin's fresh Library upload to Everyone when
+    ``library.auto_share_admin_uploads`` is on; returns the collection's
+    resulting visibility (``"workspace"`` or ``"private"``).
+
+    Writes the same ordinary Everyone grant the share dialog would, so the
+    owner can revoke it per collection there — "auto" changes the default,
+    not the mechanics. Deliberately scoped to this creation path: the
+    chat-drop path (``app.corpus_ingest.create_single_file_artefact``) never
+    routes here, so an admin's ad-hoc chat file is not published.
+
+    A failed grant write must not fail the create — the collection then
+    stays private, and that is said out loud (``visibility: "private"`` in
+    the response plus a warning log) rather than silently reproducing the
+    "only admin sees the files" state this flag exists to prevent.
+    """
+    from app.auth.session_principal import PRINCIPAL_TYPES
+    from app.switches import switch_value
+
+    if isinstance(user, PRINCIPAL_TYPES):
+        # Restricted principal (co-session / agent-session): never an admin,
+        # so never an auto-share. Explicit per the PRINCIPAL_TYPES seam
+        # contract (app/auth/session_principal.py) — without this the same
+        # outcome would ride an accidental TypeError into the except below.
+        return "private"
+
+    try:
+        if not switch_value("library_auto_share_admin_uploads"):
+            return "private"
+        if not is_user_admin(user["id"]):
+            return "private"
+        from app.resource_types import ResourceType
+        from src.db import SYSTEM_EVERYONE_GROUP
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+        if not everyone:
+            logger.warning(
+                "auto_share_admin_uploads: %r group missing — collection %s left private",
+                SYSTEM_EVERYONE_GROUP,
+                corpus_id,
+            )
+            return "private"
+        resource_grants_repo().ensure_grant(
+            everyone["id"],
+            ResourceType.COLLECTION.value,
+            corpus_id,
+            assigned_by=user["id"],
+        )
+        logger.info(
+            "collection %s auto-shared to Everyone by admin %s (library.auto_share_admin_uploads)",
+            corpus_id,
+            user.get("email"),
+        )
+        return "workspace"
+    except Exception:
+        logger.warning(
+            "auto_share_admin_uploads: grant write failed — collection %s left private",
+            corpus_id,
+            exc_info=True,
+        )
+        return "private"
+
+
 @router.post("", status_code=201)
 async def create_collection(
     payload: CreateCollectionRequest,
@@ -157,9 +221,13 @@ async def create_collection(
     The corpus is owned by the creator (``created_by``) and is private to
     them — reachable via ownership without a ``resource_grants`` row (see
     ``can_access_collection``). Admins may additionally grant a corpus to
-    groups to share it.
+    groups to share it. When the instance opts into
+    ``library.auto_share_admin_uploads``, a corpus created by an admin is
+    granted to the Everyone group at creation (workspace-visible, still
+    revocable in the share dialog).
 
-    Returns the created collection object (id, slug, name, …).
+    Returns the created collection object (id, slug, name, …) plus
+    ``visibility`` (``"workspace"`` when auto-shared, else ``"private"``).
     ``slug`` is auto-generated from ``name`` when omitted, and an explicit
     ``slug`` is normalised to a URL-safe form (``[a-z0-9-]``) so it always
     resolves via ``/library/{slug}``; a collision on the unique slug index
@@ -196,7 +264,9 @@ async def create_collection(
     # starts here — the Library's upload flow creates the collection first, then
     # posts the files into it.
     mark_journey(user.get("id"), catalog_discovered=True)
-    return _collection_out(row)
+    out = _collection_out(row)
+    out["visibility"] = _maybe_auto_share_admin_upload(corpus_id, user)
+    return out
 
 
 def _accessible_corpus_ids(user) -> list[str]:
