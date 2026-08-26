@@ -433,6 +433,16 @@ def writer_can_access_item(
     grants, not ``resource_grants``); ``item_id`` is an ``mcp_sources.id``,
     checked the same way ``app/api/mcp_user_secrets.py::_require_source_grant``
     already gates a caller's own connection reach.
+
+    The final ``return True`` is a pass-through for item_types genuinely
+    OUTSIDE the DATA axis (``plugin``/``memory_domain``/``slack_channel``) —
+    those are not data authority and are never checked here, by design.
+    It is NOT a catch-all for a ``DATA_AUTHORITY_ITEM_TYPES`` member this
+    function has not (yet) grown a branch for: that shape fails CLOSED
+    instead, on purpose — the type is data-authority-shaped by the caller's
+    own contract (``DATA_AUTHORITY_ITEM_TYPES``), so silently passing it
+    would be a fail-open convention inversion for the one function this
+    whole module leans on to keep the write-gate fail-closed.
     """
     if item_type == "table":
         base = _allowed_ids_for_user(writer_user_id, ResourceType.TABLE.value, conn)
@@ -448,7 +458,11 @@ def writer_can_access_item(
 
         granted_source_ids = {t["source_id"] for t in _visible_passthrough_tools(writer_user_id)}
         return item_id in granted_source_ids
-    return True
+    if item_type not in DATA_AUTHORITY_ITEM_TYPES:
+        return True
+    # A DATA_AUTHORITY_ITEM_TYPES member with no handled branch above — fail
+    # closed rather than silently pass (see docstring).
+    return False
 
 
 def first_inaccessible_data_item(

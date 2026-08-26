@@ -190,6 +190,19 @@ def test_writer_can_access_item_non_data_types_always_true():
     assert writer_can_access_item("nobody", "slack_channel", "C1") is True
 
 
+def test_writer_can_access_item_fails_closed_for_unhandled_data_authority_type(monkeypatch):
+    """Defense in depth: if ``DATA_AUTHORITY_ITEM_TYPES`` ever grows a value
+    with no matching branch inside ``writer_can_access_item``, the write-gate
+    must deny it rather than silently fall through to the non-data-type
+    pass-through — that catch-all is for types genuinely OUTSIDE the DATA
+    axis (plugin/memory_domain/slack_channel), never for one inside it that
+    this function simply hasn't caught up to yet."""
+    import src.agent_scope_intersection as asi
+
+    monkeypatch.setattr(asi, "DATA_AUTHORITY_ITEM_TYPES", asi.DATA_AUTHORITY_ITEM_TYPES | {"widget"})
+    assert asi.writer_can_access_item("nobody", "widget", "w1") is False
+
+
 def test_first_inaccessible_data_item_admin_bypasses_entirely(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     from src.agent_scope_intersection import first_inaccessible_data_item
