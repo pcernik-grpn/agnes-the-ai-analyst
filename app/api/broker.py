@@ -431,6 +431,12 @@ def _agent_and_caller_for_ticket(row: Dict[str, Any]) -> "tuple[Optional[Dict[st
         return None, None
     agent_id = getattr(session, "agent_id", None)
     agent_row = agents_repo().get_by_id(agent_id) if agent_id else None
+    if agent_row is None:
+        # No bound agent → both halves of the result are unused downstream
+        # (every `caller_user_id` consumer sits behind `agent_row is not
+        # None`). Return before the user lookup so an agent-less session
+        # costs exactly what it did before this feature existed.
+        return None, None
     caller = users_repo().get_by_email(session.user_email)
     caller_user_id = caller["id"] if caller else None
     return agent_row, caller_user_id

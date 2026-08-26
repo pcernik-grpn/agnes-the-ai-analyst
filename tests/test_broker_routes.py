@@ -1002,6 +1002,47 @@ def test_two_callers_on_one_shared_agent_produce_distinguishable_usage_rows(
     assert {row["user_id"] for row in by_agent} == {ctx["user_id"]}
 
 
+def test_agentless_session_costs_no_caller_lookup(broker_app, broker_agent_session, e2e_env, monkeypatch):
+    """C2.4 must not tax sessions it does not serve. A Slack/legacy session
+    with no bound agent discards both halves of the result (every
+    `caller_user_id` consumer sits behind `agent_row is not None`), so the
+    user lookup must not run at all for it — the cost promised by
+    `_agent_and_caller_for_ticket`'s docstring.
+
+    The agent-bound half is asserted too, so the test fails if the lookup is
+    dropped entirely rather than merely made conditional."""
+    import app.api.broker as broker_mod
+
+    real_users_repo = broker_mod.users_repo
+    calls: list = []
+
+    def _counting_users_repo():
+        calls.append(1)
+        return real_users_repo()
+
+    monkeypatch.setattr(broker_mod, "users_repo", _counting_users_repo)
+
+    # No bound agent -> zero user lookups.
+    tag = uuid.uuid4().hex[:8]
+    email = f"broker_agentless_{tag}@test.com"
+    conn = get_system_db()
+    UserRepository(conn).create(id=f"broker_agentless_user_{tag}", email=email, name="Agentless")
+    conn.close()
+    plain = chat_session_repo().create_session(user_email=email, surface=Surface.WEB)
+
+    agent_row, caller_user_id = broker_mod._agent_and_caller_for_ticket({"session_id": plain.id})
+    assert agent_row is None
+    assert caller_user_id is None
+    assert calls == [], "agent-less session must not pay for a caller lookup"
+
+    # Bound agent -> the lookup still happens and still attributes.
+    ctx = broker_agent_session()
+    agent_row, caller_user_id = broker_mod._agent_and_caller_for_ticket({"session_id": ctx["session_id"]})
+    assert agent_row is not None and agent_row["id"] == ctx["agent_id"]
+    assert caller_user_id == ctx["user_id"]
+    assert len(calls) == 1
+
+
 def test_shared_agent_budget_enforced_across_callers_not_per_caller(broker_app, broker_agent_session, monkeypatch):
     """Budget enforcement is UNCHANGED by C2.4 — still keyed on `agent_id`
     alone. The owner's turn pushing a shared agent over its
