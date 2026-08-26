@@ -20,11 +20,20 @@ from pathlib import Path
 import pytest
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "agents.html"
+BUILDER_CSS = Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "builder.css"
 
 
 @pytest.fixture(scope="module")
 def markup() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def builder_css() -> str:
+    """The builder shell's rules, extracted out of the page's inline <style>
+    so a second builder can load the same sheet. Assertions about LAYOUT read
+    this; assertions about behaviour still read the page's script."""
+    return BUILDER_CSS.read_text(encoding="utf-8")
 
 
 class TestTheConversationWritesTheConfiguration:
@@ -172,20 +181,21 @@ class TestThePanelShowsOnlyWhatIsConnected:
 
 
 class TestTheBuilderIsFullBleed:
-    def test_the_builder_breaks_out_of_the_index_column(self, markup):
+    def test_the_builder_breaks_out_of_the_index_column(self, markup, builder_css):
         """The workspace is not a document: a card inside the shell's centred
         column spent most of a wide screen on gutters."""
-        assert "body.ag-building .idx-band-inner" in markup
+        assert "body.ag-building .idx-band-inner" in builder_css
+        # The rule is inert without the page toggling the class.
         assert re.search(r"classList\.toggle\('ag-building'", markup)
 
-    def test_the_conversation_keeps_a_readable_measure(self, markup):
+    def test_the_conversation_keeps_a_readable_measure(self, builder_css):
         """Full-bleed panes must not turn prose into 1200px-wide lines."""
-        assert ".ag-conv-in" in markup and "max-width: 780px" in markup
+        assert ".ag-conv-in" in builder_css and "max-width: 780px" in builder_css
 
-    def test_the_two_panes_split_the_width_evenly(self, markup):
+    def test_the_two_panes_split_the_width_evenly(self, builder_css):
         """Conversation and configuration are equal partners — the panel is
         the source of truth, not a sidebar summarising the chat."""
-        rule = re.search(r"\.ag-work \{([^}]*)\}", markup)
+        rule = re.search(r"\.ag-work \{([^}]*)\}", builder_css)
         assert rule, ".ag-work rule not found"
         assert "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)" in rule.group(1)
 
@@ -207,11 +217,11 @@ class TestCollapsingASectionKeepsYourPlace:
             "the scroll position is being thrown away again"
         )
 
-    def test_the_body_is_rendered_even_when_collapsed(self, markup):
+    def test_the_body_is_rendered_even_when_collapsed(self, markup, builder_css):
         """The in-place toggle is only correct because of this rule; if the
         body were conditionally rendered, opening a section would show nothing.
         """
-        assert ".ag-sec.collapsed .ag-sec-body { display: none; }" in markup
+        assert ".ag-sec.collapsed .ag-sec-body { display: none; }" in builder_css
         sec = re.search(
             r"function section\(key, no, title, note, sub, summary, body, addKey\) \{(.*?)\n  \}", markup, re.S
         )
