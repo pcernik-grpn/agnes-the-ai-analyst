@@ -198,6 +198,43 @@ def test_column_metadata_import_proposal(ctx, tmp_path):
     assert cols["id"]["source"] == "ai_enrichment"
 
 
+def test_column_metadata_save_accepts_source_ref(ctx):
+    """``source_ref`` (mirrors metric_definitions/glossary_terms) is a
+    Postgres-only column (A3 PG-first ratchet, ``docs/migrations.md`` ->
+    "Adding a PG-only feature") — the DuckDB app-state schema is frozen and
+    never gained it. Both backends' ``save()`` accept the kwarg (signature
+    parity, ``tests/db_pg/test_repo_method_parity.py``), but only Postgres
+    persists it; DuckDB silently drops it rather than erroring, so a shared
+    caller (``src/semantic/projection.py``) works unmodified against either
+    backend."""
+    repo = ctx.column_metadata()
+
+    saved = repo.save(
+        table_id="orders",
+        column_name="region",
+        basetype="STRING",
+        description="Sales region",
+        source="databricks_metrics",
+        source_ref="dbc-test.cloud.databricks.com",
+    )
+    fetched = repo.get("orders", "region")
+    listed = {c["column_name"]: c for c in repo.list_for_table("orders")}
+
+    if ctx.backend == "pg":
+        assert saved["source_ref"] == "dbc-test.cloud.databricks.com"
+        assert fetched["source_ref"] == "dbc-test.cloud.databricks.com"
+        assert listed["region"]["source_ref"] == "dbc-test.cloud.databricks.com"
+    else:
+        assert saved["source_ref"] is None
+        assert fetched["source_ref"] is None
+        assert listed["region"]["source_ref"] is None
+
+    # Omitted entirely — stays NULL on both backends, same as every other
+    # nullable provenance column on this repo (no implicit default).
+    no_ref = repo.save(table_id="orders", column_name="amount", basetype="DECIMAL", source="manual")
+    assert no_ref["source_ref"] is None
+
+
 # ---------------------------------------------------------------------------
 # usage — emit_server_event (PG port)
 # ---------------------------------------------------------------------------

@@ -1,5 +1,25 @@
-"""sync_semantic_layer() for Databricks — fake statement client, real test DuckDB
-via the e2e_env fixture (same pattern as tests/test_keboola_semantic_layer_sync.py)."""
+"""sync_semantic_layer() for Databricks — Ossie document path, post-cutover.
+
+Since the semantic-phase-1 cutover, `sync_semantic_layer` is a pure document
+pipeline: it composes one Ossie document per Unity Catalog metric view
+(`connectors.databricks.semantic_ossie`), stores each under
+`source='databricks_metrics'` in `semantic_models`, and runs them through
+`src.semantic.projection.project_document`.
+
+Every measure is composed with ONLY the `DATABRICKS` Ossie dialect (never
+`DUCKDB`/`ANSI_SQL` — `MEASURE()` isn't valid DuckDB syntax at all), which is
+the same choice `connectors/snowflake/semantic_ossie.py` already made for its
+own warehouse-only metrics: `src.semantic.dialect.resolve_expression` skips
+composing a `metric_definitions` row for every one of them, exactly as it
+does for Snowflake. So this sync's `created_or_updated`/`pruned` counters
+describe DOCUMENT-level work (metric views synced into `semantic_models`),
+not `metric_definitions` rows — see `sync_semantic_layer`'s own docstring.
+`tests/test_databricks_ossie_adapter.py` covers document composition itself;
+this file exercises the sync entrypoint's contract: counters, error codes,
+prune scoping, legacy-row retirement.
+
+Fake statement client, real test DuckDB via the e2e_env fixture.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +51,8 @@ measures:
     expr: SUM(o_totalprice)
     description: Gross revenue before refunds
 """
+
+_DOC_ID = "databricks_metrics/dbc-test.cloud.databricks.com/main.sales.orders_metrics"
 
 
 class FakeStatementClient:
@@ -76,75 +98,52 @@ def _sync(client):
 
 
 class TestSyncSemanticLayer:
-    def test_creates_one_metric_per_measure(self, e2e_env):
-        from src.repositories import metric_repo
+    def test_stores_one_document_per_metric_view(self, e2e_env):
+        from src.repositories import semantic_model_repo
 
         result = _sync(FakeStatementClient())
         assert result["status"] == "ok"
         assert result["metric_views_seen"] == 1
-        assert result["created_or_updated"] == 2
+        assert result["created_or_updated"] == 1
         assert result["source_ref"] == "dbc-test.cloud.databricks.com"
 
-        row = metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue")
+        row = semantic_model_repo().get(_DOC_ID)
         assert row is not None
-        assert row["source"] == "databricks_semantic_layer"
+        assert row["source"] == "databricks_metrics"
         assert row["source_ref"] == "dbc-test.cloud.databricks.com"
-        assert row["sql"] == "SELECT MEASURE(`Total Revenue`) FROM `main`.`sales`.`orders_metrics`"
-        assert row["expression"] == "SUM(o_totalprice)"
-        assert row["description"] == "Gross revenue before refunds"
-        assert list(row["dimensions"]) == ["order_date", "country"]
-        assert row["category"] == "databricks"
-        # The notes must tell an agent where this runs — MEASURE() is
-        # warehouse-only, never local DuckDB.
-        assert any("SQL warehouse" in n for n in row["notes"])
+        assert row["status"] == "valid"
+        model = row["document_json"]["semantic_model"][0]
+        assert model["name"] == "main.sales.orders_metrics"
+        metric_names = {m["name"] for m in model["metrics"]}
+        assert metric_names == {"Order Count", "Total Revenue"}
 
-    def test_prunes_measures_removed_upstream(self, e2e_env):
+    def test_measures_never_reach_metric_definitions(self, e2e_env):
+        """The MEASURE()-tagged, DATABRICKS-only expression is not
+        DuckDB-runnable — `resolve_expression` skips composing a
+        `metric_definitions` row for it, same as it does for every Snowflake
+        semantic-view metric. Discoverable via the document, not the flat
+        metrics listing (`agnes catalog --metrics`)."""
         from src.repositories import metric_repo
 
         _sync(FakeStatementClient())
-        assert metric_repo().get("databricks/main.sales.orders_metrics/Order Count") is not None
+        assert metric_repo().find_by_name("Total Revenue") is None
+        assert metric_repo().find_by_name("Order Count") is None
 
-        one_measure_yaml = "version: 1.1\nsource: t\nmeasures:\n  - name: Total Revenue\n    expr: SUM(x)\n"
-        result = _sync(FakeStatementClient(yaml_by_view={"orders_metrics": one_measure_yaml}))
-        assert result["pruned"] == 1
-        assert metric_repo().get("databricks/main.sales.orders_metrics/Order Count") is None
-        assert metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue") is not None
-
-    def test_zero_usable_measures_skips_prune(self, e2e_env):
-        from src.repositories import metric_repo
-
+    def test_unchanged_document_is_not_recounted(self, e2e_env):
         _sync(FakeStatementClient())
-        # Upstream vocabulary drift: discovery finds nothing → prune must NOT
-        # wipe the previously-synced rows.
-        result = _sync(FakeStatementClient(views=[]))
-        assert result["status"] == "ok"
-        assert result["pruned"] == 0
-        assert metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue") is not None
-
-    def test_never_touches_other_writers_rows(self, e2e_env):
-        from src.repositories import metric_repo
-
-        metric_repo().create(
-            id="manual/revenue",
-            name="Total Revenue",
-            display_name="Total Revenue",
-            category="finance",
-            sql="SELECT SUM(amount) FROM orders",
-            source="manual",
-        )
         result = _sync(FakeStatementClient())
-        # The manual row owns the name — the sync must skip, count the
-        # conflict, and leave the manual row byte-for-byte intact.
-        assert result["skipped_conflict"] == 1
-        assert result["created_or_updated"] == 1  # Order Count still lands
-        row = metric_repo().get("manual/revenue")
-        assert row["source"] == "manual"
-        assert row["sql"] == "SELECT SUM(amount) FROM orders"
-        assert metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue") is None
+        assert result["created_or_updated"] == 0
+        assert result["pruned"] == 0
 
-        # And the conflicting id must survive future prunes (retained, not seen).
-        result2 = _sync(FakeStatementClient())
-        assert result2["pruned"] == 0
+    def test_prunes_documents_removed_upstream(self, e2e_env):
+        from src.repositories import semantic_model_repo
+
+        _sync(FakeStatementClient())
+        assert semantic_model_repo().get(_DOC_ID) is not None
+
+        result = _sync(FakeStatementClient(views=[]))
+        assert result["pruned"] == 1
+        assert semantic_model_repo().get(_DOC_ID) is None
 
     def test_unparseable_view_is_counted_not_fatal(self, e2e_env):
         result = _sync(FakeStatementClient(yaml_by_view={"orders_metrics": None}))
@@ -174,27 +173,58 @@ class TestSyncSemanticLayer:
         assert result["code"] == "upstream_error"
 
 
-class TestBuildMetricRows:
-    def test_measure_names_with_backticks_are_skipped(self):
-        from connectors.databricks.semantic_layer import build_metric_rows
+class TestLegacySourceRetirement:
+    """One-time purge of rows still stamped with the retired
+    `source='databricks_semantic_layer'` label, scoped to this workspace —
+    mirrors `connectors/keboola/semantic_layer.py::_sync_one_source`'s own
+    legacy-retirement guard."""
 
-        yaml_text = "measures:\n  - name: 'bad`tick'\n    expr: COUNT(1)\n"
-        rows, reason = build_metric_rows("c", "s", "v", "", yaml_text, source_ref="w")
-        # Backticks are escaped by doubling in the composed SQL — the row is
-        # still produced and the SQL stays inside the quoted identifier.
-        assert reason is None
-        assert rows[0]["sql"] == "SELECT MEASURE(`bad``tick`) FROM `c`.`s`.`v`"
+    def test_legacy_rows_are_purged_once_the_document_is_stored(self, e2e_env):
+        from src.repositories import metric_repo
 
-    def test_non_mapping_yaml_is_skipped(self):
-        from connectors.databricks.semantic_layer import build_metric_rows
+        metric_repo().create(
+            id="databricks/main.sales.orders_metrics/Total Revenue",
+            name="Total Revenue",
+            display_name="Total Revenue",
+            category="databricks",
+            sql="SELECT MEASURE(`Total Revenue`) FROM `main`.`sales`.`orders_metrics`",
+            source="databricks_semantic_layer",
+            source_ref="dbc-test.cloud.databricks.com",
+        )
+        result = _sync(FakeStatementClient())
+        assert result["status"] == "ok"
+        assert metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue") is None
+        assert result["pruned"] >= 1
 
-        rows, reason = build_metric_rows("c", "s", "v", "", "- just\n- a list\n", source_ref="w")
-        assert rows == []
-        assert reason == "yaml_not_a_mapping"
+    def test_legacy_row_of_a_different_workspace_is_untouched(self, e2e_env):
+        from src.repositories import metric_repo
 
-    def test_no_measures_is_skipped(self):
-        from connectors.databricks.semantic_layer import build_metric_rows
+        metric_repo().create(
+            id="databricks/other.workspace/x",
+            name="Other Metric",
+            display_name="Other Metric",
+            category="databricks",
+            sql="SELECT MEASURE(`x`) FROM `other`",
+            source="databricks_semantic_layer",
+            source_ref="some-other-workspace.cloud.databricks.com",
+        )
+        _sync(FakeStatementClient())
+        assert metric_repo().get("databricks/other.workspace/x") is not None
 
-        rows, reason = build_metric_rows("c", "s", "v", "", "version: 1.1\nsource: t\n", source_ref="w")
-        assert rows == []
-        assert reason == "no_measures"
+    def test_legacy_rows_are_not_purged_on_a_zero_write_pass(self, e2e_env):
+        """An empty/failed upstream fetch (0 documents stored) must never
+        delete the last good copy of a legacy row."""
+        from src.repositories import metric_repo
+
+        metric_repo().create(
+            id="databricks/main.sales.orders_metrics/Total Revenue",
+            name="Total Revenue",
+            display_name="Total Revenue",
+            category="databricks",
+            sql="SELECT MEASURE(`Total Revenue`) FROM `main`.`sales`.`orders_metrics`",
+            source="databricks_semantic_layer",
+            source_ref="dbc-test.cloud.databricks.com",
+        )
+        result = _sync(FakeStatementClient(views=[]))
+        assert result["status"] == "ok"
+        assert metric_repo().get("databricks/main.sales.orders_metrics/Total Revenue") is not None

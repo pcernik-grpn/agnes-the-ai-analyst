@@ -574,6 +574,12 @@ CREATE TABLE IF NOT EXISTS table_profiles (
 -- resource_grants (ResourceType.TABLE). Access requests flow removed —
 -- users contact admin out-of-band; admin grants via /admin/access.
 
+-- `name` is DELIBERATELY not unique: several independent writers (manual,
+-- keboola_metastore, snowflake_semantic, databricks_metrics, ...) can each
+-- describe a metric with the same display name, and `id` (the real key) is
+-- scoped per-writer. src/semantic/projection.py::_check_name_collision logs
+-- (not blocks) a same-name write from a different source — see that
+-- function's docstring for why a hard uniqueness constraint is not the fix.
 CREATE TABLE IF NOT EXISTS metric_definitions (
     id              VARCHAR PRIMARY KEY,
     name            VARCHAR NOT NULL,

@@ -39,6 +39,26 @@ class TestColumnMetadataCreate:
         rows = repo.list_for_table("orders")
         assert len(rows) == 1
 
+    def test_save_accepts_but_does_not_persist_source_ref(self, repo):
+        """``source_ref`` is Postgres-only (A3 PG-first ratchet, see
+        ``src/repositories/column_metadata.py::save``'s docstring): the
+        DuckDB app-state schema is frozen and never gained this column.
+        ``save()`` still accepts the kwarg for signature parity with the PG
+        repo, it just never lands anywhere."""
+        result = repo.save(
+            "orders",
+            "region",
+            basetype="STRING",
+            source="databricks_metrics",
+            source_ref="dbc-test.cloud.databricks.com",
+        )
+        assert result["source_ref"] is None
+        assert repo.get("orders", "region")["source_ref"] is None
+
+    def test_save_defaults_source_ref_to_none(self, repo):
+        result = repo.save("orders", "id", basetype="STRING")
+        assert result["source_ref"] is None
+
 
 class TestColumnMetadataRead:
     def test_list_for_table_filters_by_table(self, repo):
