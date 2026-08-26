@@ -395,26 +395,45 @@ def _to_response(resp: httpx.Response, extra_headers: Optional[Dict[str, str]] =
     return response
 
 
-def _agent_for_ticket(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Resolve the ticket's chat session → ``agent_id`` → agent row, or
-    ``None`` when there is nothing to resolve (Slack/legacy sessions with no
-    ``agent_id``, or a session that no longer exists). Callers must treat
-    ``None`` as "behave exactly as before this feature existed" — no
-    policy/ledger/budget enforcement runs for those sessions.
+def _agent_and_caller_for_ticket(row: Dict[str, Any]) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
+    """Resolve the ticket's chat session once and return ``(agent_row,
+    caller_user_id)``.
 
-    Caches nothing beyond the single caller's request — each call is one
-    DB round-trip (session lookup + agent lookup), matching the per-request
-    caching note in the task brief (``anthropic_proxy`` calls this once and
-    reuses the result for both the pre-forward checks and the post-response
-    usage recording)."""
+    ``agent_row`` is ``None`` when there is nothing to resolve
+    (Slack/legacy sessions with no ``agent_id``, or a session that no
+    longer exists). Callers must treat that as "behave exactly as before
+    this feature existed" — no policy/ledger/budget enforcement runs for
+    those sessions.
+
+    ``caller_user_id`` (C2.4, per-caller usage attribution) is the session's
+    own ``user_email`` — set SERVER-SIDE at session-creation time
+    (``ChatManager.create_session`` for native chat/agent sessions,
+    ``app.api.kai._create_session_and_credential`` for the embedded turn
+    engine's ``llm``-scoped ticket) — resolved to a user id. It is never
+    re-derived from anything the ticket-holder (sandbox relay or engine)
+    could shape, so it cannot be spoofed by the caller's own request. For a
+    session running a SHARED agent (C2.3) this is the grantee actually
+    driving the turn, not the agent's owner — the whole point of
+    attributing usage to the caller rather than the agent. ``None`` when
+    the session's named user no longer resolves to a live account.
+
+    Caches nothing beyond the single caller's request — one DB round-trip
+    (session lookup, shared by both halves) plus, when there IS a bound
+    agent, one more for the agent row and one for the caller's user row —
+    matching the per-request caching note in the task brief
+    (``anthropic_proxy`` calls this once and reuses the result for both the
+    pre-forward checks and the post-response usage recording)."""
     session_id = row.get("session_id")
     if not session_id:
-        return None
+        return None, None
     session = chat_session_repo().get_session(session_id)
-    agent_id = getattr(session, "agent_id", None) if session is not None else None
-    if not agent_id:
-        return None
-    return agents_repo().get_by_id(agent_id)
+    if session is None:
+        return None, None
+    agent_id = getattr(session, "agent_id", None)
+    agent_row = agents_repo().get_by_id(agent_id) if agent_id else None
+    caller = users_repo().get_by_email(session.user_email)
+    caller_user_id = caller["id"] if caller else None
+    return agent_row, caller_user_id
 
 
 @router.post("/agnes-api")
@@ -766,10 +785,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # legacy, or a session predating this feature) resolve `agent_row` to
     # `None` and skip all of it — behavior is unchanged for them.
     agent_row: Optional[Dict[str, Any]] = None
+    caller_user_id: Optional[str] = None
     budget_headers: Dict[str, str] = {}
     chat_cfg = getattr(request.app.state, "chat_config", None)
     if is_messages_post:
-        agent_row = _agent_for_ticket(row)
+        agent_row, caller_user_id = _agent_and_caller_for_ticket(row)
     if agent_row is not None:
         utility_models = getattr(chat_cfg, "agent_api_utility_models", []) or []
         budget_ttl_s = getattr(chat_cfg, "agent_api_budget_cache_ttl_s", 60)
@@ -949,6 +969,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                                         "id": str(uuid.uuid4()),
                                         "agent_id": agent_row["id"],
                                         "user_id": agent_row.get("owner_user_id"),
+                                        "caller_user_id": caller_user_id,
                                         "session_id": row.get("session_id"),
                                     },
                                     budget_ttl_s=budget_ttl_s,
@@ -997,6 +1018,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         "id": str(uuid.uuid4()),
                         "agent_id": agent_row["id"],
                         "user_id": agent_row.get("owner_user_id"),
+                        "caller_user_id": caller_user_id,
                         "session_id": row.get("session_id"),
                     },
                     budget_ttl_s=budget_ttl_s,
