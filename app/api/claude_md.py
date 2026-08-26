@@ -9,7 +9,6 @@
 
 import datetime
 import logging
-from typing import Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -18,9 +17,9 @@ from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db, get_current_user
+from src.chat_icons import CHAT_INLINE_ICON_NAMES
 from src.claude_md import build_claude_md_context, compute_default_claude_md, render_claude_md
 from src.prompt_render import make_prompt_env
-
 from src.repositories import (
     claude_md_template_repo,
 )
@@ -49,11 +48,12 @@ _VALIDATION_STUB_CONTEXT = {
         "is_admin": False,
         "groups": ["Everyone"],
     },
-    "now": datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+    "now": datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
     "today": "2026-01-01",
     # Admin-authored overrides validate against the laptop-workspace shape —
     # the chat sandbox never renders an admin override through this stub.
     "is_sandbox": False,
+    "chat_icons": list(CHAT_INLINE_ICON_NAMES),
 }
 
 # Same stub with an anonymous-style user context to validate templates against
@@ -96,10 +96,10 @@ class ClaudeMdResponse(BaseModel):
 
 
 class TemplateGetResponse(BaseModel):
-    content: Optional[str]
+    content: str | None
     default: str  # live default rendered with calling admin's context
-    updated_at: Optional[str] = None
-    updated_by: Optional[str] = None
+    updated_at: str | None = None
+    updated_by: str | None = None
     # Substrings from _LEGACY_STRINGS detected in the saved override (if any).
     # Empty when no override is set or when the override is clean. Surfaced
     # so the admin UI can prompt re-authoring after a CLI surface rename.
@@ -109,9 +109,9 @@ class TemplateGetResponse(BaseModel):
     # `source` is retained for backward-compat with the old grandfathered UI
     # ("local"/"seed"); new callers read `source_mode`/`git_path`.
     source: str = "local"
-    seed_path: Optional[str] = None
+    seed_path: str | None = None
     source_mode: str = "editor"
-    git_path: Optional[str] = None
+    git_path: str | None = None
 
 
 # Path inside the seed repo for the analyst CLAUDE.md template. Shared
@@ -136,7 +136,7 @@ class TemplatePreviewRequest(BaseModel):
 @router.get("/api/welcome", response_model=ClaudeMdResponse)
 def get_welcome(
     request: Request,
-    server_url: Optional[str] = Query(None, description="Server URL used in rendered CLAUDE.md"),
+    server_url: str | None = Query(None, description="Server URL used in rendered CLAUDE.md"),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):

@@ -8,6 +8,7 @@ import {
   noteTurnEnded as onboardingNoteTurnEnded,
 } from "./chat_onboarding.js";
 import { initChatDashboard, updateDashboardSuggestions } from "./chat_dashboard.js";
+import { applyInlineIcons, iconEl } from "./chat_icons.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -81,6 +82,11 @@ function renderMarkdownSafe(text) {
   // Parsing into a <template> is inert: no network fetches, no handler firing.
   tpl.innerHTML = marked.parse(text || "");
   _sanitizeFragment(tpl.content);
+  // AFTER the sanitizer on purpose: the icon pass builds its <svg><use>
+  // nodes itself from allowlisted names (see chat_icons.js), so it can add
+  // nothing the sanitizer would need to see — while running it earlier would
+  // let the sanitizer's attribute walk touch nodes this pass just vouched for.
+  applyInlineIcons(tpl.content);
   return tpl.innerHTML;
 }
 
@@ -2735,9 +2741,10 @@ function finalizeAssistantMessage(frame) {
 // markdown; everything else is pretty-printed JSON. A FAILED call opens
 // itself — its output is the diagnosis.
 //
-// Status icons: ⏳ = running, ✓ = done, ⚠ = error, ⊘ = cancelled. The
-// status class on the wrapper tints the left border accordingly so a
-// failed tool call is unmistakable at a glance.
+// Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
+// check = done, triangle-alert = error. The status class on the wrapper
+// tints the left border accordingly so a failed tool call is unmistakable
+// at a glance.
 
 const _TOOL_RESULT_PREVIEW_ROWS = 5;
 const _TOOL_RESULT_TEXT_PREVIEW_CHARS = 280;
@@ -2898,7 +2905,7 @@ function renderApprovalRequest(frame) {
   const icon = document.createElement("span");
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
-  icon.textContent = "\u{1F6E1}️";
+  icon.appendChild(iconEl("shield"));
   head.appendChild(icon);
   const name = document.createElement("span");
   name.className = "cloud-chat-tool-name";
@@ -3258,10 +3265,10 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const icon = document.createElement("span");
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
-  if (status === "running") icon.textContent = "⏳";
-  else if (wrapIsError) icon.textContent = "⚠";
-  else if (state === "output-available") icon.textContent = "✓";
-  if (icon.textContent) head.appendChild(icon);
+  if (status === "running") icon.appendChild(iconEl("hourglass"));
+  else if (wrapIsError) icon.appendChild(iconEl("triangle-alert"));
+  else if (state === "output-available") icon.appendChild(iconEl("check"));
+  if (icon.firstChild) head.appendChild(icon);
 
   // A semantic-layer lookup is the one tool call that is PROVENANCE rather
   // than plumbing: it says the answer you are reading was built on the
@@ -3303,7 +3310,7 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const chevron = document.createElement("span");
   chevron.className = "cloud-chat-tool-chevron";
   chevron.setAttribute("aria-hidden", "true");
-  chevron.textContent = "›";
+  chevron.appendChild(iconEl("chevron-right"));
   head.appendChild(chevron);
 
   wrap.appendChild(head);
@@ -3361,7 +3368,7 @@ function renderToolCallEnd(frame) {
   // is the one body a reader must not have to know to click for.
   if (isError) wrap.open = true;
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
-  if (icon) icon.textContent = isError ? "⚠" : "✓";
+  if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
 
   // Timing meta — "running…" → "1.2s" if we tracked startedAt.
   const meta = wrap.querySelector(".cloud-chat-tool-meta");
@@ -3794,7 +3801,7 @@ function _ensurePreviewPane() {
   closeBtn.type = "button";
   closeBtn.className = "btn btn-ghost btn-sm cloud-chat-preview-close-btn";
   closeBtn.setAttribute("aria-label", "Close preview");
-  closeBtn.textContent = "✕";
+  closeBtn.appendChild(iconEl("x"));
   closeBtn.onclick = () => _teardownPreviewPane();
   head.appendChild(closeBtn);
   pane.appendChild(head);

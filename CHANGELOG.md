@@ -12,6 +12,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
+  subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
+  ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
+  `iconEl(name)` JS helper (`chat_icons.js`). Assistant answers can now use
+  an inline icon vocabulary: `` `icon:<name>` `` tokens render as sprite
+  icons (allowlist-only — an unknown name stays plain text, and the pass
+  runs after the markdown sanitizer, building nodes itself, so it can never
+  introduce markup). The chat system prompt — both the native-sandbox
+  CLAUDE.md render and the embedded-engine workspace tarball, plus the
+  static fallback workspace — now forbids emoji outright and offers exactly
+  the names the UI renders (`chat_icons` template variable;
+  `tests/test_chat_icons.py` keeps sprite, JS allowlist and both prompts in
+  sync). Tool-call cards swap their emoji/text glyphs (⏳ ✓ ⚠ 🛡 › ✕) for
+  sprite icons tinted to the card's status accent, and the tool name drops
+  the monospace face — the header reads as the action it names, not a
+  terminal id.
+
 - **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
   env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
   collection an admin creates via the Library/API is granted to the `Everyone`

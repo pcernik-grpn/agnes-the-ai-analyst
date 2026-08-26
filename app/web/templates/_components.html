@@ -68,6 +68,26 @@
 
 
 {# ─────────────────────────────────────────────────────────────────────
+   Icon — a sprite icon from the vendored Lucide subset (#1503), the
+   design system's one icon seam. `name` must be a symbol id in
+   static/vendor/lucide-sprite.svg (canonical list: src/chat_icons.py);
+   an unknown name renders an empty 1em box, never broken markup.
+   Sizing/baseline comes from the `.ds-icon` rule in components.css;
+   color is `currentColor`. Same-document `#name` reference on purpose —
+   icon_sprite.js (loaded by _app_scripts.html on both base layouts)
+   injects the sprite inline, because external-document <use> only
+   resolves in Safari 17.1+.
+
+   Examples:
+       {{ ds.icon('database') }}
+       {{ ds.icon('triangle-alert', klass='my-warn-icon') }}
+   ───────────────────────────────────────────────────────────────────── #}
+{% macro icon(name, klass='') -%}
+  <svg class="ds-icon{% if klass %} {{ klass }}{% endif %}" aria-hidden="true"><use href="#{{ name }}"/></svg>
+{%- endmacro %}
+
+
+{# ─────────────────────────────────────────────────────────────────────
    Primary nav — top-level horizontal nav (.app-header family).
 
    Parameterized version of what the topnav chrome (`_app_header.html`)

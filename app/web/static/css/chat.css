@@ -616,9 +616,12 @@ body.chat-page-body main { margin: 0; padding: 0; }
    Scoped to the CHART positions, not `.msg-body svg`: a multi-line figure comes
    through marked as a top-level block, a one-liner gets wrapped in `<p>`, and
    the third `svg` in a bubble is the code-block copy button's 14px icon inside
-   `pre` — which a blanket rule would stretch to full width. */
-.msg-body > svg,
-.msg-body > p > svg {
+   `pre` — which a blanket rule would stretch to full width. A fourth svg now
+   shares the `> p >` position: an `icon:<name>` sprite icon (#1503, always
+   class ds-icon, which a chart never is) — it must stay a 1em inline glyph,
+   not become a block. */
+.msg-body > svg:not(.ds-icon),
+.msg-body > p > svg:not(.ds-icon) {
   display: block;
   max-width: 100%;
   height: auto;
@@ -1158,23 +1161,30 @@ summary.cloud-chat-tool-head {
   list-style: none;
 }
 summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
+/* Status icon — a sprite icon (hourglass / check / triangle-alert, see
+   chat_icons.js), tinted to the same status accent the card's left border
+   uses so the header and the edge tell one story. */
 .cloud-chat-tool-icon {
   flex: 0 0 auto;
   font-size: var(--text-md);
   line-height: 1;
 }
+.cloud-chat-tool.is-running .cloud-chat-tool-icon { color: var(--ds-accent-info-line); }
+.cloud-chat-tool.is-done    .cloud-chat-tool-icon { color: var(--ds-accent-success-line); }
+.cloud-chat-tool.is-error   .cloud-chat-tool-icon { color: var(--ds-accent-danger-line); }
+/* The header names a reader-facing ACTION ("Querying data"), not a tool id —
+   it reads as prose, so it gets the prose face. The raw id lives in the
+   tooltip and the args panel; only the args summary keeps the mono face,
+   because a command line or SQL sketch IS code. */
 .cloud-chat-tool-name {
   flex: 0 0 auto;
-  font-family: var(--font-mono, ui-monospace, monospace);
   font-weight: var(--font-medium);
   color: var(--ds-text-primary);
 }
 /* A definition lookup is the one tool call a reader should be invited to
-   FOLLOW — it is provenance for the answer, not plumbing behind it. So it
-   drops the monospace tool-id treatment (it is a sentence, not an identifier)
-   and reads as the link it is. */
+   FOLLOW — it is provenance for the answer, not plumbing behind it. It
+   reads as the link it is. */
 .cloud-chat-tool-name--definition {
-  font-family: inherit;
   color: var(--ds-primary);
   text-decoration: none;
 }

@@ -97,6 +97,7 @@ PUT validation time, so the admin is notified immediately.
 | `now` | datetime (UTC, tz-aware) | Server time at render |
 | `today` | string (`YYYY-MM-DD`) | Server date |
 | `is_sandbox` | bool | `True` when rendering for the ephemeral chat sandbox, `False` for a laptop workspace (`GET /api/welcome`, the default). Use this to branch wording that differs by surface — e.g. whether a saved file path is reachable by the user. |
+| `chat_icons` | list[str] | The inline icon names the web chat renders for `icon:<name>` tokens (canonical list: `src/chat_icons.py`). The shipped template's "Icons — never emoji" rule (sandbox renders only) offers the model exactly this list. |
 
 ## Example: iterating tables
 
