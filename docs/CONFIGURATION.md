@@ -181,6 +181,21 @@ Set the env var in `.env`/Terraform, or the YAML path in `instance.yaml`.
 | Corporate Memory block | — | `corporate_memory` | `{}` | `get_corporate_memory_config()` |
 | Hosted data apps block (`enabled`, `runtime_image`, `subdomain_base`, `default_idle_timeout_s`, `default_sleep_mode`, `default_mem_limit`, `default_cpus`, `max_apps_per_user`, `container_pids_limit`, `container_read_only`) — see [`DEPLOYMENT.md`](DEPLOYMENT.md#data-apps) | — | `data_apps` | `{}` (feature off) | `get_data_apps_config()` |
 
+### Connection ownership (`source_connections` vs `instance.yaml`)
+
+The `data_source.{bigquery,snowflake,databricks}` blocks above are read
+straight from the resolved `instance.yaml` tier — but each of those source
+types (plus `keboola`) also has a row in the `source_connections` table
+(`/api/admin/source-connections`, `agnes admin connection …`), the intended
+long-term source of truth. `app/connections_seed.py` seeds one such row per
+type from whatever `instance.yaml` / env vars are already configured on
+first boot — a one-time copy, not a live sync — after which further edits to
+`instance.yaml` for a *seeded* type log a deprecation warning and are
+otherwise ignored. See [`DATA_SOURCES.md`](DATA_SOURCES.md#connection-ownership-source_connections-vs-instanceyaml)
+for the per-source table of which side is actually load-bearing today (only
+`keboola` reads its row live; `bigquery`/`snowflake`/`databricks` still
+resolve from `instance.yaml` until that migration lands).
+
 ### Flea-market upload guardrails
 
 See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.
