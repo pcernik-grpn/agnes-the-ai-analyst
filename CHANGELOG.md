@@ -154,6 +154,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   that labels them `+00:00` — the browser then parsed the offset-less
   string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
   They now return raw datetimes and the encoder stamps the offset.
+- Web chat: the permanent "Connected." pill is gone — connected is the
+  normal state and reconnection is automatic, so the status surfaces only
+  when something is in progress or wrong ("Resuming session…", warnings,
+  errors), as a pill below the thread header. "Copy transcript" moves to
+  the header's right edge (the removed pill's spot) restyled as a quiet
+  ghost button, and a cleared status no longer leaves an empty dot-pill.
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a

@@ -387,9 +387,9 @@ body.chat-page-body main { margin: 0; padding: 0; }
 
 /* Header actions (Copy transcript). ``margin-left:auto`` pushes them to the
    trailing edge; ``flex-shrink:0`` keeps the label whole and lets the title's
-   ellipsis absorb the squeeze instead. Under the rail the header already
-   reserves 160px of right padding for the connection pill, so this lands
-   clear of it without a layout override. */
+   ellipsis absorb the squeeze instead. Under the rail this owns the header's
+   trailing edge outright — the status pill floats below the header and only
+   while something is worth saying. */
 .cloud-chat-thread-action {
   margin-left: auto;
   flex: 0 0 auto;
@@ -2632,12 +2632,13 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
    tests/test_ui_layout_theme.py) are unchanged. */
 
 /* Thread title — airier, borderless band. No floating buttons to clear on the
-   left now (history + New chat live in the rail), so the title sits at the
-   normal gutter; right padding still clears the status badge.
+   left now (history + New chat live in the rail), and no right-side reserve
+   either: the status pill only appears on trouble and sits BELOW the header
+   (see .cloud-chat-status below), so Copy transcript owns the trailing edge.
    align-items:center + min-height vertically centers the title. */
 html[data-ui-layout="rail"] .cloud-chat-thread-header {
   min-height: 68px;
-  padding: 8px 160px 8px var(--space-6);
+  padding: 8px var(--space-6);
   border-bottom: none;
   background: transparent;
   align-items: center;
@@ -2660,15 +2661,38 @@ html[data-ui-layout="rail"] .cloud-chat-thread-title {
      row back in the base rule above. */
   max-width: calc(100% - 130px);
 }
+/* Copy transcript as a quiet ghost at the header's trailing edge: the
+   bordered pill floating mid-row (left of the old status badge) read as a
+   stray control. Borderless at rest, surface on hover — same affordance
+   family as the message-level copy button below it. */
+html[data-ui-layout="rail"] .cloud-chat-thread-action {
+  border-color: transparent;
+  padding: 6px 10px;
+  color: var(--ds-text-muted);
+  border-radius: var(--radius-sm);
+}
+html[data-ui-layout="rail"] .cloud-chat-thread-action:hover {
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+}
+html[data-ui-layout="rail"] .cloud-chat-thread-action:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
 
-/* Connection state → compact pill in the top-right corner of the chat
-   surface, replacing the full-width status strip. Tone classes (is-ok /
-   is-warn / is-error) still tint it via the base rules; a leading dot
-   in currentColor reads the state at a glance. Long text ellipsizes. */
+/* Status → compact pill floating at the top-right of the chat surface,
+   replacing the full-width status strip. It appears only while something
+   is worth saying — a transient "Resuming session…", a warn, an error;
+   the connected happy path clears it (chat.js), so there is no permanent
+   sandbox-status chrome. Anchored BELOW the 68px thread header so it never
+   covers the Copy transcript action — which matters most exactly when a
+   "Disconnected" warn is up. Tone classes (is-ok / is-warn / is-error)
+   still tint it via the base rules; a leading dot in currentColor reads
+   the state at a glance. Long text ellipsizes. */
 html[data-ui-layout="rail"] .cloud-chat-status {
-  position: absolute; top: 16px; right: 16px; z-index: 6;
+  position: absolute; top: 72px; right: var(--space-6); z-index: 6;
   display: inline-flex; align-items: center; gap: 6px;
-  width: auto; max-width: 150px; min-height: 0;
+  width: auto; max-width: 320px; min-height: 0;
   padding: 5px 12px 5px 10px;
   border: 1px solid var(--ds-border); border-radius: var(--ds-radius-pill, 999px);
   background: var(--ds-surface);
@@ -2676,6 +2700,10 @@ html[data-ui-layout="rail"] .cloud-chat-status {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   box-shadow: var(--ds-shadow-sm);
 }
+/* The rail rule above out-specifies the base ``.cloud-chat-status:empty``
+   hide (its display:inline-flex wins), so restate it at rail specificity —
+   otherwise a cleared status leaves a tiny empty pill with just the dot. */
+html[data-ui-layout="rail"] .cloud-chat-status:empty { display: none; }
 html[data-ui-layout="rail"] .cloud-chat-status::before {
   content: ""; flex: 0 0 auto;
   width: 7px; height: 7px; border-radius: 50%;

@@ -1591,7 +1591,8 @@ async function openSession(chatId, wsUrlOverride) {
   // Show a "Resuming session…" status immediately after the TCP handshake and
   // before the ready frame arrives. For a fresh spawn this reads as a brief
   // connecting state; for a paused session (~1–2 s resume) it tells the user
-  // something is happening. The ready frame handler replaces it with "Connected."
+  // something is happening. The ready frame handler clears it — connected is
+  // the normal state and gets no pill.
   setStatus("Resuming session…", "info");
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
@@ -1635,7 +1636,12 @@ function handleFrame(frame) {
   switch (frame.type) {
     case "ready":
     case "runner_ready":
-      setStatus("Connected.", "ok");
+      // Connected is the NORMAL state — showing a permanent "Connected."
+      // pill told the user about infrastructure they never asked about
+      // (and reconnection is automatic anyway). Clear the transient
+      // "Resuming session…" line instead; the status surfaces only when
+      // something is wrong (warn/error) or in progress (info).
+      setStatus("");
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
