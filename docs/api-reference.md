@@ -1189,6 +1189,23 @@ semantic layer routinely describes more of a project than an instance registers.
 CLI: `agnes admin semantic-layer coverage [--json]`. MCP:
 `admin_semantic_layer_coverage`.
 
+### `/api/admin/semantic-coverage` — source-agnostic semantic-layer coverage
+
+- /api/admin/semantic-coverage
+
+`GET /api/admin/semantic-coverage` (admin) lists every registered table with
+NO valid semantic model describing it at all — `{"tables": [...]}` of full
+`table_registry` rows. Unlike `/api/admin/semantic-layer/coverage` above
+(Keboola-only, predicted live against one connected project's Metastore),
+this reads what is already stored in `semantic_models` regardless of source
+(Keboola, git, manual, upload, connection): a table is covered the moment
+ANY valid model's dataset resolves to it, whether that dataset is bound via
+a Keboola tableId or a plain `dataset.source`/`.name` match against
+`table_registry.id`/`.name`.
+
+CLI: `agnes semantic-model coverage [--limit N] [--json]`. MCP:
+`admin_semantic_coverage`.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a

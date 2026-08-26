@@ -85,7 +85,10 @@ _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 # — writers now resolve the id themselves (see `src.sync_state_key`); this
 # step only rewrites what an earlier binary already wrote (see
 # `_v123_to_v124`).
-SCHEMA_VERSION = 124
+# 125 adds table_registry.semantic_draft_pending_at — nullable TIMESTAMP, no
+# backfill, dedup bookkeeping wave 2's headless semantic-model auto-drafting
+# will read/write (see `_v124_to_v125`).
+SCHEMA_VERSION = 125
 
 # v96: data_apps registry (hosted user web apps). Extracted as a shared
 # module-level constant so the fresh-install DDL (appended to
@@ -534,7 +537,12 @@ CREATE TABLE IF NOT EXISTS table_registry (
     access_policy_note VARCHAR,
     access_policy_updated_at TIMESTAMP,
     access_policy_updated_by VARCHAR,
-    policy_mapping BOOLEAN DEFAULT false
+    policy_mapping BOOLEAN DEFAULT false,
+    -- v125: dedup bookkeeping for wave 2's headless semantic-model
+    -- auto-drafting session — when set, a draft has already been queued for
+    -- this table and a fresh sweep should not queue a second one. NULL =
+    -- no draft pending. No repository method reads/writes this yet (wave 2).
+    semantic_draft_pending_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS source_connections (
@@ -7914,6 +7922,24 @@ def _v123_to_v124(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("UPDATE schema_version SET version = 124")
 
 
+def _v124_to_v125(conn: duckdb.DuckDBPyConnection) -> None:
+    """v124→v125: add ``table_registry.semantic_draft_pending_at``.
+
+    Dedup bookkeeping for wave 2's headless semantic-model auto-drafting
+    session (semantic-phase5): when set, a draft has already been queued for
+    this table and a fresh sweep should not queue a second one. Plain
+    additive column, no backfill — NULL on every existing row means "no
+    draft pending", the correct reading for a table nothing has swept yet.
+
+    Idempotent: ``PRAGMA table_info`` skips the ALTER when the column
+    already exists, matching the neighbouring steps.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('table_registry')").fetchall()}
+    if "semantic_draft_pending_at" not in cols:
+        conn.execute("ALTER TABLE table_registry ADD COLUMN semantic_draft_pending_at TIMESTAMP")
+    conn.execute("UPDATE schema_version SET version = 125")
+
+
 def _backfill_builder_scope_rows(conn, rows, registries, _ids) -> None:
     """The per-agent write half of :func:`_v121_to_v122`, extracted so the
     transaction wrapper there reads as one unit."""
@@ -9001,6 +9027,9 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             # version stamp, which on this branch is what leaves the DB at
             # SCHEMA_VERSION.
             _v123_to_v124(conn)
+            # v124→v125: table_registry.semantic_draft_pending_at. No-op on
+            # fresh installs — _SYSTEM_SCHEMA already declares the column.
+            _v124_to_v125(conn)
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still
@@ -9302,6 +9331,8 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
                 _v122_to_v123(conn)
             if current < 124:
                 _v123_to_v124(conn)
+            if current < 125:
+                _v124_to_v125(conn)
             conn.execute(
                 "UPDATE schema_version SET version = ?, applied_at = current_timestamp",
                 [SCHEMA_VERSION],

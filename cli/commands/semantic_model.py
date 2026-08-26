@@ -244,6 +244,44 @@ def context(
             typer.echo(f"  … {total - len(objects)} more — raise --limit or narrow with --id/--model")
 
 
+@semantic_model_app.command("coverage")
+def coverage(
+    limit: int = typer.Option(0, "--limit", min=0, help="Cap the number of tables listed (0 = no cap)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """List registered tables with NO valid semantic model describing them.
+
+    Source-agnostic — covers a table bound through any semantic source
+    (Keboola, git, manual, upload, connection), not just Keboola. Mirrors
+    `GET /api/admin/semantic-coverage`. Admin-only; distinct from `agnes
+    admin semantic-layer coverage`, which predicts live Keboola metric
+    importability rather than reading stored coverage.
+    """
+    resp = api_get("/api/admin/semantic-coverage")
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    tables = body.get("tables") or []
+    if as_json:
+        if limit and limit > 0 and len(tables) > limit:
+            body["tables"] = tables[:limit]
+            body["truncated"] = {"limit": limit, "total": len(tables)}
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+
+    if not tables:
+        typer.echo("Every registered table has semantic-layer coverage.")
+        return
+
+    shown = tables[:limit] if limit and limit > 0 else tables
+    typer.echo(f"{len(tables)} table(s) with no semantic-layer coverage:")
+    for row in shown:
+        typer.echo(f"  {row.get('id')} ({row.get('name')})")
+    if limit and limit > 0 and len(tables) > limit:
+        typer.echo(f"  … and {len(tables) - limit} more — raise --limit to see them")
+
+
 @semantic_model_app.command("schema")
 def schema(
     semantic_type: List[str] = typer.Argument(..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)}"),

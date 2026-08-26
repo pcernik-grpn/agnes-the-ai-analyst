@@ -120,6 +120,11 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # semantic layer against the table registry. Triple-surface with
     # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
     "admin_semantic_layer_coverage",
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # which source wrote it. Triple-surface with
+    # /api/admin/semantic-coverage + `agnes semantic-model coverage`.
+    "admin_semantic_coverage",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -1568,6 +1573,32 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/admin/semantic-layer/coverage",
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_semantic_coverage() -> dict:
+        """List registered tables with NO valid semantic model at all (admin only).
+
+        Source-agnostic — unlike ``admin_semantic_layer_coverage`` (Keboola
+        metric importability, predicted live against one project's
+        Metastore), this reads what is already stored in the semantic-model
+        registry regardless of source (Keboola, git, manual, upload,
+        connection) and answers a narrower question: does a registered
+        table appear in ANY valid model's datasets at all.
+
+        Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
+        ``GET /api/admin/semantic-coverage`` and `agnes semantic-model
+        coverage`.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-coverage",
                 headers=headers_fn(),
                 timeout=60,
             )

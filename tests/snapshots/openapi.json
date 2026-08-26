@@ -25447,6 +25447,60 @@
         ]
       }
     },
+    "/api/admin/semantic-coverage": {
+      "get": {
+        "description": "Registered tables with NO valid semantic model describing them.\n\nSource-agnostic \u2014 unlike ``GET /api/admin/semantic-layer/coverage``\n(Keboola-only, predicts live against one connected project's Metastore),\nthis reads what is already stored in ``semantic_models`` regardless of\nsource (Keboola, git, manual, upload, connection) and answers a\nnarrower question: does a registered table appear in ANY valid model's\ndatasets at all. See ``src.semantic_coverage.tables_without_semantic_\ncoverage`` for the resolution rules.\n\nReturns ``{\"tables\": [...]}`` \u2014 full ``table_registry`` rows.",
+        "operationId": "get_semantic_coverage_api_admin_semantic_coverage_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Coverage",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/admin/semantic-layer/coverage": {
       "get": {
         "description": "How much of each connected Keboola project's semantic layer actually\nreaches Agnes, recomputed live (see\n``connectors.keboola.semantic_layer.compute_semantic_coverage``).\n\nRead-only and stateless \u2014 it does not touch metric_definitions and does not\nread the last sync's counters, which live in a process-local dict that\nempties on restart. Two conditions are worth acting on and are surfaced as\n``warnings[]``: a connection whose storage and master tokens point at\ndifferent projects, and a project none of whose metrics can bind to a\nregistered table. Tables the instance simply does not register are reported\nas a plain count, never as pending work.\n\n``?warnings_only=true`` answers with the token-identity checks alone and\nskips the Metastore enumeration \u2014 two `verify_token` calls per connection\ninstead of every project's whole semantic model. The Data sources page\ndraws its warning strip from that: it uses only the mismatch messages, and\npulling the full report on every page view was work nobody asked for.\nCounts are zeroed in that mode. (Devin Review on this PR.)\n\nUpstream calls run off the event loop \u2014 one project's Metastore being slow\nmust not stall every other request in the process.",

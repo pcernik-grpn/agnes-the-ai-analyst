@@ -10,6 +10,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **Source-agnostic semantic-layer coverage check.** `GET /api/admin/semantic-coverage` (admin, CLI `agnes semantic-model coverage`, MCP `admin_semantic_coverage`) lists every registered table with NO valid semantic model describing it at all — reads what's already stored in `semantic_models` regardless of source (Keboola, git, manual, upload, connection), unlike the existing Keboola-only `GET /api/admin/semantic-layer/coverage`. Built on a new shared resolver, `resolve_dataset_table()`, which `project_document`'s metric binder now also uses so a Keboola dataset (bound via its raw Keboola tableId) is never misreported as uncovered by a naive text match.
+- **`semantic-drafter` system identity**, provisioned via `app.auth.system_users.ensure_semantic_drafter_user()` — the non-human identity a forthcoming headless semantic-model auto-drafting session authenticates as. Unlike the scheduler service user, it is deliberately never added to the Admin group, so its writes route through `POST /api/semantic-models/apply`'s non-admin moderation queue rather than landing directly.
+- `table_registry.semantic_draft_pending_at` (nullable, no default) — dedup bookkeeping column for the same forthcoming auto-drafting feature; unused until then.
+
 ## [0.87.0] - 2026-08-25
 
 ### Added

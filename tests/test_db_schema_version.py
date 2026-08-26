@@ -1530,9 +1530,7 @@ def test_v119_db_migrates_to_v120_adds_agent_schedules(tmp_path):
     _ensure_schema(conn)
     assert get_schema_version(conn) == SCHEMA_VERSION
 
-    exists = conn.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_schedules'"
-    ).fetchone()
+    exists = conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_schedules'").fetchone()
     assert exists is not None
 
     conn.execute(
@@ -1629,4 +1627,59 @@ def test_v122_backfills_builder_agent_scope(tmp_path):
     # idempotency — re-running the step must not raise or duplicate rows
     _v121_to_v122(conn)
     assert _scope("agt_" + "a" * 32) == {("data_package", pkg_id), ("plugin", "plug-1")}
+    conn.close()
+
+
+def test_v125_table_registry_semantic_draft_pending_at_column(tmp_path):
+    """v124→v125 (semantic-phase5 wave 1, Task 3): a fresh install carries
+    ``table_registry.semantic_draft_pending_at`` — nullable TIMESTAMP,
+    NULL on a fresh row — and the migration step is idempotent."""
+    db_path = tmp_path / "system.duckdb"
+    conn = duckdb.connect(str(db_path))
+    _ensure_schema(conn)
+    # `>=`, matching this file's own convention: the claim under test is
+    # that a fresh install carries the v125 column, not that the ladder
+    # stops at 125.
+    assert SCHEMA_VERSION >= 125
+    assert get_schema_version(conn) == SCHEMA_VERSION
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('table_registry')").fetchall()}
+    assert "semantic_draft_pending_at" in cols, f"semantic_draft_pending_at missing from table_registry: {cols}"
+
+    conn.execute("INSERT INTO table_registry (id, name) VALUES ('t1', 'orders')")
+    row = conn.execute("SELECT semantic_draft_pending_at FROM table_registry WHERE id = 't1'").fetchone()
+    assert row == (None,), f"new row's semantic_draft_pending_at: {row}"
+
+    # idempotency — re-running the step must not raise
+    from src.db import _v124_to_v125
+
+    _v124_to_v125(conn)
+    conn.close()
+
+
+def test_v124_db_migrates_to_v125_adds_semantic_draft_pending_at(tmp_path):
+    """A DB pinned at v124 (a live instance's state before this migration)
+    climbs to v125 via the upgrade-block dispatch, keeping an existing row
+    intact with the new column reading its documented NULL default."""
+    db_path = tmp_path / "v124.duckdb"
+    conn = duckdb.connect(str(db_path))
+    _ensure_schema(conn)
+    conn.execute("UPDATE schema_version SET version = 124")
+    conn.execute("INSERT INTO table_registry (id, name) VALUES ('keep', 'orders')")
+    conn.close()
+
+    conn = duckdb.connect(str(db_path))
+    _ensure_schema(conn)
+    assert get_schema_version(conn) == SCHEMA_VERSION
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info('table_registry')").fetchall()}
+    assert "semantic_draft_pending_at" in cols
+
+    row = conn.execute("SELECT id, semantic_draft_pending_at FROM table_registry WHERE id = 'keep'").fetchone()
+    assert row == ("keep", None), f"existing row must survive the upgrade with a defaulted column: {row}"
+
+    # idempotency — re-running the step must not raise
+    from src.db import _v124_to_v125
+
+    _v124_to_v125(conn)
     conn.close()

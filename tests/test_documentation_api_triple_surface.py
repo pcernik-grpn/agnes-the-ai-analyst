@@ -80,6 +80,10 @@ _COHORT: dict[str, tuple[str, str]] = {
         "admin semantic-layer coverage",
         "admin_semantic_layer_coverage",
     ),
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # source — distinct from the Keboola-only endpoint above.
+    "/api/admin/semantic-coverage": ("semantic-model coverage", "admin_semantic_coverage"),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
     # this same endpoint (wraps its raw YAML text into a dict); `agnes admin

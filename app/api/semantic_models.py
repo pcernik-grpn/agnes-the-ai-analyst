@@ -291,6 +291,25 @@ async def list_semantic_models(
     return semantic_model_repo().list_all(source=source, source_ref=source_ref)
 
 
+@router.get("/api/admin/semantic-coverage")
+async def get_semantic_coverage(user: dict = Depends(require_admin)):
+    """Registered tables with NO valid semantic model describing them.
+
+    Source-agnostic — unlike ``GET /api/admin/semantic-layer/coverage``
+    (Keboola-only, predicts live against one connected project's Metastore),
+    this reads what is already stored in ``semantic_models`` regardless of
+    source (Keboola, git, manual, upload, connection) and answers a
+    narrower question: does a registered table appear in ANY valid model's
+    datasets at all. See ``src.semantic_coverage.tables_without_semantic_
+    coverage`` for the resolution rules.
+
+    Returns ``{"tables": [...]}`` — full ``table_registry`` rows.
+    """
+    from src.semantic_coverage import tables_without_semantic_coverage
+
+    return {"tables": tables_without_semantic_coverage()}
+
+
 @router.post("/api/admin/semantic-models", status_code=201)
 async def create_semantic_model(
     body: SemanticModelCreate,
