@@ -142,6 +142,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   BELOW the bubble instead of renting an invisible second row inside it —
   a one-line message no longer renders as a two-row-tall bubble. On touch
   devices (no hover) the row stays visible and the turn reserves the space.
+- Web chat: on a history reload, a multi-part assistant turn (text → tool
+  card → text) now carries its sources chips, copy/actions row, "Ask again"
+  and collapse cap on the turn's LAST text segment — where the live stream
+  already put them — instead of stapling them after the first segment,
+  mid-turn. The reload timestamp also reads the row's real `created_at` on
+  every segment rather than "now" on continuations.
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a
