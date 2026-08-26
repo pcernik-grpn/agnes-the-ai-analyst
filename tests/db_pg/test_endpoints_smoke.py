@@ -2963,6 +2963,7 @@ class TestSemanticLayerSmoke:
         "POST /api/semantic-models/validate-query",
         "GET /api/semantic-models/context",
         "GET /api/semantic-models/schema",
+        "GET /api/semantic-models/bundle",
         "POST /api/semantic-models/apply",
     }
 
@@ -3016,6 +3017,20 @@ class TestSemanticLayerSmoke:
         )
         assert schema.status_code == 200
         assert "Dataset" in schema.json()["$defs"]
+
+        # The `agnes pull` delivery channel for the local semantic cache:
+        # RBAC-scoped bundle of every accessible status='valid' model.
+        bundle = c.get("/api/semantic-models/bundle", headers=h)
+        assert bundle.status_code == 200
+        body = bundle.json()
+        assert body["ttl_seconds"] > 0
+        assert body["generated_at"]
+        bundled = {m["slug"]: m for m in body["models"]}
+        assert "smoke_model" in bundled
+        # The renderer needs the document and the hash it caches against —
+        # both must actually be carried, not just the row's identity.
+        assert bundled["smoke_model"]["document_json"]
+        assert bundled["smoke_model"]["content_hash"]
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
 
