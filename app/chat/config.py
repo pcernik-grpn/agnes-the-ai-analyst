@@ -80,17 +80,21 @@ class ChatConfig:
     docker_mem_limit: str = "2g"
     docker_cpus: float = 1.0
     docker_pids_limit: int = 512
+    # ``none`` (SECURE DEFAULT) — an ``internal`` bridge where the only
+    # reachable origin is whatever else is attached to it, so the agent (which
+    # runs with bypassPermissions over a read-write workspace) has no route to
+    # exfiltrate data to an arbitrary external host (llm-agency-open-egress-5).
+    # In-sandbox package installs stop working in this mode.
     # ``open`` — normal bridge, internet reachable (parity with in-sandbox
-    # tools that fetch packages). ``none`` — an ``internal`` bridge where the
-    # only reachable origin is whatever else is attached to it (but
-    # in-sandbox package installs stop working).
+    # tools that fetch packages). This is unrestricted egress and must be an
+    # explicit operator opt-in (``chat.docker_egress_mode: open``).
     # ``allowlist`` — the internal bridge of ``none`` PLUS an egress-proxy
     # sidecar (services/egress_proxy) dual-homed onto it: sandboxes get
     # HTTP(S)_PROXY pointed at the proxy, which enforces
     # ``docker_egress_allow_hosts`` with a post-resolution IP re-check
     # (DNS-rebinding/metadata protection). Ignoring the proxy is not a
     # bypass — the internal network has no other route out.
-    docker_egress_mode: str = "open"
+    docker_egress_mode: str = "none"
     # Hostnames sandboxes may reach in ``allowlist`` mode (exact or
     # ``*.suffix`` wildcards). Cloud metadata endpoints stay blocked even
     # if listed. Empty = deny everything except the direct internal-network
@@ -251,13 +255,15 @@ def _raw_float(raw: dict, key: str, default: float) -> float:
 
 
 def _parse_docker_egress_mode(raw: dict) -> str:
-    """``open`` | ``none`` | ``allowlist``; anything else warns and falls
-    back to ``open`` (same normalize-don't-crash convention as
-    ``_parse_on_detach``)."""
-    mode = _raw_str(raw, "docker_egress_mode", "open").lower()
+    """``none`` (secure default) | ``open`` | ``allowlist``; anything else warns
+    and falls back to the SECURE ``none`` — a misconfigured value must fail
+    closed, never grant a sandbox unrestricted internet egress
+    (llm-agency-open-egress-5). ``open`` is unrestricted egress and is only ever
+    reached by an explicit, correctly-spelled operator opt-in."""
+    mode = _raw_str(raw, "docker_egress_mode", "none").lower()
     if mode not in ("open", "none", "allowlist"):
-        logger.warning("unknown chat.docker_egress_mode %r — falling back to 'open'", mode)
-        mode = "open"
+        logger.warning("unknown chat.docker_egress_mode %r — falling back to secure 'none'", mode)
+        mode = "none"
     return mode
 
 

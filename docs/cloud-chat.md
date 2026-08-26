@@ -449,7 +449,7 @@ chat:
   docker_mem_limit: "2g"
   docker_cpus: 1.0
   docker_pids_limit: 512
-  docker_egress_mode: open          # open | none
+  docker_egress_mode: none          # none (secure default) | open | allowlist
   docker_max_total_sandboxes: 10
 ```
 
@@ -522,10 +522,19 @@ already-delivered frames).
 
 ### Egress
 
+The **secure default is `none`** — a sandbox has no route to the internet
+unless an operator explicitly opts into `open` or `allowlist`. The chat agent
+runs with `permission_mode="bypassPermissions"` over a read-write bind-mounted
+workspace, so unrestricted egress is an exfiltration surface (any workspace file
+or tool output could be POSTed to an arbitrary external host); `none` closes it
+by construction. Set `docker_egress_mode: open` only when the sandbox genuinely
+needs unrestricted internet access and you accept that trade-off; prefer
+`allowlist` when you need specific hosts (e.g. PyPI) but not the whole internet.
+
 | Mode | Behavior |
 |---|---|
-| `open` (default) | normal bridge — the sandbox can reach the internet, so in-sandbox `pip install` / `npm install` work. |
-| `none` | the sandbox joins an `internal` Docker network (`<docker_network>-internal`) with no route off the host. The Agnes app must also be attached to that network for the rails to work, and in-sandbox package installs stop working. |
+| `none` (default) | the sandbox joins an `internal` Docker network (`<docker_network>-internal`) with no route off the host. The Agnes app must also be attached to that network for the rails to work, and in-sandbox package installs stop working. This is the secure default. |
+| `open` | normal bridge — the sandbox can reach the internet, so in-sandbox `pip install` / `npm install` work. **Unrestricted egress; explicit operator opt-in only.** |
 | `allowlist` | the `none` internal network **plus** the `services/egress_proxy` sidecar dual-homed onto it (compose profile `chat-docker-egress`). Sandboxes get `HTTP(S)_PROXY` pointed at the proxy and may reach exactly `chat.docker_egress_allow_hosts` (exact names or `*.suffix` wildcards) — each connection is re-checked **after DNS resolution** against link-local/metadata/private ranges and connects to the vetted address, closing the DNS-rebinding gap; cloud metadata endpoints stay blocked even if listed. The proxy env is cooperative, but ignoring it is not a bypass: the internal network has no other route out. **Requires the rails URL to be internally reachable** — the sandbox's `NO_PROXY` carries whatever host `AGNES_SERVER` resolves to, so a public `SERVER_URL` would be forced onto a direct connection the no-route-out network cannot make. Use `AGNES_INTERNAL_URL` (e.g. `http://app:8000` under compose), as the rest of this page already instructs. |
 
 To enable `allowlist` mode under Compose: set `chat.docker_egress_mode:

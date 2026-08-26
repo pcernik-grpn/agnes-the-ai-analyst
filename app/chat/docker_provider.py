@@ -339,7 +339,7 @@ class DockerSandboxProvider:
         mem_limit: str = "2g",
         cpus: float = 1.0,
         pids_limit: int = 512,
-        egress_mode: str = "open",
+        egress_mode: str = "none",
         egress_proxy_url: str = "",
         max_total_sandboxes: int = 10,
         upload_runner: bool = True,
