@@ -54,6 +54,10 @@
    to the unstyled browser default. #}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+{# The builder workspace, shared with /agents — same shell, same affordances,
+   one copy. What stays in the <style> below is this page's own: the type
+   picker, the body editor, the card preview and the linter rows. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <style>
   .sk-no-review {
     margin-bottom: var(--space-4);
@@ -126,6 +130,11 @@
      separated from the build head by the shell's 28px inter-band gap. */
   .sk-back { display: inline-flex; align-items: center; gap: 6px; border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13px; cursor: pointer; padding: 0; margin: 0 0 14px; text-decoration: none; }
   .sk-back:hover { color: var(--ds-primary); }
+  /* The left pane's scroll region. The shell gives each pane a fixed height
+     and expects its content to scroll inside — without this the card preview
+     is clipped instead of scrollable. Mirrors .ag-conv. */
+  .sk-pvpane { flex: 1; overflow-y: auto; padding: 4px 22px 20px; }
+  .sk-pvpane .sk-preview { position: static; }
   .sk-build-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 0 0 18px; }
   .sk-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-kind-skill); }
   .sk-build-kicker--skill { color: var(--ds-kind-skill); }
@@ -399,6 +408,9 @@
 {% endblock %}
 
 {% block scripts %}
+{# NOT deferred: this page renders on boot, so BuilderShell has to exist
+   before the script below runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -520,6 +532,11 @@
   var type = null;        // null → step 1 expanded, nothing below it yet
   var typeOpen = false;   // step 1 re-opened via Change while a type is set
   var draft = null;       // the in-progress item in the builder
+  /* Which configuration sections are folded away. Content is what an author
+     is here to write, so it opens; Identity opens because it gates saving.
+     Access is a pre-answered publishing choice and Type is already decided by
+     the time this renders, so both start shut. */
+  var collapsed = { type: true, identity: false, content: false, access: true };
   var bundle = null;      // plugin only: the attached File (never persisted)
   var check = null;       // last Check result, or null
   var inFlight = false;
@@ -530,11 +547,9 @@
   var problems = [];
   var problemsLead = '';   // "Couldn’t save"; the count is derived, see alertsHtml
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
+  /* Delegated, not duplicated — see builder_shell.js on why there is one
+     escaper across both builder pages. */
+  var esc = BuilderShell.esc;
   function cfg() { return TYPES[type]; }
 
   /* ── Draft persistence (localStorage only — see DRAFT_KEY note above) ──
@@ -883,7 +898,6 @@
       '<div class="sk-pv-row"><span class="sk-pv-k">Status</span><span class="sk-pv-v" id="sk-pv-status">' + (canPublish() ? 'Ready to save' : 'Draft') + '</span></div>';
 
     return '<div>' +
-      '<h3>Preview</h3>' +
       '<div class="sk-pv-card">' +
         '<div class="sk-pv-hd">' +
           '<span class="sk-ava sk-ava--' + type + '">' + ICONS[type] + '</span>' +
@@ -967,6 +981,10 @@
     // (the shell puts 28px between the two bands, which is right between
     // zones but far too much between a back link and its heading).
     if (pageHeadBand) pageHeadBand.hidden = !!type;
+    /* Same full-bleed breakout /agents uses: once a type is chosen this is a
+       workspace, not a document, and it drops the index shell's centred
+       column. Cleared on the type picker, which IS a document. */
+    document.body.classList.toggle('ag-building', !!type);
 
     if (!type) {
       view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' + typeSectionHtml() + '</div></div>';
@@ -975,39 +993,61 @@
 
     var c = cfg(), ns = nameState();
     view.innerHTML =
-      '<a class="sk-back" href="/library">← Library</a>' +
-      '<div class="sk-build-head">' +
-        '<div style="min-width:0">' +
-          '<div class="sk-build-kicker sk-build-kicker--' + type + '">' + esc(c.kicker) + '</div>' +
-          '<h2 id="sk-build-title">' + (esc(draft.name) || esc(c.newTitle)) + '</h2>' +
-        '</div>' +
-        '<div class="sk-build-actions">' +
-          // No status line lives in this row. Receipts go to the toast and the
-          // save verdict goes to #sk-alerts below, so nothing here can grow and
-          // push the buttons off the line the author is aiming at.
-          // Discard replaced the ✕ that used to sit on each row of the picker's
-          // draft list; with the list gone this is the only way to throw work
-          // away, so it has to exist somewhere.
-          (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
-          '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
-          '<button type="button" class="cc-btn" id="sk-check" ' + (canCheck() && !reviewInProgress ? '' : 'disabled') + '>' + esc(c.checkLabel) + '</button>' +
-          '<button type="button" class="cc-btn cc-btn--primary" id="sk-save" ' + (canPublish() && !reviewInProgress ? '' : 'disabled') + '>Save to Library</button>' +
-        '</div>' +
-      '</div>' +
+      BuilderShell.head({
+        backLabel: 'Library',
+        title: draft.name || c.newTitle,
+        titleId: 'sk-build-title',
+        actionsId: 'sk-build-actions',
+        actions: headActionsHtml(),
+      }) +
       // The save verdict, below the action row and above the form it is about.
       // Empty on a good day; it never reserves space.
       '<div id="sk-alerts">' + alertsHtml() + '</div>' +
       agentCalloutHtml() +
-      '<div class="sk-bgrid">' +
-        '<div id="sk-steps">' +
-          typeSectionHtml() +
-          // Section 2 — Identity. Same fields for every type, so switching
-          // type never moves the name field out from under the author.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">2</span>' +
-              '<div class="sk-sec-grow"><h3>Identity</h3><p class="sk-sec-sub">What it is called and when someone should reach for it.</p></div>' +
-            '</div>' +
-            '<div class="sk-sec-body">' +
+      BuilderShell.workspace({
+        /* Left is where the conversation will go (phase 3 of the builder
+           spec). Until then it carries the one thing that already belongs
+           there — what you are making, as it will read — behind the same tab
+           strip, so adding Create later moves nothing. */
+        left: BuilderShell.tabs({ active: 'preview', tabs: [{ id: 'preview', label: 'Preview' }] }) +
+          '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>',
+        cfgTitle: 'Configuration',
+        cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
+        cfgBodyId: 'sk-steps',
+        cfg: stepsHtml(c, ns),
+      });
+    afterRender();
+  }
+
+  /* The header verbs. Split out of render() for the same reason /agents did
+     it: they change on their own (a draft appearing, a check finishing) and
+     repainting just this row must not rebuild the form under the caret. */
+  function headActionsHtml() {
+    var c = cfg();
+    // No status line lives in this row. Receipts go to the toast and the save
+    // verdict goes to #sk-alerts below, so nothing here can grow and push the
+    // buttons off the line the author is aiming at.
+    // Discard replaced the ✕ that used to sit on each row of the picker's
+    // draft list; with the list gone this is the only way to throw work away,
+    // so it has to exist somewhere.
+    return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
+          '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
+          '<button type="button" class="cc-btn" id="sk-check" ' + (canCheck() && !reviewInProgress ? '' : 'disabled') + '>' + esc(c.checkLabel) + '</button>' +
+      '<button type="button" class="cc-btn cc-btn--primary" id="sk-save" ' + (canPublish() && !reviewInProgress ? '' : 'disabled') + '>Save to Library</button>';
+  }
+
+  /* The configuration itself — the numbered sections, on the shell's own
+     section component so they read identically to the agent builder's. */
+  function stepsHtml(c, ns) {
+    return typeSectionHtml() +
+      // Section 2 — Identity. Same fields for every type, so switching
+      // type never moves the name field out from under the author.
+      BuilderShell.section({
+        key: 'identity',
+        collapsed: !!collapsed['identity'], no: 2, title: 'Identity',
+        sub: 'What it is called and when someone should reach for it.',
+        summary: draft.name || 'Unnamed',
+        body:
               '<label class="sk-field"><span>Name <em>— lowercase-hyphenated handle</em></span>' +
                 '<input type="text" data-sk-field="name" value="' + esc(draft.name) + '" placeholder="' + esc(c.namePlaceholder) + '" maxlength="64" autocomplete="off" spellcheck="false"></label>' +
               '<p class="sk-hint' + (ns.err ? ' err' : '') + '" id="sk-name-hint">' + esc(ns.msg) + '</p>' +
@@ -1017,29 +1057,27 @@
               fieldErrHtml('description') +
               '<label class="sk-field"><span>Category</span>' +
                 '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
-              fieldErrHtml('category') +
-            '</div>' +
-          '</div>' +
-          // Section 3 — the type's content: markdown body, or a .zip bundle.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">3</span>' +
-              '<div class="sk-sec-grow"><h3>' + esc(c.secTitle) + ' <span class="sk-sec-note">' + esc(c.secNote) + '</span></h3>' +
-              '<p class="sk-sec-sub">' + esc(c.secSub) + '</p></div>' +
-            '</div>' +
-            bodySectionHtml() +
-          '</div>' +
+          fieldErrHtml('category'),
+      }) +
+      // Section 3 — the type's content: markdown body, or a .zip bundle.
+      BuilderShell.section({
+        key: 'content',
+        collapsed: !!collapsed['content'], no: 3, title: c.secTitle, note: c.secNote, sub: c.secSub,
+        summary: bodyStats(),
+        body: bodySectionHtml(),
+      }) +
           // Section 4 — Access. It used to sit ABOVE the sections as unnumbered
           // preamble, which was fine while the sections started at Identity;
           // once Type became step 1 that put an un-numbered decision in front
           // of step 1 and broke the sequence. It is a publishing choice, so it
           // belongs last — pre-answered with the safe default, read right
           // before Save.
-          '<div class="sk-sec">' +
-            '<div class="sk-sec-head"><span class="sk-sec-no">4</span>' +
-              '<div class="sk-sec-grow"><h3>Access</h3>' +
-              '<p class="sk-sec-sub">Who can use this ' + esc(c.label.toLowerCase()) + ' once it is saved.</p></div>' +
-            '</div>' +
-            '<div class="sk-sec-body">' +
+      BuilderShell.section({
+        key: 'access',
+        collapsed: !!collapsed['access'], no: 4, title: 'Access',
+        sub: 'Who can use this ' + c.label.toLowerCase() + ' once it is saved.',
+        summary: draft.access === 'everyone' ? 'Everyone' : 'Private',
+        body:
               '<div class="sk-access" role="radiogroup" aria-label="Who can use this">' +
                 '<label class="sk-access-opt' + (draft.access === 'everyone' ? '' : ' is-on') + '">' +
                   '<input type="radio" name="sk-access" value="private" ' + (draft.access === 'everyone' ? '' : 'checked') + '>' +
@@ -1051,13 +1089,13 @@
                   '<span class="sk-access-body"><span class="sk-access-name">Everyone in the organization</span>' +
                   '<span class="sk-access-hint">Published to the Library after the automated review, then available to everyone here.</span></span>' +
                 '</label>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above.</div>' +
-        '</div>' +
-        '<aside class="sk-preview" id="sk-preview">' + previewHtml() + '</aside>' +
-      '</div>';
+              '</div>',
+      }) +
+      '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above.</div>';
+  }
+
+  /* Everything render() has to do once the markup is in the DOM. */
+  function afterRender() {
 
     // Re-insert the review banner if one was shown before this re-render (e.g. the
     // author changed the access radio after saving — without this the banner disappears).
@@ -1066,7 +1104,7 @@
       wrap.id = 'sk-review-banner-wrap';
       wrap.style.marginBottom = '16px';
       wrap.innerHTML = _reviewBannerHtml;
-      var buildHead = view.querySelector('.sk-build-head');
+      var buildHead = view.querySelector('.ag-build-head');
       var insertAfter = buildHead ? buildHead.nextSibling : null;
       if (insertAfter) {
         view.insertBefore(wrap, insertAfter);
@@ -1089,6 +1127,18 @@
   /* Light-touch preview sync while typing (no re-render → keeps focus). */
   function syncPreview() {
     var el, c = cfg(), ns = nameState();
+    /* The collapsed summaries are the only thing a folded section shows, so
+       they have to track the fields inside it — a section that still reads
+       "Unnamed" after you typed a name is worse than no summary at all. */
+    if ((el = document.querySelector('[data-sec="identity"] .ag-sec-sum'))) {
+      el.textContent = draft.name || 'Unnamed';
+    }
+    if ((el = document.querySelector('[data-sec="content"] .ag-sec-sum'))) {
+      el.textContent = bodyStats();
+    }
+    if ((el = document.querySelector('[data-sec="access"] .ag-sec-sum'))) {
+      el.textContent = draft.access === 'everyone' ? 'Everyone' : 'Private';
+    }
     if ((el = document.getElementById('sk-pv-name'))) el.textContent = draft.name || ('your-' + type);
     if ((el = document.getElementById('sk-pv-cat'))) el.textContent = draft.category || c.label;
     if ((el = document.getElementById('sk-pv-desc'))) el.textContent = draft.description || c.descPreview;
@@ -1601,7 +1651,7 @@
       var banner = document.createElement('div');
       banner.id = 'sk-review-banner-wrap';
       banner.style.marginBottom = '16px';
-      var buildHead = view.querySelector('.sk-build-head');
+      var buildHead = view.querySelector('.ag-build-head');
       var insertAfter = buildHead ? buildHead.nextSibling : null;
       if (insertAfter) {
         view.insertBefore(banner, insertAfter);
@@ -1929,9 +1979,32 @@
   document.addEventListener('click', function (e) {
     var t = e.target.closest('[data-sk-type],[data-sk-change],[data-sk-mode],[data-sk-browse],' +
                              '[data-sk-removefile],[data-sk-jump],[data-sk-dismiss],' +
+                             '[data-ag-back],[data-ag-toggle-sec],' +
                              '#sk-check,#sk-save,#sk-draft,#sk-discard');
     if (!t) return;
-    if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
+    if (t.hasAttribute('data-ag-back')) {
+      /* Straight out, no confirmation — and that is NOT an oversight.
+         /agents asks before you leave because it holds the only copy of your
+         edits; this page has written every keystroke to localStorage
+         (`persist`), so the draft is still here when you come back. A
+         "your changes will be discarded" dialog would be claiming a loss
+         that does not happen, which is how people learn to click through
+         the dialogs that do matter. */
+      window.location.href = '/library';
+    }
+    else if (t.hasAttribute('data-ag-toggle-sec')) {
+      /* In place, never a re-render: rebuilding would throw away the panel's
+         scroll position and the caret in whatever field has focus — the same
+         bug /agents had. Every section body is always in the DOM. */
+      var sk = t.getAttribute('data-ag-toggle-sec');
+      collapsed[sk] = !collapsed[sk];
+      var sec = view.querySelector('[data-sec="' + sk + '"]');
+      if (sec) {
+        sec.classList.toggle('collapsed', collapsed[sk]);
+        t.setAttribute('aria-expanded', String(!collapsed[sk]));
+      } else { render(); }
+    }
+    else if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
     else if (t.hasAttribute('data-sk-change')) { typeOpen = true; render(); }
     else if (t.hasAttribute('data-sk-dismiss')) { clearProblems(); }
     else if (t.hasAttribute('data-sk-jump')) { jumpTo(t.getAttribute('data-sk-jump')); }
