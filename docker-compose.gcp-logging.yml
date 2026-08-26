@@ -1,11 +1,16 @@
 # GCP Cloud Logging overlay — ships container stdout/stderr to Google Cloud
 # Logging via Docker's built-in `gcplogs` driver.
 #
-# Activation is PLACEMENT-DRIVEN: this file is not in any default COMPOSE_FILE
-# / CONFIG_FILES list. The runtime drivers (agnes-auto-upgrade.sh,
-# agnes-state-applier.sh) append it ONLY when the file physically exists on
-# disk (`[ -f docker-compose.gcp-logging.yml ]`), via the shared resolver in
-# scripts/ops/agnes-compose-file.sh.
+# Activation is PLACEMENT + PROBE driven: this file is not in any default
+# COMPOSE_FILE / CONFIG_FILES list. Every COMPOSE_FILE builder (the boot
+# startup script and the runtime drivers agnes-auto-upgrade.sh /
+# agnes-state-applier.sh, all via the shared gate in
+# scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active) appends it
+# ONLY when the file physically exists on disk AND the gcplogs driver probe
+# has armed the .gcp-logging-ok marker next to it. The probe exists because
+# Docker refuses to START a container whose log driver cannot initialize —
+# an armed overlay on a VM that cannot authenticate to Cloud Logging turns
+# the next routine container recreate into a full outage (#1557).
 #
 # The real placement mechanism (`infra/modules/customer-instance/`, the
 # reusable Terraform module for GCE-hosted instances): this file is baked
@@ -14,8 +19,10 @@
 # `docker cp .../opt/agnes-host/. $APP_DIR/` extracts it onto the VM on every
 # boot. The module's `enable_gcp_logging` variable (default true) then
 # decides whether the script leaves the extracted file in place or removes
-# it again — removal is what turns the resolver's presence check off for a
-# VM that opts out.
+# it again — removal is what turns the resolver's gate off for a VM that
+# opts out. The same variable gates the module's project-level
+# roles/logging.logWriter grant to the VM service account, which the driver
+# needs to authenticate (it is NOT part of any default SA setup).
 #
 # Why not default-on regardless of host: the gcplogs driver requires Google
 # ADC from the GCE metadata server, so on a non-GCP host the containers would
@@ -27,8 +34,10 @@
 # metadata server, writes under resource `gce_instance` (next to the VM/system
 # logs) to logName `gcplogs-docker-driver`, and tags each entry with
 # `jsonPayload.container.name` (e.g. "/agnes-app-1") so services stay
-# distinguishable in the Logs Explorer. The VM service account already carries
-# roles/logging.logWriter, so no IAM change is required.
+# distinguishable in the Logs Explorer. The VM service account must carry
+# roles/logging.logWriter — the module grants it when enable_gcp_logging is
+# true; without it the probe leaves this overlay disabled (loud warning in
+# the boot/tick logs) rather than letting container starts fail.
 #
 # `docker logs` / `docker compose logs` keep working via Docker's dual-logging
 # local cache (Docker >= 20.10).
