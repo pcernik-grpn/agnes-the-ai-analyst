@@ -160,6 +160,28 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   errors), as a pill below the thread header. "Copy transcript" moves to
   the header's right edge (the removed pill's spot) restyled as a quiet
   ghost button, and a cleared status no longer leaves an empty dot-pill.
+- **The GCP Cloud Logging overlay can no longer take an instance down**
+  (#1557, #1558; observed live as a 9-minute full outage on a routine
+  auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
+  service account, but the `customer-instance` Terraform module granted it
+  no logging role while defaulting `enable_gcp_logging = true` — and Docker
+  refuses to START a container whose log driver cannot initialize, so the
+  first container recreate with the overlay armed turned into 502s. Two
+  halves: (1) the module now grants `roles/logging.logWriter` on the
+  project to the VM service account, gated on the same `enable_gcp_logging`
+  variable (the deploying identity must be able to modify project IAM
+  policy — documented on the variable; grant the role out-of-band or
+  disable the flag otherwise); (2) defense in depth — the overlay is
+  engaged only when the overlay file is present AND a driver probe
+  (`agnes_gcp_logging_probe`: a no-op container on `--log-driver=gcplogs`)
+  has armed the `/opt/agnes/.gcp-logging-ok` marker. The probe runs at boot
+  and on any auto-upgrade tick that finds the overlay marker-less, and the
+  single shared gate (`agnes_gcp_logging_active` in
+  `scripts/ops/agnes-compose-file.sh`) is used by the boot startup script,
+  the auto-upgrade tick, and the state applier alike — so the boot-time
+  `COMPOSE_FILE` and the recurring resolver can never disagree about the
+  overlay again, and a missing IAM role now degrades to "Cloud Logging off
+  + loud warning" instead of an outage.
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a
