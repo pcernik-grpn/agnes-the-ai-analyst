@@ -1866,6 +1866,16 @@ class TestPrivacyPageSmoke:
 # ---------------------------------------------------------------------------
 
 KNOWN_UNTESTED = {
+    # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
+    # admin-gated, behaviorally covered outside this parameter-free smoke
+    # sweep: GET /api/admin/semantic-coverage in tests/test_semantic_coverage.py
+    # (source-agnostic zero-coverage check, RBAC gate); POST /api/admin/
+    # semantic-auto-draft-sweep in tests/test_semantic_autodraft_sweep.py
+    # (admin gate, DuckDB-backend 501 fail-clean per the A3 ratchet) plus
+    # the PG-only sweep-logic tests in tests/db_pg/test_semantic_autodraft_
+    # sweep_pg.py (dedup, batch limit, concurrency-cap degradation).
+    "GET /api/admin/semantic-coverage",
+    "POST /api/admin/semantic-auto-draft-sweep",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
