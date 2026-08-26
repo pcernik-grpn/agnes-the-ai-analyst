@@ -87,6 +87,14 @@ class PullResult:
       §10 item 4) — 0 when the analyst's stack has none, or against a
       pre-this-feature server whose manifest carries no `data_packages[]
       .tables[].access_policy` marker at all.
+    - `semantic_models_updated`: count of read-only cache files written
+      under `<workspace>/semantic/<slug>/…` this run (Fáze 1 physical
+      distribution — semantic-layer follow-up plan). 0 when the caller has
+      no accessible `status='valid'` semantic model, or against a
+      pre-this-feature server with no `/api/semantic-models/bundle` route.
+    - `semantic_models_removed`: count of model directories pruned under
+      `<workspace>/semantic/` this run because the model left the caller's
+      accessible set (revoked grant, deleted model, source re-sync).
     - `duration_s`: wall time of the call.
     - `errors`: list of `{"table": ..., "error": ...}` (or
       `{"stage": "memory_bundle", "error": ...}` /
@@ -114,6 +122,8 @@ class PullResult:
     digests_updated: int = 0
     digests_removed: int = 0
     access_policy_tables: int = 0
+    semantic_models_updated: int = 0
+    semantic_models_removed: int = 0
     tables_via_signed_url: int = 0
     tables_via_app: int = 0
     duration_s: float = 0.0
@@ -1497,6 +1507,20 @@ def run_pull(
         except Exception as exc:
             result.errors.append({"stage": "access_policy_rules", "error": str(exc)})
 
+        # 6c. Semantic-layer physical cache (Fáze 1 — "distribuce jako
+        # fyzická cache s TTL", semantic-layer follow-up plan): write/prune
+        # <workspace>/semantic/<slug>/{_brief.md,tables/*.yml,metrics/*.yml,
+        # glossary.md} for every RBAC-visible `status='valid'` semantic
+        # model, each file read-only and hash+TTL-stamped in its header.
+        # Best-effort, same posture as the memory bundle above — a server
+        # outage or a pre-this-feature server (404) must not fail the pull.
+        try:
+            updated, removed = _sync_semantic_cache(workspace)
+            result.semantic_models_updated = updated
+            result.semantic_models_removed = removed
+        except Exception as exc:
+            result.errors.append({"stage": "semantic_cache", "error": str(exc)})
+
         # 7. v49 stack sync — per-type loop into ``<workspace>/.claude/data/``
         # and ``<workspace>/.claude/memory/`` with reference-counted dedup.
         # Runs only when the manifest carries the v49 fields (older servers /
@@ -2550,3 +2574,96 @@ def _write_access_policy_rules(manifest: dict, workspace: Path) -> int:
     lines += [f"- `{name}`" for name in names]
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return len(names)
+
+
+def _make_tree_writable(path: Path) -> None:
+    """chmod every file under ``path`` writable before it's overwritten or
+    ``shutil.rmtree``'d. The semantic cache writes files 0o444 (read-only —
+    the server is the source of truth, an edit would be silently reverted on
+    the next pull); unlinking a read-only file needs directory write
+    permission on POSIX (already sufficient there) but needs the FILE itself
+    writable on Windows, so this is cheap insurance rather than a no-op.
+    """
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                p.chmod(0o644)
+            except OSError:
+                pass
+
+
+def _sync_semantic_cache(workspace: Path) -> tuple[int, int]:
+    """Fetch ``/api/semantic-models/bundle`` and render the read-only local
+    semantic-layer cache under ``<workspace>/semantic/<slug>/…`` (Fáze 1 —
+    "distribuce jako fyzická cache s TTL", semantic-layer follow-up plan).
+
+    Returns ``(models_updated, models_removed)`` — ``models_updated`` counts
+    FILES written (mirrors ``rules_count``'s per-file counting, not
+    per-model), ``models_removed`` counts whole model directories pruned
+    because the model left the caller's accessible set.
+
+    Rewrites every accessible model's files on every run rather than hash-
+    diffing per model first (mirrors ``_fetch_and_write_rules``'s `km_*.md`
+    bundle, not the parquet per-table diff path): documents are small text,
+    and a stale local file surviving a revoked grant is a correctness bug
+    the km_/ka_ prune loops already treat the same way — not a scenario
+    worth trading for the complexity of a per-model skip.
+
+    A pre-this-feature server (404, no ``/api/semantic-models/bundle``
+    route) leaves any existing local cache untouched rather than nuking it
+    — the same "older server, no key" posture ``_sync_knowledge_digests``
+    takes for a manifest missing its own key.
+    """
+    semantic_dir = workspace / "semantic"
+    resp = api_get("/api/semantic-models/bundle")
+    if resp.status_code == 404:
+        return 0, 0
+    resp.raise_for_status()
+    bundle = resp.json()
+
+    from src.semantic.cache_render import DEFAULT_TTL_SECONDS, render_semantic_cache
+
+    rows = bundle.get("models") or []
+    generated_at = bundle.get("generated_at") or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ttl_seconds = int(bundle.get("ttl_seconds") or DEFAULT_TTL_SECONDS)
+    files = render_semantic_cache(rows, generated_at=generated_at, ttl_seconds=ttl_seconds)
+
+    live_slugs = {row.get("slug") for row in rows if isinstance(row, dict) and row.get("slug")}
+
+    # Prune whole model directories the caller can no longer read (revoked
+    # grant, deleted model, source re-sync that renamed the slug).
+    removed = 0
+    if semantic_dir.is_dir():
+        for existing_dir in sorted(semantic_dir.iterdir()):
+            if existing_dir.is_dir() and existing_dir.name not in live_slugs:
+                _make_tree_writable(existing_dir)
+                shutil.rmtree(existing_dir, ignore_errors=True)
+                removed += 1
+
+    if not files:
+        return 0, removed
+
+    semantic_dir.mkdir(parents=True, exist_ok=True)
+    for relpath, content in files.items():
+        target = semantic_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target.chmod(0o644)
+        target.write_text(content, encoding="utf-8")
+        target.chmod(0o444)
+
+    # Prune stale files WITHIN a still-live model's directory (e.g. a metric
+    # the document dropped) — the write loop above only ever adds/updates.
+    for slug in live_slugs:
+        slug_dir = semantic_dir / slug
+        if not slug_dir.is_dir():
+            continue
+        for existing in list(slug_dir.rglob("*")):
+            if not existing.is_file():
+                continue
+            rel = existing.relative_to(semantic_dir).as_posix()
+            if rel not in files:
+                existing.chmod(0o644)
+                existing.unlink()
+
+    return len(files), removed

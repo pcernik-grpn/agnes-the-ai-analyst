@@ -54,6 +54,27 @@ list above. Prefer its definitions over inferring meaning from table or
 column names, and reuse a declared metric's SQL rather than inventing a
 calculation.
 
+Registered models:
+{% for m in semantic_layer.models %}
+- `{{ m.slug }}`{% if m.description %} — {{ m.description }}{% endif %}
+{% endfor %}
+
+`agnes pull` writes each one of these to `semantic/<slug>/` in this
+workspace (`_brief.md`, `tables/*.yml`, `metrics/*.yml`, and `glossary.md`
+when the model declares glossary terms) — **read those files directly**
+rather than calling `agnes semantic-model context` on every turn; they are
+the same document, already scoped to what you can see. Every file starts
+with a header comment: `generated_at`, `content_hash`, `source_slug`,
+`ttl_seconds`. Trust the file as-is until `ttl_seconds` has elapsed since
+`generated_at` ({{ semantic_layer.cache_ttl_hours }}h by default). Once
+that TTL has passed, don't just keep reading the stale file — verify first:
+call `agnes semantic-model context <type>` (or the MCP `get_semantic_context`
+tool) and compare its `model_hashes["<slug>"]` against the file's own
+`content_hash`; if they differ, run `agnes pull` before relying on the
+cache again. `agnes semantic-model validate-query` is always checked live
+against the server regardless of cache age, so always validate a query
+against it before running it, even between pulls.
+
 ```
 agnes semantic-model context dataset                       # every dataset, compact (name + summary)
 agnes semantic-model context metric --id <name>             # one metric, full detail
