@@ -47,8 +47,33 @@ def test_docker_provider_defaults(tmp_path: Path):
     assert cfg.docker_mem_limit == "2g"
     assert cfg.docker_cpus == 1.0
     assert cfg.docker_pids_limit == 512
-    assert cfg.docker_egress_mode == "open"
+    # Secure default: sandbox egress is OFF unless an operator opts in
+    # (llm-agency-open-egress-5).
+    assert cfg.docker_egress_mode == "none"
     assert cfg.docker_max_total_sandboxes == 10
+
+
+def test_default_docker_egress_mode_is_secure_none(tmp_path: Path):
+    """With no operator override the Docker sandbox must default to `none`
+    (no internet route out) — the agent runs with bypassPermissions over a
+    read-write workspace, so unrestricted egress would be an exfiltration
+    surface (llm-agency-open-egress-5). Verified via both the loader default
+    and the dataclass default."""
+    from app.chat.config import ChatConfig
+
+    assert ChatConfig().docker_egress_mode == "none"
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n  provider: docker\n")
+    assert load_chat_config(y).docker_egress_mode == "none"
+
+
+def test_explicit_open_egress_opt_in_still_supported(tmp_path: Path):
+    """Backward-compat: an operator who needs unrestricted egress can still get
+    it by explicitly setting `docker_egress_mode: open` — the capability is
+    preserved, only the default flipped."""
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n  provider: docker\n  docker_egress_mode: open\n")
+    assert load_chat_config(y).docker_egress_mode == "open"
 
 
 def test_docker_provider_overrides(tmp_path: Path):
@@ -76,20 +101,22 @@ def test_docker_provider_overrides(tmp_path: Path):
     assert cfg.docker_max_total_sandboxes == 3
 
 
-def test_unknown_docker_egress_mode_normalizes_to_open(tmp_path: Path, caplog):
-    # "allowlist" graduated to a real mode; "wide-open" stays a typo
+def test_unknown_docker_egress_mode_normalizes_to_secure_none(tmp_path: Path, caplog):
+    # "allowlist" graduated to a real mode; "wide-open" stays a typo. A
+    # misconfigured value must fail CLOSED to `none`, never grant unrestricted
+    # egress (llm-agency-open-egress-5).
     y = tmp_path / "instance.yaml"
     y.write_text("chat:\n  enabled: true\n  provider: docker\n  docker_egress_mode: wide-open\n")
     cfg = load_chat_config(y)
-    assert cfg.docker_egress_mode == "open"
+    assert cfg.docker_egress_mode == "none"
     assert "docker_egress_mode" in caplog.text
 
 
 def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
     """A key written with nothing after it parses to YAML null; the naive
-    `str(raw.get(key, default))` then produced the string "None" — and for
-    docker_egress_mode the *valid-looking* mode "none", silently cutting the
-    sandbox off from the internet (the #1148 trap). Blank must mean default."""
+    `str(raw.get(key, default))` then produced the string "None". Blank must
+    mean the default — which for docker_egress_mode is now the secure `none`
+    (llm-agency-open-egress-5)."""
     y = tmp_path / "instance.yaml"
     y.write_text(
         "chat:\n  enabled: true\n  provider:\n  harness:\n  docker_egress_mode:\n  on_detach:\n  llm:\n    auth:\n"
@@ -97,7 +124,7 @@ def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
     cfg = load_chat_config(y)
     assert cfg.provider == "kai-agent"
     assert cfg.harness == "claude-code"
-    assert cfg.docker_egress_mode == "open"
+    assert cfg.docker_egress_mode == "none"
     assert cfg.on_detach == "pause"
     assert cfg.llm_auth == "api_key"
 

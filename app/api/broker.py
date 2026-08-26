@@ -156,18 +156,30 @@ def _normalize_broker_path(raw: Any) -> httpx.URL:
 
 
 def _normalize_upstream_path(path: str) -> str:
-    """Strip trailing slashes and collapse duplicate slashes in an upstream
-    subpath, e.g. ``"/v1/messages/"`` or ``"//v1//messages"`` -> ``"/v1/messages"``.
+    """Canonicalize an upstream Anthropic subpath to the EXACT path the outbound
+    httpx request will send on, or 400. Strips trailing slashes and collapses
+    duplicate slashes, e.g. ``"/v1/messages/"`` or ``"//v1//messages"`` ->
+    ``"/v1/messages"``; a literal ``.``/``..`` dot-segment (or a backslash some
+    clients treat as ``/``) is REFUSED, never silently collapsed.
 
     ``anthropic_proxy`` is registered on a ``{subpath:path}`` wildcard, so
     ``upstream_path`` is whatever raw string the caller put after
-    ``/api/broker/anthropic`` — a literal ``== "/v1/messages"`` comparison
-    diverges from what actually reaches the Anthropic API for any
-    trailing/duplicate-slash variant. The model-policy/ledger gate and the
-    ``use_dispatcher`` check must agree on the SAME normalized value — using
-    two independent computations of "is this /v1/messages" is exactly how
-    they'd drift apart.
+    ``/api/broker/anthropic``. Three consumers must decide on the SAME value:
+    the per-agent model-allowlist/budget gate, the ``use_dispatcher`` check,
+    AND the outbound URL — otherwise the guard and the real destination
+    disagree. httpx canonicalizes the URL at send time (collapsing dot-segments
+    and duplicate slashes), so a raw ``/v1/./messages`` that a strip-empty-only
+    normalizer classifies as NON-message would still reach the real
+    ``/v1/messages``, skipping the model allowlist and monthly budget. Rejecting
+    dot-segment/backslash smuggling (rather than canonicalizing it to match)
+    keeps that guard/destination pair honest and refuses authority-smuggling
+    tricks outright. The caller feeds THIS return value to both the gate and the
+    outbound request, so they cannot drift apart.
     """
+    for form in (path, unquote(path)):
+        for seg in form.split("/"):
+            if seg in (".", "..") or "\\" in seg:
+                raise HTTPException(status_code=400, detail="broker_upstream_path_invalid")
     return "/" + "/".join(seg for seg in path.split("/") if seg)
 
 
@@ -875,7 +887,11 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     try:
         upstream_req = client.build_request(
             request.method,
-            f"{upstream_base}{upstream_path}",
+            # `normalized_upstream_path` — the SAME canonical value the policy /
+            # budget / dispatcher gates classified on above — so the guard and
+            # the real destination can never disagree (dot-segments already
+            # refused, trailing/duplicate slashes already collapsed).
+            f"{upstream_base}{normalized_upstream_path}",
             content=raw_body,
             headers=headers,
             params=request.query_params,
