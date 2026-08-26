@@ -20,10 +20,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `surfaces`, `status`, `template_entity_id`); `slug` is now optional on
   create and auto-derived from `name` when omitted. A `knowledge`/`plugins`
   write goes through the SAME `_sync_builder_scope` mapping the builder
-  uses, so `agent_scope` enforcement is identical through either surface,
-  and a draft agent's slug follows a rename exactly like the builder's own
-  PATCH does. `GET /api/v1/agents{,/{id}}` decode `knowledge`/`plugins`/
-  `surfaces` into structured JSON (previously opaque text) and now include
+  uses and forces any of the four `*_mode` columns the caller left unset to
+  `'selected'` on that same write — exactly like the builder's own PATCH —
+  so `agent_scope` enforcement is identical through either surface and an
+  agent sitting at `mode='all'` (e.g. the seeded default) cannot keep
+  passing its owner's whole stack through on an axis a `knowledge`/`plugins`
+  edit didn't mention. A draft agent's slug follows a rename exactly like
+  the builder's own PATCH does. `GET /api/v1/agents{,/{id}}` decode
+  `knowledge`/`plugins`/`surfaces` into structured JSON (previously opaque
+  text) and now include
   agents shared into one of the caller's groups, not just owned ones — the
   same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
   also cleans up sharing grants on delete, closing a gap versus the

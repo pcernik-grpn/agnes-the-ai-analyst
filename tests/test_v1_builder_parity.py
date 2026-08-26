@@ -295,6 +295,107 @@ def test_v1_update_builder_fields_round_trip_and_rescope_preserves_governance_ro
     assert ("slack_channel", "C1") in scope, "governance-owned row must survive"
 
 
+def test_v1_update_knowledge_forces_all_four_modes_to_selected_from_all(env):
+    """Reopened half of #1520: a knowledge/plugins PUT must force every mode
+    axis the caller did not explicitly set to 'selected', not merely rewrite
+    the declared knowledge/plugins JSON. The seeded default agent is born at
+    mode='all' on all four axes (`agents_repo().get_or_create_default`) and
+    is reachable through this route — only DELETE is guarded against it
+    (`agents_admin.delete_agent`'s `default_agent_undeletable`). Narrowing
+    its `knowledge` without also narrowing `tables_mode` etc. would leave the
+    declared scope cosmetic: `src.agent_scope_intersection` still passes the
+    owner's WHOLE stack through for any axis still sitting at 'all'."""
+    from src.repositories import agents_repo
+
+    repo = agents_repo()
+    default_agent = repo.get_or_create_default(env["owner"]["id"])
+    for field in ("plugins_mode", "connections_mode", "tables_mode", "memory_mode"):
+        assert default_agent[field] == "all", "test assumption: seeded default starts at 'all'"
+
+    pkg_id = _make_pkg("Pkg", "v1-default-narrow-pkg")
+
+    r = env["client"].put(
+        f"/api/v1/agents/{default_agent['id']}",
+        json={"knowledge": [pkg_id]},
+        headers=_auth(env["owner"]["token"]),
+    )
+    assert r.status_code == 200, r.text
+
+    row = repo.get_by_id(default_agent["id"])
+    for field in ("plugins_mode", "connections_mode", "tables_mode", "memory_mode"):
+        assert row[field] == "selected", (
+            f"{field} must be forced to 'selected' by a knowledge/plugins PUT, exactly "
+            f"like the /agents builder's own PATCH (app.api.agents.update_agent) — "
+            f"got {row[field]!r} instead, the declared scope is cosmetic"
+        )
+
+
+def test_v1_update_matches_builder_update_forcing_modes_from_all_to_selected(env):
+    """Update-side mirror of the create-side parity test above: given an
+    agent pre-existing at mode='all' on all four axes (the shape the seeded
+    default agent, or any pre-scope-enforcement row, has), a knowledge edit
+    through EITHER surface must land in the exact same place. The builder's
+    own PATCH already forced this unconditionally
+    (`app.api.agents.update_agent`'s `rescope` block); this proves v1's PUT
+    (`app.api.agents_admin.update_agent`) now matches it row-for-row instead
+    of leaving the pre-existing mode columns untouched."""
+    from src.repositories import agents_repo
+
+    repo = agents_repo()
+    pkg_id = _make_pkg("Pkg", "v1-parity-modes-pkg")
+    all_modes = {
+        "plugins_mode": "all",
+        "connections_mode": "all",
+        "tables_mode": "all",
+        "memory_mode": "all",
+    }
+
+    via_builder = (
+        env["client"]
+        .post(
+            "/api/agents",
+            json={"name": "Builder All"},
+            headers=_auth(env["owner"]["token"]),
+        )
+        .json()
+    )
+    repo.update(via_builder["id"], **all_modes)
+
+    via_v1 = (
+        env["client"]
+        .post(
+            "/api/v1/agents",
+            json={"name": "V1 All", "slug": "v1-all-modes-agent"},
+            headers=_auth(env["owner"]["token"]),
+        )
+        .json()
+    )
+    repo.update(via_v1["id"], **all_modes)
+
+    r_builder = env["client"].patch(
+        f"/api/agents/{via_builder['id']}",
+        json={"knowledge": [pkg_id]},
+        headers=_auth(env["owner"]["token"]),
+    )
+    assert r_builder.status_code == 200, r_builder.text
+
+    r_v1 = env["client"].put(
+        f"/api/v1/agents/{via_v1['id']}",
+        json={"knowledge": [pkg_id]},
+        headers=_auth(env["owner"]["token"]),
+    )
+    assert r_v1.status_code == 200, r_v1.text
+
+    row_builder = repo.get_by_id(via_builder["id"])
+    row_v1 = repo.get_by_id(via_v1["id"])
+    for field in ("plugins_mode", "connections_mode", "tables_mode", "memory_mode"):
+        assert row_builder[field] == row_v1[field] == "selected", (
+            f"{field}: builder={row_builder[field]!r} v1={row_v1[field]!r} — "
+            "both surfaces must force an unset mode axis to 'selected' on a "
+            "knowledge/plugins edit"
+        )
+
+
 def test_v1_update_surfaces_round_trips(env):
     created = (
         env["client"]

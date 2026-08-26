@@ -485,6 +485,25 @@ async def update_agent(
         if key in updates:
             updates[key] = json.dumps(updates[key])
 
+    # Same forced-narrowing default as the /agents builder's own PATCH
+    # (`app.api.agents.update_agent`'s `rescope` block) — closing the
+    # reopened half of #1520. A knowledge/plugins edit re-derives the
+    # enforced scope, and any mode axis the caller did NOT set explicitly in
+    # THIS request must not keep sitting at 'all' just because this route
+    # forgot to touch it — that is exactly how the seeded default agent
+    # (born at mode='all' on all four axes,
+    # `src.repositories.agents.get_or_create_default`, reachable through
+    # this route since only DELETE is guarded against it) turns a "narrow to
+    # one package" PUT into cosmetic `knowledge` with the owner's whole
+    # stack still riding underneath every untouched axis. An axis the caller
+    # DID set explicitly in this same request (`setdefault` no-ops) is left
+    # alone — explicit is intentional, `_validate_mode_values` below still
+    # gates it and the widen-to-'all' guard below still applies to it.
+    rescope = "knowledge" in supplied or "plugins" in supplied
+    if rescope:
+        for field in _SELECTED_MODE_FIELDS:
+            updates.setdefault(field, "selected")
+
     # Belt-and-suspenders: today `set(updates)` (Pydantic's exclude_unset
     # field set, minus slug/instructions) is always a subset of
     # _UPDATABLE_FIELDS by construction — UpdateAgentRequest declares no
@@ -553,7 +572,7 @@ async def update_agent(
     # read back off the SAME hydrated view the builder shows
     # (`_hydrate_builder_axes`), not the raw JSON columns, so a PUT
     # touching only one axis cannot silently wipe the other.
-    if "knowledge" in supplied or "plugins" in supplied:
+    if rescope:
         from app.api.agents import _decode, _hydrate_builder_axes, _sync_builder_scope
 
         held_knowledge, held_plugins = _hydrate_builder_axes(
