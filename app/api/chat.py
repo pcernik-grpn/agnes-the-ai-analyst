@@ -201,7 +201,7 @@ async def create_session(
         # Which agent this session runs AS. Always set (an unnamed web session
         # is attributed to the caller's default agent, see _resolve_agent_id),
         # so a client tells "named agent" from "default" by comparing against
-        # the `is_default` row in GET /api/agents rather than by null-checking.
+        # the `is_default` row in GET /api/v1/agents rather than by null-checking.
         # The composer's agent picker needs this to label a session it did not
         # itself create.
         "agent_id": s.agent_id,

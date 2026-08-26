@@ -1339,16 +1339,6 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/{session_id}/leave
 - /api/chat/{session_id}/messages
 
-### `/api/agents` — Agent registry (Library items)
-
-Server-side CRUD for the assistants composed in the Agent builder (`/agents`),
-the registry that replaced the builder's browser-only draft store. Reads are
-grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
-only the owner or an admin may edit or delete.
-
-- /api/agents
-- /api/agents/{agent_id}
-
 ### `/api/sharing` — Owner-initiated sharing of Library items
 
 The owner-scoped counterpart to `/api/access` (which is admin-only): the creator
@@ -1893,6 +1883,17 @@ fanned out into group members' installs and cannot be uninstalled
 - /api/users/{user_id}/set-password
 
 ### `/api/v1/agents` — Agent management (owner-scoped CRUD, scope, agent PATs)
+
+This is also the Agent builder's own CRUD surface (`/agents`, client-rendered
+against this API) — `knowledge`/`plugins`/`surfaces`/`role`/`tone`/`greeting`/
+`status`/`template_entity_id` are the builder's wire fields, accepted here
+directly, and `slug` is optional on create (auto-derived from `name` when
+omitted). A dedicated `/api/agents` adapter router served the same shape
+until the remediation-program's "one agent model" Track C1 folded it into
+this API (Task C1.1) and deleted the router (Task C1.2). `GET /api/v1/agents`
+and `GET /api/v1/agents/{agent_id}` are grant-aware (owner ∪ shared into one
+of the caller's groups via `/api/sharing/agent/{id}`); a grant conveys *use*
+only — mutations and token issuance stay owner-or-admin.
 
 `DELETE /api/v1/agents/{agent_id}` cascades: every PAT minted for the agent is revoked, every outbound webhook registration (`/api/v1/agents/{slug}/webhooks`) is removed, and every harvested sandbox artifact row + its object-store blob (`/api/v1/sessions/{id}/artifacts`) is deleted. The object-store blob deletes are best-effort — a single failed delete is logged and skipped rather than blocking the agent delete (an orphaned blob under a deleted agent's `agent-artifacts/` prefix is a cheap, non-sensitive leak).
 

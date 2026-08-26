@@ -1190,7 +1190,7 @@ function _takeAgentSlugFromUrl() {
 // already soft-archives the orphan (the same GC that keeps repeated "+ New
 // chat" clicks from littering the sidebar).
 
-/** Resolves when the /api/agents fetch has settled (successfully or not).
+/** Resolves when the /api/v1/agents fetch has settled (successfully or not).
  * `loadAndRenderHistory` awaits it before looking up an agent's greeting: the
  * `/chat?agent=<slug>` deep link and a picker click both open a session within
  * the same tick as the fetch, and without this the greeting silently lost the
@@ -1236,8 +1236,8 @@ function _defaultAgent() {
  * a button to assistive tech, and it still looked like something to click.
  *
  * The button keeps its server-rendered brand text as the fallback name, so a
- * failed /api/agents fetch degrades to today's behaviour rather than a blank
- * pill. */
+ * failed /api/v1/agents fetch degrades to today's behaviour rather than a
+ * blank pill. */
 function _syncAgentPicker() {
   const btn = $("chat-agent-btn");
   if (!btn) return;
@@ -1344,8 +1344,10 @@ function _renderAgentMenu() {
  * failing to enumerate agents must not block chatting with the default one. */
 async function _refreshAgents() {
   try {
-    const res = await api("/api/agents");
-    _agentsCache = (res.agents || []).filter(a => a.mine && a.slug);
+    // Re-pointed from this page's own now-deleted /api/agents (Task C1.2) —
+    // /api/v1/agents absorbed its wire shape, `mine` included, in Task C1.1.
+    const res = await api("/api/v1/agents");
+    _agentsCache = (res.data || []).filter(a => a.mine && a.slug);
   } catch (err) {
     console.warn("chat: could not load agents for the picker", err);
   }

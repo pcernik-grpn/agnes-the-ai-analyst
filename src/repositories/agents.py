@@ -30,8 +30,9 @@ _UPDATABLE = frozenset(
         "surfaces",
         "status",
         # Renaming a DRAFT re-derives its slug off the new name
-        # (app/api/agents.py::_draft_slug_rename) — the builder creates the
-        # row before the user types anything, so the slug would otherwise
+        # (app/api/agents_builder_shared.py::_draft_slug_rename) — the
+        # builder creates the row before the user types anything, so the
+        # slug would otherwise
         # stay the literal "agent" placeholder that the public address
         # (POST /api/v1/agents/{slug}/responses) is built from. Writers must
         # keep the (owner_user_id, slug) UNIQUE intact: resolve through
