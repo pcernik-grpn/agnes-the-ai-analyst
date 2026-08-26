@@ -227,3 +227,61 @@ def _fresh_cache():
     admin_dashboard.invalidate_cache()
     yield
     admin_dashboard.invalidate_cache()
+
+
+class TestEveryStepLandsWhereItsButtonSays:
+    """A step's CTA is a promise about where the click goes.
+
+    `verify` shipped saying "Simulate a person" with `href="/admin/access"`,
+    which is the Groups workspace — Simulate is a sibling LENS on that path
+    (`?lens=simulate`), so the one button whose entire purpose is "see the
+    instance as they see it" opened the grant editor instead. The done-state
+    sibling had it too: "Manage packages" shared the open state's href and
+    opened the Tables lens, a page about something else. Structural, not a
+    copy review: the pairs below are (CTA text, required href substring), so
+    a renamed lens or a moved page fails here.
+    """
+
+    # CTA phrase → what its href must contain for the phrase to be true.
+    # Each state is checked against ITS OWN destination: `cta` against
+    # `href`, `done_cta` against `done_href` — sharing one href is what made
+    # the done row's "Manage packages" open the Tables lens.
+    _PROMISES = {
+        "Simulate a person": "lens=simulate",
+        "Manage packages": "/admin/data-packages",
+        "Manage people": "/admin/users",
+    }
+
+    def test_a_cta_naming_a_destination_carries_it(self, seeded_app):
+        from app.services.admin_dashboard import resolve_journey
+
+        steps = resolve_journey()["setup"]["steps"]
+        assert steps, "the journey must have steps to check"
+        for step in steps:
+            for key, href_key in (("cta", "href"), ("done_cta", "done_href")):
+                phrase = (step.get(key) or "").strip()
+                required = self._PROMISES.get(phrase)
+                if not required:
+                    continue
+                href = step.get(href_key) or ""
+                assert required in href, (
+                    f"step {step.get('key')!r}: {key} says {phrase!r} but {href_key} is "
+                    f"{href!r} — it must carry {required!r} or the button lies"
+                )
+
+    def test_a_done_step_keeps_its_own_destination(self, seeded_app):
+        """`done_href` defaults to `href`, so a step that needs no second
+        destination is unaffected — but the key must always be present, or the
+        template's `s.done_href` silently renders an empty link."""
+        from app.services.admin_dashboard import resolve_journey
+
+        for step in resolve_journey()["setup"]["steps"]:
+            assert step.get("done_href"), f"step {step.get('key')!r} has no done_href"
+
+    def test_the_verify_step_opens_the_simulate_lens(self, seeded_app):
+        """The specific regression, pinned by name so the fix is legible."""
+        from app.services.admin_dashboard import resolve_journey
+
+        verify = {s["key"]: s for s in resolve_journey()["setup"]["steps"]}["verify"]
+        assert verify["cta"] == "Simulate a person"
+        assert verify["href"] == "/admin/access?lens=simulate"

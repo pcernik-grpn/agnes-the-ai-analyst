@@ -72,15 +72,14 @@ def _seed_co_memory_env(conn, *, grant_domain_to_both: bool = True):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def co_bundle_app_shared(e2e_env):
+def co_bundle_app_shared(e2e_env, shared_app):
     """Both participants have the memory_domain grant → domain in intersection."""
     conn = get_system_db()
     co_id, slug, dom_id = _seed_co_memory_env(conn, grant_domain_to_both=True)
     conn.close()
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     from app.auth.access import mint_co_session_jwt
     token = mint_co_session_jwt(co_id)
@@ -88,15 +87,14 @@ def co_bundle_app_shared(e2e_env):
 
 
 @pytest.fixture
-def co_bundle_app_owner_only(e2e_env):
+def co_bundle_app_owner_only(e2e_env, shared_app):
     """Only owner has the memory_domain grant → domain NOT in intersection."""
     conn = get_system_db()
     co_id, slug, dom_id = _seed_co_memory_env(conn, grant_domain_to_both=False)
     conn.close()
 
-    from app.main import create_app
     from fastapi.testclient import TestClient
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     from app.auth.access import mint_co_session_jwt
     token = mint_co_session_jwt(co_id)

@@ -2,10 +2,12 @@ Set up the BRAND CLI on this machine.
 
 Server: {server_url}
 
+BRAND is this organization's own deployment of Agnes, served
+from {server_url}, and the command-line tool it installs is named `agnes`.
+
 Your login token is already saved on this machine at ~/.agnes/token
 (written by step 4 of the install guide at {server_url}). The steps below
-only reference that file path — never print the token, echo it, or paste
-it into this chat.
+use that file path, so there is no need to display its contents.
 
 Every step below is idempotent and safe to re-run: a machine that already
 ran this setup converges instead of reinstalling, so treat "already
@@ -17,14 +19,16 @@ verification.
 Before you start, confirm the login token file is in place:
    test -s ~/.agnes/token && echo "token present" || echo "token missing"
 
-   Missing on a fresh install: stop, and send the user to
-   {server_url}/home step 4 — the step that saves it. Missing while
-   ~/.config/agnes/token.json already exists: an earlier run already
-   saved the credential, so just continue.
+   Present: continue. Missing: an earlier run may have consumed it, but that
+   needs BOTH a saved credential and a matching server — token.json records
+   no server, and the installer writes server: before anyone has signed in:
+      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
+   Prints {server_url} → continue. Anything else, including no output →
+   not signed in to {server_url}: stop, send the user to {server_url}/home step 4.
 
 1) Install the CLI:
    TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
-   (cd "$TMPDIR_WHEEL" && curl -fsSL -OJ {server_url}/cli/download)
+   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download)
    WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
    [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }
    uv tool install --force "$WHEEL"

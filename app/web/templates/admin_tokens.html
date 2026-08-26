@@ -2,12 +2,30 @@
 {% block title %}Access tokens — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
+{# The shared index-page filter toolbar (`.fbar` — the same component /library,
+   /stack and the profile tokens section render): search box, sort select and
+   the active-refinement chips row. Styles only; filtering is page-local JS
+   over an already-loaded list. #}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   /* ─────────────────────────────────────────────────────────────────────────
      /admin/tokens — ALL tokens across users for incident response + offboarding.
-     Admin-only. Card-stack layout with owner column, stat chip strip, owner
-     search + sort-by-owner chip, confirm-with-owner revoke modal. No "new
-     token" button here — admins use /me/profile for their own.
+     Admin-only. Card-stack layout with owner column, a count strip that IS the
+     status filter, owner search + sort select in the shared `.fbar`, and a
+     confirm-with-owner revoke modal. No "new token" button here — admins use
+     /me/profile for their own.
+
+     The toolbar used to be three page-local rows (STATUS pills, SORT BY pills,
+     a full-width search with `Clear filters` stranded at its far end) in a chip
+     style nothing else on the platform speaks — stacked directly under a count
+     strip repeating the same four numbers. Folded to two objects:
+       - the counts became the status filter (the strip was already the best
+         summary of the list; now it is also the control, so the numbers appear
+         once and every one of them is actionable);
+       - search + sort moved into the shared `.fbar`, with refinements restated
+         as removable `.fbar-chip`s — which is where `Clear filters` lives, so
+         it exists only while there is something to clear.
      ───────────────────────────────────────────────────────────────────────── */
 
   /* Width + gutters come from the canonical `.container` in
@@ -16,22 +34,21 @@
     font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
   }
 
-  /* ── Counts ────────────────────────────────────────────────────────────
-     The page head is the shared plain one now (`.page-header--plain`), the
-     same head People, Data and Access wear — so these four counts, which
-     used to be translucent-white chips floating on the hero's gradient, are
-     read on the page surface instead. Same four numbers, same status dots;
-     what changed is that they now belong to the page rather than to a band
-     of chrome, and every colour is a token (the white-on-gradient set had
-     no meaning off that gradient — under paper the hero is a light card and
-     the labels were 85%-white on near-white). */
+  /* ── Counts strip — the status filter ──────────────────────────────────
+     Five cards: Total, then the four statuses. Each is a toggle button;
+     pressing one filters the list to that status, pressing it again (or
+     pressing Total) returns to everything. The pressed state speaks the
+     platform's "on" vocabulary (`--ds-primary` border + tint, same as
+     .fbar-toggle.is-active), never colour alone — aria-pressed carries it. */
   .tokens-counts {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 10px;
     margin: 0 0 16px;
   }
   .tokens-counts .count-chip {
+    font-family: inherit;
+    text-align: left;
     background: var(--ds-surface);
     border: 1px solid var(--ds-border);
     border-radius: var(--ds-radius-btn);
@@ -39,7 +56,21 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease;
   }
+  .tokens-counts .count-chip:hover:not([disabled]) { border-color: var(--ds-text-disabled); }
+  .tokens-counts .count-chip[aria-pressed="true"] {
+    border-color: var(--ds-primary);
+    background: var(--ds-primary-light);
+  }
+  .tokens-counts .count-chip:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+  }
+  /* A status with no tokens is not worth a click — dim it and take it out of
+     the interaction, but keep it rendered: the zero is the information. */
+  .tokens-counts .count-chip[disabled] { opacity: 0.5; cursor: default; }
   .tokens-counts .count-chip .dot {
     width: 8px; height: 8px; border-radius: 50%;
     flex-shrink: 0;
@@ -69,140 +100,9 @@
     flex-direction: column;
   }
 
-  /* ── Toolbar ───────────────────────────────────────────────────────────── */
-  .toolbar {
-    margin-bottom: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .chip-row {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px;
-  }
-  .chip-row .chip-group-label {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    color: var(--text-secondary, #6b7280);
-    margin-right: 4px;
-  }
-
-  .chip-group {
-    display: inline-flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .chip-btn {
-    font-family: var(--font-primary, inherit);
-    font-size: 12px;
-    font-weight: 500;
-    height: 30px;
-    padding: 0 12px;
-    border-radius: 999px;
-    border: 1px solid var(--border, #e5e7eb);
-    background: var(--surface, #fff);
-    color: var(--text-secondary, #6b7280);
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition: all 0.12s ease;
-    line-height: 1;
-    white-space: nowrap;
-  }
-  .chip-btn:hover {
-    border-color: #cbd5e1;
-    color: var(--text-primary, #111827);
-  }
-  .chip-btn[aria-pressed="true"] {
-    background: color-mix(in srgb, var(--ds-primary) 10%, transparent);
-    border-color: var(--ds-primary);
-    color: var(--ds-primary);
-    font-weight: 600;
-  }
-  .chip-btn:focus-visible {
-    outline: 2px solid var(--ds-primary);
-    outline-offset: 2px;
-  }
-  .chip-btn .chip-dot {
-    width: 7px; height: 7px; border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .chip-btn[data-val="active"]   .chip-dot { background: var(--ds-accent-success-line); }
-  .chip-btn[data-val="expiring"] .chip-dot { background: var(--ds-accent-warn-line); }
-  .chip-btn[data-val="expired"]  .chip-dot { background: var(--ds-accent-danger-line); }
-  .chip-btn[data-val="revoked"]  .chip-dot { background: var(--ds-text-muted); }
-  .chip-btn .chip-arrow {
-    width: 10px; height: 10px;
-    opacity: 0;
-  }
-  .chip-btn[data-sort-dir="asc"]  .chip-arrow,
-  .chip-btn[data-sort-dir="desc"] .chip-arrow { opacity: 1; }
-  .chip-btn[data-sort-dir="asc"]  .chip-arrow { transform: rotate(180deg); }
-
-  .search-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: center;
-  }
-  .search-wrap {
-    position: relative;
-    flex: 1 1 280px;
-    min-width: 220px;
-  }
-  .search-wrap svg {
-    position: absolute;
-    left: 12px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 14px; height: 14px;
-    color: var(--text-secondary, #9ca3af);
-    pointer-events: none;
-  }
-  .search-wrap input[type="search"] {
-    width: 100%;
-    height: 38px;
-    padding: 0 12px 0 36px;
-    border: 1px solid var(--border, #e5e7eb);
-    border-radius: 8px;
-    font-size: 13px;
-    font-family: var(--font-primary, inherit);
-    background: var(--surface, #fff);
-    color: var(--text-primary, #111827);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  }
-  .search-wrap input[type="search"]::placeholder { color: var(--ds-text-muted, #9ca3af); }
-  .search-wrap input[type="search"]:hover { border-color: #cbd5e1; }
-  .search-wrap input[type="search"]:focus {
-    outline: none;
-    border-color: var(--ds-primary);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ds-primary) 15%, transparent);
-  }
-
-  .clear-link {
-    font-family: var(--font-primary, inherit);
-    background: none;
-    border: none;
-    padding: 8px 4px;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-secondary, #6b7280);
-    cursor: pointer;
-    text-decoration: none;
-    margin-left: auto;
-  }
-  .clear-link:hover { color: var(--ds-primary); text-decoration: underline; }
-  .clear-link:focus-visible {
-    outline: 2px solid var(--ds-primary);
-    outline-offset: 2px;
-    border-radius: 4px;
-  }
+  /* ── Toolbar — page-local hooks over the shared `.fbar` ────────────────── */
+  .toolbar { margin-bottom: 14px; }
+  .toolbar .fbar { margin-bottom: 10px; }
 
   /* Hidden legacy select controls — kept for test backcompat. */
   .sr-only {
@@ -223,27 +123,31 @@
     gap: 10px;
   }
   .token-card {
-    background: var(--surface, #fff);
-    border: 1px solid var(--border, #e5e7eb);
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
     border-radius: 12px;
     padding: 16px 20px;
     display: flex;
     align-items: center;
-    gap: 20px;
+    gap: 12px 20px;
+    flex-wrap: wrap;
     transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
   }
   .token-card:hover {
-    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
-    border-color: #cbd5e1;
+    box-shadow: var(--ds-shadow-sm);
+    /* One step stronger than the resting border, in both themes. */
+    border-color: var(--ds-text-disabled);
   }
+  /* Dead tokens read as recessed, not as a lighter card — the sunken token
+     has both theme values (see #1193 on the profile sibling). */
   .token-card.is-revoked,
   .token-card.is-expired {
-    background: var(--ds-surface-dim, #f0f2f6);
+    background: var(--ds-surface-sunken);
   }
   .token-card.is-revoked .token-name,
   .token-card.is-revoked .owner-email {
     text-decoration: line-through;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
   }
 
   .token-main {
@@ -257,7 +161,7 @@
     width: 32px; height: 32px;
     border-radius: 50%;
     background: var(--ds-primary);
-    color: #fff;
+    color: var(--ds-text-inverse);
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.3px;
@@ -268,43 +172,46 @@
     text-transform: uppercase;
   }
   .token-text { min-width: 0; }
+  /* Name and meta ellipsize against the flex track (`min-width: 0` above),
+     not against a fixed max-width: the old 380/420px caps chopped "Revoked
+     12 days ago" mid-word while the card sat in half a page of whitespace. */
   .token-name {
     display: block;
     font-size: 15px;
     font-weight: 600;
-    color: var(--text-primary, #1A253C);
+    color: var(--ds-text-primary);
     line-height: 1.3;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 380px;
   }
   .token-meta {
     display: block;
     font-size: 13px;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     line-height: 1.4;
     margin-top: 2px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 420px;
   }
   .owner-email { color: inherit; }
   .chip-mono {
     display: inline-block;
     padding: 1px 6px;
-    background: var(--border-light, #f3f4f6);
+    background: var(--ds-surface-dim);
     border-radius: 4px;
     font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
     font-size: 11.5px;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     letter-spacing: 0.2px;
     margin: 0 2px;
   }
 
   .token-usage {
-    flex: 0 0 200px;
+    /* Shrinkable basis, not a fixed 200px: a fixed basis is min-content the
+       card cannot go below. */
+    flex: 0 1 200px;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -313,27 +220,28 @@
   .token-usage .usage-main {
     font-size: 13px;
     font-weight: 500;
-    color: var(--text-primary, #1A253C);
+    color: var(--ds-text-primary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .token-usage .usage-sub {
     font-size: 11.5px;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .token-usage.soon .usage-main   { color: var(--ds-accent-warn-ink); }
-  .token-usage.expired .usage-main{ color: var(--ds-accent-danger-ink); }
-  .token-usage.strike .usage-main { text-decoration: line-through; color: var(--ds-text-muted); font-weight: 400; }
+  /* "Never used" is an answer, not a missing value — say it in the main slot,
+     muted, instead of the orphan "Last used —" the em-dash fallback printed. */
+  .token-usage.never .usage-main { color: var(--ds-text-muted); font-weight: 400; }
 
   .token-aside {
     display: flex;
     align-items: center;
     gap: 12px;
     flex-shrink: 0;
+    margin-left: auto;
   }
 
   /* ── Status pill ───────────────────────────────────────────────────────── */
@@ -359,7 +267,7 @@
   .status-pill.status-expiring   .pill-dot { background: var(--ds-accent-warn-line); }
   .status-pill.status-expired    { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
   .status-pill.status-expired    .pill-dot { background: var(--ds-accent-danger-line); }
-  .status-pill.status-revoked    { background: var(--ds-surface-dim, #f0f2f6); color: var(--ds-text-secondary); }
+  .status-pill.status-revoked    { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
   .status-pill.status-revoked    .pill-dot { background: var(--ds-text-muted); }
 
   /* ── Revoke button ─────────────────────────────────────────────────────── */
@@ -382,7 +290,7 @@
   }
   .revoke-btn:hover:not([disabled]) {
     background: var(--ds-accent-danger-line);
-    color: var(--ds-text-inverse, #fff);
+    color: var(--ds-text-inverse);
     border-color: var(--ds-accent-danger-line);
   }
   .revoke-btn:focus-visible {
@@ -392,8 +300,8 @@
   .revoke-btn[disabled] {
     opacity: 0.4;
     cursor: not-allowed;
-    border-color: var(--border, #e5e7eb);
-    color: var(--text-secondary, #9ca3af);
+    border-color: var(--ds-border);
+    color: var(--ds-text-muted);
   }
   .revoke-btn svg { display: block; }
   .token-card:hover .revoke-btn:not([disabled]) {
@@ -404,21 +312,21 @@
   .tokens-empty, .tokens-loading {
     text-align: center;
     padding: 48px 24px;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     font-size: 14px;
-    background: var(--surface, #fff);
-    border: 1px solid var(--border, #e5e7eb);
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
     border-radius: 12px;
   }
   .tokens-empty .empty-icon {
     margin: 0 auto 14px;
     width: 56px; height: 56px;
-    color: var(--ds-text-disabled, #d1d5db);
+    color: var(--ds-text-disabled);
   }
   .tokens-empty .empty-title {
     font-size: 15px;
     font-weight: 600;
-    color: var(--text-primary, #1A253C);
+    color: var(--ds-text-primary);
     margin: 0 0 4px;
   }
   .tokens-empty .empty-body {
@@ -431,9 +339,9 @@
     font-size: 13px;
     font-weight: 500;
     font-family: var(--font-primary, inherit);
-    border: 1px solid var(--border, #e5e7eb);
-    background: var(--surface, #fff);
-    color: var(--text-primary, #1A253C);
+    border: 1px solid var(--ds-border);
+    background: var(--ds-surface);
+    color: var(--ds-text-primary);
     cursor: pointer;
     transition: all 0.15s ease;
   }
@@ -456,12 +364,12 @@
   }
   .modal-backdrop.is-open { display: flex; }
   .modal-card {
-    background: var(--surface, #fff);
+    background: var(--ds-surface);
     border-radius: 16px;
     padding: 32px;
     width: 100%;
     max-width: 480px;
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--ds-shadow-lg);
     animation: modal-in 0.18s ease-out;
   }
   @keyframes modal-in {
@@ -472,20 +380,20 @@
     margin: 0 0 10px;
     font-size: 20px;
     font-weight: 700;
-    color: var(--text-primary, #1A253C);
+    color: var(--ds-text-primary);
     letter-spacing: -0.01em;
   }
   .modal-card p.sub {
     margin: 0 0 18px;
     font-size: 13.5px;
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     line-height: 1.55;
   }
   .modal-meta {
     margin: 14px 0 4px;
     padding: 14px 16px;
-    background: var(--background, #F5F7FA);
-    border: 1px solid var(--border-light, #f3f4f6);
+    background: var(--ds-surface-sunken);
+    border: 1px solid var(--ds-border-light);
     border-radius: 10px;
     display: grid;
     grid-template-columns: max-content 1fr;
@@ -493,7 +401,7 @@
     font-size: 13px;
   }
   .modal-meta .mk {
-    color: var(--text-secondary, #6b7280);
+    color: var(--ds-text-secondary);
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -501,7 +409,7 @@
     align-self: center;
   }
   .modal-meta .mv {
-    color: var(--text-primary, #1A253C);
+    color: var(--ds-text-primary);
     font-weight: 500;
     word-break: break-all;
   }
@@ -522,14 +430,19 @@
     position: fixed; bottom: 24px; right: 24px; z-index: 2000;
     display: flex; flex-direction: column; gap: 8px; pointer-events: none;
   }
+  /* The dark code surface is the one token pair that stays a dark chip with
+     light ink under BOTH themes — exactly what a floating toast wants. Kind
+     is a coloured leading edge, never a full tinted body (the accent inks
+     flip with the theme; the code pair does not). */
   .toast {
-    background: #111827;
-    color: #fff;
+    background: var(--ds-code-bg);
+    color: var(--ds-code-ink);
     padding: 11px 18px;
     border-radius: 10px;
+    border-left: 3px solid transparent;
     font-size: 13px;
     font-weight: 500;
-    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--ds-shadow-lg);
     opacity: 0;
     transform: translateY(8px);
     transition: opacity 0.2s, transform 0.2s;
@@ -537,8 +450,8 @@
     max-width: 400px;
   }
   .toast.show { opacity: 1; transform: translateY(0); }
-  .toast.success { background: #047857; }
-  .toast.error   { background: #b91c1c; }
+  .toast.success { border-left-color: var(--ds-accent-success-line); }
+  .toast.error   { border-left-color: var(--ds-accent-danger-line); }
 
   /* ── Responsive ────────────────────────────────────────────────────────── */
   @media (max-width: 720px) {
@@ -548,8 +461,8 @@
       gap: 14px;
     }
     .token-main { width: 100%; }
-    .token-name { max-width: none; white-space: normal; }
-    .token-meta { max-width: none; white-space: normal; }
+    .token-name { white-space: normal; }
+    .token-meta { white-space: normal; }
     .token-usage {
       flex: 1 1 auto;
       width: 100%;
@@ -561,16 +474,13 @@
       padding-left: 44px;
     }
   }
-  @media (max-width: 480px) {
-    .tokens-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  }
 </style>
 {% endblock %}
 
 {% block admin_content %}
 {# modal Cancel/Revoke render via `ds.button` (auto-imported by base_ds).
-   Bespoke .chip-btn / .clear-link / JS-generated .revoke-btn + token card
-   stack stay page-local. #}
+   The count-strip filter + JS-generated .revoke-btn + token card stack stay
+   page-local. #}
 <div class="tokens-page" data-is-admin="true" data-view="admin">
   <!-- ═════════ HEAD ═════════ -->
   {# The shared page head, section-level and PLAIN — the same one /admin/users
@@ -586,56 +496,93 @@
 
   {% include "_admin_tabs.html" %}
 
-  {# The four counts, off the retired gradient and onto the page. Above the
-     filter chips, which is what they summarise. #}
-  <div class="tokens-counts" id="tokens-counts" aria-live="polite" aria-label="Token counts summary">
-      <div class="count-chip active">
+  {# The counts, and the status filter — one object, so the same four numbers
+     never appear twice on the page. Each card is a toggle; Total is the way
+     back to everything. #}
+  <div class="tokens-counts" id="tokens-counts" role="group" aria-label="Token counts — filter by status">
+      <button type="button" class="count-chip total" data-val="all" aria-pressed="true" title="Show all tokens">
+        <span class="count-text">
+          <span class="count-value" id="count-total">0</span>
+          <span class="count-label">Total</span>
+        </span>
+      </button>
+      <button type="button" class="count-chip active" data-val="active" aria-pressed="false" title="Show only active tokens">
         <span class="dot" aria-hidden="true"></span>
-        <div class="count-text">
+        <span class="count-text">
           <span class="count-value" id="count-active">0</span>
           <span class="count-label">Active</span>
-        </div>
-      </div>
-      <div class="count-chip expiring" title="Active tokens expiring in the next 7 days">
+        </span>
+      </button>
+      <button type="button" class="count-chip expiring" data-val="expiring" aria-pressed="false" title="Active tokens expiring in the next 7 days">
         <span class="dot" aria-hidden="true"></span>
-        <div class="count-text">
+        <span class="count-text">
           <span class="count-value" id="count-expiring">0</span>
           <span class="count-label">Expiring soon</span>
-        </div>
-      </div>
-      <div class="count-chip expired">
+        </span>
+      </button>
+      <button type="button" class="count-chip expired" data-val="expired" aria-pressed="false" title="Show only expired tokens">
         <span class="dot" aria-hidden="true"></span>
-        <div class="count-text">
+        <span class="count-text">
           <span class="count-value" id="count-expired">0</span>
           <span class="count-label">Expired</span>
-        </div>
-      </div>
-      <div class="count-chip revoked">
+        </span>
+      </button>
+      <button type="button" class="count-chip revoked" data-val="revoked" aria-pressed="false" title="Show only revoked tokens">
         <span class="dot" aria-hidden="true"></span>
-        <div class="count-text">
+        <span class="count-text">
           <span class="count-value" id="count-revoked">0</span>
           <span class="count-label">Revoked</span>
-        </div>
-      </div>
+        </span>
+      </button>
   </div>
 
   <!-- ═════════ TOOLBAR ═════════ -->
+  <!-- The shared `.fbar` (css/filter_toolbar.css): owner search + one sort
+       select carrying key AND direction, so the order is legible at rest —
+       the old chips hid the direction behind a click-to-toggle arrow that
+       only appeared once the key was already active. -->
   <section class="toolbar" aria-label="Filter and sort tokens">
-    <div class="chip-row">
-      <span class="chip-group-label" id="status-group-label">Status</span>
-      <div class="chip-group" role="radiogroup" aria-labelledby="status-group-label" id="flt-status-group">
-        <button type="button" class="chip-btn" role="radio" data-val="all"      aria-pressed="true"  aria-checked="true">All</button>
-        <button type="button" class="chip-btn" role="radio" data-val="active"   aria-pressed="false" aria-checked="false"><span class="chip-dot" aria-hidden="true"></span>Active</button>
-        <button type="button" class="chip-btn" role="radio" data-val="expiring" aria-pressed="false" aria-checked="false"><span class="chip-dot" aria-hidden="true"></span>Expiring</button>
-        <button type="button" class="chip-btn" role="radio" data-val="expired"  aria-pressed="false" aria-checked="false"><span class="chip-dot" aria-hidden="true"></span>Expired</button>
-        <button type="button" class="chip-btn" role="radio" data-val="revoked"  aria-pressed="false" aria-checked="false"><span class="chip-dot" aria-hidden="true"></span>Revoked</button>
+    <div class="fbar">
+      <div class="fbar__search" role="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="m21 21-4.3-4.3"></path>
+        </svg>
+        <input id="flt-user" type="search" placeholder="Search by owner email&hellip;" autocomplete="off" aria-label="Filter by user email">
       </div>
-      <!-- Hidden legacy select — kept so test assertion id="flt-status" stays valid.
-           #1055: not converted to ds.dropdown() — this control was already
-           superseded by the visible .chip-btn radiogroup above; it is
-           sr-only/aria-hidden/tabindex=-1 and not part of the rendered UI, so
-           there is no visible native <select> here for the dropdown component
-           to stand in for. Same reasoning for #flt-last-used below. -->
+      <div class="fbar-select">
+        <select id="tok-sort" class="ds-dropdown-native" aria-label="Sort tokens">
+          <option value="created_at:desc" selected>Newest first</option>
+          <option value="created_at:asc">Oldest first</option>
+          <option value="last_used_at:desc">Recently used</option>
+          <option value="last_used_at:asc">Least recently used</option>
+          <option value="expires_at:asc">Expiring soonest</option>
+          <option value="expires_at:desc">Expiring latest</option>
+          {# Owner sort is the admin-only key — the profile sibling has no
+             owner column. data-sort-key marks it for the UI contract tests. #}
+          <option value="user_email:asc" data-sort-key="user_email">Owner A–Z</option>
+          <option value="user_email:desc" data-sort-key="user_email">Owner Z–A</option>
+        </select>
+        {{ ds.dropdown(
+          id='tok-sort-dd', target='tok-sort',
+          aria_label='Sort tokens', selected='created_at:desc',
+          options=[
+            {'value': 'created_at:desc', 'label': 'Newest first'},
+            {'value': 'created_at:asc', 'label': 'Oldest first'},
+            {'value': 'last_used_at:desc', 'label': 'Recently used'},
+            {'value': 'last_used_at:asc', 'label': 'Least recently used'},
+            {'value': 'expires_at:asc', 'label': 'Expiring soonest'},
+            {'value': 'expires_at:desc', 'label': 'Expiring latest'},
+            {'value': 'user_email:asc', 'label': 'Owner A–Z'},
+            {'value': 'user_email:desc', 'label': 'Owner Z–A'},
+          ],
+        ) }}
+      </div>
+      <!-- Hidden legacy selects — kept so the id contract the tests pin
+           (flt-status, flt-last-used) stays valid, and so the status filter
+           is still settable programmatically. #1055: not converted to
+           ds.dropdown() — superseded by the visible count-strip filter above;
+           sr-only/aria-hidden/tabindex=-1, not part of the rendered UI. -->
       <select id="flt-status" class="sr-only" tabindex="-1" aria-hidden="true">
         <option value="all" selected>All</option>
         <option value="active">Active</option>
@@ -643,25 +590,6 @@
         <option value="expired">Expired</option>
         <option value="revoked">Revoked</option>
       </select>
-    </div>
-
-    <div class="chip-row">
-      <span class="chip-group-label" id="sort-group-label">Sort by</span>
-      <div class="chip-group" role="group" aria-labelledby="sort-group-label" id="sort-group">
-        <button type="button" class="chip-btn" data-sort-key="created_at"   data-sort-dir="desc" aria-pressed="true">
-          Created<svg class="chip-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
-        </button>
-        <button type="button" class="chip-btn" data-sort-key="last_used_at" aria-pressed="false">
-          Last used<svg class="chip-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
-        </button>
-        <button type="button" class="chip-btn" data-sort-key="expires_at"   aria-pressed="false">
-          Expires<svg class="chip-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
-        </button>
-        <button type="button" class="chip-btn" data-sort-key="user_email"   aria-pressed="false">
-          Owner<svg class="chip-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
-        </button>
-      </div>
-      <!-- Hidden legacy select — kept so test assertion id="flt-last-used" stays valid -->
       <select id="flt-last-used" class="sr-only" tabindex="-1" aria-hidden="true">
         <option value="any" selected>Any time</option>
         <option value="never">Never used</option>
@@ -672,15 +600,20 @@
       </select>
     </div>
 
-    <div class="search-row">
-      <div class="search-wrap">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="11" cy="11" r="7"></circle>
-          <path d="m21 21-4.3-4.3"></path>
-        </svg>
-        <input id="flt-user" type="search" placeholder="Search by owner email&hellip;" autocomplete="off" aria-label="Filter by user email">
-      </div>
-      <button type="button" class="clear-link" id="clear-filters-toolbar">Clear filters</button>
+    <!-- Active refinements, and the only place `Clear filters` exists: it
+         appears with the first refinement and leaves with the last. -->
+    <div class="fbar-chips" id="tok-chips" hidden>
+      <span class="fbar-chip" id="tok-chip-status" hidden>
+        <span class="fbar-chip__label">Status</span>
+        <span class="fbar-chip__vals" id="tok-chip-status-val"></span>
+        <button type="button" class="fbar-chip__x" data-clear="status" aria-label="Clear the status filter">&times;</button>
+      </span>
+      <span class="fbar-chip" id="tok-chip-user" hidden>
+        <span class="fbar-chip__label">Owner</span>
+        <span class="fbar-chip__vals" id="tok-chip-user-val"></span>
+        <button type="button" class="fbar-chip__x" data-clear="user" aria-label="Clear the owner search">&times;</button>
+      </span>
+      <button type="button" class="fbar-chips__clear" id="clear-filters-toolbar">Clear filters</button>
     </div>
   </section>
 
@@ -721,6 +654,7 @@
 
 <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 // Admin tokens — list of ALL tokens for incident response / offboarding.
 const API_LIST   = "/auth/admin/tokens";
@@ -901,31 +835,51 @@ function sortItems(items) {
   const now = Date.now();
   const { key, dir } = sort;
   const mul = dir === "asc" ? 1 : -1;
+  // "Expiring soonest" must not lead with the tokens that never expire, and
+  // "Recently used" must not lead with the ones never used — an absent date is
+  // the FAR end of both axes, not the empty string that sorts first. Both
+  // never-cases are pinned to the bottom whichever direction is chosen, so the
+  // answer to "what needs attention?" is always at the top.
+  const ABSENT = "￿";
+  const val = (t) => {
+    if (key === "status") return computeStatus(t, now);
+    return t[key] || ABSENT;
+  };
   return [...items].sort((a, b) => {
-    let va, vb;
-    if (key === "status") { va = computeStatus(a, now); vb = computeStatus(b, now); }
-    else { va = a[key] || ""; vb = b[key] || ""; }
+    const va = val(a), vb = val(b);
+    if (va === ABSENT && vb === ABSENT) return 0;
+    if (va === ABSENT) return 1;
+    if (vb === ABSENT) return -1;
     if (va < vb) return -1 * mul;
     if (va > vb) return 1 * mul;
     return 0;
   });
 }
 
+// Counts over ALL tokens, not the filtered view: a count that shrank as you
+// filtered would answer a question nobody asked, and "Expired 0" is exactly
+// the fact worth knowing before clicking. Also refreshes each card's
+// pressed/disabled state, since the strip IS the status filter.
 function updateCounts() {
   const now = Date.now();
-  let active = 0, revoked = 0, expired = 0, expiring = 0;
+  const n = { all: allTokens.length, active: 0, expiring: 0, expired: 0, revoked: 0 };
   for (const t of allTokens) {
     const s = computeStatus(t, now);
-    if      (s === "active")   active++;
-    else if (s === "expiring") expiring++;
-    else if (s === "revoked")  revoked++;
-    else if (s === "expired")  expired++;
+    if (s in n) n[s] += 1;
   }
-  const byId = (id) => document.getElementById(id);
-  if (byId("count-active"))   byId("count-active").textContent   = active;
-  if (byId("count-revoked"))  byId("count-revoked").textContent  = revoked;
-  if (byId("count-expired"))  byId("count-expired").textContent  = expired;
-  if (byId("count-expiring")) byId("count-expiring").textContent = expiring;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
+  set("count-total",    n.all);
+  set("count-active",   n.active);
+  set("count-expiring", n.expiring);
+  set("count-expired",  n.expired);
+  set("count-revoked",  n.revoked);
+  document.querySelectorAll("#tokens-counts .count-chip").forEach(b => {
+    const val = b.dataset.val;
+    b.setAttribute("aria-pressed", filters.status === val ? "true" : "false");
+    // Never disable the card the caller is standing on — that would strand
+    // them on an empty list with no way back from it.
+    b.disabled = val !== "all" && n[val] === 0 && filters.status !== val;
+  });
 }
 
 // ── Card render ────────────────────────────────────────────────────────────
@@ -937,14 +891,14 @@ function renderCard(t, now) {
   const initials = initialsFor(ownerEmail);
   const exp = parseDate(t.expires_at);
 
-  const lastUsedRel = t.last_used_at ? relTime(t.last_used_at) : "—";
-  const lastUsedIp  = t.last_used_ip ? `from ${esc(t.last_used_ip)}` : (t.last_used_at ? "" : "never used");
-  const lastUsedTitle = t.last_used_at
+  // "Never used" is a statement, not a missing value — it takes the main
+  // slot (muted) instead of the "Last used —" the em-dash fallback printed.
+  const usageMain  = t.last_used_at ? `Last used ${esc(relTime(t.last_used_at))}` : "Never used";
+  const usageSub   = t.last_used_at && t.last_used_ip ? `from ${esc(t.last_used_ip)}` : "";
+  const usageCls   = t.last_used_at ? "" : "never";
+  const usageTitle = t.last_used_at
     ? `${fmtAbs(t.last_used_at)}${t.last_used_ip ? " from " + t.last_used_ip : ""}`
     : "never used";
-
-  let usageCls = "";
-  if (status === "revoked") usageCls = "";
 
   const createdRel = relTime(t.created_at);
   let expPart = "";
@@ -985,9 +939,9 @@ function renderCard(t, now) {
         </span>
       </div>
     </div>
-    <div class="token-usage ${usageCls}" title="${esc(lastUsedTitle)}">
-      <span class="usage-main">Last used ${esc(lastUsedRel)}</span>
-      ${lastUsedIp ? `<span class="usage-sub">${lastUsedIp}</span>` : ""}
+    <div class="token-usage ${usageCls}" title="${esc(usageTitle)}">
+      <span class="usage-main">${usageMain}</span>
+      ${usageSub ? `<span class="usage-sub">${usageSub}</span>` : ""}
     </div>
     <div class="token-aside">
       <span title="${esc(statusTooltip(t, status))}">${statusPill(status)}</span>
@@ -1011,6 +965,11 @@ function renderList() {
   const loading = document.getElementById("tokens-loading");
   const empty = document.getElementById("tokens-empty");
   loading.style.display = "none";
+
+  // Toolbar state is derived from the same call that draws the list, so the
+  // counts, the chips and the rows can never disagree.
+  updateCounts();
+  syncFilterChips();
 
   const filtered = sortItems(applyFilters(allTokens));
   list.innerHTML = "";
@@ -1041,7 +1000,6 @@ async function loadTokens() {
     const r = await fetch(API_LIST, { credentials: "include" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     allTokens = await r.json();
-    updateCounts();
     renderList();
   } catch (e) {
     document.getElementById("tokens-loading").textContent = "Failed to load tokens: " + e.message;
@@ -1068,63 +1026,107 @@ async function revokeToken({ id, name, owner, prefix }) {
   await loadTokens();
 }
 
-// ── Filter chips (status) ──────────────────────────────────────────────────
+// ── Status filter (the count strip) ────────────────────────────────────────
+const STATUS_LABELS = {
+  all: "All", active: "Active", expiring: "Expiring soon",
+  expired: "Expired", revoked: "Revoked",
+};
+
 function setStatusFilter(val) {
   filters.status = val;
-  document.querySelectorAll("#flt-status-group .chip-btn").forEach(b => {
-    const on = b.dataset.val === val;
-    b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.setAttribute("aria-checked", on ? "true" : "false");
-  });
   const sel = document.getElementById("flt-status");
   if (sel) sel.value = val;
   renderList();
 }
-document.querySelectorAll("#flt-status-group .chip-btn").forEach(btn => {
-  btn.addEventListener("click", () => setStatusFilter(btn.dataset.val));
+document.querySelectorAll("#tokens-counts .count-chip").forEach(btn => {
+  // A second press on the active card is the way back to everything.
+  btn.addEventListener("click", () =>
+    setStatusFilter(filters.status === btn.dataset.val ? "all" : btn.dataset.val));
 });
 document.getElementById("flt-status").addEventListener("change", e => setStatusFilter(e.target.value));
 
-// ── Sort chips ─────────────────────────────────────────────────────────────
-function setSort(key) {
-  if (sort.key === key) {
-    sort.dir = sort.dir === "asc" ? "desc" : "asc";
-  } else {
-    sort.key = key;
-    sort.dir = key === "user_email" ? "asc" : "desc";
-  }
-  document.querySelectorAll("#sort-group .chip-btn").forEach(b => {
-    if (b.dataset.sortKey === sort.key) {
-      b.setAttribute("aria-pressed", "true");
-      b.setAttribute("data-sort-dir", sort.dir);
-    } else {
-      b.setAttribute("aria-pressed", "false");
-      b.removeAttribute("data-sort-dir");
-    }
+// ── Sort — one select carrying `key:dir` ───────────────────────────────────
+// ds_dropdown.js only pushes a selection FROM the custom button+menu ONTO
+// the paired native <select> — setting `.value` straight from code (below)
+// needs an explicit re-sync or the paper-theme dropdown keeps showing
+// whatever was picked last.
+function syncSortDropdown(sel) {
+  const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+  if (!dd) return;
+  const label = dd.querySelector(".ds-dropdown-btn-label");
+  const opt = sel.options[sel.selectedIndex];
+  dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach(item => {
+    const isSelected = item.dataset.value === sel.value;
+    item.classList.toggle("is-selected", isSelected);
+    item.setAttribute("aria-checked", isSelected ? "true" : "false");
   });
+  if (label && opt) label.textContent = opt.textContent.trim();
+}
+
+function setSort(key, dir) {
+  sort.key = key;
+  sort.dir = dir;
+  const sel = document.getElementById("tok-sort");
+  if (sel) { sel.value = `${key}:${dir}`; syncSortDropdown(sel); }
   renderList();
 }
-document.querySelectorAll("#sort-group .chip-btn").forEach(btn => {
-  btn.addEventListener("click", () => setSort(btn.dataset.sortKey));
+document.getElementById("tok-sort").addEventListener("change", e => {
+  const [key, dir] = e.target.value.split(":");
+  setSort(key, dir || "desc");
 });
 
-// ── Owner email search ─────────────────────────────────────────────────────
+// ── Owner email search — debounced so a fast typist doesn't re-render per
+// keystroke ─────────────────────────────────────────────────────────────────
 (function bindUserFilter() {
   const el = document.getElementById("flt-user");
   if (!el) return;
-  el.addEventListener("input", e => {
-    filters.user = e.target.value.trim(); renderList();
+  let timer = null;
+  el.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { filters.user = el.value.trim(); renderList(); }, 120);
   });
 })();
 
+// Active refinements, restated as removable chips. The row (and with it
+// `Clear filters`) exists only while something is refined.
+function syncFilterChips() {
+  const row = document.getElementById("tok-chips");
+  if (!row) return;
+  const statusOn = filters.status !== "all";
+  const userOn = Boolean((filters.user || "").trim());
+
+  const statusChip = document.getElementById("tok-chip-status");
+  statusChip.hidden = !statusOn;
+  if (statusOn) {
+    document.getElementById("tok-chip-status-val").textContent =
+      STATUS_LABELS[filters.status] || filters.status;
+  }
+  const userChip = document.getElementById("tok-chip-user");
+  userChip.hidden = !userOn;
+  if (userOn) {
+    document.getElementById("tok-chip-user-val").textContent = `“${filters.user.trim()}”`;
+  }
+  row.hidden = !(statusOn || userOn);
+}
+
+document.querySelectorAll("#tok-chips [data-clear]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    if (btn.dataset.clear === "status") { setStatusFilter("all"); return; }
+    filters.user = "";
+    const el = document.getElementById("flt-user");
+    if (el) el.value = "";
+    renderList();
+  });
+});
+
 function clearFilters() {
   filters = { status: "all", user: "" };
-  setStatusFilter("all");
   const uf = document.getElementById("flt-user");
   if (uf) uf.value = "";
   const lu = document.getElementById("flt-last-used");
   if (lu) lu.value = "any";
-  renderList();
+  setSort("created_at", "desc");
+  setStatusFilter("all");
 }
 document.getElementById("clear-filters-btn").addEventListener("click", clearFilters);
 document.getElementById("clear-filters-toolbar").addEventListener("click", clearFilters);

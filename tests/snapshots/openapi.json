@@ -132,6 +132,11 @@
           "plugin_name": {
             "title": "Plugin Name",
             "type": "string"
+          },
+          "revoked_grants": {
+            "default": 0,
+            "title": "Revoked Grants",
+            "type": "integer"
           }
         },
         "required": [
@@ -942,6 +947,11 @@
             ],
             "title": "Photo"
           },
+          "publisher_kind": {
+            "default": "user",
+            "title": "Publisher Kind",
+            "type": "string"
+          },
           "tagline": {
             "anyOf": [
               {
@@ -1601,17 +1611,6 @@
               }
             ],
             "title": "Anthropic Api Key"
-          },
-          "e2b_api_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "E2B Api Key"
           }
         },
         "title": "ChatSecretsBody",
@@ -1839,6 +1838,11 @@
               }
             ],
             "title": "Bigquery Project"
+          },
+          "confirm_connection_change": {
+            "default": false,
+            "title": "Confirm Connection Change",
+            "type": "boolean"
           },
           "data_source": {
             "title": "Data Source",
@@ -2196,6 +2200,11 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "seed_from_instance_credentials": {
+            "default": false,
+            "title": "Seed From Instance Credentials",
+            "type": "boolean"
           },
           "source_type": {
             "title": "Source Type",
@@ -2568,6 +2577,15 @@
               }
             ],
             "title": "Precheck Verdict Token"
+          },
+          "publisher_kind": {
+            "default": "user",
+            "enum": [
+              "user",
+              "organization"
+            ],
+            "title": "Publisher Kind",
+            "type": "string"
           },
           "skill_md": {
             "title": "Skill Md",
@@ -3642,6 +3660,18 @@
           "source"
         ],
         "title": "DeployScriptRequest",
+        "type": "object"
+      },
+      "DisablePluginRequest": {
+        "description": "Optional body of the disable endpoint.\n\n``revoke_grants=True`` turns the disable into a one-action retirement:\nevery ``marketplace_plugin`` grant on the plugin is deleted in the same\ncall. Without it (or with no body at all \u2014 the pre-existing call shape)\ngrants are left intact, so a later re-enable restores the plugin for the\nsame groups.",
+        "properties": {
+          "revoke_grants": {
+            "default": false,
+            "title": "Revoke Grants",
+            "type": "boolean"
+          }
+        },
+        "title": "DisablePluginRequest",
         "type": "object"
       },
       "DisplayNameRequest": {
@@ -4942,6 +4972,98 @@
         "title": "KnobEntry",
         "type": "object"
       },
+      "LibraryPreviewItem": {
+        "description": "One row of a person's Library, as the Simulate lens previews it.",
+        "properties": {
+          "href": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Href"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "in_stack": {
+            "title": "In Stack",
+            "type": "boolean"
+          },
+          "materialized": {
+            "title": "Materialized",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "requirement": {
+            "title": "Requirement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "requirement",
+          "in_stack",
+          "materialized"
+        ],
+        "title": "LibraryPreviewItem",
+        "type": "object"
+      },
+      "LibraryPreviewResponse": {
+        "properties": {
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryPreviewSection"
+            },
+            "title": "Sections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "sections"
+        ],
+        "title": "LibraryPreviewResponse",
+        "type": "object"
+      },
+      "LibraryPreviewSection": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryPreviewItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label",
+          "items"
+        ],
+        "title": "LibraryPreviewSection",
+        "type": "object"
+      },
       "LintAuditBody": {
         "description": "Body for ``POST /lint-audit``. ``force`` bypasses the self-guard.",
         "properties": {
@@ -6037,6 +6159,24 @@
         "title": "PassthroughToolDTO",
         "type": "object"
       },
+      "PasswordChangeRequest": {
+        "properties": {
+          "current_password": {
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "PasswordChangeRequest",
+        "type": "object"
+      },
       "PasswordLoginRequest": {
         "properties": {
           "email": {
@@ -6597,6 +6737,22 @@
             ],
             "title": "Category"
           },
+          "deprecated": {
+            "default": false,
+            "title": "Deprecated",
+            "type": "boolean"
+          },
+          "deprecation_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deprecation Note"
+          },
           "description": {
             "anyOf": [
               {
@@ -6627,6 +6783,17 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "replacement": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacement"
           },
           "source_spec": {
             "anyOf": [
@@ -7789,6 +7956,41 @@
         "title": "SecretsRequest",
         "type": "object"
       },
+      "SemanticModelApply": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "document": {
+            "title": "Document",
+            "type": "string"
+          },
+          "expected_content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Content Hash"
+          }
+        },
+        "required": [
+          "document"
+        ],
+        "title": "SemanticModelApply",
+        "type": "object"
+      },
       "SemanticModelCreate": {
         "properties": {
           "description": {
@@ -7985,8 +8187,14 @@
         "type": "object"
       },
       "ServerConfigUpdateRequest": {
-        "description": "Patch payload for POST /api/admin/server-config.\n\nOnly the sections listed in `_EDITABLE_SECTIONS` are accepted; anything\nelse is rejected with 400. `confirm_danger` must be true if the patch\ntouches any danger-zone section (auth.*, server.*).",
+        "description": "Patch payload for POST /api/admin/server-config.\n\nOnly the sections listed in `_EDITABLE_SECTIONS` are accepted; anything\nelse is rejected with 400. `confirm_danger` must be true if the patch\ntouches any danger-zone section (auth.*, server.*), and\n`confirm_connection_change` must be true to repoint a data source that\nalready has registrations.",
         "properties": {
+          "confirm_connection_change": {
+            "default": false,
+            "description": "Must be true to repoint a data_source connection that registered tables already resolve against (see 409 connection_change_affects_registrations)",
+            "title": "Confirm Connection Change",
+            "type": "boolean"
+          },
           "confirm_danger": {
             "default": false,
             "description": "Must be true to apply changes touching auth.* or server.*",
@@ -11138,7 +11346,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.83.49"
+    "version": "0.86.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -11648,7 +11856,7 @@
     },
     "/admin/chat/secrets/test": {
       "post": {
-        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM auth mode actually\nuses: the static key in ``api_key`` mode, or the workload-identity federation\n(mint a token + confirm the API accepts it) in ``workload_identity`` mode \u2014\nso the admin \"test connection\" surface works in both modes.\n\nThe sandbox slot is provider-aware: ``e2b_api_key`` on an E2B deployment,\n``docker_sandbox`` (sidecar + daemon + image, via the apps-runner probe) on\na self-hosted one. Only the relevant one is returned \u2014 a docker instance has\nno E2B account, and a red row for a credential it will never use is noise,\nnot a signal.",
+        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM auth mode actually\nuses: the static key in ``api_key`` mode, or the workload-identity federation\n(mint a token + confirm the API accepts it) in ``workload_identity`` mode \u2014\nso the admin \"test connection\" surface works in both modes.\n\nThe sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +\nimage, via the apps-runner probe) on a docker deployment; a kai-agent\ndeployment gets only the anthropic probe \u2014 the engine owns its own sandbox\nbacking, and a red row for a credential the instance will never use is\nnoise, not a signal.",
         "operationId": "test_chat_secrets_admin_chat_secrets_test_post",
         "parameters": [
           {
@@ -11747,7 +11955,7 @@
     },
     "/admin/chat/{chat_id}/debug": {
       "get": {
-        "description": "Admin-only introspection of per-session in-process counters.\n\nUsed by the E2E suite (notably ``tests/e2e/test_bq_budget.py``) to\nread counters that previously had to be poked via ``docker exec\npython -c ...`` against module globals. Under the E2B-provider\nmodel there is no ``docker exec`` into the runner \u2014 the runner is\na remote E2B microVM \u2014 so the test reads from this endpoint\ninstead. The shape is intentionally narrow: just the counters the\nsuite needs to assert on.",
+        "description": "Admin-only introspection of per-session in-process counters.\n\nUsed by the E2E suite (notably ``tests/e2e/test_bq_budget.py``) to\nread counters that previously had to be poked via ``docker exec\npython -c ...`` against module globals. Under a remote-sandbox\nprovider there is no ``docker exec`` into the runner, so the test\nreads from this endpoint\ninstead. The shape is intentionally narrow: just the counters the\nsuite needs to assert on.",
         "operationId": "admin_debug_admin_chat__chat_id__debug_get",
         "parameters": [
           {
@@ -16739,6 +16947,87 @@
         ]
       }
     },
+    "/api/admin/data-sources/{source_type}/tables": {
+      "get": {
+        "description": "List the schemas + tables the configured Snowflake user can see.\n\nPowers the \"Add data source\" wizard's Snowflake table picker, so the\noperator selects real names instead of typing them. Read-only: it attaches,\nreads ``information_schema.tables`` and detaches \u2014 no extract is written and\nno registry row is touched (registration stays\n``POST /api/admin/register-table``).\n\nREST-only \u2014 admin-UI browse helper with no analyst-facing CLI/MCP analogue,\nexactly like its Keboola sibling (see ``_EXEMPT`` in\n``tests/test_documentation_api_triple_surface.py``). The registration step\nit feeds is already triple-surface.\n\n400 when ``source_type`` is not browsable, or when Snowflake is not\nconfigured on this instance, or when the resolved host is outside\n``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST``. 502 when the driver or the catalog\nquery fails \u2014 deliberately not an empty listing, which would read as \"the\naccount has no tables\".\n\nReturns ``{\"source_type\", \"database\", \"schemas\": [{\"name\", \"tables\":\n[{\"name\", \"table_type\"}, ...]}, ...]}``.",
+        "operationId": "list_source_tables_api_admin_data_sources__source_type__tables_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_type",
+            "required": true,
+            "schema": {
+              "title": "Source Type",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Narrow the listing to one schema.",
+            "in": "query",
+            "name": "schema",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow the listing to one schema.",
+              "title": "Schema"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Source Tables",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/datasource-secrets": {
       "get": {
         "description": "Presence/source status for known datasource secrets. Never leaks values.",
@@ -17313,7 +17602,7 @@
     },
     "/api/admin/doctor/new-instance": {
       "post": {
-        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``branding``. Optional body ``{\"email_to\": ...}`` makes the\nemail-delivery check send a real test message.",
+        "description": "Run the new-instance deployment checks and return a verdict per check.\n\nResponse: ``{status, checks: [{name, status, audience, detail}]}`` with\n``status \u2208 {ok, warning, error, info}`` per check (the ``agnes diagnose``\nvocabulary) and the headline aggregating the worst check. Checks:\n``login-door``, ``email-delivery``, ``chat-grant``, ``agent-scope``,\n``app-state-backend``, ``branding``. Optional body ``{\"email_to\": ...}``\nmakes the email-delivery check send a real test message.",
         "operationId": "doctor_new_instance_api_admin_doctor_new_instance_post",
         "parameters": [
           {
@@ -17377,6 +17666,60 @@
           }
         },
         "summary": "Doctor New Instance",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/doctor/support": {
+      "get": {
+        "description": "Collect the redacted support-bundle snapshot (server section of `agnes doctor`).\n\nResponse sections: ``build`` (version/channel/image tag/commit/deployed_at),\n``schema`` (backend + current vs expected migration verdict), ``retrieval``\n(``hybrid``/``lexical_only`` \u2014 the latter with ``status: warning`` so the\ndegradation is loud), ``sync`` (per-``source_type`` rollup: table/ok/error/\nstale/never_synced counts, newest ``last_sync_max``, and ``last_errors`` \u2014\na sample of up to 5 failing tables in registry name order; failure time is\nnot recorded, so the sample is capped, not recency-sorted, while the\n``errors`` count stays exact), ``disk`` (data-dir filesystem usage + DB file sizes),\n``process`` (state backend, roles, python), and ``secrets`` (env-var\n**presence booleans only \u2014 never values**). Each section is collected in\nisolation; a crashing collector reports ``{\"status\": \"error\"}`` for its\nsection instead of failing the request.",
+        "operationId": "doctor_support_api_admin_doctor_support_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Doctor Support",
         "tags": [
           "admin"
         ]
@@ -24320,6 +24663,60 @@
         ]
       }
     },
+    "/api/admin/run-audit-prune": {
+      "post": {
+        "description": "Trigger the retention-based ``audit_log`` prune.\n\nWraps :func:`src.audit_retention.prune_audit_log`. The scheduler service\nhits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the\ncorporate-memory + blocked-purge jobs); admins can also run it on demand.\n\n``retention_days`` comes from ``audit.retention_days`` (default 365, 0\nkeeps rows forever). Only ``audit_log`` has a retention policy \u2014 see\ndocs/observability.md for the other audit/observability trails.",
+        "operationId": "run_audit_prune_api_admin_run_audit_prune_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Audit Prune",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/run-blocked-purge": {
       "post": {
         "description": "Trigger the TTL purge of blocked bundle bytes.\n\nWraps :func:`src.store_guardrails.purge.purge_blocked_bundles`. The\nscheduler service hits this endpoint daily (under\n``SCHEDULER_API_TOKEN`` like the corporate-memory + verification\njobs); admins can also run it on demand from the UI.\n\n``purge_blocked_bundles`` resolves its repositories from the\n``src.repositories`` factory (backend-agnostic), so no DuckDB\nconnection is threaded through this handler anymore.",
@@ -29120,6 +29517,71 @@
         ]
       }
     },
+    "/api/admin/users/{user_id}/library-preview": {
+      "get": {
+        "description": "What the person's Library actually shows \u2014 the RESULT, where\n/effective-access is the why.\n\nComputed by ``StackResolver.browse``, the same grants-based projection\nthe /library page renders the target's shared bands from \u2014 deliberately\nNOT ``browse_admin`` and NOT a re-derivation from the grant rows, so\nthis preview cannot drift from the page it claims to predict (the\nLibrary's contract is no admin god-mode, and that applies to a preview\nOF a person just as it does to the person themselves). Covers the two\ngoverned kinds the resolver serves to the Library (data packages,\nmemory domains); the other granted kinds keep their per-type fold in\nthe Simulate chain.",
+        "operationId": "user_library_preview_api_admin_users__user_id__library_preview_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "User Library Preview",
+        "tags": [
+          "access"
+        ]
+      }
+    },
     "/api/admin/users/{user_id}/memberships": {
       "get": {
         "description": "Groups a user belongs to, joined with group metadata for display.\n\nIncludes ``source`` so the UI can distinguish admin-managed memberships\n(deletable from this page) from Google-synced or system-seeded ones\n(read-only \u2014 managed by their own writer).",
@@ -31813,7 +32275,7 @@
     },
     "/api/chat/skills": {
       "get": {
-        "description": "Server-normalized skills + commands catalog for the composer's slash menu.\n\n``{\"skills\": [{name, description, source}], \"commands\": [{name, description}]}``.\n\nTwo sources are merged server-side (see ``app.chat.skills_catalog`` for the\nfull rationale): skills shipped in the bundled chat workspace template\n(``source=\"bundled\"``) and the caller's RBAC-filtered marketplace/store\nplugin skills (``source=\"marketplace\"``) \u2014 the same set\n``app/chat/runner.py``'s ``_bootstrap_marketplace`` installs into the live\nsandbox. **Shadowing**: when a skill name is present in both sources, the\nmarketplace entry wins (it is the more user-specific grant). Either source\nfailing to list degrades non-fatally \u2014 a warning is logged and the other\nsource's skills still come back.\n\n``commands`` is currently always empty: neither ``app/chat/runner.py`` nor\nthe bundled workspace template recognize any slash command today (checked,\nnot assumed \u2014 see ``list_recognized_commands``'s docstring). Nothing is\ninvented ahead of an actual implementation.",
+        "description": "Server-normalized skills + commands catalog for the composer's slash menu.\n\n``{\"skills\": [{name, description, source}], \"commands\": [{name, description}]}``.\n\nTwo sources are merged server-side (see ``app.chat.skills_catalog`` for the\nfull rationale): skills shipped in the bundled chat workspace template\n(``source=\"bundled\"``) and the caller's RBAC-filtered marketplace/store\nplugin skills (``source=\"marketplace\"``) \u2014 the same set that is materialized\ninto the session's project scope, by ``app/chat/workdir.py`` (docker)\nor by the workspace archive ``app/api/kai.py`` serves (kai-agent). **Shadowing**: when a skill name is\npresent in both sources, the marketplace entry wins (it is the more\nuser-specific grant). Either source failing to list degrades non-fatally \u2014\na warning is logged and the other source's skills still come back.\n\nThe marketplace source is offered only when something actually delivers it\n(``chat.bootstrap_marketplace``; ``marketplace_delivery`` resolves the\nmechanism per provider). With the flag off, those rows are omitted rather\nthan advertised \u2014 a menu entry the agent has never been given resolves to\n\"Unknown command\" when the user picks it.\n\nNames are bare ``/<skill-name>`` tokens on every delivery path, never\n``<plugin>:<skill>`` \u2014 verified against the sandboxed CLI's own command\nlist, see the ``app.chat.skills_catalog`` module docstring.\n\n``commands`` carries the slash commands the caller's stack plugins ship\n(``commands/*.md``). Their token, unlike a skill's, depends on how the\nplugin was delivered \u2014 ``/<plugin>:<command>`` where Agnes installed a real\nplugin (docker), ``/<command>`` where it could only flatten the plugin\ninto project files (kai-agent). ``list_marketplace_commands`` documents the\nCLI handshake that table was verified against. Plugin AGENTS are delivered\nbut deliberately not listed: they are dispatched by the Task tool, not by a\nslash command.",
         "operationId": "list_skills_api_chat_skills_get",
         "parameters": [
           {
@@ -35336,7 +35798,7 @@
     },
     "/api/kai/workspace": {
       "get": {
-        "description": "Serve this caller's workspace tree as one gzipped tarball.\n\nClosed contract: exactly ``200`` with the archive, or ``204`` for \"this\ncaller has no workspace\". Any other status fails the engine's turn, so\nthere is no partial answer \u2014 an unreadable template falls back to the\nbundled tree rather than erroring.\n\nAuthenticated by the session credential, not a broker ticket: the engine's\n*server* fetches this once per SDK process spawn, and the sandbox never\nsees it.\n\nThe payload is per-session, because the ``CLAUDE.md`` inside it is the\nRBAC-filtered Workspace Prompt. It stays byte-stable for a given session\nand configuration \u2014 the session, not merely the caller, because the\nrendered document carries a date and is therefore pinned to\n``started_at``. That stability is what the engine's re-fetch on every SDK\nrespawn relies on.",
+        "description": "Serve this caller's workspace tree as one gzipped tarball.\n\nClosed contract: exactly ``200`` with the archive, or ``204`` for \"this\ncaller has no workspace\". Any other status fails the engine's turn, so\nthere is no partial answer \u2014 an unreadable template falls back to the\nbundled tree rather than erroring.\n\nAuthenticated by the session credential, not a broker ticket: the engine's\n*server* fetches this once per SDK process spawn, and the sandbox never\nsees it.\n\nThe payload is per-session, because the ``CLAUDE.md`` inside it is the\nRBAC-filtered Workspace Prompt and the ``.claude/skills`` overlay is the\ncaller's RBAC-filtered marketplace set. It stays byte-stable for a given\nsession and configuration \u2014 the session, not merely the caller, because the\nrendered document carries a date and is therefore pinned to\n``started_at``. That stability is what the engine's re-fetch on every SDK\nrespawn relies on; a stack change (a plugin subscribed or dropped) is a\nconfiguration change and is meant to move the bytes.",
         "operationId": "kai_workspace_api_kai_workspace_get",
         "responses": {
           "200": {
@@ -37086,7 +37548,7 @@
     },
     "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable": {
       "post": {
-        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.",
+        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
         "operationId": "disable_plugin_api_marketplaces__marketplace_id__plugins__plugin_name__disable_post",
         "parameters": [
           {
@@ -37124,6 +37586,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/DisablePluginRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -42337,6 +42816,70 @@
         "summary": "Run Deployed Script",
         "tags": [
           "scripts"
+        ]
+      }
+    },
+    "/api/semantic-models/apply": {
+      "post": {
+        "description": "Apply a hand-authored Ossie document \u2014 the one semantic-layer write\nsurface for chat, CLI, and the studio builder.\n\nWhat \"apply\" means depends on the caller's authority, and the response\nlabels the outcome so callers (human or agent) never have to guess:\n\n- **admin** \u2192 the document is validated, stored as a ``source='manual'``\n  model (create-or-replace by slug), and projected into the flat tables.\n  Response: ``{\"outcome\": \"applied\", \"model\": {...}}``.\n- **non-admin** \u2192 the document is validated, then queued as an\n  ``authoring_suggestions`` row (domain ``semantic-layer``) for admin\n  moderation \u2014 it never touches ``semantic_models`` before approval.\n  Response: ``{\"outcome\": \"submitted_for_review\", \"suggestion_id\": ...}``.\n\nShared guards, both roles: schema-invalid documents 422; a slug owned by\nan imported source 409 ``source_owned``; a supplied\n``expected_content_hash`` that no longer matches 409 ``stale_document``.\nThe non-admin branch additionally 409s ``duplicate_pending`` while an\nearlier proposal for the same slug awaits review, and 403s\n``studio_disabled`` when the instance-level Studio toggle is off (the\nadmin branch is a plain admin write, not Studio-gated).",
+        "operationId": "apply_semantic_model_endpoint_api_semantic_models_apply_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelApply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Semantic Model Endpoint",
+        "tags": [
+          "semantic-models"
         ]
       }
     },
@@ -50352,6 +50895,112 @@
         ]
       }
     },
+    "/auth/password/change": {
+      "get": {
+        "description": "Self-serve change-password page, linked from the account menu.",
+        "operationId": "password_change_page_auth_password_change_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change Page",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Change the caller's own password. Session token only (PAT rejected by\n`require_session_token`, matching `/auth/tokens` and every other door\nthat mints or rotates a credential).\n\nDouble-submit CSRF (F2) is checked FIRST, before anything else runs \u2014\nincluding the no-password-hash lookup below. A cookie-authenticated JSON\nPOST is not automatically CSRF-safe (the cookie fallback in\n`get_current_user` means an ordinary cross-site fetch would still carry\nthe session), so the caller must echo the `web_csrf` cookie value in the\n`X-CSRF-Token` header (same mechanism as `me_profile_refetch_groups`).\nChecking it first \u2014 rather than after the account-state read \u2014 closes a\nresponse-shape leak (Devin Review on PR #1548): a caller with no CSRF\ntoken would otherwise get a different status for an SSO-only account\n(400) than a password account (403 from the CSRF check), letting a\nsame-site page without the token distinguish the two account types.\nNothing here is safe to do before proving the caller sent this request\non purpose. The GET page mints the `web_csrf` cookie unconditionally \u2014\neven for an SSO-only account with no form to submit \u2014 so this ordering\nnever blocks a legitimate caller who visited it first.\n\nExisting sessions and PATs are NOT invalidated by a password change \u2014\nthis endpoint only replaces the password hash. Revoking sessions/PATs is\na separate action (`DELETE /auth/tokens/{id}`), same as every other\npassword door in this module (reset, setup, admin reset).",
+        "operationId": "password_change_auth_password_change_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Password Change",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/auth/password/login": {
       "post": {
         "description": "Login with email + password.",
@@ -51055,6 +51704,7 @@
     },
     "/catalog": {
       "get": {
+        "description": "The Catalog is folded into the Library.\n\nIt browsed the same rows the Library already renders \u2014 data packages,\nmemory domains, marketplace plugins and recipes, off the same\n``StackResolver.browse()`` \u2014 sliced by kind tabs where the Library groups\nby type into collapsible sections. Two destinations for one list, which is\nthe split the Library/Memory/Data-apps merge already named as the problem\n(spec 2026-08-12) and never got round to closing here.\n\nThe one thing this page had that the list did not is the \"what could I\nadd\" question, which is now the Library's \"Not in stack yet\" filter \u2014\nthe `?scope=available` this sends arrives with that toggle applied.\n\n302, not 308, so a reversal is not cached permanently \u2014 same reasoning as\nthe /corporate-memory, /apps and /stack retirements. The route stays\nregistered so bookmarks and old links do not 404, and every detail route\nunder it (``/catalog/p/{slug}``, ``/catalog/t/{id}``, ``/catalog/r/{slug}``,\n``/catalog/semantics``) is untouched: this folds the browse SHELL only.",
         "operationId": "catalog_catalog_get",
         "parameters": [
           {
@@ -52399,6 +53049,7 @@
     },
     "/marketplace": {
       "get": {
+        "description": "The Marketplace browse is folded into the Library.\n\nIts two tabs were Browse and My Stack \u2014 \"everything there is\" and \"what I\nhave\" \u2014 over store entities and curated plugins the Library already lists\nin full (`store_entities_repo().list(visibility_status=['approved'])`, plus\nevery granted `marketplace_plugin`). That is the same list under a second\nroof, and the tab pair is the same question the Library now asks of one\nlist: `?tab=my` maps to `scope=mine` (the In stack segment) and the\ndefault browse tab to `scope=available` (the \"Not in stack yet\" filter),\nso an old link lands where it meant to.\n\n302 and the route stays registered, per the /corporate-memory, /apps and\n/stack retirements. Every detail and sub-route is untouched \u2014\n`/marketplace/curated/{...}`, `/marketplace/flea/{id}`, the edit pages \u2014\nbecause this folds the browse SHELL, not the store.",
         "operationId": "marketplace_listing_marketplace_get",
         "parameters": [
           {

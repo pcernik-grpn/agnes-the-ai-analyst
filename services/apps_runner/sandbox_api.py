@@ -313,7 +313,7 @@ def sandbox_up(name: str, payload: dict = Body(...), x_runner_token: str | None 
         # (agent Bash tool, `claude` CLI, pip) and Python does not reap
         # re-parented grandchildren — without an init each orphaned child
         # would linger as a zombie against the pids limit for the life of
-        # the session. (E2B doesn't need this: envd is the microVM's init.)
+        # the session. (A microVM-style sandbox with its own init would not.)
         init=True,
         # Keeps the container's stdin open across attach/detach cycles so the
         # gateway can push `user_msg` / `ticket_push` frames at any time

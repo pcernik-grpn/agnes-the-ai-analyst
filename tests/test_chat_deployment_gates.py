@@ -243,86 +243,22 @@ def test_secret_status_anthropic_not_required_in_wif_mode():
 
 
 # ---------------------------------------------------------------------------
-# E2B-specific gates (Task H.6 — provider reversal)
+# Removed-provider refusal (the e2b provider was removed in 0.89.0)
 # ---------------------------------------------------------------------------
 
 
-def test_chat_refuses_without_e2b_api_key(monkeypatch):
-    """chat.enabled=true with provider=e2b but no E2B_API_KEY → refused."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_api_key_ok
+def test_stale_e2b_provider_names_the_removal_in_the_boot_refusal():
+    """The loud-refusal contract for stale ``provider: e2b`` configs: the
+    allowlist branch in app/main.py must special-case the removed provider
+    with an actionable message (what was removed, what to set, where). This
+    pins the message so a refactor cannot silently downgrade it to the
+    generic unknown-provider line."""
+    from pathlib import Path
 
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
-    monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
-    assert _chat_e2b_api_key_ok(cfg) is False
-
-
-def test_chat_accepts_with_e2b_api_key(monkeypatch):
-    """chat.enabled=true with E2B_API_KEY set → accepted."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_api_key_ok
-
-    monkeypatch.setenv("E2B_API_KEY", "sk-e2b-test")
-    monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
-    assert _chat_e2b_api_key_ok(cfg) is True
-
-
-def test_chat_e2b_key_skipped_when_disabled(monkeypatch):
-    """chat.enabled=false → E2B key check bypassed."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_api_key_ok
-
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
-    assert _chat_e2b_api_key_ok(ChatConfig(enabled=False)) is True
-
-
-def test_chat_refuses_without_e2b_template_id(monkeypatch):
-    """chat.enabled=true, provider=e2b, but no e2b_template_id → refused."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_template_id_ok
-
-    monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="e2b", e2b_template_id=None)
-    assert _chat_e2b_template_id_ok(cfg) is False
-
-
-def test_chat_accepts_with_e2b_template_id(monkeypatch):
-    """A non-empty e2b_template_id passes the gate."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_template_id_ok
-
-    monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
-    assert _chat_e2b_template_id_ok(cfg) is True
-
-
-def test_chat_e2b_template_skipped_when_disabled(monkeypatch):
-    """chat.enabled=false → template gate bypassed."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_template_id_ok
-
-    cfg = ChatConfig(enabled=False, provider="e2b")
-    assert _chat_e2b_template_id_ok(cfg) is True
-
-
-def test_chat_e2b_gates_bypassed_for_non_e2b_provider(monkeypatch):
-    """If provider != 'e2b', the e2b-specific gates short-circuit to True
-    so the operator's misconfiguration is caught by the provider-allowlist
-    branch, not by these gates."""
-    from app.chat.config import ChatConfig
-    from app.main import _chat_e2b_api_key_ok, _chat_e2b_template_id_ok
-
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
-    monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="something_else")
-    assert _chat_e2b_api_key_ok(cfg) is True
-    assert _chat_e2b_template_id_ok(cfg) is True
-    # A docker deployment has no E2B account at all — neither gate may fire.
-    docker_cfg = ChatConfig(enabled=True, provider="docker")
-    assert _chat_e2b_api_key_ok(docker_cfg) is True
-    assert _chat_e2b_template_id_ok(docker_cfg) is True
+    body = Path("app/main.py").read_text()
+    assert 'not in ("docker", "kai-agent")' in body
+    assert "chat.provider=e2b is no longer supported" in body
+    assert "AGNES_CHAT_PROVIDER" in body
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +274,9 @@ def _docker_cfg(**over):
     return ChatConfig(**kwargs)
 
 
-def test_docker_gates_bypassed_for_e2b_provider(monkeypatch):
-    """Symmetry with the e2b gates: an e2b deployment must not be refused for
-    lacking a sidecar or a non-loopback rails URL."""
+def test_docker_gates_bypassed_for_kai_agent_provider(monkeypatch):
+    """A kai-agent deployment must not be refused for lacking a sidecar or a
+    non-loopback rails URL — the docker gates fire only on provider=docker."""
     import asyncio
 
     from app.chat.config import ChatConfig
@@ -349,7 +285,7 @@ def test_docker_gates_bypassed_for_e2b_provider(monkeypatch):
     monkeypatch.delenv("SERVER_URL", raising=False)
     monkeypatch.delenv("AGNES_INTERNAL_URL", raising=False)
     monkeypatch.delenv("TESTING", raising=False)
-    cfg = ChatConfig(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
+    cfg = ChatConfig(enabled=True, provider="kai-agent")
     assert _chat_docker_rails_url_ok(cfg) is True
     assert asyncio.run(_chat_docker_sandbox_ok(cfg)) is True
 

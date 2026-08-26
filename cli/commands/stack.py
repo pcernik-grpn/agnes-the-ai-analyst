@@ -64,6 +64,17 @@ def _validate_type(value: str, *, allow_plugin_for_list: bool = False) -> str:
     return value
 
 
+# The tier's human vocabulary — 'automatic' (in every member's stack, no add
+# needed) / 'optional' (add it yourself) — matching the admin UI and the
+# Library. The API enum ('required'/'available') is a wire format: it stays
+# exact in --json and in the --requirement flag on `agnes admin grant`.
+_TIER_WORDS = {"required": "automatic", "available": "optional"}
+
+
+def _tier_word(raw: str) -> str:
+    return _TIER_WORDS.get(raw, raw)
+
+
 @stack_app.command("list")
 def stack_list(
     type_filter: Optional[str] = typer.Option(None, "--type", help="data_package | memory_domain (omit for both)"),
@@ -116,7 +127,7 @@ def stack_list(
         typer.echo(
             f"{it.get('name', '')[:name_w]:<{name_w}}  "
             f"{it.get('type', ''):<{type_w}}  "
-            f"{it.get('requirement', ''):<{req_w}}  "
+            f"{_tier_word(it.get('requirement', '')):<{req_w}}  "
             f"{desc}"
         )
 
@@ -186,7 +197,7 @@ def stack_browse(
             f"{str(it.get('id', '')):<{id_w}}  "
             f"{it.get('name', '')[:name_w]:<{name_w}}  "
             f"{it.get('type', ''):<{type_w}}  "
-            f"{it.get('requirement', ''):<{req_w}}  "
+            f"{_tier_word(it.get('requirement', '')):<{req_w}}  "
             f"{mark:<{in_w}}  "
             f"{desc}"
         )

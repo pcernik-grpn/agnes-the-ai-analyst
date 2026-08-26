@@ -77,6 +77,7 @@
    this person in"). People and Access are two of them here, so a group and
    a person are read the same way. #}
 <link rel="stylesheet" href="{{ static_url('css/section_card.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {# Creating and renaming a group — the shared drawer
    (js/components/group_drawer.js), which opens over this page so neither
    job costs the selection or the scroll. It asks for a name and stops:
@@ -516,6 +517,11 @@
     background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
   }
   .ax-tag--data { background: var(--ds-kind-data-soft); color: var(--ds-kind-data); }
+  /* Shown only while a section is expanded (it lives after </summary>, which
+     <details> hides when closed) — the type-level caveat (e.g. "Tables"
+     grants don't reach analyst visibility, see app/resource_types.py) that a
+     hover-only tooltip on the header would leave undiscoverable. */
+  .ax-type-desc { margin: -2px 0 8px 22px; font-size: 11.5px; line-height: 1.4; color: var(--ds-text-muted); max-width: 62ch; }
   .ax-sec__body { padding: 0 0 12px; }
   /* A nested type indents its buckets rather than its rows: the bucket is
      the thing you scan, and the rows only exist once you have opened one. */
@@ -584,6 +590,43 @@
   .ax-chip.ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border-color: var(--ds-accent-success-line); }
   .ax-chip.no { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); }
   .ax-chip.info { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  /* A grant whose target no longer exists. It used to render through the
+     ok-chip path with a raw id as its "name" — a green false positive in
+     the one lens built for compliance questions. */
+  .ax-chip.warn { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-color: var(--ds-accent-warn-line); }
+  /* Row names that ARE somewhere: quiet in place, honest on hover. */
+  .ax-name__link { color: inherit; text-decoration: none; }
+  .ax-name__link:hover { color: var(--ds-primary); text-decoration: underline; text-underline-offset: 2px; }
+
+  /* ── "What their Library shows" — the Library-shaped preview panel. A
+     compact render of the target's shared bands (same StackResolver.browse
+     projection the /library page uses), so the Simulate lens shows the
+     RESULT above the why-chain. Reads as a quiet card: band label + count,
+     one row per resource, the state chip reusing the .ax-chip vocabulary. */
+  .ax-preview {
+    margin: 12px 0 4px;
+    padding: 12px 14px;
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
+    border-radius: 10px;
+  }
+  .ax-preview__head {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--ds-text-muted); margin-bottom: 8px;
+  }
+  .ax-preview__band + .ax-preview__band { margin-top: 10px; }
+  .ax-preview__label { font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary); }
+  .ax-preview__n { font-weight: 700; color: var(--ds-text-muted); font-size: 11.5px; margin-left: 2px; }
+  .ax-preview__rows { list-style: none; margin: 4px 0 0; padding: 0; }
+  .ax-preview__row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 5px 0; font-size: 13px; color: var(--ds-text-primary);
+    border-top: 1px solid var(--ds-border-light);
+  }
+  .ax-preview__row:first-child { border-top: 0; }
+  .ax-preview__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ax-preview__name a { color: inherit; text-decoration: none; }
+  .ax-preview__name a:hover { color: var(--ds-primary); text-decoration: underline; text-underline-offset: 2px; }
 
   .ax-chain { margin: 6px 0 0; padding: 0; list-style: none; }
   .ax-chain li {
@@ -780,7 +823,13 @@
       <div>
         <label for="ax-sim-user">Person</label>
         <span class="fbar-select">
-          <select id="ax-sim-user"><option value="">Loading people…</option></select>
+          {# Options are fetched once and the <select> rebuilt entirely
+             client-side (loadUsers() below); the paired .ds-dropdown is kept
+             in sync by syncSimUserDropdown() (see below), using
+             ds_dropdown.js's exported re-init hook (#1473). #}
+          <select id="ax-sim-user" class="ds-dropdown-native"><option value="">Loading people…</option></select>
+          {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
+                         options=[{'value': '', 'label': 'Loading people…'}]) }}
         </span>
       </div>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
@@ -794,6 +843,7 @@
 
 {# The create / rename flow. #}
 <script src="{{ static_url('js/components/group_drawer.js') }}"></script>
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   "use strict";
@@ -1174,14 +1224,27 @@
       return blocks.length > 1 || blocks.some((b) => b.name && b.name !== t.type_display);
     };
 
+    // The page whose job is "who gets WHAT" must be able to answer "what IS
+    // that?" without a six-step detour through Data. Kinds with an
+    // id-addressable page get a link on the row name; the rest stay text —
+    // a link that needs a slug this projection doesn't carry would 404.
+    const ENTITY_HREF = {
+      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`,
+      table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
+    };
+
     const itemRow = (t, i) => {
       const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
       const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
+      const hrefFn = ENTITY_HREF[t.type_key];
+      const nameHtml = hrefFn
+        ? `<a class="ax-name__link" href="${hrefFn(i.resource_id)}">${esc(i.name || i.resource_id)}</a>`
+        : esc(i.name || i.resource_id);
       return `
       <tr data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant ? ' class="is-granted"' : ""}>
         <td class="ax-chk"><input type="checkbox" ${grant ? "checked" : ""} aria-label="Grant ${esc(i.name || i.resource_id)}"></td>
         <td class="ax-name">
-          <b>${esc(i.name || i.resource_id)}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}
+          <b>${nameHtml}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}
           ${i.description ? `<br><span class="desc">${esc(String(i.description).slice(0, 90))}</span>` : ""}
         </td>
         <td class="ax-acc">
@@ -1219,8 +1282,9 @@
       const granted = blocks.reduce((n, b) => n + b.granted, 0);
       const lead = t.type_key === LEAD_TYPE;
       const head = (cnt) => `
-        <summary><span class="car">▶</span> <span class="ax-tag ${lead ? "ax-tag--data" : ""}">${esc(t.type_display)}</span>
-          <span class="cnt">${cnt}</span></summary>`;
+        <summary title="${esc(t.type_description || "")}"><span class="car">▶</span> <span class="ax-tag ${lead ? "ax-tag--data" : ""}">${esc(t.type_display)}</span>
+          <span class="cnt">${cnt}</span></summary>
+        ${t.type_description ? `<p class="ax-type-desc">${esc(t.type_description)}</p>` : ""}`;
       if (!items.length) {
         return `<details class="ax-sec">${head("none registered")}
           <div class="ax-empty" style="padding-left:22px;">Nothing of this kind exists on the instance yet.</div>
@@ -1780,8 +1844,20 @@
   /* ── Narrowing the grant tree ─────────────────────────────────────────
      The filter the retired detail page had. Both controls re-render rather
      than hide rows, so the per-section counts stay true to what is showing. */
+  /* The working set (filter text + scope) survives leaving for an entity
+     page and coming back — the commonest interruption on this page is
+     "what IS that row?", and returning to a reset tree made every careful
+     grant decision cost the search twice. Same store and same reasoning as
+     SELECTED_KEY above: this sitting, not forever. */
+  const WORKSET_KEY = "agnes.admin.access.workset";
+  function rememberWorkset() {
+    try {
+      sessionStorage.setItem(WORKSET_KEY, JSON.stringify({ f: resourceFilter, s: accessScope }));
+    } catch (e) { /* private mode */ }
+  }
   el("ax-rfind").addEventListener("input", (e) => {
     resourceFilter = e.target.value;
+    rememberWorkset();
     renderResources();
   });
   /* The scope segments. `.fbar-seg` is the app's segmented control, so this
@@ -1792,6 +1868,7 @@
     accessScope = btn.dataset.scope;
     el("ax-scope").querySelectorAll("[data-scope]").forEach((b) =>
       b.classList.toggle("is-active", b.dataset.scope === accessScope));
+    rememberWorkset();
     renderResources();
   });
 
@@ -1961,6 +2038,51 @@
 
   /* ── Simulate ── */
 
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from ax-sim-user's
+  // own freshly-set <option>s, then re-runs ds_dropdown.js's init via the
+  // exported `dsDropdownInit` hook — needed because loadUsers() rebuilds the
+  // whole option list once from a fetch. The button is rebuilt too, not just
+  // the menu: init() isn't idempotent for its per-element listeners, so
+  // leaving the same persisting <button> node across two init() calls (one
+  // from ds_dropdown.js's own DOMContentLoaded bootstrap, one from here)
+  // double-registers its click handler — the second open()/close() undoes
+  // the first, and the menu never appears to open. Recreating the button
+  // discards that stale listener along with the old node.
+  function syncSimUserDropdown(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="ax-sim-user"]');
+    if (!dd) return;
+    const opts = Array.from(sel.options);
+    const currentOpt = opts.find((o) => o.value === sel.value) || opts[0];
+    const menuEl = dd.querySelector(".ds-dropdown-menu");
+    const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
+    const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="ax-sim-user-dd-name">${esc(ariaLabel)}</span>` : "";
+    const labelledBy = ariaLabel ? ` aria-labelledby="ax-sim-user-dd-name ax-sim-user-dd-btn-label"` : "";
+    const items = opts
+      .map((o) => `<li class="ds-dropdown-menu-item${o === currentOpt ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${esc(o.value)}">${esc(o.textContent)}</li>`)
+      .join("");
+    dd.innerHTML = `<button type="button" class="ds-dropdown-btn" id="ax-sim-user-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="ax-sim-user-dd-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="ax-sim-user-dd-btn-label">${currentOpt ? esc(currentOpt.textContent) : ""}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="ax-sim-user-dd-menu" role="menu" aria-label="${esc(ariaLabel || "Options")}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(dd);
+  }
+
+  // Lighter counterpart for when only the SELECTED value changes and the
+  // option list itself is untouched (a real click already updated the
+  // dropdown's own visuals via ds_dropdown.js; the `?user=` deep link below
+  // sets `.value` + dispatches "change" straight from code, which needs this
+  // to catch the paper-theme dropdown up). Mutates the EXISTING items in
+  // place rather than rebuilding — no button churn on every plain click.
+  function syncSimUserSelection(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="ax-sim-user"]');
+    if (!dd) return;
+    const label = dd.querySelector(".ds-dropdown-btn-label");
+    const opt = sel.options[sel.selectedIndex];
+    dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach((item) => {
+      const isSelected = item.dataset.value === sel.value;
+      item.classList.toggle("is-selected", isSelected);
+      item.setAttribute("aria-checked", isSelected ? "true" : "false");
+    });
+    if (label && opt) label.textContent = opt.textContent.trim();
+  }
+
   async function loadUsers() {
     if (users.length) return;
     try {
@@ -1973,10 +2095,21 @@
       .filter((u) => u.active !== false)
       .map((u) => `<option value="${esc(u.id)}">${esc(u.name || u.email)} — ${esc(u.email)}</option>`)
       .join("");
+    syncSimUserDropdown(sel);
   }
 
   el("ax-sim-user").addEventListener("change", async (e) => {
+    syncSimUserSelection(e.target);
     const uid = e.target.value;
+    // The picked person lives in the URL (?user=) so the preview survives a
+    // round trip — "Share it →" leaves for the package page and its back
+    // link returns HERE, to the same person, already resolved. replaceState:
+    // re-picking is a refinement of the same view, not a history entry.
+    const url = new URL(window.location.href);
+    url.searchParams.set("lens", "simulate");
+    if (uid) url.searchParams.set("user", uid);
+    else url.searchParams.delete("user");
+    history.replaceState(null, "", url);
     const out = el("ax-sim-out");
     const detailBtn = el("ax-sim-detail");
     if (!uid) {
@@ -1988,13 +2121,18 @@
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
     out.innerHTML = `<div class="ax-empty">Resolving…</div>`;
     try {
-      const [effResp, memResp] = await Promise.all([
+      const [effResp, memResp, prevResp] = await Promise.all([
         fetch(`${ADMIN_USERS_API}/${encodeURIComponent(uid)}/effective-access`, { credentials: "include" }),
         fetch(`${ADMIN_USERS_API}/${encodeURIComponent(uid)}/memberships`, { credentials: "include" }),
+        // The RESULT half: what their Library actually shows (the chain
+        // below is the why). Failure degrades to no panel, never to a
+        // broken simulation.
+        fetch(`${ADMIN_USERS_API}/${encodeURIComponent(uid)}/library-preview`, { credentials: "include" }),
       ]);
       const eff = effResp.ok ? await effResp.json() : { items: [], is_admin: false };
       const mem = memResp.ok ? await memResp.json() : [];
-      renderSimulation(uid, eff, Array.isArray(mem) ? mem : (mem.groups || []));
+      const preview = prevResp.ok ? await prevResp.json() : null;
+      renderSimulation(uid, eff, Array.isArray(mem) ? mem : (mem.groups || []), preview);
     } catch (err) {
       out.innerHTML = `<div class="ax-empty">Could not resolve this person's access (${esc(err.message)}).</div>`;
     }
@@ -2018,7 +2156,39 @@
     return idx;
   }
 
-  function renderSimulation(uid, eff, memberships) {
+  // The Library-shaped preview panel — the RESULT the chain explains. Rows
+  // come from the same StackResolver.browse projection the /library page
+  // renders for the person, so this cannot drift from what they'd see; the
+  // state chip speaks the product's one vocabulary: "In stack · Automatic"
+  // (a required-tier grant), "In stack" (added/auto), "Not in stack yet ·
+  // Optional" (classic mode, not subscribed — granted but not delivered).
+  function renderLibraryPreview(preview, uid) {
+    if (!preview || !Array.isArray(preview.sections)) return "";
+    if (!preview.sections.length) {
+      return `<div class="ax-preview"><div class="ax-preview__head">What their Library shows</div>
+        <div class="ax-empty">The shared bands of their Library are empty — nothing granted yet.</div></div>`;
+    }
+    const bands = preview.sections.map((sec) => {
+      const rows = (sec.items || []).map((it) => {
+        const state = it.requirement === "required"
+          ? `<span class="ax-chip ok" title="Automatic — in their stack; only an admin changes this">In stack · Automatic</span>`
+          : it.in_stack
+            ? `<span class="ax-chip ok" title="${it.materialized ? "In their stack and downloaded on their next pull" : "In their stack"}">In stack</span>`
+            : `<span class="ax-chip info" title="Optional — granted, but they haven't added it to their stack">Not in stack yet · Optional</span>`;
+        const name = it.href
+          ? `<a href="${esc(it.href)}?from=admin&user=${encodeURIComponent(uid)}">${esc(it.name)}</a>`
+          : esc(it.name);
+        return `<li class="ax-preview__row"><span class="ax-preview__name">${name}</span>${state}</li>`;
+      }).join("");
+      return `<div class="ax-preview__band">
+        <div class="ax-preview__label">${esc(sec.label)} <span class="ax-preview__n">${(sec.items || []).length}</span></div>
+        <ul class="ax-preview__rows">${rows}</ul></div>`;
+    }).join("");
+    return `<div class="ax-preview">
+      <div class="ax-preview__head">What their Library shows</div>${bands}</div>`;
+  }
+
+  function renderSimulation(uid, eff, memberships, preview) {
     const person = users.find((u) => u.id === uid) || {};
     const items = eff.items || [];
     const idx = resourceIndex();
@@ -2030,6 +2200,39 @@
     const packages = items.filter((i) => i.resource_type === "data_package");
     const others = items.filter((i) => i.resource_type !== "data_package");
 
+    // A grant row whose target the projection no longer lists is a DANGLING
+    // grant (package deleted, grant left behind) — the one thing this lens
+    // must not paint green. Split them out before the chips are built.
+    const live = packages.filter((p) => idx.has(`data_package:${p.resource_id}`));
+    const dangling = packages.filter((p) => !idx.has(`data_package:${p.resource_id}`));
+
+    // Tier, joined from the same access-overview this page already holds:
+    // "can use" is a weaker answer than the one the pane's own lede promises
+    // ("membership to grant to tier"). required via any of their groups wins
+    // — one Automatic grant lands it in the stack regardless of the others.
+    const tierOf = (p) => {
+      const viaIds = new Set((p.via_groups || []).map((g) => g.group_id));
+      const rows = ((overview && overview.grants) || []).filter(
+        (g) => g.resource_type === "data_package"
+            && g.resource_id === p.resource_id
+            && viaIds.has(g.group_id),
+      );
+      if (!rows.length) return null;
+      return rows.some((g) => g.requirement === "required") ? "required" : "available";
+    };
+    // Optional's suffix words by MEMBERSHIP MODE (the preview reports which
+    // one it computed under): under auto-membership every grant already IS a
+    // stack membership, so "must add it" — the classic-mode fact — would
+    // contradict the Library-shaped panel right below these chips. When the
+    // preview failed to load the mode is unknown; classic is the default.
+    const simMode = preview && preview.mode;
+    const tierText = (p) => {
+      const t = tierOf(p);
+      return t === "required" ? " · Automatic — in their stack"
+           : t === "available" ? (simMode === "auto" ? " · Optional — in their stack" : " · Optional — must add it")
+           : "";
+    };
+
     // What is NOT shared with them — the half a grant list cannot show, and
     // the reason someone opens this page at all.
     const allPackages = ((overview && overview.resources) || [])
@@ -2040,8 +2243,9 @@
 
     const groupNames = memberships.map((g) => g.name || g.group_name || g.id).filter(Boolean);
     const chips = [
-      ...packages.slice(0, 6).map((p) => `<span class="ax-chip ok">Can use: ${esc(nameOf(p))}</span>`),
+      ...live.slice(0, 6).map((p) => `<span class="ax-chip ok">Can use: ${esc(nameOf(p))}${tierText(p)}</span>`),
       ...missing.slice(0, 4).map((p) => `<span class="ax-chip no">Cannot use: ${esc(p.name)}</span>`),
+      ...dangling.map((p) => `<span class="ax-chip warn">Dangling grant: ${esc(p.resource_id)} — target deleted or unlisted</span>`),
     ];
     if (eff.is_admin) {
       chips.unshift(`<span class="ax-chip info">Admin — reaches everything regardless of grants</span>`);
@@ -2067,10 +2271,22 @@
     }
 
     // Data packages, one row each and named — the spine of the question.
-    for (const p of packages) {
+    for (const p of live) {
       const via = (p.via_groups || []).map((g) => esc(g.group_name || g.group_id)).join(", ");
       chain.push(`<li><b>${esc(nameOf(p))}</b> <span class="muted">(data package)</span>
-        — via ${via ? `<b>${via}</b>` : "<span class=\"muted\">a group</span>"}</li>`);
+        — via ${via ? `<b>${via}</b>` : "<span class=\"muted\">a group</span>"}${esc(tierText(p))}</li>`);
+    }
+
+    // Dangling grants get a stop row with the fix one click away — the group
+    // whose grant is stale is named in the row itself.
+    for (const p of dangling) {
+      const g0 = (p.via_groups || [])[0];
+      const fixHref = g0 && g0.group_id
+        ? `/admin/access?group=${encodeURIComponent(g0.group_id)}`
+        : "/admin/access";
+      chain.push(`<li class="stop"><b>${esc(p.resource_id)}</b> — a grant via
+        <b>${esc(g0 ? (g0.group_name || g0.group_id) : "a group")}</b> points at a package that
+        no longer exists. <a href="${fixHref}">Fix the grant →</a></li>`);
     }
 
     // Everything else FOLDED PER TYPE. Listing eight collection rows
@@ -2108,8 +2324,12 @@
     }
 
     for (const p of missing.slice(0, 3)) {
+      // Straight to the package's OWN page, carrying who you came for — the
+      // old link landed on the package INDEX and dropped the person, so the
+      // fix started over from a card grid. ?from=simulate&user= renders a
+      // context banner + a one-click way back to this exact preview.
       chain.push(`<li class="stop"><b>${esc(p.name)}</b> is not shared with any group they are in.
-        <a href="/admin/data-packages">Share it →</a></li>`);
+        <a href="/admin/data-packages/${encodeURIComponent(p.resource_id)}?from=simulate&user=${encodeURIComponent(uid)}">Share it →</a></li>`);
     }
 
     chain.push(`<li><b>Delivery:</b> a granted package reaches their machine on the next
@@ -2117,6 +2337,7 @@
 
     el("ax-sim-out").innerHTML =
       `<div class="ax-chips">${chips.join("") || '<span class="ax-chip no">Nothing shared with them yet</span>'}</div>
+       ${renderLibraryPreview(preview, uid)}
        <ul class="ax-chain">${chain.join("")}</ul>`;
   }
 
@@ -2180,9 +2401,39 @@
     if (PICK) {
       resourceFilter = PICK.id;
       el("ax-rfind").value = PICK.id;
+    } else {
+      // Restore this sitting's working set (filter + scope). A ?resource=
+      // arrival outranks it — that caller asked for a specific narrowing.
+      try {
+        const ws = JSON.parse(sessionStorage.getItem(WORKSET_KEY) || "null");
+        if (ws) {
+          resourceFilter = ws.f || "";
+          el("ax-rfind").value = resourceFilter;
+          if (ws.s === "granted" || ws.s === "all") {
+            accessScope = ws.s;
+            el("ax-scope").querySelectorAll("[data-scope]").forEach((b) =>
+              b.classList.toggle("is-active", b.dataset.scope === accessScope));
+          }
+        }
+      } catch (e) { /* corrupt store → default view */ }
     }
     renderPick();
     await repaint();
+    // `?user=` — the Simulate deep link. A package page's "Preview access"
+    // and the stop rows' round trips arrive with the person pre-resolved
+    // instead of "Pick a person…". Validated against the loaded list the
+    // same way `?group=` is above.
+    if (LENS === "sim") {
+      const wantedUser = params.get("user");
+      if (wantedUser) {
+        await loadUsers();
+        const sel = el("ax-sim-user");
+        if ([...sel.options].some((o) => o.value === wantedUser)) {
+          sel.value = wantedUser;
+          sel.dispatchEvent(new Event("change"));
+        }
+      }
+    }
     // The pre-tabs deep link. Now that Simulate is a URL, the hash is just an
     // older spelling of it — rewrite rather than keep a second way in.
     if (window.location.hash === "#simulate") {

@@ -41,10 +41,20 @@ TIER1_EXTENSIONS: frozenset[str] = frozenset(
         "pptx",
         "epub",
         "eml",
-        "msg",
         "pdf",
     }
 )
+
+# ``msg`` (Outlook) is deliberately absent, for the same reason TIFF is absent
+# from tier 2 below: no extractor can read it on ANY build, so accepting it
+# would mean an upload that succeeds and is rejected a minute later — and
+# "upload it again", the obvious next move, cannot help. Refusing it in the
+# upload response says so immediately. Adding it back means a parser first:
+# ``extract-msg`` is the only real option and resolves to 15 transitive
+# packages (a Tkinter GUI toolkit, two VBA/malware-analysis tools), so it
+# belongs behind an opt-in extra rather than in the default image — and then
+# the rejection message must name that extra. Exporting the mail as ``.eml``
+# is read by the stdlib on every build.
 
 # Must stay in lock-step with the image formats the vision path can actually
 # process — ``IMAGE_EXTS`` in ``src/ingest/runner.py`` and ``_EXT_MEDIA`` in

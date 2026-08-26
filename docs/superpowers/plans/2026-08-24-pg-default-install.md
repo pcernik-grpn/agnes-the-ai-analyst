@@ -45,7 +45,7 @@ piece. The master plan's A1 section carries a pointer to this deviation.
 - Dual-backend discipline still applies program-wide until A3 lands; this
   plan adds **no schema change** and **no repo change**, so no ladder work.
 - Never run the full test suite locally; run the named test files only.
-- Python: `/Users/zdeneksrotyr/Sources/VsCode/component_factory/tmp_oss/.venv/bin/pytest`.
+- Python: `.venv/bin/pytest`.
 - Branch for this plan: `zs/a1-pg-default-install` off `origin/main`; one PR.
 - Reserved files (do not touch): `app/api/agents*.py`, `app/api/broker*.py`,
   `src/repositories/__init__.py`, `connectors/jira/file_lock.py`.
@@ -82,7 +82,7 @@ piece. The master plan's A1 section carries a pointer to this deviation.
   it emits the postgres overlays; `POSTGRES_PASSWORD` minting at tpl:276 and
   `DATABASE_URL` write at tpl:742-743 (both already unconditional).
 
-- [ ] **Step 1: Write the failing test** — follow the exact style of
+- [x] **Step 1: Write the failing test** — follow the exact style of
   `tests/test_startup_dispatcher_pg_password.py` (read it first; it greps the
   tpl). New file:
 
@@ -106,19 +106,19 @@ def test_duckdb_is_not_the_seeded_default():
     assert "backend: duckdb" not in TPL
 ```
 
-- [ ] **Step 2: Run it, confirm both assertions fail** —
+- [x] **Step 2: Run it, confirm both assertions fail** —
   `.../bin/pytest tests/test_startup_pg_default.py -v` → 2 failed.
-- [ ] **Step 3: Edit the tpl seed block** — in the `if [ ! -f "$INSTANCE_YAML" ]`
+- [x] **Step 3: Edit the tpl seed block** — in the `if [ ! -f "$INSTANCE_YAML" ]`
   first-boot block (~line 111) change `backend: duckdb` → `backend: side_car`
   and rewrite the comment above (~100-105) to say: new instances start on the
   Postgres side-car; the state machine can still migrate them anywhere;
   existing instances keep their persisted backend untouched.
-- [ ] **Step 4: Re-run the test file** → 2 passed. Also run the neighboring
+- [x] **Step 4: Re-run the test file** → 2 passed. Also run the neighboring
   guards that read the tpl: `.../bin/pytest tests/test_startup_guards.py tests/test_startup_dispatcher_pg_password.py tests/test_startup_instance_yaml_perms.py -q` → all pass.
-- [ ] **Step 5: `terraform -chdir=infra/modules/customer-instance validate`**
+- [x] **Step 5: `terraform -chdir=infra/modules/customer-instance validate`**
   (or `terraform fmt -check` + validate if init is needed; if no local
   terraform, note it in the PR body — CI/plan pipeline covers it).
-- [ ] **Step 6: Commit** — `feat(infra): fresh instances default to the Postgres side-car app-state`
+- [x] **Step 6: Commit** — `feat(infra): fresh instances default to the Postgres side-car app-state`
 
 ### Task 2: state machine + config declare the new default
 
@@ -143,12 +143,12 @@ def test_duckdb_is_not_the_seeded_default():
   seeded instance.yaml (Task 1) is what drives it and record that in the
   test as a comment. Only touch `src/db_state_machine.py`'s own default.
 
-- [ ] **Step 1: Locate the default** — `grep -n "DUCKDB" src/db_state_machine.py`
+- [x] **Step 1: Locate the default** — `grep -n "DUCKDB" src/db_state_machine.py`
   and read the hits. If the module has a function like
   `current_state(default=...)`/`initial_state()`, that default is the target.
   If the ONLY notion of "fresh default" is the seeded instance.yaml, then
   this task reduces to docstring + example prose — verify and proceed.
-- [ ] **Step 2: Failing test (only if a code default exists)**:
+- [x] **Step 2: Failing test (only if a code default exists)**:
 
 ```python
 def test_state_machine_fresh_default_is_side_car(tmp_path, monkeypatch):
@@ -161,11 +161,11 @@ def test_state_machine_fresh_default_is_side_car(tmp_path, monkeypatch):
   Adjust the call to the module's real API discovered in Step 1 — if no such
   API exists, skip Steps 2-3 and only update prose (record the decision in
   the PR body).
-- [ ] **Step 3: Flip the default, re-run** → pass. Run the module's guard:
+- [x] **Step 3: Flip the default, re-run** → pass. Run the module's guard:
   `.../bin/pytest tests/test_db_state_machine.py -q` → all pass (fix any
   test that pinned the old default — those pins are the point of this task).
-- [ ] **Step 4: Update docstring + instance.yaml.example prose.**
-- [ ] **Step 5: Commit** — `feat: side_car is the fresh-install app-state default`
+- [x] **Step 4: Update docstring + instance.yaml.example prose.**
+- [x] **Step 5: Commit** — `feat: side_car is the fresh-install app-state default`
 
 ### Task 3: local/OSS quickstart defaults to the PG chain
 
@@ -185,7 +185,7 @@ def test_state_machine_fresh_default_is_side_car(tmp_path, monkeypatch):
 - Test: `tests/test_docker_compose_postgres.py` — extend with a docs-honesty
   guard.
 
-- [ ] **Step 1: Failing test** — add to a NEW file
+- [x] **Step 1: Failing test** — add to a NEW file
   `tests/test_quickstart_pg_default.py` (ruff-hook rule: new tests in new
   files):
 
@@ -208,9 +208,9 @@ def test_env_template_requires_postgres_password():
     )
 ```
 
-- [ ] **Step 2: Run → both fail. Step 3: make the doc/template edits.
+- [x] **Step 2: Run → both fail. Step 3: make the doc/template edits.
   Step 4: re-run → pass; also run `.../bin/pytest tests/test_docker_compose_postgres.py tests/test_compose_overlays_parse.py -q`.**
-- [ ] **Step 5: Commit** — `docs: Postgres compose chain is the default install path`
+- [x] **Step 5: Commit** — `docs: Postgres compose chain is the default install path`
 
 ### Task 4: new-instance doctor asserts the backend
 
@@ -230,7 +230,7 @@ def test_env_template_requires_postgres_password():
   reserved factory module, import the existing public helper — do not add
   code there).
 
-- [ ] **Step 1: Failing test** (TestClient over the doctor endpoint, seeded
+- [x] **Step 1: Failing test** (TestClient over the doctor endpoint, seeded
   admin, monkeypatched backend state both ways — follow the existing doctor
   tests' fixture style; find them with `grep -rn "doctor" tests/ --include="*.py" -l`):
 
@@ -249,10 +249,10 @@ def test_doctor_passes_side_car_backend(admin_client, force_side_car_state):
 
   (Fixture names illustrative — reuse the doctor test module's real fixtures;
   write the two monkeypatch fixtures locally in the new file.)
-- [ ] **Step 2: fails (KeyError: no such check). Step 3: implement the check.
+- [x] **Step 2: fails (KeyError: no such check). Step 3: implement the check.
   Step 4: green; run the doctor module's existing tests too. Step 5:
   `make update-openapi-snapshot` if the doctor response docstring changed.**
-- [ ] **Step 6: Commit** — `feat(doctor): new-instance gate checks the app-state backend`
+- [x] **Step 6: Commit** — `feat(doctor): new-instance gate checks the app-state backend`
 
 ### Task 5: release smoke gate boots the PG chain
 
@@ -271,23 +271,23 @@ def test_doctor_passes_side_car_backend(admin_client, force_side_car_state):
   assertions against a PG-backed app. A release that breaks PG-default boot
   now fails the gate *before* the fleet sees it.
 
-- [ ] **Step 1: Read the smoke job + script end to end; list every place the
+- [x] **Step 1: Read the smoke job + script end to end; list every place the
   compose file set or backend is assumed.** Paste the list into the PR body.
-- [ ] **Step 2: Edit the workflow**: export `POSTGRES_PASSWORD=$(openssl rand -hex 16)`
+- [x] **Step 2: Edit the workflow**: export `POSTGRES_PASSWORD=$(openssl rand -hex 16)`
   into the job env; set the compose invocation to include the postgres
   overlay (mirror however the job currently composes its `-f` chain).
-- [ ] **Step 3: Update `scripts/smoke-test.sh`** for any stale assumption
+- [x] **Step 3: Update `scripts/smoke-test.sh`** for any stale assumption
   found in Step 1; add one positive assertion: query the app's health/state
   endpoint that reports the backend (find it: `grep -rn "backend" app/api/health.py`)
   and require `side_car`.
-- [ ] **Step 4: Validate the workflow file** — `actionlint` if available
+- [x] **Step 4: Validate the workflow file** — `actionlint` if available
   locally, else note for CI. Run any smoke-script unit guards:
   `ls tests/ | grep -i smoke` → run the matching python guards.
-- [ ] **Step 5: Commit** — `ci: release smoke gate boots the Postgres-default stack`
+- [x] **Step 5: Commit** — `ci: release smoke gate boots the Postgres-default stack`
 
 ### Task 6: changelog + PR assembly
 
-- [ ] **Step 1: CHANGELOG** under `## [Unreleased]`:
+- [x] **Step 1: CHANGELOG** under `## [Unreleased]`:
 
 ```markdown
 ### Changed
@@ -300,10 +300,11 @@ def test_doctor_passes_side_car_backend(admin_client, force_side_car_state):
   smoke gate boots the Postgres chain.
 ```
 
-- [ ] **Step 2:** `.../bin/python scripts/verify_syncmap.py` → fix flags.
-- [ ] **Step 3:** Push `git push origin HEAD:refs/heads/zs/a1-pg-default-install`,
+- [x] **Step 2:** `.../bin/python scripts/verify_syncmap.py` → fix flags.
+- [x] **Step 3:** Push `git push origin HEAD:refs/heads/zs/a1-pg-default-install`,
   `gh pr create --draft` (body: deviation note, smoke-assumption list from
   Task 5 Step 1, no release cut), verify `gh pr checks` shows jobs.
+  → PR #1545, 16 jobs registered.
 - [ ] **Step 4:** `/agnes-review` on the branch; fix findings; `gh pr ready`
   only after CI green + review clean. Do not merge.
 

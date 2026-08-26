@@ -101,6 +101,47 @@ def test_unique_bak_path(tmp_path):
     assert _unique_bak_path(p) == tmp_path / "x.bak.TS.2"
 
 
+def test_prune_backups_keeps_only_the_newest_n(tmp_path):
+    """#1476: retention caps `.bak.*` growth to the N most recent."""
+    from src.initial_workspace import _MAX_BACKUPS_PER_FILE, _prune_backups
+
+    original = tmp_path / "CLAUDE.md"
+    original.write_text("current\n")
+    stamps = [
+        "20260810T000000Z",
+        "20260811T000000Z",
+        "20260812T000000Z",
+        "20260813T000000Z",
+        "20260814T000000Z",
+    ]
+    for stamp in stamps:
+        (tmp_path / f"CLAUDE.md.bak.{stamp}").write_text(stamp)
+
+    _prune_backups(original, keep=3)
+
+    remaining = sorted(p.name for p in tmp_path.glob("CLAUDE.md.bak.*"))
+    assert remaining == [
+        "CLAUDE.md.bak.20260812T000000Z",
+        "CLAUDE.md.bak.20260813T000000Z",
+        "CLAUDE.md.bak.20260814T000000Z",
+    ]
+    # Default keep= matches the module constant (no caller passes a literal).
+    assert _MAX_BACKUPS_PER_FILE == 3
+
+
+def test_prune_backups_noop_when_at_or_under_cap(tmp_path):
+    from src.initial_workspace import _prune_backups
+
+    original = tmp_path / "CLAUDE.md"
+    original.write_text("current\n")
+    (tmp_path / "CLAUDE.md.bak.20260814T000000Z").write_text("x")
+
+    _prune_backups(original, keep=3)
+
+    assert list(tmp_path.glob("CLAUDE.md.bak.*")) != []
+    assert len(list(tmp_path.glob("CLAUDE.md.bak.*"))) == 1
+
+
 # ===========================================================================
 # Layer 2: pure 3-way diff engine (src)
 # ===========================================================================
@@ -110,17 +151,19 @@ def test_classify_three_way(tmp_path):
     from src.initial_workspace import classify_workspace_update
 
     base = _make_zip({"a.md": b"a1\n", "b.md": b"b1\n", "same.md": b"s\n"})
-    _w(tmp_path / "a.md", b"MINE\n")    # analyst changed → backed_up
-    _w(tmp_path / "b.md", b"b1\n")       # unchanged → updated
-    _w(tmp_path / "same.md", b"s\n")     # identical to new → no-op
+    _w(tmp_path / "a.md", b"MINE\n")  # analyst changed → backed_up
+    _w(tmp_path / "b.md", b"b1\n")  # unchanged → updated
+    _w(tmp_path / "same.md", b"s\n")  # identical to new → no-op
     _w(tmp_path / "extra.txt", b"mine\n")  # not in template → preserved
 
-    new = _make_zip({
-        "a.md": b"a2\n",
-        "b.md": b"b2\n",
-        "same.md": b"s\n",
-        "c.md": b"c\n",     # new → created
-    })
+    new = _make_zip(
+        {
+            "a.md": b"a2\n",
+            "b.md": b"b2\n",
+            "same.md": b"s\n",
+            "c.md": b"c\n",  # new → created
+        }
+    )
     plan = classify_workspace_update(tmp_path, new, base)
     assert plan.created == ["c.md"]
     assert plan.updated == ["b.md"]
@@ -137,9 +180,13 @@ def test_update_applies_three_way_with_backup(tmp_path):
 
     new = _make_zip({"a.md": b"a2\n", "b.md": b"b2\n", "c.md": b"c\n"})
     result = update_workspace_from_template(
-        tmp_path, new, base,
-        agnes_version="9.9", server_url="http://x",
-        template_source="repo", template_sha="newsha",
+        tmp_path,
+        new,
+        base,
+        agnes_version="9.9",
+        server_url="http://x",
+        template_source="repo",
+        template_sha="newsha",
     )
 
     # a.md: analyst-changed → backed up, then refreshed
@@ -170,13 +217,40 @@ def test_update_without_baseline_backs_up_every_change(tmp_path):
     _w(tmp_path / "CLAUDE.md", b"local\n")
     new = _make_zip({"CLAUDE.md": b"new\n"})
     result = update_workspace_from_template(
-        tmp_path, new, None,
-        agnes_version="9.9", server_url="http://x",
-        template_source=None, template_sha="x",
+        tmp_path,
+        new,
+        None,
+        agnes_version="9.9",
+        server_url="http://x",
+        template_source=None,
+        template_sha="x",
     )
     assert [n for n, _ in result.backed_up] == ["CLAUDE.md"]
     assert (tmp_path / result.backed_up[0][1]).read_bytes() == b"local\n"
     assert (tmp_path / "CLAUDE.md").read_bytes() == b"new\n"
+
+
+def test_update_prunes_backups_across_repeated_merges(tmp_path):
+    """#1476: each 3-way merge that backs up an analyst-edited file must
+    prune old `.bak.*` siblings down to the retention cap, not just the
+    DEFAULT-mode (no-IWT) refresh path."""
+    from src.initial_workspace import _MAX_BACKUPS_PER_FILE, update_workspace_from_template
+
+    _w(tmp_path / "CLAUDE.md", b"v0 (analyst-edited)\n")
+    for i in range(1, _MAX_BACKUPS_PER_FILE + 3):
+        new = _make_zip({"CLAUDE.md": f"v{i}\n".encode()})
+        update_workspace_from_template(
+            tmp_path,
+            new,
+            None,  # no baseline → always classified as analyst-modified → backed up
+            agnes_version="9.9",
+            server_url="http://x",
+            template_source=None,
+            template_sha=f"sha{i}",
+        )
+
+    backups = list(tmp_path.glob("CLAUDE.md.bak.*"))
+    assert len(backups) == _MAX_BACKUPS_PER_FILE
 
 
 def test_update_rejects_unsafe_entry_writes_nothing(tmp_path):
@@ -185,9 +259,13 @@ def test_update_rejects_unsafe_entry_writes_nothing(tmp_path):
     data = _make_zip({"../escape.txt": b"naughty"})
     with pytest.raises(ValueError):
         update_workspace_from_template(
-            tmp_path, data, None,
-            agnes_version="9", server_url="s",
-            template_source=None, template_sha=None,
+            tmp_path,
+            data,
+            None,
+            agnes_version="9",
+            server_url="s",
+            template_source=None,
+            template_sha=None,
         )
     assert not (tmp_path.parent / "escape.txt").exists()
 
@@ -204,8 +282,10 @@ def test_apply_override_writes_baseline(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     zip_bytes = _make_zip({"CLAUDE.md": b"# Template\n"})
     status = iw.StatusInfo(
-        configured=True, synced=True,
-        template_source="https://github.com/acme/t", template_sha="sha1",
+        configured=True,
+        synced=True,
+        template_source="https://github.com/acme/t",
+        template_sha="sha1",
         files=["CLAUDE.md"],
     )
     monkeypatch.setattr(iw, "download_zip", lambda *a, **k: zip_bytes)
@@ -213,7 +293,12 @@ def test_apply_override_writes_baseline(tmp_path, monkeypatch):
     monkeypatch.setattr(iw, "_fetch_connector_params", lambda *a, **k: None)
 
     result = iw.apply_override(
-        ws, status, "http://x", "t", force=False, agnes_version="9.9",
+        ws,
+        status,
+        "http://x",
+        "t",
+        force=False,
+        agnes_version="9.9",
     )
     assert (ws / "CLAUDE.md").read_bytes() == b"# Template\n"
     assert result.created == ["CLAUDE.md"]
@@ -325,9 +410,11 @@ def _prep_ws_with_baseline(ws: Path):
 def _new_status_and_zip():
     new_zip = _make_zip({"a.md": b"a2\n", "b.md": b"b2\n", "c.md": b"c\n"})
     status = {
-        "configured": True, "synced": True,
+        "configured": True,
+        "synced": True,
         "template_source": "https://github.com/acme/t",
-        "template_sha": "newsha", "files": ["a.md", "b.md", "c.md"],
+        "template_sha": "newsha",
+        "files": ["a.md", "b.md", "c.md"],
     }
     return status, new_zip
 
@@ -419,8 +506,11 @@ def test_command_already_up_to_date(tmp_path, monkeypatch):
     save_template_baseline(ws, same)
     _w(ws / "a.md", b"a1\n")
     status = {
-        "configured": True, "synced": True,
-        "template_source": "repo", "template_sha": "s", "files": ["a.md"],
+        "configured": True,
+        "synced": True,
+        "template_source": "repo",
+        "template_sha": "s",
+        "files": ["a.md"],
     }
     _wire(monkeypatch, _build_api_get(status, same), _stub_api_post())
 

@@ -1,12 +1,11 @@
 # Agnes chat — Docker sandbox image
 
-The self-hosted alternative to the E2B template (`../e2b-template/`). Every
-cloud-chat session with `chat.provider: docker` runs in a container built from
+Every cloud-chat session with `chat.provider: docker` runs in a container built from
 the `Dockerfile` here, created by the `apps-runner` sidecar (the only process
 that holds the Docker socket).
 
-Operator walkthrough — prerequisites, egress modes, pause/resume semantics vs
-E2B: [`docs/cloud-chat.md`](../../../docs/cloud-chat.md) →
+Operator walkthrough — prerequisites, egress modes, pause/resume semantics:
+[`docs/cloud-chat.md`](../../../docs/cloud-chat.md) →
 *Docker provider (self-hosted)*.
 
 ## Build it (operator one-time setup)
@@ -32,13 +31,13 @@ CHAT_SANDBOX_IMAGE_PREFIX=agnes-chat-sandbox   # in .env, next to APPS_RUNNER_TO
 ```
 
 The image is **not** published to a registry by the Agnes release pipeline —
-operators build it locally, the same posture as the E2B template. It must exist
+operators build it locally. It must exist
 on the machine running the Docker daemon; the boot gate refuses to start chat
 (with the build command in the log line) when it is missing.
 
 ## Tags are mutable — rebuild deliberately
 
-`:latest` behaves exactly like the E2B template's mutable tag: a rebuild is
+`:latest` is a mutable tag: a rebuild is
 picked up by the next sandbox spawn with no Agnes redeploy. Pin a version tag
 (`agnes-chat-sandbox:0.77.32`) in `chat.docker_image` for production if you want
 rollouts to be explicit. `agnes.chat-sandbox.contract` is a label carrying the
@@ -67,5 +66,4 @@ safe here.
 ## Updating the dependency pins
 
 When `pyproject.toml` bumps `claude-agent-sdk` or another CLI runtime dep, edit
-the `pip install` block here (and the matching one in
-`../e2b-template/Dockerfile`) and rebuild.
+the `pip install` block here and rebuild.

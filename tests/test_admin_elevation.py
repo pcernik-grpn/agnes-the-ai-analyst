@@ -299,3 +299,63 @@ class TestRequestIsNoninteractive:
 
         assert not request_is_noninteractive(authorization="", has_session_cookie=True, has_sapi_header=False)
         assert not request_is_noninteractive(authorization="", has_session_cookie=False, has_sapi_header=False)
+
+
+# ---------------------------------------------------------------------------
+# Chrome: the rendered UI must match the authority the request actually has
+# ---------------------------------------------------------------------------
+#
+# `session.user.is_admin` was raw Admin-group membership, so a paused admin
+# kept every admin affordance — the rail's Admin row above all — and each one
+# led to a 403 `admin_elevation_paused`. The flag is EFFECTIVE authority now,
+# with `is_admin_paused` carrying the difference so the chrome can say why
+# instead of going quiet.
+
+
+def test_the_admin_flag_is_effective_authority_not_raw_membership(seeded_app):
+    """A paused admin renders as a non-admin, and says so."""
+    c = seeded_app["client"]
+    admin = seeded_app["admin_token"]
+    html = {"Accept": "text/html"}
+
+    body = c.get("/library", headers={**_auth(admin), **html}).text
+    assert 'href="/admin"' in body, "an elevated admin has the rail's Admin row"
+    assert "Admin paused" not in body
+
+    c.cookies.set(elevation.ELEVATION_COOKIE, elevation.PAUSED)
+    try:
+        body = c.get("/library", headers={**_auth(admin), **html}).text
+        # Not one link into the subtree that would 403 — asserted on the
+        # RENDERED page, so a chrome consumer that gates on raw membership
+        # somewhere else on this page fails here too.
+        assert 'href="/admin"' not in body
+        # …replaced by an honest one pointing at the switch, which is NOT
+        # admin-gated — so pausing is always reversible from the UI.
+        assert "Admin paused" in body
+        assert 'href="/me/profile#admin-mode"' in body
+    finally:
+        c.cookies.delete(elevation.ELEVATION_COOKIE)
+
+
+def test_a_paused_admin_is_never_stranded(seeded_app):
+    """The re-elevate switch renders for a paused admin on a page that does
+    not require elevation — the property that makes hiding admin chrome safe
+    rather than a lockout."""
+    c = seeded_app["client"]
+    admin = seeded_app["admin_token"]
+    c.cookies.set(elevation.ELEVATION_COOKIE, elevation.PAUSED)
+    try:
+        r = c.get("/me/profile", headers={**_auth(admin), "Accept": "text/html"})
+        assert r.status_code == 200, r.text
+        assert 'id="admin-mode"' in r.text
+    finally:
+        c.cookies.delete(elevation.ELEVATION_COOKIE)
+
+
+def test_a_non_admin_is_neither_admin_nor_paused(seeded_app):
+    """`is_admin_paused` must not fire for someone who was never an admin —
+    otherwise every analyst gets a rail row about a mode they cannot have."""
+    c = seeded_app["client"]
+    body = c.get("/library", headers={**_auth(seeded_app["analyst_token"]), "Accept": "text/html"}).text
+    assert "Admin paused" not in body
+    assert 'href="/admin"' not in body

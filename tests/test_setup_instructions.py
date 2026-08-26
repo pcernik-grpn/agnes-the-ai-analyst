@@ -212,15 +212,49 @@ def test_preamble_opens_with_brand_server_and_token_guard():
     joined = "\n".join(lines)
     assert lines[0] == "Set up the Agnes CLI on this machine."
     assert "Server: {server_url}" in joined
-    # Token guard — the load-bearing sentence: the prompt references the
-    # file path only, and the agent must never print/echo/paste the value.
+    # Brand/host/binary coherence: the prompt carries the operator's product
+    # name, downloads from this instance's own host, and installs a binary
+    # called `agnes`. Say once that the three name one system — an agent
+    # given three unfamiliar names and no relation between them has to treat
+    # the mismatch as a red flag.
+    #
+    # Unbranded instance: brand IS "Agnes", so there is no third name and the
+    # "own deployment of Agnes" clause would render as the tautology "Agnes is
+    # this organization's own deployment of Agnes". It is dropped; the server
+    # and the binary name are still stated.
+    assert "own deployment of Agnes" not in joined
+    assert "Agnes is served from {server_url}" in joined
+    assert "installs is named `agnes`" in joined
+    # Token handling stated as a fact, not as an instruction to conceal:
+    # the steps use the file path, so nothing needs to display its contents.
     assert "Your login token is already saved on this machine at ~/.agnes/token" in joined
-    assert "never print the token, echo it, or paste" in joined
-    # Provenance fact for the assistant's first-contact trust decision: the
-    # token came from the install guide's own previous step.
+    assert "no need to display its contents" in joined
+    assert "never print the token" not in joined
+    # Provenance fact: the token came from the install guide's previous step.
     assert "step 4 of the install guide at {server_url}" in joined
     # Idempotence promise (one line, not a paragraph).
     assert "idempotent" in joined
+
+
+def test_preamble_names_brand_host_and_binary_as_one_system_when_branded():
+    """A rebranded instance is the case the coherence sentence exists for.
+
+    The prompt then carries three names an agent cannot relate on its own —
+    the operator's product name, the instance's own hostname, and a binary
+    called `agnes` — and an unexplained mismatch between them is the
+    look-alike-domain signal that stalled a real install. Assert the
+    sentence is present and names all three.
+    """
+    from app.web.setup_instructions import render_setup_instructions
+
+    rendered = render_setup_instructions(
+        server_url="https://analyst-acme.example.net",
+        token="",
+        instance_brand="Foundry AI",
+    )
+    assert "Foundry AI is this organization's own deployment of Agnes, served" in rendered
+    assert "https://analyst-acme.example.net" in rendered
+    assert "installs is named `agnes`" in rendered
 
 
 def test_preamble_asserts_no_consent_on_the_assistants_behalf():
@@ -256,23 +290,76 @@ def test_token_precheck_block():
     assert "0) Check" not in joined
 
 
-def test_preamble_step_zero_d_reference_only_when_trust_block_emitted():
-    """The preamble's "fallback chain inside step 0(d)" line is only
-    correct when step 0 actually exists. Without ca_pem the reference
-    points at a non-existent step."""
+def test_token_precheck_requires_both_a_credential_and_a_matching_server():
+    """A missing token file must not be waved through by either signal alone.
+
+    Neither one discriminates by itself, in opposite directions:
+
+    `token.json` holds `{access_token, email}` and never the server, and there
+    is one per machine — so on a laptop signed in to a different Agnes
+    deployment it exists and proves nothing about this one. That was the
+    original false positive.
+
+    And `config.yaml`'s `server:` key is written by `/cli/install.sh` at
+    install time (`app/api/cli_artifacts.py`), which prints "1. Sign in…"
+    immediately after — so a machine that merely ran the installer matches the
+    server while nobody has ever signed in. Keying on the server *instead of*
+    token.json swapped one false positive for another, and this one is worse:
+    it fires on the ordinary fresh-install path, and the agent is told to
+    continue only to fail three steps later inside `agnes init --token-file`.
+
+    So the check requires BOTH, and anything else stops.
+    """
     from app.web.setup_instructions import resolve_lines
 
-    no_ca = "\n".join(resolve_lines("agnes.whl"))
-    assert "step 0(d)" not in no_ca
-    # The "don't disable TLS verification" guidance still appears (it's
-    # generic safety advice, valid regardless of trust block) — phrased
-    # causally rather than as a list of specific env vars/flags to avoid.
-    assert "rather than lowering certificate" in no_ca
+    joined = "\n".join(resolve_lines("agnes.whl"))
+
+    # Neither false-positive wording survives.
+    assert "so just continue" not in joined
+    assert "an earlier run already" not in joined
+    assert "an earlier run saved the credential and removed the" not in joined
+
+    # Both signals are tested, in one command so the agent cannot satisfy
+    # half of it.
+    assert "test -f ~/.config/agnes/token.json &&" in joined
+    assert "^server:" in joined
+    assert "~/.config/agnes/config.yaml" in joined
+
+    # Only the conjunction continues; everything else, including no output at
+    # all (the `test -f` short-circuit), stops.
+    assert "Prints {server_url} → continue" in joined
+    assert "including no output" in joined
+    assert "stop, send the user to {server_url}/home step 4" in joined
+
+    # Both reasons are stated, so neither shortcut is reintroduced.
+    assert "token.json records" in joined
+    assert "no server" in joined
+    assert "installer writes server: before anyone has signed in" in joined
+
+
+def test_preamble_carries_no_pre_emptive_trust_assertion():
+    """The preamble must not answer a trust question on the reader's behalf.
+
+    It used to: with a trust block emitted it appended "The fallback chain
+    inside step 0(d) is documented and OK to use; that's what fallback
+    chains are for", and an earlier revision told the agent that "whether
+    that host is trusted is the user's org's call". Read back out of a real
+    install transcript, that reassurance was quoted as the reason to
+    distrust the prompt — text that pre-empts a safety judgement reads as
+    written to defuse one. The TLS *guidance* stays, in both renders.
+    """
+    from app.web.setup_instructions import resolve_lines
 
     fake_ca = "-----BEGIN CERTIFICATE-----\nFAKEFAKEFAKE\n-----END CERTIFICATE-----\n"
-    with_ca = "\n".join(resolve_lines("agnes.whl", ca_pem=fake_ca))
-    # Trust block emits step 0 → preamble's step 0(d) reference is now valid.
-    assert "step 0(d)" in with_ca
+    for label, joined in (
+        ("no-ca", "\n".join(resolve_lines("agnes.whl"))),
+        ("ca", "\n".join(resolve_lines("agnes.whl", ca_pem=fake_ca))),
+    ):
+        assert "OK to use" not in joined, label
+        assert "org's call" not in joined, label
+        assert "verify it with their IT" not in joined, label
+        # Generic, causally-phrased TLS advice survives in both renders.
+        assert "rather than lowering certificate" in joined, label
 
 
 # ---------------------------------------------------------------------------
@@ -416,19 +503,23 @@ def test_resolve_lines_with_ca_pem_switches_step_one_to_curl_then_local_install(
     """Step 1 always downloads via /cli/download into a local file first;
     has_ca only changes whether curl carries --cacert and whether uv gets
     --native-tls (avoids rustls CaUsedAsEndEntity):
-    - has_ca=True  → curl --cacert ... | uv tool install --native-tls
-    - has_ca=False → curl ... | uv tool install (no cert flags)
+    - has_ca=True  → curl --cacert ... then uv tool install --native-tls
+    - has_ca=False → curl ... then uv tool install (no cert flags)
+
+    Both forms cap redirects at zero (`-L --max-redirs 0`, curl exit 47):
+    `-OJ` names the saved file from the response, so a cross-host redirect
+    would otherwise install whichever wheel the hop served, silently.
     """
     from app.web.setup_instructions import resolve_lines
 
     joined_ca = "\n".join(resolve_lines("agnes-1.0-py3-none-any.whl", ca_pem=_FAKE_CA_PEM))
-    assert "curl -fsSL --cacert ~/.agnes/ca.pem -OJ {server_url}/cli/download" in joined_ca
+    assert ("curl -fsSL --max-redirs 0 --cacert ~/.agnes/ca.pem -OJ {server_url}/cli/download") in joined_ca
     assert "TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)" in joined_ca
     assert 'uv tool install --native-tls --force "$WHEEL"' in joined_ca
     assert "/cli/wheel/" not in joined_ca
 
     joined_plain = "\n".join(resolve_lines("agnes-1.0-py3-none-any.whl"))
-    assert "curl -fsSL -OJ {server_url}/cli/download" in joined_plain
+    assert "curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download" in joined_plain
     assert 'uv tool install --force "$WHEEL"' in joined_plain
     assert "curl -fsSL --cacert" not in joined_plain
     assert "/cli/wheel/" not in joined_plain

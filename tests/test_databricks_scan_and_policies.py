@@ -1748,3 +1748,128 @@ class TestPolicyBodyRewriteStaysInTablePosition:
         assert "`main`.`sales`.`orders_raw`.country" not in submitted
         assert "country = 'CZ'" in submitted
         assert ") AS orders_raw" in submitted
+
+
+class TestEngineQualifiedPathPolicyGate:
+    """A `dbx.*` / three-part Databricks path names the PHYSICAL source, and
+    `rewrite_sql` substitutes policied tables by registry NAME — so the policy
+    never fires for that spelling.
+
+    The precondition is `name != source_table`, which is the ordinary case
+    (`agnes admin register-table` lets an admin name a row whatever reads
+    best). When they happen to coincide the bare-name rewrite fires by
+    accident and the path is filtered; every other fixture in this file has
+    them equal, which is exactly why the gap was invisible here.
+
+    `_gate_table_references` proved registration and the caller's grant, but
+    never asked whether the row it resolved to carries a policy — so the raw
+    statement shipped to the warehouse under Agnes's service PAT while
+    `_apply_databricks_policies` sat out the request on an empty
+    `policied_table_ids`. Same hole `sf_path_policied` / `bq_path_policied`
+    close for the other two engines.
+    """
+
+    POLICY_SQL = "SELECT * FROM orders_public WHERE country = 'CZ'"
+
+    def _setup(self, monkeypatch) -> None:
+        from src.db import get_system_db
+        from tests.conftest import grant_table_via_package
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+        _register(
+            id="dbx.sales.orders_secret",
+            name="orders_public",
+            source_type="databricks",
+            bucket="sales",
+            source_table="orders_raw",
+        )
+        _set_policy("dbx.sales.orders_secret", self.POLICY_SQL)
+        conn = get_system_db()
+        try:
+            # A granted NON-admin: an admin bypasses policies everywhere else
+            # too, and does so here by design (asserted below).
+            grant_table_via_package(conn, "dbx.sales.orders_secret", "analyst1")
+        finally:
+            conn.close()
+
+    def test_dbx_prefixed_path_to_a_policied_source_is_403(self, seeded_app, warehouse, monkeypatch):
+        wh, _settings = warehouse
+        self._setup(monkeypatch)
+
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM dbx."sales"."orders_raw"'},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403, r.text
+        detail = r.json().get("detail")
+        assert isinstance(detail, dict), detail
+        assert detail.get("reason") == "dbx_path_policied", detail
+        assert detail.get("registered_as") == "orders_public", detail
+        # The property that matters is not the status code: nothing may have
+        # reached the warehouse.
+        assert not any("orders_raw" in s for s in wh.statements), wh.statements
+
+    def test_qualified_three_part_path_riding_along_is_403(self, seeded_app, warehouse, monkeypatch):
+        """The path only routes to Databricks when a registered name rides
+        along — which is also the shape that made the leak reachable."""
+        wh, _settings = warehouse
+        self._setup(monkeypatch)
+
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM orders_public JOIN main.sales.orders_raw USING (id)"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403, r.text
+        assert r.json().get("detail", {}).get("reason") == "dbx_path_policied", r.text
+        assert not any("USING (id)" in s for s in wh.statements), wh.statements
+
+    def test_an_unpolicied_qualified_path_still_runs(self, seeded_app, warehouse, monkeypatch):
+        """Non-vacuity. A registered, granted, UNPOLICIED row addressed by its
+        engine path must be untouched by the new refusal — otherwise the fix
+        reads as working while having simply broken the path."""
+        from src.db import get_system_db
+        from tests.conftest import grant_table_via_package
+
+        wh, _settings = warehouse
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+        _register(
+            id="dbx.sales.orders_plain",
+            name="orders_plain",
+            source_type="databricks",
+            bucket="sales",
+            source_table="orders_raw",
+        )
+        conn = get_system_db()
+        try:
+            grant_table_via_package(conn, "dbx.sales.orders_plain", "analyst1")
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM dbx."sales"."orders_raw"'},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert "dbx_path_policied" not in r.text, r.text
+        assert r.status_code == 200, r.text
+
+    def test_admin_still_reaches_the_path_unfiltered(self, seeded_app, warehouse, monkeypatch):
+        """§12 — the bypass follows the credential surface, and it did so for
+        the bare name already. The new refusal must not change that."""
+        wh, _settings = warehouse
+        self._setup(monkeypatch)
+
+        c = seeded_app["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM dbx."sales"."orders_raw"'},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert "dbx_path_policied" not in r.text
+        assert "country = 'CZ'" not in wh.statements[-1]

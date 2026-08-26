@@ -1,14 +1,21 @@
 # docker-compose.e2e.yml — Linux Agnes server for the cloud-chat E2E suite.
 # Brought up by the `e2e_agnes` fixture in conftest.py and by
-# .github/workflows/e2e-e2b.yml.
+# .github/workflows/e2e-docker.yml.
 #
-# Under the E2B-provider model this is just a plain FastAPI app — no
-# NET_ADMIN cap, no nsjail build chain, no host-uid mapping. Chat
-# sandboxes run in E2B's cloud microVMs, not on this host.
+# Chat sandboxes run under the self-hosted docker provider: the agnes app
+# never touches /var/run/docker.sock — the apps-runner sidecar below is the
+# only service holding the socket, and it spawns each chat session's
+# `agnes-chat-sandbox` container as a SIBLING on the host daemon, joined to
+# the fixed `agnes-e2e` network so the sandbox can reach the app at
+# http://agnes:8000.
 #
 # Usage:
-#   ANTHROPIC_API_KEY=sk-ant-... E2B_API_KEY=sk-e2b-... \
+#   docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
+#   ANTHROPIC_API_KEY=sk-ant-... \
 #     docker compose -f tests/e2e/docker-compose.e2e.yml up --build
+# (the sandbox-image build is only needed for the AGNES_E2E_DOCKER=1 suites
+# that actually spawn sandboxes — without it the app's boot probe refuses to
+# start ChatManager and chat endpoints 503 with `chat_disabled`.)
 # Tear down:
 #   docker compose -f tests/e2e/docker-compose.e2e.yml down -v
 
@@ -22,15 +29,19 @@ services:
     environment:
       # 32+ chars — required by the production JWT secret check.
       JWT_SECRET_KEY: "e2e-secret-at-least-32-chars-long-aaaa"
-      # Anthropic key — runner calls Anthropic directly from inside the
-      # E2B microVM. Container fails fast if the host doesn't export it.
+      # Anthropic key — held server-side only; the secret broker injects it
+      # per request, sandboxes only ever see an opaque ticket. Container
+      # fails fast if the host doesn't export it.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY before running E2E}"
-      # E2B account key — Agnes mints sandboxes via the SDK against this
-      # account. The smoke suite that actually spawns sandboxes also
-      # gates on AGNES_E2E_E2B=1 on the host.
-      E2B_API_KEY: "${E2B_API_KEY:-}"
-      # The in-sandbox `agnes` CLI calls the Agnes REST API at this URL.
-      AGNES_INTERNAL_URL: "http://localhost:8000"
+      # Rails URL the in-sandbox `agnes` CLI + broker relay call. MUST be the
+      # compose service name, never localhost: app/main.py's
+      # `_chat_docker_rails_url_ok` boot gate refuses a loopback rails URL on
+      # the docker provider (inside the sandbox's own network namespace,
+      # 127.0.0.1 is the sandbox itself, not Agnes).
+      AGNES_INTERNAL_URL: "http://agnes:8000"
+      # The docker provider routes every Docker call through the sidecar.
+      APPS_RUNNER_URL: "http://apps-runner:8600"
+      APPS_RUNNER_TOKEN: "${APPS_RUNNER_TOKEN:-e2e-apps-runner-token}"
       # Optional: set AGNES_E2E_FAKE_AGENT=1 on the host to flip the
       # runner into deterministic-echo mode (no Anthropic dependency).
       AGNES_RUNNER_FAKE_AGENT: "${AGNES_E2E_FAKE_AGENT:-}"
@@ -44,11 +55,58 @@ services:
       - "${AGNES_E2E_PORT:-8000}:8000"
     volumes:
       - agnes_data:/data
+    depends_on:
+      apps-runner:
+        # The app's lifespan probes the sidecar once at boot
+        # (app/main.py::_chat_docker_sandbox_ok); if the sidecar isn't up
+        # yet, ChatManager is refused for the container's whole life.
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 3s
       timeout: 2s
       retries: 30
 
+  # The only process holding the Docker socket (the same socket-confinement
+  # invariant as the root docker-compose.yml's `apps-runner` service). Spawns
+  # and addresses chat-sandbox containers on behalf of the agnes app. Shares
+  # the /data volume so its `_resolve_host_path` can translate the app's
+  # `/data/users/.../sessions/...` paths into bind-mount sources the daemon
+  # understands (the named volume's host mountpoint). Runs as root here
+  # (Dockerfile.e2e sets no USER), so no DOCKER_GID/group_add dance is needed
+  # for socket access, unlike the uid-999 production image.
+  apps-runner:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.e2e
+    command: ["/opt/venv/bin/python", "-m", "services.apps_runner"]
+    environment:
+      APPS_RUNNER_TOKEN: "${APPS_RUNNER_TOKEN:-e2e-apps-runner-token}"
+      # Image-prefix allowlist for the chat-sandbox half of the API
+      # (/sandboxes/*). Must cover chat.docker_image in instance.yaml.e2e.
+      CHAT_SANDBOX_IMAGE_PREFIX: "agnes-chat-sandbox"
+    volumes:
+      - agnes_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      # Loopback-only publish so host-side suites (e.g.
+      # tests/e2e/test_docker_sandbox_smoke.py) can reach the sidecar with
+      # APPS_RUNNER_URL=http://localhost:8600.
+      - "127.0.0.1:${AGNES_E2E_RUNNER_PORT:-8600}:8600"
+    healthcheck:
+      # TCP-connect probe: every HTTP route requires the runner token, so a
+      # plain GET would report an authing sidecar as unhealthy.
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8600), 2).close()"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
 volumes:
   agnes_data:
+
+networks:
+  # Fixed name (instead of the project-derived `<project>_default`) so
+  # chat.docker_network in instance.yaml.e2e can reference it and the
+  # sidecar-spawned sandbox containers land on the same bridge as the app.
+  default:
+    name: agnes-e2e

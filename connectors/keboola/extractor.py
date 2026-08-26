@@ -721,6 +721,19 @@ def materialize_query(
             table_id,
         )
 
+    # Make the parquet visible to the orchestrator's master-view rebuild. Runs
+    # after the atomic publish so the view never points at a half-written file,
+    # and after the extractor pass (`_run_sync` order: extractor subprocess →
+    # materialized pass → rebuild), whose `_create_meta_table` DROP would
+    # otherwise wipe the row we just wrote.
+    _persist_materialized_inner_view(
+        extract_db_path=output_dir.parent / "extract.duckdb",
+        table_id=table_id,
+        parquet_path=parquet_path,
+        rows=row_count,
+        size_bytes=size,
+    )
+
     return {
         "table_id": table_id,
         "path": str(parquet_path),
@@ -786,6 +799,115 @@ def _read_last_sync(table_id: str):
     return _read_last_sync_for_tc({"id": table_id})
 
 
+def _ensure_meta_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Idempotent variant of :func:`_create_meta_table` — creates ``_meta`` if
+    absent and leaves existing rows alone.
+
+    :func:`_create_meta_table` DROPs first, which is right for the extractor
+    pass (it rewrites the whole extract) but wrong for the materialize path,
+    which touches exactly one table's row in an extract other rows may already
+    own.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS _meta (
+        table_name VARCHAR NOT NULL,
+        description VARCHAR,
+        rows BIGINT,
+        size_bytes BIGINT,
+        extracted_at TIMESTAMP,
+        query_mode VARCHAR DEFAULT 'local'
+    )""")
+
+
+def _persist_materialized_inner_view(
+    extract_db_path: Path,
+    table_id: str,
+    parquet_path: Path,
+    rows: int,
+    size_bytes: int,
+) -> None:
+    """Register a materialized parquet in ``extract.duckdb`` as a ``_meta`` row
+    plus an inner view, so ``SyncOrchestrator.rebuild()`` creates the master
+    view for it.
+
+    Without this the parquet lands on disk and ``sync_state`` reports ``ok``
+    with a row count, but the orchestrator — which only ever walks ``_meta`` —
+    never creates a view, so every read 400s with "registered as
+    query_mode='materialized' but is not yet materialized in this instance's
+    analytics views". On an instance whose Keboola rows are ALL materialized
+    there was no ``extract.duckdb`` at all, so the orchestrator skipped the
+    whole source with a debug-level "no extract.duckdb" and nothing surfaced
+    in the operator's log.
+
+    Parallel of ``connectors/bigquery/extractor.py::_persist_materialized_inner_view``
+    and the Snowflake/Databricks equivalents, with one deliberate difference:
+    it CREATES ``extract.duckdb`` when absent instead of skipping. BigQuery can
+    assume the extractor subprocess made the file (a BQ instance always has
+    remote rows to write); a materialized-only Keboola source has nothing else
+    that would ever create it.
+
+    Idempotent: the table's own ``_meta`` row is replaced (the table carries no
+    UNIQUE on ``table_name``) and its inner view recreated; other rows are left
+    untouched. Fail-soft — the parquet is the canonical artifact, so a
+    registration failure (lock contention, schema drift) is logged and the next
+    pass gets another chance.
+
+    How long the registration lives depends on whether the source also has
+    ``query_mode='local'`` rows, and it is worth being precise about it:
+
+    - **Materialized-only source** (the case this fixes): nothing else ever
+      writes this file, so the row and view persist until the next materialize
+      replaces them.
+    - **Mixed local + materialized source**: :func:`run` rebuilds
+      ``extract.duckdb`` from scratch on every extractor pass — it writes a
+      fresh ``extract.duckdb.tmp`` and ``shutil.move``s it over the old file —
+      so a materialized row registered on an earlier tick is wiped by any later
+      pass on which that table is not itself due. In the same tick it is
+      harmless (the materialized pass runs after the subprocess and re-registers
+      what it just published); across ticks the master view is carried by the
+      orchestrator's pre-existing filesystem-fallback pass, which recreates it
+      from ``data/*.parquet`` when a registered materialized row has no ``_meta``
+      entry, until the next materialize restores this one. Making the
+      registration survive that rebuild means teaching :func:`run` to preserve
+      foreign ``_meta`` rows, which is a change to the whole-file swap and not
+      this fix's scope.
+    """
+    safe_path = str(parquet_path).replace("'", "''")
+    try:
+        extract_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = _open_duckdb(str(extract_db_path), read_only=False)
+        try:
+            _ensure_meta_table(conn)
+            # Wrapped so a concurrent reader of `_meta` sees either the old row
+            # or the new one, never both / neither.
+            conn.execute("BEGIN")
+            try:
+                conn.execute("DELETE FROM _meta WHERE table_name = ?", [table_id])
+                conn.execute(
+                    "INSERT INTO _meta VALUES (?, ?, ?, ?, current_timestamp, 'materialized')",
+                    [table_id, "", rows, size_bytes],
+                )
+                conn.execute(
+                    f"CREATE OR REPLACE VIEW {quote_ident(table_id)} AS SELECT * FROM read_parquet('{safe_path}')"
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "materialize %s: could not register _meta/inner view in %s (%s) — the parquet is "
+            "published, but the master view will be missing until the next pass",
+            table_id,
+            extract_db_path,
+            exc,
+        )
+
+
 def _create_meta_table(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the _meta table required by the extract.duckdb contract."""
     conn.execute("DROP TABLE IF EXISTS _meta")
@@ -814,6 +936,33 @@ def _create_remote_attach_table(conn: duckdb.DuckDBPyConnection, keboola_url: st
     )
 
 
+def _ensure_remote_attach_row(conn: duckdb.DuckDBPyConnection, keboola_url: str) -> None:
+    """Merge-mode variant of :func:`_create_remote_attach_table` — creates the
+    table if absent and inserts the ``kbc`` alias row only when no row already
+    claims that alias.
+
+    First writer wins: ``_run_sync`` dispatches the global (``connection_id
+    IS NULL``) credential group first, so when both the global project and a
+    named connection carry ``remote`` rows, the alias keeps pointing at the
+    global stack — matching how the orchestrator resolves the re-ATTACH token
+    (``token_env='KEBOOLA_STORAGE_TOKEN'``, the global env credential). A
+    DROP-and-recreate here would silently repoint every remote view of the
+    pass at the LAST group's stack URL.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS _remote_attach (
+        alias VARCHAR,
+        extension VARCHAR,
+        url VARCHAR,
+        token_env VARCHAR
+    )""")
+    existing = conn.execute("SELECT count(*) FROM _remote_attach WHERE alias = 'kbc'").fetchone()[0]
+    if not existing:
+        conn.execute(
+            "INSERT INTO _remote_attach VALUES (?, ?, ?, ?)",
+            ["kbc", "keboola", keboola_url, "KEBOOLA_STORAGE_TOKEN"],
+        )
+
+
 def _try_attach_extension(conn: duckdb.DuckDBPyConnection, keboola_url: str, keboola_token: str) -> bool:
     """Try to install and attach the Keboola DuckDB extension. Returns True on success."""
     try:
@@ -832,7 +981,13 @@ def _try_attach_extension(conn: duckdb.DuckDBPyConnection, keboola_url: str, keb
         return False
 
 
-def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, keboola_token: str) -> Dict[str, Any]:
+def run(
+    output_dir: str,
+    table_configs: List[Dict[str, Any]],
+    keboola_url: str,
+    keboola_token: str,
+    merge: bool = False,
+) -> Dict[str, Any]:
     """Extract tables from Keboola into output_dir using DuckDB extension.
 
     Args:
@@ -840,10 +995,25 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         table_configs: List of table config dicts from table_registry
         keboola_url: Keboola stack URL
         keboola_token: Keboola Storage API token
+        merge: When False (default), the produced ``extract.duckdb`` is
+            rebuilt from scratch and contains ONLY this call's tables —
+            the historical whole-pass semantics, whose implicit prune is
+            how deleted/renamed registry rows disappear. When True, the
+            temp build is seeded from the CURRENT ``extract.duckdb`` so
+            this call only replaces its own tables' ``_meta`` rows and
+            views, preserving every other table already in the extract.
+            ``app.api.sync._run_sync`` dispatches one ``run()`` per
+            ``connection_id`` credential group (#B2); the first group of
+            a pass runs ``merge=False`` and every later group
+            ``merge=True`` — without this, each group's atomic
+            tmp-then-move swap clobbered the previous group's extract and
+            only the LAST connection's tables survived the pass.
 
     Returns:
         Dict with extraction stats: {tables_extracted: int, tables_failed: int, errors: list}
     """
+    import shutil
+
     output_path = Path(output_dir)
     data_dir = output_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -854,6 +1024,12 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
     tmp_db_path = output_path / "extract.duckdb.tmp"
     if tmp_db_path.exists():
         tmp_db_path.unlink()
+    if merge and db_path.exists():
+        # Seed the temp build with the extract as it stands (a previous
+        # credential group's output in the same sync pass) so the swap
+        # below replaces rather than discards it. Copy, never open the
+        # live file for write — the orchestrator may hold a read ATTACH.
+        shutil.copy2(str(db_path), str(tmp_db_path))
     conn = _open_duckdb(str(tmp_db_path))
 
     stats = {"tables_extracted": 0, "tables_failed": 0, "errors": []}
@@ -868,11 +1044,23 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         # Try DuckDB Keboola extension
         use_extension = _try_attach_extension(conn, keboola_url, keboola_token)
 
-        _create_meta_table(conn)
+        if merge:
+            # Merge mode: keep foreign `_meta` rows (previous credential
+            # groups of this pass); replace only this call's own rows so a
+            # re-extracted table never duplicates. Views use CREATE OR
+            # REPLACE below, so no separate view cleanup is needed.
+            _ensure_meta_table(conn)
+            for tc in table_configs:
+                conn.execute("DELETE FROM _meta WHERE table_name = ?", [tc["name"]])
+        else:
+            _create_meta_table(conn)
 
         has_remote = any(tc.get("query_mode") == "remote" for tc in table_configs)
         if has_remote and use_extension:
-            _create_remote_attach_table(conn, keboola_url)
+            if merge:
+                _ensure_remote_attach_row(conn, keboola_url)
+            else:
+                _create_remote_attach_table(conn, keboola_url)
 
         for tc in table_configs:
             table_name = tc["name"]
@@ -1178,8 +1366,6 @@ def run(output_dir: str, table_configs: List[Dict[str, Any]], keboola_url: str, 
         conn.close()
 
     # Atomic replace: swap temp DB into place, cleaning up any WAL files
-    import shutil
-
     old_wal = Path(str(db_path) + ".wal")
     if old_wal.exists():
         old_wal.unlink()

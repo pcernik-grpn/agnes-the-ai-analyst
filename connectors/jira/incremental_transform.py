@@ -300,7 +300,7 @@ class _IssuePayload:
     comments: list[dict]
     comments_incomplete: bool
     attachments: list[dict]
-    changelog: list[dict]
+    changelog: list[dict] | None
     issuelinks: list[dict]
     remote_links: list[dict] | None
 
@@ -384,21 +384,139 @@ def _comment_records(payload: _IssuePayload, existing: pd.DataFrame | None) -> l
     CURRENT month, so probing an unrelated (empty) month would read "nothing
     stored" and write the partial list THERE while the real thread sits in the
     creation month; views glob `month=*`, so they would double-count.
+
+    Whatever survives those rules is written through
+    `_carry_forward_public_visibility` — the same delete-then-insert that can
+    shorten a thread can also NULL a column, one comment at a time. One exit, so
+    "every row this connector writes incrementally was carry-checked" holds by
+    construction rather than by remembering to add the call to a new branch.
     """
-    if not payload.comments_incomplete:
-        return payload.comments
-    if payload.created_at_missing or _has_stored_rows(existing, payload.issue_key) or not payload.comments:
+    if payload.comments_incomplete:
+        if payload.created_at_missing or _has_stored_rows(existing, payload.issue_key) or not payload.comments:
+            logger.warning(
+                f"Skipping comments upsert for {payload.issue_key}: pagination incomplete "
+                f"(fetch failure). Existing rows preserved."
+            )
+            return None
         logger.warning(
-            f"Skipping comments upsert for {payload.issue_key}: pagination incomplete "
+            f"Writing {len(payload.comments)} partially-fetched comments for "
+            f"{payload.issue_key}: pagination incomplete (fetch failure), but no stored rows "
+            f"to preserve."
+        )
+    return _carry_forward_public_visibility(payload.issue_key, payload.comments, existing)
+
+
+#: The `existing` columns a carry-forward needs. A partition last written before
+#: v0.83.70 has no `public_visibility` at all, so this is a presence check, not a
+#: formality: an unguarded lookup raises `KeyError` out of the selector and takes
+#: down the whole issue's write — every table, not just comments.
+_CARRY_FORWARD_COLUMNS = ("issue_key", "comment_id", "updated_at", "public_visibility")
+
+
+def _stored_visibility_by_comment_id(
+    existing: pd.DataFrame | None, issue_key: str
+) -> dict[str, tuple[bool, pd.Timestamp]]:
+    """``{comment_id: (observed_visibility, updated_at)}`` for one issue's stored rows.
+
+    Only rows carrying a real boolean AND a resolvable timestamp are listed —
+    nothing else could be carried anyway, and leaving them out keeps the caller's
+    checks to the two that matter. `existing` is the whole MONTH partition, so the
+    `issue_key` filter is what stops one issue's row from answering for another's.
+    Ids are ``str``-coerced (parquet stores them as strings; a JSON integer id
+    would otherwise never match), null ids are skipped, and the first row holding
+    a real boolean wins a duplicated id so the result never depends on row order.
+    """
+    if existing is None or existing.empty or not set(_CARRY_FORWARD_COLUMNS) <= set(existing.columns):
+        return {}
+    rows = existing.loc[existing["issue_key"] == issue_key, list(_CARRY_FORWARD_COLUMNS)]
+    if rows.empty:
+        return {}
+    stamps = pd.to_datetime(rows["updated_at"], utc=True, errors="coerce")
+    stored: dict[str, tuple[bool, pd.Timestamp]] = {}
+    for comment_id, visibility, stamp in zip(rows["comment_id"], rows["public_visibility"], stamps, strict=True):
+        if pd.isna(comment_id) or pd.isna(visibility) or pd.isna(stamp):
+            continue
+        stored.setdefault(str(comment_id), (bool(visibility), stamp))
+    return stored
+
+
+def _carry_forward_public_visibility(issue_key: str, records: list[dict], existing: pd.DataFrame | None) -> list[dict]:
+    """Fill a NULL ``public_visibility`` from the stored row for the SAME comment version.
+
+    The comments upsert is an issue-scoped delete-then-insert, so a comment that
+    arrives without a boolean ``jsdPublic`` does not merely fail to add
+    information — it REPLACES an already-observed value with NULL. This is the
+    write-layer protection that superseded the flag gate in
+    ``service._embedded_comments_are_complete``: it holds on every path that
+    writes comments incrementally (webhook refetch, webhook fetch-failure
+    fallback, SLA poll, consistency-check repair), rather than on the one path a
+    completeness gate could decline to take. `transform_all` is deliberately
+    outside it — a full rebuild has no `existing` frame to carry from, and its
+    input is the raw JSON that would be re-read anyway.
+
+    Scoped to one comment VERSION. A JSM visibility flip rides a comment EDIT,
+    which bumps ``updated``, so a differing ``updated_at`` means the stored
+    boolean may describe the previous version: that stays honestly NULL until the
+    next successful refetch rather than serving a stale value as observed —
+    precisely the stored-public-actually-internal direction this column exists to
+    never repeat. An incoming boolean always wins; nothing here can overwrite one.
+    Same-second edit-plus-flip is an accepted residual: it needs a flip AND an
+    edit AND a fetch failure inside one second, and the next refetch corrects it.
+
+    Both sides of the version test go through ``pd.to_datetime(utc=True)`` — the
+    incoming value is an offset-aware stdlib ``datetime`` and the stored one a
+    UTC pandas ``Timestamp``, and a naive comparison would silently never match,
+    which reads exactly like a deployment that has nothing to carry. Every failure
+    direction here is the safe one (no carry -> NULL, never a wrong boolean), so
+    the log line below is what makes a silent never-carry degrade visible.
+
+    Mutates *records* in place and returns it: ``_apply_payloads`` calls the
+    comments selector exactly once per payload.
+
+    The "nothing unresolved" early-out is load-bearing, not a micro-optimisation:
+    reading the stored side means masking `existing` — the whole MONTH partition —
+    once per issue, and the SLA poll runs a month's open tickets through here in
+    one pass. On any deployment where the flag is present (i.e. all of them, see
+    `transform._comment_public_visibility`) that cost is never paid at all.
+    """
+    unresolved = [r for r in records if r.get("public_visibility") is None]
+    if not unresolved:
+        return records
+    stored = _stored_visibility_by_comment_id(existing, issue_key)
+    carried = 0
+    for record in unresolved:
+        comment_id = record.get("comment_id")
+        if comment_id is None:
+            continue
+        match = stored.get(str(comment_id))
+        if match is None:
+            continue
+        visibility, stored_updated = match
+        incoming_updated = pd.to_datetime(record.get("updated_at"), utc=True, errors="coerce")
+        if pd.isna(incoming_updated) or incoming_updated != stored_updated:
+            continue
+        record["public_visibility"] = visibility
+        carried += 1
+    logger.info(
+        "public_visibility for %s: carried %d stored value(s) forward, %d still NULL",
+        issue_key,
+        carried,
+        len(unresolved) - carried,
+    )
+    return records
+
+
+def _changelog_records(payload: _IssuePayload, _existing: pd.DataFrame | None) -> list[dict] | None:
+    if payload.changelog is None:
+        # The payload carries no `changelog` key — the webhook fetch-failure
+        # fallback's embedded body is the shape that does this. Preserve the
+        # existing parquet rows instead of wiping the issue's whole history.
+        logger.warning(
+            f"Skipping changelog upsert for {payload.issue_key}: overlay absent "
             f"(fetch failure). Existing rows preserved."
         )
         return None
-    logger.warning(
-        f"Writing {len(payload.comments)} partially-fetched comments for "
-        f"{payload.issue_key}: pagination incomplete (fetch failure), but no stored rows "
-        f"to preserve."
-    )
-    return payload.comments
+    return payload.changelog
 
 
 def _remote_link_records(payload: _IssuePayload, _existing: pd.DataFrame | None) -> list[dict] | None:
@@ -423,14 +541,14 @@ def _has_stored_rows(existing: pd.DataFrame | None, issue_key: str) -> bool:
     )
 
 
-# Every table this transform maintains, as (name, schema, selector). The selector
-# returns the rows to write for one issue, or None to leave that issue's stored
-# rows alone — which is what makes the two "preserve on fetch failure" rules a
-# per-issue decision without giving either table its own write path.
+# Every table this transform maintains, as (name, selector). The selector returns
+# the rows to write for one issue, or None to leave that issue's stored rows
+# alone — which is what makes the "preserve on fetch failure" rules a per-issue
+# decision without giving any table its own write path.
 _TABLES = (
     ("comments", _comment_records),
     ("attachments", lambda p, _e: p.attachments),
-    ("changelog", lambda p, _e: p.changelog),
+    ("changelog", _changelog_records),
     ("issuelinks", lambda p, _e: p.issuelinks),
     ("remote_links", _remote_link_records),
     # `issues` deliberately LAST. Its status flip is what removes a ticket from
@@ -620,6 +738,7 @@ def transform_single_issue(
     output_dir: Path | None = None,
     attachments_dir: Path | None = None,
     deleted: bool = False,
+    warn_unresolved: bool = True,
 ) -> bool:
     """
     Transform a single issue and update monthly Parquet files.
@@ -633,6 +752,9 @@ def transform_single_issue(
         output_dir: Output directory for Parquet files
         attachments_dir: Directory with downloaded attachments
         deleted: If True, remove issue from Parquet (deletion event)
+        warn_unresolved: Forwarded to ``_build_issue_payload``. ``False`` silences
+            the missing-``jsdPublic`` WARNING for a re-transform of a payload
+            already reported once — see ``JiraService.save_issue``.
 
     Returns:
         True if successful, False otherwise
@@ -666,9 +788,10 @@ def transform_single_issue(
     try:
         # One payload, then the shared apply path — the same one
         # `transform_issues` uses, so the per-issue rules for an
-        # incomplete comment thread and an absent remote-links overlay cannot
-        # drift between the single and batched callers.
-        payload = _build_issue_payload(issue_key, raw_dir, attachments_dir)
+        # incomplete comment thread, an absent changelog or remote-links overlay,
+        # and the public_visibility carry-forward cannot drift between the single
+        # and batched callers.
+        payload = _build_issue_payload(issue_key, raw_dir, attachments_dir, warn_unresolved=warn_unresolved)
         if payload is None:
             return False
 

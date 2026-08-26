@@ -20,20 +20,33 @@
    can't reach inside `<script>` template literals. All buttons across
    the page now route through the canonical `.btn-*` family in
    style-custom.css; the page-local `.cfg-btn` rule is gone. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   .cfg-page { max-width: 1260px; margin: 0 auto; padding: 0; }
   /* Hero subtitle is unconstrained here — page is wide and the text is long */
   .cfg-page .page-header--hero .page-header__subtitle { max-width: none; }
 
-  /* Two-column layout: sticky sidenav + scrollable content */
+  /* Two-column layout: sticky sidenav + scrollable content.
+     `minmax(0, 1fr)`, not a bare `1fr` — a grid track's implicit minimum is
+     its content's min-content width, so a bare `1fr` refused to shrink
+     below the widest unbroken field/help-text run and dragged the whole
+     page into horizontal scroll on every viewport narrower than that
+     (confirmed: identical ~952px main-column width at 1440 down to 320).
+     `minmax(0, …)` is the same override `.admin-split` already uses in
+     admin-nav.css for the outer sidenav + content split. */
   .cfg-body {
     display: grid;
-    grid-template-columns: 216px 1fr;
+    grid-template-columns: 216px minmax(0, 1fr);
     gap: 0 24px;
     align-items: start;
     margin-top: 24px;
   }
-  /* Column wrapper — standalone white card, fully rounded */
+  /* Column wrapper — standalone white card, fully rounded. `align-self:
+     stretch` so it reads as one continuous panel matching `.cfg-main`'s
+     full height, not a short box that visibly floats/re-shows its rounded
+     corners on every scroll. Carries no sticky/scroll behaviour itself —
+     that's split across the two classes below, on purpose (see
+     `.cfg-sidenav-sticky`). */
   .cfg-sidenav-col {
     background: var(--ds-surface);
     border: 1px solid var(--border, #e5e7eb);
@@ -41,11 +54,45 @@
     padding: 0 0 16px;
     align-self: stretch;
   }
-  .cfg-sidenav {
+  /* The ONLY sticky element — no `overflow`/scroll of its own. Splitting
+     sticky (here) from the internal scroll (`.cfg-sidenav`, below) onto two
+     different elements is the actual fix for a gap that flashed above the
+     first row on a FAST scroll gesture (never on a scripted/instant jump,
+     which is why it was invisible to automated testing): `position: sticky`
+     combined with `overflow-y: auto` on the SAME node forces the browser to
+     reconcile that node's sticky offset against the page's scroll position
+     AND its own internal scroll position together, off the compositor
+     thread — which is exactly the case that can lag a frame behind a fast
+     gesture. A sticky element with no overflow of its own stays fully
+     compositor-driven, same as `.admin-nav` (admin-nav.css), which never
+     showed this because it was never shaped this way. No background/border
+     here — those stay on `.cfg-sidenav-col` so the card still reads as one
+     continuous panel, not a second floating box. */
+  .cfg-sidenav-sticky {
     position: sticky;
     top: 68px;
-    max-height: calc(100vh - 88px);
+    height: calc(100vh - 88px);
+    /* Promotes this element to its own compositor layer rather than one
+       computed jointly with `.cfg-sidenav-col` on every frame. */
+    will-change: transform;
+  }
+  .cfg-sidenav {
+    height: 100%;
     overflow-y: auto;
+    /* No visible scrollbar at all, rather than reserving room for one
+       (previous attempt: `scrollbar-gutter: stable`, which fixed the
+       classic-scrollbar overlap but left a permanent empty strip down the
+       right edge even while nothing needs scrolling — a second, quieter
+       version of the same "grid" complaint). Still fully scrollable —
+       wheel, trackpad, arrow keys once a row is focused — this only drops
+       the track/thumb decoration Chrome/Firefox would otherwise paint. */
+    scrollbar-width: none;
+    /* Standard containment for a nested scroller (MDN's own documented use
+       case: "a sidebar that shouldn't scroll-chain into the page"). Without
+       it, overscrolling PAST this list's own top/bottom hands the rest of
+       the gesture to the page. Contained, the bounce stays inside this box
+       and the page never sees it. */
+    overscroll-behavior: contain;
     display: flex;
     flex-direction: column;
     /* `align-items` and `gap` were inherited from the bare `nav {}` rule in
@@ -58,6 +105,10 @@
     gap: 15px;
     padding: 12px 0 8px;
   }
+  /* `scrollbar-width` (above) is the Firefox/standard property; Chrome and
+     Safari need the WebKit pseudo-element instead — same intent, both
+     required to actually hide it everywhere. */
+  .cfg-sidenav::-webkit-scrollbar { display: none; }
   /* Group label — visually non-clickable: all-caps, muted, no cursor affordance */
   .cfg-sidenav-label {
     display: block;
@@ -106,6 +157,23 @@
   }
   /* main content column */
   .cfg-main { }
+  /* Below this, stack the section jump-list above the cards instead of
+     beside them — same breakpoint admin-nav.css uses to hide the outer
+     `.admin-nav` column, so the whole /admin shell goes single-column
+     together. The sticky/scrolling behaviour is a desktop-only convenience
+     (a tall side rail tracking scroll); stacked, it would either cover the
+     page (sticky) or scroll past it pinned to the viewport for no reason
+     once it is a normal block above the content. */
+  @media (max-width: 820px) {
+    /* `minmax(0, 1fr)`, not a bare `1fr` — same reason as the base rule
+       above: a single bare `1fr` track is exactly as unshrinkable as the
+       two-column version was, just with both rows now sharing the one
+       track's min-content instead of only the main column. */
+    .cfg-body { grid-template-columns: minmax(0, 1fr); }
+    .cfg-sidenav-col { align-self: auto; }
+    .cfg-sidenav-sticky { position: static; height: auto; }
+    .cfg-sidenav { overflow-y: visible; }
+  }
   /* ensure sections don't hide under the sticky app header on scroll */
   .cfg-section { scroll-margin-top: calc(var(--app-header-height) + var(--space-4)); }
   .cfg-banner {
@@ -284,7 +352,18 @@
 
   <div class="cfg-body">
     <div class="cfg-sidenav-col">
-      <nav id="cfg-sidenav" class="cfg-sidenav" aria-label="Section navigation"></nav>
+      <!-- `.cfg-sidenav-sticky` carries ONLY the sticky positioning; `nav`
+           (below) carries ONLY the internal scroll. Splitting them onto two
+           elements — not `position: sticky` + `overflow-y: auto` combined on
+           the nav itself — is what actually stops the fast-scroll gap: that
+           combination pushes the sticky offset onto the main thread (it has
+           to reconcile the page's scroll position against the nav's OWN
+           scroll position on the same node), which is exactly what a
+           compositor-only sticky element doesn't need to do. See the CSS
+           comments on both classes below for the fuller "why". -->
+      <div class="cfg-sidenav-sticky">
+        <nav id="cfg-sidenav" class="cfg-sidenav" aria-label="Section navigation"></nav>
+      </div>
     </div>
 
     <div class="cfg-main">
@@ -311,29 +390,26 @@
   </section>
 
   <!-- Cloud chat — bespoke panel (not part of instance.yaml).
-       ANTHROPIC_API_KEY / E2B_API_KEY via /admin/chat/secrets. -->
+       ANTHROPIC_API_KEY via /admin/chat/secrets. -->
   <section class="cfg-section" id="chat-section">
     <header>
       <div>
         <h3>Cloud chat</h3>
         <div class="section-help">
-          The cloud-hosted chat needs <code>ANTHROPIC_API_KEY</code> and
-          (for the E2B sandbox provider) <code>E2B_API_KEY</code> in the
-          server environment, plus a strong <code>JWT_SECRET_KEY</code>.
-          Missing or invalid keys leave chat disabled. Set the keys here
-          (stored in the server's env-overlay, never echoed back) and use
-          <strong>Test keys</strong> to confirm they actually work. A server
-          restart is required after setting keys for chat to start.
+          The cloud-hosted chat needs <code>ANTHROPIC_API_KEY</code> in the
+          server environment, plus a strong <code>JWT_SECRET_KEY</code> and
+          the active provider's backing (<code>KAI_HOST_JWT_SECRET</code> for
+          <code>kai-agent</code>, <code>APPS_RUNNER_TOKEN</code> for
+          <code>docker</code>). Missing or invalid keys leave chat disabled.
+          Set the key here (stored in the server's env-overlay, never echoed
+          back) and use <strong>Test keys</strong> to confirm it actually
+          works. A server restart is required after setting keys for chat to
+          start.
         </div>
       </div>
     </header>
     <div class="section-body">
       <div id="chat-readiness-status" class="cfg-loading">Loading…</div>
-      <div class="iw-form-field">
-        <label for="chat-e2b-key">E2B_API_KEY</label>
-        <input type="password" id="chat-e2b-key"
-               placeholder="e2b_••• (leave blank to keep existing)" autocomplete="off">
-      </div>
       <div class="iw-form-field">
         <label for="chat-anthropic-key">ANTHROPIC_API_KEY</label>
         <input type="password" id="chat-anthropic-key"
@@ -359,6 +435,15 @@
           precedence — a token shown as <code>env</code> can't be changed
           here. Storing a token requires <code>AGNES_VAULT_KEY</code> on the
           server.
+          <br>
+          Create the Slack app from the shipped manifest —
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-http.md"
+             target="_blank" rel="noopener">docs/slack-manifest-http.md</a>
+          (or the
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-socket.md"
+             target="_blank" rel="noopener">Socket&nbsp;Mode variant</a>)
+          — never by hand-picking scopes. The manifest is the minimal
+          bot-token scope set; the bot needs no user scopes at all.
         </div>
       </div>
     </header>
@@ -411,13 +496,17 @@
       </div>
     </header>
     <div class="section-body">
-      <div id="feature-flags-list" class="cfg-loading">Loading…</div>
+      <!-- `.cfg-section` clips overflow (rounded corners), so the flag table's
+           fixed 5-column min-width — which does not fit under ~900px — would
+           be silently cropped, not reachable by any scroll, without this
+           wrapper taking the overflow itself. -->
+      <div id="feature-flags-list" class="cfg-loading" style="overflow-x: auto;">Loading…</div>
     </div>
   </section>
 
       <!-- Danger zone sections (auth, server) rendered separately so bespoke sections above sit before them -->
       <div id="cfg-sections-danger" hidden></div>
-      <!-- Tail: sections not in any known group (e.g. marketplace) — rendered last, no danger styling -->
+      <!-- Tail: sections not in any known group — rendered last, no danger styling -->
       <div id="cfg-sections-tail" hidden></div>
     </div><!-- /.cfg-main -->
   </div><!-- /.cfg-body -->
@@ -442,6 +531,7 @@
   </div>
 </div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 const CFG_API = "/api/admin/server-config";
 
@@ -468,7 +558,7 @@ const SECTION_META = {
   ai: { title: "AI / LLM", help: "Provider + API key for the corporate-memory extractor. provider=anthropic|openai_compat; api_key uses ${ENV_VAR} so the secret stays in .env." },
   openmetadata: { title: "OpenMetadata", help: "Optional REST catalog enrichment. Without it, the app runs without catalog cross-links." },
   corporate_memory: {
-    title: "Corporate Memory",
+    title: "Corporate memory",
     help: "Optional governance for AI-extracted knowledge. When the section is unset, the system runs in legacy democratic-wiki mode with no admin review.",
   },
   materialize: {
@@ -490,6 +580,26 @@ const SECTION_META = {
   library: {
     title: "Library",
     help: "Analyst Library display options. show_unverified_trust surfaces the 'Community' marker beside the name of a user-authored Store item your organization hasn't verified — on by default, so every row states its provenance (Organization / Verified / Community) and none is left unlabelled. Turn it off for the older reading, where an unverified item is marked only by the absence of a marker.",
+  },
+  features: {
+    title: "Stack membership",
+    help: "Stack membership mode. Off (default): the subscribe model — required plus subscribed grants only. On: auto-membership — every granted resource lands in the stack immediately.",
+  },
+  access_policies: {
+    title: "Access policies",
+    help: "Table access policies — lets an admin attach one row-filtering and column-masking SQL policy per non-distributed table, substituted in on every server-side read with the caller's identity bound.",
+  },
+  mcp: {
+    title: "MCP access",
+    help: "Accept an MCP access token in the ?token= query string as well as the Authorization header. Convenient for clients that can't set headers, but a URL travels through proxy logs and browser history.",
+  },
+  studio: {
+    title: "Studio",
+    help: "Expose the authoring Studio (/admin/studio, the moderation queue, and the public suggestion API). Off hides the nav entries and 403s the suggestion API immediately.",
+  },
+  chat: {
+    title: "Chat access",
+    help: "Expose the cloud chat surface and whether an agent's tool calls need explicit approval. Separate from the Cloud chat card below, which holds the provider keys chat needs to actually start.",
   },
 };
 // Danger-zone sections (extra confirmation dialog before saving) — driven
@@ -568,7 +678,42 @@ function encodePath(segments) {
 //
 // `dottedKey` is kept for backward-compat / debugging; collectSection
 // prefers data-path when present.
-function renderLeafInput(fieldId, section, pathSegments, kind, value, opts, isUnset) {
+// Paired `.ds-dropdown` custom-select markup (`_components.html`'s
+// `dropdown` macro, hand-built here since that macro runs at template-render
+// time and these fields don't exist until the registry fetch resolves —
+// wired up afterward by the `dsDropdownInit` sweep at the end of
+// renderAll()). `options` is `[{value, label}]`, already fully known at
+// construction time (a fixed bool pair, or the registry's own `options`
+// list) — not the case ds.dropdown()'s own callers avoid it for elsewhere
+// (an option list rebuilt later with no re-init hook).
+function dsDropdownMarkup(fieldId, options, selectedValue, ariaLabel) {
+  const current = options.some(o => o.value === selectedValue)
+    ? selectedValue
+    : (options[0] ? options[0].value : null);
+  const currentLabel = (options.find(o => o.value === current) || {}).label || "";
+  const items = options.map(o => `<li class="ds-dropdown-menu-item${o.value === current ? " is-selected" : ""}" role="menuitemradio" aria-checked="${o.value === current}" tabindex="0" data-value="${escHtml(o.value)}">${escHtml(o.label)}</li>`).join("");
+  // The field's own <label for="..."> points at the NATIVE <select>, which
+  // `paper-skin.css` sets to `display:none` on the default theme — so without
+  // this the visible control has no accessible name and a screen reader
+  // announces a bare "true" with no indication which setting that is. Same
+  // shape the `dropdown` macro in `_components.html` uses for its `aria_label`
+  // parameter: a visually-hidden name span, then `aria-labelledby`
+  // concatenating field name and current value.
+  const name = ariaLabel ? String(ariaLabel) : "";
+  const nameSpan = name
+    ? `<span class="ds-dropdown-name" id="${fieldId}-dd-name">${escHtml(name)}</span>`
+    : "";
+  const labelledBy = name ? ` aria-labelledby="${fieldId}-dd-name ${fieldId}-dd-btn-label"` : "";
+  return `<div class="ds-dropdown" data-ds-dropdown-target="${fieldId}">
+    <button type="button" class="ds-dropdown-btn" id="${fieldId}-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${fieldId}-dd-menu"${labelledBy}>
+      ${nameSpan}<span class="ds-dropdown-btn-label" id="${fieldId}-dd-btn-label">${escHtml(currentLabel)}</span>
+      <svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <ul class="ds-dropdown-menu" id="${fieldId}-dd-menu" role="menu" aria-label="${escHtml(name || "Options")}" hidden>${items}</ul>
+  </div>`;
+}
+
+function renderLeafInput(fieldId, section, pathSegments, kind, value, opts, isUnset, fieldLabel) {
   const dottedKey = (pathSegments || []).join(".");
   const dataPath = encodePath(pathSegments);
   const leafKey = pathSegments && pathSegments.length ? pathSegments[pathSegments.length - 1] : "";
@@ -597,18 +742,21 @@ function renderLeafInput(fieldId, section, pathSegments, kind, value, opts, isUn
     // (Devin Review on #1190).
     const dflt = opts && opts.spec && typeof opts.spec.default === "boolean" ? opts.spec.default : false;
     const v = isUnset ? dflt : !!value;
-    return `<select id="${fieldId}" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" data-cast="bool">
+    const nativeSelect = `<select id="${fieldId}" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" data-cast="bool" class="ds-dropdown-native">
       <option value="true" ${v ? "selected" : ""}>true</option>
       <option value="false" ${!v ? "selected" : ""}>false</option>
     </select>`;
+    const ddOptions = [{ value: "true", label: "true" }, { value: "false", label: "false" }];
+    return nativeSelect + dsDropdownMarkup(fieldId, ddOptions, v ? "true" : "false", fieldLabel);
   }
   if (kind === "select" && Array.isArray(opts && opts.spec && opts.spec.options)) {
     const sel = value == null ? "" : String(value);
-    const options = opts.spec.options.map(o => {
-      const ov = String(o);
-      return `<option value="${escHtml(ov)}" ${sel === ov ? "selected" : ""}>${escHtml(ov)}</option>`;
-    }).join("");
-    return `<select id="${fieldId}" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}">${options}</select>`;
+    const ddOptions = opts.spec.options.map(o => ({ value: String(o), label: String(o) }));
+    const options = ddOptions.map(o =>
+      `<option value="${escHtml(o.value)}" ${sel === o.value ? "selected" : ""}>${escHtml(o.label)}</option>`
+    ).join("");
+    const nativeSelect = `<select id="${fieldId}" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" class="ds-dropdown-native">${options}</select>`;
+    return nativeSelect + dsDropdownMarkup(fieldId, ddOptions, sel, fieldLabel);
   }
   // Default: text. Use the registry's default when unset, else the value.
   const v = isUnset
@@ -887,7 +1035,7 @@ function renderNestedField(section, pathSegments, label, value, spec, depth) {
     const dataPath = encodePath(segs);
     inp = `<textarea id="${fieldId}" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" data-cast="json" placeholder="${isUnset ? 'unset — paste JSON to populate' : ''}">${escHtml(blobValue)}</textarea>`;
   } else {
-    inp = renderLeafInput(fieldId, section, segs, kind, value, { spec }, isUnset);
+    inp = renderLeafInput(fieldId, section, segs, kind, value, { spec }, isUnset, label);
   }
 
   return `
@@ -1001,24 +1149,34 @@ function renderSection(section, payload, knownForSection) {
         <button class="btn btn-primary" data-action="save-section" data-section="${section}">Save ${escHtml(meta.title.toLowerCase())}</button>
         ${section === "data_source" ? `
         <button class="btn btn-secondary" data-action="test-bigquery" type="button">Test BigQuery connection</button>
-        <span class="bq-test-result" data-section="${section}" hidden style="margin-left: 1ex;"></span>
-        <button class="btn btn-secondary" data-action="test-keboola" type="button" style="margin-left: 8px;">Test Keboola connection</button>
-        <span class="kbc-test-result" data-section="${section}" hidden style="margin-left: 1ex;"></span>
+        <button class="btn btn-secondary" data-action="test-keboola" type="button">Test Keboola connection</button>
         ` : ""}
       </div>
     </section>`;
 }
 
 const SECTION_GROUPS = [
-  { label: "General",      sections: ["instance", "data_source", "email", "theme"] },
-  { label: "Integrations", sections: ["telegram", "jira", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library"] },
-  { label: "Services",     sections: [], bespoke: [
+  { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
+  { label: "Integrations", sections: ["telegram", "jira", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
+  // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
+  // exclusive (buildSidenav()/renderAll() read them independently). "Chat
+  // access" is a real registry section (SECTION_META above) that belongs in
+  // the same group as "Cloud chat", just not the same card: it toggles the
+  // feature, the bespoke card holds the provider keys the feature needs.
+  { label: "Services",     sections: ["chat"], bespoke: [
     { id: "chat-section",          title: "Cloud chat" },
     { id: "slack-secrets-section", title: "Slack bot secrets" },
     { id: "feature-flags-section", title: "Feature flags" },
   ]},
   { label: "Danger zone",  sections: ["auth", "server"], isDanger: true },
 ];
+
+// Holds the IntersectionObserver buildSidenav() sets up for scroll-spy, so a
+// later renderAll() (after every save) can disconnect the PRIOR one before
+// building a fresh one — its targets are the very section elements that
+// render just replaced, and an observer left watching detached nodes is a
+// silent leak that never disconnects on its own.
+let _sidenavSpyObserver = null;
 
 function buildSidenav(sections) {
   const nav = document.getElementById("cfg-sidenav");
@@ -1057,7 +1215,8 @@ function buildSidenav(sections) {
     if (el) { el.id = `cfg-s-${s}`; sectionEls.set(s, el); }
   });
 
-  // Active state is set only on explicit nav click — no scroll tracking.
+  // Active state on click — immediate, so the row lights before the smooth
+  // scroll (below) has even started moving.
   nav.querySelectorAll("a").forEach(a => {
     a.addEventListener("click", e => {
       e.preventDefault();
@@ -1074,6 +1233,60 @@ function buildSidenav(sections) {
       }
     });
   });
+
+  // Scroll-spy — the click handler above only covers navigation THROUGH the
+  // nav; free-scrolling (scrollbar, trackpad, arrow keys) left the active
+  // row stuck wherever it was last clicked, which is most of how anyone
+  // actually moves through a ~40-row list. A section counts as "current"
+  // once its card has scrolled up into the top-of-viewport band (below the
+  // sticky app header, above the point a card would be mostly scrolled
+  // past) — matching where a reader's eye actually is, not the instant any
+  // pixel of the next card appears at the bottom edge.
+  if (_sidenavSpyObserver) _sidenavSpyObserver.disconnect();
+  if ("IntersectionObserver" in window) {
+    const linkByKey = new Map();
+    nav.querySelectorAll("a[data-nav-section], a[data-bespoke-section]").forEach(a => {
+      linkByKey.set(a.dataset.navSection || a.dataset.bespokeSection, a);
+    });
+    const spyTargets = [];
+    sections.forEach(s => {
+      const el = sectionEls.get(s);
+      if (el) spyTargets.push({ el, key: s });
+    });
+    SECTION_GROUPS.forEach(group => (group.bespoke || []).forEach(b => {
+      const el = document.getElementById(b.id);
+      if (el) spyTargets.push({ el, key: b.id });
+    }));
+    if (spyTargets.length) {
+      _sidenavSpyObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          if (!entry.isIntersecting) return;
+          const a = linkByKey.get(entry.target.dataset.spyKey);
+          if (!a) return;
+          nav.querySelectorAll("a").forEach(x => x.classList.remove("is-active"));
+          a.classList.add("is-active");
+          // The class alone is invisible once the list has ~40 rows and
+          // `nav` (not the page) is what actually scrolls it: the active
+          // link can end up outside `nav`'s OWN scrolled viewport, still
+          // marked but off-screen. Nudge only `nav.scrollTop` — never
+          // `window.scrollTo` / `scrollIntoView`'s default ancestor walk,
+          // which would also drag on the page scroll the user is mid-
+          // gesture on, fighting the very input that triggered this.
+          const navBox = nav.getBoundingClientRect();
+          const linkBox = a.getBoundingClientRect();
+          if (linkBox.top < navBox.top) {
+            nav.scrollTop -= (navBox.top - linkBox.top);
+          } else if (linkBox.bottom > navBox.bottom) {
+            nav.scrollTop += (linkBox.bottom - navBox.bottom);
+          }
+        });
+      }, { rootMargin: "-96px 0px -80% 0px", threshold: 0 });
+      spyTargets.forEach(({ el, key }) => {
+        el.dataset.spyKey = key;
+        _sidenavSpyObserver.observe(el);
+      });
+    }
+  }
 }
 
 function flagSourceBadge(source) {
@@ -1192,6 +1405,12 @@ function renderAll(data) {
       btn.addEventListener("click", () => onTestBigQuery(btn)));
     w.querySelectorAll('[data-action="test-keboola"]').forEach(btn =>
       btn.addEventListener("click", () => onTestKeboola(btn)));
+    // ds_dropdown.js's own bootstrap ran at DOMContentLoaded, before this
+    // fetch resolved and before any `.ds-dropdown` existed — each one built
+    // by dsDropdownMarkup() needs this explicit, one-time call instead.
+    if (window.dsDropdownInit) {
+      w.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
+    }
   });
 
   // Wire array-of-scalars + map-of-scalars add/remove buttons via event
@@ -1474,12 +1693,14 @@ function collectSection(section) {
 }
 
 // ── BigQuery test connection (#160 §4.9) ───────────────────────────────
+// Result goes through the same `showBanner()` every save on this page
+// already uses — a raw colored `<span>` crammed into the button row (the
+// previous shape) wrapped mid-sentence next to the buttons and gave "Save"
+// a more polished result than "Test" for what is the same kind of feedback.
 async function onTestBigQuery(btn) {
-  const resultEl = btn.parentElement.querySelector(".bq-test-result");
-  resultEl.hidden = false;
-  resultEl.textContent = "Testing…";
-  resultEl.style.color = "";
+  const label = btn.textContent;
   btn.disabled = true;
+  btn.textContent = "Testing…";
   try {
     const r = await fetch("/api/admin/bigquery/test-connection", {
       method: "POST",
@@ -1487,32 +1708,28 @@ async function onTestBigQuery(btn) {
     });
     if (r.ok) {
       const body = await r.json();
-      resultEl.textContent = `✓ ok (${body.elapsed_ms} ms; billing=${body.billing_project}, data=${body.data_project})`;
-      resultEl.style.color = "#2a8c4a";
+      showBanner(`BigQuery ✓ ok (${body.elapsed_ms} ms; billing=${body.billing_project}, data=${body.data_project})`, "success");
     } else {
       let body;
       try { body = await r.json(); } catch (_) { body = await r.text(); }
       const detail = body && typeof body === "object" ? body.detail : body;
       const kind = detail && typeof detail === "object" ? (detail.kind || "error") : "error";
       const hint = detail && typeof detail === "object" ? (detail.hint || detail.message || "") : String(detail);
-      resultEl.textContent = `✗ ${kind}${hint ? " — " + hint : ""}`;
-      resultEl.style.color = "#c0392b";
+      showBanner(`BigQuery ✗ ${kind}${hint ? " — " + hint : ""}`, "error");
     }
   } catch (e) {
-    resultEl.textContent = `✗ network error — ${e.message}`;
-    resultEl.style.color = "#c0392b";
+    showBanner(`BigQuery ✗ network error — ${e.message}`, "error");
   } finally {
     btn.disabled = false;
+    btn.textContent = label;
   }
 }
 
 // ── Keboola test connection ────────────────────────────────────────────
 async function onTestKeboola(btn) {
-  const resultEl = btn.parentElement.querySelector(".kbc-test-result");
-  resultEl.hidden = false;
-  resultEl.textContent = "Testing…";
-  resultEl.style.color = "";
+  const label = btn.textContent;
   btn.disabled = true;
+  btn.textContent = "Testing…";
   try {
     const r = await fetch("/api/admin/keboola/test-connection", {
       method: "POST",
@@ -1520,22 +1737,20 @@ async function onTestKeboola(btn) {
     });
     if (r.ok) {
       const body = await r.json();
-      resultEl.textContent = `✓ ok (${body.elapsed_ms} ms; ${body.bucket_count} bucket${body.bucket_count !== 1 ? "s" : ""})`;
-      resultEl.style.color = "#2a8c4a";
+      showBanner(`Keboola ✓ ok (${body.elapsed_ms} ms; ${body.bucket_count} bucket${body.bucket_count !== 1 ? "s" : ""})`, "success");
     } else {
       let body;
       try { body = await r.json(); } catch (_) { body = await r.text(); }
       const detail = body && typeof body === "object" ? body.detail : body;
       const kind = detail && typeof detail === "object" ? (detail.kind || "error") : "error";
       const hint = detail && typeof detail === "object" ? (detail.hint || detail.message || "") : String(detail);
-      resultEl.textContent = `✗ ${kind}${hint ? " — " + hint : ""}`;
-      resultEl.style.color = "#c0392b";
+      showBanner(`Keboola ✗ ${kind}${hint ? " — " + hint : ""}`, "error");
     }
   } catch (e) {
-    resultEl.textContent = `✗ network error — ${e.message}`;
-    resultEl.style.color = "#c0392b";
+    showBanner(`Keboola ✗ network error — ${e.message}`, "error");
   } finally {
     btn.disabled = false;
+    btn.textContent = label;
   }
 }
 
@@ -1631,14 +1846,21 @@ function saveResultMessage(section, data) {
 
 async function postPatch(section, patch, confirmDanger) {
   try {
-    const r = await fetch(CFG_API, {
-      method: "POST", credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sections: { [section]: patch }, confirm_danger: confirmDanger }),
+    // saveConnectionConfig (js/connection_repoint.js) is a plain POST unless the
+    // server answers the repoint 409 — then it shows the blast radius and
+    // re-sends with confirm_connection_change only if the operator agrees. It is
+    // shared with the Add-data wizard and the setup flow, which post the same
+    // data_source patches, so the refusal reads the same wherever you hit it.
+    const { ok, status, data, cancelled } = await window.saveConnectionConfig(CFG_API, {
+      sections: { [section]: patch },
+      confirm_danger: confirmDanger,
     });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      showBanner(`Save failed: ${data.detail || r.statusText}`, "error");
+    if (cancelled) {
+      showBanner("Cancelled — the connection was left unchanged.", "");
+      return;
+    }
+    if (!ok) {
+      showBanner(`Save failed: ${window.apiDetailText(data.detail) || status}`, "error");
       return;
     }
     showBanner(saveResultMessage(section, data), "success");
@@ -1724,19 +1946,18 @@ async function chatReadinessLoad() {
     // to its raw name rather than being dropped.
     const CHAT_SECRET_LABELS = {
       anthropic_api_key: "ANTHROPIC_API_KEY",
-      e2b_api_key: "E2B_API_KEY",
       jwt_secret_key: "JWT_SECRET_KEY",
-      e2b_template_id: "e2b_template_id",
       apps_runner_token: "APPS_RUNNER_TOKEN",
       chat_docker_image: "chat.docker_image",
+      kai_host_jwt_secret: "KAI_HOST_JWT_SECRET",
     };
     // Rows that echo plain config rather than secrets: they always carry a
     // value (built-in defaults), so "set" is meaningless for them — show them
     // only when the active provider actually requires them. Secret rows stay
-    // visible whenever set, so "you still have an E2B key configured" reads
-    // on a docker instance and vice versa. With chat disabled nothing is
+    // visible whenever set, so a configured-but-unused credential still reads
+    // on the other provider's instance. With chat disabled nothing is
     // "required", so everything renders as setup guidance.
-    const CHAT_CONFIG_ROWS = new Set(["e2b_template_id", "chat_docker_image"]);
+    const CHAT_CONFIG_ROWS = new Set(["chat_docker_image"]);
     const rows = Object.entries(s.secrets || {})
       .filter(([key, v]) => !s.enabled || v.required || (v.set && !CHAT_CONFIG_ROWS.has(key)))
       .map(([key, v]) => [CHAT_SECRET_LABELS[key] || key, v]);
@@ -1778,15 +1999,12 @@ async function chatReadinessLoad() {
 }
 
 async function chatSaveSecrets(btn) {
-  const e2b = document.getElementById("chat-e2b-key").value.trim();
   const anth = document.getElementById("chat-anthropic-key").value.trim();
-  if (!e2b && !anth) {
-    showBanner("Enter at least one key to save.", "error");
+  if (!anth) {
+    showBanner("Enter a key to save.", "error");
     return;
   }
-  const payload = {};
-  if (e2b) payload.e2b_api_key = e2b;
-  if (anth) payload.anthropic_api_key = anth;
+  const payload = { anthropic_api_key: anth };
   btn.disabled = true;
   try {
     const r = await fetch(CHAT_API + "/secrets", {
@@ -1797,8 +2015,7 @@ async function chatSaveSecrets(btn) {
     });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const body = await r.json();
-    // Clear the inputs so the secret doesn't linger in the DOM.
-    document.getElementById("chat-e2b-key").value = "";
+    // Clear the input so the secret doesn't linger in the DOM.
     document.getElementById("chat-anthropic-key").value = "";
     showBanner("Saved " + body.changed.join(", ") + ". Restart the server to activate chat.", "success");
     chatReadinessLoad();
@@ -1820,10 +2037,9 @@ async function chatTestSecrets(btn) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const b = await r.json();
     const fmt = (label, x) => `${x.ok ? "✓" : "✗"} ${label}: ${x.detail}`;
-    // The sandbox row is provider-aware: e2b_api_key on an E2B deployment,
-    // docker_sandbox on a self-hosted one. Render whichever came back.
+    // The sandbox row is provider-aware: docker_sandbox on a docker
+    // deployment, nothing extra on kai-agent. Render whichever came back.
     const rows = [
-      ["E2B", b.e2b_api_key],
       ["Docker sandbox", b.docker_sandbox],
       ["Anthropic", b.anthropic_api_key],
     ].filter(([, x]) => x);

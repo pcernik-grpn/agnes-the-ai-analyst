@@ -81,6 +81,43 @@ print('true' if 'version' in d and 'channel' in d and 'schema_version' in d else
     check "health detailed version fields" "$HAS_VERSION"
 fi
 
+# 2c. App-state backend (A1: fresh installs default to Postgres). Reads
+# the same use_pg()-derived verdict app/services/instance_doctor.py's
+# app-state-backend check reports, via the support-bundle's
+# schema.backend field ("postgres"/"duckdb" — see app/services/support_bundle.py).
+#
+# The hard "must be postgres" assertion is opt-in via
+# EXPECT_APP_STATE_BACKEND: this script serves TWO release.yml jobs with
+# opposite stacks. The `smoke-test` job boots the Postgres-overlay chain and
+# sets EXPECT_APP_STATE_BACKEND=postgres — its positive assertion that A1's
+# default actually boots on Postgres. The `e2e-bind-mount` job deliberately
+# boots the legacy DuckDB-only shape (no postgres overlay, no DATABASE_URL)
+# to pin the host-mount chown contract; an unconditional postgres assertion
+# would fail that job on every main push. When the var is unset, only assert
+# the endpoint answers with a known backend.
+if [ -n "$TOKEN" ]; then
+    BACKEND=$(curl -sf "$HOST/api/admin/doctor/support" \
+      -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d.get('schema',{}).get('backend','unknown'))
+" 2>/dev/null || echo "unreachable")
+    if [ -n "${EXPECT_APP_STATE_BACKEND:-}" ]; then
+        if [ "$BACKEND" = "$EXPECT_APP_STATE_BACKEND" ]; then
+            check "app-state backend ($BACKEND)" "true"
+        else
+            check "app-state backend ($BACKEND, expected $EXPECT_APP_STATE_BACKEND)" "false"
+        fi
+    else
+        case "$BACKEND" in
+            postgres|duckdb) check "app-state backend reported ($BACKEND; no EXPECT_APP_STATE_BACKEND set)" "true" ;;
+            *)               check "app-state backend reported ($BACKEND — support endpoint unreachable?)" "false" ;;
+        esac
+    fi
+else
+    echo "  SKIP app-state backend (no token)"
+fi
+
 # 4. Query SELECT 1 (requires auth)
 if [ -n "$TOKEN" ]; then
     QUERY_OK=$(curl -sf -X POST "$HOST/api/query" \

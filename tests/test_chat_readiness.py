@@ -22,7 +22,7 @@ TEST_ADMIN = {"id": "admin1", "email": "admin@test.com", "is_admin": True}
 
 
 def _cfg(**kw):
-    base = dict(enabled=True, provider="e2b", e2b_template_id="agnes-chat")
+    base = dict(enabled=True, provider="kai-agent", kai_agent_url="http://kai-agent:3000")
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -42,25 +42,25 @@ def test_secret_status_disabled_config_is_never_ready():
 
 def test_secret_status_ready_when_all_present(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xxx")
-    monkeypatch.setenv("E2B_API_KEY", "e2b_xxx")
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "kai-secret-xxx")
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
     s = readiness.secret_status(_cfg())
     assert s["ready"] is True
     assert s["missing"] == []
-    assert s["secrets"]["e2b_api_key"]["set"] is True
+    assert s["secrets"]["kai_host_jwt_secret"]["set"] is True
     # No secret value is echoed back anywhere in the payload.
     assert "sk-ant-xxx" not in str(s)
-    assert "e2b_xxx" not in str(s)
+    assert "kai-secret-xxx" not in str(s)
 
 
 def test_secret_status_flags_missing_required(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.delenv("KAI_HOST_JWT_SECRET", raising=False)
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
     s = readiness.secret_status(_cfg())
     assert s["ready"] is False
     assert "anthropic_api_key" in s["missing"]
-    assert "e2b_api_key" in s["missing"]
+    assert "kai_host_jwt_secret" in s["missing"]
 
 
 def test_secret_status_weak_jwt_is_not_set(monkeypatch):
@@ -70,13 +70,13 @@ def test_secret_status_weak_jwt_is_not_set(monkeypatch):
     assert "jwt_secret_key" in s["missing"]
 
 
-def test_secret_status_e2b_not_required_for_other_provider(monkeypatch):
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
+def test_secret_status_kai_secret_not_required_for_other_provider(monkeypatch):
+    monkeypatch.delenv("KAI_HOST_JWT_SECRET", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk")
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
-    s = readiness.secret_status(_cfg(provider="local"))
-    assert s["secrets"]["e2b_api_key"]["required"] is False
-    assert "e2b_api_key" not in s["missing"]
+    s = readiness.secret_status(_cfg(provider="docker", docker_image="img"))
+    assert s["secrets"]["kai_host_jwt_secret"]["required"] is False
+    assert "kai_host_jwt_secret" not in s["missing"]
 
 
 def _docker_cfg(**kw):
@@ -87,14 +87,14 @@ def _docker_cfg(**kw):
 
 def test_secret_status_docker_rows_required_only_for_the_docker_provider(monkeypatch):
     """A docker deployment needs the sidecar token and an image, and needs no
-    E2B account at all — the readiness surface must say exactly that."""
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    engine secret at all — the readiness surface must say exactly that."""
+    monkeypatch.delenv("KAI_HOST_JWT_SECRET", raising=False)
     monkeypatch.delenv("APPS_RUNNER_TOKEN", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk")
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
 
     s = readiness.secret_status(_docker_cfg())
-    assert s["secrets"]["e2b_api_key"]["required"] is False
+    assert s["secrets"]["kai_host_jwt_secret"]["required"] is False
     assert s["secrets"]["apps_runner_token"]["required"] is True
     assert s["secrets"]["apps_runner_token"]["set"] is False
     assert s["secrets"]["chat_docker_image"]["required"] is True
@@ -102,9 +102,9 @@ def test_secret_status_docker_rows_required_only_for_the_docker_provider(monkeyp
     assert "apps_runner_token" in s["missing"]
     assert s["ready"] is False
 
-    e2b = readiness.secret_status(_cfg())
-    assert e2b["secrets"]["apps_runner_token"]["required"] is False
-    assert e2b["secrets"]["chat_docker_image"]["required"] is False
+    kai = readiness.secret_status(_cfg())
+    assert kai["secrets"]["apps_runner_token"]["required"] is False
+    assert kai["secrets"]["chat_docker_image"]["required"] is False
 
 
 def test_secret_status_docker_ready_when_token_and_image_present(monkeypatch):
@@ -181,71 +181,6 @@ def test_test_docker_sandbox_classifies_an_unreachable_sidecar(monkeypatch):
     assert r["ok"] is False
     assert "apps-runner" in r["detail"]
     assert "connection refused" in r["detail"]
-
-
-# ---------------------------------------------------------------------------
-# Live probes — E2B
-# ---------------------------------------------------------------------------
-
-
-def test_test_e2b_key_missing(monkeypatch):
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
-    import asyncio
-
-    r = asyncio.run(readiness.test_e2b_key())
-    assert r["ok"] is False
-    assert "not set" in r["detail"]
-
-
-# On the modern e2b SDK ``AsyncSandbox.list`` is a *synchronous* factory that
-# returns an ``AsyncSandboxPaginator``; the authenticated round trip happens
-# when the first page is awaited via ``next_items()``. These fakes mirror that
-# contract exactly — a coroutine-returning ``list`` (the previous fake) hid the
-# real ``TypeError: object AsyncSandboxPaginator can't be used in 'await'``.
-
-
-class _FakePaginator:
-    def __init__(self, *, items=None, error=None):
-        self._items = items or []
-        self._error = error
-
-    async def next_items(self, *a, **k):
-        if self._error is not None:
-            raise self._error
-        return self._items
-
-
-def test_test_e2b_key_valid(monkeypatch):
-    import asyncio
-
-    import e2b
-
-    def _fake_list(*a, **k):  # sync factory, NOT a coroutine
-        return _FakePaginator(items=[])
-
-    monkeypatch.setattr(e2b.AsyncSandbox, "list", staticmethod(_fake_list))
-    r = asyncio.run(readiness.test_e2b_key(api_key="e2b_good"))
-    assert r["ok"] is True
-
-
-def test_test_e2b_key_auth_failure_classified(monkeypatch):
-    import asyncio
-
-    import e2b
-
-    class _AuthErr(Exception):
-        status_code = 401
-
-    def _fake_list(*a, **k):  # error surfaces from the awaited first page
-        return _FakePaginator(error=_AuthErr("unauthorized"))
-
-    monkeypatch.setattr(e2b.AsyncSandbox, "list", staticmethod(_fake_list))
-    r = asyncio.run(readiness.test_e2b_key(api_key="e2b_bad"))
-    assert r["ok"] is False
-    assert "authentication failed" in r["detail"]
-    # Guard: _FakePaginator is deliberately NOT awaitable, so if the impl ever
-    # reverts to ``await AsyncSandbox.list(...)`` the valid-key test above fails
-    # with the exact production TypeError instead of passing silently.
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +293,8 @@ def _make_app(*, chat_enabled: bool = True) -> tuple[TestClient, duckdb.DuckDBPy
     app.include_router(admin_chat_router)
     app.state.chat_config = SimpleNamespace(
         enabled=chat_enabled,
-        provider="e2b",
-        e2b_template_id="agnes-chat",
+        provider="kai-agent",
+        kai_agent_url="http://kai-agent:3000",
     )
     conn = duckdb.connect(":memory:")
     _ensure_schema(conn)
@@ -369,21 +304,21 @@ def _make_app(*, chat_enabled: bool = True) -> tuple[TestClient, duckdb.DuckDBPy
 
 
 def test_readiness_endpoint_returns_presence(monkeypatch):
-    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.delenv("KAI_HOST_JWT_SECRET", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk")
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
     client, _ = _make_app()
     r = client.get("/admin/chat/readiness")
     assert r.status_code == 200
     body = r.json()
-    assert body["secrets"]["e2b_api_key"]["set"] is False
+    assert body["secrets"]["kai_host_jwt_secret"]["set"] is False
     assert body["secrets"]["anthropic_api_key"]["set"] is True
-    assert "e2b_api_key" in body["missing"]
+    assert "kai_host_jwt_secret" in body["missing"]
 
 
 def test_readiness_endpoint_surfaces_llm_runtime(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk")
-    monkeypatch.setenv("E2B_API_KEY", "e2b")
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
     monkeypatch.setenv("JWT_SECRET_KEY", "x" * 40)
     client, _ = _make_app()
     # Healthy → null.
@@ -402,13 +337,21 @@ def test_set_secrets_persists_only_provided(monkeypatch):
         lambda name, value: calls.append((name, value)),
     )
     client, _ = _make_app()
-    r = client.post("/admin/chat/secrets", json={"e2b_api_key": "e2b_new"})
+    r = client.post("/admin/chat/secrets", json={"anthropic_api_key": "sk-new"})
     assert r.status_code == 200
     body = r.json()
-    assert body["changed"] == ["e2b_api_key"]
+    assert body["changed"] == ["anthropic_api_key"]
     assert body["restart_required"] is True
-    # Only the provided key was persisted; the omitted one was untouched.
-    assert calls == [("E2B_API_KEY", "e2b_new")]
+    assert calls == [("ANTHROPIC_API_KEY", "sk-new")]
+
+
+def test_set_secrets_rejects_the_removed_e2b_field():
+    """The e2b provider is gone; its secret slot must not silently accept a
+    write (the field left ChatSecretsBody, so an e2b-only payload is now the
+    empty-payload 422)."""
+    client, _ = _make_app()
+    r = client.post("/admin/chat/secrets", json={"e2b_api_key": "e2b_new"})
+    assert r.status_code == 422
 
 
 def test_set_secrets_rejects_empty_payload():
@@ -444,7 +387,7 @@ def test_secrets_endpoints_require_admin(monkeypatch):
 
     app = FastAPI()
     app.include_router(admin_chat_router)
-    app.state.chat_config = SimpleNamespace(enabled=True, provider="e2b", e2b_template_id="t")
+    app.state.chat_config = SimpleNamespace(enabled=True, provider="kai-agent", kai_agent_url="http://kai-agent:3000")
     conn = duckdb.connect(":memory:")
     _ensure_schema(conn)
     # get_current_user returns a non-admin; require_admin runs for real and 403s.
@@ -452,5 +395,64 @@ def test_secrets_endpoints_require_admin(monkeypatch):
     app.dependency_overrides[_get_db] = lambda: conn
     client = TestClient(app)
     assert client.get("/admin/chat/readiness").status_code == 403
-    assert client.post("/admin/chat/secrets", json={"e2b_api_key": "x"}).status_code == 403
+    assert client.post("/admin/chat/secrets", json={"anthropic_api_key": "x"}).status_code == 403
     assert client.post("/admin/chat/secrets/test").status_code == 403
+
+
+# --- kai-agent: the two cost caps the engine cannot feed ---
+
+
+def _kai_cfg(**over):
+    from types import SimpleNamespace
+
+    base = dict(
+        enabled=True,
+        provider="kai-agent",
+        kai_agent_url="http://kai-agent:3000",
+        docker_image=None,
+        daily_anthropic_spend_usd=20.0,
+        max_session_tokens=200_000,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_readiness_names_the_caps_the_engine_cannot_meter(monkeypatch):
+    """`daily_anthropic_spend_usd` and `max_session_tokens` are enforced off
+    `chat_messages.tokens_in/out`, which only a usage-carrying frame writes.
+    The engine's SSE stream carries none, so on this provider both are inert —
+    and both ship LIVE defaults, so flipping one YAML key silently removes two
+    budgets instance-wide. An operator should not learn that from a bill.
+    """
+    from app.chat.readiness import secret_status
+
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
+    out = secret_status(_kai_cfg())
+    assert set(out["unmetered_caps"]) == {"daily_anthropic_spend_usd", "max_session_tokens"}
+
+
+def test_a_cap_explicitly_disabled_is_not_reported_as_unmetered(monkeypatch):
+    """Only a cap the operator actually set is worth warning about — one
+    already turned off is not a surprise waiting to happen."""
+    from app.chat.readiness import secret_status
+
+    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
+    out = secret_status(_kai_cfg(daily_anthropic_spend_usd=0, max_session_tokens=0))
+    assert out["unmetered_caps"] == []
+
+
+def test_other_providers_meter_normally(monkeypatch):
+    """Non-vacuity: the native runner writes usage, so its caps are live and
+    must not be reported as inert."""
+    from types import SimpleNamespace
+
+    from app.chat.readiness import secret_status
+
+    cfg = SimpleNamespace(
+        enabled=True,
+        provider="docker",
+        docker_image="agnes-chat-sandbox:latest",
+        daily_anthropic_spend_usd=20.0,
+        max_session_tokens=200_000,
+    )
+    assert secret_status(cfg)["unmetered_caps"] == []

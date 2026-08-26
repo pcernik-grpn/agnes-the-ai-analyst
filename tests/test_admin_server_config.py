@@ -1229,10 +1229,16 @@ class TestSectionMetadataHasNoPhantomSections:
     half-removal that resurfaces the moment that filter changes. That
     happened with the `desktop:` section; this guard is the ratchet.
 
-    Only one direction is asserted. The reverse (a section the API serves
-    that the template does not label) is legitimate: switch-derived
-    sections render with a generated label and deliberately carry no
-    hand-written entry.
+    Both directions are asserted now. The reverse — a section the API serves
+    that the template does not label — used to be exempt on the reasoning that
+    switch-derived sections render with a generated label and deliberately
+    carry no hand-written entry. That exemption cost five real sections
+    (`access_policies`, `chat`, `features`, `mcp`, `studio`): with no
+    `SECTION_GROUPS` membership they landed in the ungrouped tail, which
+    renders BELOW Danger zone, so "Danger zone is last" was quietly untrue and
+    five settings pages were unreachable from the sidenav. Coverage is 21/21
+    as of that fix, and the reverse assertion is what keeps the next editable
+    switch from repeating it.
     """
 
     @staticmethod
@@ -1275,6 +1281,23 @@ class TestSectionMetadataHasNoPhantomSections:
         assert not phantom, (
             f"SECTION_META labels sections the API no longer accepts: {phantom}. "
             "Remove them from admin_server_config.html together with the server-side section."
+        )
+
+    def test_every_editable_section_has_a_label_and_a_group(self):
+        """The reverse direction. A section the API accepts but the template
+        neither labels nor groups renders under a generated label in the
+        ungrouped tail — which paints after Danger zone, i.e. off the bottom of
+        the sidenav's intended order."""
+        from app.api.admin import _EDITABLE_SECTIONS
+
+        tpl = self._template_text()
+        editable = set(_EDITABLE_SECTIONS)
+        missing_meta = sorted(editable - self._section_meta_keys(tpl))
+        missing_group = sorted(editable - self._section_group_names(tpl))
+        assert not missing_meta and not missing_group, (
+            f"sections with no SECTION_META label: {missing_meta}; "
+            f"sections in no SECTION_GROUPS group: {missing_group}. "
+            "An unlabelled section renders in the tail, below Danger zone."
         )
 
     def test_sidenav_groups_list_no_section_the_api_rejects(self):

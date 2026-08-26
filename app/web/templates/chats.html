@@ -44,6 +44,7 @@
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/chats.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {% endblock %}
 
 {% block page_head %}
@@ -198,7 +199,7 @@
          yield to any more (the list is not a table; see the note on it below).
          Three orders, each of which the list can actually be read in. #}
       <div class="fbar-select" id="ch-sortwrap">
-        <select id="ch-sort" aria-label="Sort chats">
+        <select id="ch-sort" class="ds-dropdown-native" aria-label="Sort chats">
           <option value="updated_desc">Recent activity</option>
           <option value="updated_asc">Oldest activity</option>
           <option value="name_asc">Name A–Z</option>
@@ -206,6 +207,23 @@
           <option value="agent_asc">Agent A–Z</option>
           <option value="agent_desc">Agent Z–A</option>
         </select>
+        {# Custom dropdown replacement (#1055), same shape as library.html's
+           #lib-sort — filter_toolbar.js's shared sort engine already
+           re-syncs any `.ds-dropdown` paired to its `sort.el` on every
+           programmatic value change (syncPairedDropdown()), so no page-local
+           JS is needed here. #}
+        {{ ds.dropdown(
+          id='ch-sort-dd', target='ch-sort',
+          aria_label='Sort chats', selected='updated_desc',
+          options=[
+            {'value': 'updated_desc', 'label': 'Recent activity'},
+            {'value': 'updated_asc', 'label': 'Oldest activity'},
+            {'value': 'name_asc', 'label': 'Name A–Z'},
+            {'value': 'name_desc', 'label': 'Name Z–A'},
+            {'value': 'agent_asc', 'label': 'Agent A–Z'},
+            {'value': 'agent_desc', 'label': 'Agent Z–A'},
+          ],
+        ) }}
       </div>
 
       {# List ⇄ grid toggle — the same shared control as the Library and My
@@ -387,6 +405,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script src="{{ static_url('js/filter_toolbar.js') }}"></script>
 {# The shared row menu — same component, same three actions, plus this page's
    Archive/Restore. Loaded here because /chats is not a chat surface, so neither

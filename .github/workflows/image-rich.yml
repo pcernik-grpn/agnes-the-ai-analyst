@@ -1,0 +1,119 @@
+name: Rich image (docling + embeddings)
+
+# The `-rich` image variant: the ordinary server image plus the `[docling]`
+# and `[embeddings]` extras, for instances that ingest office documents
+# (docx/pptx/epub/msg) or want hybrid rather than lexical-only retrieval.
+#
+# Deliberately NOT part of `release.yml`. Both extras pull torch, so this
+# image is gigabytes larger and slower to build; making every release carry
+# that would cost every VM in the fleet disk and pull time for a capability
+# only some instances use. An instance opts in by pointing its image_tag at
+# a `-rich` tag.
+#
+# Manual by design (`workflow_dispatch`): the rich image tracks the same code
+# as the channel it is built from, so it is rebuilt when an instance that
+# uses it needs to roll forward — not on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build (default: the default branch)"
+        required: false
+        default: ""
+      tag_suffix:
+        description: "Tag suffix. The image is published as <channel>-<suffix>, e.g. stable-rich"
+        required: false
+        default: "rich"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-rich:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve channel and version
+        id: meta
+        run: |
+          set -euo pipefail
+          # Same channel rule release.yml uses: main is `stable`, anything
+          # else is a dev build. Kept simple on purpose — this workflow does
+          # not publish floating per-user tags.
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ -z "${{ inputs.ref }}" ]; then
+            CHANNEL="stable"
+          elif [ "${{ inputs.ref }}" = "main" ]; then
+            CHANNEL="stable"
+          else
+            CHANNEL="dev"
+          fi
+          VERSION="$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')"
+          SUFFIX="${{ inputs.tag_suffix }}"
+          SUFFIX="${SUFFIX:-rich}"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "suffix=${SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building ${CHANNEL}-${SUFFIX} from $(git rev-parse --short HEAD) (v${VERSION})"
+
+      - name: Free disk space
+        # The torch wheels the extras pull do not fit alongside the runner's
+        # preinstalled toolchains — without this the build dies partway with
+        # a bare "no space left on device".
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          push: true
+          build-args: |
+            AGNES_VERSION=${{ steps.meta.outputs.version }}
+            RELEASE_CHANNEL=${{ steps.meta.outputs.channel }}
+            AGNES_COMMIT_SHA=${{ github.sha }}
+            AGNES_TAG=${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}
+            EXTRA_EXTRAS=,docling,embeddings
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.channel }}-${{ steps.meta.outputs.suffix }}
+            ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.suffix }}
+            ghcr.io/${{ github.repository }}:sha-${{ steps.meta.outputs.short_sha }}-${{ steps.meta.outputs.suffix }}
+
+      - name: Verify the extras are actually present
+        # A rich image whose extras silently failed to install is worse than
+        # no rich image: it looks identical and degrades at runtime (office
+        # uploads rejected, retrieval lexical-only), which is the exact
+        # failure this variant exists to remove. Assert the capability
+        # probes, not just that the build succeeded.
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.channel }}-${{ steps.meta.outputs.suffix }}"
+          docker run --rm --entrypoint python "$IMAGE" -c "
+          from src.ingest.retrieval import retrieval_mode
+          from src.ingest.text_extract import docling_capability
+          mode = retrieval_mode()
+          docling = docling_capability()
+          print(f'retrieval_mode={mode} docling={docling}')
+          assert mode == 'hybrid', f'expected hybrid retrieval, got {mode}'
+          assert docling, 'docling extra is not importable in the rich image'
+          "
+
+      - name: Report the size cost
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.channel }}-${{ steps.meta.outputs.suffix }}"
+          docker image inspect "$IMAGE" --format 'rich image size: {{.Size}} bytes' || true
+          echo "Instances opt in by setting image_tag to ${{ steps.meta.outputs.channel }}-${{ steps.meta.outputs.suffix }}"

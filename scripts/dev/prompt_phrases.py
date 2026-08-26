@@ -28,7 +28,30 @@ BANNED_PHRASES: list[str] = [
     # literal JWT fragment inside the rendered body.
     "{token}",
     "eyJ",
+    # Patch 3 — read back out of a real install transcript, where the agent
+    # quoted these lines as its reason for distrusting the whole prompt.
+    #
+    # Pre-emptive trust assertions: text that answers a safety question the
+    # reader has not asked yet reads as written to defuse the check. State
+    # what a step does and leave the judgement to whoever is reading.
+    "org's call",
+    "verify it with their IT",
+    "OK to use",
+    # Concealment framing around the credential. The behaviour is fine — the
+    # token lives in a file and nothing needs to display it — but phrased as
+    # an instruction to keep it out of sight it reads as hiding a credential
+    # from oversight rather than as "there is nothing to show here".
+    "never print the token",
+    "never on the command line",
 ]
+
+# Deliberately NOT guarded here: the strongest trigger in that transcript was
+# a hostname mismatch — a workspace doc naming one fleet-wide Agnes host as
+# the legitimate one while the install ran against a per-instance host, which
+# the agent read as a look-alike domain. That is a relationship between two
+# values, not a phrase, so no substring check can see it; a per-instance
+# server URL rendered through the normal templating is the fix, and a phrase
+# pattern here would only produce false positives on ordinary host mentions.
 
 # Facts that must survive de-escalation — the wording changed, not the
 # underlying information.

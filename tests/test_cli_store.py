@@ -541,7 +541,64 @@ def test_store_status_wait_times_out(monkeypatch):
     monkeypatch.setattr(store_mod.time, "sleep", lambda s: None)
     result = runner.invoke(store_app, ["status", "e1", "--wait", "--timeout", "300"])
     assert result.exit_code == 2
-    assert "still" in _clean(result.output).lower()
+    assert "still" in _clean(result.output).lower() or "still" in _clean(result.stderr).lower()
+
+
+def test_store_status_wait_json_emits_single_document(monkeypatch):
+    """--wait --json must emit exactly ONE JSON document (the final state).
+
+    Regression: the wait loop used to json.dumps() every poll iteration, so
+    the stdout of `agnes store status <id> --wait --json` was several
+    concatenated JSON documents and json.loads() over it failed.
+    """
+    import json as _json
+
+    import cli.commands.store as store_mod
+
+    responses = iter(
+        [
+            _status_body("pending_llm"),
+            _status_body("pending_llm"),
+            _status_body("approved"),
+        ]
+    )
+    monkeypatch.setattr(store_mod, "api_get_json", lambda path: next(responses))
+    monkeypatch.setattr(store_mod.time, "sleep", lambda s: None)
+    result = runner.invoke(store_app, ["status", "e1", "--wait", "--json"])
+    assert result.exit_code == 0, result.output
+    body = _json.loads(result.stdout)  # raises if more than one document
+    assert body["submission"]["status"] == "approved"
+    assert result.stdout.count('"entity_id"') == 1
+
+
+def test_store_status_wait_json_timeout_single_document(monkeypatch):
+    """Timeout under --wait --json: one pending document on stdout, note on stderr."""
+    import json as _json
+
+    import cli.commands.store as store_mod
+
+    monkeypatch.setattr(store_mod, "api_get_json", lambda path: _status_body("pending_llm"))
+    fake_now = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(store_mod.time, "monotonic", lambda: float(next(fake_now)))
+    monkeypatch.setattr(store_mod.time, "sleep", lambda s: None)
+    result = runner.invoke(store_app, ["status", "e1", "--wait", "--timeout", "300", "--json"])
+    assert result.exit_code == 2
+    body = _json.loads(result.stdout)
+    assert body["submission"]["status"] == "pending_llm"
+    assert "still" in _clean(result.stderr).lower()
+
+
+def test_store_status_json_no_wait_single_document(monkeypatch):
+    """Plain --json (no --wait) stays a single parseable document."""
+    import json as _json
+
+    import cli.commands.store as store_mod
+
+    monkeypatch.setattr(store_mod, "api_get_json", lambda path: _status_body("approved"))
+    result = runner.invoke(store_app, ["status", "e1", "--json"])
+    assert result.exit_code == 0, result.output
+    body = _json.loads(result.stdout)
+    assert body["submission"]["status"] == "approved"
 
 
 def test_store_delete_without_tty_names_the_remedy(monkeypatch):

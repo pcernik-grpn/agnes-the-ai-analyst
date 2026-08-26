@@ -233,15 +233,14 @@ def _seed_copresence_app(conn):
 
 
 @pytest.fixture
-def co_ws_app(e2e_env):
+def co_ws_app(e2e_env, shared_app):
     from src.db import get_system_db
-    from app.main import create_app
     from app.chat.persistence import ChatRepository
     from fastapi.testclient import TestClient
 
     conn = get_system_db()
     co_id, owner_tk, collab_tk, stranger_tk = _seed_copresence_app(conn)
-    app = create_app()
+    app = shared_app
     app.state.chat_repo = ChatRepository(conn)
     client = TestClient(app, raise_server_exceptions=False)
     yield client, co_id, owner_tk, collab_tk, stranger_tk

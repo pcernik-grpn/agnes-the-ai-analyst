@@ -1,162 +1,69 @@
-{tls_trust_block}Set up the {instance_brand} CLI on this machine.
+Set up the {{ instance.name }} CLI on this machine.
 
 Server: {server_url}
 
 Your login token is already saved on this machine at ~/.agnes/token
-(written by step 4 of the install guide at {server_url}). The steps
-below only reference that file path — never print the token, echo
-it, or paste it into this chat.
+(written by step 4 of the install guide at {server_url}). The steps below
+use that file path, so there is no need to display its contents.
 
-Run these, in order. The script is idempotent — safe to re-run if a step
-fails partway through. If a step fails with an unfamiliar error, paste the
-exact error back and stop. Do NOT improvise around TLS errors by disabling
-verification (`-k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`,
-`git -c http.sslVerify=false`, etc.) — those are dead ends that hide the
-real problem.
+Every step below is idempotent and safe to re-run: a machine that already
+ran this setup converges instead of reinstalling, so treat "already
+configured" outcomes as success. If a step fails with an unfamiliar error,
+paste the exact error back and stop — and for a TLS error look for the cause
+(corporate proxy, internal CA, clock skew) rather than lowering certificate
+verification.
 
-{install_cli_block}
+Before you start, confirm the login token file is in place:
+   test -s ~/.agnes/token && echo "token present" || echo "token missing"
 
-2) Confirm the install location.
-   The /home page's "Step 2 — pick a folder" recommended
-       mkdir -p ~/Desktop/{workspace_dir} && cd ~/Desktop/{workspace_dir}
-   but the install works in any workspace folder the user prepared.
-   Decide where to install using the three branches below — do NOT
-   silently `mkdir`/`cd` anywhere, and do NOT treat the user's current
-   cwd as a mistake unless it lands in the REFUSE list.
+   Missing: an earlier run may have consumed it, but that needs BOTH a
+   saved credential and a matching server — token.json records no server,
+   and the installer writes server: before anyone has signed in:
+      test -f ~/.config/agnes/token.json && grep -m1 '^server:' ~/.config/agnes/config.yaml
+   Prints {server_url} → continue. Anything else, including no output →
+   not signed in to {server_url}: stop, send the user to
+   {server_url}/home step 4 — the step that saves it.
 
-   Run:
-       pwd
+1) Install the CLI:
+   TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
+   (cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ {server_url}/cli/download)
+   WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
+   [ -n "$WHEEL" ] || { echo "error: wheel download failed (no .whl in $TMPDIR_WHEEL)" >&2; exit 1; }
+   uv tool install --force "$WHEEL"
 
-   2a) REFUSE — these paths are never safe to install into. STOP and
-       tell the user verbatim:
+   If uv is not installed yet, install it from the official instructions at
+   https://docs.astral.sh/uv/ — on Windows `winget install --id=astral-sh.uv`,
+   on macOS `brew install uv`. If you use the shell installer instead,
+   download it to a file and show it to me before running it.
 
-           "I won't install {instance_brand} into <pwd> — it's a home or
-           system directory and the install would scatter .claude/,
-           .agnes/, AGNES_WORKSPACE.md and marketplace clones across
-           it. Please pick a workspace folder (e.g. ~/Desktop/{workspace_dir}
-           or ~/work/{workspace_dir}), cd into it, and re-paste this
-           script from there."
+   If `agnes --version` fails after install because ~/.local/bin is not on PATH:
+     export PATH="$HOME/.local/bin:$PATH"
+     RC="$HOME/.zshrc"  # or ~/.bashrc / ~/.bash_profile
+     grep -qF '$HOME/.local/bin' "$RC" 2>/dev/null \
+       || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
 
-       Then stop — no `mkdir`, no `cd`, no further steps. The refuse
-       list is exact match on:
-           $HOME    /    /tmp    /etc    /usr    /var    /opt
-           /root    /bin    /sbin    /boot    /sys    /proc
+2) Set up the {{ instance.name }} workspace in the current directory:
 
-   2b) PROCEED SILENTLY — if the cwd is a prepared workspace, just
-       continue to step 3 without prompting. The whitelisted artefacts
-       a prepared workspace may already hold are:
-           .git    .claude    .agnes    AGNES_WORKSPACE.md    README.md
-       To check, run (fixed-string match, no regex):
+   agnes onboard --server-url "{server_url}" --workspace .
 
-           ls -A | grep -Fxv -e .git -e .claude -e .agnes -e AGNES_WORKSPACE.md -e README.md | head -1
+   The CLI checks the directory first: it declines home and system directories,
+   and asks before adopting a directory that already holds unrelated files.
+   Relay its instructions to the user and follow them — re-run with
+   `--accept-dir` only once the user has explicitly agreed to this directory
+   (the install guide suggested a workspace folder such as ~/Desktop/Agnes).
+   Don't pick or create a folder on your own.
 
-       If the output is empty (cwd is empty OR contains only the
-       whitelisted artefacts above) → the user clearly prepared this
-       folder; continue to step 3 in <pwd>. Remember <pwd> as the
-       install dir for step 9.
+   From there `agnes onboard` converges the rest in one run — workspace init,
+   the first data pull, the marketplace plugins, and diagnostics — and is
+   safe to re-run. Read its summary; step 4 asks you to recap it.
 
-   2c) CONFIRM — for any other cwd (unrelated content present), tell
-       the user verbatim, exactly once:
+3) Restart Claude Code so every plugin, MCP server, and hook installed above actually loads:
+   Tell me to type `/exit` (or close the Claude Code session entirely), then run `claude` again from this same directory.
 
-           "I'll install {instance_brand} in <pwd>. Reply 'ok' to
-           continue here, 'default' to install in ~/Desktop/{workspace_dir}
-           instead, or 'abort' to stop. (For a different custom path:
-           type /exit, `cd` to where you want it, then run `claude`
-           again and re-paste this script.)"
-
-       Wait for the user's reply.
-         - 'ok' / 'yes' / 'install here' / Enter → continue to step 3
-                       in <pwd>. Remember <pwd> as the install dir.
-         - 'default' → run:
-                       mkdir -p ~/Desktop/{workspace_dir} && cd ~/Desktop/{workspace_dir}
-                       Then continue to step 3 in the new cwd.
-                       Remember ~/Desktop/{workspace_dir} as the install
-                       dir for step 9.
-         - 'abort' / anything else → stop without making any changes.
-                       Do NOT run `mkdir`, do NOT `cd`, do NOT continue.
-
-3) Bootstrap your {instance_brand} workspace in this directory.
-   The token was saved to ~/.agnes/token by step 4 of the install
-   guide, so there is nothing to write here — `agnes init
-   --token-file` reads it directly (never on the command line, which
-   would trip Claude Code's auto-classifier) and removes the file
-   once the credential is saved to ~/.config/agnes/token.json:
-
-   agnes init --server-url "{server_url}" --token-file ~/.agnes/token --workspace .
-
-   If Claude Code still blocks an `agnes` command (e.g. the
-   `agnes init` line above or `agnes catalog` in step 4), prefix
-   it with `!` to run the command directly in your shell,
-   bypassing the auto-classifier — e.g. `! agnes init …`. The
-   `!` prefix is Claude Code's escape hatch for commands you
-   explicitly trust.
-
-   This authenticates with the PAT, fetches your CLAUDE.md (RBAC-filtered),
-   writes AGNES_WORKSPACE.md (human-facing docs), installs Claude Code
-   SessionStart/End hooks (auto-refresh), and runs an initial `agnes pull`
-   so your DuckDB views are ready.
-
-4) Verify the data is queryable:
-   agnes catalog
-
-   This should list the tables your account has grants for. Empty list
-   means your admin hasn't granted you access yet — contact them.
-
-   Tip: type `/agnes-private` inside any Claude Code session to mark it
-   private — its transcript is skipped by `agnes push` (audit-logged to
-   `.claude/agnes-sessions-private-skipped.txt`). The statusbar shows
-   `🔒 agnes-private` while you're in a private session.
-
-5) Make sure git and claude are installed (required for the marketplace clone):
-     git --version
-     claude --version
-
-   If `git --version` fails ("command not found" or similar), install git:
-     - macOS:   brew install git
-     - Windows: winget install --id Git.Git -e --source winget --silent
-     - Linux:   sudo apt-get install git    OR    sudo dnf install git
-
-   If `claude --version` fails, install Claude Code:
-     - npm (Linux): npm i -g @anthropic-ai/claude-code
-     - macOS / Windows native installer: see https://docs.claude.com/claude-code
-
-   Then re-run both `--version` checks to confirm before continuing.
-
-{marketplace_block}
-
-7) Run diagnostics:
-   agnes diagnose
-
-   This should print "Overall: healthy". `db_schema: unknown` and
-   `data: 0 tables` are NORMAL in two cases:
-     - fresh install (no tables registered yet), and
-     - non-admin roles (e.g. `analyst`) that don't have grants to read
-       the system schema even on populated instances.
-   Only flag actual yellow/red checks (api / duckdb_state / users).
-
-8) Connect the user's tools (last interactive ask before Confirm):
-
-   For each tool below, ask the user verbatim: "Set up <NAME> now? (Y/n)".
-   Treat empty/Enter as YES — the default is install. Only skip when the
-   user types an explicit "no" / "n" / "skip". Wait for each answer
-   before moving to the next. The prompts below are idempotent and
-   safe to re-run if anything goes sideways.
-
-{connector_tiles}
-
-   After all asks (regardless of answers) continue to step 9.
-
-9) Restart Claude Code so every plugin, MCP server, and SessionStart hook installed above actually loads:
-   Tell me to type `/exit` (or close the Claude Code session entirely), then run `claude` again from this same directory — the install dir confirmed in step 2 (`~/Desktop/{workspace_dir}` on the default path, or whatever cwd the user explicitly accepted with 'install here').
-   The next session boots with all marketplace plugins, every connector's keychain entries / OAuth grants, and the agnes-welcome + refresh-marketplace SessionStart hooks active. This is the last action before the Confirm summary — once I'm back in Claude Code, setup is complete.
-
-10) Confirm:
-   Tell me "{instance_brand} workspace is ready" and summarize:
-   - `agnes --version` output
-   - First few lines of `agnes catalog` (tables you can see)
-   - Confirmation that `./CLAUDE.md` and `./AGNES_WORKSPACE.md` exist
-   - Confirmation that `./.claude/settings.json` contains SessionStart/End hooks
-   - The `agnes diagnose` overall status
-   - Whether skills were copied or left on-demand
-   - Confirmation that `~/.agnes/marketplace/.git/` exists (the marketplace clone) and that any granted plugins installed
-   - For each connector listed in step 8: the verbatim ✅ or ❌ line that the connector's verify step emitted earlier in this session (e.g. `✅ Asana ready — ...` or `❌ Atlassian setup failed: ...`). If the user declined a connector, say declined.{ca_bundle_finale_bullet}
+4) Confirm:
+   Tell me "{{ instance.name }} workspace is ready" and recap what `agnes onboard`
+   reported:
+   - what it installed versus what was already present
+   - the diagnose status it finished on
+   - which connectors are available to set up later — nothing to do now,
+     just ask when you want one (e.g. "set up Jira")

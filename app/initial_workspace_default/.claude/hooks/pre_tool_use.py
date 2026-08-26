@@ -42,11 +42,11 @@ def _agnes_host() -> str | None:
     """This instance's own hostname, from the env the sandbox is spawned with.
 
     It cannot be a literal above: the host differs per deployment, and this
-    file ships verbatim. `app/chat/e2b_provider.py::_effective_allow_out`
-    derives the same host for the VM-level policy and its comment claims the
-    two agree — they did not. The VM allowed the Agnes host and this hook did
-    not, so every in-sandbox request to Agnes was refused here, before it ever
-    reached the network that would have permitted it.
+    file ships verbatim. A historic sandbox-level allowlist derived the same
+    host for its own policy and its comment claimed the two agreed — they did
+    not. The sandbox allowed the Agnes host and this hook did not, so every
+    in-sandbox request to Agnes was refused here, before it ever reached the
+    network that would have permitted it.
 
     What that cost, watched live: asked to build a data app, the agent got its
     git credential from the API, then failed to clone the app's repo by name,
@@ -60,8 +60,10 @@ def _agnes_host() -> str | None:
     write to its own environment — so a rewritten value would widen this set.
     That is not a regression. This hook lives inside the sandbox on a
     filesystem the agent can write, so it has always been advisory; the
-    authoritative control is the VM egress policy (`deny_out=[ALL_TRAFFIC]`
-    plus an allowlist the sandbox cannot touch), and that policy is unchanged.
+    authoritative controls live outside the sandbox — the docker provider's
+    egress modes (`none`'s internal bridge, `allowlist`'s egress-proxy
+    sidecar with its compose-owned EGRESS_ALLOW_HOSTS) and, on kai-agent,
+    the engine's own sandbox policy.
     """
     import os
     from urllib.parse import urlparse

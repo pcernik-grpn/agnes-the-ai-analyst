@@ -111,6 +111,14 @@ class TestRewrite:
         assert wrap_with_limit("SELECT 1", 10).endswith("LIMIT 10")
         assert "SELECT 1" in wrap_with_limit("SELECT 1", 10)
 
+    def test_wrap_with_limit_strips_one_trailing_semicolon(self):
+        # A trailing `;` is a legal top-level statement terminator but breaks
+        # Spark SQL once embedded inside this subquery wrap; /api/query's
+        # SELECT-only guard tolerates it, so the wrap must too.
+        wrapped = wrap_with_limit("SELECT 1;", 10)
+        assert ";" not in wrapped
+        assert wrapped == wrap_with_limit("SELECT 1", 10)
+
 
 # ---------------------------------------------------------------------------
 # 2. Registry gate + engine arbitration

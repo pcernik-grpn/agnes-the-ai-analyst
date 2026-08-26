@@ -56,6 +56,31 @@ def get_server_url() -> str:
     return os.environ.get("AGNES_SERVER", config.get("server", "http://localhost:8000"))
 
 
+def resolve_server_url(explicit: Optional[str] = None) -> Optional[str]:
+    """Explicit flag → ``AGNES_SERVER`` → saved config. ``None`` when unknown.
+
+    The counterpart to `get_server_url()` for commands that must not INVENT a
+    server. `get_server_url()` falls back to ``http://localhost:8000``, which
+    is right for a local dev loop and wrong for anything that then acts on it:
+    `agnes auth login` used to open a browser at that default, so a user who
+    forgot ``--server`` saw only "localhost refused to connect" with nothing
+    naming the real cause. Commands that need a REAL server resolve here and
+    refuse on ``None``.
+
+    Trailing slashes are stripped so a pasted ``https://host/`` and a typed
+    ``https://host`` persist identically.
+    """
+    if explicit:
+        return explicit.rstrip("/")
+    env = os.environ.get("AGNES_SERVER")
+    if env:
+        return env.rstrip("/")
+    saved = (load_config() or {}).get("server")
+    if saved:
+        return str(saved).rstrip("/")
+    return None
+
+
 def get_token() -> Optional[str]:
     # In-process override wins over BOTH the on-disk file and the env var.
     # Set by `_with_token_override(...)`; used by `agnes init --token X`

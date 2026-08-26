@@ -32,45 +32,104 @@ Reviewers should bounce PRs that touch user-visible behavior without a
 changelog update — same way they'd bounce a PR with no test changes for new
 logic.
 
-## Release-cut belongs to the PR — non-negotiable
+## Release-cut is a dedicated cut PR — non-negotiable
 
-**The version bump + CHANGELOG rename + new empty `[Unreleased]` are the LAST
-commit on the PR that earned the version. Never a standalone follow-up PR.**
+**Feature PRs never bump `pyproject.toml`, rename `## [Unreleased]`, or touch
+`server.json`'s version field. They only ever add a bullet under
+`## [Unreleased]`** (see the Changelog discipline section above — unchanged).
+The version bump + CHANGELOG rename is cut once a day by
+`.github/workflows/daily-cut.yml`, which opens a PR labeled `release-cut` for
+a human to review and merge. It never merges or tags anything itself.
 
-When a PR lands the only `[Unreleased]` content (or is the last in a queue of
-in-flight feature PRs), the release-cut MUST ship as part of the same merge.
-Standalone release-cut PRs add review-overhead PRs to history with no behavior
-change of their own and pollute `git log` with bookkeeping commits separated
-from the work that earned them.
+This replaces the old rule ("the release-cut ships in the same PR that earns
+the version"), which made whichever PR happened to land last-with-content in
+`[Unreleased]` also own the version bump — in practice, whichever PR won the
+race to merge. Two PRs racing for the same version number produced a
+duplicated `## [X.Y.Z]` heading once merged (see § CHANGELOG merge hazards
+below, kept for the rare manual-cut case), a recurring failure mode across
+15–25 hand-cut releases/day. Centralizing the cut removes the race at the
+root: there is exactly one writer of the version number and the rename, once
+a day.
 
-**Mandatory checklist before approving / enabling auto-merge on ANY PR:**
+### The three version segments
 
-1. **Stop.** Will this PR land alone in `[Unreleased]` (no other in-flight PRs
-   queued behind it)?
-2. **If yes**, the release-cut is REQUIRED in the same PR before merge. BEFORE
-   pushing the final commit:
-   - Bump `pyproject.toml` to `X.Y.Z`
-   - Rename `## [Unreleased]` → `## [X.Y.Z] — YYYY-MM-DD`, add a new empty
-     `## [Unreleased]` on top
-   - Either squash these into the consolidation commit OR add as a separate
-     `release: X.Y.Z` commit on the same branch
-3. **THEN** push, approve, enable auto-merge.
-4. After auto-merge fires: tag `vX.Y.Z` against the merge commit + create a
-   GitHub Release. Done — one PR, one merge, one release.
+- **Minor (`X.Y+1.0`) — the daily batch.** `daily-cut.yml`'s default and its
+  scheduled (cron) run always use this. Every bullet accumulated under
+  `[Unreleased]` since the last cut ships together.
+- **Patch (`X.Y.Z+1`) — emergency hotfix only.** Dispatch `daily-cut.yml`
+  manually with `bump: patch` (`gh workflow run daily-cut.yml -f bump=patch`)
+  to ship immediately, outside the daily cadence. It still ships the
+  *entire* current `[Unreleased]` content — if unrelated in-flight work has
+  already merged, prefer waiting for the next scheduled minor cut instead.
+- **Major (`X+1.0.0`) — milestone, human decision.** Dispatch with `bump:
+  major` only when the team has actually decided this cut is a milestone
+  boundary; never automatic.
 
-**Failure mode to avoid:** enabling auto-merge on the feature PR thinking "I'll
-add the release-cut after." Auto-merge fires faster than the second commit
-lands. The window closes; the only fix is a standalone release-cut PR — exactly
-what this rule prohibits.
+### The train-driver role
 
-**Acceptable standalone release-cut** (rare): only when `[Unreleased]`
-accumulated bullets from MULTIPLE already-merged PRs AND no further
-behavior-change PR is queued — i.e. the cut is the only outstanding work and
-there's no PR to attach it to.
+A human (or an agent session acting for one) merges the ready PR queue
+completely *first*, then reviews and merges the cut PR — in that order. Once
+a cut PR is open, treat it as a short lock on `main`: merging more feature
+PRs while it sits open means `main`'s `[Unreleased]` keeps growing
+underneath a cut branch that already snapshotted an older state of that same
+section, and merging the stale cut PR on top risks the same kind of
+same-region collision this workflow exists to avoid. `daily-cut.yml` won't
+open a second cut PR while one is already open (it checks for an open PR
+carrying the `release-cut` label first), so the practical rule is: **flush
+the queue, then merge the cut PR, in that order, before resuming feature
+merges.** If the cut PR ends up showing a merge conflict against a newer
+`main` (the queue wasn't fully flushed before someone merged past it), close
+it and re-dispatch `daily-cut.yml` rather than resolving the conflict by
+hand — a hand-resolved overlap on `[Unreleased]` is exactly the collision
+class this exists to prevent. Bullets that land after a cut PR opened simply
+ride into the next day's cut; that is expected, not a bug.
+
+### Post-merge: tag + Release
+
+Merging the cut PR to `main` triggers `release.yml`'s ordinary push-to-main
+build (`:stable`, `:stable-YYYY.MM.N`) — no extra step needed for the image.
+The semver tag + GitHub Release are **not** created automatically on merge;
+the cut PR's body carries the exact command to run afterward:
+
+```bash
+gh workflow run tag-release.yml -f tag=vX.Y.Z
+```
+
+(`target` defaults to `main`'s current HEAD, which is correct immediately
+after merging the cut PR, as long as nothing else merged in between.)
+`tag-release.yml` validates the tag against `pyproject.toml` and the
+`CHANGELOG.md` section at the target commit before creating anything
+server-side; re-dispatching is safe (see the workflow's own comments for the
+repair semantics). This is a deliberate choice over tag-on-merge automation:
+a merge-commit-triggered auto-tag would need to re-derive "is this push a
+cut" from the diff to avoid tagging every `main` push — more moving parts
+than a copy-pasteable command in a PR body a human is already reading. The
+rest of the post-merge sequence (rollback-on-smoke-fail, manual rollback,
+weekly pruning) is unchanged — see below.
+
+### Emergency path when Actions dispatch isn't available
+
+`scripts/release_cut.py` (unit-tested in `tests/test_release_cut.py`) is the
+same pure logic `daily-cut.yml` calls — run it directly when you need a cut
+from an environment that can push branches but can't dispatch a workflow:
+
+```bash
+python3 scripts/release_cut.py --bump patch   # or --bump minor / --bump major
+git checkout -b release-cut/v<version>
+git add CHANGELOG.md pyproject.toml server.json
+git commit -m "release: <version>"
+git push -u origin HEAD
+gh pr create --label release-cut --title "release: <version>" --body "..."
+```
+
+`--dry-run --json` prints the computed plan (next version, the bullets it
+would ship) without writing anything — use it to sanity-check before
+committing. An empty `[Unreleased]` is a no-op (exit 0, nothing written), so
+running it speculatively is always safe.
 
 ## Release workflow — concrete recipe
 
-### Happy path (8 steps)
+### Happy path — feature PR (5 steps, no cut)
 
 ```bash
 # 1. Branch from a fresh checkout. iCloud Drive worktrees randomly hang
@@ -85,12 +144,10 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 # 3. Add a CHANGELOG bullet under [Unreleased].
 #    Group: Added | Changed | Fixed | Removed | Internal
 #    Mark BREAKING with **BREAKING** prefix.
+#    Do NOT touch pyproject.toml, server.json, or the [Unreleased] heading
+#    itself — that is the cut PR's job, not this one's.
 
-# 4. Commit the change(s). Multiple logical commits OK; release-cut
-#    will be a SEPARATE last commit (next step). DO NOT bundle the
-#    release-cut into the same commit as the change — it pollutes
-#    the SHA that auto-close keywords reference and makes revert
-#    targeted at the change-only difficult.
+# 4. Commit the change(s).
 
 # 5. Run the full pytest suite locally:
 #    `pytest tests/ -p no:xdist -q` (or `-n auto` if xdist works).
@@ -98,59 +155,26 @@ cd agnes-<topic> && git checkout -b zs/<branch-name>
 #    subprocess timeout) are OK to ignore; verify by reverting your
 #    diff and reproducing on bare main.
 
-# 6. Release-cut commit (LAST commit on the PR per the rule above):
-#    - Bump pyproject.toml: version = "X.Y.Z"
-#    - Rename `## [Unreleased]` → `## [X.Y.Z] — YYYY-MM-DD`
-#    - Add a fresh empty `## [Unreleased]` line above
-#    Commit message: `release: X.Y.Z — <one-line summary>`
-
-# 7. Push branch + open PR + enable auto-merge SQUASH:
+# 6. Push branch + open PR + enable auto-merge SQUASH:
 #    git push -u origin HEAD
 #    gh pr create --repo keboola/agnes-the-ai-analyst \
 #      --head <branch> --title "<...>" --body "<...>"
 #    gh pr merge <N> --repo keboola/agnes-the-ai-analyst \
 #      --squash --auto --delete-branch
-
-# 8. After auto-merge fires (poll or `Monitor`):
-#    git fetch origin --tags
-#    git tag vX.Y.Z <release-cut-sha>
-#    git push origin vX.Y.Z
-#    gh release create vX.Y.Z --repo keboola/agnes-the-ai-analyst \
-#      --title "vX.Y.Z — <...>" --notes "<copy-paste from CHANGELOG>"
-#
-#    OR, from an environment that cannot push tags (remote/CI-managed
-#    operator sessions commonly allow branch pushes but refuse
-#    refs/tags/*): dispatch the `Tag release` workflow instead —
-#    gh workflow run tag-release.yml -f tag=vX.Y.Z -f target=<release-cut-sha>   # the commit that bumped pyproject: the squash/merge commit normally; for an unsquashed cut, the branch's cut commit itself, not the merge
-#    It validates server-side (tag shape, target on main, tag ==
-#    pyproject.toml version at the target, CHANGELOG section present),
-#    creates the tag ref via the API, and publishes the Release with the
-#    CHANGELOG section as its body. Re-dispatching is safe: an
-#    already-tagged-and-released version no-ops, a tag missing its
-#    Release gets the Release created, a tag pointing elsewhere refuses.
 ```
 
-### Picking the next version
+That's it for a feature PR — no version bump, no tag, no Release. The cut
+(and everything after it) is a separate PR; see § Release-cut is a dedicated
+cut PR above.
 
-`pyproject.toml`'s current `version` is the **next-release target** (post-cut
-from the previous release). Pre-1.0 we patch-bump for everything that doesn't
-break operator-facing APIs:
+### Picking the version segment for a cut
 
-- `instance.yaml` schema additions, new env vars, new endpoints → patch (e.g.
-  0.54.3 → 0.54.4)
-- New CLI subcommands, BREAKING removals, schema migrations → still patch within
-  the current 0.5x cycle (no minor bumps cut today)
-- The CHANGELOG `**BREAKING**` marker is what operators grep for; the version
-  number is secondary
-
-Always check `git tag -l "v0.X*"` before naming — if `v0.54.0` is already
-tagged, the next one is `v0.54.1`, even if `pyproject.toml` still says `0.54.0`
-from a stale post-cut commit (we've shipped that race before). Note that this
-stale-pyproject fallback is a local-tag-push path only: the dispatchable
-`tag-release.yml` deliberately refuses a tag that doesn't match
-`pyproject.toml` at the target commit, so in that (rare, already-off-process)
-state, first land a commit that fixes the version, or push the tag from a
-clone that can.
+See § The three version segments above: minor is the default for the daily
+batch, patch is emergency-hotfix-only, major is a human milestone decision.
+`scripts/release_cut.py` reads the CURRENT version straight out of
+`pyproject.toml` and bumps from there — since only the cut PR itself ever
+writes that field, there is no drift to reconcile and no need to cross-check
+`git tag -l` before naming (the old failure mode this used to guard against).
 
 ### Authoring expectations on the PR
 
@@ -199,15 +223,23 @@ clone that can.
 - **Force-pushed and lost auto-merge?** GitHub *usually* preserves auto-merge
   across force-pushes for the same PR; if it cleared, just re-run
   `gh pr merge <N> --squash --auto --delete-branch`.
-- **Release-cut commit forgot to land?** That's the failure mode the
-  "Release-cut belongs to the PR" rule prevents. If it happens anyway: open a
-  follow-on PR with ONLY the release-cut commit, ship it, and write up why in
-  your post-mortem comment.
+- **A cut PR went stale (merge conflict against a newer `main`)?** The queue
+  wasn't fully flushed before something else merged past it — close the
+  stale cut PR and re-dispatch `daily-cut.yml` rather than resolving the
+  conflict by hand (see § The train-driver role above).
 - **Wrong version number tagged?** `git tag -d vX.Y.Z && git push --delete
   origin vX.Y.Z` then re-tag against the right SHA. Update the GitHub Release if
   you already created it.
 
 ### CHANGELOG merge hazards
+
+**This section describes the failure mode the dedicated cut PR (above) was
+built to eliminate.** It should now be rare — feature PRs never rename
+`[Unreleased]` or bump the version, so a long-lived feature branch merging
+`origin/main` only ever picks up a rename on main's side, not a competing
+one from its own branch. Kept for the residual manual-cut path (the
+"Emergency path when Actions dispatch isn't available" case above) and as a
+diagnostic if an old habit resurfaces.
 
 Merging `origin/main` into a long-lived feature branch touches `CHANGELOG.md`
 on both sides almost every time — main keeps cutting releases while your
@@ -449,9 +481,11 @@ you don't need; keep the Keep-a-Changelog order.
 - Refactors, test additions, dependency bumps with no behavior change.
 ```
 
-At release-cut time `## [Unreleased]` is renamed to `## [X.Y.Z] — YYYY-MM-DD`
-and a fresh empty `## [Unreleased]` is added on top. CI publishes the matching
-`stable-YYYY.MM.N` image tag for the merge commit (see Deploy workflows above).
+The daily cut PR (`.github/workflows/daily-cut.yml`) renames
+`## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and adds a fresh empty
+`## [Unreleased]` on top — never a feature PR. CI publishes the matching
+`stable-YYYY.MM.N` image tag for the cut PR's merge commit (see Deploy
+workflows above).
 
 ## Slack release digest (optional)
 

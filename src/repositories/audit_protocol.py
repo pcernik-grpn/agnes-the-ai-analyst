@@ -113,6 +113,11 @@ class AuditRepositoryProtocol(Protocol):
         """Most recent scheduler-classified audit row timestamp."""
         ...
 
+    def prune_older_than(self, days: int) -> int:
+        """Delete rows older than ``days``; return the deleted-row count.
+        The caller owns the "0/negative = keep forever" short-circuit."""
+        ...
+
     def active_users_since(self, since: datetime) -> int:
         """Distinct non-NULL user_id count at/after *since*."""
         ...

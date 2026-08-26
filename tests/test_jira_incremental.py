@@ -517,3 +517,146 @@ def test_incremental_skips_partial_comments_when_created_at_unparseable(tmp_path
         "partial comment list into the fallback (current) month — this can "
         "double-count the thread once the real creation month is known"
     )
+
+
+# --------------------------------------------------------------------------------
+# Changelog: absent overlay preserves, present-but-empty wipes.
+# --------------------------------------------------------------------------------
+#
+# The exact contract `_remote_links` has carried since #203, applied to the one
+# other table whose overlay can go missing. `fetch_issue` and the backfill both
+# request `expand=renderedFields,changelog`, so a successful fetch ALWAYS carries
+# a `changelog` key — the only writer that does not is the webhook fetch-failure
+# fallback, whose payload is the event body Jira embedded, and Jira has never
+# embedded a changelog there. Every such save therefore wrote zero changelog rows
+# through an issue-scoped delete-then-insert, silently deleting the issue's whole
+# stored history.
+
+
+def _seed_changelog_parquet(parquet_root, month_key, rows):
+    from connectors.jira.transform import CHANGELOG_SCHEMA
+
+    target = parquet_root / "changelog"
+    target.mkdir(parents=True, exist_ok=True)
+    save_parquet_month(pd.DataFrame(rows), CHANGELOG_SCHEMA, target, month_key)
+
+
+def _issue_without_changelog(issue_key: str) -> dict:
+    return {
+        "key": issue_key,
+        "id": "10001",
+        "fields": {
+            "summary": "test",
+            "status": {"name": "Open"},
+            "issuetype": {"name": "Bug"},
+            "attachment": [],
+            "comment": {"comments": [], "total": 0},
+            "created": "2026-05-15T00:00:00.000+0000",
+            "updated": "2026-05-15T00:00:00.000+0000",
+        },
+        "_remote_links": [],
+        # NOTE: no `changelog` key — that is the test condition.
+    }
+
+
+def _stored_change_ids(output_dir, issue_key):
+    df = load_parquet_month(output_dir / "changelog", "2026-05")
+    if df is None:
+        return []
+    return df[df["issue_key"] == issue_key]["change_id"].tolist()
+
+
+def test_incremental_preserves_changelog_when_the_key_is_absent(tmp_path):
+    """A payload with no `changelog` key carries no fresh history — it is not
+    evidence that the issue has none. The webhook fetch-failure fallback is
+    exactly this shape, so before the preserve selector every such save wiped the
+    issue's stored changelog rows."""
+    raw_dir, output_dir, attachments_dir = tmp_path / "raw", tmp_path / "parquet", tmp_path / "attachments"
+    output_dir.mkdir()
+    attachments_dir.mkdir()
+
+    _seed_changelog_parquet(
+        output_dir,
+        "2026-05",
+        [
+            {
+                "change_id": "ch-existing",
+                "issue_key": "PROJ-1",
+                "author_email": "a@example.com",
+                "author_name": "A",
+                "field_name": "status",
+                "field_type": "jira",
+                "from_value": "New",
+                "to_value": "In Progress",
+                "changed_at": "2026-05-15T00:00:00+00:00",
+            }
+        ],
+    )
+    _write_raw_issue(raw_dir, "PROJ-1", _issue_without_changelog("PROJ-1"))
+
+    ok = transform_single_issue(
+        issue_key="PROJ-1", raw_dir=raw_dir, output_dir=output_dir, attachments_dir=attachments_dir
+    )
+
+    assert ok is True
+    assert _stored_change_ids(output_dir, "PROJ-1") == ["ch-existing"], (
+        "stored changelog rows were wiped by a payload that carried no changelog overlay"
+    )
+
+
+def test_incremental_wipes_changelog_when_histories_is_present_but_empty(tmp_path):
+    """The mirror image, and the reason the check is on the KEY rather than on
+    emptiness: `{'histories': []}` is a successful fetch confirming the issue has
+    no history right now, so stale rows must go. Collapsing the two would make
+    the preserve rule unfalsifiable."""
+    raw_dir, output_dir, attachments_dir = tmp_path / "raw", tmp_path / "parquet", tmp_path / "attachments"
+    output_dir.mkdir()
+    attachments_dir.mkdir()
+
+    _seed_changelog_parquet(
+        output_dir,
+        "2026-05",
+        [
+            {
+                "change_id": "ch-stale",
+                "issue_key": "PROJ-2",
+                "author_email": "a@example.com",
+                "author_name": "A",
+                "field_name": "status",
+                "field_type": "jira",
+                "from_value": "New",
+                "to_value": "In Progress",
+                "changed_at": "2026-05-15T00:00:00+00:00",
+            }
+        ],
+    )
+    issue = _issue_without_changelog("PROJ-2")
+    issue["changelog"] = {"histories": []}
+    _write_raw_issue(raw_dir, "PROJ-2", issue)
+
+    ok = transform_single_issue(
+        issue_key="PROJ-2", raw_dir=raw_dir, output_dir=output_dir, attachments_dir=attachments_dir
+    )
+
+    assert ok is True
+    assert _stored_change_ids(output_dir, "PROJ-2") == [], (
+        "a successful empty-history fetch left stale changelog rows behind"
+    )
+
+
+def test_a_full_rebuild_survives_an_issue_whose_changelog_overlay_is_absent(tmp_path):
+    """`transform_all` extends a list with the selector's return value. Widening
+    the return type to `list | None` without guarding that extend crashes the
+    rebuild mid-issue — and the per-file handler is a blind `except`, so the run
+    would finish "successfully" having silently dropped every table's rows for
+    that issue."""
+    from connectors.jira.transform import transform_all
+
+    raw_dir, output_dir = tmp_path / "raw", tmp_path / "parquet"
+    output_dir.mkdir()
+    _write_raw_issue(raw_dir, "PROJ-3", _issue_without_changelog("PROJ-3"))
+
+    counts = transform_all(raw_dir=raw_dir, output_dir=output_dir)
+
+    assert counts["issues"] == 1, "the issue was dropped by the blind per-file except — a partial-bucket rebuild"
+    assert counts["changelog"] == 0

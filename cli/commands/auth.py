@@ -13,6 +13,7 @@ from cli.config import (
     clear_token,
     get_token,
     get_server_url,
+    resolve_server_url,
     save_config,
     load_config,
 )
@@ -68,12 +69,50 @@ def _manual_token_hint() -> None:
     )
 
 
-def _login_with_password(server: str | None) -> None:
-    """Terminal-only email+password login (no browser)."""
-    if server:
-        import os
+def _require_server(explicit: str | None) -> str:
+    """Resolve the server to sign in against, or exit 1 naming the fix.
 
-        os.environ["AGNES_SERVER"] = server
+    Both login paths (browser loopback and ``--password``) run through here
+    BEFORE anything else, so neither can fall back to `get_server_url()`'s
+    ``http://localhost:8000`` default and send the user to a server that
+    isn't there. Exporting ``AGNES_SERVER`` keeps the rest of this process —
+    including the manual-fallback hint on failure — on the resolved host;
+    writing it to the config is `_persist_server`'s job, once the sign-in has
+    actually worked.
+    """
+    import os
+
+    resolved = resolve_server_url(explicit)
+    if not resolved:
+        typer.echo(
+            "No server configured. Pass --server https://<your-agnes-host>, or set "
+            "AGNES_SERVER.\n"
+            "  Running an instance on this machine? --server http://localhost:8000",
+            err=True,
+        )
+        raise typer.Exit(1)
+    os.environ["AGNES_SERVER"] = resolved
+    return resolved
+
+
+def _persist_server(explicit: str | None, resolved: str) -> None:
+    """Save an explicitly-passed ``--server`` — only after a successful login.
+
+    Without this the URL lived in ``AGNES_SERVER`` for one process only, so
+    the next command (and `agnes pull`, and `whoami`) resolved back to the
+    localhost default until `agnes init` seeded the config. Deliberately
+    AFTER the token lands, unlike `agnes auth import-token`: a typo'd host
+    that failed to sign in must not become the persisted default.
+    """
+    if explicit:
+        save_config({"server": resolved})
+
+
+def _login_with_password() -> None:
+    """Terminal-only email+password login (no browser).
+
+    The server is already resolved and exported by `_require_server`.
+    """
     email = typer.prompt("Email")
     password = typer.prompt("Password", hide_input=True)
     body = {"email": email, "password": password}
@@ -100,7 +139,11 @@ def _login_with_password(server: str | None) -> None:
 
 @auth_app.command()
 def login(
-    server: str = typer.Option(None, help="Server URL override"),
+    server: str = typer.Option(
+        None,
+        help="Server URL. Required unless AGNES_SERVER or a saved config already "
+        "names one; persisted for later commands when passed.",
+    ),
     password: bool = typer.Option(
         False,
         "--password",
@@ -122,29 +165,33 @@ def login(
     Use --password for a terminal-only email+password login (rare; only for
     password accounts on a host with no browser), or --no-browser to print the
     URL when no browser can be auto-launched.
+
+    The server comes from --server, then AGNES_SERVER, then the saved config;
+    with none of the three this refuses instead of guessing a local instance.
     """
+    server_url = _require_server(server)
+
     if password:
         try:
-            _login_with_password(server)
+            _login_with_password()
         except typer.Exit:
             raise
         except Exception as e:
             typer.echo(f"Connection error: {e}", err=True)
             raise typer.Exit(1)
+        _persist_server(server, server_url)
         return
-
-    if server:
-        import os
-
-        os.environ["AGNES_SERVER"] = server
 
     from cli.lib.loopback import capture_code_via_browser
 
-    server_url = get_server_url()
     token_name = f"Agnes CLI ({socket.gethostname()})"[:80]
 
     if not no_browser:
-        typer.echo(f"Opening {server_url}/cli/auth/start in your browser…")
+        # Deliberately NOT echoing a bare `{server_url}/cli/auth/start` here.
+        # That form is missing the loopback `port` and `state`, so a user who
+        # copied it because no browser appeared would land on a page that
+        # cannot hand the code back. `capture_code_via_browser` prints the
+        # real, complete URL for every run — that is the one to paste.
         typer.echo("Sign in and approve the request — waiting for it to complete.")
 
     try:
@@ -181,6 +228,7 @@ def login(
 
     data = resp.json()
     save_token(data["token"], data["email"])
+    _persist_server(server, server_url)
     expires = data.get("expires_at") or "never"
     typer.echo(f"Logged in as {data['email']} (token valid until {expires}).")
 
@@ -306,7 +354,9 @@ def import_token(
             # read it as neither a rejection nor a fault, so login "verified"
             # against a server it never reached. (Devin Review on #1266.)
             if is_redirect(resp.status_code):
-                typer.echo(moved_server_message(resp.status_code, resp.headers.get("Location", ""), verify_url), err=True)
+                typer.echo(
+                    moved_server_message(resp.status_code, resp.headers.get("Location", ""), verify_url), err=True
+                )
                 raise typer.Exit(1)
             if resp.status_code == 401:
                 detail = "unauthorized"

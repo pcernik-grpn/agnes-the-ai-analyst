@@ -932,7 +932,7 @@ def test_legacy_token_aliases_defined_in_root() -> None:
 # Deliberately NOT flagged, because they are correct:
 #   - a `-soft` fill whose own ink is a deep accent (`--ds-agnes`,
 #     `--ds-kind-*`): dark-on-light stays legible when the tint can't flip,
-#     so `.ag-ava` / `.ag-instack` / `.ws-badge--in_workspace` are fine.
+#     so `.ag-ava` / `.ag-instack` are fine.
 #   - `--ds-text-inverse` ink: that token IS the pairing for solid fills.
 #   - rules already scoped to a `[data-theme="…"]`: a dark block carries its
 #     own colours, and a light theme (`paper`, `blue`, `navy`) can never be

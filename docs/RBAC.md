@@ -24,6 +24,26 @@ The practical consequences:
 
 To limit what an *agent* can reach, use agent scopes (an agent's effective authority is owner grants ∩ agent scope, enforced live at every brokered request) — but the same boundary applies underneath: the agent inherits whatever the connection's upstream principal can see.
 
+### Table grants: agent-scope and co-session ceilings
+
+A direct `resource_grants(group, 'table', id)` row does **not** grant an
+analyst visibility into that table — ordinary analyst access is entirely
+Data-Package-mediated (`src/rbac.py::can_access_table` / `get_accessible_tables`).
+What a direct `TABLE` grant still does is set the ceiling that **agent
+scoping** (`tables_mode='selected'`, `src/agent_scope_intersection.py::
+compute_agent_intersection`) and **co-session** grant intersection
+(`src/grant_intersection.py::compute_grant_intersection`) narrow against —
+both read `app.auth.access._allowed_ids_for_user(owner_id, 'table')`, a raw
+`resource_grants` lookup that never expands through a Data Package.
+
+Practical consequence: to let a scoped agent (or a co-drive session) reach a
+table, an admin must grant that table to the owner's group **in addition
+to** — never instead of — putting it in a Data Package the owner has access
+to. Granting only the package leaves the agent's/session's effective table
+set empty for that table, regardless of the owner's own query access to it
+via `agnes query`/`agnes pull`. If nobody in the instance uses agent scoping
+or co-sessions, a `TABLE` grant has no live effect at all.
+
 ### A third layer: row and column access policies
 
 Grants and agent scopes both answer "can this group/agent reach the table at all". A **separate, optional layer** answers a narrower question on top of that: once a group can reach a table, an admin may attach **one SQL policy** that Agnes substitutes for the table on every server-side read — filtering rows and masking columns by the caller's identity (`$user_email` / `$user_id` / `$user_groups`). It only applies to tables that never leave the server (`query_mode='remote'` or `server_only=true`, so a policy can't be routed around via `agnes pull`), and it is off by default behind the `access_policies.enabled` feature flag. Full reference — authoring, the mapping-table pattern, disclosure, and known v1 limitations: [`table-access-policies.md`](table-access-policies.md).
@@ -318,7 +338,7 @@ Schema v49 (unified Browse + My Stack for Data Packages and Memory):
 
 - `resource_grants` gains a `requirement VARCHAR DEFAULT 'available'` column. Enum: `'available'` | `'required'`. Applies to `data_package`, `memory_domain`, and `memory_item` grants. Per-group decision: same resource can be Required for Sales but Available for Engineering without duplicating the resource itself.
 - New resource types in `app.resource_types.ResourceType`:
-  - `DATA_PACKAGE` — admin-curated bundle of tables (`data_packages` table; M:N to `table_registry` via `data_package_tables`). Effective `TABLE` set for a user = `(direct TABLE grants) ∪ (tables in DATA_PACKAGE grants the user has)`.
+  - `DATA_PACKAGE` — admin-curated bundle of tables (`data_packages` table; M:N to `table_registry` via `data_package_tables`). At v49 the effective `TABLE` set for a user was `(direct TABLE grants) ∪ (tables in DATA_PACKAGE grants the user has)`. This was later hardened: analyst table visibility now flows through Data Packages **only** (`src/rbac.py::can_access_table` / `get_accessible_tables`) — a direct `TABLE` grant no longer contributes to it at all. See [Table grants: agent-scope and co-session ceilings](#table-grants-agent-scope-and-co-session-ceilings) for what a direct `TABLE` grant is still for.
   - `MEMORY_ITEM` — per-group item-level Required override. Default for an item comes from `knowledge_items.is_required` flag; a `MEMORY_ITEM` grant flips that for the specified group.
 - `MEMORY_DOMAIN` grants migrated from slug strings to `memory_domains.id` references. Orphan grants (pointing at non-existent domains) preserved for admin cleanup.
 - Marketplace plugins: v49 originally left them out (`marketplace_plugins.is_system` was the only mandatory path), but the tier now applies to `marketplace_plugin` grants too — `resolve_user_marketplace` serves `granted ∩ (subscribed ∪ required)`, so a required grant puts the plugin in every group member's served set without a subscription row (unsubscribe/uninstall return 409). `is_system` remains the *global* (all-users) mandatory flag; `requirement='required'` is the *group-scoped* one.

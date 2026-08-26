@@ -11,7 +11,7 @@ table, no StackResolver — via three dedicated endpoints
 The standalone My Stack page — including its own dedicated Artefacts tab —
 is retired (#1088; /stack now 302s to /library?stack=in_stack). The
 ``/api/stack/artefacts/*`` endpoints stay live and untouched (below,
-``TestArtefactStackApi``); the Library's inline "Add to Stack" / "In Stack"
+``TestArtefactStackApi``); the Library's inline "Add to stack" / "In stack"
 badge on each artefact row (``TestArtefactsPageStackAwareness``) is the
 surviving UI for the same membership. One piece of the retired tab's UI has
 no like-for-like replacement: it kept listing an artefact as "Unavailable"
@@ -143,4 +143,4 @@ class TestArtefactsPageStackAwareness:
         text = c.get("/library", headers=_auth(seeded_app["analyst_token"])).text
         assert f'data-stack-badge="{col["id"]}"' in text
         assert f'data-add-to-stack="{col["id"]}"' not in text
-        assert "In Stack" in text
+        assert "In stack" in text

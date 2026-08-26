@@ -83,9 +83,11 @@ PUT validation time, so the admin is notified immediately.
 | `server.hostname` | string | Host part only |
 | `sync_interval` | string | e.g. `"1h"` from `instance.yaml` |
 | `data_source.type` | string | `keboola`, `bigquery`, or `local` |
-| `tables` | list[dict] | RBAC-filtered list of `{name, description, query_mode}` |
+| `data_source.source_types` | list[str] | Sorted distinct `source_type` values of the tables visible to the calling user. Use this (together with `data_source.type`) to gate engine-specific guidance — a multi-source instance can register e.g. BigQuery or Databricks rows while `type` stays `local` |
+| `tables` | list[dict] | RBAC-filtered list of `{name, description, query_mode, source_type}` |
 | `metrics.count` | int | Total metric definitions in DB |
 | `metrics.categories` | list[str] | Sorted unique category names |
+| `semantic_layer.has_models` | bool | `True` iff the calling user can read at least one valid semantic model |
 | `marketplaces` | list[dict] | RBAC-filtered `{slug, name, plugins:[{name}]}` |
 | `user.id` | string | Analyst user ID |
 | `user.email` | string | Analyst email |

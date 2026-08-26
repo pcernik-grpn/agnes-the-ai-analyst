@@ -8,11 +8,17 @@ from app.auth.token_hash import hash_token
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
+    # This file tests provider MECHANICS (magic link, password, OAuth), not
+    # the default-offering policy (that's tests/test_auth_provider_defaults.py).
+    # Email is opt-in-only by default since B6, so pin an explicit allowlist
+    # naming every provider these tests exercise — otherwise the magic-link
+    # endpoints 404 under the new default and this file stops testing what
+    # it says it tests.
+    monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "google,email,password,keboola,microsoft")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
 
@@ -40,7 +46,7 @@ def client(tmp_path, monkeypatch):
     ur.create(id="ml1", email="ml@test.com", name="ML User")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     return TestClient(app)
 
 
@@ -173,6 +179,53 @@ class TestEmailAuth:
         resp = client.post("/auth/email/send-link/web", data={"email": "nobody@test.com"})
         assert resp.status_code == 200
         assert "Check Your Email" in resp.text
+
+    def test_magic_link_falls_back_to_request_origin_not_localhost(self, client, monkeypatch):
+        """With no pinned public origin, the emailed link must follow the
+        request, not the `http://localhost:8000` literal.
+
+        `_build_magic_link` used to read SERVER_URL alone with a hard localhost
+        default, so an instance served behind a TLS terminator that never set
+        SERVER_URL mailed its users a sign-in link pointing at their own laptop.
+        """
+        monkeypatch.delenv("SERVER_URL", raising=False)
+        monkeypatch.delenv("AGNES_BASE_URL", raising=False)
+        monkeypatch.setenv("LOCAL_DEV_MODE", "1")
+        resp = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        assert resp.status_code == 200
+        link = resp.json()["dev_link"]
+        assert link.startswith("http://testserver/auth/email/verify"), link
+        assert "localhost:8000" not in link
+
+    def test_magic_link_web_form_falls_back_to_request_origin(self, client, monkeypatch):
+        """Same fallback on the web-form door — asserted on the DELIVERED mail,
+        which is built by a second call site (`_send_email`) that has to agree
+        with the one feeding the dev/console link."""
+        monkeypatch.delenv("SERVER_URL", raising=False)
+        monkeypatch.delenv("AGNES_BASE_URL", raising=False)
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        sent: list = []
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp(sent))
+        resp = client.post("/auth/email/send-link/web", data={"email": "ml@test.com"})
+        assert resp.status_code == 200
+        assert len(sent) == 1, "no mail recorded"
+        body = str(sent[0])
+        assert "http://testserver/auth/email/verify" in body, body
+        assert "localhost:8000" not in body
+
+    def test_magic_link_honors_pinned_public_origin(self, client, monkeypatch):
+        """An operator-pinned origin still wins over the request, and
+        AGNES_BASE_URL takes precedence over SERVER_URL (public_base_url's
+        documented order)."""
+        monkeypatch.setenv("LOCAL_DEV_MODE", "1")
+        monkeypatch.setenv("SERVER_URL", "https://from-server-url.example.com")
+        resp = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        assert resp.json()["dev_link"].startswith("https://from-server-url.example.com/auth/email/verify")
+
+        monkeypatch.setenv("AGNES_BASE_URL", "https://pinned.example.com/")
+        resp = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        assert resp.json()["dev_link"].startswith("https://pinned.example.com/auth/email/verify")
 
     def test_verify_invalid_token(self, client):
         resp = client.post(
@@ -862,7 +915,7 @@ class TestLocalDevGroupsInjection:
     so /me/profile renders the mocked groups."""
 
     @pytest.fixture
-    def dev_client(self, tmp_path, monkeypatch):
+    def dev_client(self, tmp_path, monkeypatch, shared_app):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
         monkeypatch.setenv("SESSION_SECRET", "test-session-secret-32chars-minimum!!")
@@ -872,9 +925,8 @@ class TestLocalDevGroupsInjection:
             "LOCAL_DEV_GROUPS",
             '[{"id":"local-dev-engineers@example.com","name":"Local Dev Engineers"}]',
         )
-        from app.main import create_app
 
-        return TestClient(create_app())
+        return TestClient(shared_app)
 
     def test_dev_user_sees_mocked_groups_on_profile(self, dev_client):
         resp = dev_client.get("/me/profile")
@@ -978,7 +1030,7 @@ class TestGoogleCallbackGroupSync:
     """
 
     @pytest.fixture
-    def google_app(self, tmp_path, monkeypatch):
+    def google_app(self, tmp_path, monkeypatch, shared_app):
         import json as _json
         from unittest.mock import AsyncMock
         from types import SimpleNamespace
@@ -986,7 +1038,6 @@ class TestGoogleCallbackGroupSync:
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
         monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
 
-        from app.main import create_app
         import app.auth.providers.google as g_mod
 
         # (1) bypass the is_available guard
@@ -1016,7 +1067,7 @@ class TestGoogleCallbackGroupSync:
             lambda email: ["grp_a@groupon.com", "grp_b@groupon.com"],
         )
 
-        app = create_app()
+        app = shared_app
         client = TestClient(app, follow_redirects=False)
         return {"client": client, "json": _json}
 

@@ -353,6 +353,25 @@ if [ -n "$DATA_APPS_RUNTIME_IMAGE" ]; then
     esac
 fi
 
+# Retry the optional kai-agent engine on EVERY tick it is found down, not
+# only when drift is detected: an engine that failed at boot (bad image,
+# failed migrate) would otherwise stay down until something unrelated about
+# the machine changed, because the drift-gated recreate below never fires on
+# a no-change tick. Gated on the engine NOT already running — an
+# unconditional `up -d kai-agent` would re-run the one-shot migrator (its
+# service_completed_successfully dependency) every 5 minutes forever, a
+# needless container start + DB connection per tick on a healthy box.
+# Targeted at the engine service so this cannot recreate app services and
+# bypass the sync-defer guard below; compose brings the engine's own
+# dependencies (its postgres + one-shot migrate) with it. Tolerant, same
+# posture as the pull above.
+if [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
+    if [ -z "$(docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} ps -q --status running kai-agent 2>/dev/null)" ]; then
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d kai-agent >/dev/null 2>&1 \
+            || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; retrying next tick"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Role-split (m-tier) rolling-recreate support (spec §3.8/§3.9).
 #
@@ -604,6 +623,32 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
             echo "$(date): role-split rolling recreate ABORTED (${REASON[*]}) — see logs/alert" >&2
             exit 1
         fi
+        # The rolling recreate touches only worker/gateway/api replicas, and
+        # the every-tick retry above only starts a DOWN engine — so on a VM
+        # that is both role-split and kai-agent-enabled, an engine image bump
+        # would otherwise never land via the tick. Recreate it tolerantly
+        # here; `up -d kai-agent` no-ops when nothing about it drifted.
+        if [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
+            docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d kai-agent >/dev/null 2>&1 \
+                || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to recreate after the role-split rollout; next tick retries"
+        fi
+    elif [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
+        # The optional kai-agent engine overlay (startup-script section 4c)
+        # must not gate the app's recreate: the engine's one-shot migrate is
+        # a hard start condition for the ENGINE service, and under `set -e`
+        # a broken engine image or failed migration would abort this tick
+        # right here — config marker never written, self-update below never
+        # runs. Mirror the startup script's split: base stack strictly with
+        # the overlay filtered out, then the full list tolerantly.
+        _kai_full_compose_file="$COMPOSE_FILE"
+        COMPOSE_FILE=$(printf '%s' "$COMPOSE_FILE" | tr ':' '\n' \
+            | grep -vx 'docker-compose.kai-agent.yml' | paste -sd: -)
+        export COMPOSE_FILE
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
+        COMPOSE_FILE="$_kai_full_compose_file"
+        export COMPOSE_FILE
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d \
+            || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; base stack recreated — next tick retries"
     else
         docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
     fi

@@ -2,7 +2,7 @@
 
 Regression for the latent duplicate-session bug: the old code did
 `await dispatch_event(...)` before returning 200, so a >3s _handle_dm
-(E2B spawn) blew Slack's 3s budget and triggered retries. We assert the
+(sandbox spawn) blew Slack's 3s budget and triggered retries. We assert the
 handler returns near-instantly and dispatches exactly once.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ def test_events_endpoint_acks_before_slow_dispatch(monkeypatch):
 
     async def slow_dispatch(app, event):
         # 5s mock dispatch — must stay > the 3.0s assertion below to catch a regression back to await
-        await asyncio.sleep(5)  # simulate E2B spawn > 3s budget
+        await asyncio.sleep(5)  # simulate sandbox spawn > 3s budget
         dispatched.append(event)
 
     # Patch the symbol used inside the endpoint module.

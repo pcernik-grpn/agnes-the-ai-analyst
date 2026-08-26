@@ -37,7 +37,7 @@ _OK_DESC = "Use when validating store version edit flow across every guardrail t
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
@@ -45,9 +45,8 @@ def web_client(tmp_path, monkeypatch):
     (tmp_path / "analytics").mkdir()
     (tmp_path / "extracts").mkdir()
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 

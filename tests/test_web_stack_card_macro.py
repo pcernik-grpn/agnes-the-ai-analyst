@@ -43,7 +43,7 @@ def test_default_available_card_renders_add_button():
     assert 'class="stack-card"' in html
     assert "Sales bundle" in html
     assert "+ Add to stack" in html
-    assert "Required" not in html
+    assert "Automatic" not in html
     assert "Remove" not in html
 
 
@@ -58,8 +58,8 @@ def test_required_card_renders_badge_and_disabled_button():
     })
     assert "is-required" in html
     assert "is-in-stack" in html
-    # Required badge in the top-right corner.
-    assert ">Required<" in html
+    # Tier badge in the top-right corner — "Automatic", the human word for the required tier.
+    assert ">Automatic<" in html
     # No Remove or Add buttons — required is non-removable.
     assert 'data-action="remove"' not in html
     assert 'data-action="add"' not in html

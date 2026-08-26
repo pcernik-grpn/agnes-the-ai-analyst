@@ -125,7 +125,12 @@ TMPDIR_WHEEL=$(mktemp -d -t agnes_cli.XXXXXX)
 trap 'rm -rf "$TMPDIR_WHEEL"' EXIT
 # Use -OJ so curl honours Content-Disposition and saves the wheel with its real
 # PEP-427 filename (pip / uv tool install reject filenames without a version).
-(cd "$TMPDIR_WHEEL" && curl -fsSL -OJ "$SERVER/cli/download")
+# --max-redirs 0 because -OJ takes the saved filename from the response and -L
+# follows redirects across hosts: a hostname alias answering 308 would have the
+# redirect target's wheel installed with nothing on screen to say the download
+# moved. Any redirect now aborts with
+# `curl: (47) Maximum (0) redirects followed`.
+(cd "$TMPDIR_WHEEL" && curl -fsSL --max-redirs 0 -OJ "$SERVER/cli/download")
 WHEEL=$(ls "$TMPDIR_WHEEL"/*.whl 2>/dev/null | head -n1)
 if [ -z "$WHEEL" ]; then
     echo "error: wheel download failed (no .whl found in $TMPDIR_WHEEL)" >&2

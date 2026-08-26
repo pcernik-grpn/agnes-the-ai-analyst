@@ -195,11 +195,19 @@ class AuditPgRepository:
         limit: int = 100,
     ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[datetime, str]]]:
         where, params = self._filters_where(
-            since=since, until=until, user_id=user_id, action=action,
-            action_prefix=action_prefix, action_in=action_in,
-            resource=resource, resource_prefix=resource_prefix,
-            result_pattern=result_pattern, result_class=result_class,
-            correlation_id=correlation_id, q=q, source=source,
+            since=since,
+            until=until,
+            user_id=user_id,
+            action=action,
+            action_prefix=action_prefix,
+            action_in=action_in,
+            resource=resource,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            correlation_id=correlation_id,
+            q=q,
+            source=source,
             include_self_reads=include_self_reads,
         )
         if cursor is not None:
@@ -329,6 +337,7 @@ class AuditPgRepository:
         w = ("WHERE " + " AND ".join(where)) if where else ""
         out: dict = {}
         with self._engine.connect() as conn:
+
             def _bucket(select: str, extra: str = "", group: str = "1") -> list:
                 clause = w + (f" AND {extra}" if (w and extra) else (f"WHERE {extra}" if extra else ""))
                 return conn.execute(
@@ -355,14 +364,18 @@ class AuditPgRepository:
         }
         return out
 
+    def prune_older_than(self, days: int) -> int:
+        """Mirrors ``AuditRepository.prune_older_than``."""
+        with self._engine.begin() as conn:
+            res = conn.execute(
+                sa.text(f"DELETE FROM audit_log WHERE timestamp < (CURRENT_TIMESTAMP - INTERVAL '{int(days)} days')")
+            )
+            return int(getattr(res, "rowcount", 0) or 0)
+
     def last_scheduler_tick(self) -> "datetime | None":
         """Mirrors ``AuditRepository.last_scheduler_tick``."""
         with self._engine.connect() as conn:
-            row = conn.execute(
-                sa.text(
-                    f"SELECT MAX(timestamp) FROM audit_log WHERE {SCHEDULER_ACTION_SQL}"
-                )
-            ).first()
+            row = conn.execute(sa.text(f"SELECT MAX(timestamp) FROM audit_log WHERE {SCHEDULER_ACTION_SQL}")).first()
         return row[0] if row else None
 
     def upload_filenames_since(self, since: datetime) -> "list[str]":
@@ -371,10 +384,7 @@ class AuditPgRepository:
 
         with self._engine.connect() as conn:
             rows = conn.execute(
-                sa.text(
-                    "SELECT params FROM audit_log "
-                    "WHERE action = 'session.upload' AND timestamp >= :since"
-                ),
+                sa.text("SELECT params FROM audit_log WHERE action = 'session.upload' AND timestamp >= :since"),
                 {"since": since},
             ).fetchall()
         out: set[str] = set()
@@ -430,8 +440,11 @@ class AuditPgRepository:
             ).first()
         if row is None:
             return {
-                "events_total": 0, "active_users": 0, "errors": 0,
-                "p95": None, "duration_coverage": 0.0,
+                "events_total": 0,
+                "active_users": 0,
+                "errors": 0,
+                "p95": None,
+                "duration_coverage": 0.0,
             }
         total = int(row[5] or 0)
         return {

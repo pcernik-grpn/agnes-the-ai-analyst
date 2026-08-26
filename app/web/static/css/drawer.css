@@ -243,6 +243,17 @@ button.ds-drawer__step:not([disabled]):hover { background: var(--ds-surface-sunk
   color: var(--ds-text-primary);
 }
 .ds-drawer__field textarea { min-height: 62px; resize: vertical; }
+/* A permanently-fixed value (a slug already in URLs and grant rows) still has
+   to be READ here — it is part of what identifies the thing being edited — so
+   it keeps its box and its label, and only stops looking typeable. Sunken
+   ground plus muted ink, not the browser's default grey-on-grey, which the
+   custom field styles above override into looking editable again. */
+.ds-drawer__field input[disabled],
+.ds-drawer__field textarea[disabled] {
+  background: var(--ds-surface-sunken);
+  color: var(--ds-text-muted);
+  cursor: not-allowed;
+}
 .ds-drawer__field input:focus-visible,
 .ds-drawer__field textarea:focus-visible {
   outline: var(--ds-focus-outline);

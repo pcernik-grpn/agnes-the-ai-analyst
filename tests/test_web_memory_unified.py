@@ -185,20 +185,10 @@ class TestTopnavClassicMemoryCardState:
             "'+ Add to stack' for something the user cannot remove"
         )
 
-    def test_an_unsubscribed_available_domain_reads_as_addable(self, seeded_app):
-        """The negative control: without it a build that hardcoded every card
-        as in-stack would look correct.
-
-        Read off the Catalog's Memory grid. Under the classic subscribe model
-        that grid carries the full granted set with its add-to-stack state,
-        which is exactly the state under test; /corporate-memory, where this
-        used to look, redirects into the Library for any granted caller."""
-        dom = _make_domain(slug="avail-dom", name="Available Domain")
-        _grant("Everyone", dom, requirement="available", users=["analyst1"])
-
-        body = seeded_app["client"].get("/catalog", headers=_auth(seeded_app["analyst_token"])).text
-
-        assert "Available Domain" in body
-        card = body[body.index("Available Domain") - 3000 : body.index("Available Domain") + 1500]
-        assert 'data-state="add"' in card, "an unsubscribed available domain must stay addable in classic mode"
+    # test_an_unsubscribed_available_domain_reads_as_addable was retired with
+    # the Catalog browse shell it read from: /catalog now 302s into
+    # /library?scope=available (the Catalog/Marketplace fold), so there is no
+    # Memory grid there to carry `data-state="add"`. The addable/in-stack
+    # split it guarded lives on the Library's own Memory band, pinned by
+    # tests/test_web_library_memory_band.py.
 

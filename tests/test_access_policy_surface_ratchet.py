@@ -290,6 +290,16 @@ EXEMPT: frozenset[str] = frozenset(
         # POST /api/query/hybrid -- spec §8 names this one explicitly: "out
         # of scope by §12's admin bypass, not by omission".
         "app/api/query_hybrid.py::hybrid_query",
+        # Live sample for a non-BQ `query_mode='remote'` row -- the exact
+        # twin of `_fetch_bq_sample` (which the scanner never sees only
+        # because `bq.duckdb_session()` is not a target primitive; this one
+        # reads through `get_analytics_db_readonly()`, which is). Single
+        # call site: `build_sample`'s remote branch (COVERED), which runs
+        # the same Task-13 fail-closed guard as the BQ branch -- a policied
+        # row's non-admin caller 500s before this fetch is reached, and the
+        # helper reads exactly the one view `can_access_table` already
+        # authorized.
+        "app/api/v2_sample.py::_fetch_remote_view_sample",
         # Databricks remote routing probe: reads `information_schema.tables`
         # to answer "does a master view exist for the remote rows this SQL
         # names", i.e. whether DuckDB can resolve the statement locally at

@@ -183,9 +183,11 @@ def test_the_in_stack_step_rings_the_add_control_and_the_filter():
     and resolution fell straight back to the filter — hence `reveal`."""
     step = _welcome_block().split("      key: 'in-stack',", 1)[1].split("\n    },", 1)[0]
     assert step.split("selector: '", 1)[1].split("'", 1)[0] == "[data-add-to-stack]"
+    # The ringed "filter" is the Scope segment — it replaced the "In stack
+    # only" toggle when the Catalog/Marketplace fold landed.
     assert "extraSpotlight: ['#lib-stack-toggle']" in step
-    # Opens the group that HOLDS an Add control, and settles for the filter only
-    # if no group has one at all.
+    # Opens the group that HOLDS an Add control, and settles for the scope
+    # control only if no group has one at all.
     assert "revealHost: { container: '[data-lib-sec]', toggle: '[data-sec-toggle]' }" in step
     assert "fallbackSelector: '#lib-stack-toggle" in step
     js = _js()
@@ -302,9 +304,10 @@ def test_the_share_step_can_open_the_group_that_holds_its_anchor():
 
 def test_library_step_anchors_exist_on_the_library_page():
     lib = LIBRARY_HTML.read_text(encoding="utf-8")
-    # "In stack only" only renders when flipping it would change the list, so
-    # the step falls back to a row's own Stack control — which is why BOTH have
-    # to exist for the step to be reliable on a fresh account.
+    # The step's primary anchor is a row's own Stack control; its fallback is
+    # the "In stack only" toggle — both have to exist (in the template source;
+    # the toggle renders conditionally) for the step to be reliable on a
+    # fresh account.
     assert 'id="lib-stack-toggle"' in lib
     assert "data-add-to-stack=" in lib
     assert 'id="lib-new-btn"' in lib

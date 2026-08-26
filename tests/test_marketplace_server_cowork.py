@@ -25,8 +25,7 @@ def _read_zip(data: bytes) -> dict:
 
 
 @pytest.fixture
-def cowork_env(e2e_env):
-    from app.main import create_app
+def cowork_env(e2e_env, shared_app):
     from app.auth.jwt import create_access_token
     from src.db import get_system_db
     from src.repositories.users import UserRepository
@@ -96,7 +95,7 @@ def cowork_env(e2e_env):
     finally:
         conn.close()
 
-    app = create_app()
+    app = shared_app
     return {
         "client": TestClient(app),
         "admin_token": create_access_token("admin1", "admin@test.local"),

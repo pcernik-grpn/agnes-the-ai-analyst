@@ -284,6 +284,12 @@ class TestPlanRefusesAPoliciedTablesPhysicalSourceTwin:
         assert "finance_invoices_governed" in offender["reason"], (
             "the operator must be told WHICH policied row blocked it"
         )
+        # The escape it names must be one that still works. It used to say
+        # "register it by hand with server_only=true", which the §3.2 twin
+        # interlock now refuses outright: distributability stopped deciding
+        # whether the check fires, so a hand-registered server_only twin is
+        # rejected exactly like a distributable one.
+        assert "server_only=true" not in offender["reason"], offender["reason"]
 
     def test_a_source_matching_no_policied_row_is_unaffected(self, stub_table_registry):
         stub_table_registry["rows"] = {

@@ -283,8 +283,15 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         "match": ["/admin/grants", "/admin/groups"],
     },
     {
+        # Key stays `library` (it is the localStorage collapse key and the
+        # active-section anchor — renaming it would forget every browser's
+        # disclosure state); only the LABEL changes. "Library" here collided
+        # with the analyst Library (/library) while meaning something
+        # entirely different — marketplaces, moderation, curation — and the
+        # first-time-admin walkthrough (2026-08-18 IA investigation) hit the
+        # collision within minutes. "Content" names the actual job.
         "key": "library",
-        "label": "Library",
+        "label": "Content",
         "icon": "package",
         "divider_before": "Maintain",
         "items": [
@@ -293,7 +300,10 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             # sections merge here.
             {"label": "Marketplaces", "href": "/admin/marketplaces", "match": ["/admin/marketplaces"]},
             {"label": "Store moderation", "href": "/admin/store", "match": ["/admin/store"]},
-            {"label": "Flea submissions", "href": "/admin/store/submissions", "match": ["/admin/store/submissions"]},
+            # "Submissions", not "Flea submissions": the trust vocabulary
+            # moved to Organization/Verified/Community and the seam spec's
+            # decision 8 retires the WORD flea, never the URLs.
+            {"label": "Submissions", "href": "/admin/store/submissions", "match": ["/admin/store/submissions"]},
             {"label": "Store lint", "href": "/admin/store/lint", "match": ["/admin/store/lint"]},
             {
                 "label": "Studio suggestions",

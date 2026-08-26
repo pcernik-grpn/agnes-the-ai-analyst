@@ -261,13 +261,18 @@ class TestAdminNavInventoryCoverage:
 
         The shape is the admin redesign's: three INTENT sections first
         (People, Data, Access — get people in, get data in, get the data to
-        the people), then the maintenance half behind the divider (Library,
-        Instance, Activity)."""
+        the people), then the maintenance half behind the divider (Content,
+        Instance, Activity).
+
+        `library` keeps its KEY with a "Content" label on purpose: the key is
+        the localStorage collapse anchor, and the old label collided with the
+        analyst Library while meaning marketplaces/moderation/curation (the
+        2026-08-18 IA investigation's F8)."""
         assert [(s["key"], s["label"]) for s in ADMIN_NAV_SECTIONS] == [
             ("people", "People"),
             ("data", "Data"),
             ("access", "Access"),
-            ("library", "Library"),
+            ("library", "Content"),
             ("instance", "Instance"),
             ("activity", "Activity"),
         ]
@@ -1310,4 +1315,3 @@ class TestDataLensFlowStrip:
 # behind. `app/web/admin_nav.py` is read directly by the only surface that
 # renders it, and `TestAdminPageCoverage::test_every_admin_page_route_has_a_nav_entry`
 # above still holds every live admin page to an entry in it.
-

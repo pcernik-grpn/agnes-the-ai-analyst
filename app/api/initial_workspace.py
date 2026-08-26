@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -769,17 +770,111 @@ def _compute_render_dry_run() -> dict:
                         f"{entry.slug}` will fail until the seed is fixed"
                     )
 
-        # Confirm the renderer can build a complete document end-to-end
-        # using the synced content. Failures here catch unicode / format
-        # regressions the manifest validator misses.
-        from app.web.setup_instructions import resolve_lines
-
-        resolve_lines(
-            "agnes.whl",
-            connector_manifest=manifest,
-            server_host="example.invalid",
-            instance_brand="Agnes",
+        # The built-in prompt renderer no longer reads seed content
+        # (the thin prompt ignores the connector manifest), so rendering
+        # it here would validate nothing about the sync. What a seed CAN
+        # break now is a forked install-prompt template: on the git-bound
+        # path only `{server_url}` and the Jinja context are substituted
+        # (docs/seed-repo-contract.md §5), so a retired or unwired
+        # single-brace placeholder renders literally into the analyst's
+        # prompt. Surface that to the operator here.
+        from src.initial_workspace import (
+            PROMPT_SEED_PATHS,
+            UNWIRED_PLACEHOLDER_RE,
+            resolve_seed_file,
         )
+
+        # Scan the file the prompt is actually bound to when a custom
+        # git_path is set (same resolution rule as the `{token}` probe
+        # above) — the canonical template matters only when it is the one
+        # analysts get.
+        scan_path = (
+            bound_git_path
+            if bound_git_path is not None
+            else PROMPT_SEED_PATHS["install"]
+        )
+        tmpl = resolve_seed_file(scan_path)
+        if tmpl is not None:
+            tmpl_text, _tmpl_source = tmpl
+            unwired = sorted(
+                {
+                    name
+                    for name in UNWIRED_PLACEHOLDER_RE.findall(tmpl_text)
+                    if name != "{server_url}"
+                }
+            )
+            if unwired:
+                msg = (
+                    f"{scan_path} (install prompt) references placeholder(s) "
+                    f"{', '.join(unwired)} that nothing substitutes on the "
+                    "git-bound prompt path — they will render literally in "
+                    "the analyst's prompt (only {server_url} and Jinja "
+                    "{{ ... }} context are replaced; see "
+                    "docs/seed-repo-contract.md section 5)"
+                )
+                if bound_git_path is None:
+                    # Editor mode: the prompt renders the DB override or the
+                    # shipped default, not this seed file — the finding only
+                    # matters for a future git binding / fork of the template.
+                    msg += (
+                        " (warning only: the install prompt does not"
+                        " currently render this file)"
+                    )
+                summary["warnings"].append(msg)
+
+            # A git-bound template is also rendered through the sandboxed
+            # Jinja path — and a render error there is SILENT for analysts
+            # (`/setup` falls back to the built-in default with only a log
+            # line). Validate the render here with the same stub context the
+            # welcome-template save endpoint uses, so a broken seed commit
+            # surfaces to the operator instead. Editor mode skips this: the
+            # seed file is not rendered at all there, and the DB override
+            # was already validated at save time.
+            # Unlike the `{token}` probe (where a meta-read failure must stay
+            # conservative — a false block beats shipping a token-embedding
+            # seed), render validation must only fire on a CONFIRMED git
+            # binding: `_install_prompt_bound_git_path` falls back to the
+            # canonical path on a meta-read failure, and hard-failing the
+            # sync over a template an editor-mode instance never renders
+            # would turn a transient DB hiccup into a false alarm.
+            confirmed_git = False
+            try:
+                from src.repositories import welcome_template_repo
+
+                confirmed_git = welcome_template_repo().get_meta().get("source_mode") == "git"
+            except Exception:  # noqa: BLE001 — meta unreadable → not confirmed
+                confirmed_git = False
+
+            if bound_git_path is not None and confirmed_git:
+                from app.api.welcome import (
+                    _VALIDATION_STUB_CONTEXT,
+                    _VALIDATION_STUB_CONTEXT_ANON,
+                )
+                from src.prompt_render import make_prompt_env
+
+                try:
+                    env = make_prompt_env()
+                    template = env.from_string(tmpl_text)
+                    template.render(**_VALIDATION_STUB_CONTEXT)
+                    # /setup is publicly reachable, so the anonymous shape
+                    # must render too — with StrictUndefined, `user.email`
+                    # without an `{% if user %}` guard fails only here.
+                    template.render(**_VALIDATION_STUB_CONTEXT_ANON)
+                except Exception as exc:  # noqa: BLE001 — any render failure means silent fallback
+                    msg = (
+                        f"{scan_path} (git-bound to the install prompt) does "
+                        f"not render: {type(exc).__name__}: {exc}. Analysts "
+                        "silently get the built-in default prompt instead."
+                    )
+                    if _tmpl_source == "iwt":
+                        summary["errors"].append(msg)
+                        summary["ok"] = False
+                    else:
+                        summary["warnings"].append(
+                            msg
+                            + " (warning only: resolved from the bundled "
+                            "seed, not the operator's synced clone)"
+                        )
     except Exception as e:
         summary["ok"] = False
         summary["errors"].append(f"render dry-run raised: {e!r}")

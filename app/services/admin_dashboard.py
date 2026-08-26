@@ -329,6 +329,7 @@ def _step(
     cta: str,
     area: Optional[dict],
     done_cta: Optional[str] = None,
+    done_href: Optional[str] = None,
     facts: Optional[list] = None,
     health: Optional[dict] = None,
     aside: Optional[dict] = None,
@@ -351,6 +352,12 @@ def _step(
         # row shows the maintenance label instead ("Add another source").
         "cta": cta,
         "done_cta": done_cta or cta,
+        # …and when the maintenance verb names a DIFFERENT place, the click has
+        # to follow it: "Bundle tables" belongs on the Tables lens, "Manage
+        # packages" on the Packages workspace. Sharing one href made the done
+        # row's label a promise the click broke — the same defect the verify
+        # step had with "Simulate a person".
+        "done_href": done_href or href,
         "aside": aside,
     }
 
@@ -438,6 +445,10 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
             href="/admin/tables",
             cta="Bundle tables",
             done_cta="Manage packages",
+            # Bundling happens on the Tables lens (that is where the tables
+            # are); managing the packages themselves is the Packages
+            # workspace's whole job.
+            done_href="/admin/data-packages",
         ),
         _step(
             "people",
@@ -549,7 +560,11 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
                 "tools and library they get — before they tell you something is missing."
             ),
             facts=[{"n": reach, "label": "reached"}],
-            href="/admin/access",
+            # The Simulate LENS, not the Access workspace: Simulate is a real
+            # URL (`?lens=simulate`), and a CTA that says "Simulate a person"
+            # while landing on the grant editor is the one broken promise this
+            # step cannot afford — seeing it as they see it is its whole job.
+            href="/admin/access?lens=simulate",
             cta="Simulate a person",
         )
     )

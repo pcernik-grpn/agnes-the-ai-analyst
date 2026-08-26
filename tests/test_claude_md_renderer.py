@@ -521,6 +521,138 @@ class TestSemanticLayerSection:
         assert "## Semantic layer" not in out
 
 
+# ---------------------------------------------------------------------------
+# Vendor-neutral "Remote Queries" — BigQuery/Databricks content is gated on
+# the instance actually having that engine (primary data_source.type or a
+# registered table's source_type), so e.g. a Snowflake- or Keboola-backed
+# instance never tells its agent about BigQuery dialects it doesn't have.
+# ---------------------------------------------------------------------------
+
+
+def _seed_table(conn, *, table_id: str, name: str, source_type: str, query_mode: str = "remote") -> None:
+    conn.execute(
+        "INSERT INTO table_registry (id, name, description, query_mode, source_type) VALUES (?, ?, ?, ?, ?)",
+        [table_id, name, f"{name} table", query_mode, source_type],
+    )
+
+
+def _contiguous_pipe_runs(text: str) -> list[int]:
+    """Lengths of maximal runs of consecutive markdown-table (`|`-prefixed)
+    lines — a Jinja whitespace-control regression splits a table with blank
+    lines, which markdown renders as broken fragments."""
+    runs, current = [], 0
+    for line in text.splitlines():
+        if line.lstrip().startswith("|"):
+            current += 1
+        elif current:
+            runs.append(current)
+            current = 0
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _failure_table_runs(out: str) -> list[int]:
+    """Pipe-runs of just the failure-mode dictionary — the table whose rows
+    are conditionally rendered, so the one a whitespace regression breaks."""
+    import re
+
+    m = re.search(r"### Failure-mode dictionary.*?(?=\n### )", out, re.S)
+    assert m, "Failure-mode dictionary section not found"
+    return _contiguous_pipe_runs(m.group(0))
+
+
+def test_context_tables_include_source_type(conn):
+    _seed_table(conn, table_id="t-sf", name="sf_orders", source_type="snowflake")
+    ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert ctx["tables"][0]["source_type"] == "snowflake"
+
+
+def test_context_source_types_reflect_rbac_visible_tables(conn):
+    """data_source.source_types is derived from the tables the CALLER can see,
+    so a user with no grant on the instance's only BigQuery table gets a
+    prompt without BigQuery guidance."""
+    _seed_table(conn, table_id="t-bq", name="events", source_type="bigquery")
+    _seed_table(conn, table_id="t-kbc", name="orders", source_type="keboola", query_mode="local")
+
+    _make_user(conn, user_id="ua", email="alice@example.com")
+    gid = _make_group(conn, name="bq-readers")
+    _add_member(conn, user_id="ua", group_id=gid)
+    _grant_table(conn, group_id=gid, table_id="t-bq")
+
+    user_a = {"id": "ua", "email": "alice@example.com", "name": "Alice", "is_admin": False, "groups": []}
+    ctx = build_claude_md_context(conn, user=user_a, server_url="https://example.com")
+    assert ctx["data_source"]["source_types"] == ["bigquery"]
+
+    ctx_admin = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert ctx_admin["data_source"]["source_types"] == ["bigquery", "keboola"]
+
+
+def test_context_source_types_empty_without_tables(conn):
+    ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert ctx["data_source"]["source_types"] == []
+
+
+def test_default_remote_queries_vendor_neutral_without_bigquery(conn, monkeypatch):
+    """A non-BigQuery instance (e.g. Keboola- or Snowflake-backed) renders the
+    Remote Queries core with no BigQuery/Databricks content anywhere."""
+    monkeypatch.setattr("src.claude_md.get_data_source_type", lambda: "local")
+    _seed_table(conn, table_id="t-sf", name="sf_orders", source_type="snowflake")
+    out = compute_default_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+
+    assert "## Remote Queries" in out
+    assert "agnes snapshot create" in out
+    assert "remote_scan_too_large" in out  # engine-shared cost/size gate stays in the core
+    lowered = out.lower()
+    assert "bigquery" not in lowered
+    assert "bq" not in lowered
+    assert "databricks" not in lowered
+    assert "gcp" not in lowered
+
+    # the failure-mode table survives the conditional rows as ONE table
+    runs = _failure_table_runs(out)
+    assert len(runs) == 1 and runs[0] >= 7, runs
+
+
+def test_default_remote_queries_bigquery_blocks_when_primary_bq(conn, monkeypatch):
+    monkeypatch.setattr("src.claude_md.get_data_source_type", lambda: "bigquery")
+    out = compute_default_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert "BigQuery SQL flavor" in out
+    assert "cross_project_forbidden" in out
+    assert "bq_path_not_registered" in out
+    assert "personal GCP auth" in out
+
+
+def test_default_remote_queries_bigquery_blocks_via_registered_table(conn, monkeypatch):
+    """Multi-source instance: primary type 'local' but a BigQuery table is
+    registered — the BigQuery guidance must still render."""
+    monkeypatch.setattr("src.claude_md.get_data_source_type", lambda: "local")
+    _seed_table(conn, table_id="t-bq", name="events", source_type="bigquery")
+    out = compute_default_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert "BigQuery SQL flavor" in out
+    assert "cross_project_forbidden" in out
+    # conditional rows render inside one contiguous failure-mode table
+    runs = _failure_table_runs(out)
+    assert len(runs) == 1 and runs[0] >= 9, runs
+
+
+def test_default_remote_queries_databricks_block_gated(conn, monkeypatch):
+    monkeypatch.setattr("src.claude_md.get_data_source_type", lambda: "local")
+    _seed_table(conn, table_id="t-dbx", name="dbx_sales", source_type="databricks")
+    out = compute_default_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+    assert "Databricks SQL flavor" in out
+    assert "bigquery" not in out.lower()
+
+
+def test_default_template_carries_no_legacy_strings():
+    """The shipped default saved verbatim as an admin override must not trip
+    the /admin/prompts stale-override banner (_LEGACY_STRINGS scan)."""
+    from app.api.claude_md import _scan_legacy_strings
+    from src.claude_md import _load_default_template
+
+    assert _scan_legacy_strings(_load_default_template()) == []
+
+
 def test_metrics_summary_degrades_when_table_registry_missing(conn, monkeypatch):
     """A half-migrated DB (metric_definitions present, table_registry not yet
     created) must degrade to an empty summary for a non-admin caller, not

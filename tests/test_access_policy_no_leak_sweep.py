@@ -949,3 +949,199 @@ class TestReadPathGuardCatchesStoredLeakyPolicy:
         # email surfaces (pandas renamed the masked dup to `email_1`).
         assert r.status_code == 200, r.text
         assert b"alice@example.com" in (r.content or b""), "expected the leak to reappear with the guard disabled"
+
+
+# ---------------------------------------------------------------------------
+# §3.2, second half — the twins the interlock did NOT cover, and the
+# engine-qualified paths that reach a policied physical source without ever
+# naming the policied registry row.
+#
+# Both classes below are the same hazard the file already pins for
+# distributable twins and for `<source>.main.<table>` references, arriving
+# through the two doors those guards structurally cannot see:
+# `_is_distributable_registry_row` is False for every non-distributable
+# shape, and the rewrite matches by registry NAME, which `sf.*` / `bq.*`
+# paths never spell.
+# ---------------------------------------------------------------------------
+
+
+def _register_engine_row_with_policy(source_type: str, table_id: str, bucket: str, source_table: str) -> None:
+    """A `query_mode='remote'` row for one engine, carrying a policy.
+
+    Registered through the repository rather than the admin API on purpose
+    (unlike ``TestDesignDocCanonicalExampleRejectedAtSave``, which is about
+    the write path): registering a remote row through the API kicks off
+    that connector's extract rebuild, and these tests are about the READ
+    gate, which never gets that far.
+    """
+    from src.db import get_system_db
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id=table_id,
+            name=table_id,
+            source_type=source_type,
+            query_mode="remote",
+            bucket=bucket,
+            source_table=source_table,
+        )
+        registry.set_access_policy(
+            table_id,
+            sql=f"SELECT * FROM {table_id} WHERE list_contains($user_groups, cost_center)",
+            note="engine-path gate test",
+            updated_by="admin",
+        )
+    finally:
+        conn.close()
+
+
+class TestBypassUnpoliciedNonDistributableTwin:
+    """§3.2 — the twin interlock keys on ``_is_distributable_registry_row``,
+    so it only ever fires for ``local``/``materialized`` twins. A second
+    registry row over the SAME physical source that is itself
+    non-distributable (``server_only=true``, or ``query_mode='remote'``)
+    slips past both directions: it can be registered next to a policied
+    table, and a policy can be attached next to it. Either way the raw rows
+    stay readable server-side under the twin's own name by anyone granted
+    it — the policy protects one name, not the data."""
+
+    def test_registering_server_only_twin_of_policied_table_is_422(self, sweep):
+        c = sweep["client"]
+        resp = _register(
+            c,
+            sweep["admin_token"],
+            name="invoices_server_only_twin",
+            bucket="in.c-finance",
+            source_table="invoices",
+            server_only=True,
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert "invoices" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("invoices_server_only_twin") is None
+
+    def test_attaching_a_policy_while_an_unpolicied_twin_exists_is_422(self, sweep):
+        """The mirror direction: two unpolicied rows over one physical
+        source is legal (nothing to protect yet), but the moment a policy
+        goes onto one of them the other becomes the open door."""
+        c = sweep["client"]
+        token = sweep["admin_token"]
+        for name in ("payroll_a", "payroll_b"):
+            resp = _register(
+                c,
+                token,
+                name=name,
+                bucket="in.c-hr",
+                source_table="payroll",
+                server_only=True,
+            )
+            assert resp.status_code in (200, 201), resp.text
+
+        resp = c.put(
+            "/api/admin/registry/payroll_a",
+            json={
+                "access_policy_sql": "SELECT * FROM payroll_a WHERE list_contains($user_groups, cost_center)",
+                "access_policy_note": "cost-centre filter",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert "payroll_b" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("payroll_a")["access_policy_sql"] is None
+
+
+class TestBypassEngineQualifiedPath:
+    """A direct ``sf."SCHEMA"."TABLE"`` / ``bq."dataset"."table"`` reference
+    names the PHYSICAL source, never the registry row, so
+    ``rewrite_sql`` — which substitutes by registry name — never fires and
+    the policy simply does not apply. Each engine's own gate checks only
+    that the path is registered and that the caller holds a grant on the
+    row it resolved to, which a caller granted the policied table passes.
+    Fail closed instead: point them at the registered name, where the
+    policy is enforced."""
+
+    def test_sf_path_to_a_policied_source_is_403(self, sweep):
+        from src.db import get_system_db
+        from tests.conftest import grant_table_via_package
+
+        _register_engine_row_with_policy("snowflake", "sf_invoices", "FINANCE", "INVOICES")
+        conn = get_system_db()
+        try:
+            grant_table_via_package(conn, "sf_invoices", "u_cca", group_name="CCA")
+        finally:
+            conn.close()
+
+        c = sweep["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM sf."FINANCE"."INVOICES"'},
+            headers=_auth(sweep["cca_token"]),
+        )
+        assert r.status_code == 403, r.text
+        detail = r.json().get("detail")
+        assert isinstance(detail, dict), detail
+        assert detail.get("reason") == "sf_path_policied", detail
+        assert detail.get("registered_as") == "sf_invoices", detail
+
+    def test_bq_path_to_a_policied_source_is_403(self, sweep):
+        from src.db import get_system_db
+        from tests.conftest import grant_table_via_package
+
+        _register_engine_row_with_policy("bigquery", "bq_invoices", "finance", "invoices_bq")
+        conn = get_system_db()
+        try:
+            grant_table_via_package(conn, "bq_invoices", "u_cca", group_name="CCA")
+        finally:
+            conn.close()
+
+        c = sweep["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM bq."finance"."invoices_bq"'},
+            headers=_auth(sweep["cca_token"]),
+        )
+        assert r.status_code == 403, r.text
+        detail = r.json().get("detail")
+        assert isinstance(detail, dict), detail
+        assert detail.get("reason") == "bq_path_policied", detail
+        assert detail.get("registered_as") == "bq_invoices", detail
+
+    def test_an_unpolicied_engine_path_is_not_rejected_by_this_gate(self, sweep):
+        """Non-vacuity: the same path shape over a source with NO policy
+        anywhere must not pick up the new rejection — it fails later (no
+        real warehouse in tests), never with ``*_path_policied``."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+        from tests.conftest import grant_table_via_package
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="sf_plain",
+                name="sf_plain",
+                source_type="snowflake",
+                query_mode="remote",
+                bucket="FINANCE",
+                source_table="PLAIN",
+            )
+            grant_table_via_package(conn, "sf_plain", "u_cca", group_name="CCA")
+        finally:
+            conn.close()
+
+        c = sweep["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": 'SELECT * FROM sf."FINANCE"."PLAIN"'},
+            headers=_auth(sweep["cca_token"]),
+        )
+        assert "sf_path_policied" not in r.text, r.text

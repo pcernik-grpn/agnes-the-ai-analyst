@@ -210,3 +210,31 @@ class TestStaleResponsesCannotWriteAnotherAgentsRows:
             "newer loadSchedules reset it, which throws into the catch arm and "
             "shows 'Could not delete the schedule' for a DELETE that succeeded"
         )
+
+    def test_create_reads_the_generation_and_drops_superseded_arms(self, markup):
+        """createSchedule's POST can also settle after the panel moved on: the
+        success arm pushed the created row into whatever array the panel
+        renders NOW (coercing a fresh one over a mid-load null — agent A's row
+        inside B's list), and the error arm wrote A's failure into B's form.
+        Both arms must drop a superseded continuation, reading the generation
+        (without bumping it — a create is not a load and must not invalidate
+        one in flight)."""
+        body = re.search(r"function createSchedule\(a, btn\)(.*?)\n  \}", markup, re.S)
+        assert body, "createSchedule not found"
+        text = body.group(0)
+        assert "var gen = schedGen;" in text, (
+            "createSchedule does not read the generation at entry — its continuations cannot tell they were superseded"
+        )
+        assert "var gen = ++schedGen;" not in text, (
+            "createSchedule must READ the generation, not claim a new one — "
+            "bumping it would make an in-flight load drop its own response"
+        )
+        assert text.count("gen !== schedGen") >= 2, (
+            "both the success arm and the error arm must drop a superseded "
+            f"continuation (found {text.count('gen !== schedGen')} checks, expected >= 2)"
+        )
+        assert "schedules || []" not in text, (
+            "the success arm coerces `schedules` — under the generation guard "
+            "a current-generation continuation always sees the owning array, "
+            "and coercion is exactly the write-into-the-wrong-agent bug"
+        )

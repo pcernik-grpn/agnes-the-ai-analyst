@@ -12,10 +12,11 @@ month, then apply all of a month's updates against one load and one save per tab
 Two invariants this file pins, both load-bearing and neither obvious:
 
   * **Equivalence.** Batched output must equal what the per-issue path produces for
-    the same inputs, including the two tri-state rules that are decided PER ISSUE
+    the same inputs, including the tri-state rules that are decided PER ISSUE
     against shared state — a `_comments_incomplete` marker preserves that issue's
-    stored thread, and an absent `_remote_links` overlay preserves its stored links.
-    Flattening those to a per-batch decision would silently wipe threads.
+    stored thread, an absent `_remote_links` overlay preserves its stored links,
+    and an absent `changelog` overlay preserves its stored history. Flattening any
+    of them to a per-batch decision would silently wipe a month's rows.
   * **Lock discipline.** `file_lock.py` documents the nesting as
     `issue_json_lock` (outer) -> `parquet_month_lock` (inner). The batch path holds
     the month lock across many issues, so it must never reach for an issue lock
@@ -261,6 +262,28 @@ def test_an_absent_remote_links_overlay_preserves_only_that_issues_rows(tree) ->
 
     links = _rows(out, "remote_links")
     assert "PROJ-701" in links["issue_key"].tolist(), "preserved rows were wiped"
+
+
+def test_an_absent_changelog_overlay_preserves_only_that_issues_rows(tree) -> None:
+    """Sibling of the remote_links rule, for the other table whose overlay can go
+    missing. Both are decided PER ISSUE against the same shared `existing` frame,
+    so the batch path has to keep them per-issue too — flattening either to a
+    per-batch decision would wipe the whole month's history for one absent key."""
+    raw, out = tree
+    keys = ["PROJ-801", "PROJ-802"]
+    for k in keys:
+        _write_raw(raw, _raw_issue(k, rich=True))
+    jira_incremental.transform_issues(keys, raw_dir=raw, output_dir=out)
+    assert len(_rows(out, "changelog")) == 2
+
+    # One issue comes back as a webhook-fallback body, which carries no changelog.
+    absent = _raw_issue("PROJ-801", rich=True)
+    del absent["changelog"]
+    _write_raw(raw, absent)
+    jira_incremental.transform_issues(keys, raw_dir=raw, output_dir=out)
+
+    changelog = _rows(out, "changelog")
+    assert sorted(changelog["issue_key"].tolist()) == keys, "preserved changelog rows were wiped"
 
 
 # --------------------------------------------------------------------------------

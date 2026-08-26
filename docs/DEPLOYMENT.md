@@ -52,6 +52,7 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    cat > .env <<EOF
    JWT_SECRET_KEY=$(openssl rand -hex 32)
    AGNES_VAULT_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
+   POSTGRES_PASSWORD=$(openssl rand -hex 16)
    DATA_DIR=/data
    DATA_SOURCE=keboola
    KEBOOLA_STORAGE_TOKEN=<your-token>
@@ -71,21 +72,49 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    (The Terraform module generates and persists this key automatically; this
    manual step matters only on self-provisioned hosts.)
 
+   `POSTGRES_PASSWORD` is the default install's app-state Postgres side-car
+   password (A1) — required by the `docker-compose.postgres.yml` overlay
+   included below. A legacy DuckDB-only install (existing instances, or a
+   deliberate opt-out for a new one) skips it and the overlay entirely — see
+   *Legacy fallback* at the end of this section.
+
 3. Mount a persistent disk at `/data` (optional but recommended — survives host rebuild). If you do, use the overlay:
 
    ```bash
    docker compose \
        -f docker-compose.yml \
+       -f docker-compose.postgres.yml \
        -f docker-compose.prod.yml \
        -f docker-compose.host-mount.yml \
+       -f docker-compose.postgres-host-mount.yml \
        up -d
    ```
+
+   The last file is required whenever `docker-compose.postgres.yml` and
+   `docker-compose.host-mount.yml` are combined (see its own header comment)
+   — it rebinds `postgres`'s data directory and `data-migrate`'s source
+   mount straight to the host `/data`, instead of the empty named volumes
+   the other two overlays would otherwise leave in place. Without it,
+   Postgres persistence silently reverts to a Docker-managed volume tied to
+   the boot disk, and `data-migrate` reads no rows at all. Also `mkdir -p
+   /data/postgres && chown -R 70:70 /data/postgres` on the host beforehand —
+   customer-instance VMs get this from the Terraform startup script, but a
+   self-provisioned host does not.
 
    Without a persistent disk (data on Docker named volume, tied to boot disk):
 
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+   docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.prod.yml up -d
    ```
+
+   **Legacy fallback (existing installs / explicit DuckDB opt-out):** drop
+   `-f docker-compose.postgres.yml` from either command above (and, in the
+   persistent-disk command, also drop `-f docker-compose.postgres-host-mount.yml`
+   — it references services `docker-compose.postgres.yml` defines, so
+   keeping it without the postgres overlay fails compose validation) and
+   don't set `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
+   instance did before A1. Not recommended for a new install (see
+   [postgres-cutover-runbook.md](postgres-cutover-runbook.md) for why).
 
 4. Bootstrap your admin password via `POST /auth/bootstrap`:
 
@@ -503,6 +532,57 @@ status. The endpoint requires admin auth (the sidecar's
   `UPDATE script_registry SET last_status = NULL WHERE id = '<id>';`
   Auto-recovery via max-runtime detection is intentionally out of scope
   for v0; revisit if it happens in practice.
+
+## The `-rich` image variant (office documents + hybrid retrieval)
+
+Two Collections capabilities ship as optional extras, because each pulls
+torch and together they add gigabytes to the image:
+
+| Extra | Without it | With it |
+|---|---|---|
+| `docling` | `.docx` / `.pptx` uploads are accepted and then **rejected** — there is no lightweight parser for them | office documents are parsed and indexed |
+| `embeddings` | retrieval is `lexical_only` — whole-word matching, weak on slide decks and prose | retrieval is `hybrid` (semantic + lexical) |
+
+The default image deliberately ships **without** them: every VM in a fleet
+would pay the disk and pull cost for a capability only some instances use.
+Instances that need it run the `-rich` variant instead.
+
+**Build and publish it** with the `Rich image (docling + embeddings)`
+workflow (`.github/workflows/image-rich.yml`, `workflow_dispatch`). It
+builds the same commit with the extras appended and publishes
+`:<channel>-rich` (e.g. `stable-rich`), plus version- and SHA-pinned tags.
+The workflow asserts the capabilities inside the built image before
+finishing, so a variant whose extras silently failed to install cannot ship
+looking identical to a working one.
+
+Locally, the same thing:
+
+```bash
+docker build --build-arg EXTRA_EXTRAS=",docling,embeddings" -t agnes:rich .
+```
+
+**Point an instance at it** by setting its image tag to `stable-rich`
+(Terraform: the `image_tag` variable; Compose: the `image:` line). Nothing
+else changes — same code, same schema, same configuration.
+
+**Check which one is running:**
+
+```bash
+docker exec <container> python -c "from src.ingest.retrieval import retrieval_mode; \
+from src.ingest.text_extract import docling_capability; \
+print(retrieval_mode(), docling_capability())"
+```
+
+`hybrid True` is the rich image; `lexical_only False` is the default one. On
+the default image a rejected office upload says so in its rejection reason
+rather than leaving the operator to guess.
+
+Every other allowlisted format is readable on **both** images: `.eml` and
+`.epub` are parsed by the standard library, with no extra. `.msg` (Outlook's
+binary format) is not on the upload allowlist at all — no parser for it ships
+on either image, so an upload containing one is refused in the response rather
+than accepted and rejected afterwards. Mail exported as `.eml` works
+everywhere.
 
 ## Which path should I pick?
 
@@ -1075,39 +1155,29 @@ unit/contract tests:
 
 ## Cloud-chat host requirements
 
-Agnes can serve a zero-install web chat and Slack DM bot at `/chat`. The
-sandboxed runner lives in an E2B ephemeral microVM; the Agnes host only
-needs RAM/CPU for the FastAPI app, ChatManager state, DuckDB, and any
-open WebSockets.
+Agnes can serve a zero-install web chat and Slack DM bot at `/chat`.
+Sessions run on one of two providers: the embedded **kai-agent** turn
+engine (the default — the engine owns the agent loop and its own
+execution sandbox, so Agnes spawns nothing per session) or **docker**
+(a self-hosted container per session on the host's own Docker daemon).
 
-**Full operator guide:** [`cloud-chat.md`](cloud-chat.md)
+**Full operator guide** — provider setup, prerequisites, and how to
+choose between them: [`cloud-chat.md`](cloud-chat.md)
 
 ### Agnes server floor
 
-Per-sandbox compute is billed by E2B (not by the Agnes host). The Agnes
-server itself needs only:
+Under the default kai-agent provider the Agnes server itself needs only:
 
 - 2 GB RAM (FastAPI + ChatManager + chat_repo + WS connections)
 - 1 vCPU for small teams; bump if you regularly host 50+ concurrent WS
   clients
 
-There is no per-session RAM/CPU floor for the host any more — that
-moved to the E2B template (`e2b.toml`).
-
-### E2B account
-
-1. Create an E2B account at https://e2b.dev and copy the API key from
-   the dashboard.
-2. Build the chat sandbox template: `e2b auth login` followed by
-   `e2b template build` inside
-   `app/initial_workspace_default/e2b-template/` (see that directory's
-   README for the full walkthrough).
-3. Set `E2B_API_KEY` in the Agnes server environment.
-4. Put the returned template id into `chat.e2b_template_id` in
-   `instance.yaml`.
-
-Sandbox billing is visible in the operator's E2B dashboard. Agnes does
-not yet surface per-session E2B cost in its own admin UI.
+The engine sidecar (and whatever sandbox infrastructure it manages) is
+sized by the deployment, not by the Agnes app. Under the docker provider,
+sandboxes run on the Agnes host itself — budget the per-sandbox bounds
+(`chat.docker_mem_limit` × `chat.docker_max_total_sandboxes`) on top of
+the floor above; see [`cloud-chat.md`](cloud-chat.md) → *Docker provider
+(self-hosted)*.
 
 ### Multi-replica chat HA (wave-2F)
 

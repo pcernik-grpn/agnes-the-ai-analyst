@@ -80,6 +80,20 @@ locals {
     var.dispatcher_vertex_sa_secret,
   ])) : toset([])
 
+  # Opt-in embedded kai-agent turn engine: same shape as the dispatcher —
+  # per-VM flag, module-wide config, secretAccessor only when some instance
+  # actually enables it. Secrets already granted through runtime_secret_env
+  # OR runtime_secrets are subtracted: a caller reusing one of the app's own
+  # secrets for the engine would otherwise declare the same (project, secret,
+  # role, member) IAM binding twice and the second apply errors with
+  # "already exists" — the same duplicate-binding trap
+  # oauth_secret_name_template documents.
+  kai_agent_any_enabled = anytrue([for inst in local.all_instances : inst.kai_agent_enabled])
+  kai_agent_secrets = local.kai_agent_any_enabled ? setsubtract(toset(compact([
+    var.kai_agent_jwt_secret,
+    var.kai_agent_e2b_key_secret,
+  ])), setunion(toset(keys(var.runtime_secret_env)), toset(var.runtime_secrets))) : toset([])
+
   # --- Vendor-neutral per-instance branding -> /data/state/instance.yaml ---
   # The startup script seeds instance.yaml on FIRST boot only (it never clobbers
   # an existing file). These locals turn the optional per-VM branding fields into
@@ -251,7 +265,7 @@ resource "google_secret_manager_secret_iam_member" "vm_runtime" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
-# Grant read access to secrets that get auto-injected as .env entries (E2B,
+# Grant read access to secrets that get auto-injected as .env entries (Anthropic,
 # Anthropic, Slack, etc.) per var.runtime_secret_env. The startup script
 # iterates this map and writes one `<env_var>=$(gcloud secrets ...)` line
 # per entry to /opt/agnes/.env.
@@ -268,6 +282,20 @@ resource "google_secret_manager_secret_iam_member" "vm_runtime_env" {
 # already exist (created out-of-band, like the OAuth clients above).
 resource "google_secret_manager_secret_iam_member" "vm_dispatcher" {
   for_each  = local.dispatcher_secrets
+  project   = var.gcp_project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.vm.email}"
+}
+
+# kai-agent engine secrets (shared JWT secret + E2B key) — read-only, and only
+# when some instance actually enables the engine. Both secrets must already
+# exist (created out-of-band, like the dispatcher's above). A secret also
+# mapped in runtime_secret_env is deliberately absent from this for_each (see
+# the setsubtract in locals) — the grant already exists there, and declaring
+# it twice errors the apply.
+resource "google_secret_manager_secret_iam_member" "vm_kai_agent" {
+  for_each  = local.kai_agent_secrets
   project   = var.gcp_project_id
   secret_id = each.value
   role      = "roles/secretmanager.secretAccessor"
@@ -476,6 +504,9 @@ resource "google_compute_instance" "vm" {
     # still asking for "topnav" fails the plan instead of silently getting rail.
     theme      = each.value.theme
     experience = each.value.experience
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — "" writes no env line and
+    # the instance follows instance.yaml / the app default.
+    chat_provider = each.value.chat_provider
     # Vendor-neutral branding for the FIRST-boot instance.yaml (logo/brand/
     # theme colours/custom_scripts), pre-rendered to a base64'd YAML fragment —
     # "" when the caller set no branding on this VM.
@@ -494,6 +525,7 @@ resource "google_compute_instance" "vm" {
     data_apps_enabled               = each.value.data_apps_enabled
     data_apps_runtime_image         = var.data_apps_runtime_image
     enable_watchdog                 = var.enable_watchdog
+    enable_gcp_logging              = var.enable_gcp_logging
     alert_webhook_url               = var.alert_webhook_url
     watchdog_files_b64              = local.watchdog_files_b64
     dispatcher_enabled              = each.value.dispatcher_enabled
@@ -501,6 +533,19 @@ resource "google_compute_instance" "vm" {
     dispatcher_key_secret           = var.dispatcher_key_secret
     dispatcher_vertex_sa_secret     = var.dispatcher_vertex_sa_secret
     dispatcher_policies_b64         = base64encode(var.dispatcher_policies)
+    kai_agent_enabled               = each.value.kai_agent_enabled
+    kai_agent_mem_limit             = each.value.kai_agent_mem_limit
+    kai_agent_cpus                  = each.value.kai_agent_cpus
+    kai_agent_pg_mem_limit          = each.value.kai_agent_pg_mem_limit
+    kai_agent_broker_mcp_enabled    = each.value.kai_agent_broker_mcp_enabled
+    kai_agent_image                 = var.kai_agent_image
+    kai_agent_jwt_secret            = var.kai_agent_jwt_secret
+    kai_agent_e2b_key_secret        = var.kai_agent_e2b_key_secret
+    # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
+    # value can break the template or the shell heredoc quoting.
+    kai_agent_env_b64 = base64encode(join("\n", [
+      for k, v in var.kai_agent_env : "${k}=${v}"
+    ]))
   })
 
   service_account {
@@ -533,6 +578,28 @@ resource "google_compute_instance" "vm" {
       )
       error_message = "dispatcher_enabled=true on instance ${each.value.name} requires dispatcher_image, dispatcher_policies, dispatcher_key_secret and dispatcher_vertex_sa_secret to be set on the module."
     }
+
+    # Same plan-time catch for the kai-agent engine: an enabled VM without
+    # the module-wide config would fail loudly halfway through boot — and an
+    # enabled VM whose kai_agent_env is missing the keys the engine's own
+    # env validation requires (HOST_AGENT_IDENTITY always; the
+    # ANTHROPIC_UPSTREAM_* pair when CLOUD_LLM_PROVIDER=anthropic) would
+    # plan and apply cleanly and then crash-loop at runtime — the same
+    # silent-fallback class the dispatcher's policies check exists to catch.
+    precondition {
+      condition = !each.value.kai_agent_enabled || (
+        var.kai_agent_image != "" &&
+        var.kai_agent_jwt_secret != "" &&
+        var.kai_agent_e2b_key_secret != "" &&
+        contains(keys(var.kai_agent_env), "HOST_AGENT_IDENTITY") &&
+        contains(keys(var.kai_agent_env), "CLOUD_LLM_PROVIDER") &&
+        (lookup(var.kai_agent_env, "CLOUD_LLM_PROVIDER", "") != "anthropic" || (
+          contains(keys(var.kai_agent_env), "ANTHROPIC_UPSTREAM_URL") &&
+          contains(keys(var.kai_agent_env), "ANTHROPIC_UPSTREAM_API_KEY")
+        ))
+      )
+      error_message = "kai_agent_enabled=true on instance ${each.value.name} requires kai_agent_image, kai_agent_jwt_secret and kai_agent_e2b_key_secret on the module, plus kai_agent_env carrying HOST_AGENT_IDENTITY and CLOUD_LLM_PROVIDER (and the ANTHROPIC_UPSTREAM_URL/ANTHROPIC_UPSTREAM_API_KEY pair when the provider is anthropic) — the engine's env validation refuses to boot without them."
+    }
   }
 
   # Ensure VM SA has read access to required secrets BEFORE the VM boots — otherwise
@@ -544,6 +611,7 @@ resource "google_compute_instance" "vm" {
     google_secret_manager_secret_iam_member.vm_runtime_env,
     google_secret_manager_secret_iam_member.vm_oauth,
     google_secret_manager_secret_iam_member.vm_dispatcher,
+    google_secret_manager_secret_iam_member.vm_kai_agent,
     google_secret_manager_secret_version.jwt,
     google_secret_manager_secret_version.session,
   ]

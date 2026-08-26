@@ -1521,3 +1521,89 @@ class TestEveryBucketSourceTableCompositionIsNormalized:
         hits = self._hits()
         stale = [p for p in self._EXEMPT if not any(h.startswith(p) for h in hits)]
         assert not stale, f"no longer composes — drop from _EXEMPT: {stale}"
+
+
+# ---- extract.duckdb registration (_meta + inner view) ----------------------
+
+
+def test_materialize_query_registers_meta_and_inner_view(tmp_path, fake_storage_client_parquet):
+    """A materialized Keboola row must land in its source's ``extract.duckdb``
+    as a ``_meta`` row + inner view, or ``SyncOrchestrator.rebuild()`` never
+    creates the master view: the parquet sits on disk, ``sync_state`` reports
+    ``ok`` with a row count, and every read 400s with "registered as
+    query_mode='materialized' but is not yet materialized in this instance's
+    analytics views".
+
+    BigQuery (``_persist_materialized_inner_view``), Snowflake and Databricks
+    all do this; Keboola was the only connector whose materialize path skipped
+    it, so a Keboola-materialized-only instance never got an
+    ``extract.duckdb`` at all and the orchestrator silently skipped the whole
+    source (debug-level "no extract.duckdb").
+    """
+    output_dir = tmp_path / "extracts" / "keboola" / "data"
+    output_dir.mkdir(parents=True)
+
+    kbe.materialize_query(
+        table_id="orders",
+        bucket="in.c-sales",
+        source_table="orders",
+        storage_client=fake_storage_client_parquet,
+        output_dir=output_dir,
+    )
+
+    extract_db = output_dir.parent / "extract.duckdb"
+    assert extract_db.is_file(), "materialize must create extract.duckdb for a materialized-only source"
+
+    conn = duckdb.connect(str(extract_db), read_only=True)
+    try:
+        assert conn.execute("SELECT table_name, rows, query_mode FROM _meta").fetchall() == [
+            ("orders", 2, "materialized")
+        ]
+        # The inner view must resolve through to the published parquet — the
+        # orchestrator only creates a master view when an inner object of the
+        # same name exists.
+        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_materialize_query_meta_registration_replaces_own_row_only(tmp_path, fake_storage_client_parquet):
+    """Re-materializing replaces that table's ``_meta`` row (the table carries
+    no UNIQUE on ``table_name``, so a blind INSERT would duplicate it) and
+    leaves every other row — e.g. a ``query_mode='remote'`` row written by the
+    extractor pass — untouched."""
+    output_dir = tmp_path / "extracts" / "keboola" / "data"
+    output_dir.mkdir(parents=True)
+
+    for _ in range(2):
+        kbe.materialize_query(
+            table_id="orders",
+            bucket="in.c-sales",
+            source_table="orders",
+            storage_client=fake_storage_client_parquet,
+            output_dir=output_dir,
+        )
+
+    extract_db = output_dir.parent / "extract.duckdb"
+    conn = duckdb.connect(str(extract_db), read_only=False)
+    try:
+        conn.execute(
+            "INSERT INTO _meta VALUES ('sibling', '', 0, 0, current_timestamp, 'remote')",
+        )
+    finally:
+        conn.close()
+
+    kbe.materialize_query(
+        table_id="orders",
+        bucket="in.c-sales",
+        source_table="orders",
+        storage_client=fake_storage_client_parquet,
+        output_dir=output_dir,
+    )
+
+    conn = duckdb.connect(str(extract_db), read_only=True)
+    try:
+        rows = conn.execute("SELECT table_name, query_mode FROM _meta ORDER BY table_name").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("orders", "materialized"), ("sibling", "remote")]

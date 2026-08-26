@@ -14,7 +14,7 @@ messages, and CHANGELOG stay English.
 
 1. **TDD-first.** Write the failing test, watch it fail, then the minimal
    implementation. Before claiming done, run the full suite:
-   `.venv/bin/pytest tests/ --tb=short -n auto -q`.
+   `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`.
 2. **Dual-backend parity in the SAME change.** Touch `src/repositories/X.py` →
    also touch `src/repositories/X_pg.py`, register both in
    `src/repositories/__init__.py` `_REGISTRY`, and extend the contract test.

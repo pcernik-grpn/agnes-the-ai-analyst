@@ -470,7 +470,11 @@
     {% if s.current %}
     <span class="aov-step__flag">Do this next</span>
     {% elif not s.failed %}
-    <a class="aov-step__go" href="{{ s.href }}">{{ s.done_cta if s.done else s.cta }} →</a>
+    {# Label and destination switch TOGETHER: a done row's maintenance verb
+       ("Manage packages") often names a different place than the open verb
+       ("Bundle tables"), and a shared href made the label a promise the
+       click broke. #}
+    <a class="aov-step__go" href="{{ s.done_href if s.done else s.href }}">{{ s.done_cta if s.done else s.cta }} →</a>
     {% endif %}
 
     {# Row two. Rendered only when the step actually has something to hang

@@ -139,11 +139,18 @@ PAT `surface` narrows authority further: a token with an unrecognized surface
 
 ### Sandbox isolation
 
-Chat sessions run in per-session microVMs. Egress is enforced **at the VM level**,
-independent of anything inside the sandbox: `deny_out=[ALL_TRAFFIC]` plus a host
-allowlist that defaults to the Agnes host, loopback, and the LLM and package
-endpoints the agent needs (`app/chat/e2b_provider.py`). Operators can tighten it
-via `chat.egress_allow_out`. Killing a session destroys the whole VM.
+Chat sessions run in per-session sandboxes: under the `docker` provider a
+hardened container created by the apps-runner sidecar (non-root, `cap_drop:
+ALL`, `no-new-privileges`, resource limits, no Docker socket inside —
+`app/chat/docker_provider.py`); under the default `kai-agent` provider, the
+embedded engine's own remote execution sandbox. The in-sandbox
+`pre_tool_use.py` hook is **advisory only** (fail-open, Bash-only, agent-
+rewritable); the enforcing egress layers sit outside the sandbox's reach —
+the docker provider's `chat.docker_egress_mode` (`none` joins an internal
+network with no route off the host; `allowlist` adds the egress-proxy
+sidecar, whose compose-owned `EGRESS_ALLOW_HOSTS` is the enforcing copy) and,
+on kai-agent, the engine's own sandbox policy. Killing a session destroys
+its sandbox.
 
 ### Untrusted input
 
@@ -237,12 +244,20 @@ record, so logout cannot invalidate a stolen cookie. The available kill switch i
 deactivating the user. PATs, by contrast, are checked against the database on
 every request and revoke immediately.
 
-### CSRF relies mostly on `SameSite`
+### CSRF: an origin gate above `SameSite`
 
-There is no application-wide CSRF middleware. The session cookie is
-`HttpOnly`, `SameSite=Lax`, and `Secure` when the deployment resolves to HTTPS;
-one sensitive web form uses an explicit double-submit token. For other
-state-changing browser POSTs, `SameSite=Lax` is the protection.
+State-changing browser requests are defended in layers. The session cookie is
+`HttpOnly`, `SameSite=Lax`, and `Secure` when the deployment resolves to HTTPS,
+which keeps it off a truly cross-site POST; the sensitive HTML web forms add an
+explicit double-submit token. Above these, an application-wide
+`CsrfOriginMiddleware` refuses any state-changing request authenticated *only*
+by the session cookie when the browser reports it cross-origin
+(`Sec-Fetch-Site: same-site`/`cross-site`, or an `Origin` that is neither
+same-origin nor on the `CORS_ORIGINS` allowlist) — which also covers the case
+`SameSite=Lax` cannot: a *same-site* request from a hosted data app on a sibling
+sub-domain. Bearer/PAT API callers (CLI, MCP, agent API) are unaffected. The
+gate acts only on positive cross-origin evidence and can be disabled with
+`AGNES_CSRF_ORIGIN_ENFORCE=0`.
 
 ### Rate limiting is auth-only
 
@@ -332,6 +347,6 @@ Agnes secures what it controls; the rest is yours.
 ## Hardening roadmap
 
 Directionally, and without commitment to dates: per-tool approval and a command
-policy for the agent runtime, provenance labeling for untrusted content, an
-application-wide CSRF defense, tamper-evident audit, signed release artifacts, and
-per-app isolation for hosted data apps.
+policy for the agent runtime, provenance labeling for untrusted content,
+tamper-evident audit, signed release artifacts, and per-app isolation for hosted
+data apps.

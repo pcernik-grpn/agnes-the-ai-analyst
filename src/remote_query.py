@@ -11,17 +11,31 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import duckdb
+
+from src.remote_engines import strip_one_trailing_semicolon
+
+if TYPE_CHECKING:
+    from connectors.bigquery.access import BqAccess
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 
 _RESERVED_ALIASES = {
-    "information_schema", "duckdb_tables", "duckdb_columns",
-    "duckdb_databases", "duckdb_settings", "duckdb_functions",
-    "duckdb_views", "duckdb_indexes", "duckdb_schemas",
-    "main", "memory", "system", "temp",
+    "information_schema",
+    "duckdb_tables",
+    "duckdb_columns",
+    "duckdb_databases",
+    "duckdb_settings",
+    "duckdb_functions",
+    "duckdb_views",
+    "duckdb_indexes",
+    "duckdb_schemas",
+    "main",
+    "memory",
+    "system",
+    "temp",
 }
 
 logger = logging.getLogger(__name__)
@@ -66,7 +80,7 @@ _BLOCKED_KEYWORDS: List[str] = [
     "glob(",
     "list_files",
     "'/",
-    '\"/',
+    '"/',
     "http://",
     "https://",
     "s3://",
@@ -81,6 +95,18 @@ _BLOCKED_KEYWORDS: List[str] = [
     "duckdb_views",
     "duckdb_indexes",
     "duckdb_schemas",
+    # SQLite-compat catalog views — `SELECT sql FROM sqlite_master` returns
+    # every view's CREATE VIEW body, disclosing the absolute parquet paths the
+    # orchestrator bakes into master views (`read_parquet('/data/extracts/…')`).
+    # This engine executes against a local DuckDB connection that may carry
+    # those views (the hybrid BQ+local join path), so the leak applies here too.
+    # Kept in lockstep with app/api/query.py's `_BLOCKED_SQL_TOKENS`.
+    "sqlite_master",
+    "sqlite_schema",
+    "sqlite_temp_master",
+    "sqlite_temp_schema",
+    # Leaks cached external file paths (absolute parquet paths) directly.
+    "duckdb_external_file_cache",
     "pragma_table_info",
     "pragma_storage_info",
     # Relative path traversal
@@ -138,7 +164,7 @@ def _strip_leading_sql_comments(sql: str) -> str:
         if stripped.startswith("--"):
             # Line comment runs to the next newline (or end of string).
             newline = stripped.find("\n")
-            s = "" if newline == -1 else stripped[newline + 1:]
+            s = "" if newline == -1 else stripped[newline + 1 :]
             continue
         if stripped.startswith("/*"):
             # Search for the closing */ AFTER the two-char opener, so a comment
@@ -149,7 +175,7 @@ def _strip_leading_sql_comments(sql: str) -> str:
             if end == -1:
                 # Unterminated block comment — leave it so the guard rejects.
                 return stripped
-            s = stripped[end + 2:]
+            s = stripped[end + 2 :]
             continue
         return stripped
 
@@ -161,9 +187,12 @@ def _validate_sql(sql: str) -> None:
         RemoteQueryError: with error_type="query_error" if validation fails.
     """
     sql_lower = sql.strip().lower()
+    # Tolerate exactly one trailing semicolon (see app/api/query.py's
+    # _assert_select_only) rather than treating it as a second statement.
+    body = strip_one_trailing_semicolon(sql_lower)
 
     for keyword in _BLOCKED_KEYWORDS:
-        if keyword in sql_lower:
+        if keyword in body:
             raise RemoteQueryError(
                 f"Blocked SQL pattern: {keyword!r}",
                 error_type="query_error",
@@ -171,7 +200,8 @@ def _validate_sql(sql: str) -> None:
             )
 
     import re as _re
-    if not _re.match(r"^(select|with)\s", _strip_leading_sql_comments(sql_lower)):
+
+    if not _re.match(r"^(select|with)\s", _strip_leading_sql_comments(body)):
         raise RemoteQueryError(
             "Query must start with SELECT or WITH",
             error_type="query_error",
@@ -195,14 +225,18 @@ _BQ_BLOCKED_KEYWORDS = [
 def _validate_bq_sql(sql: str) -> None:
     """Validate BQ SQL — narrower than DuckDB blocklist, only blocks writes."""
     sql_lower = sql.strip().lower()
+    # Tolerate exactly one trailing semicolon (see app/api/query.py's
+    # _assert_select_only) rather than treating it as a second statement.
+    body = strip_one_trailing_semicolon(sql_lower)
     for keyword in _BQ_BLOCKED_KEYWORDS:
-        if keyword in sql_lower:
+        if keyword in body:
             raise RemoteQueryError(
                 f"Blocked BQ SQL keyword: {keyword.strip()}",
                 error_type="query_error",
             )
     import re as _re
-    if not _re.match(r"^(select|with)\s", _strip_leading_sql_comments(sql_lower)):
+
+    if not _re.match(r"^(select|with)\s", _strip_leading_sql_comments(body)):
         raise RemoteQueryError(
             "BQ query must start with SELECT or WITH",
             error_type="query_error",
@@ -267,9 +301,7 @@ class RemoteQueryEngine:
     # Phase 1
     # ------------------------------------------------------------------
 
-    def register_bq(
-        self, alias: str, bq_sql: str, *, job_labels: dict[str, str] | None = None
-    ) -> Dict[str, Any]:
+    def register_bq(self, alias: str, bq_sql: str, *, job_labels: dict[str, str] | None = None) -> Dict[str, Any]:
         """Register a BigQuery query result as a DuckDB view.
 
         Steps:
@@ -304,6 +336,12 @@ class RemoteQueryEngine:
 
         _validate_bq_sql(bq_sql)
 
+        # The guard above tolerates one trailing semicolon; strip it here so
+        # neither the COUNT(*) pre-check subquery wrap below nor the data
+        # fetch sees an embedded ";" (legal at top level, a parse error once
+        # wrapped).
+        bq_sql = strip_one_trailing_semicolon(bq_sql)
+
         client = self._get_bq_client()
 
         # Tag the BQ jobs for per-user/workload cost attribution.
@@ -328,8 +366,7 @@ class RemoteQueryEngine:
 
         if count_value > self.max_bq_registration_rows:
             raise RemoteQueryError(
-                f"BQ result has {count_value:,} rows, exceeding the "
-                f"limit of {self.max_bq_registration_rows:,}.",
+                f"BQ result has {count_value:,} rows, exceeding the limit of {self.max_bq_registration_rows:,}.",
                 error_type="row_limit",
                 details={
                     "count": count_value,
@@ -361,8 +398,7 @@ class RemoteQueryEngine:
         memory_mb = arrow_table.nbytes / (1024 * 1024)
         if memory_mb > self.max_memory_mb:
             raise RemoteQueryError(
-                f"Arrow table uses {memory_mb:.1f} MiB, exceeding the "
-                f"limit of {self.max_memory_mb:.1f} MiB.",
+                f"Arrow table uses {memory_mb:.1f} MiB, exceeding the limit of {self.max_memory_mb:.1f} MiB.",
                 error_type="memory_limit",
                 details={"memory_mb": memory_mb, "max_memory_mb": self.max_memory_mb},
             )
@@ -405,11 +441,7 @@ class RemoteQueryEngine:
 
         try:
             result = self._conn.execute(sql).fetchmany(self.max_result_rows + 1)
-            columns = (
-                [desc[0] for desc in self._conn.description]
-                if self._conn.description
-                else []
-            )
+            columns = [desc[0] for desc in self._conn.description] if self._conn.description else []
         except RemoteQueryError:
             raise
         except Exception as exc:
@@ -426,10 +458,7 @@ class RemoteQueryEngine:
         serializable_rows = []
         for row in rows:
             serializable_rows.append(
-                [
-                    str(v) if v is not None and not isinstance(v, (int, float, bool, str)) else v
-                    for v in row
-                ]
+                [str(v) if v is not None and not isinstance(v, (int, float, bool, str)) else v for v in row]
             )
 
         return {
@@ -457,6 +486,7 @@ class RemoteQueryEngine:
         """
         if self._bq is None:
             from connectors.bigquery.access import get_bq_access, BqAccessError
+
             try:
                 self._bq = get_bq_access()
             except BqAccessError as exc:
@@ -469,6 +499,7 @@ class RemoteQueryEngine:
             return self._bq.client()
         except Exception as exc:
             from connectors.bigquery.access import BqAccessError
+
             if isinstance(exc, BqAccessError):
                 raise RemoteQueryError(
                     f"BigQuery access unavailable: {exc.message}",

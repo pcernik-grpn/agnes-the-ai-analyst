@@ -7,7 +7,8 @@ default for every call to render_claude_md().
 
 Override content is a Jinja2 template (autoescape=False, StrictUndefined).
 Available placeholders: instance.{name,subtitle}, server.{url,hostname},
-sync_interval, data_source.type, tables (list), metrics.{count,categories},
+sync_interval, data_source.{type,source_types}, tables (list of
+{name,description,query_mode,source_type}), metrics.{count,categories},
 semantic_layer.has_models (True iff the calling user can read >=1 valid
 semantic model), marketplaces (RBAC-filtered list),
 user.{id,email,name,is_admin,groups}, now, today.
@@ -110,7 +111,12 @@ def _list_tables(conn: duckdb.DuckDBPyConnection | None, *, user: dict) -> list[
         allowed_set = set(allowed_ids)
         rows = [r for r in rows if r.get("id") in allowed_set]
     return [
-        {"name": r.get("name"), "description": r.get("description") or "", "query_mode": r.get("query_mode") or "local"}
+        {
+            "name": r.get("name"),
+            "description": r.get("description") or "",
+            "query_mode": r.get("query_mode") or "local",
+            "source_type": r.get("source_type") or "",
+        }
         for r in rows
     ]
 
@@ -250,6 +256,7 @@ def build_claude_md_context(
     """
     now = datetime.now(timezone.utc) if now is None else now
     parsed = urlparse(server_url)
+    tables = _list_tables(conn, user=user)
     return {
         "instance": {
             "name": get_instance_name(),
@@ -260,8 +267,15 @@ def build_claude_md_context(
             "hostname": parsed.hostname or "",
         },
         "sync_interval": get_sync_interval(),
-        "data_source": {"type": get_data_source_type()},
-        "tables": _list_tables(conn, user=user),
+        "data_source": {
+            "type": get_data_source_type(),
+            # Distinct source_types of the tables the CALLER can see. The
+            # primary `type` alone can't gate engine-specific template
+            # sections: a multi-source instance registers e.g. BigQuery or
+            # Databricks remote rows while `type` stays 'local'/'keboola'.
+            "source_types": sorted({t["source_type"] for t in tables if t["source_type"]}),
+        },
+        "tables": tables,
         "metrics": _metrics_summary(conn, user=user),
         "semantic_layer": {"has_models": _has_semantic_layer(conn, user=user)},
         "marketplaces": _marketplaces_for_user(conn, user),

@@ -157,8 +157,16 @@
        of its own — leaving it unhighlighted made the whole chrome read as
        "nowhere", which is the same strand this rail already avoids for the
        surfaces it retired. #}
+    {# Every entity detail page the Library links out to also counts: without
+       these the rail highlighted NOTHING on /catalog/p/*, /memory/d/*,
+       /apps/detail/* and /marketplace/* — the most-visited detail surfaces
+       were a navigation blank spot ("you are nowhere"). All of them are
+       reached from the Library and return to it. #}
     {% set _on_library = _path.startswith('/library') or _path == '/artefacts'
-                         or _path == '/catalog/semantics' %}
+                         or _path.startswith('/catalog')
+                         or _path.startswith('/memory/d')
+                         or _path.startswith('/apps/detail')
+                         or _path.startswith('/marketplace') %}
     {% set _on_agents = _path == '/agents' %}
 
     {# ── Global search — one box across tables, curated knowledge, and
@@ -498,6 +506,20 @@
             <span class="rail-i-label">Admin</span>
         </a>
     </div>
+    {% elif session.user.is_admin_paused %}
+    {# Elevation is paused for this browser, so `is_admin` is False and the row
+       above is correctly gone — every /admin page would 403
+       (`admin_elevation_paused`). Silence would read as a bug though ("where
+       did Admin go?"), so the slot says what happened and links to the switch.
+       /me/profile is deliberately NOT admin-gated, which is what keeps this
+       from being a dead end: pausing can always be undone. #}
+    <div class="rail-admin">
+        <a class="rail-i rail-i--muted" href="/me/profile#admin-mode"
+           title="Admin mode is paused for this browser — you're running on your explicit grants. Click to resume.">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.5"/></svg>
+            <span class="rail-i-label">Admin paused</span>
+        </a>
+    </div>
     {% endif %}{# /session.user.is_admin #}
 
     {# "How {brand} works" is no longer a row here — it is a `.rail-meta` row in
@@ -635,6 +657,14 @@
                 </div>
                 {# ── About you ── #}
                 <a class="app-user-menu-item {% if _path == '/me/profile' %}is-active{% endif %}" role="menuitem" href="/me/profile">Profile</a>
+                {# Self-serve change-password (B6) — password auth had no
+                   in-app way to rotate a credential you already know, only
+                   token-based reset (forgot it) and admin reset. Placed next
+                   to Profile since it's the same "about you" account-state
+                   group; the route itself 404s if this instance excludes
+                   the password provider (require_provider("password")), so
+                   no extra gating is needed here. #}
+                <a class="app-user-menu-item {% if _path == '/auth/password/change' %}is-active{% endif %}" role="menuitem" href="/auth/password/change">Change password</a>
                 {# My connections (#919/#1086) — per-user MCP OAuth self-service.
                    Same placement contract as the topnav user dropdown
                    (tests/test_web_nav_me_connections.py, which runs over BOTH

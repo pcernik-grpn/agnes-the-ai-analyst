@@ -113,6 +113,46 @@ variable "prod_instance" {
     # dev-first rollout doesn't touch prod. Brings up the apps-runner sidecar +
     # the AGNES_DATA_APPS_ENABLED env override on that VM's .env only.
     data_apps_enabled = optional(bool, false)
+    # Opt-in embedded kai-agent turn engine on this VM (app >= the /api/kai
+    # host wiring, app/api/kai.py). Per-VM (like dispatcher_enabled) so a
+    # dev-first rollout doesn't touch prod. Brings up the engine + its own
+    # Postgres as extra compose services AND writes KAI_HOST_JWT_SECRET into
+    # that VM's app .env, enabling the /api/kai/* host surface — both halves
+    # of the shared-secret pair come from one Secret Manager secret, so they
+    # cannot drift. Requires the module-level kai_agent_* variables.
+    kai_agent_enabled = optional(bool, false)
+    # Engine container resource ceilings, written to /opt/agnes/.env like
+    # app_mem_limit above — per-VM TF fields and not .env hand-edits, because
+    # the startup script rewrites .env from scratch on every boot and a
+    # hand-raised ceiling would silently drop back to the default. Heavy work
+    # happens in the remote E2B sandbox, so the engine itself stays small.
+    kai_agent_mem_limit    = optional(string, "2g")
+    kai_agent_cpus         = optional(string, "1.0")
+    kai_agent_pg_mem_limit = optional(string, "1g")
+    # Opt-in: let the engine's sandbox reach this instance's own MCP tool
+    # surface. Sets both halves of the pair that only work together — the
+    # app-side ticket-scope switch (KAI_BROKER_MCP_ENABLED=true in the app
+    # .env) and the engine-side broker URL (HOST_BROKER_MCP_URL derived from
+    # the VM's own public origin, the same SERVER_URL the LLM broker line
+    # uses, since the E2B sandbox egresses to it from the public internet).
+    # One flag rather than two knobs because either half alone is a silent
+    # failure: URL without the scope answers 503 kai_mcp_not_enabled on every
+    # tool call (`_require_mcp_surface` is declared ahead of the ticket
+    # dependency so it decides before any credential is inspected), scope
+    # without the URL simply never registers the tool server. Inert unless
+    # kai_agent_enabled is also true on this VM.
+    kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
+    # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
+    # Codifies which engine runs
+    # /chat sessions IN TERRAFORM instead of a hand-edited instance.yaml on
+    # the data disk — the overlay survives reboots and recreates, but not a
+    # fresh data disk, and it is invisible in review. Empty (the default)
+    # writes NO env line, so the instance keeps whatever instance.yaml says.
+    # "kai-agent" requires kai_agent_enabled on the same VM (validated below):
+    # pinning web chat onto an engine this VM does not run refuses every
+    # session at boot.
+    chat_provider = optional(string, "")
 
     # --- Vendor-neutral per-instance branding (all OPTIONAL) ---
     # Written into the VM's /data/state/instance.yaml on FIRST boot only. The
@@ -217,6 +257,20 @@ variable "prod_instance" {
   # entry in app/switches.py), so a typo here would look applied and do
   # nothing. Catch it at plan time. `classic` is retired for the same reason
   # `topnav` is above — it names a behavior the app no longer has.
+  # The app resolves an unknown chat.provider by REFUSING the ChatManager at
+  # boot (app/main.py provider allowlist) — loud, but only at runtime on the
+  # VM. Catch the typo (and the engine-less kai-agent pin, which would refuse
+  # every session at mint time) at plan time instead.
+  validation {
+    condition     = contains(["", "docker", "kai-agent"], var.prod_instance.chat_provider)
+    error_message = "prod_instance.chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.89.0."
+  }
+
+  validation {
+    condition     = var.prod_instance.chat_provider != "kai-agent" || var.prod_instance.kai_agent_enabled
+    error_message = "prod_instance.chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
+  }
+
   validation {
     condition     = contains(["", "redesign"], var.prod_instance.experience)
     error_message = "prod_instance.experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
@@ -273,6 +327,20 @@ variable "dev_instances" {
     dispatcher_enabled  = optional(bool, false)
     # Per-VM hosted data apps — see prod_instance for the rationale.
     data_apps_enabled = optional(bool, false)
+    # Per-VM embedded kai-agent turn engine — see prod_instance for the
+    # rationale. Same "must be on the type" rule as the fields above.
+    kai_agent_enabled = optional(bool, false)
+    # Engine resource ceilings — see prod_instance; same defaults, same
+    # "must be on the type" rule.
+    kai_agent_mem_limit    = optional(string, "2g")
+    kai_agent_cpus         = optional(string, "1.0")
+    kai_agent_pg_mem_limit = optional(string, "1g")
+    # Engine → instance MCP tool surface — see prod_instance for the
+    # rationale; same default, inert without kai_agent_enabled.
+    kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
+    # rationale; same default (empty = no env line), same validations below.
+    chat_provider = optional(string, "")
     # See prod_instance for the rationale; same default.
     upgrade_schedule = optional(string, "*/5 * * * *")
 
@@ -346,6 +414,21 @@ variable "dev_instances" {
       for i in var.dev_instances : contains(["", "redesign"], i.experience)
     ])
     error_message = "each dev_instances[].experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
+  }
+
+  # Same plan-time guards as prod_instance.chat_provider — see there.
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : contains(["", "docker", "kai-agent"], i.chat_provider)
+    ])
+    error_message = "each dev_instances[].chat_provider must be \"\", \"docker\" or \"kai-agent\". The \"e2b\" provider was removed in app 0.89.0."
+  }
+
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : i.chat_provider != "kai-agent" || i.kai_agent_enabled
+    ])
+    error_message = "dev_instances[].chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
   }
 }
 
@@ -474,13 +557,13 @@ variable "notification_channel_ids" {
 }
 
 variable "runtime_secrets" {
-  description = "Names of existing Secret Manager secrets the VM needs to read at runtime (e.g. Keboola Storage token). VM SA gets scoped secretAccessor on each. Use this for secrets the startup script handles explicitly (KEBOOLA_STORAGE_TOKEN, GOOGLE_CLIENT_ID/SECRET — names are hardcoded in startup-script.sh.tpl). For new app-level secrets (E2B_API_KEY, ANTHROPIC_API_KEY, SLACK_*), prefer `runtime_secret_env` below."
+  description = "Names of existing Secret Manager secrets the VM needs to read at runtime (e.g. Keboola Storage token). VM SA gets scoped secretAccessor on each. Use this for secrets the startup script handles explicitly (KEBOOLA_STORAGE_TOKEN, GOOGLE_CLIENT_ID/SECRET — names are hardcoded in startup-script.sh.tpl). For new app-level secrets (ANTHROPIC_API_KEY, SLACK_*), prefer `runtime_secret_env` below."
   type        = list(string)
   default     = ["keboola-storage-token"]
 }
 
 variable "runtime_secret_env" {
-  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: e2b-api-key -> E2B_API_KEY, anthropic-api-key -> ANTHROPIC_API_KEY."
+  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN."
   type        = map(string)
   default     = {}
 }
@@ -515,6 +598,12 @@ variable "studio_enabled" {
 
 variable "enable_watchdog" {
   description = "Install the host-side watchdog + daily DB backup on every VM. The watchdog (5-min systemd timer) greps container logs for known incident signatures — DuckDB fatal crash loops, the invalidated-database \"zombie\" state (app answers /api/health 200 while every write 500s), WAL salvage data-loss events, index-desync errors — plus container restart bursts, cgroup OOM kills, scheduler failure streaks and /data disk pressure. The backup (daily systemd timer) copies system.duckdb+WAL to /data/backups/system-duckdb/ with 7-day retention and proves each copy restorable via a canary open+replay. Complements enable_monitoring: uptime checks see the VM from outside; the watchdog sees failure states the health endpoint cannot express, and PD snapshots preserve a corrupted file faithfully while the canary verify catches the corruption."
+  type        = bool
+  default     = true
+}
+
+variable "enable_gcp_logging" {
+  description = "Ship every container's stdout/stderr to Google Cloud Logging via Docker's built-in gcplogs driver, in addition to the local dual-logging cache `docker logs` reads from. On: the startup script extracts docker-compose.gcp-logging.yml (baked into the image) into the app directory, which the COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) then includes on every `docker compose` invocation — so logs survive the routine container recreates the auto-upgrade cron performs every 5 minutes, which otherwise destroy the Docker json-file log history. Off: the script removes the file instead, keeping the instance on the default json-file driver (rotated by /etc/docker/daemon.json) — the only supported choice for a non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server credentials."
   type        = bool
   default     = true
 }
@@ -576,6 +665,101 @@ variable "dispatcher_vertex_sa_secret" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "kai_agent_image" {
+  description = <<-EOT
+    Full image ref (with tag) of the kai-agent turn engine, e.g.
+    "<region>-docker.pkg.dev/<project>/<repo>/kai-agent:<tag>". Pin to an
+    immutable tag — the engine runs as an extra compose service on any VM
+    whose instance object sets `kai_agent_enabled = true`, and the
+    agnes-auto-upgrade tick re-pulls it every cycle, so a floating tag makes
+    rollouts non-reproducible.
+
+    Registry access: when the image lives in GCP Artifact Registry
+    (*-docker.pkg.dev) the startup script runs `gcloud auth configure-docker`
+    for that host, so the VM's own service account authenticates the pull —
+    grant it artifactregistry.reader on the repository. Any other private
+    registry needs pre-authenticated pull access on the VM (not provided by
+    this module).
+
+    Required (with the other kai_agent_* variables) when any instance enables
+    the engine.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "kai_agent_jwt_secret" {
+  description = <<-EOT
+    Secret Manager secret name holding the HS256 secret shared between the
+    Agnes host surface and the engine (>= 32 chars — the engine refuses
+    shorter; mint with `openssl rand -hex 32`). On every VM with
+    `kai_agent_enabled = true` the startup script writes the SAME fetched
+    value to both halves of the pair: KAI_HOST_JWT_SECRET in the app's .env
+    (enabling the /api/kai/* host routes — unset, they answer 503) and
+    HOST_JWT_SECRET in the engine's env, so the two can never drift. Module
+    grants the VM SA secretAccessor; the fetch fails LOUDLY at boot when the
+    engine is enabled. Required when any instance enables the engine.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "kai_agent_e2b_key_secret" {
+  description = <<-EOT
+    Secret Manager secret name holding the E2B API key the engine spawns its
+    sandboxes with (the engine's E2B_API_KEY — may name the same secret the
+    app's own cloud chat uses via runtime_secret_env). Module grants the VM SA
+    secretAccessor; fetch fails loudly at boot when the engine is enabled.
+    Required when any instance enables the engine.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "kai_agent_env" {
+  description = <<-EOT
+    Extra environment for the engine container, written verbatim into its env
+    file AFTER the derived lines — env_file gives later duplicate keys
+    precedence, so entries here can also override a derived value (e.g. a
+    split-horizon HOST_BROKER_TICKET_URL). Deployment-owned, like
+    dispatcher_policies. NON-SENSITIVE values only: the map lands in Terraform
+    state and on the VM in plaintext.
+
+    The module derives HOST_MODULE/HOST_JWT_*/HOST_BROKER_LLM_URL/
+    HOST_BROKER_TICKET_URL/HOST_WORKSPACE_URL/POSTGRES_URL/E2B_API_KEY; the
+    engine additionally requires from this map at minimum:
+      HOST_AGENT_IDENTITY  — the agent's persona line (host copy)
+      CLOUD_LLM_PROVIDER   — "anthropic" for a broker-fronted engine, plus its
+      ANTHROPIC_UPSTREAM_URL / ANTHROPIC_UPSTREAM_API_KEY — required by the
+        engine's env validation even though the jwt host path never reads
+        them (all LLM traffic transits the Agnes broker); placeholders are
+        fine and expected.
+    Optional extras: LLM_MODEL_NAME, LOG_LEVEL, ...
+
+    HOST_BROKER_MCP_URL is normally NOT set here: the per-VM
+    kai_agent_broker_mcp_enabled flag derives it from this instance's own
+    origin AND sets the app-side switch that makes it work, which is the
+    pairing this key alone cannot complete. Set it here only to override the
+    derived value (split-horizon, say).
+
+    Values must be SINGLE-LINE: the map is rendered as KEY=VALUE lines into
+    the engine's env_file, where an embedded line break truncates the value
+    and turns its remainder into a garbage line — the engine then never
+    starts, with only a generic warning in the boot log. Rejected at plan
+    time below.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for k, v in var.kai_agent_env :
+      !strcontains(v, "\n") && !strcontains(k, "\n") && !strcontains(k, "=")
+    ])
+    error_message = "kai_agent_env keys and values must be single-line (and keys must not contain '='): the map becomes KEY=VALUE lines in the engine's env_file, where an embedded newline corrupts the file and the engine silently never starts."
+  }
 }
 
 variable "alert_webhook_url" {

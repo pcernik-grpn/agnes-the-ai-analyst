@@ -213,15 +213,16 @@ async def access_overview(
 
     # Per-resource-type hierarchies. Driven by the registry in
     # app.resource_types — adding a new type there is the one place that
-    # surfaces here, no extra wiring. Disabled types (e.g. TABLE without
-    # AGNES_ENABLE_TABLE_GRANTS) are skipped so the admin UI does not
-    # render a chip for grants the runtime cannot enforce yet.
+    # surfaces here, no extra wiring. Disabled types (none as of v19 — see
+    # `is_resource_type_enabled`) are skipped so the admin UI does not render
+    # a chip for grants the runtime cannot enforce yet.
     from app.resource_types import enabled_resource_types
 
     resources = [
         {
             "type_key": spec.key.value,
             "type_display": spec.display_name,
+            "type_description": spec.description,
             "blocks": spec.list_blocks(),
         }
         for spec in enabled_resource_types()
@@ -682,20 +683,17 @@ async def create_grant(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     rt = _validate_resource_type(payload.resource_type)
-    # Feature gate: refuse to mint grants for resource types whose runtime
-    # enforcement is not wired up yet (e.g. ResourceType.TABLE without
-    # AGNES_ENABLE_TABLE_GRANTS). Listing + deleting existing rows still
-    # works so operators can clean up legacy data.
+    # Feature gate: refuse to mint grants for a resource type disabled by
+    # `is_resource_type_enabled` (all types are enabled unconditionally as of
+    # v19 — this exists for a future type whose runtime enforcement isn't
+    # wired up yet). Listing + deleting existing rows still works so
+    # operators can clean up legacy data.
     from app.resource_types import is_resource_type_enabled
 
     if not is_resource_type_enabled(rt):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"resource_type {rt.value!r} is not currently enabled. "
-                "Set AGNES_ENABLE_TABLE_GRANTS=1 to opt in once the runtime "
-                "enforcement is in place (see docs/TODO-rbac-data-enforcement.md)."
-            ),
+            detail=f"resource_type {rt.value!r} is not currently enabled.",
         )
     if not payload.resource_id.strip():
         raise HTTPException(status_code=400, detail="resource_id is required")
@@ -1394,6 +1392,101 @@ async def user_effective_access(
         is_admin=is_user_admin(user_id),
         items=list(grouped.values()),
         tables=tables,
+    )
+
+
+class LibraryPreviewItem(BaseModel):
+    """One row of a person's Library, as the Simulate lens previews it."""
+
+    id: str
+    name: str
+    # The wire enum ('required' | 'available') — the UI translates to the
+    # human tier words (Automatic / Optional), same as everywhere else.
+    requirement: str
+    in_stack: bool
+    # True iff `agnes pull` keeps a local copy (always for required; for
+    # available only once subscribed) — the delivery half of the answer.
+    materialized: bool
+    # The analyst page for the row, when a slug exists to link to.
+    href: Optional[str] = None
+
+
+class LibraryPreviewSection(BaseModel):
+    kind: str
+    label: str
+    items: List[LibraryPreviewItem]
+
+
+class LibraryPreviewResponse(BaseModel):
+    # 'auto' (every grant is a membership) or 'classic' (available grants
+    # need a subscription) — the UI words the not-in-stack state off this.
+    mode: str
+    sections: List[LibraryPreviewSection]
+
+
+@router.get(
+    "/users/{user_id}/library-preview",
+    response_model=LibraryPreviewResponse,
+)
+async def user_library_preview(
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    """What the person's Library actually shows — the RESULT, where
+    /effective-access is the why.
+
+    Computed by ``StackResolver.browse``, the same grants-based projection
+    the /library page renders the target's shared bands from — deliberately
+    NOT ``browse_admin`` and NOT a re-derivation from the grant rows, so
+    this preview cannot drift from the page it claims to predict (the
+    Library's contract is no admin god-mode, and that applies to a preview
+    OF a person just as it does to the person themselves). Covers the two
+    governed kinds the resolver serves to the Library (data packages,
+    memory domains); the other granted kinds keep their per-type fold in
+    the Simulate chain.
+    """
+    from app.instance_config import get_stack_auto_membership
+    from app.services.stack_resolver import StackResolver
+    from src.repositories import data_packages_repo, memory_domains_repo
+
+    if not users_repo().get_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    resolver = StackResolver()
+    slugs = {
+        ResourceType.DATA_PACKAGE: {r["id"]: r.get("slug") for r in data_packages_repo().list(limit=100000)},
+        ResourceType.MEMORY_DOMAIN: {r["id"]: r.get("slug") for r in memory_domains_repo().list(limit=100000)},
+    }
+    href_base = {
+        ResourceType.DATA_PACKAGE: "/catalog/p/",
+        ResourceType.MEMORY_DOMAIN: "/memory/d/",
+    }
+    labels = {
+        ResourceType.DATA_PACKAGE: "Data packages",
+        ResourceType.MEMORY_DOMAIN: "Memory",
+    }
+
+    sections: list[LibraryPreviewSection] = []
+    for rt in (ResourceType.DATA_PACKAGE, ResourceType.MEMORY_DOMAIN):
+        entries = resolver.browse(user_id, rt)
+        if not entries:
+            continue
+        items = [
+            LibraryPreviewItem(
+                id=e.id,
+                name=e.name,
+                requirement=e.requirement or "available",
+                in_stack=bool(e.in_stack),
+                materialized=bool(e.materialized),
+                href=(href_base[rt] + slugs[rt][e.id]) if slugs[rt].get(e.id) else None,
+            )
+            for e in sorted(entries, key=lambda e: (e.name or "").lower())
+        ]
+        sections.append(LibraryPreviewSection(kind=rt.value, label=labels[rt], items=items))
+
+    return LibraryPreviewResponse(
+        mode="auto" if get_stack_auto_membership() else "classic",
+        sections=sections,
     )
 
 

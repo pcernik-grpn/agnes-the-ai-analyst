@@ -97,6 +97,78 @@ def _fetch_bq_table_options(bq, dataset: str, table: str) -> dict:
     return {"partition_by": partition_by, "clustered_by": clustered_by}
 
 
+def _column_metadata_descriptions(table_id: str) -> dict[str, str]:
+    """Admin-authored per-column descriptions for ``table_id`` — the key
+    shape ``app/api/metadata.py`` writes and reads, ``(table_id,
+    column_name)``.
+
+    Safe to bake into the shared, bare-``table_id``-keyed ``_schema_cache``
+    entry: ``column_metadata`` carries no RBAC narrower than table access
+    itself (the same boundary ``build_schema`` already enforced via
+    ``can_access_table`` before this is ever called), unlike an Ossie
+    semantic-model field description — see ``_ossie_field_descriptions``.
+    """
+    from src.repositories import column_metadata_repo
+
+    return {
+        col["column_name"]: col["description"]
+        for col in column_metadata_repo().list_for_table(table_id)
+        if col.get("description")
+    }
+
+
+def _ossie_field_descriptions(table_id: str, user: dict, conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
+    """Ossie dataset field descriptions bound to ``table_id``, from every
+    ``status='valid'`` semantic model ``user`` may actually READ.
+
+    A semantic model is its own, narrower RBAC resource
+    (``ResourceType.SEMANTIC_MODEL`` — an unlinked model is admin-only; see
+    ``app/api/semantic_models.py::_can_read_model``), strictly narrower than
+    table access. This function — and therefore its result — must never be
+    baked into the shared ``_schema_cache`` entry a later, less-privileged
+    caller could receive back unfiltered; see ``build_schema``, which calls
+    this fresh on every request, cache hit or miss.
+    """
+    from app.api.semantic_models import _can_read_model
+    from src.repositories import semantic_model_repo
+    from src.semantic_context import dataset_field_descriptions
+
+    descriptions: dict[str, str] = {}
+    for row in semantic_model_repo().list_all():
+        if row.get("status") != "valid" or not row.get("document_json"):
+            continue
+        if not _can_read_model(user, row, conn):
+            continue
+        for model in row["document_json"].get("semantic_model") or []:
+            if not isinstance(model, dict):
+                continue
+            found = dataset_field_descriptions(model, table_id)
+            if found:
+                descriptions.update(found)
+    return descriptions
+
+
+def _apply_ossie_descriptions(payload: dict, table_id: str, user: dict, conn: duckdb.DuckDBPyConnection) -> dict:
+    """Overlay ``_ossie_field_descriptions`` onto any still-blank column
+    description in ``payload`` — never onto one ``column_metadata`` already
+    filled, same precedence as before.
+
+    Returns a NEW ``payload``/``columns`` (never mutates in place): the
+    incoming ``payload`` may be the exact object living in ``_schema_cache``
+    (a cache hit), and baking one caller's model-permitted text into that
+    shared object would leak it to the next caller under the same bare
+    ``table_id`` key — the RBAC leak this function exists to close.
+    """
+    descriptions = _ossie_field_descriptions(table_id, user, conn)
+    if not descriptions:
+        return payload
+    columns = [
+        {**col, "description": col.get("description") or descriptions.get(col["name"], "")}
+        for col in payload["columns"]
+    ]
+    return {**payload, "columns": columns}
+
+
 def build_schema(
     conn: duckdb.DuckDBPyConnection,
     user: dict,
@@ -133,15 +205,24 @@ def build_schema(
 
     cached = _schema_cache.get(cache_key)
     if cached is not None:
-        return cached
+        payload = cached
+    else:
+        payload = build_schema_uncached(conn, table_id, bq=bq, row=row)
 
-    payload = build_schema_uncached(conn, table_id, bq=bq, row=row)
+        if has_access_policy:
+            payload = _apply_effective_schema(payload, table_id, user)
+            _schema_cache.set(cache_key, payload)
 
-    if has_access_policy:
-        payload = _apply_effective_schema(payload, table_id, user)
-        _schema_cache.set(cache_key, payload)
-
-    return payload
+    # An Ossie dataset field description rides a separate, narrower RBAC
+    # resource than table access (`_ossie_field_descriptions` /
+    # `_can_read_model`) — applied fresh on EVERY call, cache hit or miss,
+    # and never written into `_schema_cache` itself: the bare `table_id` key
+    # is shared across every caller who can reach this table, so baking one
+    # caller's model-permitted text into it would leak that text to the
+    # next caller regardless of THEIR model access. `column_metadata`
+    # (`_column_metadata_descriptions`, already baked in above) carries no
+    # such narrower boundary and is unaffected.
+    return _apply_ossie_descriptions(payload, table_id, user, conn)
 
 
 def _apply_effective_schema(payload: dict, table_id: str, user: dict) -> dict:
@@ -173,6 +254,15 @@ def _apply_effective_schema(payload: dict, table_id: str, user: dict) -> dict:
     consumer of this shape, without either of them needing to learn about
     `hidden`.
     """
+    # KNOWN GAP (flagged, not fixed here): `effective_schema` builds its own
+    # column list independent of `build_schema_uncached`'s `description`
+    # merge, so a policied table's non-admin schema can lose a
+    # column_metadata/Ossie description that an unpolicied read of the same
+    # table would carry. `_apply_ossie_descriptions` still runs after this
+    # (see `build_schema`) and will fill any blank it finds, but a
+    # column-name mismatch between the two column lists is not guaranteed
+    # absent. Correctness follow-up, not a security issue (RBAC-scoped
+    # either way).
     columns = effective_schema(table_id, user)
     if columns is None:
         return payload
@@ -270,6 +360,39 @@ def build_schema_uncached(
             "clustered_by": [],
             "where_dialect_hints": DIALECT_HINTS,
         }
+    elif source_type == "snowflake" and query_mode == "remote":
+        # Same shape as the Databricks branch above and for the same reason: a
+        # remote Snowflake row has no parquet, so the local branch below would
+        # 404 — and the CLI renders that as "not found in the registry" on a
+        # table that is registered and answers `agnes query --remote` fine.
+        # Flavor stays `duckdb`: unlike Databricks there is no per-query ship
+        # to the warehouse, the analyst queries the ATTACHed `sf` catalog.
+        from connectors.snowflake.remote import fetch_schema as snowflake_fetch_schema
+        from connectors.snowflake.settings import resolve_snowflake_settings
+
+        settings = resolve_snowflake_settings()
+        if settings is None:
+            raise NotFound(table_id)
+        try:
+            # allow_empty=False: a `WHERE table_schema/table_name` miss — a
+            # dropped table, a repointed connection, a case-mismatched bucket —
+            # would otherwise return `columns: []` as a successful answer AND
+            # cache it, hiding for the cache's lifetime exactly the breakage
+            # this endpoint is being asked about.
+            columns = snowflake_fetch_schema(row, settings=settings, allow_empty=False)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"snowflake schema lookup failed: {exc}") from exc
+        payload = {
+            "table_id": table_id,
+            "source_type": source_type,
+            "sql_flavor": "duckdb",
+            "columns": columns,
+            "partition_by": None,
+            "clustered_by": [],
+            "where_dialect_hints": {},
+        }
     else:
         # Local source — read schema from the parquet via DuckDB. Resolve the
         # parquet by source-name-agnostic lookup: the extract directory is not
@@ -283,7 +406,11 @@ def build_schema_uncached(
         # extractor's own master view over the partition dir does.
         from app.utils import LOCAL_PARQUET_READ_EXPR, resolve_local_parquet_glob
 
-        parquet = resolve_local_parquet_glob(table_id, source_type)
+        # `registry_name`: the write side keys the parquet filename by the
+        # row's `name`, not its `id` — see `_physical_key_candidates` in
+        # app/utils.py. Without it, any row whose id was slugified from the
+        # name 404-ed here while fully synced.
+        parquet = resolve_local_parquet_glob(table_id, source_type, registry_name=row.get("name"))
         if parquet is None:
             raise NotFound(table_id)
         local_conn = _open_duckdb(":memory:")
@@ -303,6 +430,21 @@ def build_schema_uncached(
             "clustered_by": [],
             "where_dialect_hints": {},
         }
+
+    # Fill in a real per-column description from admin-authored
+    # `column_metadata`, leaving `""` where none exists (an Ossie dataset
+    # field description, the other source, is layered on separately by
+    # `build_schema` — see `_apply_ossie_descriptions` — never here, since
+    # this payload is what gets cached under the bare, RBAC-shared
+    # `table_id` key just below). A branch above that already carries its
+    # own description (e.g. a Databricks/Snowflake INFORMATION_SCHEMA
+    # comment fetched by `fetch_schema`) is left untouched — this only
+    # fills in the blank.
+    descriptions = _column_metadata_descriptions(table_id)
+    if descriptions:
+        for col in payload["columns"]:
+            if not col.get("description"):
+                col["description"] = descriptions.get(col["name"], "")
 
     # A policied table's schema is caller-scoped (§11), so it must never
     # land in a cache keyed on `table_id` alone — `row` (not `user`; this

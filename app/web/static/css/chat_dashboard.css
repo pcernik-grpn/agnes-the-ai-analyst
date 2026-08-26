@@ -77,7 +77,7 @@ html[data-ui-layout="rail"] .rdb-context {
 
 .rdb-actions {
     min-width: 0;
-    text-align: left;
+    text-align: center;
 }
 
 .rdb-panel-title {
@@ -98,11 +98,20 @@ html[data-ui-layout="rail"] .rdb-context {
     color: var(--ds-primary-dark);
 }
 
-/* Vertical stack — minimal, borderless single-line items. */
+/* Vertical stack — minimal, borderless single-line items, centred as a BLOCK
+   under the composer.
+
+   `width: fit-content` + auto margins, rather than centring each row on its
+   own: the rows differ in width by a few pixels, so per-row centring left the
+   icon column visibly ragged. Sizing the list to its widest row and centring
+   that box keeps every icon on one vertical line while the group still reads
+   as centred under the input. */
 .rdb-actions-list {
     list-style: none;
-    margin: 0;
+    margin: 0 auto;
     padding: 0;
+    width: fit-content;
+    max-width: 100%;
     display: flex;
     flex-direction: column;
     gap: 11px;
@@ -113,10 +122,15 @@ html[data-ui-layout="rail"] .rdb-context {
     min-width: 0;
 }
 
-/* One real button on a SINGLE line — icon · title · trailing "Start →".
-   Borderless and flat (no vertical padding); a subtle background on hover. */
+/* One real button on a SINGLE line — icon · title, centred under the
+   composer. Borderless and flat; a subtle background on hover.
+
+   `flex: 0 1 auto` (not the old `flex: 1`) is what lets the row centre: a
+   grown button filled the column and its content sat at the left edge however
+   the parent aligned it. Shrink is kept so a long title still ellipsizes
+   rather than overflowing. */
 .rdb-action {
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
     display: flex;
     flex-direction: row;
@@ -167,7 +181,7 @@ html[data-ui-layout="rail"] .rdb-context {
 /* Title + description on ONE line: bold title, then a muted description that
    truncates with an ellipsis so the item never wraps to a second row. */
 .rdb-action-txt {
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
     display: flex;
     flex-direction: row;
@@ -190,24 +204,6 @@ html[data-ui-layout="rail"] .rdb-context {
    for the button's aria-label). */
 .rdb-action-reason {
     display: none;
-}
-
-/* "Start →" trailing the row, right-aligned. */
-.rdb-action-cta {
-    flex-shrink: 0;
-    margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ds-primary-dark);
-}
-
-.rdb-action-cta svg {
-    width: 14px;
-    height: 14px;
-    display: block;
 }
 
 .rdb-actions-empty {
@@ -287,22 +283,16 @@ html[data-ui-layout="rail"] .rdb-context {
 /* ── Responsive ──────────────────────────────────────────────────── */
 
 @media (max-width: 680px) {
-    /* Rows stack their metadata; the trailing CTA drops under the text. */
+    /* Narrow: a long title may wrap rather than ellipsize, so the row is
+       allowed two lines. The trailing-CTA rules that used to live here went
+       with the CTA itself. */
     .rdb-action {
         flex-wrap: wrap;
-    }
-
-    .rdb-action-txt {
-        flex-basis: calc(100% - 44px);
     }
 
     .rdb-action-title,
     .rdb-action-reason {
         white-space: normal;
-    }
-
-    .rdb-action-cta {
-        margin-left: 44px;
     }
 
     /* Touch devices have no hover — keep the dismiss control visible. */

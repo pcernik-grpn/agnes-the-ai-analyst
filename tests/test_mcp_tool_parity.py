@@ -164,6 +164,7 @@ def test_a_read_only_tool_is_never_marked_destructive():
 
 """Verbs a tool title may open with — the action the caller is authorizing."""
 _TITLE_VERBS = {
+    "apply",
     "list",
     "get",
     "search",

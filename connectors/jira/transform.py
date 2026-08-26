@@ -375,12 +375,192 @@ def apply_schema(df: pd.DataFrame, schema: dict) -> pa.Table:
     return pa.Table.from_pandas(df, schema=pa_schema, preserve_index=False)
 
 
+#: ADF smart-link nodes. All three carry their target in ``attrs`` and have NO
+#: text child at all, so a text-node-only walk emitted nothing for them and a
+#: comment whose whole body is one smart link stored as ``''``.
+_ADF_CARD_TYPES = frozenset({"inlineCard", "blockCard", "embedCard"})
+
+
+def _nonempty_str(value: object) -> str | None:
+    """``value`` stripped, or ``None`` if it is not a non-blank string.
+
+    One definition of "a usable URL string", because every ADF attribute this
+    module reads comes from third-party JSON and may be absent, null or mistyped.
+    """
+    return stripped if isinstance(value, str) and (stripped := value.strip()) else None
+
+
+#: Query/fragment parameter names whose VALUE is a credential. Two tiers because
+#: the vocabulary is not standardised: a substring match catches every vendor
+#: spelling built around a known word (``access_token``, ``refresh_token``,
+#: ``mfaManagementToken``, ``X-Amz-Signature``), while short or ambiguous names
+#: have to be matched whole or they would fire on innocent params — ``sig``
+#: as a substring would redact ``design``, ``auth`` would redact ``author``.
+_SECRET_PARAM_SUBSTRINGS = ("token", "jwt", "secret", "password", "passwd", "signature", "credential", "apikey")
+_SECRET_PARAM_NAMES = frozenset({"tok", "sig", "key", "pin", "auth", "code", "sdata"})
+
+#: Deliberately a word, not an ellipsis: it survives a CSV round-trip, greps
+#: cleanly, and reads as a decision rather than as truncated data.
+_REDACTED_VALUE = "REDACTED"
+
+#: Splits on ``&``/``;`` while KEEPING the separators, so a redacted URL differs
+#: from the original only in the values removed. One character class, no
+#: alternation to backtrack over — linear on adversarial input (security
+#: playbook rule 5).
+_PARAM_SPLIT_RE = re.compile(r"([&;])")
+
+
+#: Separators vendors sprinkle through parameter names. Stripping them before the
+#: substring match is what makes one entry cover `api_key`, `api-key` and
+#: `apiKey`. Only the substring tier is normalised: the exact tier must keep
+#: seeing `api_key` as a different name from `key`.
+_PARAM_NAME_SEPARATORS = str.maketrans("", "", "_-.")
+
+
+def _is_secret_param(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in _SECRET_PARAM_NAMES:
+        return True
+    squashed = lowered.translate(_PARAM_NAME_SEPARATORS)
+    return any(word in squashed for word in _SECRET_PARAM_SUBSTRINGS)
+
+
+def _redact_param_values(blob: str) -> str:
+    """``blob`` (a query string or fragment) with credential values removed."""
+    pieces = _PARAM_SPLIT_RE.split(blob)
+    for index in range(0, len(pieces), 2):  # odd indices are the separators
+        name, equals, _value = pieces[index].partition("=")
+        if equals and _is_secret_param(name):
+            pieces[index] = f"{name}={_REDACTED_VALUE}"
+    return "".join(pieces)
+
+
+def _redact_url_secrets(url: str) -> str:
+    """``url`` with any credential-bearing parameter value replaced.
+
+    Inlining a href verbatim is the whole point of this renderer, but Jira hands
+    out URLs that carry bearer credentials in the query string — a Service Desk
+    ``unsubscribe?jwt=…`` link is a signed token authorising an action, and these
+    columns are distributed to analyst laptops as parquet and read by agents. So
+    the URL is kept whole and identifiable and only the *values* go. Everything
+    else — path, scheme, ordering, separators, non-secret params — is verbatim.
+
+    The fragment is covered too, because OAuth's implicit flow puts the token
+    there rather than in the query.
+    """
+    head, hash_sep, fragment = url.partition("#")
+    base, query_sep, query = head.partition("?")
+
+    out = base
+    if query_sep:
+        out += query_sep + _redact_param_values(query)
+    if hash_sep:
+        out += hash_sep + _redact_param_values(fragment)
+    return out
+
+
+def _adf_card_url(node: dict) -> str | None:
+    """Target of a smart-link node, or ``None`` if it carries none.
+
+    A blockCard resolved by the Smart Links service can arrive with an embedded
+    JSON-LD object instead of a flat ``url`` — same target, different spelling.
+    """
+    attrs = node.get("attrs")
+    if not isinstance(attrs, dict):
+        return None
+    data = attrs.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    for candidate in (attrs.get("url"), data.get("url"), data.get("@id")):
+        if url := _nonempty_str(candidate):
+            return _redact_url_secrets(url)
+    return None
+
+
+def _adf_link_href(node: dict) -> str | None:
+    """Href of the ``link`` mark on a text node, or ``None`` if it has none."""
+    marks = node.get("marks")
+    if not isinstance(marks, list):
+        return None
+    for mark in marks:
+        if not isinstance(mark, dict) or mark.get("type") != "link":
+            continue
+        attrs = mark.get("attrs")
+        if isinstance(attrs, dict) and (href := _nonempty_str(attrs.get("href"))):
+            return href
+    return None
+
+
+def _without_inferred_scheme(target: str) -> str:
+    """``target`` without a leading ``http://`` / ``https://``.
+
+    Two prefixes rather than a URL parser on purpose: the question is only
+    whether Jira's autolinker prepended a scheme to text the author typed, and
+    ``http://SKILL.md`` is not a URL anyone wants normalised. Only the FIRST
+    scheme goes, so a doubled ``https://http://x`` keeps its second one.
+    """
+    for scheme in ("https://", "http://"):
+        if target.startswith(scheme):
+            return target[len(scheme) :]
+    return target
+
+
+def _render_adf_link(text: str, href: str) -> str:
+    """Render one link-marked text node so the href survives the flattening.
+
+    The anchor text alone is what a text-node walk kept, and for a labelled link
+    ("DMD-1943" pointing at a Linear issue) that discards the only copy of the
+    target. ``label (href)`` keeps both and still reads as a sentence.
+
+    An autolink is the exception — Jira marks up a URL the author typed by using
+    it as its own anchor text, so the parenthesised copy would be pure noise. Two
+    spellings of the same link count as one:
+
+    * the href differs only by a trailing slash: emit the href, one copy of a URL
+      that is already whole either way;
+    * the href is the anchor text plus a scheme Jira inferred: emit the anchor
+      text. The scheme is the autolinker's guess, not authored content, and Jira
+      guesses freely — it links a bare ``SKILL.md`` to ``http://SKILL.md``.
+      Emitting the href there would rewrite a word into a URL that never existed,
+      and the text already carries every character of the target.
+
+    Every URL leaves through ``_redact_url_secrets``, but the comparisons above
+    run on the RAW href on purpose: redacting first would make an autolinked
+    ``?token=`` URL stop matching its own anchor text, and this would emit
+    ``<raw url> (<redacted url>)`` — printing the credential it just removed.
+    """
+    label = text.strip()
+    if not label:
+        return _redact_url_secrets(href)
+    bare_label = label.rstrip("/")
+    if bare_label == href.rstrip("/"):
+        return _redact_url_secrets(href)
+    if bare_label == _without_inferred_scheme(href).rstrip("/"):
+        # This branch fires only when the label IS the target, so the label is a
+        # URL and earns the same redaction rather than an exemption.
+        return _redact_url_secrets(label)
+    return f"{label} ({_redact_url_secrets(href)})"
+
+
+def _join_adf_parts(parts: list[str]) -> str:
+    """Join fragments, dropping the ones that render to nothing.
+
+    Only fragment *edges* are stripped, never a ``codeBlock``'s interior.
+    """
+    return " ".join([stripped for part in parts if (stripped := part.strip())])
+
+
 def extract_text_from_adf(node: dict | list | None) -> str:
     """
     Extract plain text from Atlassian Document Format (ADF) content.
 
     ADF is a nested JSON structure used by Jira for rich text.
     This function recursively extracts all text content.
+
+    URLs are inlined rather than dropped: a smart-link node keeps its target in
+    ``attrs``, a ``link`` mark keeps its in ``marks[].attrs.href``, and a walk
+    over ``text`` nodes alone saw neither. ``_adf_card_url`` and
+    ``_render_adf_link`` carry the per-construct rules.
     """
     if node is None:
         return ""
@@ -389,7 +569,7 @@ def extract_text_from_adf(node: dict | list | None) -> str:
         return node
 
     if isinstance(node, list):
-        return " ".join(extract_text_from_adf(item) for item in node)
+        return _join_adf_parts([extract_text_from_adf(item) for item in node])
 
     if not isinstance(node, dict):
         return ""
@@ -397,15 +577,25 @@ def extract_text_from_adf(node: dict | list | None) -> str:
     # Get text from this node
     text_parts = []
 
-    # Direct text content
-    if "text" in node:
-        text_parts.append(node["text"])
+    # Smart links: no text child, target lives in attrs. Emitted as a bare token
+    # in the sentence flow, taking the spacing a word in that position would get.
+    if node.get("type") in _ADF_CARD_TYPES:
+        card_url = _adf_card_url(node)
+        if card_url:
+            text_parts.append(card_url)
+
+    # Direct text content. A missing key and an explicit null both fall out of
+    # the isinstance guard, so it stands in for the old `"text" in node` too.
+    text = node.get("text")
+    if isinstance(text, str):
+        href = _adf_link_href(node)
+        text_parts.append(_render_adf_link(text, href) if href else text)
 
     # Recursive content
     if "content" in node:
         text_parts.append(extract_text_from_adf(node["content"]))
 
-    return " ".join(text_parts).strip()
+    return _join_adf_parts(text_parts)
 
 
 def extract_user_info(user: dict | None) -> dict:
@@ -587,13 +777,25 @@ def transform_issue(raw_issue: dict) -> dict:
 # coerce it by content. A plain `bool()` reads any non-empty string as truthy
 # and would silently flip a public comment to internal.
 #
+# `jsdPublic` is a Jira CLOUD PLATFORM field, not a JSM-licensed one. Live
+# verification (2026-08-19) found it serialized as a boolean on 100% of comments
+# on two JSM-UNLICENSED Cloud sites as well as a licensed one, and Atlassian's
+# v2/v3 OpenAPI schema says as much: it "defaults to true ... when the site
+# doesn't use Jira Service Desk". Licensing gates the VALUE (`false` occurs only
+# in service-desk projects), never the key's presence. Jira Data Center/Server
+# lacks the field entirely — and cannot run this connector at all, which
+# hardcodes `/rest/api/3`. So a NULL here is an anomaly worth a WARNING on every
+# deployment this code can reach.
+#
 # Reports of `jsdPublic` being wrong (JSDCLOUD-7997, -8275, -6050) concern
 # WEBHOOK payloads and WRITE attempts. This connector reads GET refetches on
 # every path but one: `process_webhook_event`'s fetch-failure fallback
-# (service.py) can transform the webhook body's own comments when the refetch
-# fails AND the embedded thread self-reports complete — narrow and healed by
-# the next successful refetch, but it means "only reads GET responses" would
-# overstate the guarantee.
+# (service.py) transforms the webhook body's own comments when the refetch fails
+# and the embedded thread is length-complete. Whether Cloud webhook bodies
+# serialize the flag is the one shape nobody has sampled — which is why the
+# incremental write layer no longer depends on the answer: it carries a stored
+# same-version value forward rather than letting an unflagged comment null one
+# (`incremental_transform._carry_forward_public_visibility`).
 
 
 def _comment_public_visibility(comment: dict) -> bool | None:
@@ -689,13 +891,20 @@ def transform_comments(
 
     if unresolved and warn_unresolved:
         # Counted, not defaulted — the operator needs to see the size of the gap
-        # rather than have it disappear into a plausible-looking `true`. Worded
-        # as "resolved", not "written": whether these records land in parquet is
-        # the caller's decision (the incremental path may preserve instead), and
-        # "no boolean jsdPublic" covers all three unresolved shapes — absent,
+        # rather than have it disappear into a plausible-looking `true`. On every
+        # deployment this connector can run against, `jsdPublic` is a platform
+        # field present on every comment, so a non-zero count here is a genuine
+        # anomaly and this is the only signal of it.
+        #
+        # Worded as what ARRIVED, not as what is stored: this count is taken
+        # before the incremental write layer gets a chance to carry a stored
+        # same-version value forward (`incremental_transform._comment_records`),
+        # so the number of rows that actually end up NULL may be lower. "No
+        # boolean jsdPublic" covers all three unresolved shapes — absent,
         # explicit null, and mistyped.
         logger.warning(
-            "Jira issue %s: %d of %d comments carry no boolean jsdPublic — public_visibility resolved as NULL",
+            "Jira issue %s: %d of %d comments arrived without a boolean jsdPublic — public_visibility is NULL "
+            "here; the incremental write layer may still carry a stored same-version value forward",
             issue_key,
             unresolved,
             len(comments),
@@ -741,10 +950,33 @@ def transform_attachments(raw_issue: dict, attachments_dir: Path | None = None) 
     return records
 
 
-def transform_changelog(raw_issue: dict) -> list[dict]:
-    """Extract and transform changelog entries from an issue."""
+def transform_changelog(raw_issue: dict) -> list[dict] | None:
+    """Extract and transform changelog entries from an issue.
+
+    Returns:
+      - list[dict]: fresh records to upsert. May be empty — ``{"histories": []}``
+        is a successful fetch confirming the issue has no history right now.
+      - None: the ``changelog`` key was absent entirely, so this payload carries
+        no fresh history AT ALL. Callers that upsert onto an issue-scoped
+        delete-then-insert store MUST treat ``None`` as "skip the upsert, preserve
+        existing rows" — the identical contract ``transform_remote_links``
+        carries, and for the identical reason.
+
+    The key shape is set by the writers: ``JiraService.fetch_issue`` and the
+    backfill both request ``expand=renderedFields,changelog``, so a successful
+    fetch always carries the key. The one writer that does not is
+    ``process_webhook_event``'s fetch-failure fallback, whose payload is the
+    event body Jira embedded — and Jira has never embedded a changelog there. So
+    every such save wrote zero changelog rows over the issue's stored history,
+    deleting it, on a path that runs precisely when a refetch has already failed.
+    """
     issue_key = raw_issue.get("key")
-    changelog = raw_issue.get("changelog", {})
+    # Absent and explicit-null both mean "no fresh data", mirroring
+    # `transform_remote_links` — absent is the writers' contract, explicit null
+    # the defensive case where a JSON edit stored one.
+    changelog = raw_issue.get("changelog")
+    if changelog is None:
+        return None
     histories = changelog.get("histories", [])
 
     records = []
@@ -1058,7 +1290,15 @@ def transform_all(
                     )
                 attachments_by_month[month_key].append(att_record)
 
-            changelog_by_month[month_key].extend(transform_changelog(raw_issue))
+            changelog_records = transform_changelog(raw_issue)
+            if changelog_records is not None:
+                changelog_by_month[month_key].extend(changelog_records)
+            # else: same story as `_remote_links` below — the payload carries no
+            # changelog overlay. A rebuild has nothing to preserve, so the issue
+            # simply contributes no changelog rows. The guard is not cosmetic:
+            # `extend(None)` raises, and the per-file handler below is a blind
+            # `except`, so an unguarded version would drop EVERY table's rows for
+            # that issue while the run still reported success.
             issuelinks_by_month[month_key].extend(transform_issuelinks(raw_issue))
             rl_records = transform_remote_links(raw_issue)
             if rl_records is not None:

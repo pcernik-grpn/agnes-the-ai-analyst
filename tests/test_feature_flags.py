@@ -88,8 +88,11 @@ class TestFeatureFlagsRegistry:
             "studio",
             "guardrails",
             "chat",
+            "chat_provider",
             "chat_approvals",
+            "chat_bootstrap_marketplace",
             "data_apps",
+            "data_apps_allow_same_origin",
             "library_show_unverified_trust",
             "experience",
             "stack_auto_membership",
@@ -238,8 +241,11 @@ class TestServerConfigFeatureFlagsInventory:
             "studio",
             "guardrails",
             "chat",
+            "chat_provider",
             "chat_approvals",
+            "chat_bootstrap_marketplace",
             "data_apps",
+            "data_apps_allow_same_origin",
             "library_show_unverified_trust",
             "stack_auto_membership",
             "mcp_query_param_token",
@@ -284,6 +290,33 @@ class TestServerConfigFeatureFlagsInventory:
         assert row["value_label"] == "auto"
         assert row["effective"] is True
         assert row["source"] == "env"
+
+    def test_chat_provider_row_resolves_through_the_runtime_view(self, seeded_app, monkeypatch):
+        """chat_provider is a select AND chat-runtime-resolved: its string
+        must come from `_chat_flag_runtime_view` (switch_value raises for
+        runtime_view switches by design), and a BLANK env must not label the
+        source "env" — `_resolve_chat_provider` treats blank as unset, so the
+        panel would claim a pin that does not exist (Devin Review on this PR)."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        monkeypatch.delenv("AGNES_CHAT_PROVIDER", raising=False)
+        flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
+        row = flags["chat_provider"]
+        assert row["value_label"] == "kai-agent"
+        assert row["effective"] is False
+        assert row["source"] == "default"
+        monkeypatch.setenv("AGNES_CHAT_PROVIDER", "docker")
+        flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
+        row = flags["chat_provider"]
+        assert row["value_label"] == "docker"
+        assert row["effective"] is True
+        assert row["source"] == "env"
+        # Blank env = unset for the select resolver — the label must agree.
+        monkeypatch.setenv("AGNES_CHAT_PROVIDER", "  ")
+        flags = {f["name"]: f for f in c.get("/api/admin/server-config", headers=_auth(token)).json()["feature_flags"]}
+        row = flags["chat_provider"]
+        assert row["value_label"] == "kai-agent"
+        assert row["source"] == "default"
 
     def test_preset_coupled_flag_resolves_and_labels_preset_source(self, seeded_app, monkeypatch):
         """Under ``experience: redesign`` with no per-knob setting, the

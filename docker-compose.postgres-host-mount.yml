@@ -1,12 +1,23 @@
 # Bridge overlay — used ONLY when both `docker-compose.postgres.yml` and
 # `docker-compose.host-mount.yml` are loaded in the same chain
 # (i.e. customer-instance VMs running Postgres side-car). It restates
-# data-migrate's mount as a direct host bind so the migration script
-# reads the actual /data/state/system.duckdb instead of the (empty)
-# named volume the postgres overlay declares.
+# two mounts defined only in docker-compose.postgres.yml as direct host
+# binds:
+#   - data-migrate's mount, so the migration script reads the actual
+#     /data/state/system.duckdb instead of the (empty) named volume the
+#     postgres overlay declares;
+#   - postgres's data directory, bound to /data/postgres (the
+#     startup-script pre-creates it, uid:gid 70:70, mode 0700, on every
+#     boot — survives container recreates, covered by the daily
+#     disk-snapshot policy on /data). A direct service-level bind, NOT
+#     `driver_opts` on the `postgres_data` named volume itself, for the
+#     same reason documented in docker-compose.host-mount.yml's header:
+#     a named volume's driver options are fixed at create time, so
+#     editing them and re-running `compose up` does not propagate — the
+#     footgun that already bit the `data:` volume in production once.
 #
-# Why a third file: the data-migrate service is defined in
-# docker-compose.postgres.yml; referencing it from host-mount.yml made
+# Why a third file: both services above are defined in
+# docker-compose.postgres.yml; referencing them from host-mount.yml made
 # `docker compose -f base -f prod -f host-mount` (the default baseline
 # without postgres) fail validation with
 #
@@ -24,3 +35,7 @@ services:
   data-migrate:
     volumes: !override
       - /data:/data:ro
+
+  postgres:
+    volumes: !override
+      - /data/postgres:/var/lib/postgresql/data

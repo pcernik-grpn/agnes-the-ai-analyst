@@ -104,7 +104,7 @@ def _grant_table_direct(conn, table_id: str, user_id: str, group_name: str) -> N
 
 
 @pytest.fixture
-def scoped_agent_env(e2e_env, mock_extract_factory):
+def scoped_agent_env(e2e_env, mock_extract_factory, shared_app):
     """Owner has real local tables t1 + t2 (registered, extracted, rebuilt
     into analytics.duckdb as real views with real rows) and real access to
     both. An agent owned by them is scoped to t1 only. A second, default
@@ -114,7 +114,6 @@ def scoped_agent_env(e2e_env, mock_extract_factory):
     from src.repositories.table_registry import TableRegistryRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
     from src.repositories.users import UserRepository
-    from app.main import create_app
     from fastapi.testclient import TestClient
 
     conn = get_system_db()
@@ -124,7 +123,7 @@ def scoped_agent_env(e2e_env, mock_extract_factory):
     UserGroupMembersRepository(conn).add_member("admin1", admin_gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     client = TestClient(app)
     admin_token = create_access_token("admin1", "admin@test.com")
     owner_jwt = create_access_token("owner1", "owner@test.com")

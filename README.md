@@ -144,7 +144,7 @@ uv pip install ".[dev,server]"
 uvicorn app.main:app --reload
 
 # Run the test suite
-pytest tests/ -v
+pytest tests/ connectors/ -v
 ```
 
 ## Project Structure
@@ -206,7 +206,7 @@ Key entry points:
 ## Contributing
 
 1. Fork the repository and create a feature branch.
-2. Run `pytest tests/ -v` to verify all tests pass before opening a pull request.
+2. Run `pytest tests/ connectors/ -v` to verify all tests pass before opening a pull request.
 3. Keep commits focused and messages concise.
 4. Open a pull request against `main` with a clear description of the change.
 

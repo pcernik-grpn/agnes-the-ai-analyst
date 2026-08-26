@@ -64,10 +64,10 @@ def test_list_names_with_prefix_both_backends(_env):
     repo = system_secrets_repo()
     repo.upsert("SLACK_BOT_TOKEN", "xoxb-unrelated")
     repo.upsert("env_overlay/ANTHROPIC_API_KEY", "sk-anthropic")
-    repo.upsert("env_overlay/E2B_API_KEY", "e2b-key")
+    repo.upsert("env_overlay/SENDGRID_API_KEY", "sg-key")
 
     names = repo.list_names_with_prefix("env_overlay/")
-    assert names == ["env_overlay/ANTHROPIC_API_KEY", "env_overlay/E2B_API_KEY"]
+    assert names == ["env_overlay/ANTHROPIC_API_KEY", "env_overlay/SENDGRID_API_KEY"]
 
     assert repo.list_names_with_prefix("env_overlay/") == sorted(repo.list_names_with_prefix("env_overlay/"))
     assert repo.list_names_with_prefix("does-not-exist/") == []

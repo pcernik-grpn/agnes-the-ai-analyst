@@ -97,21 +97,26 @@ def capture_code_via_browser(
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
-    start_url = (
-        server_url.rstrip("/")
-        + "/cli/auth/start?"
-        + urlencode({"port": port, "state": state})
-    )
+    start_url = server_url.rstrip("/") + "/cli/auth/start?" + urlencode({"port": port, "state": state})
     try:
         opened = webbrowser.open(start_url) if open_browser else False
-        if not opened:
-            # Headless / no default browser — print the URL so the user can
-            # open it on a machine that can reach this loopback port.
-            print(f"Open this URL in your browser to continue:\n  {start_url}")
+        # ALWAYS print the URL, whether or not the auto-open reported success.
+        # `webbrowser.open()`'s return value is not evidence that a browser
+        # actually surfaced: the macOS backend returns `not rc` from the
+        # `osascript` pipe, so it says True whenever osascript merely
+        # dispatched, and the Unix backends return True on a zero exit from a
+        # launcher that may have gone to a text browser or nowhere at all.
+        # Gating the print on it withheld the one thing the user needs in
+        # exactly the case where the browser did not come up — leaving a
+        # silent wait until the timeout with no URL on screen to click.
+        # `start_url` carries the loopback `port` and `state`, so it is the
+        # only form that can complete the flow; printing it costs one line
+        # when the browser did open.
+        print(f"Open this URL in your browser to continue:\n  {start_url}")
+        if not opened and open_browser:
+            print("(could not launch a browser automatically)")
         if not done.wait(timeout=timeout):
-            raise TimeoutError(
-                f"timed out after {int(timeout)}s waiting for browser sign-in"
-            )
+            raise TimeoutError(f"timed out after {int(timeout)}s waiting for browser sign-in")
     finally:
         httpd.shutdown()
         httpd.server_close()

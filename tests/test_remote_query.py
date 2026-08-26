@@ -1,7 +1,5 @@
 """Tests for RemoteQueryEngine — two-phase BQ registration + DuckDB execution."""
 
-from datetime import date
-from decimal import Decimal
 from unittest.mock import MagicMock
 
 import duckdb
@@ -30,9 +28,7 @@ def _make_bq_access(client):
 def analytics_conn():
     conn = duckdb.connect()
     conn.execute("CREATE TABLE orders (id INT, date DATE, amount DECIMAL(10,2))")
-    conn.execute(
-        "INSERT INTO orders VALUES (1, '2026-01-01', 100.0), (2, '2026-01-15', 200.0)"
-    )
+    conn.execute("INSERT INTO orders VALUES (1, '2026-01-01', 100.0), (2, '2026-01-15', 200.0)")
     yield conn
     conn.close()
 
@@ -93,6 +89,25 @@ class TestRemoteQueryEngineRegister:
         rows = analytics_conn.execute("SELECT COUNT(*) FROM bq_orders").fetchone()
         assert rows[0] == 3
 
+    def test_register_bq_trailing_semicolon_does_not_break_count_wrap(self, analytics_conn):
+        """_validate_bq_sql tolerates one trailing `;`; register_bq must strip
+        it before embedding the SQL in the COUNT(*) pre-check subquery, or a
+        validated query fails there instead of registering."""
+        arrow_table = pa.table({"order_id": pa.array([10, 20, 30], type=pa.int64())})
+        mock_client = _make_bq_mock(arrow_table)
+
+        engine = RemoteQueryEngine(
+            analytics_conn,
+            bq_access=_make_bq_access(mock_client),
+            max_bq_registration_rows=500_000,
+        )
+
+        result = engine.register_bq("bq_orders", "SELECT order_id FROM bq.orders;")
+
+        assert result["rows"] == 3
+        count_sql = mock_client.query.call_args_list[0].args[0]
+        assert ";" not in count_sql
+
     def test_register_bq_row_limit_exceeded(self, analytics_conn):
         """COUNT pre-check returns a value exceeding the row limit → RemoteQueryError."""
         arrow_table = pa.table({"x": pa.array([1], type=pa.int64())})
@@ -136,6 +151,7 @@ class TestRemoteQueryEngineRegister:
         """When google-cloud-bigquery is not installed, BqAccess raises
         BqAccessError(bq_lib_missing); the engine must translate that to
         RemoteQueryError."""
+
         def _missing_lib_factory(projects):
             raise BqAccessError(
                 "bq_lib_missing",
@@ -194,9 +210,7 @@ class TestRemoteQueryEngineExecute:
         engine.register_bq("bq_labels", "SELECT id, label FROM bq.labels")
 
         result = engine.execute(
-            "SELECT o.id, o.amount, b.label "
-            "FROM orders o JOIN bq_labels b ON o.id = b.id "
-            "ORDER BY o.id"
+            "SELECT o.id, o.amount, b.label FROM orders o JOIN bq_labels b ON o.id = b.id ORDER BY o.id"
         )
 
         assert result["row_count"] == 2
@@ -243,6 +257,15 @@ class TestValidateSql:
             "SELECT read_parquet('/data/file.parquet')",
             "SELECT * FROM '../secret/file'",
             "SELECT 1; DROP TABLE foo",
+            # SQLite-compat catalog views leak local view SQL (absolute parquet
+            # paths) when this engine runs against a DuckDB conn carrying the
+            # orchestrator's master views — kept in lockstep with
+            # app/api/query.py's _BLOCKED_SQL_TOKENS.
+            "SELECT sql FROM sqlite_master",
+            "SELECT sql FROM sqlite_schema",
+            "SELECT sql FROM sqlite_temp_master",
+            "SELECT sql FROM sqlite_temp_schema",
+            "SELECT * FROM duckdb_external_file_cache()",
         ],
     )
     def test_blocked_sql(self, sql):
@@ -261,6 +284,18 @@ class TestValidateSql:
     )
     def test_allowed_sql(self, sql):
         # Should not raise
+        _validate_sql(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT id FROM orders;",
+            "select count(*) from orders;",
+        ],
+    )
+    def test_allows_single_trailing_semicolon(self, sql):
+        # A single trailing `;` is routine SQL formatting, not a second
+        # statement — must not be confused with the multi-statement guard.
         _validate_sql(sql)
 
     @pytest.mark.parametrize(
@@ -348,6 +383,18 @@ class TestValidateBqSql:
     @pytest.mark.parametrize(
         "sql",
         [
+            "SELECT id FROM project.dataset.table;",
+            "SELECT * FROM dataset.INFORMATION_SCHEMA.COLUMNS;",
+        ],
+    )
+    def test_allows_single_trailing_semicolon(self, sql):
+        # A single trailing `;` is routine SQL formatting, not a second
+        # statement — must not be confused with the multi-statement guard.
+        _validate_bq_sql(sql)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
             "-- leading comment\nSELECT 1 AS x",
             "-- first\n-- second\nSELECT id FROM project.dataset.table",
             "/* block */ SELECT 1 AS x",
@@ -374,7 +421,6 @@ class TestValidateBqSql:
 
     def test_block_comment_with_slash_body_before_real_select_allowed(self):
         _validate_bq_sql("/*/ header */ SELECT 1")
-
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +478,7 @@ class TestHybridQueryBigQuery:
         engine.register_bq("traffic", "SELECT date, views FROM bq.traffic")
 
         result = engine.execute(
-            "SELECT o.id, o.amount, t.views "
-            "FROM orders o JOIN traffic t ON o.date = t.date "
-            "ORDER BY o.id"
+            "SELECT o.id, o.amount, t.views FROM orders o JOIN traffic t ON o.date = t.date ORDER BY o.id"
         )
 
         assert result["row_count"] == 2
@@ -476,8 +520,10 @@ class TestHybridQueryBigQuery:
 
         mock_client = MagicMock()
         mock_client.query.side_effect = [
-            traffic_count_job, traffic_data_job,
-            revenue_count_job, revenue_data_job,
+            traffic_count_job,
+            traffic_data_job,
+            revenue_count_job,
+            revenue_data_job,
         ]
 
         engine = RemoteQueryEngine(
@@ -489,9 +535,7 @@ class TestHybridQueryBigQuery:
         engine.register_bq("revenue", "SELECT date, revenue FROM bq.revenue")
 
         result = engine.execute(
-            "SELECT t.date, t.views, r.revenue "
-            "FROM traffic t JOIN revenue r ON t.date = r.date "
-            "ORDER BY t.views"
+            "SELECT t.date, t.views, r.revenue FROM traffic t JOIN revenue r ON t.date = r.date ORDER BY t.views"
         )
 
         assert result["row_count"] == 2
@@ -515,6 +559,7 @@ class TestHybridQueryBigQuery:
         the same shape get_bq_access() would produce on bq_lib_missing /
         not_configured in production.
         """
+
         def _missing_lib_factory(projects):
             raise BqAccessError(
                 "bq_lib_missing",
@@ -592,9 +637,7 @@ class TestHybridQueryBigQuery:
         """When the Arrow table exceeds max_memory_mb, returns
         RemoteQueryError with error_type='memory_limit'."""
         # Create a table that reports a large nbytes
-        big_arrow = pa.table(
-            {"x": pa.array([1] * 1000, type=pa.int64())}
-        )
+        big_arrow = pa.table({"x": pa.array([1] * 1000, type=pa.int64())})
         mock_client = _make_bq_mock(big_arrow)
 
         engine = RemoteQueryEngine(

@@ -3,7 +3,7 @@
 Covers `app/chat/agent_profile.py::select_in_budget` / `materialize_memories`
 (pure unit tests) and the `ChatManager._spawn_live` seam that must call
 `materialize_memories` BEFORE `_spawn_runner` uploads the session workdir
-into the (remote, E2B microVM) sandbox — see that module's docstring for
+into the (remote) sandbox — see that module's docstring for
 why the post-spawn `record_snapshot` seam is the wrong place for this.
 """
 

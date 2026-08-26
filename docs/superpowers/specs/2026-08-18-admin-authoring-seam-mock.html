@@ -1,0 +1,926 @@
+<title>Agnes — admin authoring seam (clickable mock)</title>
+
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   Clickable mock for docs/superpowers/specs/2026-08-18-admin-authoring-seam-design.md
+
+   Tokens are copied VERBATIM from app/web/static/css/design-tokens.css
+   (`:root[data-theme="paper"]`) so the mock reads as the product, not as
+   a wireframe. Deliberately single-theme: it is a fidelity mock of the
+   paper theme, which is light.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  color-scheme: light;
+
+  --ds-primary: #0284c7;
+  --ds-primary-dark: #0369a1;
+  --ds-primary-light: #e0f2fe;
+
+  --ds-bg: #f3f6fa;
+  --ds-surface: #ffffff;
+  --ds-surface-dim: #f5f7fb;
+  --ds-surface-sunken: #eaeef2;
+  --ds-border: #e2e8f0;
+  --ds-border-light: #edf2f8;
+
+  --ds-text-primary: #0f172a;
+  --ds-text-secondary: #475569;
+  --ds-text-muted: #64748b;
+
+  --ds-kind-data: #0f5f5c;
+  --ds-kind-data-soft: #e2f2f0;
+  --ds-kind-data-line: #a9d8d3;
+
+  --ds-accent-warn-bg: #fff7e8;
+  --ds-accent-warn-ink: #a16207;
+  --ds-accent-warn-line: #f6dfb4;
+  --ds-accent-success-bg: #e6f6f4;
+  --ds-accent-success-ink: #0f766e;
+  --ds-accent-success-line: #b7e3de;
+  --ds-accent-danger-bg: #feecec;
+  --ds-accent-danger-ink: #dc2626;
+  --ds-accent-danger-line: #fca5a5;
+
+  --ds-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --ds-shadow-md: 0 8px 20px rgba(0, 0, 0, 0.06);
+  --ds-shadow-lg: 0 12px 34px rgba(37, 99, 235, 0.08);
+
+  --ds-radius-btn: 9px;
+  --ds-radius-pill: 9999px;
+  --ds-font: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* Mock-only: the prototype chrome is deliberately NOT product-coloured,
+     so nothing on the bar can be mistaken for a real control. */
+  --proto-ink: #f1f5f9;
+  --proto-bg: #172033;
+  --proto-line: #2b3852;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--ds-font);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  background: var(--ds-bg);
+  color: var(--ds-text-primary);
+}
+
+:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 2px; border-radius: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ── Prototype chrome (not product) ─────────────────────────────── */
+.proto {
+  position: sticky; top: 0; z-index: 2000;
+  background: var(--proto-bg); color: var(--proto-ink);
+  border-bottom: 1px solid var(--proto-line);
+  padding: 10px 18px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 18px;
+  font-size: 13px;
+}
+.proto__tag {
+  font-size: 10.5px; letter-spacing: .11em; text-transform: uppercase;
+  font-weight: 700; color: #7dd3fc;
+}
+.proto__grp { display: flex; align-items: center; gap: 8px; }
+.proto__lbl { color: #94a3b8; font-size: 12px; }
+.proto__seg { display: inline-flex; background: #0f172a; border: 1px solid var(--proto-line); border-radius: 8px; padding: 2px; }
+.proto__seg button {
+  appearance: none; border: 0; background: transparent; color: #94a3b8;
+  font: inherit; font-size: 12.5px; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+}
+.proto__seg button[aria-pressed="true"] { background: #334155; color: #f8fafc; font-weight: 600; }
+.proto__note { margin-left: auto; color: #94a3b8; font-size: 12px; max-width: 46ch; }
+
+/* ── App shell ──────────────────────────────────────────────────── */
+.app { display: grid; grid-template-columns: 208px 1fr; min-height: calc(100vh - 46px); }
+
+.rail {
+  background: var(--ds-surface); border-right: 1px solid var(--ds-border);
+  padding: 18px 12px; display: flex; flex-direction: column; gap: 2px;
+}
+.rail__brand {
+  display: flex; align-items: center; gap: 9px;
+  font-weight: 700; letter-spacing: -0.02em; padding: 0 8px 16px;
+}
+.rail__mark {
+  width: 24px; height: 24px; border-radius: 7px;
+  background: var(--ds-kind-data); color: #fff;
+  display: grid; place-items: center; font-size: 12px; font-weight: 700;
+}
+.rail__i {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border-radius: 8px; cursor: pointer;
+  color: var(--ds-text-secondary); font-size: 14px;
+  border: 0; background: transparent; font-family: inherit; width: 100%; text-align: left;
+}
+.rail__i:hover { background: var(--ds-surface-dim); color: var(--ds-text-primary); }
+.rail__i.on { background: var(--ds-primary-light); color: var(--ds-primary-dark); font-weight: 600; }
+.rail__i .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .5; flex: 0 0 auto; }
+.rail__rule { margin: 12px 10px 8px; border-top: 1px solid var(--ds-border-light); }
+.rail__cap { padding: 0 10px 6px; font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ds-text-muted); font-weight: 700; }
+
+.stage { padding: 30px 36px 80px; max-width: 1120px; }
+.screen { display: none; }
+.screen.on { display: block; animation: fade .18s ease; }
+@keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+/* ── Shared product-ish components ──────────────────────────────── */
+.crumb { font-size: 13px; color: var(--ds-text-muted); margin-bottom: 14px; }
+.crumb a { color: var(--ds-text-secondary); text-decoration: none; border-bottom: 1px solid var(--ds-border); cursor: pointer; }
+.crumb a:hover { color: var(--ds-primary-dark); border-color: currentColor; }
+
+h1 { font-size: 30px; line-height: 1.2; letter-spacing: -0.025em; margin: 0 0 6px; text-wrap: balance; }
+h2 { font-size: 16px; letter-spacing: -0.01em; margin: 0 0 2px; }
+.lede { color: var(--ds-text-secondary); margin: 0 0 18px; max-width: 62ch; }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  border-radius: var(--ds-radius-pill); padding: 2px 10px;
+  font-size: 11.5px; font-weight: 600; letter-spacing: .01em;
+  background: var(--ds-kind-data-soft); color: var(--ds-kind-data);
+  border: 1px solid var(--ds-kind-data-line);
+}
+.pill--warn { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-color: var(--ds-accent-warn-line); }
+.pill--ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border-color: var(--ds-accent-success-line); }
+.pill--mute { background: var(--ds-surface-dim); color: var(--ds-text-muted); border-color: var(--ds-border); }
+
+.btn {
+  appearance: none; font: inherit; font-size: 14px; font-weight: 500;
+  border-radius: var(--ds-radius-btn); padding: 8px 15px; cursor: pointer;
+  border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-primary);
+  display: inline-flex; align-items: center; gap: 7px; transition: background .12s, border-color .12s;
+}
+.btn:hover { background: var(--ds-surface-dim); }
+.btn--primary { background: var(--ds-primary); border-color: var(--ds-primary); color: #fff; font-weight: 600; }
+.btn--primary:hover { background: var(--ds-primary-dark); border-color: var(--ds-primary-dark); }
+.btn--sm { font-size: 13px; padding: 5px 11px; border-radius: 8px; }
+.btn--danger { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
+
+.card { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; box-shadow: var(--ds-shadow-sm); }
+
+/* Detail layout — main column + aside rail, mirroring detail.cols_open() */
+.hero { display: grid; grid-template-columns: 1fr 300px; gap: 26px; align-items: start; margin-bottom: 26px; }
+.hero__main { min-width: 0; display: flex; flex-direction: column; gap: 24px; }
+.hero__aside { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 76px; }
+.hero__badges { display: flex; gap: 7px; margin-bottom: 12px; flex-wrap: wrap; }
+.hero__acts { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+
+.side { padding: 16px 18px; }
+.side h3 { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ds-text-muted); margin: 0 0 10px; font-weight: 700; }
+.side dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; font-size: 13.5px; }
+.side dt { color: var(--ds-text-muted); }
+.side dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* THE governance cluster — §4.2 of the design */
+.manage {
+  margin-top: 14px; border: 1px solid var(--ds-border); border-radius: 12px;
+  background: var(--ds-surface-dim); overflow: hidden;
+}
+.manage__head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 13px; border-bottom: 1px solid var(--ds-border);
+  background: var(--ds-surface);
+}
+.manage__key {
+  font-size: 10px; letter-spacing: .11em; text-transform: uppercase; font-weight: 700;
+  color: var(--ds-text-muted); border: 1px solid var(--ds-border);
+  border-radius: 5px; padding: 1px 6px; background: var(--ds-surface-dim);
+}
+.manage__ttl { font-size: 12.5px; color: var(--ds-text-secondary); }
+.manage__body { padding: 11px 13px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.manage__door {
+  margin-left: auto; font-size: 13px; color: var(--ds-primary-dark);
+  background: 0; border: 0; font-family: inherit; cursor: pointer; padding: 4px 2px;
+}
+.manage__door:hover { text-decoration: underline; }
+
+/* Tables */
+.tbl-wrap { overflow-x: auto; }
+table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.tbl th {
+  text-align: left; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--ds-text-muted); font-weight: 700; padding: 9px 14px;
+  border-bottom: 1px solid var(--ds-border); white-space: nowrap;
+}
+table.tbl td { padding: 11px 14px; border-bottom: 1px solid var(--ds-border-light); vertical-align: top; }
+table.tbl tr:last-child td { border-bottom: 0; }
+table.tbl code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  color: var(--ds-text-muted); background: var(--ds-surface-dim);
+  border: 1px solid var(--ds-border-light); border-radius: 5px; padding: 1px 5px;
+}
+.t-name { font-weight: 600; }
+.t-sub { color: var(--ds-text-muted); font-size: 13px; }
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+
+.sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 12px; }
+.sec-head .count { color: var(--ds-text-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+/* Library */
+.lib-bar {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+  padding: 10px 12px; background: var(--ds-surface);
+  border: 1px solid var(--ds-border); border-radius: 12px;
+}
+.lib-search {
+  flex: 1; border: 1px solid var(--ds-border); border-radius: 8px;
+  padding: 7px 11px; font: inherit; font-size: 14px; background: var(--ds-surface-dim); color: inherit;
+}
+.lib-new { position: relative; }
+.lib-menu {
+  position: absolute; right: 0; top: calc(100% + 7px); width: 288px; z-index: 60;
+  background: var(--ds-surface); border: 1px solid var(--ds-border);
+  border-radius: 12px; box-shadow: var(--ds-shadow-md); padding: 6px; display: none;
+}
+.lib-menu.on { display: block; }
+.lib-menu__cap {
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase; font-weight: 700;
+  color: var(--ds-text-muted); padding: 9px 11px 5px;
+}
+.lib-menu__cap--admin { color: var(--ds-accent-warn-ink); display: flex; align-items: center; gap: 7px; }
+.lib-menu__cap--admin::after {
+  content: "admin"; font-size: 9px; letter-spacing: .08em;
+  background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line);
+  border-radius: 4px; padding: 0 5px; text-transform: uppercase;
+}
+.lib-menu__sep { border-top: 1px solid var(--ds-border-light); margin: 5px 0; }
+.lib-menu__i {
+  display: block; width: 100%; text-align: left; font: inherit; font-size: 14px;
+  background: 0; border: 0; border-radius: 8px; padding: 8px 11px; cursor: pointer; color: inherit;
+}
+.lib-menu__i:hover { background: var(--ds-surface-dim); }
+.lib-menu__i small { display: block; color: var(--ds-text-muted); font-size: 12px; }
+
+/* Drawer — geometry from app/web/static/css/drawer.css.
+   `top` clears the prototype bar (which is chrome ABOUT the mock, not part
+   of the product) so the drawer is full-height within the app area and its
+   own header can never be occluded. --proto-h is kept in sync from JS. */
+.drawer { position: fixed; left: 0; right: 0; bottom: 0; top: var(--proto-h, 46px); z-index: 1200; display: none; }
+.drawer.on { display: block; }
+.drawer__backdrop { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.45); animation: dfade .16s ease; }
+@keyframes dfade { from { opacity: 0; } to { opacity: 1; } }
+.drawer__panel {
+  position: absolute; top: 0; right: 0; bottom: 0; width: min(600px, 100vw);
+  display: flex; flex-direction: column; background: var(--ds-surface);
+  border-left: 1px solid var(--ds-border); box-shadow: var(--ds-shadow-lg);
+  animation: din .22s cubic-bezier(.22,.8,.3,1);
+}
+@keyframes din { from { transform: translateX(26px); opacity: .4; } to { transform: none; opacity: 1; } }
+.drawer__head { padding: 18px 22px 14px; border-bottom: 1px solid var(--ds-border); display: flex; align-items: flex-start; gap: 12px; }
+.drawer__head h2 { font-size: 17px; }
+.drawer__sub { color: var(--ds-text-muted); font-size: 13px; margin: 2px 0 0; }
+.drawer__x { margin-left: auto; background: 0; border: 0; font-size: 21px; line-height: 1; color: var(--ds-text-muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+.drawer__x:hover { background: var(--ds-surface-dim); color: var(--ds-text-primary); }
+.drawer__body { padding: 20px 22px; overflow-y: auto; flex: 1; }
+.drawer__foot {
+  padding: 14px 22px; border-top: 1px solid var(--ds-border);
+  display: flex; gap: 9px; align-items: center; background: var(--ds-surface-dim);
+}
+.drawer__foot .spacer { margin-left: auto; }
+
+.fld { margin-bottom: 15px; }
+.fld > label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 5px; }
+.fld input[type=text], .fld textarea, .fld select {
+  width: 100%; font: inherit; font-size: 14px; padding: 8px 11px;
+  border: 1px solid var(--ds-border); border-radius: 8px;
+  background: var(--ds-surface); color: inherit;
+}
+.fld textarea { min-height: 74px; resize: vertical; }
+.fld .hint { font-size: 12px; color: var(--ds-text-muted); margin-top: 4px; }
+.fld-row { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+
+.escape {
+  margin-top: 16px; padding: 11px 13px; border-radius: 10px;
+  background: var(--ds-accent-warn-bg); border: 1px solid var(--ds-accent-warn-line);
+  font-size: 13px; color: var(--ds-accent-warn-ink);
+}
+.escape button { background: 0; border: 0; font: inherit; font-weight: 600; color: inherit; text-decoration: underline; cursor: pointer; padding: 0; }
+
+.pick { display: flex; align-items: center; gap: 11px; padding: 9px 4px; border-bottom: 1px solid var(--ds-border-light); }
+.pick:last-child { border-bottom: 0; }
+.pick input { width: 16px; height: 16px; accent-color: var(--ds-primary); flex: 0 0 auto; }
+.pick .g { flex: 1; min-width: 0; }
+
+/* Legacy modal — used ONLY by "Today" mode, to show what teleporting costs */
+.legacy { position: fixed; left: 0; right: 0; bottom: 0; top: var(--proto-h, 46px); z-index: 1300; display: none; }
+.legacy.on { display: grid; place-items: center; }
+.legacy__bd { position: absolute; inset: 0; background: rgba(15,23,42,.45); }
+.legacy__card {
+  position: relative; width: min(520px, 92vw); max-height: 78vh; overflow: auto;
+  background: var(--ds-surface); border-radius: 12px; box-shadow: var(--ds-shadow-md); padding: 22px;
+}
+
+.toasts { position: fixed; right: 20px; bottom: 20px; z-index: 1400; display: flex; flex-direction: column; gap: 9px; }
+.toast {
+  background: var(--ds-text-primary); color: #fff; padding: 10px 15px;
+  border-radius: 10px; font-size: 13.5px; box-shadow: var(--ds-shadow-md);
+  animation: tin .2s ease;
+}
+@keyframes tin { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+
+/* Role + mode gating */
+[data-role="analyst"] .admin-only { display: none !important; }
+[data-mode="today"] .proposed-only { display: none !important; }
+[data-mode="proposed"] .today-only { display: none !important; }
+
+.callout {
+  margin: 0 0 20px; padding: 12px 15px; border-radius: 11px; font-size: 13.5px;
+  background: var(--ds-primary-light); border: 1px solid #bae6fd; color: #075985;
+}
+.callout b { font-weight: 700; }
+
+@media (max-width: 900px) {
+  .app { grid-template-columns: 1fr; }
+  .rail { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--ds-border); }
+  .rail__brand, .rail__rule, .rail__cap { display: none; }
+  .rail__i { width: auto; white-space: nowrap; }
+  .hero { grid-template-columns: 1fr; }
+  .stage { padding: 22px 18px 70px; }
+}
+</style>
+
+<div class="proto">
+  <span class="proto__tag">Mock</span>
+  <div class="proto__grp">
+    <span class="proto__lbl">Signed in as</span>
+    <div class="proto__seg" role="group" aria-label="Role">
+      <button type="button" data-role-btn="admin" aria-pressed="true">Admin</button>
+      <button type="button" data-role-btn="analyst" aria-pressed="false">Analyst</button>
+    </div>
+  </div>
+  <div class="proto__grp">
+    <span class="proto__lbl">Behaviour</span>
+    <div class="proto__seg" role="group" aria-label="Behaviour">
+      <button type="button" data-mode-btn="today" aria-pressed="false">Today</button>
+      <button type="button" data-mode-btn="proposed" aria-pressed="true">Proposed</button>
+    </div>
+  </div>
+  <p class="proto__note">Flip <b>Today</b> to see what editing a package costs right now: you leave the package for the Tables lens.</p>
+</div>
+
+<div class="app" id="app" data-role="admin" data-mode="proposed">
+
+  <aside class="rail">
+    <div class="rail__brand"><span class="rail__mark">A</span> Agnes</div>
+    <button class="rail__i" data-go="library"><span class="dot"></span> Library</button>
+    <button class="rail__i" data-go="catalog-pkg"><span class="dot"></span> Connect</button>
+    <button class="rail__i"><span class="dot"></span> Agents</button>
+    <button class="rail__i"><span class="dot"></span> Chat</button>
+    <div class="rail__rule"></div>
+    <div class="rail__cap admin-only">Admin</div>
+    <button class="rail__i admin-only" data-go="admin-pkg"><span class="dot"></span> Data</button>
+    <button class="rail__i admin-only" data-go="admin-tables"><span class="dot"></span> Tables</button>
+  </aside>
+
+  <main class="stage">
+
+    <!-- ══ Screen 1 — the analyst package page ══════════════════ -->
+    <section class="screen on" data-screen="catalog-pkg">
+      <p class="crumb"><a data-go="library">Library</a> › Catalog › Revenue core</p>
+
+      <div class="hero">
+        <div class="hero__main">
+          <div>
+          <div class="hero__badges">
+            <span class="pill">Data package</span>
+            <span class="pill pill--mute">Finance</span>
+            <span class="pill pill--ok">Organization</span>
+          </div>
+          <h1>Revenue core</h1>
+          <p class="lede">Orders, refunds and FX rates joined to a single daily grain — the tables every revenue
+            question starts from. Use it for MRR, net revenue and cohort work.</p>
+
+          <div class="hero__acts">
+            <button class="btn btn--primary" data-toast="Added to your stack">Add to stack</button>
+            <button class="btn">Ask Agnes</button>
+          </div>
+          </div>
+
+          <div class="card">
+            <div style="padding:16px 18px 4px" class="sec-head">
+              <h2>Tables in this package</h2><span class="count">5</span>
+            </div>
+            <div class="tbl-wrap">
+              <table class="tbl">
+                <thead>
+                  <tr><th>Table</th><th>Bucket</th><th>Mode</th><th class="num">Rows</th><th>Last sync</th></tr>
+                </thead>
+                <tbody id="pkg-tables"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="hero__aside">
+          <div class="card side">
+            <h3>About this package</h3>
+            <dl>
+              <dt>Tables</dt><dd>5</dd>
+              <dt>Size</dt><dd>1.4 GB</dd>
+              <dt>Freshness</dt><dd>2h ago</dd>
+              <dt>Availability</dt><dd>Optional</dd>
+            </dl>
+          </div>
+
+          <!-- §4.2 — one governance cluster, admin only, object-scoped only -->
+          <div class="manage admin-only">
+            <div class="manage__head">
+              <span class="manage__key">Admin</span>
+              <span class="manage__ttl">Manage this package</span>
+            </div>
+            <div class="manage__body">
+              <button class="btn btn--sm" data-edit>Edit details</button>
+              <button class="btn btn--sm" data-tables>Tables</button>
+              <button class="btn btn--sm" data-share>Sharing</button>
+              <button class="manage__door" data-go="admin-pkg">Manage in Admin →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ Screen 2 — the admin package page ════════════════════ -->
+    <section class="screen" data-screen="admin-pkg">
+      <p class="crumb">Admin › Data › <a data-go="admin-tables">Data packages</a> › Revenue core</p>
+
+      <div class="callout proposed-only">
+        <b>Same component, second lens.</b> “Edit details” opens the shared drawer right here —
+        the package’s own page can finally edit the package.
+      </div>
+      <div class="callout today-only">
+        <b>Today:</b> this page cannot edit its own package. “Edit details…” is a link to
+        <code>/admin/tables?edit_package=…</code>.
+      </div>
+
+      <h1>Revenue core</h1>
+      <p class="lede">What is in it, who can use it, and who has actually pulled it.</p>
+
+      <div style="display:grid; grid-template-columns:1fr 320px; gap:22px; align-items:start">
+        <div class="card">
+          <div style="padding:16px 18px 4px" class="sec-head">
+            <h2>Composition</h2><span class="count">5 tables</span>
+          </div>
+          <div class="tbl-wrap">
+            <table class="tbl">
+              <thead><tr><th>Table</th><th>Bucket</th><th>Mode</th><th></th></tr></thead>
+              <tbody id="adm-tables"></tbody>
+            </table>
+          </div>
+          <div style="padding:13px 18px; border-top:1px solid var(--ds-border)">
+            <button class="btn btn--sm" data-tables>+ Add tables</button>
+          </div>
+        </div>
+
+        <div style="display:flex; flex-direction:column; gap:14px">
+          <div class="card side">
+            <h3>Appears as</h3>
+            <p style="margin:0 0 12px; font-size:13.5px; color:var(--ds-text-secondary)">
+              Its name, icon, category and description are what analysts read before adding it.</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap">
+              <button class="btn btn--sm proposed-only" data-edit>Edit details</button>
+              <button class="btn btn--sm today-only" data-go="admin-tables" data-legacy>Edit details…</button>
+              <button class="btn btn--sm" data-go="catalog-pkg">View as analyst →</button>
+            </div>
+          </div>
+
+          <div class="card side">
+            <h3>Delivery</h3>
+            <dl>
+              <dt>Shared with</dt><dd>3 groups</dd>
+              <dt>People reached</dt><dd>14</dd>
+              <dt>Actually pulled</dt><dd>11</dd>
+            </dl>
+            <p style="margin:11px 0 0; font-size:12.5px; color:var(--ds-text-muted)">
+              A grant is permission; the data lands on <code>agnes pull</code>.</p>
+            <div style="margin-top:11px"><button class="btn btn--sm" data-share>Sharing</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ Screen 3 — the Library ═══════════════════════════════ -->
+    <section class="screen" data-screen="library">
+      <h1>Library</h1>
+      <p class="lede">Everything you have — your files and skills, plus what has been shared with you.</p>
+
+      <div class="callout proposed-only admin-only">
+        <b>Open “+ Add”.</b> The menu now says which half of it changes only your library and which
+        half publishes to everyone.
+      </div>
+
+      <div class="lib-bar">
+        <input class="lib-search" type="text" placeholder="Search your library" aria-label="Search your library">
+        <div class="lib-new">
+          <button class="btn btn--primary" id="add-btn" aria-haspopup="true" aria-expanded="false">+ Add ▾</button>
+          <div class="lib-menu" id="add-menu" role="menu">
+            <div class="lib-menu__cap">Add to your library</div>
+            <button class="lib-menu__i" role="menuitem">Build a skill</button>
+            <button class="lib-menu__i" role="menuitem">Build a plugin</button>
+            <button class="lib-menu__i" role="menuitem">Build an agent template</button>
+            <button class="lib-menu__i" role="menuitem">Upload a file</button>
+            <button class="lib-menu__i" role="menuitem">Install from the marketplace</button>
+            <button class="lib-menu__i" role="menuitem" data-go="catalog-pkg">Add shared data &amp; recipes</button>
+
+            <div class="admin-only proposed-only">
+              <div class="lib-menu__sep"></div>
+              <div class="lib-menu__cap lib-menu__cap--admin">Publish to the workspace</div>
+              <button class="lib-menu__i" role="menuitem" data-create>
+                New data package
+                <small>Everyone you share it with will see it</small>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Name</th><th>Type</th><th>Where it came from</th><th>Availability</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="t-name" data-go="catalog-pkg" style="cursor:pointer; color:var(--ds-primary-dark)">Revenue core</span>
+                    <div class="t-sub">Orders, refunds and FX rates at a daily grain</div></td>
+                <td><span class="pill">Data package</span></td>
+                <td class="t-sub">Shared with you</td>
+                <td><span class="pill pill--mute">Optional</span></td>
+              </tr>
+              <tr>
+                <td><span class="t-name">Product analytics</span><div class="t-sub">Sessions, events and funnels</div></td>
+                <td><span class="pill">Data package</span></td>
+                <td class="t-sub">Shared with you</td>
+                <td><span class="pill pill--ok">Automatic</span></td>
+              </tr>
+              <tr>
+                <td><span class="t-name">Revenue definitions</span><div class="t-sub">How the company counts MRR and churn</div></td>
+                <td><span class="pill pill--mute">Memory</span></td>
+                <td class="t-sub">Shared with you</td>
+                <td><span class="pill pill--ok">Automatic</span></td>
+              </tr>
+              <tr>
+                <td><span class="t-name">Cohort report</span><div class="t-sub">Your own skill</div></td>
+                <td><span class="pill pill--mute">Skill</span></td>
+                <td class="t-sub">Yours</td>
+                <td><span class="pill pill--mute">Private</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ Screen 4 — the Tables lens (the teleport destination) ═ -->
+    <section class="screen" data-screen="admin-tables">
+      <p class="crumb">Admin › Data › Tables</p>
+      <div class="callout today-only" style="background:var(--ds-accent-warn-bg); border-color:var(--ds-accent-warn-line); color:var(--ds-accent-warn-ink)">
+        <b>You have left the package.</b> To rename it you were sent to the Tables lens — a page about
+        something else — and the editor here is a centred modal, not the shared drawer.
+      </div>
+      <h1>Tables</h1>
+      <p class="lede">Every registered table in the instance.</p>
+      <div class="card">
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>Table</th><th>Bucket</th><th>Source</th><th>Mode</th><th>Package</th></tr></thead>
+            <tbody id="all-tables"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Drawer -->
+<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-ttl">
+  <div class="drawer__backdrop" data-close></div>
+  <div class="drawer__panel">
+    <div class="drawer__head">
+      <div>
+        <h2 id="drawer-ttl">Edit data package</h2>
+        <p class="drawer__sub" id="drawer-sub">Revenue core</p>
+      </div>
+      <button class="drawer__x" data-close aria-label="Close">&times;</button>
+    </div>
+    <div class="drawer__body" id="drawer-body"></div>
+    <div class="drawer__foot" id="drawer-foot"></div>
+  </div>
+</div>
+
+<!-- Legacy modal (Today mode only) -->
+<div class="legacy" id="legacy" role="dialog" aria-modal="true" aria-labelledby="legacy-ttl">
+  <div class="legacy__bd" data-legacy-close></div>
+  <div class="legacy__card">
+    <h2 id="legacy-ttl" style="margin-bottom:4px">Edit Data Package</h2>
+    <p style="color:var(--ds-text-muted); font-size:13px; margin:0 0 16px">
+      The legacy modal that lives inside the Tables page.</p>
+    <div class="fld"><label for="l-name">Name</label><input id="l-name" type="text" value="Revenue core"></div>
+    <div class="fld"><label for="l-desc">Description</label><textarea id="l-desc">Orders, refunds and FX rates joined to a single daily grain.</textarea></div>
+    <div style="display:flex; gap:9px; margin-top:18px">
+      <button class="btn btn--primary" data-legacy-close data-toast="Saved — now find your way back to the package">Save</button>
+      <button class="btn" data-legacy-close>Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var app = document.getElementById('app');
+  var drawer = document.getElementById('drawer');
+  var legacy = document.getElementById('legacy');
+  var lastFocus = null;
+
+  /* The prototype bar sits ABOVE the product and wraps at narrow widths, so
+     its height is measured rather than assumed. Without this the bar (z 2000)
+     occludes the drawer header (z 1200) and the drawer looks headless. */
+  var protoBar = document.querySelector('.proto');
+  function syncProtoH() {
+    document.documentElement.style.setProperty('--proto-h', protoBar.offsetHeight + 'px');
+  }
+  syncProtoH();
+  window.addEventListener('resize', syncProtoH);
+  if (window.ResizeObserver) new ResizeObserver(syncProtoH).observe(protoBar);
+
+  /* ── Data ─────────────────────────────────────────────────────── */
+  var TABLES = [
+    { name: 'orders',       bucket: 'in.c-billing', src: 'Keboola', mode: 'local',        rows: '48.2M', sync: '2h ago' },
+    { name: 'order_items',  bucket: 'in.c-billing', src: 'Keboola', mode: 'local',        rows: '191.6M', sync: '2h ago' },
+    { name: 'customers',    bucket: 'in.c-crm',     src: 'Keboola', mode: 'local',        rows: '2.1M',  sync: '2h ago' },
+    { name: 'refunds',      bucket: 'in.c-billing', src: 'Keboola', mode: 'local',        rows: '310k',  sync: '2h ago' },
+    { name: 'fx_rates',     bucket: 'in.c-finance', src: 'BigQuery', mode: 'materialized', rows: '84k',  sync: '6h ago' }
+  ];
+  var UNPACKAGED = [
+    { name: 'marketing_spend', bucket: 'in.c-ads',     src: 'BigQuery', mode: 'remote' },
+    { name: 'support_tickets', bucket: 'in.c-support', src: 'Jira',     mode: 'local' }
+  ];
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); }
+
+  function modePill(m) {
+    var cls = m === 'remote' ? 'pill--warn' : (m === 'materialized' ? 'pill--mute' : 'pill--ok');
+    return '<span class="pill ' + cls + '">' + esc(m) + '</span>';
+  }
+
+  /* ── Render tables ────────────────────────────────────────────── */
+  document.getElementById('pkg-tables').innerHTML = TABLES.map(function (t) {
+    return '<tr><td><span class="t-name">' + esc(t.name) + '</span></td>' +
+      '<td><code>' + esc(t.bucket) + '</code></td>' +
+      '<td>' + modePill(t.mode) + '</td>' +
+      '<td class="num">' + esc(t.rows) + '</td>' +
+      '<td class="t-sub">' + esc(t.sync) + '</td></tr>';
+  }).join('');
+
+  document.getElementById('adm-tables').innerHTML = TABLES.map(function (t) {
+    return '<tr><td><span class="t-name">' + esc(t.name) + '</span></td>' +
+      '<td><code>' + esc(t.bucket) + '</code></td>' +
+      '<td>' + modePill(t.mode) + '</td>' +
+      '<td style="text-align:right"><button class="btn btn--sm btn--danger" data-toast="Removed ' +
+        esc(t.name) + ' from Revenue core">Remove</button></td></tr>';
+  }).join('');
+
+  document.getElementById('all-tables').innerHTML = TABLES.concat(UNPACKAGED).map(function (t, i) {
+    return '<tr><td><span class="t-name">' + esc(t.name) + '</span></td>' +
+      '<td><code>' + esc(t.bucket) + '</code></td>' +
+      '<td class="t-sub">' + esc(t.src) + '</td>' +
+      '<td>' + modePill(t.mode) + '</td>' +
+      '<td>' + (i < TABLES.length ? '<span class="pill">Revenue core</span>'
+                                  : '<span class="pill pill--warn">Unpackaged</span>') + '</td></tr>';
+  }).join('');
+
+  /* ── Screens ──────────────────────────────────────────────────── */
+  function go(name) {
+    var found = false;
+    document.querySelectorAll('.screen').forEach(function (s) {
+      var on = s.getAttribute('data-screen') === name;
+      s.classList.toggle('on', on);
+      if (on) found = true;
+    });
+    if (!found) return;
+    document.querySelectorAll('.rail__i').forEach(function (b) {
+      b.classList.toggle('on', b.getAttribute('data-go') === name);
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /* ── Toast ────────────────────────────────────────────────────── */
+  function toast(msg) {
+    var host = document.getElementById('toasts');
+    var el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = msg;
+    host.appendChild(el);
+    setTimeout(function () { el.remove(); }, 2600);
+  }
+
+  /* ── Drawer ───────────────────────────────────────────────────── */
+  var BODIES = {
+    edit: {
+      title: 'Edit data package', sub: 'Revenue core',
+      body:
+        '<div class="fld"><label for="d-name">Name</label>' +
+        '<input id="d-name" type="text" value="Revenue core"></div>' +
+        '<div class="fld"><label for="d-slug">URL name</label>' +
+        '<input id="d-slug" type="text" value="revenue-core">' +
+        '<p class="hint">Follows the name until you edit it.</p></div>' +
+        '<div class="fld"><label for="d-desc">Description</label>' +
+        '<textarea id="d-desc">Orders, refunds and FX rates joined to a single daily grain — the tables every revenue question starts from.</textarea>' +
+        '<p class="hint">Analysts read this before adding the package.</p></div>' +
+        '<div class="fld-row">' +
+        '<div class="fld"><label for="d-cat">Category</label><select id="d-cat">' +
+        '<option>Finance</option><option>Product</option><option>Marketing</option></select></div>' +
+        '<div class="fld"><label for="d-status">Status</label><select id="d-status">' +
+        '<option>Published</option><option>Draft</option><option>Retired</option></select></div>' +
+        '</div>',
+      foot:
+        '<button class="btn btn--danger btn--sm" data-toast="Package retired">Retire package</button>' +
+        '<span class="spacer"></span>' +
+        '<button class="btn" data-close>Cancel</button>' +
+        '<button class="btn btn--primary" data-close data-toast="Revenue core saved">Save changes</button>'
+    },
+    tables: {
+      title: 'Tables in this package', sub: 'Revenue core',
+      body: (function () {
+        var rows = TABLES.map(function (t) {
+          return '<label class="pick"><input type="checkbox" checked aria-label="' + esc(t.name) + '">' +
+            '<span class="g"><span class="t-name">' + esc(t.name) + '</span>' +
+            '<div class="t-sub"><code>' + esc(t.bucket) + '</code> · ' + esc(t.src) + '</div></span>' +
+            modePill(t.mode) + '</label>';
+        }).join('');
+        var more = UNPACKAGED.map(function (t) {
+          return '<label class="pick"><input type="checkbox" aria-label="' + esc(t.name) + '">' +
+            '<span class="g"><span class="t-name">' + esc(t.name) + '</span>' +
+            '<div class="t-sub"><code>' + esc(t.bucket) + '</code> · ' + esc(t.src) + '</div></span>' +
+            modePill(t.mode) + '</label>';
+        }).join('');
+        return '<p class="hint" style="margin:0 0 12px; color:var(--ds-text-secondary); font-size:13.5px">' +
+          'Tick a table to include it. Buckets come from the source project — they are not Agnes containers.</p>' +
+          rows + '<div style="height:14px"></div>' +
+          '<div style="font-size:10.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--ds-text-muted); font-weight:700; margin-bottom:4px">Not in any package</div>' +
+          more +
+          '<div class="escape">Don’t see the table you need? It has to be registered first — ' +
+          '<button data-go="admin-tables" data-close>register tables →</button>' +
+          '<div style="margin-top:5px; font-weight:400; font-size:12.5px">Connecting a source is an instance-wide job, so it stays in Admin.</div></div>';
+      })(),
+      foot:
+        '<span class="spacer"></span>' +
+        '<button class="btn" data-close>Cancel</button>' +
+        '<button class="btn btn--primary" data-close data-toast="Composition saved — 5 tables">Save composition</button>'
+    },
+    share: {
+      title: 'Who can use this', sub: 'Revenue core',
+      body:
+        '<p class="hint" style="margin:0 0 14px; color:var(--ds-text-secondary); font-size:13.5px">' +
+        'Grant the package to a group. <b>Automatic</b> puts it in everyone’s stack; ' +
+        '<b>Optional</b> lets them add it themselves.</p>' +
+        '<label class="pick"><input type="checkbox" checked aria-label="Finance"><span class="g">' +
+        '<span class="t-name">Finance</span><div class="t-sub">6 people</div></span>' +
+        '<span class="pill pill--ok">Automatic</span></label>' +
+        '<label class="pick"><input type="checkbox" checked aria-label="Data team"><span class="g">' +
+        '<span class="t-name">Data team</span><div class="t-sub">5 people</div></span>' +
+        '<span class="pill pill--mute">Optional</span></label>' +
+        '<label class="pick"><input type="checkbox" checked aria-label="Leadership"><span class="g">' +
+        '<span class="t-name">Leadership</span><div class="t-sub">3 people</div></span>' +
+        '<span class="pill pill--mute">Optional</span></label>' +
+        '<label class="pick"><input type="checkbox" aria-label="Everyone"><span class="g">' +
+        '<span class="t-name">Everyone</span><div class="t-sub">Every person in the workspace</div></span></label>' +
+        '<div class="escape" style="background:var(--ds-surface-dim); border-color:var(--ds-border); color:var(--ds-text-secondary)">' +
+        '<b>11 of 14</b> people who can reach this package have actually pulled it.</div>',
+      foot:
+        '<span class="spacer"></span>' +
+        '<button class="btn" data-close>Cancel</button>' +
+        '<button class="btn btn--primary" data-close data-toast="Sharing saved — 3 groups">Save sharing</button>'
+    },
+    create: {
+      title: 'New data package', sub: 'Published to the workspace',
+      body:
+        '<div class="escape" style="margin:0 0 16px">Everyone you share this with will see it in their Library.</div>' +
+        '<div class="fld"><label for="c-name">Name</label>' +
+        '<input id="c-name" type="text" placeholder="e.g. Marketing spend"></div>' +
+        '<div class="fld"><label for="c-desc">Description</label>' +
+        '<textarea id="c-desc" placeholder="What questions does this answer?"></textarea></div>' +
+        '<div class="fld-row">' +
+        '<div class="fld"><label for="c-cat">Category</label><select id="c-cat">' +
+        '<option>Finance</option><option>Product</option><option>Marketing</option></select></div>' +
+        '<div class="fld"><label for="c-status">Status</label><select id="c-status">' +
+        '<option>Draft</option><option>Published</option></select></div></div>' +
+        '<p class="hint">You can add tables and choose who gets it on the next step — or leave it a draft.</p>',
+      foot:
+        '<span class="spacer"></span>' +
+        '<button class="btn" data-close>Cancel</button>' +
+        '<button class="btn btn--primary" data-close data-toast="Data package created">Create package</button>'
+    }
+  };
+
+  function openDrawer(kind) {
+    var spec = BODIES[kind];
+    if (!spec) return;
+    lastFocus = document.activeElement;
+    document.getElementById('drawer-ttl').textContent = spec.title;
+    document.getElementById('drawer-sub').textContent = spec.sub;
+    document.getElementById('drawer-body').innerHTML = spec.body;
+    document.getElementById('drawer-foot').innerHTML = spec.foot;
+    drawer.classList.add('on');
+    var first = drawer.querySelector('input, select, textarea, button');
+    if (first) setTimeout(function () { first.focus({ preventScroll: true }); }, 60);
+  }
+
+  function closeDrawer() {
+    drawer.classList.remove('on');
+    if (lastFocus && lastFocus.focus) lastFocus.focus({ preventScroll: true });
+  }
+
+  /* ── Add menu ─────────────────────────────────────────────────── */
+  var addBtn = document.getElementById('add-btn');
+  var addMenu = document.getElementById('add-menu');
+
+  function closeMenu() {
+    addMenu.classList.remove('on');
+    addBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  addBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var open = addMenu.classList.toggle('on');
+    addBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  document.addEventListener('click', function (e) {
+    if (!addMenu.contains(e.target) && e.target !== addBtn) closeMenu();
+  });
+
+  /* ── One delegated click handler ──────────────────────────────── */
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest('[data-go],[data-edit],[data-tables],[data-share],[data-create],[data-close],[data-toast],[data-legacy],[data-legacy-close]');
+    if (!t) return;
+
+    var today = app.getAttribute('data-mode') === 'today';
+
+    if (t.hasAttribute('data-legacy-close')) { legacy.classList.remove('on'); }
+    if (t.hasAttribute('data-close')) closeDrawer();
+
+    /* The whole point of Today mode: "edit" is a navigation, not an action. */
+    if (t.hasAttribute('data-edit')) {
+      closeMenu();
+      if (today) { go('admin-tables'); setTimeout(function () { legacy.classList.add('on'); }, 260); }
+      else openDrawer('edit');
+      e.preventDefault(); return;
+    }
+    if (t.hasAttribute('data-legacy')) {
+      go('admin-tables');
+      setTimeout(function () { legacy.classList.add('on'); }, 260);
+      e.preventDefault(); return;
+    }
+    if (t.hasAttribute('data-tables')) { closeMenu(); openDrawer('tables'); e.preventDefault(); return; }
+    if (t.hasAttribute('data-share'))  { closeMenu(); openDrawer('share');  e.preventDefault(); return; }
+    if (t.hasAttribute('data-create')) { closeMenu(); openDrawer('create'); e.preventDefault(); return; }
+
+    if (t.hasAttribute('data-toast')) toast(t.getAttribute('data-toast'));
+    if (t.hasAttribute('data-go')) { closeMenu(); go(t.getAttribute('data-go')); }
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (legacy.classList.contains('on')) legacy.classList.remove('on');
+    else if (drawer.classList.contains('on')) closeDrawer();
+    else closeMenu();
+  });
+
+  /* ── Prototype switches ───────────────────────────────────────── */
+  document.querySelectorAll('[data-role-btn]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var role = b.getAttribute('data-role-btn');
+      app.setAttribute('data-role', role);
+      document.querySelectorAll('[data-role-btn]').forEach(function (o) {
+        o.setAttribute('aria-pressed', String(o === b));
+      });
+      closeDrawer(); closeMenu();
+      /* An analyst cannot stand on an admin screen. */
+      var cur = document.querySelector('.screen.on');
+      if (role === 'analyst' && cur && /^admin-/.test(cur.getAttribute('data-screen'))) go('catalog-pkg');
+    });
+  });
+
+  document.querySelectorAll('[data-mode-btn]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      app.setAttribute('data-mode', b.getAttribute('data-mode-btn'));
+      document.querySelectorAll('[data-mode-btn]').forEach(function (o) {
+        o.setAttribute('aria-pressed', String(o === b));
+      });
+      closeDrawer(); closeMenu(); legacy.classList.remove('on');
+    });
+  });
+
+  go('catalog-pkg');
+})();
+</script>

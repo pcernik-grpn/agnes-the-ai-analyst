@@ -33,7 +33,13 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from src.remote_engines import mask_backticks, name_reference_re, qualified_path_re, rewrite_bare_names
+from src.remote_engines import (
+    mask_backticks,
+    name_reference_re,
+    qualified_path_re,
+    rewrite_bare_names,
+    strip_one_trailing_semicolon,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +128,34 @@ def _resolved_targets(rows: Sequence[dict], default_catalog: str) -> Dict[Tuple[
     return out
 
 
+def _policied_targets(rows: Sequence[dict], default_catalog: str) -> Dict[Tuple[str, str, str], dict]:
+    """``{(catalog, schema, table): row}`` for every row carrying a policy.
+
+    Two deliberate differences from :func:`_resolved_targets`, which is the
+    *resolution* table rather than the *policy* one.
+
+    It is built from EVERY Databricks row, not only the ``query_mode='remote'``
+    ones, because a policy may sit on a ``server_only`` materialized row over
+    the same Unity Catalog table. The §3.2 twin interlock refuses that pair at
+    write time, but instances that already carry one keep serving reads — so
+    the read gate cannot assume the policy lives on a remote row.
+
+    And it keys on the resolved ``(catalog, schema, table)`` rather than the
+    raw ``bucket`` string (the ``sf``/``bq`` twin scan in
+    ``_policied_row_over_physical_source`` can compare buckets directly, this
+    one cannot): a dotted bucket pins its own catalog, so ``sales`` under
+    default catalog ``main`` and ``main.sales`` are one physical table spelled
+    two ways.
+    """
+    out: Dict[Tuple[str, str, str], dict] = {}
+    for r in rows:
+        if not (r.get("access_policy_sql") and r.get("bucket") and r.get("source_table")):
+            continue
+        catalog, schema, table = row_target(r, default_catalog)
+        out.setdefault((catalog.lower(), schema.lower(), table.lower()), r)
+    return out
+
+
 def _gate_table_references(
     sql: str,
     rows: Sequence[dict],
@@ -129,6 +163,7 @@ def _gate_table_references(
     accessible: Optional[set],
     is_admin: bool,
     default_catalog: str,
+    policied_by_target: Optional[Dict[Tuple[str, str, str], dict]] = None,
 ) -> Optional[dict]:
     """Refuse the statement unless EVERY table it names is registered + granted.
 
@@ -202,6 +237,7 @@ def _gate_table_references(
         display = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
         row = None
         qualified = True
+        target_key: Optional[Tuple[str, str, str]] = None
         if not db and not catalog:
             row = by_name.get(name)
             qualified = False
@@ -212,9 +248,11 @@ def _gate_table_references(
             from connectors.databricks.extractor import split_bucket
 
             bucket_catalog, bucket_schema = split_bucket(db, default_catalog)
-            row = by_target.get((bucket_catalog.lower(), bucket_schema.lower(), name))
+            target_key = (bucket_catalog.lower(), bucket_schema.lower(), name)
+            row = by_target.get(target_key)
         else:
-            row = by_target.get(((catalog or default_catalog).lower(), db, name))
+            target_key = ((catalog or default_catalog).lower(), db, name)
+            row = by_target.get(target_key)
 
         if row is None:
             return {
@@ -244,6 +282,42 @@ def _gate_table_references(
                 "registered_as": row.get("name"),
                 "message": f"You do not have access to the Databricks table '{row.get('name')}'.",
             }
+
+        # A qualified path names the PHYSICAL source, and `rewrite_sql`
+        # substitutes policied tables by registry NAME (§5.2) — so for this
+        # spelling the rewrite never fires, `policied_table_ids` comes back
+        # empty, `_apply_databricks_policies` sits the request out, and the raw
+        # statement ships to the warehouse under Agnes's service PAT. Registration
+        # and the grant, both proved above, say nothing about a policy, and the
+        # row a path resolves to need not even be the policied one when a source
+        # is registered twice. Mirrors `sf_path_policied` / `bq_path_policied`
+        # (`_policied_row_over_physical_source` in `app/api/query.py`), and sits
+        # AFTER the grant check for the same fail-closed ordering.
+        #
+        # Restricted to a `qualified` reference on two counts. A bare name is
+        # already covered — that is the spelling `rewrite_sql` does substitute.
+        # And it is what keeps the policy re-gate out of this branch: that pass
+        # (`_apply_databricks_policies`, `allowed=None`, `is_admin=True`)
+        # re-parses a statement whose policy body has ALREADY been rewritten to
+        # backticked native paths, every one of which reads as a qualified
+        # reference to the very row whose policy produced it — and every one of
+        # them is skipped by `qualified and is_admin` above, before reaching
+        # here. Re-gating a substituted statement must not undo its own
+        # substitution.
+        if qualified and policied_by_target and target_key is not None:
+            policied = policied_by_target.get(target_key)
+            if policied is not None:
+                return {
+                    "reason": "dbx_path_policied",
+                    "table": display,
+                    "registered_as": policied.get("name"),
+                    "message": (
+                        f"'{display}' carries an access policy, which is enforced under its "
+                        f"registered name '{policied.get('name')}'. A direct Databricks path names "
+                        "the physical table, so the policy would not apply — refused."
+                    ),
+                    "hint": (f"Query {str(policied.get('name'))!r} instead of the direct path."),
+                }
 
     return None
 
@@ -278,7 +352,8 @@ def guardrail_inputs(
     from src.repositories import table_registry_repo
 
     repo = table_registry_repo()
-    rows = [r for r in repo.list_by_source("databricks") if (r.get("query_mode") or "") == "remote"]
+    all_rows = repo.list_by_source("databricks")
+    rows = [r for r in all_rows if (r.get("query_mode") or "") == "remote"]
 
     accessible = set(allowed) if allowed is not None else None
 
@@ -292,6 +367,10 @@ def guardrail_inputs(
         accessible=accessible,
         is_admin=is_admin,
         default_catalog=default_catalog,
+        # Built from ALL Databricks rows, not the `remote`-filtered `rows`: a
+        # policy may live on a `server_only` materialized row over the same
+        # physical table (see `_policied_targets`).
+        policied_by_target=_policied_targets(all_rows, default_catalog),
     )
     if blocked is not None:
         return [], blocked
@@ -547,8 +626,15 @@ def wrap_with_limit(sql: str, limit: int) -> str:
     The outer wrap is legal Spark SQL for any SELECT, including one that
     already carries its own ``LIMIT`` (the inner limit simply wins when it is
     smaller).
+
+    A single trailing semicolon is a legal top-level statement terminator but
+    an illegal one once embedded inside this subquery wrap — Spark SQL parses
+    it as ending the statement early. ``/api/query``'s SELECT-only guard
+    tolerates exactly one trailing ``;`` (routine SQL formatting), so strip it
+    here too or that tolerated query fails at the warehouse instead of running.
     """
-    return f"SELECT * FROM (\n{sql}\n) AS agnes_remote_q LIMIT {int(limit)}"
+    body = strip_one_trailing_semicolon(sql)
+    return f"SELECT * FROM (\n{body}\n) AS agnes_remote_q LIMIT {int(limit)}"
 
 
 #: Databricks manifest ``type_name`` → Arrow type. Only matters for a

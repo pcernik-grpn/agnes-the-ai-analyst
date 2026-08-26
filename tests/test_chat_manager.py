@@ -61,7 +61,10 @@ def manager(tmp_path: Path) -> ChatManager:
         provider=provider,
         workdir_mgr=workdir_mgr,
         repo=repo,
-        config=ChatConfig(enabled=True, concurrency_per_user=2),
+        # Pin the native provider: this suite exercises the runner-frame path
+        # and asserts on chat_<hex> session ids, which `engine_session_id`
+        # replaces with UUIDs under the (default) kai-agent provider.
+        config=ChatConfig(enabled=True, concurrency_per_user=2, provider="docker"),
     )
 
 
@@ -1972,7 +1975,21 @@ def test_resume_from_row_reconnects_after_restart(manager: ChatManager, monkeypa
         live = await manager._resume_from_row(row)
 
         assert live is not None
-        manager._provider.resume.assert_awaited_once_with(sandbox_id="sbx-restart", runner_pid=555, env={})
+        # env carries the session identity AND the approval knobs for
+        # providers whose resumed handle needs them (the kai-agent engine
+        # re-mints its session JWT from the identity and keeps the approvals
+        # kill-switch sticky across pause/resume); the sandbox providers
+        # ignore env on resume.
+        manager._provider.resume.assert_awaited_once_with(
+            sandbox_id="sbx-restart",
+            runner_pid=555,
+            env={
+                "AGNES_SESSION_ID": s.id,
+                "AGNES_USER_EMAIL": s.user_email,
+                "AGNES_APPROVAL_TIMEOUT_SECONDS": str(manager._config.approval_timeout_seconds),
+                "AGNES_APPROVALS": "on",
+            },
+        )
         manager._provider.spawn.assert_not_awaited()
         assert live.state == SessionState.ACTIVE
         await manager.kill(s.id, reason="test_done")
@@ -2090,62 +2107,17 @@ def test_spawn_agnes_server_falls_back_to_internal_url(manager: ChatManager, tmp
     assert captured["env"]["AGNES_SERVER"] == "http://10.0.0.5:8000"
 
 
-def test_spawn_uploads_wheel_before_workspace_and_sets_sentinel_env(manager: ChatManager, tmp_path, monkeypatch):
-    """The wheel is a single small write whose sentinel unblocks the runner's
-    in-sandbox pip install — it must be staged BEFORE the (much slower)
-    workspace push so the install overlaps the upload. The runner env carries
-    the workspace-ready sentinel path so the runner knows to gate the agent
-    CLI spawn on it (empty when the provider mounts the workspace itself)."""
-    monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
-
-    import app.chat.e2b_workspace_sync as sync_mod
-    from app.chat.e2b_workspace_sync import SANDBOX_WORKSPACE_READY
-
-    order: list[str] = []
-
-    async def fake_wheel(stage):
-        order.append("wheel")
-
-    async def fake_workspace(sandbox, root, *, max_bytes):
-        order.append("workspace")
-        return 0
-
-    monkeypatch.setattr(sync_mod, "stage_agnes_wheel", fake_wheel)
-    monkeypatch.setattr(sync_mod, "upload_workspace", fake_workspace)
-
-    handle = FakeHandle()
-    handle._sandbox = MagicMock()  # sandbox present → E2B sync branch taken
-    captured = {}
-
-    async def fake_spawn(**kw):
-        captured.update(kw)
-        return handle
-
-    manager._provider.spawn = fake_spawn
-    _make_provider_e2b_shaped(manager)
-
-    async def _run():
-        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
-        sess = manager._repo.get_session(s.id)
-        await manager._spawn_runner(sess, tmp_path)
-
-    asyncio.run(_run())
-
-    assert order == ["wheel", "workspace"]
-    assert captured["env"]["AGNES_WORKSPACE_SYNC_SENTINEL"] == SANDBOX_WORKSPACE_READY
-
-
-def _make_provider_e2b_shaped(manager: ChatManager) -> None:
-    """Make the fixture's MagicMock provider behave like ``E2BProvider``:
-    ``syncs_workspace=False`` (the manager pushes the workspace) plus an async
-    ``stage_file`` that writes through the handle's sandbox file API.
+def _make_provider_stagable(manager: ChatManager) -> None:
+    """Make the fixture's MagicMock provider behave like a real provider:
+    ``syncs_workspace=True`` (both real providers own workspace delivery) plus
+    an async ``stage_file`` that writes through the handle's sandbox file API.
 
     Needed because the fixture provider is a bare ``MagicMock``: its
-    auto-attributes are truthy (so ``syncs_workspace`` must be pinned) and its
-    ``stage_file`` is not a coroutine function, which is exactly how
-    ``ChatManager._file_stager`` detects "this provider cannot stage files".
+    auto-attributes are truthy but its ``stage_file`` is not a coroutine
+    function, which is exactly how ``ChatManager._file_stager`` detects
+    "this provider cannot stage files".
     """
-    manager._provider.syncs_workspace = False
+    manager._provider.syncs_workspace = True
 
     async def _stage(handle, path, data):
         await handle._sandbox.files.write(path, data)
@@ -2154,26 +2126,16 @@ def _make_provider_e2b_shaped(manager: ChatManager) -> None:
 
 
 def test_spawn_stages_wheel_and_context_for_a_bind_mounting_provider(manager: ChatManager, tmp_path, monkeypatch):
-    """`syncs_workspace=True` must skip ONLY the workspace push.
-
-    The CLI wheel and the restore-context transcript are not workspace sync:
-    without them a bind-mounting provider loses the `agnes` CLI (the runner
-    blocks the full 60 s wheel wait on a `.ready` that never appears) and loses
-    conversation history on every crash respawn.
+    """The CLI wheel and the restore-context transcript are not workspace
+    sync: without them a provider that mounts the workspace itself loses the
+    `agnes` CLI (the runner blocks the full 60 s wheel wait on a `.ready` that
+    never appears) and loses conversation history on every crash respawn.
     """
     monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
 
-    import app.chat.e2b_workspace_sync as sync_mod
-    from app.chat.e2b_workspace_sync import SANDBOX_CONTEXT_RESTORE, SANDBOX_WHEEL_READY
+    from app.chat.sandbox_staging import SANDBOX_CONTEXT_RESTORE, SANDBOX_WHEEL_READY
 
     staged: dict = {}
-    pushed: list[str] = []
-
-    async def fake_workspace(sandbox, root, *, max_bytes):
-        pushed.append("workspace")
-        return 0
-
-    monkeypatch.setattr(sync_mod, "upload_workspace", fake_workspace)
 
     handle = FakeHandle()
     captured: dict = {}
@@ -2201,73 +2163,14 @@ def test_spawn_stages_wheel_and_context_for_a_bind_mounting_provider(manager: Ch
     assert SANDBOX_CONTEXT_RESTORE in staged
     assert "earlier answer" in str(staged[SANDBOX_CONTEXT_RESTORE])
     # The context must land BEFORE the wheel-ready sentinel: that sentinel is
-    # the only pre-boot barrier a bind-mounting provider has (the workspace
-    # wait is skipped), and the runner reads the context strictly after its
-    # sentinel-gated install — staged later, a restarted session could start
-    # answering without its history.
+    # the only pre-boot barrier the providers share, and the runner reads the
+    # context strictly after its sentinel-gated install — staged later, a
+    # restarted session could start answering without its history.
     paths = list(staged)
     assert paths.index(SANDBOX_CONTEXT_RESTORE) < paths.index(SANDBOX_WHEEL_READY)
-    # ...and only the workspace tarball stays behind the syncs_workspace gate.
-    assert pushed == []
+    # The workspace-sync sentinel env is always empty: both providers own
+    # their workspace delivery, so the runner never waits on an upload.
     assert captured["env"]["AGNES_WORKSPACE_SYNC_SENTINEL"] == ""
-
-
-def test_spawn_stages_wheel_and_context_through_the_e2b_files_api(manager: ChatManager, tmp_path, monkeypatch):
-    """E2B regression for the same split: with the REAL provider the wheel,
-    its sentinel and the restore-context still land through
-    ``sandbox.files.write``, at the same paths — restore-context first, so the
-    wheel's ``.ready`` sentinel guarantees it on every provider (under E2B the
-    trailing workspace-ready sentinel is a second barrier)."""
-    monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
-
-    from app.chat.e2b_provider import E2BProvider
-    from app.chat.e2b_workspace_sync import (
-        SANDBOX_CONTEXT_RESTORE,
-        SANDBOX_WHEEL_DIR,
-        SANDBOX_WHEEL_READY,
-        SANDBOX_WORKSPACE_READY,
-    )
-
-    wheel = tmp_path / "agnes_the_ai_analyst-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"WHEELBYTES")
-    monkeypatch.setattr("app.api.cli_artifacts._find_wheel", lambda: wheel)
-
-    written: list[str] = []
-
-    handle = FakeHandle()
-    sb = MagicMock()
-    sb.files = MagicMock()
-
-    async def _write(path, data):
-        written.append(path)
-
-    sb.files.write = AsyncMock(side_effect=_write)
-    sb.commands = MagicMock()
-    sb.commands.run = AsyncMock()
-    handle._sandbox = sb
-
-    async def fake_spawn(**kw):
-        return handle
-
-    provider = E2BProvider(api_key="k", template_id="t")
-    provider.spawn = fake_spawn  # type: ignore[method-assign]
-    manager._provider = provider
-
-    async def _run():
-        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
-        manager._repo.append_message(session_id=s.id, role="assistant", content="earlier answer")
-        sess = manager._repo.get_session(s.id)
-        await manager._spawn_runner(sess, tmp_path / "session")
-
-    (tmp_path / "session").mkdir()
-    asyncio.run(_run())
-
-    assert written == [
-        SANDBOX_CONTEXT_RESTORE,
-        f"{SANDBOX_WHEEL_DIR}/{wheel.name}",
-        SANDBOX_WHEEL_READY,
-        SANDBOX_WORKSPACE_READY,
-    ]
 
 
 def test_agnes_server_url_resolution_chain(monkeypatch):
@@ -3340,7 +3243,7 @@ class TestRestoreContext:
         asyncio.run(_run())
 
     def test_spawn_uploads_restore_context_when_history_exists(self, manager: ChatManager, tmp_path, monkeypatch):
-        from app.chat.e2b_workspace_sync import SANDBOX_CONTEXT_RESTORE
+        from app.chat.sandbox_staging import SANDBOX_CONTEXT_RESTORE
 
         monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
 
@@ -3366,7 +3269,7 @@ class TestRestoreContext:
                 return handle
 
             manager._provider.spawn = fake_spawn
-            _make_provider_e2b_shaped(manager)
+            _make_provider_stagable(manager)
             await manager._spawn_runner(sess, tmp_path)
             assert SANDBOX_CONTEXT_RESTORE in writes
             assert "earlier answer" in str(writes[SANDBOX_CONTEXT_RESTORE])
@@ -3958,7 +3861,7 @@ def test_web_session_with_no_attached_browser_still_waits(manager: ChatManager):
 
 
 def test_orphan_sweep_is_a_noop_for_providers_without_listing(manager: ChatManager):
-    """E2B (and any provider whose sandboxes aren't host-local) has no
+    """A provider whose sandboxes aren't host-local has no
     list_sandboxes — the sweep must do nothing, not crash the reaper."""
 
     async def _run():
@@ -4296,14 +4199,10 @@ def test_question_answer_local_delivery(manager: ChatManager):
         live._stdin_lock = asyncio.Lock()
         manager._live[s.id] = live
         with patch("app.chat.inbound.publish_control", new=AsyncMock()) as pub:
-            await manager.deliver_question_answer(
-                s.id, "ques-1", answers={"Which color?": "Red"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer(s.id, "ques-1", answers={"Which color?": "Red"}, sender_email="u@x")
         pub.assert_not_called()
         written = _question_answers_written(handle)
-        assert written == [
-            {"type": "question_answer", "request_id": "ques-1", "answers": {"Which color?": "Red"}}
-        ]
+        assert written == [{"type": "question_answer", "request_id": "ques-1", "answers": {"Which color?": "Red"}}]
 
     asyncio.run(_run())
 
@@ -4319,9 +4218,7 @@ def test_question_answer_hardens_junk_to_dismissed(manager: ChatManager):
         live.handle = handle
         live._stdin_lock = asyncio.Lock()
         manager._live[s.id] = live
-        await manager.deliver_question_answer(
-            s.id, "ques-2", answers={"k": 42, 3: "v", "s": "   "}, sender_email="u@x"
-        )
+        await manager.deliver_question_answer(s.id, "ques-2", answers={"k": 42, 3: "v", "s": "   "}, sender_email="u@x")
         written = _question_answers_written(handle)
         assert written == [{"type": "question_answer", "request_id": "ques-2", "dismissed": True}]
 
@@ -4338,9 +4235,7 @@ def test_question_answer_forwarded_to_remote_owner(manager: ChatManager):
             patch("app.chat.routing.this_gateway_id", return_value="gw-me"),
             patch("app.chat.inbound.publish_control", new=AsyncMock()) as pub,
         ):
-            await manager.deliver_question_answer(
-                "chat_remote", "ques-3", answers={"q": "a"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer("chat_remote", "ques-3", answers={"q": "a"}, sender_email="u@x")
         pub.assert_awaited_once()
         assert pub.await_args.args[1] == "question"
         extra = pub.await_args.kwargs["extra"]
@@ -4366,9 +4261,7 @@ def test_question_answer_publish_failure_does_not_escape(manager: ChatManager):
                 new=AsyncMock(side_effect=inbound.InboundPublishFailed("down")),
             ),
         ):
-            await manager.deliver_question_answer(
-                "chat_remote", "ques-4", answers={"q": "a"}, sender_email="u@x"
-            )
+            await manager.deliver_question_answer("chat_remote", "ques-4", answers={"q": "a"}, sender_email="u@x")
 
     asyncio.run(_run())
 

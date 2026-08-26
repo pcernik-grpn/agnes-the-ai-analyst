@@ -48,11 +48,13 @@ def two_sources(seeded_app, mock_extract_factory):
     mock_extract_factory("jira", [{"name": "secret", "data": [{"id": "1", "v": "classified"}]}])
 
     from src.orchestrator import SyncOrchestrator
+
     SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
 
     # Grant analyst only the `pub` table (in srca); srcb stays un-granted.
     from src.db import get_system_db
     from src.repositories.table_registry import TableRegistryRepository
+
     conn = get_system_db()
     try:
         pub_row = TableRegistryRepository(conn).get_by_name("pub")
@@ -124,3 +126,65 @@ def test_admin_bypasses_catalog_gate(two_sources):
         headers=_auth(tok),
     )
     assert r.status_code != 403, r.text
+
+
+# --- #1394: the catalog gate scanned RAW SQL text, so a string literal or
+# comment merely CONTAINING a registered catalog name followed by a dot
+# (`SELECT 'jira.com' AS x`) was refused as an authorization failure even
+# though the query references no catalog at all. Fixed by masking string /
+# dollar-quoted literals and comments before the regex runs — quoted
+# IDENTIFIERS stay visible (see `test_quoted_catalog_qualified_ref_is_403`
+# above, which pins that a genuine quoted-catalog reference must still 403).
+
+
+def test_string_literal_containing_catalog_name_is_not_403(two_sources):
+    """The exact #1394 repro: a literal, not a reference."""
+    c = two_sources["client"]
+    tok = two_sources["analyst_token"]
+    r = c.post(
+        "/api/query",
+        json={"sql": "SELECT 'jira.com' AS x"},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_realistic_domain_filter_literal_is_not_403(two_sources):
+    """The realistic shape from the issue: filtering a granted table by an
+    email-domain literal that happens to spell a registered catalog name."""
+    c = two_sources["client"]
+    tok = two_sources["analyst_token"]
+    r = c.post(
+        "/api/query",
+        json={"sql": "SELECT count(*) AS n FROM pub WHERE v LIKE '%@jira.com'"},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_comment_containing_catalog_name_is_not_403(two_sources):
+    """A SQL comment is inert — DuckDB never executes it — so a catalog name
+    inside one must not trip the gate either."""
+    c = two_sources["client"]
+    tok = two_sources["analyst_token"]
+    r = c.post(
+        "/api/query",
+        json={"sql": "SELECT 1 AS n -- jira.com"},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_decoy_literal_does_not_shield_a_real_catalog_reference(two_sources):
+    """Mixed case: a literal containing the catalog name AND a genuine
+    catalog-qualified reference in the same query — the real one must still
+    be caught."""
+    c = two_sources["client"]
+    tok = two_sources["analyst_token"]
+    r = c.post(
+        "/api/query",
+        json={"sql": 'SELECT * FROM jira.main."secret" WHERE 1=1 -- jira.com decoy'},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 403, r.text
+    assert "un-granted source catalog" in r.text, r.text

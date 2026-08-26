@@ -100,32 +100,30 @@ def _grant_table_direct(conn, table_id, user_id, group_name):
 
 
 @pytest.fixture
-def co_app(e2e_env):
+def co_app(e2e_env, shared_app):
     """App fixture: co-session where only ua holds table t1. t1 -> 403 for the co token."""
     from src.db import get_system_db
-    from app.main import create_app
     conn = get_system_db()
     co_id = _seed_co_app_base(conn)
     # Only ua gets direct table grant for t1 -> t1 not in intersection
     _grant_table_direct(conn, "t1", "ua", "g-t1-only-a")
     conn.close()
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     yield client, co_id
 
 
 @pytest.fixture
-def co_app_shared(e2e_env):
+def co_app_shared(e2e_env, shared_app):
     """App fixture: co-session where BOTH ua and ub hold table t2. t2 -> 200."""
     from src.db import get_system_db
-    from app.main import create_app
     conn = get_system_db()
     co_id = _seed_co_app_base(conn)
     # Both ua and ub get direct table grants for t2 -> t2 in intersection
     _grant_table_direct(conn, "t2", "ua", "g-t2-both-a")
     _grant_table_direct(conn, "t2", "ub", "g-t2-both-b")
     conn.close()
-    app = create_app()
+    app = shared_app
     client = TestClient(app, raise_server_exceptions=False)
     yield client, co_id
 
@@ -201,12 +199,11 @@ _CO_TABLE = "co_local_tbl"
 
 
 @pytest.fixture
-def co_app_local(e2e_env, mock_extract_factory):
+def co_app_local(e2e_env, mock_extract_factory, shared_app):
     """Co-session where BOTH participants hold `co_local_tbl` — a real local
     table with a parquet on disk, so the v2 read endpoints reach a 200."""
     from src.db import get_system_db
     from src.repositories.table_registry import TableRegistryRepository
-    from app.main import create_app
 
     mock_extract_factory("keboola", [{"name": _CO_TABLE, "data": [{"n": "1"}, {"n": "2"}]}])
     conn = get_system_db()
@@ -215,7 +212,7 @@ def co_app_local(e2e_env, mock_extract_factory):
     _grant_table_direct(conn, _CO_TABLE, "ua", "g-co-local-a")
     _grant_table_direct(conn, _CO_TABLE, "ub", "g-co-local-b")
     conn.close()
-    client = TestClient(create_app(), raise_server_exceptions=False)
+    client = TestClient(shared_app, raise_server_exceptions=False)
     yield client, co_id
 
 

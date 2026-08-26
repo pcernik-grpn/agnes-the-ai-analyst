@@ -62,6 +62,7 @@
                         in a grey footer band #}
 <link rel="stylesheet" href="{{ static_url('css/section_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   /* Page-local styles only, and every colour is a `--ds-*` token — the head
      band, the state pill, the group chip, and the table cell decorations.
@@ -400,19 +401,19 @@
           Add them to a group below.
         </div>
 
-        {# The picker is the shared toolbar's native-select chrome. NOT
-           ds.dropdown(): refreshGroupDropdown() rebuilds this <select>'s
-           options wholesale on every membership change (initial load, after
-           an add, after a remove), filtering out groups the person is already
-           in and the ones Workspace owns — and keeping a custom dropdown's
-           menu in sync would need re-running ds_dropdown.js's per-instance
-           init(), which it doesn't expose (it self-bootstraps once at
-           DOMContentLoaded). #}
+        {# refreshGroupDropdown() rebuilds this <select>'s options wholesale
+           on every membership change (initial load, after an add, after a
+           remove), filtering out groups the person is already in and the
+           ones Workspace owns. The paired .ds-dropdown is kept in sync by
+           syncAddGroupDropdown() (see below), using ds_dropdown.js's
+           exported re-init hook (#1473). #}
         <div class="fbar ud-addrow" role="group" aria-label="Add this person to a group">
           <div class="fbar-select">
-            <select id="add-group-select" aria-label="Group to add">
+            <select id="add-group-select" class="ds-dropdown-native" aria-label="Group to add">
               <option value="">— Pick a group —</option>
             </select>
+            {{ ds.dropdown(id='add-group-dd', target='add-group-select', aria_label='Group to add',
+                           options=[{'value': '', 'label': '— Pick a group —'}]) }}
           </div>
           {{ ds.button('Add to group', variant='primary', size='sm',
                        id='add-group-btn', disabled=True) }}
@@ -594,6 +595,7 @@
   </p>
 </div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 const USER_ID = document.querySelector("[data-user-id]").dataset.userId;
 const USER_API = `/api/users/${encodeURIComponent(USER_ID)}`;
@@ -748,7 +750,7 @@ function renderMemberships() {
       admin: "Added by an admin",
       google_sync: "Synced from Google Workspace",
       system_seed: "System-managed",
-      auto: "Automatic — everyone here is a member",
+      auto: "Auto-joined — everyone here is a member",
     })[m.source] || `Added via ${m.source}`;
     const addedFragment = m.added_at ? ` · ${esc(fmtDate(m.added_at))}` : "";
     // Same chip colour + name-shortening rules as the people list:
@@ -779,6 +781,34 @@ async function loadGroups() {
   if (!r.ok) return;
   allGroups = await r.json();
   refreshGroupDropdown();
+}
+
+// Rebuilds the paired `.ds-dropdown`'s button AND menu from
+// add-group-select's own freshly-set <option>s, then re-runs ds_dropdown.js's
+// init via the exported `dsDropdownInit` hook — needed because
+// refreshGroupDropdown() rebuilds the select's options wholesale on every
+// membership change. The button is rebuilt too, not just the menu: init()
+// isn't idempotent for its per-element listeners, so leaving the same
+// persisting <button> node across two init() calls (one from
+// ds_dropdown.js's own DOMContentLoaded bootstrap, one from here)
+// double-registers its click handler — the second open()/close() undoes the
+// first, and the menu never appears to open. Recreating the button discards
+// that stale listener along with the old node.
+function syncAddGroupDropdown() {
+  const sel = document.getElementById("add-group-select");
+  const host = document.querySelector('.ds-dropdown[data-ds-dropdown-target="add-group-select"]');
+  if (!host) return;
+  const opts = Array.from(sel.options);
+  const currentOpt = opts[0];
+  const menuEl = host.querySelector(".ds-dropdown-menu");
+  const ariaLabel = menuEl ? menuEl.getAttribute("aria-label") || "" : "";
+  const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="add-group-dd-name">${esc(ariaLabel)}</span>` : "";
+  const labelledBy = ariaLabel ? ` aria-labelledby="add-group-dd-name add-group-dd-btn-label"` : "";
+  const items = opts
+    .map((o, i) => `<li class="ds-dropdown-menu-item${i === 0 ? " is-selected" : ""}" role="menuitemradio" aria-checked="${i === 0}" tabindex="0" data-value="${esc(o.value)}">${esc(o.textContent)}</li>`)
+    .join("");
+  host.innerHTML = `<button type="button" class="ds-dropdown-btn" id="add-group-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="add-group-dd-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="add-group-dd-btn-label">${currentOpt ? esc(currentOpt.textContent) : ""}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="add-group-dd-menu" role="menu" aria-label="${esc(ariaLabel || "Options")}" hidden>${items}</ul>`;
+  if (window.dsDropdownInit) window.dsDropdownInit(host);
 }
 
 function refreshGroupDropdown() {
@@ -831,6 +861,7 @@ function refreshGroupDropdown() {
   } else {
     hint.hidden = true;
   }
+  syncAddGroupDropdown();
 }
 
 document.getElementById("add-group-select").addEventListener("change", e => {

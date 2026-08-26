@@ -177,7 +177,7 @@ def test_corp_memory_section_renders_in_html(seeded_app, monkeypatch, tmp_path):
         body = r.text
         # SECTION_META entry — title is operator-friendly.
         assert "corporate_memory" in body, "section name not exposed in template JS"
-        assert "Corporate Memory" in body, "SECTION_META entry missing"
+        assert "Corporate memory" in body, "SECTION_META entry missing"
     finally:
         ic._instance_config = None
 

@@ -20,6 +20,13 @@ Design notes
   the first ~600 chars (enough signal for a title, keeps token cost
   per call <500 input + ~16 output). Result is stripped, quote-trimmed,
   and capped at 60 chars before being persisted.
+- **Best-effort does not mean silent.** "No credential obtainable" used to
+  log at debug and vanish — a session just stayed ``Untitled chat`` forever
+  with no operator-visible signal (#1526). It now logs a WARNING (once per
+  process for "nothing configured"; every time for "configured but minting
+  failed", since that's an ongoing operational problem rather than expected
+  state) without changing the best-effort contract: the turn still never
+  fails because of this.
 """
 
 from __future__ import annotations
@@ -62,6 +69,65 @@ _SYSTEM_PROMPT = (
     "given its first user message. Reply with the title only — no preamble, "
     "no explanation."
 )
+
+# WIF env vars a token exchange needs (mirrors app/auth/wif.py::_exchange
+# and the boot-time check in app/main.py::_chat_anthropic_key_ok). Checked
+# here only to classify a mint failure for logging purposes — never to gate
+# the actual exchange, which stays entirely inside app.auth.wif.
+_WIF_REQUIRED_ENV_VARS = (
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+)
+
+# Warned about a missing Anthropic credential this process already? Auto-title
+# runs on every session's first assistant turn, so without a once-per-process
+# guard a keyless/misconfigured instance (local dev, TESTING=1, or WIF simply
+# not rolled out yet) would log one WARNING per conversation forever. Mirrors
+# the once-per-process pattern in app/instance_config.py::_warn_once. A
+# credential that IS configured but fails to *mint* (see
+# `_wif_appears_configured` below) is a different, ongoing condition and is
+# deliberately NOT rate-limited — surfaced every time, like the
+# `logger.exception` in `_generate_title_sync` for a rejected key.
+_no_credential_warned = False
+
+
+def _wif_appears_configured() -> bool:
+    """Best-effort read of whether an operator set up WIF at all.
+
+    Used only to pick a log message/severity when a mint attempt fails —
+    never to gate the exchange itself (``app.auth.wif`` is the sole source
+    of truth there). "Appears" because this only checks env presence, not
+    validity; an invalid value still reaches this function as an exception,
+    just correctly classified as "configured but failing" rather than "not
+    configured".
+    """
+    if not all(os.environ.get(var, "").strip() for var in _WIF_REQUIRED_ENV_VARS):
+        return False
+    return bool(
+        os.environ.get("ANTHROPIC_IDENTITY_TOKEN", "").strip()
+        or os.environ.get("ANTHROPIC_IDENTITY_TOKEN_FILE", "").strip()
+    )
+
+
+def _warn_no_credential(exc: Exception) -> None:
+    """Log "no Anthropic credential at all" once per process at WARNING;
+    every later occurrence in this process drops to DEBUG (see the
+    module-level docstring on `_no_credential_warned` for why)."""
+    global _no_credential_warned
+    if _no_credential_warned:
+        logger.debug("no Anthropic credential (static or WIF) for auto-title: %s", exc)
+        return
+    _no_credential_warned = True
+    logger.warning(
+        "auto-title disabled: no Anthropic credential available (set "
+        "ANTHROPIC_API_KEY, or the workload_identity vars "
+        "ANTHROPIC_FEDERATION_RULE_ID / ANTHROPIC_ORGANIZATION_ID / "
+        "ANTHROPIC_SERVICE_ACCOUNT_ID plus an identity token) — sessions will "
+        "keep the 'Untitled chat' default until one is configured. Logged "
+        "once per process; cause: %s",
+        exc,
+    )
 
 
 def _strip_title(raw: str) -> Optional[str]:
@@ -170,7 +236,14 @@ async def generate_title(user_message: str, *, llm_auth: str = "api_key") -> Opt
         from app.auth.wif import get_federated_access_token
 
         token = await asyncio.to_thread(get_federated_access_token)
-    except Exception as exc:  # noqa: BLE001 — best-effort; missing creds => skip
-        logger.debug("no Anthropic credential (static or WIF) for auto-title: %s", exc)
+    except Exception as exc:  # noqa: BLE001 — best-effort; missing/failed creds => skip
+        if _wif_appears_configured():
+            # Configured but minting failed (expired rule, revoked service
+            # account, network hiccup...) — an ongoing operational problem,
+            # not the expected keyless-instance state, so every occurrence
+            # is surfaced (see #1526).
+            logger.warning("auto-title disabled: Anthropic WIF token mint failed: %s", exc)
+        else:
+            _warn_no_credential(exc)
         return None
     return await asyncio.to_thread(_generate_title_sync, user_message, auth_token=token)

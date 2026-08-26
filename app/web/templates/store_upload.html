@@ -602,6 +602,26 @@
           <div class="field-hint">Subject area of your entity — helps people filter the Store.</div>
         </div>
 
+        {% if session.user.is_admin %}
+        <div class="field" id="publisher-field">
+          <label class="field-label">Publish as</label>
+          {# Admin-only, defaulting to the organization: an admin publishing
+             from this page is almost always standing behind it as the
+             workspace, and the old flow landed their uploads as Community
+             until a second trip to the moderation hub flipped the marker.
+             The API enforces the same gate (403 for a non-admin sending
+             organization), so this block is convenience, not the security. #}
+          <label style="display:flex; gap:8px; align-items:baseline; margin-bottom:6px;">
+            <input type="radio" name="publisher_kind" value="organization" checked>
+            <span><b>Your organization</b> — analysts see the Organization trust mark.</span>
+          </label>
+          <label style="display:flex; gap:8px; align-items:baseline;">
+            <input type="radio" name="publisher_kind" value="user">
+            <span><b>You (Community)</b> — published under your own name.</span>
+          </label>
+        </div>
+        {% endif %}
+
         <div class="field">
           <label class="field-label">Cover photo <span style="color:var(--text-secondary,#6b7280);font-weight:400;">(optional)</span></label>
           <div class="file-drop" id="photo-drop">
@@ -1394,6 +1414,10 @@ finishBtn.addEventListener('click', async () => {
     const photo = document.getElementById('photo').files[0];
     if (photo) fd.append('photo', photo);
     for (const d of docs) fd.append('docs', d);
+    // Admin-only radio (absent for everyone else → field never sent → API
+    // default 'user' applies, same as before this field existed).
+    const pubKind = document.querySelector('input[name="publisher_kind"]:checked');
+    if (pubKind) fd.append('publisher_kind', pubKind.value);
 
     const res = await fetch('/api/store/entities', {method: 'POST', body: fd});
     if (res.ok) {

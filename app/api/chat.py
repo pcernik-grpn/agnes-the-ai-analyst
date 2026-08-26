@@ -19,7 +19,12 @@ from app.chat.manager import ChatManager, ConcurrencyCapHit, SessionNotFound
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
-from app.chat.skills_catalog import BUNDLED_TEMPLATE_DIR, list_recognized_commands, merged_skills
+from app.chat.skills_catalog import (
+    BUNDLED_TEMPLATE_DIR,
+    marketplace_delivery,
+    merged_commands,
+    merged_skills,
+)
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
@@ -193,6 +198,13 @@ async def create_session(
         "id": s.id,
         "surface": s.surface.value,
         "title": s.title,
+        # Which agent this session runs AS. Always set (an unnamed web session
+        # is attributed to the caller's default agent, see _resolve_agent_id),
+        # so a client tells "named agent" from "default" by comparing against
+        # the `is_default` row in GET /api/agents rather than by null-checking.
+        # The composer's agent picker needs this to label a session it did not
+        # itself create.
+        "agent_id": s.agent_id,
         "ws_ticket": ticket,
         "ws_url": f"/api/chat/sessions/{s.id}/stream?ticket={ticket}",
     }
@@ -203,6 +215,13 @@ async def list_sessions(
     request: Request,
     user: dict = Depends(require_chat_access),
 ):
+    # Seven sibling routes on this router carry this guard; this one never did,
+    # so a restricted principal got a 500 (``user["email"]`` on a frozen
+    # dataclass) where 403 is the answer. Listing "your" conversations has no
+    # restricted-principal meaning anyway — a co-session has no single identity
+    # whose history this would be, and an agent-session must not enumerate its
+    # owner's.
+    _reject_restricted_principal(user, "list conversations")
     repo = _get_repo(request)
     rows = repo.list_sessions(user["email"])
     return [
@@ -214,6 +233,10 @@ async def list_sessions(
             "last_message_at": s.last_message_at.isoformat() if s.last_message_at else None,
             "message_count": s.message_count,
             "paused": s.sandbox_paused_at is not None,
+            # See create_session: lets the composer's agent picker show WHO a
+            # reopened conversation is with. Column has existed since v101;
+            # it was simply never projected onto the wire.
+            "agent_id": s.agent_id,
             # Pin state for the history panel's Pinned group. `pinned_at` is
             # also exposed so a client can order pins itself; the repo already
             # returns pinned-first, so the flag alone is enough for the rail.
@@ -383,8 +406,28 @@ async def delete_session_permanently(
     repo.hard_delete_session(chat_id)
 
 
+def _chat_config_for_delivery(request: Request):
+    """The chat config the delivery gate must be resolved against.
+
+    ``app.main`` always sets ``app.state.chat_config`` (chat-enabled or not), so
+    the state read is the normal path. The fallback re-reads the same overlay
+    file it loads from, which is also what ``app/api/kai.py`` reads when it
+    builds the workspace archive — so a harness that mounts this router without
+    app state still resolves the flag the way the delivering side will, instead
+    of silently reporting "nothing is delivered".
+    """
+    cfg = getattr(request.app.state, "chat_config", None)
+    if cfg is not None:
+        return cfg
+    from app.chat.config import load_chat_config
+    from app.secrets import _state_dir
+
+    return load_chat_config(_state_dir() / "instance.yaml")
+
+
 @router.get("/skills")
 async def list_skills(
+    request: Request,
     user: dict = Depends(require_chat_access),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -395,20 +438,37 @@ async def list_skills(
     Two sources are merged server-side (see ``app.chat.skills_catalog`` for the
     full rationale): skills shipped in the bundled chat workspace template
     (``source="bundled"``) and the caller's RBAC-filtered marketplace/store
-    plugin skills (``source="marketplace"``) — the same set
-    ``app/chat/runner.py``'s ``_bootstrap_marketplace`` installs into the live
-    sandbox. **Shadowing**: when a skill name is present in both sources, the
-    marketplace entry wins (it is the more user-specific grant). Either source
-    failing to list degrades non-fatally — a warning is logged and the other
-    source's skills still come back.
+    plugin skills (``source="marketplace"``) — the same set that is materialized
+    into the session's project scope, by ``app/chat/workdir.py`` (docker)
+    or by the workspace archive ``app/api/kai.py`` serves (kai-agent). **Shadowing**: when a skill name is
+    present in both sources, the marketplace entry wins (it is the more
+    user-specific grant). Either source failing to list degrades non-fatally —
+    a warning is logged and the other source's skills still come back.
 
-    ``commands`` is currently always empty: neither ``app/chat/runner.py`` nor
-    the bundled workspace template recognize any slash command today (checked,
-    not assumed — see ``list_recognized_commands``'s docstring). Nothing is
-    invented ahead of an actual implementation.
+    The marketplace source is offered only when something actually delivers it
+    (``chat.bootstrap_marketplace``; ``marketplace_delivery`` resolves the
+    mechanism per provider). With the flag off, those rows are omitted rather
+    than advertised — a menu entry the agent has never been given resolves to
+    "Unknown command" when the user picks it.
+
+    Names are bare ``/<skill-name>`` tokens on every delivery path, never
+    ``<plugin>:<skill>`` — verified against the sandboxed CLI's own command
+    list, see the ``app.chat.skills_catalog`` module docstring.
+
+    ``commands`` carries the slash commands the caller's stack plugins ship
+    (``commands/*.md``). Their token, unlike a skill's, depends on how the
+    plugin was delivered — ``/<plugin>:<command>`` where Agnes installed a real
+    plugin (docker), ``/<command>`` where it could only flatten the plugin
+    into project files (kai-agent). ``list_marketplace_commands`` documents the
+    CLI handshake that table was verified against. Plugin AGENTS are delivered
+    but deliberately not listed: they are dispatched by the Task tool, not by a
+    slash command.
     """
-    skills = merged_skills(BUNDLED_TEMPLATE_DIR, conn, user)
-    return {"skills": skills, "commands": list_recognized_commands()}
+    delivery = marketplace_delivery(_chat_config_for_delivery(request))
+    return {
+        "skills": merged_skills(BUNDLED_TEMPLATE_DIR, conn, user, delivery=delivery),
+        "commands": merged_commands(conn, user, delivery=delivery),
+    }
 
 
 class JourneyUpdateBody(BaseModel):
@@ -492,6 +552,20 @@ async def list_messages(
             "role": m.role,
             "content": m.content,
             "tool_calls": m.tool_calls,
+            # The turn's ordered shape, so a reload renders prose and tool
+            # cards in the sequence they actually happened (#1504). NULL for a
+            # row written before schema v123 — the client falls back to the
+            # positionless `tool_calls` above and renders those after the
+            # answer, which is all the old row can honestly support.
+            "parts": m.parts,
+            # The composer reads this for two filters, both of which are dead
+            # without it: the ArrowUp prompt-recall stack (a co-drive peer's
+            # prompt must not surface under the owner's history) and
+            # `renderMessage`'s peer-attribution badge, which otherwise
+            # disappears on every reload. `/api/chat/copresence` already
+            # exposes the field to participants and this route is owner-only
+            # (a non-owner 404s above), so it discloses nothing new.
+            "sender_email": m.sender_email,
             "created_at": m.created_at.isoformat(),
             # Recomputed on read rather than stored (see app/chat/sources.py):
             # the pair it needs is already here, so this costs no column, no
@@ -589,7 +663,7 @@ async def ws_stream(ws: WebSocket, chat_id: str, ticket: str, last_seq: int = 0)
                 if kind == "user_msg":
                     # The client may send ``user_msg`` as soon as the WS is
                     # TCP-open, but ``attach()`` hasn't necessarily finished
-                    # ``_spawn_runner`` (E2B sandbox creation can take ~5 s),
+                    # ``_spawn_runner`` (sandbox creation can take ~5 s),
                     # so ``live[chat_id]`` may not exist yet. Wait briefly
                     # for ``attach`` to populate it before raising — without
                     # this, an early ``user_msg`` triggers SessionNotFound,

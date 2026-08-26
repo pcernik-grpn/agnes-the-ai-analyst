@@ -364,17 +364,39 @@ def _attach_admin_flag(user: dict, conn: duckdb.DuckDBPyConnection) -> None:
     after the v13 migration. Computing the flag once per request here
     keeps every consumer in sync with ``app.auth.access.is_user_admin``
     (the same call all server-side admin gates use).
+
+    ``is_admin`` is EFFECTIVE authority, so it honors the elevation consent
+    gate: an admin who paused their own elevation gets ``False`` here, because
+    ``require_admin`` refuses that request (403 ``admin_elevation_paused``)
+    and chrome gated on the raw membership sent them straight into it — the
+    rail kept an Admin row that only ever produced an error page. The
+    middleware stamps the pause before authentication (see app/main.py), so
+    the flag is resolvable at this point.
+
+    ``is_admin_paused`` carries the difference — in the Admin group, but
+    paused — so chrome can say *why* the admin surfaces are gone and link to
+    the switch (on /me/profile, deliberately outside admin-gated UI, so a
+    paused admin is never stranded). Enforcement paths keep calling
+    ``is_user_admin`` / ``require_admin`` directly; this pair is for
+    rendering.
     """
     from app.auth.access import is_user_admin
+    from app.auth.elevation import elevation_paused
 
     user_id = user.get("id")
     if user_id:
         try:
-            user["is_admin"] = is_user_admin(user_id, conn)
+            in_admin_group = is_user_admin(user_id, conn)
         except Exception:
-            user["is_admin"] = False
+            in_admin_group = False
+        # Subject-scoped: the pause is this person pausing their own god-mode
+        # (an unstamped caller still honors it — reduction is always safe).
+        paused = bool(in_admin_group) and elevation_paused(str(user_id))
+        user["is_admin"] = bool(in_admin_group) and not paused
+        user["is_admin_paused"] = paused
     else:
         user["is_admin"] = False
+        user["is_admin_paused"] = False
 
 
 def get_optional_user(
@@ -454,6 +476,126 @@ def require_session_token(request: Request, user: dict = Depends(get_current_use
                 detail="This endpoint requires an interactive session, not a PAT",
             )
     return user
+
+
+def require_session_or_user_pat(*, allow_stack_surface: bool = False):
+    """Factory for a dependency like ``require_session_token``, but ALSO
+    accepting a user PAT (``typ="pat"``) — for READ-ONLY agent-management
+    endpoints only. Mutating agent-management routes
+    (create/update/delete/scope/token issuance/memory writes) keep using
+    ``require_session_token`` unchanged.
+
+    Motivation: ``agnes agent list`` — the very command `agnes chat`'s own
+    error text points a caller at — must work for a normally-logged-in
+    analyst's own PAT, not force a fresh interactive session just to
+    discover which agents exist. ``agnes login`` / ``agnes init`` both mint
+    ``surface='stack'`` PATs by default (`app/api/cli_auth.py`), so a fix
+    that only accepted ``surface='all'`` would not actually help the common
+    case — see (3) below.
+
+    ``allow_stack_surface`` (default ``False``) controls whether a
+    ``surface='stack'`` PAT qualifies, on top of a full-surface
+    (``surface='all'``) one, which always qualifies:
+
+    - ``allow_stack_surface=True`` — used by ``GET /api/v1/agents``,
+      ``GET /api/v1/agents/{id}``, ``GET /api/v1/agents/{slug}/schedules``.
+      ``surface='stack'`` narrows *data reads* (it drops an admin's
+      god-mode short-circuit to the analyst stack branch — see
+      ``src/rbac.py``'s ``_credential_surface``); it was never meant to hide
+      the caller's own agent *metadata* (name, slug, scope shape, schedule
+      cadence), and accepting it here never widens data access.
+    - ``allow_stack_surface=False`` (default) — used by
+      ``GET /api/v1/agents/{id}/memories``. A memory notebook can hold
+      free-text content the owner wrote or an agent inferred, the most
+      sensitive of the four read surfaces — kept on the conservative
+      full-surface-PAT-or-session default; reviewers may widen this later.
+
+    Still rejects, fail-closed, regardless of ``allow_stack_surface``:
+
+    1. **Every restricted principal** (``SessionPrincipal`` / ``AgentPrincipal``,
+       ``PRINCIPAL_TYPES``) — neither carries a single owner identity these
+       owner-scoped reads can run against, and an ``AgentPrincipal`` is the
+       sandbox's own narrowed credential, which must never drive the
+       owner-facing agent API.
+    2. **An agent-scoped PAT** (``typ="agent_pat"``) — an agent must never
+       enumerate or read its OWNER's *other* agents just because it holds a
+       PAT. Denied unconditionally, regardless of surface.
+    3. **Scheduler shared secret / ``X-StorageApi-Token`` header credential**
+       — same non-interactive-service exclusions as ``require_session_token``.
+    4. **Any ``credential_surface`` value other than ``'all'`` or (when
+       allowed) ``'stack'``** — an unrecognized/future surface value fails
+       closed rather than silently qualifying.
+
+    The surface check in (4) applies to EVERY credential that carries a
+    ``credential_surface`` tag, not just ``typ="pat"`` ones. Two non-PAT
+    credential kinds are also stamped ``credential_surface="stack"`` by
+    ``resolve_token_to_user`` (``app/auth/pat_resolver.py``): a session JWT
+    minted for an AGENT surface — the chat-sandbox token from
+    ``mint_session_jwt`` (no ``typ`` claim at all) and an MCP-OAuth connector
+    token (``typ="session"``, ``scope="mcp-oauth"``). Gating the surface
+    check on ``typ in _PAT_LIKE_TYPES`` would let both slip through
+    unchecked on every route including ``memories`` — the same rule must
+    apply to them as to a PAT carrying the same surface tag. A credential
+    with no ``credential_surface`` key at all (a genuine interactive browser
+    session) reads as ``'all'``, same convention as
+    ``src/rbac.py``'s ``_credential_surface`` helper, and is unaffected.
+    """
+
+    def _dependency(request: Request, user: dict = Depends(get_current_user)) -> dict:
+        """Plain ``def`` — same Tier 1 threadpool convention as
+        ``require_session_token`` (PR #188)."""
+        from app.auth.session_principal import PRINCIPAL_TYPES
+
+        if isinstance(user, PRINCIPAL_TYPES):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint requires an interactive session or a user PAT",
+            )
+
+        auth = request.headers.get("authorization", "")
+        token = None
+        if auth.startswith("Bearer "):
+            token = auth.removeprefix("Bearer ")
+        if not token and request:
+            token = request.cookies.get("access_token")
+        if not token and request.headers.get("x-storageapi-token"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint requires an interactive session or a user PAT, not a Storage API token",
+            )
+        if token:
+            from app.auth.scheduler_token import is_scheduler_token
+
+            if is_scheduler_token(token):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This endpoint requires an interactive session or a user PAT, not a service token",
+                )
+            from app.auth.jwt import verify_token
+
+            payload = verify_token(token) or {}
+            if payload.get("typ") == "agent_pat":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This endpoint requires an interactive session or a qualifying user PAT",
+                )
+
+            # Surface check is keyed on the RESOLVED credential_surface, not
+            # on typ — a sandbox (mint_session_jwt) or MCP-OAuth token
+            # carrying credential_surface='stack' must be held to the same
+            # rule as a surface='stack' PAT (see docstring). No key at all
+            # reads as 'all' and always qualifies.
+            surface = user.get("credential_surface")
+            if surface is not None and surface != "all":
+                qualifies = allow_stack_surface and surface == "stack"
+                if not qualifies:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="This endpoint requires an interactive session or a qualifying user PAT",
+                    )
+        return user
+
+    return _dependency
 
 
 def reject_keboola_header_credential(user: dict = Depends(get_current_user)) -> dict:

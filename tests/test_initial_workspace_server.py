@@ -9,6 +9,7 @@ from src.initial_workspace import (
     initialize_default_workspace,
     initialize_workspace_from_template,
     is_override_workspace,
+    read_sentinel_server_url,
     write_sentinel,
 )
 
@@ -56,6 +57,36 @@ def test_is_override_workspace_false_when_missing(tmp_path: Path):
     assert is_override_workspace(tmp_path) is False
 
 
+def test_read_sentinel_server_url_roundtrip(tmp_path: Path):
+    write_sentinel(
+        tmp_path,
+        agnes_version="0.55.0",
+        server_url="https://agnes.example.com",
+        template_source=None,
+        template_sha=None,
+        override=False,
+    )
+    assert read_sentinel_server_url(tmp_path) == "https://agnes.example.com"
+
+
+def test_read_sentinel_server_url_none_when_missing(tmp_path: Path):
+    assert read_sentinel_server_url(tmp_path) is None
+
+
+def test_read_sentinel_server_url_none_without_line(tmp_path: Path):
+    sentinel = tmp_path / ".claude" / "init-complete"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("completed_at: 2026-01-01T00:00:00+00:00\nagnes_version: 0.55.0\n")
+    assert read_sentinel_server_url(tmp_path) is None
+
+
+def test_read_sentinel_server_url_tolerates_whitespace(tmp_path: Path):
+    sentinel = tmp_path / ".claude" / "init-complete"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("server_url :   http://192.0.2.1:8000  \n")
+    assert read_sentinel_server_url(tmp_path) == "http://192.0.2.1:8000"
+
+
 def test_initialize_workspace_from_template_writes_files_and_sentinel(tmp_path: Path):
     zip_bytes = _make_zip({"CLAUDE.md": b"hello"})
     result = initialize_workspace_from_template(
@@ -78,7 +109,7 @@ def test_initialize_default_workspace_copies_bundled(tmp_path: Path):
     (bundled / ".claude").mkdir()
     (bundled / ".claude" / "settings.json").write_text("{}")
     workspace = tmp_path / "ws"
-    result = initialize_default_workspace(
+    initialize_default_workspace(
         workspace,
         agnes_version="0.55.0",
         server_url="https://example",

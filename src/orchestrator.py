@@ -152,34 +152,116 @@ def _get_extracts_dir() -> Path:
     return data_dir / "extracts"
 
 
-def _hash_table_parts(table_dir: Path) -> list[dict] | None:
+def _parquet_magic_ok(f, size: int) -> bool:
+    """Cheap structural check on an ALREADY-OPEN parquet file handle — not a
+    full parse. Leaves the handle positioned at offset 0 on return, ready
+    for a fresh streaming read, so a caller that also needs to hash *f*
+    reuses this one open descriptor rather than opening the file twice.
+
+    A parquet file carries the SAME 4-byte magic at both ends: ``PAR1``
+    normally, or ``PARE`` when the footer is encrypted (verified against
+    pyarrow's own `verify_file_encrypted`, which asserts the FIRST four
+    bytes of an encrypted-footer file are ``PARE``). Requiring the two ends
+    to match is deliberately stricter than checking them independently: a
+    file whose head and tail disagree is not a shape the format produces.
+    This catches truncation and footerless writes (the #1354 failure mode:
+    a process killed mid-write leaves a file with a valid header and no
+    footer) — it does NOT catch subtle internal corruption (a footer that
+    parses but describes bytes that don't match the row groups, a bit flip
+    inside a data page, etc.). A file that passes this check is
+    "well-formed enough to admit", never "valid" — callers must not treat
+    a pass as proof the file is readable, only as proof it is not the
+    truncated/footerless shape #1364 is about.
+    """
+    if size < 8:
+        return False
+    f.seek(0)
+    head = f.read(4)
+    f.seek(-4, os.SEEK_END)
+    tail = f.read(4)
+    f.seek(0)
+    return head in (b"PAR1", b"PARE") and tail == head
+
+
+def _hash_table_parts(table_dir: Path) -> tuple[list[dict] | None, list[str]]:
     """Per-part manifest for a partitioned table stored as a *directory* of
     parquet parts — Jira hive (``month=*/data.parquet``) and Keboola
-    partitioned (``<key>.parquet``). Returns a list of
+    partitioned (``<key>.parquet``).
+
+    Returns ``(parts, rejected)``. ``parts`` is a list of
     ``{path, hash, size_bytes}`` sorted by relpath, where ``hash`` is the
     full content MD5 of the part (same contract as the single-file hash
-    ``agnes pull`` re-verifies), or ``None`` when *table_dir* is not a
-    directory of parquets (i.e. a single-file table).
+    ``agnes pull`` re-verifies) for every part that passed
+    :func:`_parquet_magic_ok` — or ``None`` when *table_dir* is not a
+    directory of parquets at all (i.e. a single-file table) or every part
+    was rejected. ``rejected`` is the relpaths of parts that failed the
+    structural check (#1364) — each already logged at WARNING naming the
+    exact path and reason.
+
+    A rejected part is simply not (re)hashed here; it is NOT the caller's
+    cue to drop the path from the manifest outright. `agnes pull`'s
+    `_diff_parts` treats "on disk locally, absent from the fresh manifest"
+    as an intentional server-side deletion and PRUNES — deletes — the
+    local copy (see `test_diff_parts_prunes_dropped_month`). Naively
+    excluding a corrupt part that was previously distributed good would
+    therefore delete the analyst's last-good copy, the opposite of this
+    fix's intent. The caller (`_update_sync_state`) uses `rejected` to
+    keep such a part's manifest entry frozen at its last known-good hash
+    via `_merge_frozen_parts` instead of dropping it — a rejected path
+    with no prior good hash (never distributed) is safe to omit outright,
+    since there is nothing local to protect.
     """
     if not table_dir.is_dir():
-        return None
+        return None, []
     parts: list[dict] = []
+    rejected: list[str] = []
     for pq in sorted(
         table_dir.rglob("*.parquet"),
         key=lambda p: p.relative_to(table_dir).as_posix(),
     ):
-        h = hashlib.md5()
+        relpath = pq.relative_to(table_dir).as_posix()
         with open(pq, "rb") as f:
+            if not _parquet_magic_ok(f, pq.stat().st_size):
+                logger.warning(
+                    "Refusing corrupt parquet part %s in %s — missing/invalid PAR1 "
+                    "magic (well-formed-enough check only, not a full parse); not "
+                    "(re)published from this pass. See #1364.",
+                    relpath,
+                    table_dir,
+                )
+                rejected.append(relpath)
+                continue
+            h = hashlib.md5()
             for chunk in iter(lambda: f.read(8192), b""):
                 h.update(chunk)
         parts.append(
             {
-                "path": pq.relative_to(table_dir).as_posix(),
+                "path": relpath,
                 "hash": h.hexdigest(),
                 "size_bytes": pq.stat().st_size,
             }
         )
-    return parts or None
+    return (parts or None), rejected
+
+
+def _merge_frozen_parts(
+    parts: list[dict],
+    rejected: list[str],
+    previous_by_path: dict[str, dict],
+) -> list[dict]:
+    """Reintroduce a rejected (corrupt-this-pass) part's last known-good
+    manifest entry, when one exists, instead of leaving it silently
+    excluded — see the pull-prune hazard documented on
+    :func:`_hash_table_parts`. A rejected path with no prior entry (never
+    distributed good) is left out: there is no local copy to protect, and
+    nothing corrupt should enter the manifest for the first time.
+    """
+    merged = list(parts)
+    for relpath in rejected:
+        prev = previous_by_path.get(relpath)
+        if prev is not None:
+            merged.append(prev)
+    return merged
 
 
 def _parts_rollup_hash(parts: list[dict]) -> str:
@@ -1528,10 +1610,17 @@ class SyncOrchestrator:
         try:
             # Backend-aware: write sync_state through the factory (Postgres on
             # a PG instance) so /dashboard's factory-backed reads see it.
-            from src.repositories import sync_state_repo
+            from src.repositories import sync_state_repo, table_registry_repo
+            from src.sync_state_key import resolve_sync_state_key_for_row
 
             extracts_dir = _get_extracts_dir()
             repo = sync_state_repo()
+            # One registry read for the whole rebuild, not one per table —
+            # this loop can run per Jira webhook (rebuild_source) as well
+            # as per scheduler tick, under `_rebuild_lock` + the PG
+            # advisory lease, so a per-row `get_by_name()` round trip here
+            # would scale with meta_rows on every single call.
+            registry_by_name = {r["name"]: r for r in table_registry_repo().list_all()}
             for table_name, rows, size_bytes, query_mode in meta_rows:
                 # Materialized rows own their sync_state: the materialized
                 # pass writes it on success (update_sync) and failure
@@ -1540,6 +1629,12 @@ class SyncOrchestrator:
                 # is never retried until the next day.
                 if query_mode == "materialized":
                     continue
+                # B1: sync_state.table_id / sync_history.table_id are keyed
+                # by the registry id, resolved from this table's name (see
+                # src.sync_state_key) — the parquet filename below is a
+                # SEPARATE, unrelated convention (still `table_name`) and
+                # stays untouched.
+                sync_key = resolve_sync_state_key_for_row(table_name, registry_by_name.get(table_name))
                 pq_path = extracts_dir / source_name / "data" / f"{table_name}.parquet"
                 table_dir = extracts_dir / source_name / "data" / table_name
                 file_hash = ""
@@ -1607,9 +1702,29 @@ class SyncOrchestrator:
                             pq_path,
                             table_dir,
                         )
-                    # Single-file table: full content MD5 (see docstring).
-                    h = hashlib.md5()
+                    # Single-file table: full content MD5 (see docstring), after
+                    # a structural PAR1/footer check (#1364) — reusing this same
+                    # open handle, not a second open. A corrupt file is refused:
+                    # this table's sync_state is left untouched THIS ROUND
+                    # (`continue`, skipping the update_sync call below) rather
+                    # than published with a hash that correctly describes
+                    # corrupt bytes. That freezes the manifest at its last
+                    # known-good hash (or, pre-first-sync, publishes nothing) —
+                    # `agnes pull` neither downloads the corrupt bytes nor
+                    # drops a good copy it already has.
                     with open(pq_path, "rb") as f:
+                        if not _parquet_magic_ok(f, pq_path.stat().st_size):
+                            logger.warning(
+                                "Refusing corrupt parquet %s for table %r in source %r — "
+                                "missing/invalid PAR1 magic (well-formed-enough check "
+                                "only, not a full parse); sync_state left at its last "
+                                "known-good value. See #1364.",
+                                pq_path,
+                                table_name,
+                                source_name,
+                            )
+                            continue
+                        h = hashlib.md5()
                         for chunk in iter(lambda: f.read(8192), b""):
                             h.update(chunk)
                     file_hash = h.hexdigest()
@@ -1617,13 +1732,27 @@ class SyncOrchestrator:
                     # Partitioned table (no single {table}.parquet): hash each
                     # part; the rollup keeps the whole-table hash contract, and
                     # the summed part sizes replace the missing single-file size.
-                    parts = _hash_table_parts(table_dir)
-                    if parts:
+                    fresh_parts, rejected = _hash_table_parts(table_dir)
+                    merged_parts = list(fresh_parts or [])
+                    if rejected:
+                        # A corrupt part may have been distributed good before
+                        # (#1364) — freeze it at its last known-good entry
+                        # rather than silently dropping it, which `agnes
+                        # pull`'s `_diff_parts` would otherwise read as an
+                        # intentional server-side deletion and PRUNE.
+                        previous = repo.get_table_state(sync_key)
+                        previous_by_path = {p["path"]: p for p in (previous or {}).get("parts") or []}
+                        merged_parts = _merge_frozen_parts(merged_parts, rejected, previous_by_path)
+                    if merged_parts:
+                        parts = merged_parts
                         file_hash = _parts_rollup_hash(parts)
                         out_size = sum(p["size_bytes"] for p in parts)
+                    # else: parts stays None — nothing publishable this round,
+                    # same contract as an empty directory (see
+                    # `_hash_table_parts`'s docstring).
 
                 repo.update_sync(
-                    table_id=table_name,
+                    table_id=sync_key,
                     rows=rows or 0,
                     file_size_bytes=out_size,
                     hash=file_hash,
@@ -1638,7 +1767,7 @@ class SyncOrchestrator:
                     # written above untouched, so the bytes served here stay
                     # byte-for-byte identical to the flat-only case.
                     repo.set_error(
-                        table_name,
+                        sync_key,
                         f"Both a flat parquet ({pq_path}) and a partition "
                         f"directory ({table_dir}) exist for this table; "
                         f"serving the flat file, which may be stale. See #1339.",
@@ -1656,6 +1785,7 @@ class SyncOrchestrator:
         """
         try:
             from src.repositories import sync_state_repo, table_registry_repo
+            from src.sync_state_key import resolve_sync_state_key_for_row
 
             # Materialized rows own their last_sync (see _update_sync_state):
             # the fallback fires exactly when `_meta` is missing — e.g. a
@@ -1665,6 +1795,12 @@ class SyncOrchestrator:
             # next tick re-runs the materialize, healing `_meta`.
             registry_row = table_registry_repo().get_by_name(table_id)
             is_materialized = bool(registry_row and registry_row.get("query_mode") == "materialized")
+            # B1: sync_state.table_id is the registry id (src.sync_state_key)
+            # — reuses `registry_row`, already fetched above, rather than a
+            # second lookup. `table_id` (the parameter) stays the parquet
+            # filename stem used for the view lookup right below; only the
+            # sync_state write key changes.
+            sync_key = resolve_sync_state_key_for_row(table_id, registry_row)
 
             h = hashlib.md5()
             with open(parquet_path, "rb") as f:
@@ -1672,7 +1808,7 @@ class SyncOrchestrator:
                     h.update(chunk)
             row_count = conn.execute(f"SELECT COUNT(*) FROM {quote_ident(table_id)}").fetchone()[0]
             sync_state_repo().update_sync(
-                table_id=table_id,
+                table_id=sync_key,
                 rows=int(row_count or 0),
                 file_size_bytes=parquet_path.stat().st_size,
                 hash=h.hexdigest(),

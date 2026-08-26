@@ -201,11 +201,15 @@ class TestInterlockCaseC:
     def test_a_twin_flipped_to_distributable_after_the_attach_is_rejected(self, seeded_app, monkeypatch):
         """PUT-path defense-in-depth in the other direction:
         ``TestRegisterTimeInterlock`` covers a brand-new twin being caught
-        the moment IT is registered; this covers an EXISTING undistributed
-        twin (allowed to coexist) being flipped distributable later. The
-        interlock re-validates the merged shape on every write to a
-        distributable row, independent of which fields that write
-        touches."""
+        the moment IT is registered; this covers an EXISTING twin that was
+        registered first, so nothing would ever re-run the twin-side check
+        for it. The attach is what gets refused.
+
+        This test used to assert the opposite — that the attach succeeds
+        and only a LATER flip to distributable is refused — because the
+        interlock keyed on ``agnes pull``. An undistributed twin leaks the
+        same rows through ``/api/query`` under its own name, so the attach
+        is now the rejection point."""
         monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
@@ -235,20 +239,33 @@ class TestInterlockCaseC:
             },
             headers=_auth(token),
         )
-        assert attach.status_code == 200, attach.text
+        assert attach.status_code == 422, attach.text
+        assert "access_policy_physical_source_conflict" in attach.text
+        assert twin_id in attach.text
 
-        resp = c.put(
-            f"/api/admin/registry/{twin_id}",
-            json={"server_only": False},
+        # Clear the twin out of the way and the same attach is accepted —
+        # the rejection is about the twin, not about this policy.
+        assert c.delete(f"/api/admin/registry/{twin_id}", headers=_auth(token)).status_code in (200, 204)
+        retry = c.put(
+            f"/api/admin/registry/{policied_id}",
+            json={
+                "access_policy_sql": _policy_sql("flip_orig_src"),
+                "access_policy_note": "pii masking",
+            },
             headers=_auth(token),
         )
-        assert resp.status_code == 422, resp.text
-        assert "access_policy_physical_source_conflict" in resp.text
-        assert policied_id in resp.text
+        assert retry.status_code == 200, retry.text
 
-    def test_a_twin_that_stays_server_only_is_not_rejected(self, seeded_app, monkeypatch):
-        """The conflict is about DISTRIBUTABILITY, not mere physical-source
-        overlap — two undistributed rows sharing a source is not a leak."""
+    def test_a_twin_that_stays_server_only_is_also_rejected(self, seeded_app, monkeypatch):
+        """Physical-source overlap is the conflict, distributability only
+        decides the wording.
+
+        The original version of this test asserted that two undistributed
+        rows over one source may coexist, on the reasoning that neither is
+        downloaded by ``agnes pull``. A live instance disproved it: the
+        unpolicied row answers ``/api/query`` server-side under its own
+        name and returns exactly the rows the policy withholds, to anyone
+        granted it."""
         monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
@@ -271,21 +288,33 @@ class TestInterlockCaseC:
         )
         assert attach.status_code == 200, attach.text
 
-        twin_id = _register(
-            c,
-            token,
-            name="twin_src2",
-            server_only=True,
-            bucket="in.c-main",
-            source_table="orders",
-        )
+        # Registered BEFORE the policy existed, so it is already on disk —
+        # the shape a live instance actually gets into.
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="twin_src2",
+                name="twin_src2",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+                bucket="in.c-main",
+                source_table="orders",
+            )
+        finally:
+            conn.close()
 
         resp = c.put(
-            f"/api/admin/registry/{twin_id}",
+            "/api/admin/registry/twin_src2",
             json={"description": "an unrelated edit"},
             headers=_auth(token),
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
 
 
 @pytest.mark.journey
@@ -391,9 +420,12 @@ class TestRegisterTimeInterlock:
 
         assert table_registry_repo().get("mat_twin_src") is None
 
-    def test_a_server_only_twin_is_allowed_at_register(self, seeded_app, monkeypatch):
-        """The register-time check only blocks the DISTRIBUTABLE case —
-        two undistributed rows sharing a physical source is not a leak."""
+    def test_a_server_only_twin_is_rejected_at_register(self, seeded_app, monkeypatch):
+        """Register time refuses an undistributed twin too.
+
+        Asserted the opposite until an undistributed twin was shown to
+        serve the same rows through ``/api/query`` under its own name —
+        ``agnes pull`` is one way out of the policy, not the only one."""
         monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
@@ -428,7 +460,12 @@ class TestRegisterTimeInterlock:
             },
             headers=_auth(token),
         )
-        assert resp.status_code == 201, resp.text
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("so_twin_src") is None
 
 
 @pytest.mark.journey
@@ -473,3 +510,90 @@ class TestHappyPath:
         assert row["access_policy_sql"] is None
         assert row["access_policy_note"] is None
         assert row["access_policy_updated_by"] is None
+
+
+@pytest.mark.journey
+class TestTwoPoliciedRowsStayUnwindable:
+    """Two POLICIED rows over one physical source are legal (§3.2 says so
+    explicitly: "each read goes through a policy, and which one an admin wants
+    where is their call"). What follows from that has to be checked, because
+    the twin scan runs on the MERGED record: clearing either policy leaves an
+    unpolicied row over a source the other row still policies — the exact
+    disclosure the interlock exists to refuse — so BOTH clears are 422 and
+    neither ordering unwinds the pair.
+
+    That refusal is correct on the merits and stays. What was not correct is
+    the wording: the rejection told an admin who was *removing* a policy to
+    "attach a policy to this row too", and the docstring on
+    ``_check_policied_row_has_no_unpolicied_twin`` promised a safety valve
+    ("an admin can always undo the policy") that this shape does not have.
+    Two escapes do exist — repoint the row at a different source first, or
+    unregister one of the pair — and the message has to name them.
+    """
+
+    def _pair(self, c, token):
+        first = _register(c, token, name="pair_a", server_only=True, bucket="in.c-main", source_table="ledger")
+        assert (
+            c.put(
+                f"/api/admin/registry/{first}",
+                json={"access_policy_sql": _policy_sql("pair_a"), "access_policy_note": "a"},
+                headers=_auth(token),
+            ).status_code
+            == 200
+        )
+        # The second row cannot be registered unpolicied (that is the twin
+        # interlock), so it arrives pointed elsewhere and is repointed by a
+        # PUT that attaches its own policy in the same write.
+        second = _register(c, token, name="pair_b", server_only=True, bucket="in.c-main", source_table="other")
+        moved = c.put(
+            f"/api/admin/registry/{second}",
+            json={
+                "source_table": "ledger",
+                "access_policy_sql": _policy_sql("pair_b"),
+                "access_policy_note": "b",
+            },
+            headers=_auth(token),
+        )
+        assert moved.status_code == 200, moved.text
+        return first, second
+
+    def test_clearing_either_policy_is_refused_in_both_orders(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first, second = self._pair(c, token)
+
+        for target in (first, second):
+            resp = c.put(
+                f"/api/admin/registry/{target}",
+                json={"access_policy_sql": None},
+                headers=_auth(token),
+            )
+            assert resp.status_code == 422, resp.text
+            assert "access_policy_physical_source_conflict" in resp.text
+            # The message must not steer the admin into the one action that
+            # cannot help — they are removing a policy, not missing one.
+            assert "attach a policy to this row too" not in resp.text, resp.text
+            # …and it must name an escape that works.
+            assert "unregister" in resp.text, resp.text
+
+    def test_repointing_first_unwinds_the_pair(self, seeded_app, monkeypatch):
+        """The escape the message now names, exercised end to end: keep the
+        policy while moving the row off the shared source, then clear it."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first, _second = self._pair(c, token)
+
+        moved = c.put(
+            f"/api/admin/registry/{first}",
+            json={"source_table": "ledger_archive"},
+            headers=_auth(token),
+        )
+        assert moved.status_code == 200, moved.text
+        cleared = c.put(
+            f"/api/admin/registry/{first}",
+            json={"access_policy_sql": None},
+            headers=_auth(token),
+        )
+        assert cleared.status_code == 200, cleared.text

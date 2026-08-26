@@ -534,6 +534,23 @@
         /* Mode leads with meaning, keeps the system word. */
         .tbl-mode { white-space: nowrap; font-size: 12.5px; color: var(--ds-text-secondary); }
 
+        /* Sync status (B1) — same status vocabulary + colour mapping as
+           `/admin/sync`'s `.status-pill` (admin_sync.html), scoped under
+           `.tbl-sync-pill` to match this file's `.tbl-*` naming instead of
+           reusing the bare class names. Data comes straight off the
+           registry row this lens already fetches (`last_sync_status` /
+           `last_sync` / `last_sync_error`, #754) — no second request. */
+        .tbl-sync-pill {
+            display: inline-block; padding: 2px 8px; border-radius: var(--ds-radius-pill);
+            font-size: 11px; font-weight: 600;
+        }
+        .tbl-sync-pill--ok      { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+        .tbl-sync-pill--error   { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+        .tbl-sync-pill--pending { background: var(--ds-surface-dim);       color: var(--ds-text-secondary); }
+        .tbl-sync-pill--running { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+        .tbl-sync-pill--skipped { background: var(--ds-accent-info-bg);    color: var(--ds-accent-info-ink); }
+        .tbl-sync-age { display: block; margin-top: 2px; font-size: 10.5px; color: var(--ds-text-muted); }
+
         /* A package the row belongs to — a chip that is also the way in. */
         .tbl-pkg {
             display: inline-block;
@@ -1879,7 +1896,7 @@
                                 </label>
                             </div>
                             <div class="form-hint" id="editBqModeWarning" style="display:none;
-                                 color:#EA580C;background:rgba(234,88,12,.08);padding:8px;border-radius:6px;margin-top:8px;">
+                                 color:var(--ds-accent-warn-ink);background:var(--ds-accent-warn-bg);padding:8px;border-radius:6px;margin-top:8px;">
                                 <!-- Filled by onEditBqAccessModeChange() when switching
                                      modes on an existing row — warns about parquet
                                      drop / scheduling impact. -->
@@ -2050,11 +2067,18 @@
                             <span>Keboola is not connected — <strong>Discover</strong> won't work. <a href="/admin/data-sources" style="color:inherit; text-decoration:underline;">Connect a Keboola project</a>, or fill in Bucket / Source Table by hand.</span>
                         </div>
                         {% endif %}
-                        {# Three sync-mode radios:
+                        {# Four sync-mode radios:
                            - whole / custom → query_mode='materialized' (DuckDB Keboola
                              extension; whole synthesizes SELECT *, custom uses admin SQL)
                            - direct → query_mode='local' (Storage API SDK, supports
-                             v26 sync strategies: incremental/partitioned + where_filters) #}
+                             v26 sync strategies: incremental/partitioned + where_filters)
+                           - remote → query_mode='remote' (live — same DuckDB extension
+                             view as 'whole', but nothing syncs; every analyst query goes
+                             straight to Keboola). Mirrors the "Live" option already
+                             offered by the BigQuery/Databricks/Snowflake modals in this
+                             template — bucket/source_table stay required (kb-source-table
+                             visibility already treats any non-custom mode the same way,
+                             see onKbSyncModeChange()). #}
                         <div class="form-group">
                             <label class="form-label">What to sync?</label>
                             <div class="bq-sync-radio-group" style="display:flex; gap:12px; margin-top:6px; flex-wrap:wrap;">
@@ -2083,6 +2107,16 @@
                                         (e.g. last 30 days only, per-day rollup).
                                     </div>
                                 </label>
+                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:12px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
+                                    <input type="radio" name="kbSyncMode" value="remote" onchange="onKbSyncModeChange()">
+                                    <strong>Live (remote)</strong>
+                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
+                                        Each analyst query goes straight to Keboola through
+                                        the DuckDB extension view. Always current; 0 disk on
+                                        the analyst machine. Nothing syncs — no schedule,
+                                        no server-only distribution.
+                                    </div>
+                                </label>
                             </div>
                         </div>
 
@@ -2100,7 +2134,8 @@
                            register payload so the table isn't provenance-less. #}
                         <div class="form-group" id="kbProjectPickerGroup" style="display:none;">
                             <label class="form-label" for="kbProjectSelect">Keboola project</label>
-                            <select class="form-select" id="kbProjectSelect"></select>
+                            <select class="form-select ds-dropdown-native" id="kbProjectSelect"></select>
+                            {{ ds.dropdown(id='kbProjectSelect-dd', target='kbProjectSelect', aria_label='Keboola project', options=[]) }}
                             <div class="form-hint">Discover, List tables and Use table as base run against this project.</div>
                         </div>
 
@@ -2233,11 +2268,20 @@
 
                             <div class="form-group">
                                 <label class="form-label" for="kbStrategy">Sync strategy</label>
-                                <select class="form-select" id="kbStrategy" onchange="onKbStrategyChange()">
+                                <select class="form-select ds-dropdown-native" id="kbStrategy" onchange="onKbStrategyChange()">
                                     <option value="full_refresh">Full refresh — pull entire table each tick</option>
                                     <option value="incremental">Incremental — pull rows changed since last sync</option>
                                     <option value="partitioned">Partitioned — per-partition files, per-month/day/year</option>
                                 </select>
+                                {{ ds.dropdown(
+                                  id='kbStrategy-dd', target='kbStrategy',
+                                  aria_label='Sync strategy', selected='full_refresh',
+                                  options=[
+                                    {'value': 'full_refresh', 'label': 'Full refresh — pull entire table each tick'},
+                                    {'value': 'incremental', 'label': 'Incremental — pull rows changed since last sync'},
+                                    {'value': 'partitioned', 'label': 'Partitioned — per-partition files, per-month/day/year'},
+                                  ],
+                                ) }}
                             </div>
 
                             <div class="form-group kb-strategy-incremental kb-strategy-partitioned" style="display:none;">
@@ -2263,11 +2307,20 @@
                             </div>
                             <div class="form-group kb-strategy-partitioned" style="display:none;">
                                 <label class="form-label" for="kbPartitionGranularity">Granularity</label>
-                                <select class="form-select" id="kbPartitionGranularity">
+                                <select class="form-select ds-dropdown-native" id="kbPartitionGranularity">
                                     <option value="month">Month — YYYY_MM.parquet (default)</option>
                                     <option value="day">Day — YYYY_MM_DD.parquet</option>
                                     <option value="year">Year — YYYY.parquet</option>
                                 </select>
+                                {{ ds.dropdown(
+                                  id='kbPartitionGranularity-dd', target='kbPartitionGranularity',
+                                  aria_label='Granularity', selected='month',
+                                  options=[
+                                    {'value': 'month', 'label': 'Month — YYYY_MM.parquet (default)'},
+                                    {'value': 'day', 'label': 'Day — YYYY_MM_DD.parquet'},
+                                    {'value': 'year', 'label': 'Year — YYYY.parquet'},
+                                  ],
+                                ) }}
                             </div>
                             <div class="form-group kb-strategy-partitioned" style="display:none;">
                                 <label class="form-label" for="kbInitialLoadChunkDays">Initial-load chunk size (days)
@@ -2644,7 +2697,8 @@
                            the row's own connection_id, when it has one, on open. #}
                         <div class="form-group" id="editKbProjectPickerGroup" style="display:none;">
                             <label class="form-label" for="editKbProjectSelect">Keboola project</label>
-                            <select class="form-select" id="editKbProjectSelect"></select>
+                            <select class="form-select ds-dropdown-native" id="editKbProjectSelect"></select>
+                            {{ ds.dropdown(id='editKbProjectSelect-dd', target='editKbProjectSelect', aria_label='Keboola project', options=[]) }}
                             <div class="form-hint">Discover, List tables and Use table as base run against this project. Not sent on save — it only steers where these buttons look.</div>
                         </div>
 
@@ -2764,11 +2818,20 @@
 
                             <div class="form-group">
                                 <label class="form-label" for="editKbStrategy">Sync strategy</label>
-                                <select class="form-select" id="editKbStrategy" onchange="onEditKbStrategyChange()">
+                                <select class="form-select ds-dropdown-native" id="editKbStrategy" onchange="onEditKbStrategyChange()">
                                     <option value="full_refresh">Full refresh — pull entire table each tick</option>
                                     <option value="incremental">Incremental — pull rows changed since last sync</option>
                                     <option value="partitioned">Partitioned — per-partition files, per-month/day/year</option>
                                 </select>
+                                {{ ds.dropdown(
+                                  id='editKbStrategy-dd', target='editKbStrategy',
+                                  aria_label='Sync strategy', selected='full_refresh',
+                                  options=[
+                                    {'value': 'full_refresh', 'label': 'Full refresh — pull entire table each tick'},
+                                    {'value': 'incremental', 'label': 'Incremental — pull rows changed since last sync'},
+                                    {'value': 'partitioned', 'label': 'Partitioned — per-partition files, per-month/day/year'},
+                                  ],
+                                ) }}
                             </div>
 
                             <div class="form-group editkb-strategy-incremental editkb-strategy-partitioned" style="display:none;">
@@ -2788,11 +2851,20 @@
                             </div>
                             <div class="form-group editkb-strategy-partitioned" style="display:none;">
                                 <label class="form-label" for="editKbPartitionGranularity">Granularity</label>
-                                <select class="form-select" id="editKbPartitionGranularity">
+                                <select class="form-select ds-dropdown-native" id="editKbPartitionGranularity">
                                     <option value="month">Month (default)</option>
                                     <option value="day">Day</option>
                                     <option value="year">Year</option>
                                 </select>
+                                {{ ds.dropdown(
+                                  id='editKbPartitionGranularity-dd', target='editKbPartitionGranularity',
+                                  aria_label='Granularity', selected='month',
+                                  options=[
+                                    {'value': 'month', 'label': 'Month (default)'},
+                                    {'value': 'day', 'label': 'Day'},
+                                    {'value': 'year', 'label': 'Year'},
+                                  ],
+                                ) }}
                             </div>
                             <div class="form-group editkb-strategy-partitioned" style="display:none;">
                                 <label class="form-label" for="editKbInitialLoadChunkDays">Initial-load chunk size (days)
@@ -2890,11 +2962,20 @@
                      (e.g. jira). -->
                 <div class="form-group keboola-edit-only">
                     <label class="form-label" for="editStrategy">Sync Strategy</label>
-                    <select class="form-select" id="editStrategy">
+                    <select class="form-select ds-dropdown-native" id="editStrategy">
                         <option value="full_refresh">Full Refresh</option>
                         <option value="incremental">Incremental</option>
                         <option value="partitioned">Partitioned</option>
                     </select>
+                    {{ ds.dropdown(
+                      id='editStrategy-dd', target='editStrategy',
+                      aria_label='Sync Strategy', selected='full_refresh',
+                      options=[
+                        {'value': 'full_refresh', 'label': 'Full Refresh'},
+                        {'value': 'incremental', 'label': 'Incremental'},
+                        {'value': 'partitioned', 'label': 'Partitioned'},
+                      ],
+                    ) }}
                 </div>
                 <div class="form-group keboola-edit-only">
                     <label class="form-label" for="editPrimaryKey">Primary Key</label>
@@ -3052,14 +3133,19 @@
         window.AgnesPackageDrawer.open({
           typed: typed,
           chipHost: host,
-          onCreated: function (pkg, grantFailures) {
+          onCreated: function (pkg, grantFailures, tableFailures) {
             if (typeof loadDataPackagesSection === 'function') {
               try { loadDataPackagesSection(); } catch (_) {}
             }
             if (typeof showToast === 'function') {
               const msg = 'Data Package "' + pkg.name + '" created';
-              if (grantFailures > 0) {
-                showToast(msg + ' — ' + grantFailures + ' grant(s) failed', 'error');
+              // Named separately: a failed grant and a failed table send the
+              // admin to different places, so the toast says which happened.
+              const parts = [];
+              if (grantFailures > 0) parts.push(grantFailures + ' grant(s) failed');
+              if (tableFailures > 0) parts.push(tableFailures + ' table(s) not added');
+              if (parts.length) {
+                showToast(msg + ' — ' + parts.join(', '), 'error');
               } else {
                 showToast(msg, 'success');
               }
@@ -3079,7 +3165,7 @@
         document.getElementById('editDataPackageModal').style.display = 'flex';
         document.getElementById('edp-id').value = pkgId;
         document.getElementById('edp-tables-list').innerHTML =
-          '<div style="padding:12px; color:#5f6368;">Loading…</div>';
+          '<div style="padding:12px; color:var(--ds-text-secondary);">Loading…</div>';
         try {
           const r = await fetch('/api/admin/data-packages/' + encodeURIComponent(pkgId),
                                 { credentials: 'same-origin' });
@@ -3092,6 +3178,7 @@
           document.getElementById('edp-color').value = pkg.color || '#e0f2fe';
           // v51: pre-fill status + category from the loaded package.
           document.getElementById('edp-status').value = pkg.status || 'prod';
+          _syncDropdownFromSelect(document.getElementById('edp-status'));
           document.getElementById('edp-category').value = pkg.category || '';
           // v50: hydrate cover image (URL + preview); clear the file
           // input so a previous typed-and-cancelled file doesn't leak.
@@ -3165,6 +3252,7 @@
             const gid = String(g.id || g.name || '');
             const gname = String(g.name || gid);
             const cur = current[gid] || '';
+            const selId = 'edp-rbac-req-' + gid;
             const opt = (v, label) =>
               '<option value="' + v + '"' + (cur === v ? ' selected' : '') + '>' + label + '</option>';
             return (
@@ -3172,14 +3260,20 @@
               + 'style="display:flex; gap:8px; align-items:center; '
               +        'padding:6px; border:1px solid var(--border); border-radius:6px;">'
               + '<span style="flex:1;">' + gname + '</span>'
-              + '<select class="edp-rbac-req" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
+              + '<select id="' + selId + '" class="edp-rbac-req ds-dropdown-native" style="padding:4px; border:1px solid var(--border); border-radius:4px;">'
               +   opt('', '(no grant)')
               +   opt('available', 'available')
               +   opt('required', 'required')
               + '</select>'
+              + _dropdownMarkupHtml(selId + '-dd', selId, gname + ' requirement', [
+                  { value: '', label: '(no grant)' },
+                  { value: 'available', label: 'available' },
+                  { value: 'required', label: 'required' },
+                ], cur)
               + '</div>'
             );
           }).join('');
+          if (window.dsDropdownInit) rowsEl.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
           _edpRbacLoaded = true;
         } catch (e) {
           rowsEl.innerHTML = '<div style="padding:8px; color:var(--error); font-size:12px;">Failed to load: ' + e.message + '</div>';
@@ -3277,7 +3371,7 @@
       function renderEdpTablesList(tables) {
         const el = document.getElementById('edp-tables-list');
         if (!tables.length) {
-          el.innerHTML = '<div style="padding:12px; color:#5f6368; font-size:13px;">'
+          el.innerHTML = '<div style="padding:12px; color:var(--ds-text-secondary); font-size:13px;">'
             + 'No tables in this package yet. Click <strong>+ Add tables</strong> above.</div>';
           return;
         }
@@ -3394,7 +3488,7 @@
                   { credentials: 'same-origin' }),
           ]);
           if (!allResp.ok || !pkgResp.ok) {
-            listEl.innerHTML = '<div style="padding:8px; color:#b91c1c;">'
+            listEl.innerHTML = '<div style="padding:8px; color:var(--ds-accent-danger-ink);">'
               + 'Failed to load tables (' + allResp.status + ' / ' + pkgResp.status + ').</div>';
             return;
           }
@@ -3410,7 +3504,7 @@
           });
           renderEdpInlineAddList();
         } catch (e) {
-          listEl.innerHTML = '<div style="padding:8px; color:#b91c1c;">'
+          listEl.innerHTML = '<div style="padding:8px; color:var(--ds-accent-danger-ink);">'
             + 'Network error: ' + escapeHtml(e.message) + '</div>';
         }
       }
@@ -3697,13 +3791,13 @@
         const list = document.getElementById('bulk-assign-list');
         if (!pkgResp.ok) {
           sel.innerHTML = '<option value="">Failed to load packages</option>';
-          list.innerHTML = '<div style="padding:12px; color:#b91c1c;">HTTP '
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-accent-danger-ink);">HTTP '
             + pkgResp.status + ' on /api/admin/data-packages</div>';
           return;
         }
         if (!tableResp.ok) {
           sel.innerHTML = '<option value="">Failed to load tables</option>';
-          list.innerHTML = '<div style="padding:12px; color:#b91c1c;">HTTP '
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-accent-danger-ink);">HTTP '
             + tableResp.status + ' on /api/admin/registry</div>';
           return;
         }
@@ -3760,7 +3854,7 @@
         sel.onchange = async function() {
           if (sel.value !== '__create__') { refreshBulkAssignAvailability(); return; }
           const name = await promptModal('Name for the new Data Package:');
-          if (!name || !name.trim()) { sel.value = ''; return; }
+          if (!name || !name.trim()) { sel.value = ''; _syncDropdownRebuild(sel); return; }
           const slug = _deriveSlug(name.trim());
           const r = await fetch('/api/admin/data-packages', {
             method: 'POST',
@@ -3778,6 +3872,7 @@
             const detail = await r.json().catch(function() { return {}; });
             await alertModal('Create failed: ' + (detail.detail || r.statusText));
             sel.value = '';
+            _syncDropdownRebuild(sel);
             return;
           }
           const created = await r.json();
@@ -3792,11 +3887,13 @@
           opt.textContent = name.trim();
           sel.appendChild(opt);
           sel.value = created.id;
+          _syncDropdownRebuild(sel);
           refreshBulkAssignAvailability();
         };
         if (preselectPkgId && _bulkAssignPackages.some(function(p) { return p.id === preselectPkgId; })) {
           sel.value = preselectPkgId;
         }
+        _syncDropdownRebuild(sel);
         renderBulkAssignList();
         refreshBulkAssignAvailability();
       }
@@ -3814,7 +3911,7 @@
       function renderBulkAssignList() {
         const list = document.getElementById('bulk-assign-list');
         if (!_bulkAssignTables.length) {
-          list.innerHTML = '<div style="padding:12px; color:#5f6368;">'
+          list.innerHTML = '<div style="padding:12px; color:var(--ds-text-secondary);">'
             + 'No tables registered yet — use "+ Register new table" above.</div>';
           return;
         }
@@ -3831,7 +3928,7 @@
             + '       style="display:flex; gap:8px; align-items:center; padding:6px; border-radius:4px; cursor:pointer;">'
             + '  <input type="checkbox" class="bulk-assign-cb" value="' + escapeHtmlAttr(id) + '">'
             + '  <span style="flex:1; font-family:var(--font-mono);">' + escapeHtml(name) + '</span>'
-            + (meta ? '  <span style="font-size:12px; color:#5f6368;">' + escapeHtml(meta) + '</span>' : '')
+            + (meta ? '  <span style="font-size:12px; color:var(--ds-text-secondary);">' + escapeHtml(meta) + '</span>' : '')
             + '</label>';
         }).join('');
       }
@@ -3994,12 +4091,22 @@
           <div class="form-group" style="display:flex; gap:12px;">
             <div style="flex:1;">
               <label class="form-label">Status</label>
-              <select id="edp-status" class="form-input" style="height:38px;">
+              <select id="edp-status" class="form-input ds-dropdown-native" style="height:38px;">
                 <option value="prod">Prod — ready for analyst use</option>
                 <option value="poc">POC — try-before-you-buy</option>
                 <option value="coming-soon">Coming soon — visible but not usable yet</option>
                 <option value="draft">Draft — admin-only, hidden from analysts</option>
               </select>
+              {{ ds.dropdown(
+                id='edp-status-dd', target='edp-status',
+                aria_label='Status', selected='prod',
+                options=[
+                  {'value': 'prod', 'label': 'Prod — ready for analyst use'},
+                  {'value': 'poc', 'label': 'POC — try-before-you-buy'},
+                  {'value': 'coming-soon', 'label': 'Coming soon — visible but not usable yet'},
+                  {'value': 'draft', 'label': 'Draft — admin-only, hidden from analysts'},
+                ],
+              ) }}
             </div>
             <div style="flex:1;">
               <label class="form-label">Category <span class="optional">(optional)</span></label>
@@ -4169,11 +4276,14 @@
         <div class="modal-body">
           <div class="form-group">
             <label class="form-label" for="bulk-assign-package">Target Data Package</label>
-            <select id="bulk-assign-package" class="form-input"
+            <select id="bulk-assign-package" class="form-input ds-dropdown-native"
                     style="width:100%;"
                     onchange="refreshBulkAssignAvailability()">
               <option value="">— Loading packages —</option>
             </select>
+            {{ ds.dropdown(id='bulk-assign-package-dd', target='bulk-assign-package',
+                           aria_label='Target Data Package',
+                           options=[{'value': '', 'label': '— Loading packages —'}]) }}
             <div class="form-hint">Pick the package the selected tables should be bundled into.</div>
           </div>
           <div class="form-group">
@@ -4190,7 +4300,7 @@
             <div id="bulk-assign-list"
                  style="border:1px solid var(--border); border-radius:6px;
                         max-height:50vh; overflow-y:auto; padding:6px;">
-              <div style="padding:12px; color:#5f6368;">Loading tables…</div>
+              <div style="padding:12px; color:var(--ds-text-secondary);">Loading tables…</div>
             </div>
             <div class="form-hint" id="bulk-assign-hint">
               Already-assigned tables are checked + disabled so re-submitting
@@ -4278,11 +4388,21 @@
                         <div class="ap-rr-controls">
                             <button type="button" class="btn btn-secondary btn-sm" id="apAddRuleBtn"
                                     onclick="_apAddRowRule()">Add rule</button>
-                            <select class="form-input" id="apRowCombine" style="display:none; max-width:260px;"
-                                    onchange="_apOnRowCombineChange(this.value)">
-                                <option value="and">Match ALL rules (AND)</option>
-                                <option value="or">Match ANY rule (OR)</option>
-                            </select>
+                            <span class="ap-rowcombine-wrap" style="display:none; max-width:260px;">
+                                <select class="form-input ds-dropdown-native" id="apRowCombine"
+                                        onchange="_apOnRowCombineChange(this.value)">
+                                    <option value="and">Match ALL rules (AND)</option>
+                                    <option value="or">Match ANY rule (OR)</option>
+                                </select>
+                                {{ ds.dropdown(
+                                  id='apRowCombine-dd', target='apRowCombine',
+                                  aria_label='Row rule combine mode', selected='and',
+                                  options=[
+                                    {'value': 'and', 'label': 'Match ALL rules (AND)'},
+                                    {'value': 'or', 'label': 'Match ANY rule (OR)'},
+                                  ],
+                                ) }}
+                            </span>
                         </div>
                     </div>
                     <div class="form-hint" style="margin-top:0;">
@@ -4368,10 +4488,62 @@
    the `?new_package=1` entry point both go through it. NOT deferred — the
    auto-open on `?new_package=1` runs at DOMContentLoaded. #}
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
     /* ═══════════════════════════════════════════════════════════════
        Admin Tables - JavaScript
        ═══════════════════════════════════════════════════════════════ */
+
+    // ds_dropdown.js only pushes a selection FROM the custom button+menu ONTO
+    // the paired native <select> — for a static option list (never rebuilt),
+    // setting `.value` straight from code (modal open/reset defaults) needs
+    // this explicit re-sync or the paper-theme dropdown keeps showing
+    // whatever was picked last. Mutates the EXISTING items in place rather
+    // than rebuilding, since the option list itself never changes for these
+    // controls.
+    function _syncDropdownFromSelect(sel) {
+        if (!sel) return;
+        var dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+        if (!dd) return;
+        var label = dd.querySelector('.ds-dropdown-btn-label');
+        var opt = sel.options[sel.selectedIndex];
+        dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach(function (item) {
+            var isSelected = item.dataset.value === sel.value;
+            item.classList.toggle('is-selected', isSelected);
+            item.setAttribute('aria-checked', isSelected ? 'true' : 'false');
+        });
+        if (label && opt) label.textContent = opt.textContent.trim();
+    }
+
+    // Rebuilds the paired `.ds-dropdown`'s button AND menu from a select's
+    // own freshly-set <option>s, then re-runs ds_dropdown.js's init via the
+    // exported `dsDropdownInit` hook — for statically-rendered `.ds-dropdown`
+    // markup whose surrounding DOM persists across repeat calls (e.g. a
+    // project picker repopulated every time its modal reopens). The button
+    // is rebuilt too, not just the menu: init() isn't idempotent for its
+    // per-element listeners, so leaving the same persisting <button> node
+    // across two init() calls double-registers its click handler — the
+    // second open()/close() undoes the first, and the menu never appears to
+    // open. Recreating the button discards that stale listener along with
+    // the old node.
+    function _syncDropdownRebuild(sel) {
+        if (!sel) return;
+        var host = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+        if (!host) return;
+        var opts = [];
+        for (var i = 0; i < sel.options.length; i++) { opts.push({ value: sel.options[i].value, label: sel.options[i].textContent }); }
+        var menuEl = host.querySelector('.ds-dropdown-menu');
+        var ariaLabel = menuEl ? menuEl.getAttribute('aria-label') || '' : '';
+        var wrapped = _dropdownMarkupHtml(sel.id + '-dd', sel.id, ariaLabel, opts, sel.value);
+        // _dropdownMarkupHtml returns the whole `<div class="ds-dropdown" ...>`
+        // wrapper; host is that same wrapper, so only its INNER markup is
+        // swapped in, keeping the host node (and its data-ds-dropdown-target
+        // attribute) itself intact.
+        var tmp = document.createElement('div');
+        tmp.innerHTML = wrapped;
+        host.innerHTML = tmp.firstElementChild.innerHTML;
+        if (window.dsDropdownInit) window.dsDropdownInit(host);
+    }
 
     // ── Register-new-table dropdown ─────────────────────────────
     // Replaces the per-connector tab nav. The user picks the connector
@@ -4444,9 +4616,9 @@
         msg.textContent = message;
 
         if (type === 'success') {
-            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10B77F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ds-accent-success-ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
         } else {
-            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#EA580C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+            icon.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--ds-accent-warn-ink)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
         }
 
         // Show
@@ -4498,6 +4670,36 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
+    }
+
+    /**
+     * Hand-built `.ds-dropdown` markup (see _components.html's `dropdown`
+     * macro) for pairing with a <select> that only exists inside a JS
+     * template literal, one instance per dynamically-added row — no id
+     * exists at Jinja-render time for a macro to target. `options` is
+     * `[{value, label}]`. Caller must run `window.dsDropdownInit` on the
+     * inserted host once, right after the surrounding innerHTML assignment.
+     */
+    function _dropdownMarkupHtml(id, targetId, ariaLabel, options, selected) {
+        var current = null;
+        for (var i = 0; i < options.length; i++) { if (options[i].value === selected) { current = options[i]; break; } }
+        if (!current) current = options[0] || null;
+        var currentLabel = current ? current.label : '';
+        var items = options.map(function (o) {
+            var isSel = current && o.value === current.value;
+            return '<li class="ds-dropdown-menu-item' + (isSel ? ' is-selected' : '') + '" role="menuitemradio" '
+                + 'aria-checked="' + (isSel ? 'true' : 'false') + '" tabindex="0" '
+                + 'data-value="' + escapeHtmlAttr(o.value) + '">' + escapeHtml(o.label) + '</li>';
+        }).join('');
+        var nameSpan = ariaLabel ? '<span class="ds-dropdown-name" id="' + id + '-name">' + escapeHtml(ariaLabel) + '</span>' : '';
+        var labelledBy = ariaLabel ? ' aria-labelledby="' + id + '-name ' + id + '-btn-label"' : '';
+        return '<div class="ds-dropdown" data-ds-dropdown-target="' + targetId + '">'
+            + '<button type="button" class="ds-dropdown-btn" id="' + id + '-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="' + id + '-menu"' + labelledBy + '>'
+            +   nameSpan + '<span class="ds-dropdown-btn-label" id="' + id + '-btn-label">' + escapeHtml(currentLabel) + '</span>'
+            +   '<svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>'
+            + '</button>'
+            + '<ul class="ds-dropdown-menu" id="' + id + '-menu" role="menu" aria-label="' + escapeHtmlAttr(ariaLabel || 'Options') + '" hidden>' + items + '</ul>'
+            + '</div>';
     }
 
     /**
@@ -4687,9 +4889,9 @@
         });
         // Default v26 dropdowns
         var kbStrategyEl = document.getElementById('kbStrategy');
-        if (kbStrategyEl) kbStrategyEl.value = 'full_refresh';
+        if (kbStrategyEl) { kbStrategyEl.value = 'full_refresh'; _syncDropdownFromSelect(kbStrategyEl); }
         var kbGranEl = document.getElementById('kbPartitionGranularity');
-        if (kbGranEl) kbGranEl.value = 'month';
+        if (kbGranEl) { kbGranEl.value = 'month'; _syncDropdownFromSelect(kbGranEl); }
         // #607 — checkbox isn't covered by the .value='' loop above.
         var kbServerOnlyEl = document.getElementById('kbServerOnly');
         if (kbServerOnlyEl) kbServerOnlyEl.checked = false;
@@ -4860,10 +5062,12 @@
     });
 
     function _buildKeboolaPayload() {
-        // Three modes:
+        // Four modes:
         //   whole / custom → query_mode='materialized' (DuckDB Keboola extension)
         //   direct         → query_mode='local' + v26 sync_strategy fields
         //                    (Storage API SDK, supports incremental/partitioned/where_filters)
+        //   remote         → query_mode='remote' (live — same extension view as
+        //                    'whole', but nothing syncs; no server_only, no sync_schedule)
         var mode = _getKbSyncMode();
         var viewName = (document.getElementById('kbViewName').value || '').trim();
         var bucket = (document.getElementById('kbBucket').value || '').trim();
@@ -4927,6 +5131,25 @@
                 payload.where_filters = _parseFiltersJSONOrThrow('kbWhereFilters');
             }
             return payload;
+        }
+
+        if (mode === 'remote') {
+            // Live — mirrors the BigQuery live branch (_buildBigQueryPayload):
+            // no server_only (the model validator 422s server_only=true +
+            // query_mode='remote' — there's no server-stored parquet to
+            // suppress), no v26 sync-strategy fields (nothing ever syncs).
+            return {
+                name: viewName || sourceTable,
+                source_type: 'keboola',
+                query_mode: 'remote',
+                bucket: bucket,
+                source_table: sourceTable,
+                primary_key: primaryKey,
+                connection_id: connectionId,
+                sync_schedule: (document.getElementById('kbSyncSchedule').value || '').trim() || null,
+                description: (document.getElementById('kbDescription').value || '').trim() || null,
+                folder: (document.getElementById('kbFolder').value || '').trim() || null,
+            };
         }
 
         // Materialized paths (whole / custom)
@@ -5003,11 +5226,11 @@
                 var kind = detail && typeof detail === 'object' ? (detail.kind || 'error') : 'error';
                 var hint = detail && typeof detail === 'object' ? (detail.hint || detail.message || '') : String(detail);
                 resultEl.textContent = '✗ ' + kind + (hint ? ' — ' + hint : '');
-                resultEl.style.color = '#c0392b';
+                resultEl.style.color = 'var(--ds-accent-danger-ink)';
             }
         } catch (e) {
             resultEl.textContent = '✗ network error — ' + e.message;
-            resultEl.style.color = '#c0392b';
+            resultEl.style.color = 'var(--ds-accent-danger-ink)';
         } finally {
             btn.disabled = false;
         }
@@ -5129,6 +5352,7 @@
             select.appendChild(legacy);
         }
         if (preselectId) select.value = preselectId;
+        _syncDropdownRebuild(select);
         group.style.display = '';
     }
 
@@ -5480,6 +5704,7 @@
 
         // v26 fields
         document.getElementById('editKbStrategy').value = table.sync_strategy || 'full_refresh';
+        _syncDropdownFromSelect(document.getElementById('editKbStrategy'));
         document.getElementById('editKbIncrementalWindowDays').value =
             table.incremental_window_days != null ? table.incremental_window_days : '';
         document.getElementById('editKbMaxHistoryDays').value =
@@ -5487,6 +5712,7 @@
         document.getElementById('editKbPartitionBy').value = table.partition_by || '';
         document.getElementById('editKbPartitionGranularity').value =
             table.partition_granularity || 'month';
+        _syncDropdownFromSelect(document.getElementById('editKbPartitionGranularity'));
         document.getElementById('editKbInitialLoadChunkDays').value =
             table.initial_load_chunk_days != null ? table.initial_load_chunk_days : '';
         document.getElementById('editKbWhereFilters').value =
@@ -6723,6 +6949,7 @@
         document.getElementById('editDescription').value = table.description || '';
         document.getElementById('editFolder').value = table.folder || '';
         document.getElementById('editStrategy').value = table.sync_strategy || 'full_refresh';
+        _syncDropdownFromSelect(document.getElementById('editStrategy'));
         document.getElementById('editPrimaryKey').value = (table.primary_key || []).join(', ');
         _editOriginalQueryMode = null;
         document.getElementById('editSubmitBtn').disabled = false;
@@ -7101,6 +7328,40 @@
              + '</span>';
     }
 
+    // ── Sync column (B1) ──────────────────────────────────────────────
+    // Same status vocabulary + colour mapping as `/admin/sync`
+    // (admin_sync.html: `const status = r.last_sync_status || (r.last_sync
+    // ? "ok" : "pending")`) so the two lenses never disagree about what a
+    // status word means. `t` is the raw `/api/admin/registry` row this
+    // page already fetched — `last_sync_status` / `last_sync` /
+    // `last_sync_error` are populated there per #754.
+    var _SYNC_PILL_CLASS = {
+        ok:      'tbl-sync-pill--ok',
+        error:   'tbl-sync-pill--error',
+        skipped: 'tbl-sync-pill--skipped',
+        running: 'tbl-sync-pill--running',
+        pending: 'tbl-sync-pill--pending',
+    };
+    function _fmtSyncAge(iso) {
+        if (!iso) return '';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        var diffS = Math.floor((Date.now() - d.getTime()) / 1000);
+        if (diffS < 60) return 'just now';
+        if (diffS < 3600) return Math.floor(diffS / 60) + 'm ago';
+        if (diffS < 86400) return Math.floor(diffS / 3600) + 'h ago';
+        return Math.floor(diffS / 86400) + 'd ago';
+    }
+    function renderSyncPill(t) {
+        var status = t.last_sync_status || (t.last_sync ? 'ok' : 'pending');
+        var cls = _SYNC_PILL_CLASS[status] || 'tbl-sync-pill--pending';
+        var age = _fmtSyncAge(t.last_sync);
+        var title = (status === 'error' || status === 'skipped') && t.last_sync_error
+            ? ' title="' + escapeHtmlAttr(t.last_sync_error) + '"' : '';
+        return '<span class="tbl-sync-pill ' + cls + '"' + title + '>' + escapeHtml(status) + '</span>'
+             + (age ? '<span class="tbl-sync-age">' + escapeHtml(age) + '</span>' : '');
+    }
+
     // Table access policies design doc §3: a policy may only survive on a
     // table agnes pull can't route around.
     function _apIsEligible(t) {
@@ -7425,7 +7686,7 @@
             return;
         }
         var disabled = !_apTable || !_apIsEligible(_apTable);
-        list.innerHTML = _apColumns.map(function(col) {
+        list.innerHTML = _apColumns.map(function(col, i) {
             var maskEntry = _apMaskState[col.name];
             var maskChoice = (maskEntry && typeof maskEntry === 'object') ? maskEntry.choice : (maskEntry || 'show');
             var samples = (col.samples || []).slice(0, 3).map(function(s) {
@@ -7434,8 +7695,12 @@
             var distinct = (col.distinct === null || col.distinct === undefined) ? '' : (formatNumber(col.distinct) + ' distinct');
             var pii = col.pii ? '<span class="ap-col-pii">PII</span>' : '';
             var colArg = escapeHtmlAttr(JSON.stringify(col.name));
-            var options = ['show', 'hide', 'nullify', 'hash', 'unmask'].map(function(m) {
-                return '<option value="' + m + '"' + (m === maskChoice ? ' selected' : '') + '>' + _AP_MASK_LABELS[m] + '</option>';
+            var maskId = 'ap-col-mask-' + i;
+            var maskDropdownOptions = ['show', 'hide', 'nullify', 'hash', 'unmask'].map(function(m) {
+                return { value: m, label: _AP_MASK_LABELS[m] };
+            });
+            var options = maskDropdownOptions.map(function(o) {
+                return '<option value="' + o.value + '"' + (o.value === maskChoice ? ' selected' : '') + '>' + o.label + '</option>';
             }).join('');
             var groupInput = (maskChoice === 'unmask')
                 ? '<input type="text" class="form-input ap-unmask-group" placeholder="group names, comma-separated" '
@@ -7452,12 +7717,21 @@
                 +     (distinct ? '<div class="ap-col-distinct">' + escapeHtml(distinct) + '</div>' : '')
                 +   '</div>'
                 +   '<div class="ap-col-mask">'
-                +     '<select class="form-input" ' + (disabled ? 'disabled ' : '')
-                +       'onchange="_apOnMaskChange(' + colArg + ', this.value)">' + options + '</select>'
+                +     '<span class="ap-col-mask-wrap">'
+                // Same as the row-rule builder above: skip the branded pair
+                // entirely when disabled — select.ds-dropdown-native{display:
+                // none} in paper-skin.css doesn't check `disabled`, so adding
+                // the class without a paired dropdown would hide the control
+                // with nothing to replace it.
+                +       '<select id="' + maskId + '" class="form-input' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
+                +         'onchange="_apOnMaskChange(' + colArg + ', this.value)">' + options + '</select>'
+                +       (disabled ? '' : _dropdownMarkupHtml(maskId + '-dd', maskId, col.name + ' mask', maskDropdownOptions, maskChoice))
+                +     '</span>'
                 +     groupInput
                 +   '</div>'
                 + '</div>';
         }).join('');
+        if (window.dsDropdownInit) list.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
     }
 
     function _apOnMaskChange(colName, maskValue) {
@@ -7503,14 +7777,18 @@
                 + 'No row rules — every caller sees every row.</div>';
         } else {
             list.innerHTML = _apRowRules.map(function(rule, i) {
+                var colId = 'ap-rr-col-' + i;
+                var opId = 'ap-rr-op-' + i;
                 var colOptions = _apColumns.map(function(col) {
                     return '<option value="' + escapeHtmlAttr(col.name) + '"'
                         + (col.name === rule.column ? ' selected' : '') + '>' + escapeHtml(col.name) + '</option>';
                 }).join('');
+                var colDropdownOptions = _apColumns.map(function(col) { return { value: col.name, label: col.name }; });
                 var opOptions = Object.keys(_AP_ROW_OPS).map(function(op) {
                     return '<option value="' + op + '"' + (op === rule.op ? ' selected' : '') + '>'
                         + _AP_ROW_OPS[op] + '</option>';
                 }).join('');
+                var opDropdownOptions = Object.keys(_AP_ROW_OPS).map(function(op) { return { value: op, label: _AP_ROW_OPS[op] }; });
                 var needsValue = _AP_ROW_OPS_NO_VALUE.indexOf(rule.op) === -1;
                 var valueField = needsValue
                     ? '<input type="text" class="form-input ap-rr-val" '
@@ -7519,21 +7797,44 @@
                       + 'value="' + escapeHtmlAttr(rule.value || '') + '" '
                       + 'oninput="_apOnRowRuleValueChange(' + i + ', this.value)">'
                     : '<span class="ap-rr-val"></span>';
+                // Per-row ids (index-based — rows shift on remove, but the
+                // whole list is rebuilt from scratch on every add/remove, so
+                // a reused index always pairs with a freshly-inserted node,
+                // never a persisting one from before).
+                // select.ds-dropdown-native{display:none} in paper-skin.css
+                // is unconditional — it doesn't check `disabled`. Skipping
+                // the paired dropdown here without ALSO skipping the class
+                // would hide the native select with nothing to replace it,
+                // the exact invisible-control bug this whole pass exists to
+                // fix elsewhere. A disabled row falls back to the plain
+                // (browser-default-styled) select instead.
                 return ''
                     + '<div class="ap-rr-row">'
-                    +   '<select class="form-input ap-rr-col" ' + (disabled ? 'disabled ' : '')
-                    +     'onchange="_apOnRowRuleColumnChange(' + i + ', this.value)">' + colOptions + '</select>'
-                    +   '<select class="form-input ap-rr-op" ' + (disabled ? 'disabled ' : '')
-                    +     'onchange="_apOnRowRuleOpChange(' + i + ', this.value)">' + opOptions + '</select>'
+                    +   '<span class="ap-rr-col-wrap">'
+                    +     '<select id="' + colId + '" class="form-input ap-rr-col' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
+                    +       'onchange="_apOnRowRuleColumnChange(' + i + ', this.value)">' + colOptions + '</select>'
+                    +     (disabled ? '' : _dropdownMarkupHtml(colId + '-dd', colId, 'Column', colDropdownOptions, rule.column))
+                    +   '</span>'
+                    +   '<span class="ap-rr-op-wrap">'
+                    +     '<select id="' + opId + '" class="form-input ap-rr-op' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
+                    +       'onchange="_apOnRowRuleOpChange(' + i + ', this.value)">' + opOptions + '</select>'
+                    +     (disabled ? '' : _dropdownMarkupHtml(opId + '-dd', opId, 'Operator', opDropdownOptions, rule.op))
+                    +   '</span>'
                     +   valueField
                     +   '<button type="button" class="btn btn-secondary btn-sm ap-rr-remove" ' + (disabled ? 'disabled ' : '')
                     +     'onclick="_apRemoveRowRule(' + i + ')" aria-label="Remove rule">×</button>'
                     + '</div>';
             }).join('');
+            if (window.dsDropdownInit) list.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
         }
         if (combineSelect) {
-            combineSelect.style.display = _apRowRules.length >= 2 ? '' : 'none';
+            // The paired .ds-dropdown (paper theme) needs to show/hide
+            // together with the native select, so visibility toggles on
+            // their shared wrapper rather than on the select alone.
+            var combineWrap = combineSelect.closest('.ap-rowcombine-wrap');
+            if (combineWrap) combineWrap.style.display = _apRowRules.length >= 2 ? '' : 'none';
             combineSelect.value = _apRowCombine;
+            _syncDropdownFromSelect(combineSelect);
         }
         var addBtn = document.getElementById('apAddRuleBtn');
         if (addBtn) addBtn.disabled = disabled;
@@ -8292,7 +8593,7 @@
             if (!idCell || idCell.textContent.trim() !== tableId) return;
             var statusCell = tr.querySelector('td.col-status');
             if (!statusCell) return;
-            var color = {fresh: '#10B77F', warming: 'var(--ds-primary)', pending: '#9CA3AF', error: '#EA580C'}[rs.status] || '#9CA3AF';
+            var color = {fresh: 'var(--ds-accent-success-ink)', warming: 'var(--ds-primary)', pending: 'var(--ds-text-muted)', error: 'var(--ds-accent-warn-ink)'}[rs.status] || 'var(--ds-text-muted)';
             var label = rs.status === 'fresh' ? 'fresh' : rs.status;
             // Build via DOM API so rs.error escapes safely into the title
             // attribute (XSS guard — rs.error is server-derived, may contain
@@ -8431,10 +8732,11 @@
           + '<table class="data-table" id="adminTablesFlat">'
           + '<colgroup>'
           +   '<col style="width: 4%">'
-          +   '<col style="width: 24%">'
-          +   '<col style="width: 13%">'
-          +   '<col style="width: 13%">'
-          +   '<col style="width: 16%">'
+          +   '<col style="width: 20%">'
+          +   '<col style="width: 12%">'
+          +   '<col style="width: 12%">'
+          +   '<col style="width: 8%">'
+          +   '<col style="width: 14%">'
           +   '<col style="width: 11%">'
           +   '<col style="width: 13%">'
           +   '<col style="width: 6%">'
@@ -8445,6 +8747,7 @@
           +   '<th>Table</th>'
           +   '<th>Source</th>'
           +   '<th>Mode</th>'
+          +   '<th>Sync</th>'
           +   '<th>Package</th>'
           +   '<th>Access</th>'
           +   '<th>Reaches</th>'
@@ -8542,6 +8845,13 @@
 
             // ── Mode
             html += '<td class="tbl-mode">' + renderModeBadge(t.query_mode) + '</td>';
+
+            // ── Sync — same status vocabulary as /admin/sync, read straight
+            // off the registry row this lens already fetched (#754's
+            // last_sync_status / last_sync / last_sync_error) — no second
+            // request. Internal tables never sync, so they get the same
+            // quiet "—" the Package/Reaches columns give them.
+            html += '<td>' + (isInternal ? '<span class="tbl-muted">—</span>' : renderSyncPill(t)) + '</td>';
 
             // ── Package
             if (isInternal) {

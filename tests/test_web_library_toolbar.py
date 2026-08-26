@@ -157,7 +157,7 @@ def test_files_of_every_format_share_one_files_section(seeded_app):
 
 
 # ---------------------------------------------------------------------------
-# Stack: a single "In stack only" toggle (no Available/In Stack submenu)
+# Stack: the "In stack only" toggle + the demoted availability filter
 # ---------------------------------------------------------------------------
 
 
@@ -165,14 +165,15 @@ def _add_to_stack(seeded_app, collection_id: str, token: str):
     return seeded_app["client"].post(f"/api/stack/artefacts/{collection_id}", headers=_auth(token))
 
 
-def test_stack_filter_is_a_single_in_stack_only_toggle(seeded_app):
-    """ "In stack only" answers "what can my agent actually use?" in one click —
-    the axis the table also acts on via "+ Add to Stack". Two things are
-    deliberate. The two-option Available/In Stack category is retired: the
-    states are complementary, so a submenu offering both was a longer way to
-    say "everything". And the survivor is a BUTTON on the bar, not a row inside
-    the Filter menu — the condition is consequential enough that it should not
-    need a click to discover, nor a chip to report."""
+def test_stack_filter_is_the_in_stack_only_toggle(seeded_app):
+    """The stack filter is a pressed-state BUTTON on the bar (`.fbar-toggle`,
+    the design system's own pattern for a binary refinement worth seeing at
+    rest) carrying the unfiltered in-Stack tally — not a scope segment (that
+    gave one filter tab-rank; tried after the fold, retired) and not a row
+    inside the Filter menu (the condition must not need a click to
+    discover). The acquisition question stays one level deep as the Filter
+    menu's "Not in stack yet" toggle: every acquirable row already sits in
+    the unfiltered list wearing its own Add pill, so nothing is hidden."""
     tok = seeded_app["admin_token"]
     added = _create(seeded_app, "Stack Added", tok)
     _create(seeded_app, "Stack Not Added", tok)
@@ -180,14 +181,24 @@ def test_stack_filter_is_a_single_in_stack_only_toggle(seeded_app):
 
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
     assert 'id="lib-stack-toggle"' in text
-    assert 'data-facet="stack" data-facet-value="in_stack"' in text
-    assert ">In stack only<" in text
-    assert "fbar-menu__toggle" not in text, "retired in-menu toggle markup"
-    assert 'data-cat="stack"' not in text
-    assert 'data-facet="stack" value="available"' not in text
-    # Row attribute the toggle slices on, in both states.
+    assert 'data-facet-value="in_stack"' in text
+    # The count rides the button, kept truthful by refreshStackCount after
+    # an in-place membership change.
+    assert "fbar-toggle__n" in text
+    assert "data-stack-count" in text
+    # The two-state Scope segment is retired — a filter is not a tab.
+    assert 'id="lib-scope"' not in text
+    assert 'data-seg="in_stack"' not in text
+    # Both controls slice on the row's strict Stack membership: the button
+    # keeps `in_stack` rows, the availability toggle keeps `available` ones —
+    # one attribute, no ownership-blended data-scope projection to drift.
     assert 'data-stack="in_stack"' in text
     assert 'data-stack="available"' in text
+    assert 'data-scope="' not in text, "the retired scope projection must not return"
+    # The demoted acquisition filter: one toggle checkbox in the menu, with
+    # its tally (the fixture leaves one row addable).
+    assert 'data-facet="availability"' in text
+    assert "Not in stack yet" in text
 
 
 def test_stack_deep_link_arrives_with_the_toggle_applied(seeded_app):
@@ -208,31 +219,9 @@ def test_stack_deep_link_arrives_with_the_toggle_applied(seeded_app):
     assert "const STACK_ONLY = false;" in c.get("/library?stack=whatever", headers=_auth(tok)).text
 
 
-def test_stack_toggle_shows_the_matching_item_count(seeded_app):
-    """The toggle carries the tally of what it would leave standing, so the
-    caller knows the size of their Stack before flipping it."""
-    tok = seeded_app["admin_token"]
-    import re
-
-    for name in ("Counted A", "Counted B", "Uncounted"):
-        col = _create(seeded_app, name, tok)
-        if name.startswith("Counted"):
-            assert _add_to_stack(seeded_app, col["id"], tok).status_code == 200
-
-    text = seeded_app["client"].get("/library", headers=_auth(tok)).text
-    badge = re.search(r'<span class="fbar-toggle__n">(\d+)</span>', text)
-    assert badge, "the In-stack-only toggle rendered no count"
-    rendered = int(badge.group(1))
-    # Every row carrying the in-Stack state is counted — the two just added plus
-    # whatever auto-membership already put there (grants, installs).
-    in_stack_rows = len(re.findall(r'<tr\b[^>]*data-stack="in_stack"[^>]*>', text))
-    top_level = len(
-        [r for r in re.findall(r'<tr\b[^>]*data-stack="in_stack"[^>]*>', text) if "data-parent-id" not in r]
-    )
-    assert rendered == top_level, (
-        f"count {rendered} != {top_level} top-level in-Stack rows ({in_stack_rows} incl. children)"
-    )
-    assert rendered >= 2
+# (test_stack_toggle_shows_the_matching_item_count is folded into the main
+# toggle test above: the count rides the button again — `fbar-toggle__n` +
+# `data-stack-count` are pinned there.)
 
 
 def test_stack_toggle_keeps_locked_admin_required_items(seeded_app):
@@ -292,7 +281,7 @@ def test_stack_state_is_visible_on_every_row(seeded_app):
 
 def test_granted_resources_report_in_stack_not_addable(seeded_app, monkeypatch):
     """Auto-membership (opt-in): a grant on the caller's group puts a resource
-    in their Stack with no action, so those rows say "In Stack" and offer no
+    in their Stack with no action, so those rows say "In stack" and offer no
     Add. The classic default renders granted-but-unsubscribed rows as
     not-a-member (tests/test_web_library.py::
     test_library_available_grant_classic_is_not_claimed_in_stack)."""
@@ -436,7 +425,7 @@ def test_long_category_gets_its_own_search_field(seeded_app):
     a search field (and a "No matches" line) into any popover holding more than
     CAT_SEARCH_MIN options. Injected from the row count in JS, never authored in
     a template, so every page and every future facet inherits it; a short
-    category (Optional / Required) stays a plain list."""
+    category (the Access facet's two options) stays a plain list."""
     js = seeded_app["client"].get("/static/js/filter_toolbar.js").text
     assert "var CAT_SEARCH_MIN = 10;" in js
     assert "function setupCatSearch(cat)" in js

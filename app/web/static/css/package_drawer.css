@@ -70,3 +70,95 @@
    in a 600px drawer beside a name, not on a full-width bar. */
 .pdw-pick .fbar-seg { flex: 0 0 auto; }
 .pdw-pick .fbar-seg__btn { height: 26px; padding: 0 9px; font-size: 12px; }
+
+/* ── Composition list (edit mode) ──────────────────────────────────────
+ * A scrolling, searchable checkbox list rather than a chip input: the
+ * question here is "what is in this package", and the honest answer is the
+ * whole registry with the members ticked — a chip input shows only what is
+ * already in and makes what is NOT in it something you have to go looking
+ * for. Capped in height so the fields under it stay reachable without
+ * scrolling the drawer body past them.
+ */
+.pdw-tables__search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 11px;
+  font: inherit;
+  font-size: 13px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  color: var(--ds-text-primary);
+  margin-bottom: 8px;
+}
+.pdw-tables {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+}
+.pdw-tables__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 11px 7px 40px;   /* indented under its bucket */
+  border-bottom: 1px solid var(--ds-border-light);
+  cursor: pointer;
+}
+.pdw-tables__row:last-child { border-bottom: 0; }
+.pdw-tables__row:hover { background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent); }
+.pdw-tables__row input { margin-top: 3px; flex: 0 0 auto; accent-color: var(--ds-primary); }
+.pdw-tables__g { min-width: 0; display: flex; flex-direction: column; }
+.pdw-tables__n { font-size: 13px; font-weight: 500; color: var(--ds-text-primary); }
+.pdw-tables__s { font-size: 11.5px; color: var(--ds-text-muted); }
+
+/* ── PROJECT › BUCKET › table ──────────────────────────────────────────
+ * The registry's own shape, not one invented for this form: a project is a
+ * source connection, a bucket is its grouping inside it. Both are the source
+ * system's containers — the package is the Agnes one — which is why the
+ * hint above this list says so in as many words.
+ *
+ * A group's box is a bulk action, so it sits IN the summary and stops the
+ * click from toggling the disclosure it lives in (see the component's own
+ * click handler). `indeterminate` is a property, not an attribute, so it is
+ * set after paint; the styling below only has to not fight it.
+ */
+.pdw-grp { border-bottom: 1px solid var(--ds-border-light); }
+.pdw-grp:last-child { border-bottom: 0; }
+.pdw-grp__sum {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 11px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.pdw-grp__sum::-webkit-details-marker { display: none; }
+.pdw-grp__sum::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0; height: 0;
+  border-left: 4px solid var(--ds-text-muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .12s ease;
+}
+.pdw-grp[open] > .pdw-grp__sum::before { transform: rotate(90deg); }
+.pdw-grp__sum:hover { background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent); }
+.pdw-grp__box { flex: 0 0 auto; accent-color: var(--ds-primary); }
+.pdw-grp__name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdw-grp__n {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ds-text-muted);
+  background: var(--ds-surface-dim);
+  border-radius: var(--ds-radius-pill, 9999px);
+  padding: 1px 7px;
+}
+/* A project reads as the heading it is; a bucket is a rung below it. */
+.pdw-grp--project > .pdw-grp__sum { font-size: 13px; font-weight: 600; color: var(--ds-text-primary); }
+.pdw-grp--bucket > .pdw-grp__sum { padding-left: 26px; font-size: 12.5px; color: var(--ds-text-secondary); }
+.pdw-grp--bucket > .pdw-grp__sum .pdw-grp__name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }

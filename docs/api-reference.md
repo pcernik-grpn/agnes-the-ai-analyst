@@ -744,6 +744,7 @@ checks against.
 
 - /api/admin/users/{user_id}/activity
 - /api/admin/users/{user_id}/effective-access
+- /api/admin/users/{user_id}/library-preview
 - /api/admin/users/{user_id}/memberships
 - /api/admin/users/{user_id}/memberships/{group_id}
 - /api/admin/users/{user_id}/sessions
@@ -1024,7 +1025,7 @@ synced IWT clone for the bind-git file picker.
 
 - /api/admin/bigquery/test-connection
 
-### `/api/admin/doctor` — deployment-gate diagnostics
+### `/api/admin/doctor` — deployment-gate & support diagnostics
 
 `POST /api/admin/doctor/new-instance` (admin-only) runs the new-instance
 deployment checks — `login-door`, `email-delivery`, `chat-grant`,
@@ -1036,11 +1037,40 @@ real test message through the same send path the login flows use. CLI:
 `agnes admin doctor --new-instance`; the host-side siblings live in
 `scripts/ops/post-deploy-smoke-test.sh`.
 
+`GET /api/admin/doctor/support` (admin-only) collects the redacted
+support-bundle snapshot that feeds the server section of `agnes doctor`:
+`build` (version/channel/image tag/commit), `schema` (backend + migration
+verdict), `retrieval` (`hybrid`/`lexical_only`, the latter a loud
+`warning`), `sync` (per-source rollup with the most recent failures),
+`disk`, `process`, and `secrets` (env-var **presence booleans only —
+never values**). Each section is collected in isolation, so a crashing
+collector reports itself instead of failing the request.
+
 - /api/admin/doctor/new-instance
+- /api/admin/doctor/support
 
 ### `/api/admin/keboola` — Keboola diagnostics
 
 - /api/admin/keboola/test-connection
+
+### `/api/admin/data-sources` — Source catalog discovery
+
+Admin-only, read-only browse of a configured source's catalog, for the
+"Add data source" wizard's table picker. Keyed on `source_type` rather than a
+connection id, because the sources that need it have no connection record — their
+coordinates live in `data_source.<name>` (instance.yaml / `/admin/server-config`).
+Snowflake today; Keboola keeps its per-connection listing below.
+
+- /api/admin/data-sources/{source_type}/tables
+
+`GET …/{source_type}/tables` attaches, reads `information_schema.tables` and
+detaches — no extract is written and no registry row touched (registration stays
+`POST /api/admin/register-table`). Optional `?schema=` narrows to one schema.
+Returns `{source_type, database, schemas: [{name, tables: [{name, table_type}]}]}`.
+400 when the source type is not browsable, when the source is not configured, or
+when the resolved host is outside `AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`; 502 when
+the driver or catalog query fails — never an empty listing, which would read as
+"the account has no tables".
 
 ### `/api/admin/source-connections` — Named source connections (multi-project Keboola, #731)
 
@@ -1176,6 +1206,7 @@ so comments and key order survive.
 - /api/semantic-models/validate-query
 - /api/semantic-models/context
 - /api/semantic-models/schema
+- /api/semantic-models/apply
 
 `POST /api/admin/semantic-models` validates the pasted document against the
 vendored Ossie schema (422 with the schema errors on failure) and stores it
@@ -1199,6 +1230,22 @@ CLI: `agnes admin semantic-model list/show/import/export/validate` (the
 last runs entirely offline — no server, no token) and `agnes admin
 semantic-source add/list/sync`. MCP: `semantic_model_search`,
 `semantic_model_get`.
+
+`POST /api/semantic-models/apply` is the one non-admin-reachable write
+surface (chat-first authoring): any authenticated caller submits an Ossie
+document, and the outcome branches on authority — an admin's document is
+validated, stored as `source='manual'`, and projected (`outcome: applied`);
+anyone else's is queued as an `authoring_suggestions` row (domain
+`semantic-layer`) for admin moderation (`outcome: submitted_for_review`) and
+never touches `semantic_models` before approval. Shared guards for both
+roles: schema-invalid 422; a slug owned by an imported source 409
+`source_owned` (stronger than the raw admin POST — apply refuses to shadow
+an imported model even for admins); a stale `expected_content_hash` 409
+`stale_document` (the optimistic lock for read → modify → re-apply). The
+non-admin branch also 409s `duplicate_pending` while an earlier proposal for
+the same slug awaits review, and 403s `studio_disabled` when the Studio
+toggle is off. CLI: `agnes semantic-model apply`. MCP:
+`apply_semantic_model`.
 
 `POST /api/semantic-models/validate-query` validates a SQL statement against
 the caller's accessible `status='valid'` models (same RBAC tier as
@@ -1233,6 +1280,7 @@ and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
 
 ### `/api/admin/run-*` — Background job triggers
 
+- /api/admin/run-audit-prune
 - /api/admin/run-blocked-purge
 - /api/admin/run-bq-metadata-refresh
 - /api/admin/run-corporate-memory
@@ -1554,7 +1602,7 @@ the engine exposes nothing.
   failed turn. The tree is the admin-registered Initial Workspace Template
   when one is synced, else the bundled default: `CLAUDE.md`, the org
   `PreToolUse` safety hook, and `.claude/skills/*`. Agnes's own sandbox-image
-  build assets (`e2b-template/`, `docker-sandbox/`) are excluded — they
+  build assets (`docker-sandbox/`) are excluded — they
   describe how to build a sandbox, not how to work in one.
 
   `CLAUDE.md` is the **rendered** Workspace Prompt, not the template's static
@@ -1908,7 +1956,7 @@ Multi-turn counterpart to the one-shot runtime above: create a session bound to 
 
 ### `/api/v1/sessions/{id}/artifacts` — sandbox artifact harvest + download (V1b Task 5)
 
-The chat sandbox is a remote E2B microVM; files an agent writes under `/work/outputs` inside it are harvested into the object store + `agent_artifacts` registry at two points: when a one-shot `/responses` (or `/jobs`) turn completes, and when `DELETE /api/v1/sessions/{id}` tears the sandbox down. Harvest is best-effort — a store that isn't configured, a missing `outputs/` dir, or a single file's read/write failure are all logged and skipped, never surfaced as an error on the run/delete path they piggyback on. Filenames are agent-chosen (an injection surface) and are sanitized to a flat, CR/LF-free basename before use — both as the object-store key (`agent-artifacts/{session_id}/{safe_filename}`) and in the download response's `Content-Disposition` header. Per-session caps (`agent_api_artifact_max_bytes`, default 25 MiB per file; `agent_api_artifact_max_files`, default 20 per harvest call) bound how much a single run can push into the store. Auth on both routes is the same `require_session_principal` every `/api/v1/sessions/{id}/*` route uses (owner or an agent PAT bound to this exact session's agent; any mismatch is `404`, never `403`).
+The chat sandbox is a separate per-session environment (a container under the docker provider); files an agent writes under `/work/outputs` inside it are harvested into the object store + `agent_artifacts` registry at two points: when a one-shot `/responses` (or `/jobs`) turn completes, and when `DELETE /api/v1/sessions/{id}` tears the sandbox down. Harvest is best-effort — a store that isn't configured, a missing `outputs/` dir, or a single file's read/write failure are all logged and skipped, never surfaced as an error on the run/delete path they piggyback on. Filenames are agent-chosen (an injection surface) and are sanitized to a flat, CR/LF-free basename before use — both as the object-store key (`agent-artifacts/{session_id}/{safe_filename}`) and in the download response's `Content-Disposition` header. Per-session caps (`agent_api_artifact_max_bytes`, default 25 MiB per file; `agent_api_artifact_max_files`, default 20 per harvest call) bound how much a single run can push into the store. Auth on both routes is the same `require_session_principal` every `/api/v1/sessions/{id}/*` route uses (owner or an agent PAT bound to this exact session's agent; any mismatch is `404`, never `403`).
 
 `GET /api/v1/sessions/{id}/artifacts` — `200 {data: [{id, filename, size_bytes, content_type, created_at}], has_more, next_cursor}` — every artifact harvested for this session so far.
 

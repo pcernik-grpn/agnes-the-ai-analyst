@@ -320,18 +320,18 @@ def test_single_file_artefacts_with_same_filename_keep_distinct_names(seeded_app
 
 # ── Stack pill: what a row says about how it got into the Stack ────────────
 #
-# Membership is ONE state — "In Stack" — and the rows differ only in whether
+# Membership is ONE state — "In stack" — and the rows differ only in whether
 # the caller may change it:
 #
-#   Required grant   → "In Stack" + LOCK. Not the caller's to remove; the
+#   Required grant   → "In stack" + LOCK. Not the caller's to remove; the
 #                      unsubscribe API answers 400 cannot_remove_required.
 #                      The word "Required" is NOT the label: the tier is an
 #                      attribute of the membership, filterable through the
 #                      separate Optional/Required facet.
-#   Available grant  → "In Stack", plain checkmark. Auto-membership
+#   Available grant  → "In stack", plain checkmark. Auto-membership
 #                      (StackResolver's browse() sets in_stack
 #                      unconditionally) — no "add" to offer, the grant did it.
-#   Own artefact     → "In Stack" ⇄ "Add to Stack", a real toggle. A personal
+#   Own artefact     → "In stack" ⇄ "Add to stack", a real toggle. A personal
 #                      upload has no admin grant tier, so the subscription row
 #                      IS the membership.
 
@@ -372,11 +372,11 @@ def _row_for(body: str, title: str) -> str:
 #: let the shipped copy drift from the spec, so the exact sentences are asserted.
 #: Both tiers are locked; only the wording differs.
 LOCKED_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-GRANTED_TOOLTIP = "Granted to your group — only an admin can remove it from your Stack."
+GRANTED_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
 
 
 def test_library_required_grant_is_locked_in_stack(seeded_app):
-    """A required grant reads the SAME "In Stack" as any other member — it is
+    """A required grant reads the SAME "In stack" as any other member — it is
     one — and is marked by a lock plus the locked tooltip. The tier is an
     attribute of the membership, not a different state, so the word "Required"
     is NOT the pill's label (the separate Optional/Required facet filters it)."""
@@ -388,7 +388,7 @@ def test_library_required_grant_is_locked_in_stack(seeded_app):
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Mandated Package")
-    assert "In Stack" in row
+    assert "In stack" in row
     assert "lib-instack--locked" in row  # locked → lock glyph + info tint
     assert LOCKED_TOOLTIP in row
     # Not a button, and not addable — nothing to click either way.
@@ -402,7 +402,7 @@ def test_library_required_grant_is_locked_in_stack(seeded_app):
 
 def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app, monkeypatch):
     """AUTO-membership (opt-in): an available grant is already in the stack,
-    so the row reports that plainly — no "Add to Stack" for something already
+    so the row reports that plainly — no "Add to stack" for something already
     in it, and no remove (the grant is an admin's to change). The classic
     default renders the honest not-a-member state (sibling below).
 
@@ -421,7 +421,7 @@ def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app,
 
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Offered Package")
-    assert "In Stack" in row
+    assert "In stack" in row
     assert "lib-instack--fixed" in row
     assert "lib-instack--locked" in row  # not the removable pill's rest state
     assert "data-add-to-stack" not in row
@@ -435,7 +435,7 @@ def test_library_available_grant_reads_in_stack_and_offers_no_toggle(seeded_app,
 def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, monkeypatch):
     """CLASSIC: a granted-but-unsubscribed ``available`` package is NOT a
     stack member — membership is required ∪ subscribed, and it also drives
-    query authorization — so the row must not claim "In Stack", must not
+    query authorization — so the row must not claim "In stack", must not
     land in the "In stack only" filter bucket, and points the caller at the
     Catalog to add it (Devin Review on #1199). A subscribed one renders as a
     member again.
@@ -456,7 +456,7 @@ def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, mon
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Classic Offered Package")
     assert 'data-stack="available"' in row, "unsubscribed available must filter as addable, not in-stack"
-    assert 'data-stack-badge="' not in row or "In Stack" not in row.split("data-add-to-stack")[0], (
+    assert 'data-stack-badge="' not in row or "In stack" not in row.split("data-add-to-stack")[0], (
         "a non-member must not wear the member pill"
     )
     # A real Add control wired to the generic subscribe endpoint (JSON body
@@ -480,7 +480,7 @@ def test_library_available_grant_classic_is_not_claimed_in_stack(seeded_app, mon
     body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
     row = _row_for(body, "Classic Offered Package")
     assert 'data-stack="in_stack"' in row
-    assert "In Stack" in row
+    assert "In stack" in row
 
 
 def test_library_lists_granted_curated_plugins(seeded_app):
@@ -530,7 +530,7 @@ def test_library_lists_granted_curated_plugins(seeded_app):
     row = _row_for(body, "granted-plugin")
     # Granted at the `available` tier and never subscribed, so the grant is
     # ELIGIBILITY, not membership: the row offers the toggle. (This assertion
-    # used to read "In Stack" + no toggle — the auto-membership model, which is
+    # used to read "In stack" + no toggle — the auto-membership model, which is
     # right for data packages and wrong for plugins. See the dedicated
     # subscription-tracking test below for why.)
     assert "data-add-to-stack" in row
@@ -583,7 +583,7 @@ def test_library_plugin_stack_state_tracks_subscription_not_the_grant(seeded_app
 
     The Library used to reuse the auto-membership model that data packages and
     memory domains legitimately have, rendering every eligible plugin as a
-    LOCKED "In Stack". That was wrong twice over: it contradicted /marketplace
+    LOCKED "In stack". That was wrong twice over: it contradicted /marketplace
     and the agent's own ``marketplace_search`` (both of which read the
     subscription union), and because the row rendered locked it removed the only
     affordance that could have corrected the state.

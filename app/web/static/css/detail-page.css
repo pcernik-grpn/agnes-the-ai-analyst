@@ -2871,3 +2871,70 @@ html[data-theme="paper"] .detail--panels .detail-question__cta { font-size: 12.5
     html[data-theme="paper"] .detail--panels .detail-hero__title-row h1 { font-size: 23px; }
     html[data-theme="paper"] .detail--panels .pkg-table-detail { padding-left: 0; }
 }
+
+/* ── The governance cluster (macros/_detail.html :: manage) ─────────────
+ *
+ * A rail section like any other — it inherits `.detail-side`'s surface and
+ * spacing — with one job on top of that: to read as a DIFFERENT AUTHORITY
+ * from the blocks above it, without shouting. A reader who can manage this
+ * arrived to read it, so nothing here may compete with the hero's primary
+ * action. Hence: no filled button, no accent fill, no colour that means
+ * "do this" — a labelled key chip, a hairline, and secondary buttons.
+ *
+ * Scoped to the paper theme like every other rule in this sheet
+ * (tests/test_ui_layout_theme.py::test_detail_page_rules_are_scoped_to_theme):
+ * the editorial detail layout IS the paper look, and an unscoped rule here
+ * would restyle the pre-redesign pages other instances are entitled to see
+ * unchanged. Values are `--ds-*` only, so a future theme inherits it by
+ * adding its own scoped block rather than by overriding this one.
+ */
+html[data-theme="paper"] .detail-manage__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+/* The chip names WHOSE authority this is. It carries the word rather than a
+ * colour, because "admin" is not a severity and the semantic palette is
+ * spoken for. */
+html[data-theme="paper"] .detail-manage__key {
+    font-size: 10px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ds-text-muted);
+    border: 1px solid var(--ds-border);
+    border-radius: 5px;
+    padding: 1px 6px;
+    background: var(--ds-surface-dim);
+    flex: 0 0 auto;
+}
+html[data-theme="paper"] .detail-manage__ttl {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--ds-text-secondary);
+    letter-spacing: 0;
+    text-transform: none;
+    min-width: 0;
+}
+html[data-theme="paper"] .detail-manage__body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+/* Destructive actions keep the cluster's quiet weight and say so in ink
+ * only — a filled red button in a rail would outrank the hero. */
+html[data-theme="paper"] .detail-manage__danger {
+    color: var(--ds-accent-danger-ink);
+    border-color: var(--ds-accent-danger-line);
+}
+/* The single door out to the admin surface, last and on its own line: it
+ * LEAVES the page, which every action above it does not. */
+html[data-theme="paper"] .detail-manage__door {
+    display: inline-block;
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--ds-primary-dark);
+    text-decoration: none;
+}
+html[data-theme="paper"] .detail-manage__door:hover { text-decoration: underline; }

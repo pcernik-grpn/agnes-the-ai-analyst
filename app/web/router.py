@@ -1734,84 +1734,11 @@ def _data_package_entry_dict(
 
 
 # ── Unified catalog-card normalizers ─────────────────────────────────
-# Adapt each kind's entry dict → the single `c` contract consumed by the
-# reusable catalog_card() macro (templates/macros/_catalog_card.html) and
-# its JS twin. One shape → one component → identical cards everywhere.
-
-
-def _catalog_card_data(e: dict, *, auto_membership: bool = True) -> dict:
-    """Data package → catalog_card `c`, action semantics per membership mode.
-
-    Auto-membership: every package reaching this normalizer is already in
-    the caller's stack — required packages render a locked 'Required' pill
-    (always downloaded); everything else gets the Download-locally/
-    Remove-local-copy toggle (``mode: 'download'``), and the dict's
-    ``in_stack`` key carries the LOCAL-DOWNLOAD state. Classic (the
-    default membership mode): the same generic /api/stack endpoints JOIN
-    and LEAVE the stack, so the card emits ``mode: 'stack'`` — the macro's
-    Add-to-stack/Remove wording — and ``in_stack`` is real membership
-    (Devin Review on #1199, round 5: download wording on a
-    membership-changing control loses users their query access)."""
-    if e.get("requirement") == "required":
-        action = {"mode": "required"}
-    else:
-        rid = e["id"]
-        action = {
-            "mode": "download" if auto_membership else "stack",
-            "state": "in" if e.get("in_stack") else "add",
-            "add_url": "/api/stack/subscribe",
-            "remove_url": f"/api/stack/subscription/data_package/{rid}",
-            "rt": "data_package",
-            "rid": rid,
-        }
-    owner = e.get("owner_name")
-    return {
-        "kind": "data",
-        "kind_label": "Data",
-        "title": e["name"],
-        "href": e["drilldown_url"],
-        "curator": f"Curated by {owner}" if owner else "Curated",
-        "category": e.get("category"),
-        "description": e["description"],
-        "tags": e.get("tags") or [],
-        "meta_icon": "tables",
-        "meta_text": e.get("meta") or "",
-        "action": action,
-    }
-
-
-def _catalog_card_memory(d: dict, *, auto_membership: bool = True) -> dict:
-    """Memory domain → catalog_card `c`. Every domain reaching this
-    normalizer is already in the caller's stack (auto-membership) —
-    download-locally toggle (``mode: 'download'``) wired to the generic
-    /api/stack endpoints (resource_type=memory_domain); required domains
-    render the locked pill instead."""
-    rid = d["id"]
-    n = d.get("items_count", 0) or 0
-    if d.get("requirement") == "required":
-        action = {"mode": "required"}
-    else:
-        action = {
-            "mode": "download" if auto_membership else "stack",
-            "state": "in" if d.get("in_stack") else "add",
-            "add_url": "/api/stack/subscribe",
-            "remove_url": f"/api/stack/subscription/memory_domain/{rid}",
-            "rt": "memory_domain",
-            "rid": rid,
-        }
-    return {
-        "kind": "memory",
-        "kind_label": "Memory",
-        "title": d["name"],
-        "href": f"/memory/d/{d['slug']}",
-        "curator": None,
-        "category": None,
-        "description": d.get("description") or "Curated organizational knowledge domain.",
-        "tags": [],
-        "meta_icon": "items",
-        "meta_text": f"{n} item{'s' if n != 1 else ''}",
-        "action": action,
-    }
+# Adapt an entry dict -> the single `c` contract consumed by the reusable
+# catalog_card() macro (templates/macros/_catalog_card.html) and its JS
+# twin. The data-package and memory adapters died with the /catalog browse
+# shell (folded into /library); the upload adapter below is the survivor
+# (the Library's Artefacts band renders through it).
 
 
 def _catalog_card_upload(c: dict) -> dict:
@@ -1950,256 +1877,26 @@ async def catalog(
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    # v49 — unified Browse + My Stack tabs (Task 8.2). The old per-source
-    # source-card / per-table list moved into /catalog/p/<slug> (Task 8.3).
-    from app.services.stack_resolver import StackResolver
-    from app.resource_types import ResourceType
+    """The Catalog is folded into the Library.
 
-    resolver = StackResolver(conn)
-    pkg_repo = data_packages_repo()
+    It browsed the same rows the Library already renders — data packages,
+    memory domains, marketplace plugins and recipes, off the same
+    ``StackResolver.browse()`` — sliced by kind tabs where the Library groups
+    by type into collapsible sections. Two destinations for one list, which is
+    the split the Library/Memory/Data-apps merge already named as the problem
+    (spec 2026-08-12) and never got round to closing here.
 
-    # Pre-compute per-package table counts + source-type tag set in one pass
-    # so we don't repeat the join per card.
-    pkg_meta: dict[str, dict] = {}
-    try:
-        for pkg in pkg_repo.list():
-            tables = pkg_repo.list_tables(pkg["id"])
-            source_types = sorted({(t.get("source_type") or "") for t in tables if t.get("source_type")})
-            pkg_meta[pkg["id"]] = {
-                "table_count": len(tables),
-                "source_types": source_types,
-            }
-    except Exception as e:
-        logger.warning("could not enumerate data_packages: %s", e)
+    The one thing this page had that the list did not is the "what could I
+    add" question, which is now the Library's "Not in stack yet" filter —
+    the `?scope=available` this sends arrives with that toggle applied.
 
-    is_admin_view = is_user_admin(user["id"], conn)
-    # Stack-membership mode (spec 2026-08-07-default-chrome-ux-parity):
-    # classic (default) keeps the pre-redesign catalog behavior verbatim —
-    # admin god-mode Browse via ``browse_admin`` and a Browse grid listing
-    # EVERY granted package with its add-to-stack state. Auto-membership
-    # (the redesign semantics) drops god-mode from the user-facing Catalog
-    # (auditing lives at /admin/data-packages) and reshapes Browse into
-    # "things you can ADD" — in that mode ``browse()`` marks everything
-    # granted in_stack, so the grid only shows the rest.
-    from app.instance_config import get_stack_auto_membership
-
-    auto_membership = get_stack_auto_membership()
-    if is_admin_view and not auto_membership:
-        all_granted_entries = resolver.browse_admin(user["id"], ResourceType.DATA_PACKAGE)
-    else:
-        all_granted_entries = resolver.browse(user["id"], ResourceType.DATA_PACKAGE)
-    stack_entries = resolver.stack(user["id"], ResourceType.DATA_PACKAGE)
-
-    # Group ``required`` packages first so they cluster together at the
-    # top of the grid instead of being scattered by creation order —
-    # first-demo feedback (2026-05-19): "bylo by dobre ty required mit
-    # vzdy nekde seskupene spolu na jedne strane". Secondary order falls
-    # back to the resolver's name-ordered output. Under auto-membership it
-    # is applied to BOTH grids — most packages a caller sees then render
-    # on My Stack rather than Browse, so the grouping must follow them
-    # there; classic keeps the pre-redesign contract (Browse only).
-    _req_first_key = lambda e: (0 if e.requirement == "required" else 1, e.name or "")  # noqa: E731
-    all_granted_entries = sorted(all_granted_entries, key=_req_first_key)
-    if auto_membership:
-        stack_entries = sorted(stack_entries, key=_req_first_key)
-
-    # Catalog reshape (auto-membership only): every granted package is
-    # already in_stack=True there, so the Data grid — whose whole purpose
-    # becomes "things you can ADD" — only shows entries NOT already in the
-    # caller's stack. Classic renders the full granted set, pre-redesign
-    # style.
-    addable_entries = [e for e in all_granted_entries if not e.in_stack] if auto_membership else all_granted_entries
-
-    def _adapt(e):
-        slug = None
-        try:
-            full = pkg_repo.get(e.id)
-            if full:
-                slug = full.get("slug")
-        except Exception:
-            slug = None
-        meta = pkg_meta.get(e.id, {})
-        return _data_package_entry_dict(
-            e,
-            drilldown_url=f"/catalog/p/{slug}" if slug else f"/catalog#{e.id}",
-            table_count=meta.get("table_count", 0),
-            source_types=meta.get("source_types", []),
-            is_admin_view=is_admin_view,
-        )
-
-    entries = [_adapt(e) for e in addable_entries]
-    stack_entries_adapted = [_adapt(e) for e in stack_entries]
-
-    # Aggregate distinct source types across the user's visible packages —
-    # drives the per-source chip row in the catalog page.
-    source_type_chips = sorted({st for e in entries for st in (e.get("tags") or [])})
-
-    # Empty-state hint: when no packages exist, the page tells admins how
-    # many tables are already registered (so the CTA "go to /admin/tables
-    # and group them" lands with concrete context). Non-internal tables
-    # only — the agnes_* internal rows aren't analyst-facing.
-    total_registered_tables = 0
-    try:
-        total_registered_tables = table_registry_repo().count_non_internal()
-    except Exception:
-        total_registered_tables = 0
-
-    # Direct (unbundled) tables on /catalog were dropped per user feedback:
-    # "nemít Direct Tables zvlášť. Potřebujeme to mít celé v nějaké
-    # skupině v těch data packages." Everything an analyst sees here must
-    # belong to a Data Package — admin's job is to package unbundled
-    # tables via Group-by-bucket (one-click) or Bulk-assign on
-    # /admin/tables. The manifest endpoint at /api/sync/manifest still
-    # emits `direct_tables[]` so existing CLI clients with `table`-typed
-    # RBAC grants keep working (BC, not a web surface).
-
-    # Unified Catalog (rail layout / #896 prototype IA): one page with
-    # kind tabs — Data · Plugins · Memory · Recipes — for the shared,
-    # curated resources. Data/Memory render server-side here; Plugins +
-    # Recipes hydrate client-side from their existing APIs. Uploads
-    # (file collections) are private user resources and live on My Stack
-    # (see /stack), not in the shared Catalog.
-    #
-    # Memory kind-tab: mirrors the Data grid's contract in BOTH modes —
-    # grant-scoped via ``browse()`` (fixes a pre-existing gap where this
-    # tab enumerated every memory domain with no RBAC check at all);
-    # under auto-membership filtered to entries NOT already in the
-    # caller's stack, under classic the full granted set with its
-    # add-to-stack state — INCLUDING the admin god-mode fork, so the one
-    # page an admin sees applies one scope to both server-rendered kinds
-    # (same ``is_admin_view and not auto_membership`` condition as the
-    # Data grid above; Devin Review on #1199, both rounds).
-    if is_admin_view and not auto_membership:
-        all_mem_entries = resolver.browse_admin(user["id"], ResourceType.MEMORY_DOMAIN)
-    else:
-        all_mem_entries = resolver.browse(user["id"], ResourceType.MEMORY_DOMAIN)
-    addable_mem_entries = [e for e in all_mem_entries if not e.in_stack] if auto_membership else all_mem_entries
-    memory_cards = _unified_memory_cards(addable_mem_entries)
-    # Normalize both server-rendered kinds into the single catalog_card
-    # `c` contract (Plugins + Recipes normalize client-side in the JS twin).
-    data_cards = [_catalog_card_data(e, auto_membership=auto_membership) for e in entries]
-    memory_card_models = [_catalog_card_memory(d, auto_membership=auto_membership) for d in memory_cards]
-    # ── "Recommended for you" — intentionally empty for granted data /
-    #    memory. The Catalog only surfaces resources the caller does NOT
-    #    already have; under auto-membership every granted package is
-    #    already in My Stack, so recommending one here (even as a "not
-    #    yet downloaded" nudge) re-introduces exactly the already-yours
-    #    clutter this reshape removes. The "download a local copy" action
-    #    for granted-but-not-materialized packages lives on My Stack,
-    #    where those cards carry the Download button. A future revision
-    #    may repopulate this row with genuinely not-yet-added shared
-    #    assets (uninstalled plugins / fleamarket), which are not-yours
-    #    by definition.
-    recommended_cards: list = []
-    # Default active kind tab: Data first (if it has addable content),
-    # else Memory, else Plugins — Data/Memory are normally empty post
-    # auto-membership (everything granted is already in My Stack), so
-    # the Catalog naturally centers on Plugins/Recipes.
-    if data_cards:
-        default_kind = "data"
-    elif memory_card_models:
-        default_kind = "memory"
-    else:
-        default_kind = "plugins"
-    ctx = _build_context(
-        request,
-        user=user,
-        is_admin=is_admin_view,
-        entries=entries,
-        data_cards=data_cards,
-        stack_entries=stack_entries_adapted,
-        source_type_chips=source_type_chips,
-        total_registered_tables=total_registered_tables,
-        memory_cards=memory_card_models,
-        recommended_cards=recommended_cards,
-        default_kind=default_kind,
-        # The lede describes what the Data/Memory tabs actually contain,
-        # and that differs by membership mode. Under auto-membership a
-        # grant IS stack membership, so those tabs hold only what you do
-        # NOT have and "granted data lives in My Stack, not here" is true.
-        # Under classic a grant is an invitation you have not accepted, so
-        # the same tabs list granted-but-unsubscribed resources and that
-        # sentence would contradict the grid right under it (Devin on #1199).
-        auto_membership=auto_membership,
-    )
-    return templates.TemplateResponse(request, "catalog_unified.html", ctx)
-
-
-def _unified_memory_cards(entries: list) -> list:
-    """Adapt memory-domain ``ResourceEntry`` rows for the unified catalog
-    grid (light: name/slug/description/items_count — the per-item richness
-    stays on /memory/d/<slug>).
-
-    ``entries`` must already be RBAC-scoped (``StackResolver.browse()`` /
-    ``.stack()`` output) — this function does no grant filtering of its
-    own. It used to enumerate every memory domain unconditionally (a
-    pre-existing gap: the Memory kind-tab on /catalog ignored RBAC
-    entirely); callers now pass the resolver's grant-scoped entries so the
-    tab honors the same privacy invariant as the Data grid. ``in_stack`` on
-    the returned dict carries ``entry.materialized`` (local-download
-    state), matching ``_data_package_entry_dict``'s convention.
+    302, not 308, so a reversal is not cached permanently — same reasoning as
+    the /corporate-memory, /apps and /stack retirements. The route stays
+    registered so bookmarks and old links do not 404, and every detail route
+    under it (``/catalog/p/{slug}``, ``/catalog/t/{id}``, ``/catalog/r/{slug}``,
+    ``/catalog/semantics``) is untouched: this folds the browse SHELL only.
     """
-    cards: list = []
-    try:
-        domains_repo = memory_domains_repo()
-        for e in entries:
-            try:
-                d = domains_repo.get(e.id)
-            except Exception:
-                d = None
-            if not d:
-                continue
-            try:
-                items = domains_repo.list_items_of_domain(e.id, limit=10000)
-            except Exception:
-                items = []
-            cards.append(
-                {
-                    "id": e.id,
-                    "name": e.name or d.get("name") or d.get("slug"),
-                    "description": e.description or d.get("description") or "",
-                    "slug": d.get("slug"),
-                    "items_count": len(items),
-                    "requirement": e.requirement,
-                    "in_stack": e.materialized,
-                }
-            )
-    except Exception as e:
-        logger.warning("unified catalog: could not enumerate memory domains: %s", e)
-    return cards
-
-
-def _unified_library_cards(user: dict, conn) -> list:
-    """File collections adapted for the unified catalog grid — same RBAC
-    scoping as the /library page (admin sees all)."""
-    from src.rbac import get_accessible_ids
-    from app.resource_types import ResourceType
-
-    cards: list = []
-    try:
-        is_admin = is_user_admin(user["id"], conn)
-        accessible_ids = get_accessible_ids(user, ResourceType.COLLECTION.value, conn)
-        allowed = None if accessible_ids is None else set(accessible_ids)
-        cf_repo = corpus_files_repo()
-        for col in file_corpora_repo().list():
-            if not is_admin and allowed is not None and col["id"] not in allowed:
-                continue
-            try:
-                file_count = len(cf_repo.list_for_corpus(col["id"]))
-            except Exception:
-                file_count = 0
-            cards.append(
-                {
-                    "id": col["id"],
-                    "name": col.get("name") or col.get("slug"),
-                    "description": col.get("description") or "",
-                    "slug": col.get("slug"),
-                    "file_count": file_count,
-                }
-            )
-    except Exception as e:
-        logger.warning("unified catalog: could not enumerate collections: %s", e)
-    return cards
+    return RedirectResponse(url="/library?scope=available", status_code=302)
 
 
 @router.get("/stack", response_class=HTMLResponse)
@@ -2326,7 +2023,7 @@ _SKILL_VISIBILITY: dict[str, tuple[str, str]] = {
 #: making the same promise, and ``tests/test_web_library.py`` asserts them
 #: verbatim so the shipped copy cannot drift from the spec.
 _LOCKED_STACK_TOOLTIP = "Required by your admin and cannot be removed from your stack."
-_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your Stack."
+_GRANTED_STACK_TOOLTIP = "Granted to your group — only an admin can remove it from your stack."
 
 
 def _library_row_base(
@@ -2371,16 +2068,16 @@ def _library_row_base(
         # EVERY row that can be filtered carries one of the two — a row with no
         # state would be silently dropped by the "In stack only" toggle while its
         # own pill claimed membership. The row renders the state as the
-        # presence/absence of the "In Stack" badge, so the filter never hides
+        # presence/absence of the "In stack" badge, so the filter never hides
         # anything for an invisible reason.
         "stack_state": "",
         "stack_title": "",
         # What the pill READS on the row, kept separate from ``stack_state`` so
         # the wording can differ from the filtered value. Empty → the template
-        # falls back to "In Stack".
+        # falls back to "In stack".
         "stack_pill": "",
         # Membership the caller cannot drop — any group grant, whichever tier.
-        # It reads the SAME "In Stack" as any other member (it is one) and is
+        # It reads the SAME "In stack" as any other member (it is one) and is
         # marked by a LOCK plus a tooltip naming who *can* remove it. The tier
         # is an attribute of the membership, not a different state, and the
         # separate Optional/Required facet is where the tier is filterable.
@@ -2411,18 +2108,48 @@ def _library_row_base(
         "meta_text": meta_text,
         "share_type": share_type,
         "shareable": share_type is not None,
-        # Facet fields. ``requirement`` is the grant tier an admin set
-        # ("required" = mandatory, everything else optional). ``tags`` reuses
+        # Facet fields. ``requirement`` is the grant tier an admin set, shown
+        # in the vocabulary every admin surface speaks: "required" (the API
+        # enum) reads **Automatic** — in members' stacks without an add —
+        # and everything else reads **Optional**. ``tags`` reuses
         # whatever the source registry already carries (data-package tags,
         # store-entity category) — no generic tagging table exists, so kinds
         # without tags simply never match a Tags filter. ``owner_key`` is the
         # stable value the Owner facet groups on (the label is what's shown).
         "requirement": requirement,
-        "requirement_label": "Required" if requirement == "required" else "Optional",
+        "requirement_label": "Automatic" if requirement == "required" else "Optional",
         "tags": tags or [],
         "owner_key": owner_key or "",
         "search": " ".join(s for s in (title, description, type_label, owner_label, extra_search) if s).lower(),
     }
+
+
+def _has_readable_semantic_model(user: dict, conn, *, surface: str) -> bool:
+    """Whether to offer this caller the ``/semantic-layer`` browse pages.
+
+    The same ``_can_read_model`` gate those pages apply, so a caller who can
+    read nothing is never sent to an empty page. Deliberately NOT gated on the
+    flat projection's counts: a model with no metrics or glossary terms
+    projected yet — the default state of an upstream document that declares
+    datasets and relationships but no aggregations — still counts, because
+    those objects are the one thing the browse UI exists to show.
+
+    Best-effort by contract: every caller renders a LINK off this, so a
+    ``semantic_models`` read failure must degrade to "no link" and leave the
+    rest of the page intact rather than 500 it. ``surface`` only labels the log.
+
+    Shared by ``/library``'s Definitions footer and ``/catalog/semantics``'
+    header + empty state. One reader, because the two disagreeing is exactly
+    how the standalone page came to claim "no metrics registered yet" on an
+    instance whose Library was already offering the document next door.
+    """
+    try:
+        from app.api.semantic_models import _can_read_model
+
+        return any(_can_read_model(user, row, conn) for row in semantic_model_repo().list_all())
+    except Exception as e:  # noqa: BLE001 - the link is best-effort
+        logger.warning("%s: semantic-model existence check failed: %s", surface, e)
+        return False
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -2521,8 +2248,8 @@ async def library_page(
             return "workspace"
         return "shared"
 
-    # Artefacts already in the caller's Stack — drives the "Add to Stack" vs
-    # quiet "In Stack" badge on artefact rows.
+    # Artefacts already in the caller's Stack — drives the "Add to stack" vs
+    # quiet "In stack" badge on artefact rows.
     try:
         in_stack_ids = set(user_stack_subscriptions_repo().list_for_user(uid, ct))
     except Exception as e:
@@ -2619,7 +2346,7 @@ async def library_page(
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
             # a folder shows its folder's state as a plain badge.
-            row["stack_pill"] = "In Stack"
+            row["stack_pill"] = "In stack"
             # Membership here is a `user_stack_subscriptions` row, and it is the
             # caller's to add or drop either way. Children deliberately inherit
             # neither flag: Stack membership is per collection, so a file inside a
@@ -2836,7 +2563,7 @@ async def library_page(
             items[-1]["stack_endpoint"] = f"/api/store/entities/{s['id']}/install"
             if _inst:
                 items[-1]["stack_state"] = "in_stack"
-                items[-1]["stack_pill"] = "In Stack"
+                items[-1]["stack_pill"] = "In stack"
                 items[-1]["stack_removable"] = True
                 items[-1]["stack_title"] = "The default agent can use this — click to remove it"
             else:
@@ -2927,7 +2654,7 @@ async def library_page(
         # (Devin Review on #1199): under auto-membership every granted row IS
         # in the Stack (``in_stack`` arrives True, rendering exactly as
         # before); under the classic default a granted-but-unsubscribed
-        # ``available`` resource is NOT a member — claiming "In Stack" there
+        # ``available`` resource is NOT a member — claiming "In stack" there
         # would label rows the agent cannot actually query (membership also
         # drives ``get_accessible_tables``). Callers whose membership
         # genuinely is the grant (recipes, plugins) omit the argument.
@@ -2941,7 +2668,7 @@ async def library_page(
             import json as _json
 
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In Stack"
+            items[-1]["stack_pill"] = "In stack"
             items[-1]["stack_removable"] = True
             # Remove is a path-param DELETE; re-add (after a remove, without
             # a reload) POSTs the generic subscribe endpoint with a body —
@@ -2949,11 +2676,11 @@ async def library_page(
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Added by you — click to remove it from your Stack"
+            items[-1]["stack_title"] = "Added by you — click to remove it from your stack"
         elif in_stack:
             items[-1]["stack_state"] = "in_stack"
             # Every non-droppable member row says the same thing about
-            # membership — "In Stack" — and is LOCKED: there is no per-user
+            # membership — "In stack" — and is LOCKED: there is no per-user
             # membership to drop, only a grant an admin can revoke (required
             # tier, or auto-membership where the grant IS the membership).
             # The lock is driven by *droppability*, not by the grant tier:
@@ -2961,7 +2688,7 @@ async def library_page(
             # left an optional grant rendering the success-tinted check that
             # a REMOVABLE row wears at rest. The tier stays legible in the
             # tooltip and the Optional/Required facet.
-            items[-1]["stack_pill"] = "In Stack"
+            items[-1]["stack_pill"] = "In stack"
             items[-1]["stack_locked"] = True
             if requirement == "required":
                 items[-1]["stack_title"] = _LOCKED_STACK_TOOLTIP
@@ -2983,7 +2710,7 @@ async def library_page(
             items[-1]["stack_endpoint"] = "/api/stack/subscribe"
             items[-1]["stack_body"] = _json.dumps({"resource_type": type_key, "resource_id": item_id})
             items[-1]["stack_remove_endpoint"] = f"/api/stack/subscription/{type_key}/{item_id}"
-            items[-1]["stack_title"] = "Granted to you, but not in your Stack — add it to make it queryable"
+            items[-1]["stack_title"] = "Granted to you, but not in your stack — add it to make it queryable"
 
     # Governed data packages + memory domains — StackResolver.browse() is
     # exactly "required ∪ available for my groups" for these two types.
@@ -3127,7 +2854,7 @@ async def library_page(
             # tier and never subscribed is genuinely absent from the caller's
             # served set — its skills and commands are NOT loaded in their
             # Claude Code. Treating the grant as membership (as this did) made
-            # the Library claim a locked "In Stack" for every eligible plugin:
+            # the Library claim a locked "In stack" for every eligible plugin:
             # it contradicted both the /marketplace card and the agent's own
             # `marketplace_search`, and — because the row rendered locked — it
             # removed the only affordance that could have fixed the state.
@@ -3139,6 +2866,13 @@ async def library_page(
 
             plugin_in_stack, plugin_required = _curated_stack_sets(None, uid)
             for pl in marketplace_plugins_repo().list_all():
+                # Admin-disabled is instance-wide "does not exist" for every
+                # user-facing surface, grants notwithstanding — same
+                # post-filter as the v2 /skills admin branch
+                # (app/api/v2_marketplace.py). Without it the Library kept
+                # rendering the card with a working "+ Add to stack" button.
+                if pl.get("admin_disabled"):
+                    continue
                 mid, pname = pl.get("marketplace_id"), pl.get("name")
                 path = f"{mid}/{pname}"
                 if path not in plugin_paths:
@@ -3190,7 +2924,7 @@ async def library_page(
                 locked = bool(pl.get("is_system")) or key in plugin_required
                 if key in plugin_in_stack:
                     row["stack_state"] = "in_stack"
-                    row["stack_pill"] = "In Stack"
+                    row["stack_pill"] = "In stack"
                     row["stack_locked"] = locked
                     row["stack_removable"] = not locked
                     row["stack_title"] = (
@@ -3232,7 +2966,7 @@ async def library_page(
             # Installing a store item IS its Stack membership, and the caller may
             # undo it — the same install endpoint, removed.
             items[-1]["stack_state"] = "in_stack"
-            items[-1]["stack_pill"] = "In Stack"
+            items[-1]["stack_pill"] = "In stack"
             items[-1]["stack_removable"] = True
             items[-1]["stack_endpoint"] = f"/api/store/entities/{inst['id']}/install"
             items[-1]["stack_title"] = "The default agent can use this — click to remove it"
@@ -3369,7 +3103,7 @@ async def library_page(
     # readable by everyone unconditionally. Modelled as inventory they had to
     # neuter all four of the table's columns at once — Owner said "Your
     # workspace" (true of nothing in particular), Sharing said "Workspace" but
-    # refused to change, Stack said "In Stack" but locked, Actions was empty —
+    # refused to change, Stack said "In stack" but locked, Actions was empty —
     # and four special-cased columns is the table saying the object is not one
     # of its rows. A data package looks similar but is genuinely different:
     # access to it VARIES per caller, which is what makes it "what I have".
@@ -3427,16 +3161,7 @@ async def library_page(
         # hide the one thing this UI exists to browse. Read in its own guard so
         # a semantic_models failure leaves the metric/glossary footer already
         # computed above intact instead of suppressing it.
-        _has_readable_model = False
-        try:
-            from app.api.semantic_models import _can_read_model
-
-            for _sm_row in semantic_model_repo().list_all():
-                if _can_read_model(user, _sm_row, conn):
-                    _has_readable_model = True
-                    break
-        except Exception as e:  # noqa: BLE001 - footer link is best-effort
-            logger.warning("/library: semantic-model existence check failed: %s", e)
+        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
 
         if _visible_metrics or _glossary_terms or _has_readable_model:
             definitions_footer = {
@@ -3488,6 +3213,11 @@ async def library_page(
     # included: a locked membership IS a membership (its tier is filterable on
     # its own Optional/Required category).
     library_in_stack_count = sum(1 for c in items if c.get("stack_state") == "in_stack")
+    # What the Filter menu's "Not in stack yet" toggle can act on — strictly
+    # the rows whose Add control would do something (stack_state 'available');
+    # rows with no stack membership at all (files, apps) are neither in nor
+    # addable. Zero means the toggle doesn't render: no dead filters.
+    library_available_count = sum(1 for c in items if c.get("stack_state") == "available")
 
     # Tags are multi-valued per row, so they need their own tally.
     tag_counts: dict = {}
@@ -3650,6 +3380,7 @@ async def library_page(
         library_origins=library_origins,
         library_requirements=library_requirements,
         library_in_stack_count=library_in_stack_count,
+        library_available_count=library_available_count,
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
@@ -3665,12 +3396,24 @@ async def library_page(
         ),
         # Arrive with "In stack only" already pressed — /library?stack=in_stack.
         # The chat empty state's Stack status line ("Using N knowledge sources
-        # and M capabilities from your Stack") points here instead of at
+        # and M capabilities from your stack") points here instead of at
         # the de-railed /stack page (#1088); this list spans every kind that
         # page did, and the toggle narrows it to what the line counts. The value
         # is compared against the facet's one legal value, so what reaches the
         # page's JS is a boolean, never caller text.
         library_stack_only=request.query_params.get("stack") == "in_stack",
+        # Scope preset — `/library?scope=mine|available`. This is where the
+        # retired Catalog and Marketplace browse pages land: they were the
+        # "what could I add" and "what have I got" halves of one list. The
+        # page's JS maps `mine` onto the In stack segment and `available`
+        # onto the Filter menu's "Not in stack yet" toggle (the acquisition
+        # question was demoted off the bar when the segment went two-state).
+        # Validated against the two legal values, so what reaches the page's
+        # JS is one of ours and never caller text; anything else falls back
+        # to `all`, which is what the Library opens on.
+        library_scope=(
+            request.query_params.get("scope") if request.query_params.get("scope") in ("mine", "available") else ""
+        ),
         # Default OFF (upgrade parity): an unverified Store item is marked by
         # the absence of a marker unless the instance opts into the positive
         # trust vocabulary. Must stay in step with the FEATURE_FLAGS registry
@@ -3776,7 +3519,13 @@ async def agents_page(
 
         allowed = accessible_collection_ids(user)  # None => admin sees all
         cf_repo = corpus_files_repo()
-        for col in file_corpora_repo().list():
+        # TODO: the per-collection file count below is an N+1 (one query per
+        # reachable collection, so per *every* collection for an admin). It was
+        # incidentally bounded while this read the 200-capped list(); switching
+        # to list_all() to stop hiding reachable collections removes that
+        # ceiling. A bulk `counts_by_corpus()` on both corpus_files backends
+        # would collapse it into one query.
+        for col in file_corpora_repo().list_all():
             if allowed is not None and col["id"] not in allowed:
                 continue
             try:
@@ -3933,6 +3682,12 @@ async def catalog_semantics(
         metric_categories=metric_categories,
         metric_count=len(metrics),
         glossary_count=glossary_count,
+        # The door to /semantic-layer. Both pages are titled "Semantic layer"
+        # and this is the reachable one, so without the link a document with
+        # datasets and relationships but no metrics rendered as "there is no
+        # semantic layer here". Same gate /library's Definitions footer uses —
+        # a readable document, never this page's own metric/glossary counts.
+        has_semantic_models=_has_readable_semantic_model(user, conn, surface="/catalog/semantics"),
     )
     return templates.TemplateResponse(request, "catalog_semantics.html", ctx)
 
@@ -4070,6 +3825,7 @@ async def semantic_layer_detail(
     """
     from app.web.semantic_layer_view import (
         agnes_extension_payload,
+        dialect_skipped_count,
         is_imported,
         model_constraints,
         model_glossary,
@@ -4193,6 +3949,7 @@ async def semantic_layer_detail(
         relationships=relationships,
         glossary=glossary,
         counts=object_counts(model),
+        dialect_skipped_count=dialect_skipped_count(model),
     )
     return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
 
@@ -4309,10 +4066,16 @@ async def catalog_package_detail(
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
     # Admin bypass via is_user_admin; otherwise require a grant (any tier).
+    # The detail token is DISTINCT (same pattern as admin_elevation_paused)
+    # so error.html can answer with language and a request-access action
+    # instead of echoing a machine string. It carries the package NAME —
+    # the 403 already confirms existence (deliberate for this kind: packages
+    # 403, collections 404 — see the leak-sensitivity split), so naming it
+    # costs nothing and makes the copy-request text worth sending.
     if not (
         is_user_admin(user["id"], conn) or can_access(user["id"], ResourceType.DATA_PACKAGE.value, pkg["id"], conn)
     ):
-        raise HTTPException(status_code=403, detail="access_denied")
+        raise HTTPException(status_code=403, detail=f"package_not_shared:{pkg['name']}")
 
     # Telemetry: emit data_package.view (Section 9.2). source=browse|my-stack
     # passed as ?source=…; default 'direct' for typed/bookmarked navigation.
@@ -5938,21 +5701,25 @@ async def marketplace_listing(
     request: Request,
     user: dict = Depends(get_current_user),
 ):
-    import json as _json
-    from src.category_icons import all_paths
-    from app.instance_config import get_store_verification_enabled, get_value
+    """The Marketplace browse is folded into the Library.
 
-    curators_url = (get_value("marketplace", "curators_url") or "").strip()
-    ctx = _build_context(
-        request,
-        user=user,
-        category_icons_json=_json.dumps(all_paths()),
-        curators_url=curators_url,
-        # Off by default: an instance with no reviewer must not render the
-        # verification vocabulary at all (see get_store_verification_enabled).
-        store_verification_enabled=get_store_verification_enabled(),
-    )
-    return templates.TemplateResponse(request, "marketplace.html", ctx)
+    Its two tabs were Browse and My Stack — "everything there is" and "what I
+    have" — over store entities and curated plugins the Library already lists
+    in full (`store_entities_repo().list(visibility_status=['approved'])`, plus
+    every granted `marketplace_plugin`). That is the same list under a second
+    roof, and the tab pair is the same question the Library now asks of one
+    list: `?tab=my` maps to `scope=mine` (the In stack segment) and the
+    default browse tab to `scope=available` (the "Not in stack yet" filter),
+    so an old link lands where it meant to.
+
+    302 and the route stays registered, per the /corporate-memory, /apps and
+    /stack retirements. Every detail and sub-route is untouched —
+    `/marketplace/curated/{...}`, `/marketplace/flea/{id}`, the edit pages —
+    because this folds the browse SHELL, not the store.
+    """
+    tab = (request.query_params.get("tab") or "").strip()
+    target = "/library?scope=mine" if tab == "my" else "/library?scope=available"
+    return RedirectResponse(url=target, status_code=302)
 
 
 @router.get("/marketplace/flea/{entity_id}", response_class=HTMLResponse)
@@ -6831,6 +6598,32 @@ async def admin_package_detail(
     except Exception as e:  # noqa: BLE001
         logger.warning("package detail: could not compute delivery state: %s", e)
 
+    # ── Arrival context (?from=simulate&user=) ───────────────────────────
+    # The Simulate lens's "Share it →" lands here carrying WHO the admin came
+    # to fix. Resolved server-side to a name + their groups so the banner can
+    # say "Jane — Everyone, product-team" instead of echoing a uuid, and the
+    # back link returns to the preview with the same person still selected.
+    # Unknown/garbage ids resolve to None and the page renders normally.
+    preview_ctx = None
+    if request.query_params.get("from") == "simulate":
+        _puid = request.query_params.get("user") or ""
+        if _puid:
+            try:
+                _pu = users_repo().get_by_id(_puid)
+            except Exception:  # noqa: BLE001 — the banner is chrome, never a 500
+                _pu = None
+            if _pu:
+                try:
+                    _pgroups = list(user_group_members_repo().list_group_names_for_user(_puid))
+                except Exception:  # noqa: BLE001
+                    _pgroups = []
+                preview_ctx = {
+                    "user_id": _puid,
+                    "name": _pu.get("name") or _pu.get("email") or _puid,
+                    "groups": [g for g in _pgroups if g],
+                    "back_href": f"/admin/access?lens=simulate&user={_puid}",
+                }
+
     ctx = _build_context(
         request,
         user=user,
@@ -6842,6 +6635,7 @@ async def admin_package_detail(
         sharing=sharing,
         all_groups=all_groups,
         delivery=delivery,
+        preview_ctx=preview_ctx,
         newest_sync=newest_sync.isoformat() if newest_sync else None,
         newest_sync_age_minutes=(int((now - newest_sync).total_seconds() // 60) if newest_sync else None),
     )
@@ -7370,8 +7164,13 @@ def _source_inventory() -> dict:
         if conns_per_type.get(stype):
             continue  # a real connection of this type owns the card
         own_tables = unlinked_by_type.pop(stype, [])
+        # Computed once per iteration (and only actually calls the probe when
+        # `stype == "keboola"`, via short-circuit) so the keboola branch below
+        # can reuse the same boolean instead of calling `_keboola_credentialed()`
+        # a second time to decide whether the "Import" button gets to render.
+        keboola_credentialed = stype == "keboola" and _keboola_credentialed()
         if not own_tables and not (
-            (stype == "keboola" and _keboola_credentialed())
+            keboola_credentialed
             or (stype == "bigquery" and _bigquery_credentialed())
             or (stype == "snowflake" and _snowflake_credentialed())
             or (stype == "databricks" and _databricks_credentialed())
@@ -7379,7 +7178,29 @@ def _source_inventory() -> dict:
             continue
         did = f"derived:{stype}"
         by_conn[did] = own_tables
-        derived.append({"id": did, "source_type": stype, "derived": True, **meta})
+        row = {"id": did, "source_type": stype, "derived": True, **meta}
+        if stype == "keboola":
+            # The "Import as managed connection" button on this card needs
+            # these two values to POST straight to
+            # `/api/admin/source-connections` without a second round trip —
+            # see `_keboola_instance_config()`. `credentialed` gates the
+            # button itself: a stack_url with no working token anywhere has
+            # nothing to import, and rendering the button in that state
+            # created a connection with no credential and a badge that
+            # claimed otherwise.
+            row["stack_url"], row["token_env"] = _keboola_instance_config()
+            row["credentialed"] = keboola_credentialed
+            # `create_connection` rejects an unallowlisted `token_env` before
+            # anything else (`_reject_disallowed_token_env`) — a card can be
+            # credentialed via the generic env var or the instance vault
+            # while `data_source.keboola.token_env` is still some custom,
+            # unallowlisted name, in which case Import would 400 even though
+            # the card looks ready. Gate the button on this too rather than
+            # advertise a one-click path that dead-ends for that config.
+            from src.orchestrator_security import is_token_env_allowed
+
+            row["token_env_allowlisted"] = is_token_env_allowed(row["token_env"])
+        derived.append(row)
 
     try:
         states = {s["table_id"]: s for s in sync_state_repo().get_all_states()}
@@ -7619,6 +7440,24 @@ def _db_cap(key: str, default: int) -> int:
         return default
 
 
+def _keboola_instance_config() -> tuple[str, str]:
+    """The instance-level Keboola `stack_url` + `token_env`, however they got
+    there (`instance.yaml` or `/admin/server-config`).
+
+    Shared by `_keboola_credentialed()` (which only needs the boolean half)
+    and the derived Keboola card's "Import as managed connection" button
+    (`_source_inventory()`), which needs the actual values to POST to
+    `POST /api/admin/source-connections` without a second round trip.
+    """
+    from app.instance_config import get_value
+
+    stack_url = (get_value("data_source", "keboola", "stack_url", default="") or "").strip()
+    token_env = (
+        get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN") or "KEBOOLA_STORAGE_TOKEN"
+    ).strip()
+    return stack_url, token_env
+
+
 def _keboola_credentialed() -> bool:
     """Whether this instance has an instance-level Keboola stack URL + token
     — the pre-flight half of the same check
@@ -7633,26 +7472,21 @@ def _keboola_credentialed() -> bool:
     `_DERIVED_SOURCES` without a Keboola entry despite
     `app/connections_seed.py` seeding one on first boot only when both are
     already present.
-    """
-    from app.instance_config import get_value
 
-    stack_url = (get_value("data_source", "keboola", "stack_url", default="") or "").strip()
+    The 3-step fallback itself lives in
+    `app.datasource_secrets.keboola_instance_token` — shared with the
+    derived Keboola card's "Import as managed connection" vault-seeding
+    step (`app/api/admin_source_connections.py`), which also needs to know
+    WHICH of the three actually holds the value, not just whether one does.
+    """
+    stack_url, token_env = _keboola_instance_config()
     if not stack_url:
         return False
 
-    token_env = (
-        get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN") or "KEBOOLA_STORAGE_TOKEN"
-    ).strip()
-    if os.environ.get(token_env, "").strip():
-        return True
-    if os.environ.get("KEBOOLA_STORAGE_TOKEN", "").strip():
-        return True
-    try:
-        from app.datasource_secrets import datasource_secret
+    from app.datasource_secrets import keboola_instance_token
 
-        return bool((datasource_secret("KEBOOLA_STORAGE_TOKEN") or "").strip())
-    except Exception:
-        return False
+    value, _provenance = keboola_instance_token(token_env)
+    return value is not None
 
 
 def _orphan_reason(connection_id: str) -> str:
@@ -9176,7 +9010,7 @@ async def chat_page(
         return RedirectResponse("/")
     # Rail pre-conversation state = the Dashboard (issue #896): greeting,
     # the real composer, a "Using N knowledge sources and M capabilities
-    # from your Stack" context line, activity panels, and
+    # from your stack" context line, activity panels, and
     # guided task starters — rendered by chat.html's rail empty-state
     # blocks and hidden the moment a conversation starts. The counts are
     # the caller's ACTUAL Stack contents (same reads as the /stack page

@@ -78,7 +78,7 @@ Run the tests covering the code you touched, then the full suite — the same
 command CI runs:
 
 ```bash
-.venv/bin/pytest tests/ --tb=short -n auto -q
+.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
 ```
 
 Failures in code you touched: fix before pushing. Failures unrelated to your

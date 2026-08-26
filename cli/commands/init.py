@@ -56,6 +56,7 @@ from cli.lib.automode import (
     ensure_marketplace_trusted,
     marketplace_trust_entries,
     marketplace_trust_state,
+    prune_stale_loopback_declarations,
 )
 from cli.lib.commands import install_claude_commands
 from cli.lib.hooks import install_claude_hooks
@@ -315,6 +316,19 @@ def _maybe_declare_marketplace_trust(host: str, decision: Optional[bool], server
       the declaration was pre-empting.
     """
     settings_path = user_settings_path()
+
+    # Dead ephemeral ports go first, before any consent gate: every local
+    # dev-server restart mints a new 127.0.0.1:<port> "host", so the pairs
+    # written for previous ports piled up forever — each one blessing an
+    # address the OS will hand to whatever local process asks next. Removing
+    # this tool's own stale grants NARROWS trust, the opposite of the write
+    # the consent prompt exists for, so no path skips it — not even
+    # --no-trust-marketplace-host, which is a request for less trust.
+    pruned = prune_stale_loopback_declarations(settings_path, host)
+    if pruned:
+        typer.echo(
+            f"Removed stale auto-mode declarations for previous local ports from {settings_path}: " + ", ".join(pruned)
+        )
 
     if decision is False:
         typer.echo(f"Skipping the auto-mode trust declaration for {host} (--no-trust-marketplace-host).")
@@ -1060,9 +1074,13 @@ def init(
         # ------------------------------------------------------------------
         if claude_md.exists() and force:
             try:
+                from src.initial_workspace import _prune_backups, _unique_bak_path
+
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                backup_path = workspace / f"CLAUDE.md.bak.{ts}"
+                backup_path = _unique_bak_path(workspace / f"CLAUDE.md.bak.{ts}")
                 backup_path.write_bytes(claude_md.read_bytes())
+                # #1476: bound backup growth — keep only the most recent few.
+                _prune_backups(claude_md)
                 typer.echo(f"Backed up existing CLAUDE.md → {backup_path.name}")
             except OSError as exc:
                 typer.echo(

@@ -192,7 +192,7 @@ class TestBrowseAdminDataPackage:
     def test_required_grant_propagates_to_requirement_field(self, conn):
         """A required grant on one of the admin's groups must surface as
         ``requirement='required'`` so the macro renders the disabled
-        ``In stack (required)`` footer instead of an actionable Remove
+        ``In stack (automatic)`` footer instead of an actionable Remove
         button (which would 400 from /api/stack/unsubscribe).
 
         Regression: previously ``browse_admin`` passed an empty

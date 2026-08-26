@@ -4,11 +4,32 @@
 
 {% block content %}
 {# ds.button (Go home / Back) is auto-imported by base_ds. #}
+{# Two distinct-detail cases turn a machine 403 into a door (the pattern
+   `admin_elevation_paused` established below):
+   - `package_not_shared:<name>` — the caller found data that EXISTS but is
+     not granted to any of their groups. The raw token must not print; the
+     name it carries feeds the copy + the request-access action.
+   - `bridge` (context from _render_error) — a non-admin opened an admin
+     entity URL; the page it bridges to does its own grant check. #}
+{% set _not_shared = message and message.startswith('package_not_shared:') %}
+{% set _pkg_name = message.split(':', 1)[1] if _not_shared else None %}
 <div class="error-container">
     <div class="error-card">
         <div class="error-code">{{ code }}</div>
-        <h2 class="error-title">{{ title }}</h2>
-        {% if message %}
+        <h2 class="error-title">{% if _not_shared %}Not shared with you yet{% else %}{{ title }}{% endif %}</h2>
+        {% if _not_shared %}
+        <p class="error-message">
+            The data package <b>{{ _pkg_name }}</b> exists, but isn’t shared with
+            any of your groups. Your workspace admins can share it — it takes one
+            grant.
+        </p>
+        {% elif bridge %}
+        <p class="error-message">
+            That’s an admin page — a teammate probably copied their own URL.
+            You can’t open the admin workspace, but the package has a page for
+            you.
+        </p>
+        {% elif message %}
         <p class="error-message">{{ message }}</p>
         {% endif %}
         {% if path %}
@@ -45,6 +66,13 @@
                          href='/me/profile#admin-mode') }}
             {{ ds.button('Go home', variant='secondary',
                          href=url_for('index')) }}
+            {% elif _not_shared %}
+            {{ ds.button('Copy request for your admin', variant='primary',
+                         attrs='id="copy-access-request" data-pkg-name="' ~ (_pkg_name | e) ~ '"') }}
+            {{ ds.button('Back to Library', variant='secondary', href='/library') }}
+            {% elif bridge %}
+            {{ ds.button('Open ' ~ bridge.name ~ ' →', variant='primary', href=bridge.href) }}
+            {{ ds.button('Back to Library', variant='secondary', href='/library') }}
             {% else %}
             {{ ds.button('Go home', variant='primary',
                          href=url_for('index')) }}
@@ -54,5 +82,47 @@
         </div>
     </div>
 </div>
+
+{% if _not_shared %}
+<script>
+(function () {
+  'use strict';
+  var btn = document.getElementById('copy-access-request');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var name = btn.getAttribute('data-pkg-name') || 'this data package';
+    var text = 'Hi! Could you share the "' + name + '" data package with me in Agnes? ' +
+               'I hit its page but it isn’t granted to any of my groups yet.';
+    function done() {
+      var t = btn.textContent;
+      btn.textContent = 'Copied ✓';
+      setTimeout(function () { btn.textContent = t; }, 2200);
+    }
+    // No-clipboard fallback stays on the page (native dialogs are banned,
+    // #497 §1): reveal the text pre-selected so Ctrl/Cmd-C is the one step.
+    function reveal() {
+      var box = document.getElementById('copy-access-request-text');
+      if (!box) {
+        box = document.createElement('textarea');
+        box.id = 'copy-access-request-text';
+        box.readOnly = true;
+        box.rows = 3;
+        box.style.cssText = 'width:100%;margin-top:12px;font:inherit;';
+        btn.closest('.error-card').appendChild(box);
+      }
+      box.value = text;
+      box.hidden = false;
+      box.focus({ preventScroll: true });
+      box.select();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, reveal);
+    } else {
+      reveal();
+    }
+  });
+})();
+</script>
+{% endif %}
 
 {% endblock %}

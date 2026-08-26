@@ -68,6 +68,19 @@ REDIRECTED_UNDER_RAIL = {
     # StackResolver.browse() call, and `?stack=in_stack` is the toggle that
     # answers the question the page existed to answer.
     "/stack": "/library?stack=in_stack",
+    # The Catalog and the Marketplace browse shells. Both listed rows the
+    # Library already renders in full — every approved store entity, every
+    # granted data package / memory domain / recipe / curated plugin — sliced
+    # by kind tabs or a Browse-vs-My-Stack tab pair. That pair IS the Library's
+    # Scope segment, so each redirect arrives with its half selected.
+    #
+    # These two are why `Install from the marketplace` and `Add shared data &
+    # recipes` sat in the Library's "+ Add" menu: PR #1276 put them there to
+    # stop the pages being orphans after the rail retired their nav entries. The
+    # rows are gone now, and the fold is what makes their absence correct rather
+    # than a stranded surface.
+    "/catalog": "/library?scope=available",
+    "/marketplace": "/library?scope=available",
 }
 
 _ROUTE_RE = re.compile(r'@router\.get\("(/[^"{}]*)"[^)]*response_class=HTMLResponse')
@@ -215,18 +228,33 @@ def test_redirected_entries_really_redirect(seeded_app, monkeypatch):
         assert resp.headers["location"] == target
 
 
-def test_rail_replacement_paths_for_retired_entries_exist():
-    """The rail retired its Marketplace, Data Packages and Studio rows *onto*
-    the Library "+ Add" menu. That substitution only holds while the menu
-    really carries the links — this pins them so a Library toolbar refactor
-    can't silently strand live surfaces again."""
+def test_a_retired_browse_page_is_folded_not_stranded():
+    """A page the rail stopped linking needs a destination, not a menu row.
+
+    This used to require `library.html` to carry `href="/marketplace"` and
+    `href="/catalog"`, because the "+ Add" menu was the only thing linking
+    them: the rail had retired both nav entries and PR #1276 put the links in
+    that menu to stop two live pages being orphans.
+
+    Both are now folded INTO the Library (`REDIRECTED_UNDER_RAIL`), which is
+    the durable answer the merge spec (2026-08-12) already gave for
+    /corporate-memory, /apps and /stack — so an inbound link from the very
+    page they redirect to would be a loop. What must hold is the weaker, truer
+    thing: every retired browse page either redirects somewhere real, or is
+    still linked. `test_redirected_entries_really_redirect` above proves the
+    redirect end; this proves nothing is left in neither state.
+    """
     library = LIBRARY.read_text()
     for href in ("/marketplace", "/catalog"):
-        assert f'href="{href}"' in library, (
-            f"library.html no longer links {href}. Under the rail chrome the "
-            "Library '+ Add' menu is that page's only entry point (see the IA "
-            "note in _app_rail.html) — restore the menu item or give the rail "
-            "a nav entry."
+        folded = href in REDIRECTED_UNDER_RAIL
+        linked = f'href="{href}"' in library
+        assert folded or linked, (
+            f"{href} is neither folded into the Library nor linked from it — "
+            "it is reachable only by typing the URL. Add it to "
+            "REDIRECTED_UNDER_RAIL with its target, or link it."
+        )
+        assert not (folded and linked), (
+            f"{href} both redirects to the Library and is linked from it — the link is a loop through a 302. Drop one."
         )
 
 

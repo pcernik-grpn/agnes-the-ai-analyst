@@ -124,16 +124,15 @@ class TestModeResolution:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
     monkeypatch.setattr(kv, "stack_url", lambda: "https://connection.example.com")
     monkeypatch.setattr(kv, "configured_project_id", lambda: None)
     monkeypatch.setattr(kv, "client_id", lambda: "cid")
     monkeypatch.setattr(kv, "client_secret", lambda: "csecret")
-    from app.main import create_app
 
-    return TestClient(create_app())
+    return TestClient(shared_app)
 
 
 class TestMultiProjectCallback:

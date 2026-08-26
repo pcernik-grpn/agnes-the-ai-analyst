@@ -30,15 +30,19 @@ def _resp(status_code=200, json_data=None, text=""):
 def _make_local_db(tmp_config):
     """Create a local DuckDB with a sample table for exploration tests."""
     import duckdb
+
     db_dir = tmp_config / "local" / "user" / "duckdb"
     db_dir.mkdir(parents=True)
     conn = duckdb.connect(str(db_dir / "analytics.duckdb"))
     conn.execute("CREATE TABLE orders (id INTEGER, amount DOUBLE, status VARCHAR)")
-    conn.executemany("INSERT INTO orders VALUES (?, ?, ?)", [
-        (1, 99.5, "shipped"),
-        (2, 200.0, "pending"),
-        (3, 50.0, "shipped"),
-    ])
+    conn.executemany(
+        "INSERT INTO orders VALUES (?, ?, ?)",
+        [
+            (1, 99.5, "shipped"),
+            (2, 200.0, "pending"),
+            (3, 50.0, "shipped"),
+        ],
+    )
     conn.close()
     return db_dir / "analytics.duckdb"
 
@@ -53,17 +57,31 @@ class TestExploreLocal:
         assert "3" in result.output  # row count
 
     def test_explore_no_db(self, tmp_config):
-        """Exploring without local DB exits with guidance."""
-        result = runner.invoke(app, ["explore", "orders"])
-        assert result.exit_code == 1
-        assert "not found" in result.output.lower() or "sync" in result.output.lower()
+        """Exploring without local DB now falls back to the server under
+        the default --scope auto (command-UX standard: default = auto,
+        not local-only) instead of just failing. Mocked like every other
+        server-path test in this file / test_explore_scope_flag.py — an
+        unmocked call here would hit a real (unreachable in CI) server and
+        surface as an uncaught AgnesTransportError instead of exercising
+        the command's own behavior."""
+        profile = {"table": "orders", "row_count": 42}
+        with patch("cli.client.api_get", return_value=_resp(200, profile)) as mock_get:
+            result = runner.invoke(app, ["explore", "orders"])
+        assert result.exit_code == 0, result.output
+        assert "[scope] no local data yet" in result.output
+        assert "running server-side" in result.output
+        mock_get.assert_called_once_with("/api/catalog/profile/orders")
 
     def test_explore_missing_table(self, tmp_config):
-        """Exploring a non-existent table exits with error."""
+        """A local DB exists but lacks the requested table: --scope auto
+        falls back to the server rather than just listing local tables."""
         _make_local_db(tmp_config)
-        result = runner.invoke(app, ["explore", "nonexistent_xyz"])
+        with patch("cli.client.api_get", return_value=_resp(404, {"detail": "Not found"}, "Not found")) as mock_get:
+            result = runner.invoke(app, ["explore", "nonexistent_xyz"])
         assert result.exit_code == 1
-        assert "not found" in result.output.lower() or "nonexistent" in result.output.lower()
+        assert "[scope] 'nonexistent_xyz' not found locally" in result.output
+        assert "running server-side" in result.output
+        mock_get.assert_called_once_with("/api/catalog/profile/nonexistent_xyz")
 
     def test_explore_json_flag(self, tmp_config):
         """--json flag produces valid JSON with table info.

@@ -7,6 +7,7 @@ tests/test_chat_persistence.py) are:
   - ``_ensure_schema(conn)``         to migrate it to the current version
 """
 
+import json
 from pathlib import Path
 
 import duckdb
@@ -121,6 +122,25 @@ def test_prepare_session_dir_without_profile_symlinks_claude_md(workdir_mgr: Wor
     workdir_mgr.ensure_user_workdir("u@x")
     sdir = workdir_mgr.prepare_session_dir("u@x", "chat_noprof")
     assert (sdir / "CLAUDE.md").is_symlink()
+
+
+def test_prepare_session_dir_replaces_dangling_symlinks(workdir_mgr: WorkdirManager):
+    """Regression: re-preparing a session dir that holds a DANGLING symlink
+    (e.g. created under a relative DATA_DIR, whose target resolves against the
+    link's own directory) must replace it, not die with FileExistsError —
+    ``exists()`` follows the link and reports False, so the recreate fired on
+    a path that was already occupied. Hit live on the post-restart resume
+    path (`_resume_from_row` → prepare_session_dir)."""
+    workdir_mgr.ensure_user_workdir("u@x")
+    sdir = workdir_mgr.prepare_session_dir("u@x", "chat_dangle")
+    link = sdir / "CLAUDE.md"
+    assert link.is_symlink()
+    link.unlink()
+    link.symlink_to("data/nonexistent/CLAUDE.md")  # dangling
+    assert link.is_symlink() and not link.exists()
+    sdir2 = workdir_mgr.prepare_session_dir("u@x", "chat_dangle")  # must not raise
+    assert sdir2 == sdir
+    assert (sdir / "CLAUDE.md").exists()  # re-pointed at the real workspace file
 
 
 def test_purge_user_removes_root(workdir_mgr: WorkdirManager):
@@ -338,3 +358,156 @@ class TestTurningTheFeatureBackOnRestoresTheSkill:
         monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "1")
         _reconcile_feature_gated_skills(ws, template)
         assert (ws / ".claude" / "skills" / "agnes-data-apps-extras" / "SKILL.md").read_text(encoding="utf-8") == "x"
+
+
+# ---------------------------------------------------------------------------
+# Marketplace delivery (#1552) — the workspace half of
+# `chat.bootstrap_marketplace`. The server writes the caller's filtered
+# marketplace as a directory here and enables the plugins for the project; the
+# runner then installs from that directory OFFLINE inside the sandbox. What
+# reaches the agent is real plugins — skills, agents, commands, hooks, MCP
+# servers — not just skills.
+# ---------------------------------------------------------------------------
+
+
+def _fake_export(names: "list[str]", *, boom: bool = False):
+    """Stand-in for `app/chat/marketplace_payload.export_marketplace_tree` —
+    the injected seam. Writes a minimal but real marketplace layout so the
+    assertions below are about the workspace contract, not the packager."""
+
+    def _export(_email: str, dest: Path) -> "list[str]":
+        if boom:
+            raise RuntimeError("marketplace export exploded")
+        import shutil as _shutil
+
+        if dest.exists():
+            _shutil.rmtree(dest)
+        if not names:
+            return []
+        (dest / ".claude-plugin").mkdir(parents=True)
+        (dest / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps({"name": "agnes", "plugins": [{"name": n, "source": f"./plugins/{n}"} for n in names]}),
+            encoding="utf-8",
+        )
+        for n in names:
+            (dest / "plugins" / n / "commands").mkdir(parents=True)
+            (dest / "plugins" / n / "commands" / f"{n}-ship.md").write_text("---\n---\nBody.", encoding="utf-8")
+        return list(names)
+
+    return _export
+
+
+def _mgr(tmp_path: Path, export) -> WorkdirManager:
+    conn = duckdb.connect(":memory:")
+    _ensure_schema(conn)
+    bundled = tmp_path / "bundled"
+    (bundled / ".claude").mkdir(parents=True)
+    (bundled / "CLAUDE.md").write_text("default")
+    (bundled / ".claude" / "settings.json").write_text("{}")
+    return WorkdirManager(
+        data_dir=tmp_path / "data",
+        repo=ChatRepository(conn),
+        bundled_template_dir=bundled,
+        server_url="https://agnes.example",
+        agnes_version="0.55.0",
+        get_marketplace_sha=lambda: "mkt-sha-1",
+        get_template_status=lambda: None,
+        export_marketplace=export,
+    )
+
+
+def _settings(ws: Path) -> dict:
+    return json.loads((ws / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+
+def test_the_marketplace_tree_lands_in_the_workspace(tmp_path: Path):
+    """The runner installs from this directory offline — no PAT, no network,
+    which is exactly what the in-sandbox clone could never do."""
+    mgr = _mgr(tmp_path, _fake_export(["kbl"]))
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    assert (ws / ".claude" / "agnes-marketplace" / ".claude-plugin" / "marketplace.json").is_file()
+    assert (ws / ".claude" / "agnes-marketplace" / "plugins" / "kbl" / "commands" / "kbl-ship.md").is_file()
+
+
+def test_stack_plugins_are_enabled_for_the_project(tmp_path: Path):
+    """`claude plugin install --scope project` records the install in the CLI's
+    HOME registry but does NOT enable it here — without this the plugins load
+    disabled and nothing they ship is reachable."""
+    mgr = _mgr(tmp_path, _fake_export(["kbl", "other"]))
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    assert _settings(ws)["enabledPlugins"] == {"kbl@agnes": True, "other@agnes": True}
+
+
+def test_a_plugin_that_left_the_stack_is_disabled_and_removed(tmp_path: Path):
+    names = ["kbl"]
+    mgr = _mgr(tmp_path, _fake_export(names))
+
+    ws = mgr.ensure_user_workdir("u@x")
+    assert "kbl@agnes" in _settings(ws)["enabledPlugins"]
+
+    names.clear()  # unsubscribed from everything
+    mgr.ensure_user_workdir("u@x")
+
+    assert _settings(ws)["enabledPlugins"] == {}
+    assert not (ws / ".claude" / "agnes-marketplace").exists()
+
+
+def test_another_marketplaces_plugin_is_never_touched(tmp_path: Path):
+    """Only `@agnes` keys are ours to prune. A user who installed a plugin from
+    the official marketplace by hand must keep it."""
+    mgr = _mgr(tmp_path, _fake_export(["kbl"]))
+    ws = mgr.ensure_user_workdir("u@x")
+
+    settings_path = ws / ".claude" / "settings.json"
+    cfg = _settings(ws)
+    cfg["enabledPlugins"]["superpowers@claude-plugins-official"] = True
+    settings_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert _settings(ws)["enabledPlugins"]["superpowers@claude-plugins-official"] is True
+
+
+def test_enablement_is_idempotent(tmp_path: Path):
+    """The settings file rides the workspace upload on every spawn; rewriting an
+    unchanged file would churn its mtime for nothing."""
+    mgr = _mgr(tmp_path, _fake_export(["kbl"]))
+    ws = mgr.ensure_user_workdir("u@x")
+    first = (ws / ".claude" / "settings.json").stat().st_mtime_ns
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert (ws / ".claude" / "settings.json").stat().st_mtime_ns == first
+
+
+def test_an_empty_stack_writes_no_marketplace(tmp_path: Path):
+    mgr = _mgr(tmp_path, _fake_export([]))
+
+    ws = mgr.ensure_user_workdir("u@x")
+
+    assert not (ws / ".claude" / "agnes-marketplace").exists()
+    assert _settings(ws).get("enabledPlugins", {}) == {}
+
+
+def test_a_failing_export_does_not_deny_the_session(tmp_path: Path):
+    mgr = _mgr(tmp_path, _fake_export(["kbl"], boom=True))
+
+    ws = mgr.ensure_user_workdir("u@x")  # must not raise
+
+    assert (ws / "CLAUDE.md").exists()
+
+
+def test_no_marketplace_wiring_leaves_the_workspace_alone(tmp_path: Path):
+    """`export_marketplace=None` is "this instance has no marketplace wiring",
+    not "the stack is empty" — it must not prune anything."""
+    mgr = _mgr(tmp_path, None)
+    ws = mgr.ensure_user_workdir("u@x")
+    (ws / ".claude" / "settings.json").write_text(json.dumps({"enabledPlugins": {"x@agnes": True}}), encoding="utf-8")
+
+    mgr.ensure_user_workdir("u@x")
+
+    assert _settings(ws)["enabledPlugins"] == {"x@agnes": True}

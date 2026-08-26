@@ -41,6 +41,7 @@ from cli.commands.query import query_command
 from cli.commands.status import status_app
 from cli.commands.admin import admin_app
 from cli.commands.diagnose import diagnose_app
+from cli.commands.doctor import doctor_app
 from cli.commands.skills import skills_app
 from cli.commands.self_upgrade import self_upgrade_app
 from cli.commands.setup import setup_app
@@ -316,6 +317,7 @@ app.command("query")(query_command)
 app.add_typer(status_app, name="status")
 app.add_typer(admin_app, name="admin")
 app.add_typer(diagnose_app, name="diagnose")
+app.add_typer(doctor_app, name="doctor")
 app.add_typer(skills_app, name="skills")
 app.add_typer(self_upgrade_app, name="self-upgrade")
 # Hidden verb alias: `agnes self-update` resolves to the SAME callback as

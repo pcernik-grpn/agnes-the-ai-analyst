@@ -20,6 +20,11 @@
          event handlers (click/change/keydown/DOMContentLoaded) — never at
          top-level parse time — by which point the globals are defined. -->
     <script src="{{ static_url('js/modal.js') }}"></script>
+    <!-- Shared confirm-and-retry for the connection-repoint 409. Loaded here,
+         not per page, because all four surfaces that write a data_source
+         connection need it and only one of them owns a dialog. Depends on
+         modal.js above (falls back to window.confirm if it is absent). -->
+    <script src="{{ static_url('js/connection_repoint.js') }}"></script>
     <script>
       // v54 global undo-toast — surfaced by admin delete handlers. The
       // toast carries an Undo button that POSTs to a restore URL, so
@@ -327,7 +332,7 @@
         if (!document.getElementById('adminMenu')) return;
         const ITEMS = [
           { label: 'Tables / Data packages',      hint: 'admin · g t',  href: '/admin/tables' },
-          { label: 'Corporate Memory',            hint: 'admin · g m',  href: '/admin/corporate-memory' },
+          { label: 'Corporate memory',            hint: 'admin · g m',  href: '/admin/corporate-memory' },
           { label: 'Memory · Review queue',       hint: 'admin',        href: '/admin/corporate-memory#review' },
           { label: 'Memory · All items',          hint: 'admin',        href: '/admin/corporate-memory#all' },
           { label: 'Memory · Domains',            hint: 'admin',        href: '/admin/corporate-memory#domains' },
@@ -339,7 +344,7 @@
           { label: 'Activity / Audit log',        hint: 'admin · g l',  href: '/admin/activity' },
           { label: 'Telemetry',                   hint: 'admin',        href: '/admin/telemetry' },
           { label: 'Sessions',                    hint: 'admin',        href: '/admin/sessions' },
-          { label: 'Curated Marketplaces',        hint: 'admin · g c',  href: '/admin/marketplaces' },
+          { label: 'Curated marketplaces',        hint: 'admin · g c',  href: '/admin/marketplaces' },
           {% if can_studio %}
           { label: 'Studio',                       hint: 'authoring',    href: '/admin/studio' },
           { label: 'Studio · Data package',       hint: 'authoring',    href: '/admin/studio/data-package' },
@@ -351,8 +356,8 @@
           { label: 'Studio · Suggestions queue',  hint: 'admin',        href: '/admin/studio/suggestions' },
           {% endif %}
           { label: 'Tokens',                      hint: 'admin · g k',  href: '/admin/tokens' },
-          { label: 'Moderation & Trust',          hint: 'admin · g v',  href: '/admin/store' },
-          { label: 'Flea Submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
+          { label: 'Moderation & trust',          hint: 'admin · g v',  href: '/admin/store' },
+          { label: 'Flea submissions',            hint: 'admin · g r',  href: '/admin/store/submissions' },
           { label: 'Prompts',                     hint: 'admin',        href: '/admin/prompts' },
           { label: '— User-facing —',             hint: 'separator',    href: null },
           { label: 'Catalog',                     hint: 'user',         href: '/catalog' },

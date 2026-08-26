@@ -53,7 +53,7 @@ class TestStackList:
         assert args[0] == "/api/stack"
         assert kwargs["params"] == {"type": "data_package"}
         assert "Sales" in result.output
-        assert "available" in result.output
+        assert "optional" in result.output
 
     def test_list_without_type_fetches_both(self):
         with patch(

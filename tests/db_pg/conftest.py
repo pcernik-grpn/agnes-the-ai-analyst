@@ -19,6 +19,7 @@ process per test, with equivalent observable behavior.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from typing import Iterator
@@ -105,7 +106,16 @@ def _start_embedded() -> Iterator[str]:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _start_pgserver() -> Iterator[str]:
+def _start_dedicated_pgserver() -> Iterator[str]:
+    """A private, throwaway Postgres for one fixture — the pre-sharing behavior.
+
+    ``_start_pgserver`` below now shares ONE server across all xdist workers of
+    a run, which is right for the ~2.7k contract tests but wrong for the few
+    tests that need a server nobody else has touched: naming a database that
+    provably does not exist yet, or counting connections against a dsn that a
+    peer's warm DuckLake attach could otherwise be pooling. Those keep this
+    dedicated path, and pay the initdb, deliberately.
+    """
     import tempfile
     from pathlib import Path
 
@@ -116,26 +126,9 @@ def _start_pgserver() -> Iterator[str]:
     tmpdir = tempfile.mkdtemp(prefix="agnes-pgserver-")
     server = None
     try:
-        # cleanup_mode='stop' (#1362): cleanup() then actually runs
-        # `pg_ctl -w … stop` (graceful, waited, terminate/kill fallback) and
-        # pgserver's own atexit handler becomes a real second net. With the
-        # previous ``None``, cleanup() returned before the stop path and clean
-        # runs only shut the postmaster down via PostgreSQL's PANIC on the
-        # rmtree'd pidfile ~15 s later.
         server = pgserver.get_server(tmpdir, cleanup_mode="stop")
-        # Owner sentinel (#1362): records which pytest process created this
-        # data dir. A hard-killed run (SIGKILL, OOM) leaks a live postmaster;
-        # the reaper uses this file to tell that orphan (owner dead → stop +
-        # reap) from a concurrent worktree session's live Postgres (owner
-        # alive → never touch). Written AFTER get_server — initdb insists on
-        # an empty directory — but inside this try, so a failed write (ENOSPC
-        # is exactly the scenario this work is about) still stops the
-        # just-started postmaster in the finally (Devin Review on #1367).
         (Path(tmpdir) / OWNER_SENTINEL).write_text(str(os.getpid()), encoding="utf-8")
-        # pgserver returns a unix-socket URI; rewrite to psycopg dialect.
-        raw_uri = server.get_uri()
-        url = raw_uri.replace("postgresql://", "postgresql+psycopg://", 1)
-        yield url
+        yield server.get_uri().replace("postgresql://", "postgresql+psycopg://", 1)
     finally:
         if server is not None:
             try:
@@ -145,26 +138,102 @@ def _start_pgserver() -> Iterator[str]:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _reap_orphaned_pgserver_data_dirs() -> None:
-    """Best-effort removal of ``agnes-pgserver-*`` dirs orphaned by hard-killed runs.
+def _start_pgserver(testrun_uid: str, worker_id: str) -> Iterator[str]:
+    """Boot (or attach to) ONE Postgres shared by every xdist worker in this run.
 
-    A run killed hard (SIGKILL, OOM, disk full) never reaches
-    ``_start_pgserver``'s ``finally``, leaving ~300 MB data dirs — and their
-    still-running postmasters — in $TMPDIR forever. Reap them at session
-    start; concurrent worktree sessions are protected by the reaper's
-    owner-sentinel + postmaster identity checks and minimum-age guard
-    (#1362). Under xdist only gw0 scans — the reap is global, one worker
-    suffices.
+    ``_pg_url`` is session-scoped, but under pytest-xdist each worker process
+    runs its OWN session — so the previous ``mkdtemp()`` per worker meant
+    ``-n auto`` booted one full Postgres PER CORE. Measured on a 14-core
+    laptop: 8+ concurrent postmasters, each with a 300-640 MB data dir, one
+    initdb apiece, and a matching pile of orphans whenever a run was killed
+    (10 dirs / 4.1 GB observed).
+
+    pgserver already supports exactly what is wanted here: ``get_server()``
+    takes an interprocess lock, calls an idempotent ``ensure_postgres_running``,
+    and refcounts holders in ``.handle_pids.json``, stopping the postmaster
+    when the LAST handle closes. It was never given the chance, because every
+    worker passed a different path. Keying the data dir on xdist's
+    ``testrun_uid`` (identical across all workers of one run, fresh for the
+    next) turns N servers into one, and ``cleanup_mode='stop'`` still shuts it
+    down once the final worker exits.
+
+    Isolation is preserved by giving each worker its OWN DATABASE on that
+    shared server, because the per-test ``_drop_user_schema`` drops ``public``
+    and workers would otherwise drop it out from under each other. A separate
+    database is a stronger boundary than the separate schema they had before.
+
+    The checkout token keeps two git worktrees from ever selecting the same
+    data dir, matching the DATA_DIR scheme in the root conftest.
     """
-    if os.environ.get("PYTEST_XDIST_WORKER", "gw0") != "gw0":
-        return
     import tempfile
     from pathlib import Path
 
-    from tests.db_pg.pgserver_reaper import reap_orphaned_pgserver_dirs
+    import pixeltable_pgserver as pgserver
+    import sqlalchemy as _sa
 
-    reap_orphaned_pgserver_dirs(Path(tempfile.gettempdir()))
+    from tests.db_pg.pgserver_reaper import OWNER_SENTINEL
+
+    checkout_token = hashlib.sha256(str(Path(__file__).resolve().parents[2]).encode()).hexdigest()[:8]
+    pgdata = Path(tempfile.gettempdir()) / f"agnes-pgserver-{checkout_token}-{testrun_uid}"
+    pgdata.mkdir(parents=True, exist_ok=True)
+
+    server = None
+    try:
+        # Idempotent + interprocess-locked: the first worker to arrive runs
+        # initdb and starts the postmaster, the rest attach to it.
+        server = pgserver.get_server(pgdata, cleanup_mode="stop")
+        # Owner sentinel (#1362) for the reaper. Under a shared server the
+        # sentinel must name a process that outlives any single worker, so it
+        # records the xdist CONTROLLER (our parent) when we are a worker.
+        # Writing our own short-lived worker PID would make the dir look
+        # orphaned the moment that worker exited.
+        owner_pid = os.getppid() if worker_id != "master" else os.getpid()
+        try:
+            (pgdata / OWNER_SENTINEL).write_text(str(owner_pid), encoding="utf-8")
+        except OSError:
+            pass  # a peer worker wrote it microseconds ago; either value is fine
+
+        raw_uri = server.get_uri()
+        admin_url = raw_uri.replace("postgresql://", "postgresql+psycopg://", 1)
+
+        # Per-worker database on the shared server. `master` is the no-xdist
+        # case and keeps the default database.
+        if worker_id == "master":
+            yield admin_url
+        else:
+            dbname = f"agnes_{worker_id}"
+            admin = _sa.create_engine(admin_url, future=True, isolation_level="AUTOCOMMIT")
+            try:
+                with admin.connect() as conn:
+                    # CREATE DATABASE has no IF NOT EXISTS; a leftover from a
+                    # reused uid would otherwise abort the worker.
+                    exists = conn.execute(
+                        _sa.text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": dbname}
+                    ).scalar()
+                    if not exists:
+                        conn.execute(_sa.text(f'CREATE DATABASE "{dbname}"'))
+            finally:
+                admin.dispose()
+            yield server.get_uri(database=dbname).replace("postgresql://", "postgresql+psycopg://", 1)
+    finally:
+        if server is not None:
+            try:
+                # Releases THIS process's handle. pgserver stops the postmaster
+                # only when the last worker's handle goes away.
+                server.cleanup()
+            except Exception:
+                pass
+        # Deliberately NOT rmtree'd here: a peer worker may still be using the
+        # shared dir. The last handle's cleanup stops the server, and the
+        # sessionstart reaper in the root conftest removes the directory once
+        # its owner is gone.
+
+
+# The orphaned-pgserver sweep used to live here as a session autouse fixture,
+# which meant it only ever ran for developers who invoked `tests/db_pg`. It now
+# runs from the root conftest's `pytest_sessionstart` for EVERY invocation of
+# the suite (see `_sweep_leaked_scratch` there) — the leak this guards against
+# is created by this package but suffered by every later run on the machine.
 
 
 @pytest.fixture(scope="session")
@@ -174,14 +243,18 @@ def pg_backend() -> str:
 
 
 @pytest.fixture(scope="session")
-def _pg_url(pg_backend) -> Iterator[str]:
-    """Boot a Postgres (once per session) and yield its SQLAlchemy URL."""
+def _pg_url(pg_backend, testrun_uid, worker_id) -> Iterator[str]:
+    """Boot a Postgres (once per RUN, not per worker) and yield its URL.
+
+    ``testrun_uid`` and ``worker_id`` come from pytest-xdist and are defined
+    even without ``-n`` (uid random per run, worker_id ``"master"``).
+    """
     if pg_backend == "container":
         yield from _start_container()
     elif pg_backend == "embedded":
         yield from _start_embedded()
     elif pg_backend == "pgserver":
-        yield from _start_pgserver()
+        yield from _start_pgserver(testrun_uid, worker_id)
     else:
         raise ValueError(f"unknown backend {pg_backend!r}")
 

@@ -9,8 +9,7 @@ Stdout: JSON lines. Outbound types: runner_ready, token, tool_call,
         approval_request / approval_resolved (ApprovalGate round-trip),
         question_request / question_resolved (QuestionGate round-trip).
 
-Env (set by ChatManager via the sandbox provider — under v1 the
-E2BProvider passes these through ``AsyncSandbox.create(envs=...)``):
+Env (set by ChatManager via the sandbox provider's spawn env):
 - AGNES_SESSION_ID, AGNES_USER_EMAIL, AGNES_SERVER, AGNES_TOKEN
 - AGNES_DAILY_BUDGET_USD, AGNES_PER_TOOL_CALL_SECONDS
 
@@ -39,7 +38,7 @@ if TYPE_CHECKING:  # names for annotations only — no runtime import (see below
     from app.chat.relay import Relay
 
 # NOTE: `app.chat.relay` is intentionally NOT imported at module level. This
-# file runs as a standalone script (`python3 /work/runner.py`) inside the E2B
+# file runs as a standalone script (`python3 /work/runner.py`) inside the
 # sandbox, where the `app` package does not exist until `_install_agnes_cli()`
 # pip-installs the uploaded wheel. A module-level `from app.chat.relay import
 # Relay` crashed the runner at interpreter startup with `ModuleNotFoundError:
@@ -56,7 +55,7 @@ if TYPE_CHECKING:  # names for annotations only — no runtime import (see below
 _relay: "Relay | None" = None
 
 # Directory the agnes CLI wheel is staged in by ChatManager at spawn
-# (e2b_workspace_sync.upload_agnes_wheel keeps the wheel's PEP 427 filename).
+# (sandbox_staging.stage_agnes_wheel keeps the wheel's PEP 427 filename).
 # Module-level so tests can point it at a temp dir.
 _SANDBOX_WHEEL_DIR = "/tmp/agnes-cli"
 # ``.ready`` sentinel the manager writes after staging the wheel. The runner
@@ -81,7 +80,7 @@ _WORKSPACE_WAIT_SECONDS = 180
 # post-restart spawn, cross-gateway takeover). Appended to the agent's
 # system prompt at boot so the conversation stays coherent — including the
 # assistant's own earlier answers. Mirrors
-# app/chat/e2b_workspace_sync.SANDBOX_CONTEXT_RESTORE (this file runs
+# app/chat/sandbox_staging.SANDBOX_CONTEXT_RESTORE (this file runs
 # standalone inside the sandbox, so the path is duplicated by design, like
 # _SANDBOX_WHEEL_DIR above). Module-level so tests can point it elsewhere.
 _CONTEXT_RESTORE_PATH = "/tmp/agnes-context.md"
@@ -579,7 +578,7 @@ def _install_agnes_cli() -> None:
     - ``--no-deps``: every runtime dep is already in the template image;
       reinstalling the tree would add seconds to every spawn.
     - NO ``--user``: the console script must land in ``/usr/local/bin`` (the
-      e2b base image chmods ``/usr/local`` 777, so the non-root sandbox
+      sandbox base image chmods ``/usr/local`` 777, so the non-root sandbox
       ``user`` can write there). A ``--user`` install lands ``agnes`` in
       ``~/.local/bin``, which is NOT on the PATH the agent's Bash tool runs
       with — Claude Code's Bash tool resets PATH to a system default
@@ -728,39 +727,78 @@ def _agnes_mcp_servers() -> dict:
     }
 
 
-def _bootstrap_marketplace(workdir: str) -> None:
-    """Install the user's RBAC-filtered Agnes marketplace plugins (skills)
-    into this session's project so the agent can use them.
+def _register_workspace_marketplace(workdir: Path) -> None:
+    """Install the workspace's shipped marketplace plugins into this project.
 
-    Runs the same ``agnes refresh-marketplace --bootstrap`` the analyst
-    workspace runs at first init: it clones the per-user marketplace bare repo
-    (PAT-gated, from AGNES_SERVER), registers it with the in-sandbox ``claude``
-    CLI (``claude plugin marketplace add``), and enables the plugins in the
-    project (cwd). Combined with ``setting_sources=["project"]`` on the SDK
-    client, the agent then sees the plugin skills (e.g. ``keboola-howto``).
+    The server wrote the caller's RBAC-filtered marketplace as a plain directory
+    inside the workspace (``app/chat/marketplace_payload.py``); Claude Code
+    registers a directory as a marketplace and installs from it with no network
+    access at all:
 
-    Without this the sandbox only has Claude Code's built-in skills — the
-    synced marketplace is invisible. Best-effort and bounded: a failure (no
-    token, network, claude CLI quirk) leaves the agent on built-in skills only
-    rather than blocking the session; output is routed to stderr so it never
-    corrupts the stdout JSON-frame protocol.
+        claude plugin marketplace add <workspace>/.claude/agnes-marketplace
+        claude plugin install <name>@agnes --scope project
+
+    Both are needed. ``marketplace add`` records the source in the CLI's HOME
+    settings and ``plugin install`` records the install in its HOME registry —
+    HOME is fresh in every sandbox, so this runs per spawn even though the
+    workspace persists. The project-level ``enabledPlugins`` half is already in
+    the workspace settings the server wrote, which is what makes the plugins
+    load rather than sit installed-but-disabled.
+
+    ``--scope user``, deliberately, even though this is conceptually a
+    per-project install: ``--scope project`` writes ``enabledPlugins`` into
+    ``<cwd>/.claude/settings.json``, and in a session directory that path is a
+    SYMLINK to the shared workspace — which the CLI refuses outright
+    (``SymlinkWriteRefusedError``), so every install failed and no plugin
+    loaded. User scope has no such write, and in a sandbox it means exactly the
+    same thing: HOME is created fresh for this session and thrown away with it.
+
+    Best-effort and bounded, like every other spawn-time convergence: a failure
+    costs the session its marketplace plugins, never the session. Output goes to
+    stderr so it cannot corrupt the stdout frame protocol.
     """
     from shutil import which
 
-    if which("agnes") is None:
+    from app.chat.marketplace_payload import MARKETPLACE_NAME, MARKETPLACE_TREE_SUBDIR
+
+    tree = workdir / MARKETPLACE_TREE_SUBDIR
+    manifest = tree / ".claude-plugin" / "marketplace.json"
+    if not manifest.is_file():
+        # No stack plugins for this user, or the operator turned delivery off.
+        return
+    claude = which("claude")
+    if claude is None:
+        print("marketplace: no `claude` on PATH; skipping plugin registration", file=sys.stderr, flush=True)
+        return
+
+    def _run(args: list[str], label: str) -> bool:
+        try:
+            result = subprocess.run(
+                [claude, *args],
+                cwd=str(workdir),
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stderr.fileno(),
+                stderr=sys.stderr.fileno(),
+                check=False,
+                timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 — non-fatal; agent still runs
+            print(f"marketplace: {label} failed: {exc}", file=sys.stderr, flush=True)
+            return False
+        if result.returncode != 0:
+            print(f"marketplace: {label} exited {result.returncode}", file=sys.stderr, flush=True)
+            return False
+        return True
+
+    if not _run(["plugin", "marketplace", "add", str(tree)], "marketplace add"):
         return
     try:
-        subprocess.run(
-            ["agnes", "refresh-marketplace", "--bootstrap"],
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            stdout=sys.stderr.fileno(),
-            stderr=sys.stderr.fileno(),
-            check=False,
-            timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001 — non-fatal; agent still runs
-        print(f"marketplace bootstrap failed: {exc}", file=sys.stderr, flush=True)
+        names = [p["name"] for p in json.loads(manifest.read_text(encoding="utf-8")).get("plugins", [])]
+    except (OSError, ValueError, TypeError):
+        print("marketplace: shipped manifest is unreadable; skipping installs", file=sys.stderr, flush=True)
+        return
+    for name in names:
+        _run(["plugin", "install", f"{name}@{MARKETPLACE_NAME}", "--scope", "user"], f"install {name}")
 
 
 async def _dispatch_frame(frame: dict, queue: "asyncio.Queue[dict]") -> None:
@@ -1000,7 +1038,7 @@ async def _real_agent_loop(
     # catalog``/``query``/…) autonomously. The SDK's default permission mode
     # denies any tool needing approval in this headless context (no human to
     # prompt), so the agent emits a tool_call and then hangs / hallucinates
-    # success without ever executing it. The E2B microVM is the isolation
+    # success without ever executing it. The sandbox is the isolation
     # boundary here (ephemeral, per-session); egress control is the workspace
     # PreToolUse hook's job and is documented as best-effort/fail-open.
     # bypassPermissions swallows the file hook's ``ask`` verdicts (executes
@@ -1029,7 +1067,7 @@ async def _real_agent_loop(
     )
     # Approval gate (SDK in-process PreToolUse hook). HookMatcher AND the
     # ClaudeAgentOptions.hooks field must both exist — an older sandbox
-    # template (the E2B :latest tag is mutable, outside the wheel's pin) could
+    # image (its :latest tag is mutable, outside the wheel's pin) could
     # ship one without the other; degrade to today's behavior (no gate) rather
     # than crash the runner at ClaudeAgentOptions(**options_kwargs). Same
     # __dataclass_fields__ probe used for include_partial_messages below
@@ -1044,7 +1082,7 @@ async def _real_agent_loop(
         if not _hooks_supported or HookMatcher is None:
             # Nothing can be registered, so nothing can deny either — be
             # honest about that rather than calling it fail-closed. The
-            # sandbox template's SDK is outside the wheel's pin (the E2B
+            # sandbox image's SDK is outside the wheel's pin (its
             # :latest tag is mutable), so log loudly enough for an operator
             # to notice that ask-flagged commands are running unasked.
             gate.disable_unsupported(
@@ -1386,6 +1424,12 @@ async def _consume_turn(
                 "tool_use_id": block.tool_use_id,
                 "tool": block.tool_use_id,
                 "result": result,
+                # The SDK already knows whether the tool failed; forwarding it
+                # spares the client a guess. Without this the UI fell back to
+                # sniffing the payload for a leading "error"/"traceback", so a
+                # real failure whose text starts anywhere else ("Catalog Error:
+                # Table … does not exist") rendered with a success tick.
+                "is_error": bool(getattr(block, "is_error", False)),
             }
         )
 
@@ -1731,12 +1775,16 @@ async def amain() -> None:
         # with`) loads CLAUDE.md/.claude from /work at boot. The wheel install
         # above deliberately does NOT gate on this — it overlaps the upload.
         await _wait_workspace_ready()
-        # Opt-in (AGNES_BOOTSTRAP_MARKETPLACE=1): install the user's marketplace
-        # plugins into this project so setting_sources surfaces them. After the
-        # CLI install (needs the `agnes` binary); before the reader attaches for
-        # the same fd-0 reason as the install.
-        if os.environ.get("AGNES_BOOTSTRAP_MARKETPLACE") == "1":
-            _bootstrap_marketplace(str(workdir))
+        # Register the marketplace the server shipped in the workspace, so the
+        # user's stack plugins load with everything they contain — skills,
+        # agents, slash commands, hooks, MCP servers. Offline by construction
+        # (a local directory), which is what the old design got wrong: it ran
+        # `agnes refresh-marketplace --bootstrap` here to CLONE the marketplace,
+        # impossible from inside a sandbox (the git endpoint is PAT-gated, the
+        # sandbox deliberately holds no PAT, and the relay routes no marketplace
+        # prefix), so it 401'd behind a `check=False` subprocess (#1552). After
+        # the CLI install; before the reader attaches, for the same fd-0 reason.
+        _register_workspace_marketplace(workdir)
 
     _emit({"type": "runner_ready"})
     queue = await _stdin_lines()

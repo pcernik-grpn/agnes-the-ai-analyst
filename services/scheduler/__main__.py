@@ -624,6 +624,14 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # job at 03:00. Endpoint reads guardrails.blocked_bundle_ttl_days
         # from instance.yaml and short-circuits when set to 0.
         ("store-blocked-purge", "daily 04:00", "/api/admin/run-blocked-purge", "POST", 600),
+        # B8: retention-based audit_log pruning. Cheap (one indexed DELETE),
+        # runs once daily at 05:30 UTC — offset from the other nightly rows
+        # (marketplaces 03:00, initial-workspace 03:30, store-blocked-purge
+        # 04:00, ducklake-maintenance 04:30, jira-org-refresh/store-lint-audit
+        # 05:00) so none of them fire on the same tick. Endpoint reads
+        # audit.retention_days from instance.yaml and short-circuits when
+        # set to 0 (default 365). Short 60s timeout — a single DELETE.
+        ("audit-prune", "daily 05:30", "/api/admin/run-audit-prune", "POST", 60),
         # wave-2G Task 5: DuckLake merge_adjacent_files/expire_snapshots/
         # cleanup_old_files/VACUUM pass (app/worker/kinds.py::
         # _run_ducklake_maintenance). Offset 30 min after the 04:00 store

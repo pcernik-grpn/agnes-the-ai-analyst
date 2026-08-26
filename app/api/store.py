@@ -2171,6 +2171,10 @@ class CreateFromMarkdownBody(BaseModel):
     # in-flight review can no longer publish it. It still appears in the
     # owner's Library (which lists their own entities regardless of status).
     access: Literal["private", "everyone"] = "everyone"
+    # Same contract and the same admin gate as the multipart sibling's
+    # publisher_kind Form field — validated inside create_entity, which this
+    # endpoint delegates to.
+    publisher_kind: Literal["user", "organization"] = "user"
     # v89: preview the skill linter's verdict before publishing. When set,
     # short-circuits after name/frontmatter synthesis — no create_entity
     # call, no DB writes of any kind.
@@ -2349,6 +2353,7 @@ async def create_entity_from_markdown(
             photo=None,
             docs=[],
             access=body.access,
+            publisher_kind=body.publisher_kind,
             user=user,
             conn=conn,
         )
@@ -2380,6 +2385,14 @@ async def create_entity(
     # caller — the upload wizard, the CLI, the tests — on the historical
     # publish-to-everyone behaviour.
     access: str = Form("everyone"),
+    # Who stands behind the item. Default keeps every existing caller on
+    # Community ('user'); 'organization' is the trust marker analysts read as
+    # "my company published this", so setting it AT CREATE is admin-only —
+    # the same authority the post-hoc publisher toggle already requires
+    # (PublisherUpdateRequest below). Without this field an admin's own
+    # publishes landed as Community and needed a second, separate moderation
+    # step to say what the publisher actually was.
+    publisher_kind: str = Form("user"),
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -2387,6 +2400,10 @@ async def create_entity(
         raise HTTPException(status_code=400, detail="invalid_type")
     if access not in ("private", "everyone"):
         raise HTTPException(status_code=400, detail="invalid_access")
+    if publisher_kind not in ("user", "organization"):
+        raise HTTPException(status_code=400, detail="invalid_publisher_kind")
+    if publisher_kind == "organization" and not is_user_admin(user["id"], conn):
+        raise HTTPException(status_code=403, detail="admin_required_for_publisher_kind")
 
     try:
         username = sanitize_username(user["email"])
@@ -2583,6 +2600,7 @@ async def create_entity(
             file_size=file_size,
             visibility_status=initial_visibility,
             tagline=final_tagline,
+            publisher_kind=publisher_kind,
         )
         _audit(
             conn,

@@ -115,18 +115,6 @@
 [data-theme="paper"] .fbar-select:has(> .ds-dropdown[data-ds-dropdown-target])::after {
     display: none;
 }
-/* `.ws-select` (workspace.html) draws its OWN box — border, background,
-   fixed height — unlike `.fbar-select`, whose box lives entirely on the
-   native <select> it wraps and simply hides with it. Left alone, a claimed
-   ds-dropdown here (which draws its own full box via .ds-dropdown-btn) would
-   render as a box nested inside another, taller than the wrapper allows. */
-[data-theme="paper"] .ws-select:has(> .ds-dropdown[data-ds-dropdown-target]) {
-    border: none;
-    background: none;
-    padding: 0;
-    height: auto;
-}
-
 /* ── Cards — hairline border, hover lift ──────────────────────── */
 [data-theme="paper"] .ds-card,
 [data-theme="paper"] .stack-card,

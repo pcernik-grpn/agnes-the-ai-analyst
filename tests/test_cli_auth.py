@@ -14,6 +14,12 @@ runner = CliRunner()
 def tmp_config(tmp_path, monkeypatch):
     monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path / "local"))
+    # `agnes auth login` exports the resolved server into os.environ, which
+    # outlives the invocation — so without this every test after one that signs
+    # in would inherit a server it never asked for, and a missing-server case
+    # would pass for the wrong reason in a full-file run while failing in
+    # isolation. Tests that need one set it explicitly.
+    monkeypatch.delenv("AGNES_SERVER", raising=False)
     (tmp_path / "config").mkdir()
     (tmp_path / "local").mkdir()
     yield tmp_path
@@ -28,8 +34,9 @@ def _make_response(status_code=200, json_data=None, text=""):
 
 
 class TestAuthLogin:
-    def test_login_browser_success(self):
+    def test_login_browser_success(self, monkeypatch):
         """Default browser flow: capture a code, exchange it, save the token."""
+        monkeypatch.setenv("AGNES_SERVER", "http://example.test")
         exch = _make_response(
             200,
             {
@@ -49,8 +56,9 @@ class TestAuthLogin:
         assert mock_post.call_args[0][0] == "/cli/auth/exchange"
         assert mock_post.call_args[1]["json"]["code"] == "code-xyz"
 
-    def test_login_browser_timeout_prints_manual_hint(self):
+    def test_login_browser_timeout_prints_manual_hint(self, monkeypatch):
         """A timeout exits 1 and points the user at the manual import path."""
+        monkeypatch.setenv("AGNES_SERVER", "http://example.test")
         with patch(
             "cli.lib.loopback.capture_code_via_browser",
             side_effect=TimeoutError("no callback"),
@@ -60,8 +68,9 @@ class TestAuthLogin:
         assert "timed out" in result.output.lower()
         assert "import-token" in result.output
 
-    def test_login_server_too_old(self):
+    def test_login_server_too_old(self, monkeypatch):
         """A 404 from /cli/auth/exchange means the server predates this flow."""
+        monkeypatch.setenv("AGNES_SERVER", "http://example.test")
         exch = _make_response(404, {"detail": "Not Found"})
         with patch("cli.lib.loopback.capture_code_via_browser", return_value="c"):
             with patch("cli.commands.auth.api_post", return_value=exch):
@@ -69,8 +78,9 @@ class TestAuthLogin:
         assert result.exit_code == 1
         assert "doesn't support browser login" in result.output
 
-    def test_login_password_mode(self):
+    def test_login_password_mode(self, monkeypatch):
         """--password keeps the terminal-only email+password path."""
+        monkeypatch.setenv("AGNES_SERVER", "http://example.test")
         resp = _make_response(200, {"access_token": "tokP", "email": "bob@example.com"})
         with patch("cli.commands.auth.api_post", return_value=resp) as mock_post:
             with patch("cli.commands.auth.save_token") as mock_save:
@@ -84,8 +94,9 @@ class TestAuthLogin:
         assert mock_post.call_args[0][0] == "/auth/token"
         assert mock_post.call_args[1]["json"] == {"email": "bob@example.com", "password": "hunter2"}
 
-    def test_login_password_mode_invalid_credentials(self):
+    def test_login_password_mode_invalid_credentials(self, monkeypatch):
         """Bad password creds exit with error under --password."""
+        monkeypatch.setenv("AGNES_SERVER", "http://example.test")
         mock_resp = _make_response(401, {"detail": "Invalid credentials"})
         with patch("cli.commands.auth.api_post", return_value=mock_resp):
             result = runner.invoke(
@@ -95,6 +106,115 @@ class TestAuthLogin:
             )
         assert result.exit_code == 1
         assert "Login failed" in result.output
+
+    def test_login_refuses_when_no_server_is_configured(self, monkeypatch):
+        """No --server, no AGNES_SERVER, no saved config -> refuse.
+
+        The old behavior fell through to `get_server_url()`'s
+        `http://localhost:8000` default and opened a browser there, so the
+        only symptom a user saw was "localhost refused to connect" — with no
+        hint that the server was never configured.
+        """
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        with patch("cli.lib.loopback.capture_code_via_browser") as mock_capture:
+            result = runner.invoke(app, ["auth", "login", "--no-browser"])
+        assert result.exit_code == 1
+        assert "--server" in result.output
+        # localhost may only appear as the explicit local-dev hint — never as a
+        # server this command silently went and opened.
+        assert "Opening http://localhost:8000" not in result.output
+        mock_capture.assert_not_called()
+
+    def test_login_password_refuses_when_no_server_is_configured(self, monkeypatch):
+        """The --password path is gated by the same gate, before any prompt."""
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        with patch("cli.commands.auth.api_post") as mock_post:
+            result = runner.invoke(
+                app,
+                ["auth", "login", "--password"],
+                input="a@example.com\nhunter2\n",
+            )
+        assert result.exit_code == 1
+        assert "--server" in result.output
+        # Refused before asking for credentials, not after.
+        assert "Email" not in result.output
+        mock_post.assert_not_called()
+
+    def test_login_with_server_flag_persists_server_to_config_yaml(self, tmp_path, monkeypatch):
+        """`--server` must be persisted, like `agnes auth import-token` does.
+
+        Without this, the very next command (`agnes auth whoami`, `agnes pull`,
+        even this command's own manual-fallback hint) resolved back to the
+        localhost default, because login only exported AGNES_SERVER in-process.
+        Also asserts the URL is normalized (trailing slash stripped).
+        """
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        exch = _make_response(200, {"token": "tok", "email": "a@example.com", "expires_at": None})
+        with patch("cli.lib.loopback.capture_code_via_browser", return_value="c"):
+            with patch("cli.commands.auth.api_post", return_value=exch):
+                with patch("cli.commands.auth.save_token"):
+                    result = runner.invoke(
+                        app,
+                        ["auth", "login", "--server", "https://agnes.example.com/", "--no-browser"],
+                    )
+        assert result.exit_code == 0, result.output
+
+        import yaml
+
+        config_file = tmp_path / "config" / "config.yaml"
+        assert config_file.exists(), "config.yaml must be written when --server is passed"
+        assert yaml.safe_load(config_file.read_text()).get("server") == "https://agnes.example.com"
+
+    def test_login_does_not_persist_server_when_login_fails(self, tmp_path, monkeypatch):
+        """A --server that never signed in must not become the saved default.
+
+        `agnes auth import-token` persists before verifying; here a typo'd host
+        would otherwise stick around as the server every later command resolves.
+        """
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        with patch(
+            "cli.lib.loopback.capture_code_via_browser",
+            side_effect=TimeoutError("no callback"),
+        ):
+            result = runner.invoke(
+                app,
+                ["auth", "login", "--server", "https://typo.example.com", "--no-browser"],
+            )
+        assert result.exit_code == 1
+        assert not (tmp_path / "config" / "config.yaml").exists()
+        # The failed run still points its own fallback hint at the right host.
+        assert "https://typo.example.com/me/profile#tokens" in result.output
+
+    def test_login_password_persists_server_after_success(self, tmp_path, monkeypatch):
+        """The --password path persists too — one behavior on both doors."""
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        resp = _make_response(200, {"access_token": "tokP", "email": "bob@example.com"})
+        with patch("cli.commands.auth.api_post", return_value=resp):
+            with patch("cli.commands.auth.save_token"):
+                result = runner.invoke(
+                    app,
+                    ["auth", "login", "--password", "--server", "https://pw.example.com"],
+                    input="bob@example.com\nhunter2\n",
+                )
+        assert result.exit_code == 0, result.output
+
+        import yaml
+
+        cfg = yaml.safe_load((tmp_path / "config" / "config.yaml").read_text())
+        assert cfg.get("server") == "https://pw.example.com"
+
+    def test_login_accepts_server_from_saved_config(self, tmp_path, monkeypatch):
+        """A server already in config.yaml is enough — the gate must not
+        demand --server on every login."""
+        monkeypatch.delenv("AGNES_SERVER", raising=False)
+        (tmp_path / "config" / "config.yaml").write_text("server: https://saved.example.com\n")
+        exch = _make_response(200, {"token": "tok", "email": "a@example.com", "expires_at": None})
+        with patch("cli.lib.loopback.capture_code_via_browser", return_value="c") as mock_capture:
+            with patch("cli.commands.auth.api_post", return_value=exch):
+                with patch("cli.commands.auth.save_token"):
+                    result = runner.invoke(app, ["auth", "login", "--no-browser"])
+        assert result.exit_code == 0, result.output
+        assert mock_capture.call_args[0][0] == "https://saved.example.com"
 
 
 class TestAuthLogout:
@@ -373,6 +493,7 @@ def test_da_login_sends_password(monkeypatch):
         )
 
     monkeypatch.setattr(auth_mod, "api_post", fake_post, raising=False)
+    monkeypatch.setenv("AGNES_SERVER", "http://example.test")
 
     runner = CliRunner()
     # Provide email and password via stdin (typer prompts). --password selects

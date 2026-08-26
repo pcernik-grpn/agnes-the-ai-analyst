@@ -6,7 +6,18 @@
 {% set page_hero_subtitle = "Admin-managed git repos cloned nightly. Synced plugins surface in the Claude Code marketplace feed." %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
 <style>
+  /* No global `.sr-only` in this codebase — declared page-locally, same
+     convention as admin_tokens.html / admin_hub.html. */
+  .sr-only {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0);
+    white-space: nowrap; border: 0;
+  }
+
   .marketplaces-toolbar {
     display: flex; justify-content: space-between; align-items: center;
     gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
@@ -68,18 +79,7 @@
   .date-cell { color: var(--text-secondary, #6b7280); font-size: 12px; white-space: nowrap; }
 
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; white-space: nowrap; }
-  .icon-btn {
-    background: transparent; border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
-    padding: 5px 10px; font-size: 12px; cursor: pointer;
-    color: var(--text-secondary, #6b7280); transition: all 0.15s;
-    text-decoration: none; line-height: 1.4;
-    white-space: nowrap;
-  }
-  .icon-btn:hover { color: var(--text-primary, #111827); border-color: var(--ds-border); background: var(--ds-surface-dim); }
-  .icon-btn.primary { color: var(--ds-primary, #6366f1); border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent); }
-  .icon-btn.primary:hover { background: var(--ds-primary-light); }
-  .icon-btn.danger:hover { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
-  .icon-btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* .icon-btn now shared — see css/icon_btn.css */
 
   .mp-empty, .mp-loading {
     text-align: center; padding: 48px 16px;
@@ -271,10 +271,10 @@
 <div class="marketplaces-page">
 
   <div class="marketplaces-toolbar">
-    <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" autocomplete="off">
+    <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" aria-label="Filter by slug, name, or URL" autocomplete="off">
     <a class="icon-btn" href="/marketplace/format-guide" target="_blank" rel="noopener"
        title="Open the marketplace-metadata.json format guide in a new tab">
-      Format guide →
+      Format guide → <span class="sr-only">(opens in a new tab)</span>
     </a>
     {{ ds.button('+ Add marketplace', variant='primary', id='open-create-btn') }}
   </div>
@@ -688,6 +688,17 @@ async function openDetails(id, name) {
         : (p.is_system
           ? `<span class="plugin-system-pill" title="Mandatory for every user — managed below">SYSTEM</span>`
           : "");
+      // Curator-side lifecycle: marketplace-metadata.json marks the plugin
+      // deprecated. Sync auto-disables it; the pill explains WHY it is (or
+      // keeps becoming) disabled, incl. the curator's note + replacement.
+      const depTitle = [
+        "Upstream marketplace-metadata.json marks this plugin deprecated — sync re-disables it automatically.",
+        p.deprecation_note || "",
+        p.replacement ? `Replacement: ${p.replacement}` : "",
+      ].filter(Boolean).join(" ");
+      const depPill = p.deprecated === true
+        ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
+        : "";
       const sysBtnLabel = p.is_system ? "Unmark system" : "Mark as system";
       const sysBtnTitle = isDisabled
         ? "Plugin is disabled. Re-enable it before marking as system."
@@ -704,7 +715,7 @@ async function openDetails(id, name) {
          </svg>`;
       return `<div class="plugin-item">
         <div class="plugin-item-head">
-          <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}
+          <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
           <span class="spacer"></span>
           <label class="plugin-disable-toggle" title="${esc(isDisabled
               ? "Plugin is admin-disabled and hidden everywhere. Toggle off to re-enable."
@@ -774,7 +785,7 @@ function toggleSystem(btn, marketplaceId, marketplaceName) {
         <li>RBAC grants are added for <strong>every existing group</strong>.</li>
         <li>Subscriptions are created for <strong>every existing user</strong>.</li>
         <li>Every <strong>new user</strong> and <strong>new group</strong> inherits it automatically.</li>
-        <li>Users see it as <strong>Required</strong> on /marketplace and cannot uninstall it from /marketplace?tab=my.</li>
+        <li>Users see it as <strong>Automatic</strong> — in their stack with no way to uninstall it.</li>
         <li>Admins cannot revoke it from a group's Access tab while the system flag is on.</li>
       </ul>
       <p style="margin: 0; font-size: 12px; color: var(--text-secondary, #6b7280);">
@@ -874,10 +885,16 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
         <li>It drops out of every user's my-stack.</li>
         <li>It is removed from the synthetic served marketplace.</li>
       </ul>
-      <p style="margin: 0; font-size: 12px; color: var(--text-secondary, #6b7280);">
+      <p style="margin: 0 0 10px; font-size: 12px; color: var(--text-secondary, #6b7280);">
         If this plugin is marked as <strong>system</strong>, disabling also clears the system flag.
         Re-enabling later does not restore it.
-      </p>`;
+      </p>
+      <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 13px;">
+        <input type="checkbox" id="disable-revoke-grants" style="margin-top: 2px;">
+        <span>Also revoke <strong>all group grants</strong> for this plugin
+          (permanent retirement — re-enabling later will not bring it back for
+          anyone until groups are re-granted)</span>
+      </label>`;
     okBtn.textContent = "Disable plugin";
     okBtn.classList.remove("btn-primary");
     okBtn.classList.add("btn-danger");
@@ -892,27 +909,45 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
   // later fire on a different plugin.)
   okBtn.onclick = async () => {
     okBtn.onclick = null;
+    // Read the retirement checkbox BEFORE closing — closeModal leaves the DOM
+    // in place, but the next open rebuilds bodyEl.innerHTML, so the value only
+    // exists at confirm time. Present in the disable direction only.
+    const revokeGrants = !isDisabled && !!document.getElementById("disable-revoke-grants")?.checked;
     closeModal("disable-confirm-modal");
-    await performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled);
+    await performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled, revokeGrants);
   };
 
   openModal("disable-confirm-modal");
 }
 
-async function performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled) {
+async function performToggleDisabled(el, marketplaceId, marketplaceName, isDisabled, revokeGrants = false) {
   const pluginName = el.dataset.plugin;
   const path = isDisabled ? "enable" : "disable";
   el.disabled = true;
   try {
     const url = `${API}/${encodeURIComponent(marketplaceId)}/plugins/${encodeURIComponent(pluginName)}/${path}`;
-    const r = await fetch(url, { method: "POST", credentials: "include" });
+    const opts = { method: "POST", credentials: "include" };
+    if (!isDisabled && revokeGrants) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify({ revoke_grants: true });
+    }
+    const r = await fetch(url, opts);
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       toast(`Toggle failed: ${err.detail || r.status}`, "error");
       el.disabled = false;
       return;
     }
-    toast(isDisabled ? `Enabled ${pluginName}` : `Disabled ${pluginName}`, "success");
+    const data = await r.json().catch(() => ({}));
+    const revoked = data.revoked_grants || 0;
+    toast(
+      isDisabled
+        ? `Enabled ${pluginName}`
+        : revoked
+          ? `Disabled ${pluginName} — revoked ${revoked} grant${revoked === 1 ? "" : "s"}`
+          : `Disabled ${pluginName}`,
+      "success",
+    );
     // Re-render the modal so the pill, locked system button, and switch
     // state all refresh from a fresh fetch.
     openDetails(marketplaceId, marketplaceName);

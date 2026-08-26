@@ -1,18 +1,19 @@
 """Automated end-to-end acceptance test — Sarah's day one.
 
 Drives the 12 assertion checkpoints from scenario_sarah_day_one.md against a
-live cloud-chat deployment (real E2B + real Anthropic per Q7). Skips
-without the full set of opt-in env flags so it never runs accidentally
-in a contributor's local pytest.
+live cloud-chat deployment (real docker-provider sandboxes + real Anthropic
+per Q7 — the apps-runner sidecar must be up and the agnes-chat-sandbox
+image built). Skips without the full set of opt-in env flags so it never
+runs accidentally in a contributor's local pytest.
 
 To run:
 
     AGNES_E2E=1 \
     AGNES_E2E_ANTHROPIC=1 \
-    AGNES_E2E_E2B=1 \
+    AGNES_E2E_DOCKER=1 \
     AGNES_E2E_FULL_ACCEPTANCE=1 \
     ANTHROPIC_API_KEY=sk-ant-... \
-    E2B_API_KEY=e2b_... \
+    APPS_RUNNER_TOKEN=... \
     AGNES_HOST=https://agnes.acme.test \
     AGNES_ADMIN_EMAIL=adam@acme.test \
     AGNES_TEST_USER_EMAIL=sarah@acme.test \
@@ -41,10 +42,10 @@ import pytest
 _REQUIRED_ENVS = (
     "AGNES_E2E",
     "AGNES_E2E_ANTHROPIC",
-    "AGNES_E2E_E2B",
+    "AGNES_E2E_DOCKER",
     "AGNES_E2E_FULL_ACCEPTANCE",
     "ANTHROPIC_API_KEY",
-    "E2B_API_KEY",
+    "APPS_RUNNER_TOKEN",
     "AGNES_HOST",
     "AGNES_ADMIN_EMAIL",
     "AGNES_TEST_USER_EMAIL",

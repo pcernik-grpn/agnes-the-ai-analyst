@@ -32,7 +32,7 @@ def _identity(email="jane@example.com"):
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
     monkeypatch.setenv("AGNES_KEBOOLA_ALLOW_TOKEN_HEADER", "1")
@@ -41,10 +41,9 @@ def client(tmp_path, monkeypatch):
     from app.auth import keboola_header
 
     keboola_header.reset_state_for_tests()
-    from app.main import create_app
     from src.repositories import users_repo
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     uid = str(uuid.uuid4())
     users_repo().create(id=uid, email="jane@example.com", name="Jane")

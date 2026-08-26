@@ -60,11 +60,10 @@ class _AuthedClient:
 
 
 @pytest.fixture
-def mgmt_env(tmp_path, monkeypatch):
+def mgmt_env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import SYSTEM_ADMIN_GROUP, get_system_db
     from src.repositories.user_group_members import UserGroupMembersRepository
     from src.repositories.users import UserRepository
@@ -77,7 +76,7 @@ def mgmt_env(tmp_path, monkeypatch):
     UserGroupMembersRepository(conn).add_member("admin1", admin_gid, source="system_seed")
     conn.close()
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {
         "client": client,
         "owner": {"id": "owner1", "email": "owner@test.com", "token": create_access_token("owner1", "owner@test.com")},

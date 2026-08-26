@@ -21,7 +21,7 @@
  *   window.AgnesPackageDrawer.open({
  *     typed:     'Sales bundle',   // prefill the name
  *     chipHost:  hostEl,           // chip-input to append the new chip to
- *     onCreated: function (pkg, grantFailures) { … },
+ *     onCreated: function (pkg, grantFailures, tableFailures) { … },
  *   })
  *
  * No endpoint is new here — the same three the modal used:
@@ -38,9 +38,26 @@
   'use strict';
 
   var PKG_API = '/api/admin/data-packages';
+  var REGISTRY_API = '/api/admin/registry';
+  var CONNECTIONS_API = '/api/admin/source-connections';
   var GRANTS_API = '/api/admin/grants';
   var GROUPS_API = '/api/admin/groups';
   var COVER_API = '/api/admin/uploads/cover-image';
+
+  /* Display names for the sources that group tables when no source CONNECTION
+     owns them (internal tables, and the connectors that have no connection
+     row). Without this the group headings are raw enum values — `bigquery`,
+     `jira` — sitting beside a real project's name, which reads as leaked data
+     rather than a heading. */
+  var SOURCE_LABELS = {
+    keboola: 'Keboola', bigquery: 'BigQuery', jira: 'Jira',
+    databricks: 'Databricks', snowflake: 'Snowflake',
+    internal: 'Agnes internal', local: 'Uploaded files',
+  };
+  function sourceLabel(t) {
+    if (!t) return 'Other';
+    return SOURCE_LABELS[t] || (t.charAt(0).toUpperCase() + t.slice(1));
+  }
 
   var els = null;          // built lazily on first open
   var st = null;           // per-open state
@@ -105,7 +122,7 @@
       '      <div class="ds-drawer__field">' +
       '        <label for="pdw-slug">Slug</label>' +
       '        <input type="text" id="pdw-slug" autocomplete="off" placeholder="sales-bundle">' +
-      '        <p class="ds-drawer__hint">URL-safe identifier; follows the name until you edit it.</p>' +
+      '        <p class="ds-drawer__hint" id="pdw-slug-hint">URL-safe identifier; follows the name until you edit it.</p>' +
       '      </div>' +
       '      <div class="ds-drawer__field">' +
       '        <label for="pdw-desc">Description <span class="ds-drawer__opt">(optional)</span></label>' +
@@ -155,6 +172,20 @@
       '          </div>' +
       '        </div>' +
       '      </div>' +
+      // Composition, in BOTH modes. It was edit-only on the reasoning that a
+      // package being created has no id to attach a table to — but the group
+      // picks below are collected the same way and applied after the POST
+      // answers, so "no id yet" was never the obstacle it looked like. A
+      // create that cannot choose tables makes an empty package and sends the
+      // admin to a second surface to fill it.
+      '      <div class="ds-drawer__field" id="pdw-tables-field">' +
+      '        <label for="pdw-tables-search" id="pdw-tables-label">Tables in this package</label>' +
+      '        <p class="ds-drawer__hint" style="margin:0 0 8px;">Tick a table to include it.' +
+      '          <strong>Buckets</strong> come from the source project — they are not Agnes containers.</p>' +
+      '        <input type="text" id="pdw-tables-search" class="pdw-tables__search"' +
+      '               autocomplete="off" placeholder="Search tables…">' +
+      '        <div id="pdw-tables" class="pdw-tables"></div>' +
+      '      </div>' +
       '      <details class="ds-drawer__disclose" id="pdw-access">' +
       '        <summary>Who gets it <span class="ds-drawer__opt">(optional)</span></summary>' +
       '        <p class="ds-drawer__hint" style="margin:8px 0 12px;">' +
@@ -178,8 +209,15 @@
       root: root,
       panel: root.querySelector('.ds-drawer__panel'),
       body: root.querySelector('.ds-drawer__body'),
+      // Edit mode rewrites the three pieces of copy that name the verb —
+      // leaving "New data package" over a form full of an existing package's
+      // values is the kind of mislabel that gets a rename saved as a create.
+      title: root.querySelector('#pdw-title'),
+      sub: root.querySelector('.ds-drawer__sub'),
+      lede: root.querySelector('.ds-drawer__lede'),
       name: root.querySelector('#pdw-name'),
       slug: root.querySelector('#pdw-slug'),
+      slugHint: root.querySelector('#pdw-slug-hint'),
       desc: root.querySelector('#pdw-desc'),
       status: root.querySelector('#pdw-status'),
       category: root.querySelector('#pdw-category'),
@@ -191,6 +229,10 @@
       coverClear: root.querySelector('#pdw-cover-clear'),
       access: root.querySelector('#pdw-access'),
       groups: root.querySelector('#pdw-groups'),
+      tablesField: root.querySelector('#pdw-tables-field'),
+      tablesLabel: root.querySelector('#pdw-tables-label'),
+      tablesSearch: root.querySelector('#pdw-tables-search'),
+      tables: root.querySelector('#pdw-tables'),
       err: root.querySelector('#pdw-err'),
       submit: root.querySelector('#pdw-submit'),
     };
@@ -252,20 +294,267 @@
         });
       }
     });
+    // Re-render on search rather than filtering the DOM: the list is
+    // re-sorted (members first) as ticks change, so one renderer owns both.
+    els.tablesSearch.addEventListener('input', function () { if (st) renderTables(); });
+    els.tables.addEventListener('change', function (e) {
+      if (!st) return;
+      var box = e.target.closest('input[type="checkbox"]');
+      if (!box) return;
+      var id = box.getAttribute('data-table-id');
+      if (id) {
+        if (box.checked) st.tablesSelected.add(id); else st.tablesSelected.delete(id);
+        // Re-render so the group boxes above it re-tally — a bucket that reads
+        // "all" after one of its tables was unticked is worse than no summary.
+        renderTables();
+        return;
+      }
+      if (!box.classList.contains('pdw-grp__box')) return;
+      // A group box is a bulk action on what is under it, and `indeterminate`
+      // reads as unchecked to `.checked` — so a click on a partly-selected
+      // group means "select the rest", never "clear it".
+      var want = box.checked;
+      tablesUnder(box.getAttribute('data-project'), box.getAttribute('data-bucket')).forEach(function (t) {
+        if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
+      });
+      renderTables();
+    });
+    // A click on the group's checkbox must not also open/close the <details>
+    // it lives in the <summary> of.
+    els.tables.addEventListener('click', function (e) {
+      if (e.target.closest('.pdw-grp__box')) e.stopPropagation();
+    });
     els.submit.addEventListener('click', submit);
     return els;
   }
 
   /* ── Open / close ─────────────────────────────────────────────────── */
 
+  /* ── Mode ─────────────────────────────────────────────────────────────
+     Two verbs, one form. Create writes POST + the grants the access matrix
+     collects; edit writes PUT and the SAME matrix, hydrated from the grants
+     that already exist and DIFFED on Save (add / retier / revoke) — so who
+     gets a package is editable on whatever page the drawer opens on, and the
+     admin workspace trip is optional for this errand too. The package's own
+     page keeps what a drawer cannot hold: the delivery read-out and the
+     per-group people counts. */
+
+  function applyMode(mode) {
+    var editing = mode === 'edit';
+    els.title.textContent = editing ? 'Edit data package' : 'New data package';
+    els.sub.textContent = editing
+      ? 'What analysts read before they add it.'
+      : 'A package is the unit an analyst receives — tables reach them only through one.';
+    els.lede.hidden = editing;
+    // The slug is in URLs and in grant rows, and `PUT /{id}` carries no slug
+    // field — an editable box would silently discard what was typed.
+    els.slug.disabled = editing;
+    els.slug.title = editing ? 'Slug is permanent — used in URLs and grants' : '';
+    // The hint has to move with the field: "follows the name until you edit
+    // it" over a box you cannot type in describes the other mode's behaviour.
+    els.slugHint.textContent = editing
+      ? 'Permanent — it is in this package’s URL and in every grant written against it.'
+      : 'URL-safe identifier; follows the name until you edit it.';
+    els.access.hidden = false;
+    // Both modes carry the list; only the label differs, because on a create
+    // there is no existing membership for "in this package" to refer to.
+    els.tablesLabel.textContent = editing ? 'Tables in this package' : 'Tables to include';
+    els.submit.textContent = editing ? 'Save changes' : 'Create package';
+  }
+
+  /* ── Composition ──────────────────────────────────────────────────────
+     Membership is DIFFED and applied on Save, not written on each tick: the
+     drawer offers Cancel, and a click that had already hit the API would
+     make that button a lie. */
+
+  /* The registry is a flat list of ~500 rows across a handful of projects and
+     a hundred-odd buckets, which is how the source systems are actually
+     organised — so a package is almost never "these 3 arbitrary tables", it is
+     "this bucket" or "everything from that project". Rendering it flat made
+     the admin tick that structure back in by hand, one row at a time.
+
+     Two levels, PROJECT › BUCKET, because those are the two containers the
+     data really has: a project is a source connection, a bucket is its own
+     grouping inside it. Neither is an Agnes concept — the package is. Both
+     levels carry a tri-state box (all / some / none of their tables), so
+     "add this bucket" is one click and stays truthful when one table under it
+     is unticked. */
+
+  function tableGroups() {
+    var q = (els.tablesSearch.value || '').trim().toLowerCase();
+    var projects = [];
+    var byProject = {};
+    st.registry.forEach(function (t) {
+      if (q && (t.id + ' ' + (t.name || '') + ' ' + (t.bucket || '') + ' ' + (t.project || ''))
+                 .toLowerCase().indexOf(q) === -1) return;
+      var pk = t.project || 'Other';
+      if (!byProject[pk]) {
+        byProject[pk] = { key: pk, label: pk, buckets: {}, order: [] };
+        projects.push(byProject[pk]);
+      }
+      var p = byProject[pk];
+      // A table with no bucket still needs a home; naming it after the source
+      // is truer than inventing an empty group.
+      var bk = t.bucket || (t.source_type ? t.source_type : 'Ungrouped');
+      if (!p.buckets[bk]) { p.buckets[bk] = { key: bk, label: bk, tables: [] }; p.order.push(bk); }
+      p.buckets[bk].tables.push(t);
+    });
+    projects.forEach(function (p) {
+      p.order.sort();
+      p.order.forEach(function (bk) {
+        p.buckets[bk].tables.sort(function (a, b) {
+          return String(a.name || a.id).localeCompare(String(b.name || b.id));
+        });
+      });
+    });
+    projects.sort(function (a, b) { return a.label.localeCompare(b.label); });
+    return projects;
+  }
+
+  function tallyState(tables) {
+    var on = 0;
+    tables.forEach(function (t) { if (st.tablesSelected.has(t.id)) on++; });
+    return on === 0 ? 'none' : (on === tables.length ? 'all' : 'some');
+  }
+
+  function boxAttrs(state) {
+    return (state === 'all' ? ' checked' : '') + (state === 'some' ? ' data-indeterminate="1"' : '');
+  }
+
+  function renderTables() {
+    var projects = tableGroups();
+    if (!projects.length) {
+      els.tables.innerHTML = '<p class="ds-drawer__hint">No table matches that.</p>';
+      return;
+    }
+    var searching = !!(els.tablesSearch.value || '').trim();
+    var html = projects.map(function (p) {
+      var pTables = [];
+      p.order.forEach(function (bk) { pTables = pTables.concat(p.buckets[bk].tables); });
+      var pState = tallyState(pTables);
+      // Open when searching (the match is the point), or when the group
+      // already contributes to the package — a member you cannot see is a
+      // member you cannot remove.
+      var pOpen = searching || pState !== 'none';
+      var buckets = p.order.map(function (bk) {
+        var b = p.buckets[bk];
+        var bState = tallyState(b.tables);
+        var bOpen = searching || bState !== 'none';
+        var rows = b.tables.map(function (t) {
+          var on = st.tablesSelected.has(t.id);
+          var sub = [t.source_type, t.query_mode].filter(Boolean).map(esc).join(' · ');
+          return '<label class="pdw-tables__row">' +
+            '<input type="checkbox" data-table-id="' + esc(t.id) + '"' + (on ? ' checked' : '') +
+            ' aria-label="' + esc(t.name || t.id) + '">' +
+            '<span class="pdw-tables__g"><span class="pdw-tables__n">' + esc(t.name || t.id) + '</span>' +
+            (sub ? '<span class="pdw-tables__s">' + sub + '</span>' : '') + '</span></label>';
+        }).join('');
+        return '<details class="pdw-grp pdw-grp--bucket"' + (bOpen ? ' open' : '') + '>' +
+          '<summary class="pdw-grp__sum">' +
+          '<input type="checkbox" class="pdw-grp__box" data-group="bucket"' +
+          ' data-project="' + esc(p.key) + '" data-bucket="' + esc(b.key) + '"' + boxAttrs(bState) +
+          ' aria-label="All tables in ' + esc(b.label) + '">' +
+          '<span class="pdw-grp__name">' + esc(b.label) + '</span>' +
+          '<span class="pdw-grp__n">' + b.tables.length + '</span>' +
+          '</summary>' + rows + '</details>';
+      }).join('');
+      return '<details class="pdw-grp pdw-grp--project"' + (pOpen ? ' open' : '') + '>' +
+        '<summary class="pdw-grp__sum">' +
+        '<input type="checkbox" class="pdw-grp__box" data-group="project"' +
+        ' data-project="' + esc(p.key) + '"' + boxAttrs(pState) +
+        ' aria-label="All tables in ' + esc(p.label) + '">' +
+        '<span class="pdw-grp__name">' + esc(p.label) + '</span>' +
+        '<span class="pdw-grp__n">' + pTables.length + '</span>' +
+        '</summary>' + buckets + '</details>';
+    }).join('');
+    els.tables.innerHTML = html;
+    // `indeterminate` is a PROPERTY with no HTML attribute, so it cannot ride
+    // the markup above and has to be set after the paint.
+    els.tables.querySelectorAll('[data-indeterminate]').forEach(function (b) {
+      b.indeterminate = true;
+    });
+  }
+
+  /* Every table under a group, honouring the current search — ticking a group
+     must mean what the reader can see under it, not the whole registry. */
+  function tablesUnder(project, bucket) {
+    var out = [];
+    tableGroups().forEach(function (p) {
+      if (p.key !== project) return;
+      p.order.forEach(function (bk) {
+        if (bucket && bk !== bucket) return;
+        out = out.concat(p.buckets[bk].tables);
+      });
+    });
+    return out;
+  }
+
+  /* `pkgId` is null on a create: the registry and the project names are
+     fetched exactly the same way, and the member set is simply empty. */
+  function hydrateTables(pkgId) {
+    Promise.all([
+      pkgId ? api(PKG_API + '/' + encodeURIComponent(pkgId))
+            : Promise.resolve({ tables: [] }),
+      api(REGISTRY_API),
+      // The registry carries `connection_id`, not the project's NAME. A raw
+      // uuid is not a group heading anyone can read, so resolve it here; a
+      // failed lookup degrades to grouping by source type rather than
+      // failing the list.
+      api(CONNECTIONS_API).catch(function () { return []; }),
+    ]).then(function (res) {
+      if (!st || st.pkgId !== pkgId) return;
+      var pkg = res[0];
+      var reg = res[1];
+      var conns = res[2];
+      var connName = {};
+      (Array.isArray(conns) ? conns : (conns.connections || conns.items || [])).forEach(function (c) {
+        if (c && c.id) connName[c.id] = c.name || c.id;
+      });
+      st.registry = (Array.isArray(reg) ? reg : (reg.tables || [])).map(function (t) {
+        return {
+          id: t.id, name: t.name || t.id, bucket: t.bucket || '',
+          source_type: t.source_type || '', query_mode: t.query_mode || '',
+          // Project = the source connection this table came through. Tables
+          // with no connection (internal, and the derived sources) fall back
+          // to the source's own name, which is the truthful grouping for them.
+          project: connName[t.connection_id] || sourceLabel(t.source_type),
+        };
+      });
+      var members = (pkg.tables || []).map(function (t) { return t.id; });
+      st.tablesOriginal = new Set(members);
+      st.tablesSelected = new Set(members);
+      // A member the registry no longer lists still has to be shown — a row
+      // you cannot see is a row you cannot remove.
+      var known = new Set(st.registry.map(function (t) { return t.id; }));
+      members.forEach(function (id) {
+        if (!known.has(id)) {
+          st.registry.push({ id: id, name: id, bucket: 'Ungrouped', source_type: '',
+                             query_mode: '', project: 'Other' });
+        }
+      });
+      renderTables();
+    }).catch(function (e) {
+      els.tables.innerHTML = '<p class="ds-drawer__hint">Could not load tables: ' + esc(e.message) + '</p>';
+    });
+  }
+
   function open(opts) {
     opts = opts || {};
     build();
+    var mode = opts.mode === 'edit' ? 'edit' : 'create';
     st = {
+      mode: mode,
+      pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
-      slugTouched: false,
+      onSaved: opts.onSaved || function () {},
+      slugTouched: mode === 'edit',
       groupsLoaded: false,
+      grantsLoaded: false,
+      grantsOriginal: new Map(),
+      registry: [],
+      tablesOriginal: new Set(),
+      tablesSelected: new Set(),
       restoreFocus: document.activeElement,
     };
     var typed = opts.typed || '';
@@ -286,13 +575,54 @@
     els.groups.innerHTML = '';
     els.err.hidden = true;
     els.submit.disabled = false;
-    els.submit.textContent = 'Create package';
+    applyMode(mode);
 
     els.root.hidden = false;
     els.root.classList.add('is-open');
     document.body.style.overflow = 'hidden';
     els.body.scrollTop = 0;
+    els.tablesSearch.value = '';
+    els.tables.innerHTML = '<p class="ds-drawer__hint">Loading…</p>';
+    if (mode === 'edit') {
+      hydratePackage(opts.pkgId);
+      hydrateTables(opts.pkgId);
+      // Sharing is part of the edit form: open the disclose so the current
+      // grants are visible without a click, and hydrate rows + grants (the
+      // paint runs when the LATER of the two fetches lands).
+      els.access.open = true;
+      hydrateGroups();
+      hydrateGrants(opts.pkgId);
+    } else {
+      // The registry is the same fetch in create mode; only the member set
+      // differs (empty), so the picker is usable before the package exists.
+      hydrateTables(null);
+    }
     setTimeout(function () { els.name.focus({ preventScroll: true }); }, 60);
+  }
+
+  /* Fields are filled from the API rather than from whatever the caller had
+     on screen: the page that opens this may be rendering a stale row, and a
+     PUT built from stale values silently reverts someone else's edit. */
+  function hydratePackage(pkgId) {
+    els.submit.disabled = true;
+    api(PKG_API + '/' + encodeURIComponent(pkgId)).then(function (pkg) {
+      if (!st || st.pkgId !== pkgId) return;   // drawer moved on while we waited
+      els.name.value = pkg.name || '';
+      els.slug.value = pkg.slug || '';
+      els.desc.value = pkg.description || '';
+      els.status.value = pkg.status || 'prod';
+      els.category.value = pkg.category || '';
+      els.icon.value = pkg.icon || '';
+      if (pkg.color) {
+        els.color.value = pkg.color;
+        els.color.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      els.coverUrl.value = pkg.cover_image_url || '';
+      renderCover(pkg.cover_image_url || '');
+      els.submit.disabled = false;
+    }).catch(function (e) {
+      fail('Could not load the package: ' + e.message);
+    });
   }
 
   function close() {
@@ -400,10 +730,50 @@
           + '</span>'
           + '</div>';
       }).join('');
+      // Edit mode may already hold the grants — the rows just appeared, so
+      // paint them now (no-op in create mode / before grants load).
+      paintGrantRows();
     }).catch(function (e) {
       st.groupsLoaded = false;
       els.groups.innerHTML = '<p class="ds-drawer__empty">Could not load the groups: '
         + esc(e.message) + '</p>';
+    });
+  }
+
+  /* Edit mode: the grants that exist NOW, so the matrix shows the truth and
+     Save can diff against it. Keyed by group_id; the grant row id rides
+     along because retier is PUT /grants/{id} and revoke is DELETE on it. */
+  function hydrateGrants(pkgId) {
+    api(GRANTS_API + '?resource_type=data_package').then(function (rows) {
+      if (!st || st.pkgId !== pkgId) return; // drawer re-opened on another package meanwhile
+      st.grantsOriginal = new Map();
+      (Array.isArray(rows) ? rows : []).forEach(function (r) {
+        if (String(r.resource_id) === String(pkgId)) {
+          st.grantsOriginal.set(String(r.group_id), { id: r.id, requirement: r.requirement });
+        }
+      });
+      st.grantsLoaded = true;
+      paintGrantRows();
+    }).catch(function () {
+      // Grants unreadable → the matrix stays a create-shaped blank and Save
+      // must NOT diff against an empty map (it would read as "revoke all").
+      st.grantsLoaded = false;
+    });
+  }
+
+  /* Tick + tier every row according to grantsOriginal. Runs after whichever
+     of the two fetches (groups list, grants) lands last. */
+  function paintGrantRows() {
+    if (!st || !st.grantsLoaded) return;
+    els.groups.querySelectorAll('[data-group-id]').forEach(function (row) {
+      var g = st.grantsOriginal.get(row.getAttribute('data-group-id'));
+      var box = row.querySelector('input[type="checkbox"]');
+      if (box) box.checked = !!g;
+      row.querySelectorAll('.fbar-seg__btn').forEach(function (b) {
+        var on = !!g && b.dataset.tier === (g.requirement === 'required' ? 'required' : 'available');
+        b.classList.toggle('is-active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
     });
   }
 
@@ -443,9 +813,101 @@
       return;
     }
 
+    if (st && st.mode === 'edit') {
+      els.submit.disabled = true;
+      els.submit.textContent = 'Saving…';
+      var pkgId = st.pkgId;
+      // `category` and `cover_image_url` honour an empty-string-clears
+      // contract server-side (see update_data_package), so an emptied field
+      // must send "" rather than null — null means "leave unchanged", which
+      // would make clearing a category impossible from here.
+      api(PKG_API + '/' + encodeURIComponent(pkgId), {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: name,
+          description: els.desc.value.trim() || null,
+          icon: els.icon.value.trim() || null,
+          color: els.color.value.trim() || null,
+          cover_image_url: els.coverUrl.value || '',
+          status: els.status.value || 'prod',
+          category: els.category.value.trim(),
+        }),
+      }).then(function (saved) {
+        // Membership diff, after the metadata write. Both directions are
+        // idempotent server-side, so a retry cannot double-apply.
+        var added = [], removed = [];
+        st.tablesSelected.forEach(function (id) { if (!st.tablesOriginal.has(id)) added.push(id); });
+        st.tablesOriginal.forEach(function (id) { if (!st.tablesSelected.has(id)) removed.push(id); });
+        var calls = added.map(function (id) {
+          return api(PKG_API + '/' + encodeURIComponent(pkgId) + '/tables', {
+            method: 'POST', body: JSON.stringify({ table_id: id }),
+          });
+        }).concat(removed.map(function (id) {
+          return api(PKG_API + '/' + encodeURIComponent(pkgId) + '/tables/' + encodeURIComponent(id), {
+            method: 'DELETE',
+          });
+        }));
+        // Sharing diff — only when the current grants actually loaded, so a
+        // failed hydrate can never be misread as "revoke everything". Same
+        // Save, same idempotent-ops rule as the table diff above.
+        if (st.grantsLoaded) {
+          var desired = new Map();
+          chosenGrants().forEach(function (g) { desired.set(String(g.group_id), g.requirement); });
+          desired.forEach(function (req, gid) {
+            var cur = st.grantsOriginal.get(gid);
+            if (!cur) {
+              calls.push(api(GRANTS_API, {
+                method: 'POST',
+                body: JSON.stringify({
+                  group_id: gid, resource_type: 'data_package',
+                  resource_id: pkgId, requirement: req,
+                }),
+              }));
+            } else if ((cur.requirement === 'required') !== (req === 'required')) {
+              calls.push(api(GRANTS_API + '/' + encodeURIComponent(cur.id), {
+                method: 'PUT', body: JSON.stringify({ requirement: req }),
+              }));
+            }
+          });
+          st.grantsOriginal.forEach(function (cur, gid) {
+            if (!desired.has(gid)) {
+              calls.push(api(GRANTS_API + '/' + encodeURIComponent(cur.id), { method: 'DELETE' }));
+            }
+          });
+        }
+        return Promise.allSettled(calls).then(function (results) {
+          var failures = results.filter(function (r) { return r.status === 'rejected'; }).length;
+          if (failures) {
+            // The metadata IS saved by now, so this cannot be reported as a
+            // failed save — name what actually did not happen and keep the
+            // drawer open on the list the admin needs to look at.
+            els.submit.disabled = false;
+            els.submit.textContent = 'Save changes';
+            fail(failures + ' change' + (failures === 1 ? '' : 's') +
+                 ' (tables or sharing) could not be applied. The other details were saved.');
+            hydrateTables(pkgId);
+            hydrateGrants(pkgId);
+            return;
+          }
+          var done = (st && st.onSaved) || function () {};
+          close();
+          try { done(saved || { id: pkgId, name: name }); } catch (_) { /* the caller's problem */ }
+        });
+      }).catch(function (e) {
+        els.submit.disabled = false;
+        els.submit.textContent = 'Save changes';
+        fail('Could not save the package: ' + e.message);
+      });
+      return;
+    }
+
     els.submit.disabled = true;
     els.submit.textContent = 'Creating…';
     var grants = chosenGrants();
+    // Snapshot both collected sets before the POST, for the same reason the
+    // group picks are snapshotted: `st` belongs to the open drawer, and the
+    // writes below happen after it has been told to close.
+    var tableIds = st ? Array.from(st.tablesSelected) : [];
 
     api(PKG_API, {
       method: 'POST',
@@ -465,10 +927,13 @@
       // callback reading `pkg.name` would otherwise get `undefined` (which
       // is exactly what the chip and the toast used to show).
       var pkg = { id: created.id, name: name, slug: slug };
-      // Grants are secondary: a failed one does NOT roll the package back
-      // (it exists, and both Access editors can write the grant), so the
-      // count rides out to the caller for its own message.
-      return Promise.allSettled(grants.map(function (g) {
+      // Grants and tables are both secondary: a failure in either does NOT
+      // roll the package back (it exists, and both are writable from its own
+      // page), so the counts ride out to the caller for its own message.
+      // They are counted SEPARATELY — "3 grants failed" and "3 tables failed"
+      // send an admin to different places, so one merged number would be a
+      // worse message than either.
+      var grantCalls = grants.map(function (g) {
         return api(GRANTS_API, {
           method: 'POST',
           body: JSON.stringify({
@@ -478,15 +943,28 @@
             requirement: g.requirement,
           }),
         });
-      })).then(function (results) {
-        var failures = results.filter(function (r) { return r.status === 'rejected'; }).length;
+      });
+      // Membership is written only now, because only now is there an id to
+      // attach it to — the same collect-then-apply order the group picks use.
+      var tableCalls = tableIds.map(function (id) {
+        return api(PKG_API + '/' + encodeURIComponent(pkg.id) + '/tables', {
+          method: 'POST', body: JSON.stringify({ table_id: id }),
+        });
+      });
+      return Promise.all([
+        Promise.allSettled(grantCalls),
+        Promise.allSettled(tableCalls),
+      ]).then(function (settled) {
+        function rejected(r) { return r.status === 'rejected'; }
+        var failures = settled[0].filter(rejected).length;
+        var tableFailures = settled[1].filter(rejected).length;
         var host = st && st.chipHost;
         var done = (st && st.onCreated) || function () {};
         if (host && host.addChip) host.addChip({ id: pkg.id, name: pkg.name });
         close();
         // The package exists by now, so a caller's own error must not be
         // reported as a failed create on a drawer that has already closed.
-        try { done(pkg, failures); } catch (_) { /* the caller's problem */ }
+        try { done(pkg, failures, tableFailures); } catch (_) { /* the caller's problem */ }
       });
     }).catch(function (e) {
       els.submit.textContent = 'Create package';

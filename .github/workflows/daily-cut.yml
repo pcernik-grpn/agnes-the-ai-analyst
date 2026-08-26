@@ -1,0 +1,114 @@
+name: Daily release cut
+
+# E1 (docs/RELEASING.md § Release-cut is a dedicated cut PR): feature PRs no
+# longer carry a release-cut — they only ever add bullets under
+# `## [Unreleased]`. This workflow is the daily cut: once a day (or on
+# manual dispatch, e.g. for an emergency hotfix or a milestone bump), it
+# computes the next version, rewrites CHANGELOG.md + pyproject.toml (+
+# server.json when present), and opens a PR labeled `release-cut` for a
+# human to review and merge — it never merges or tags anything itself.
+#
+# The cut arithmetic lives in scripts/release_cut.py (pure functions, unit
+# tested in tests/test_release_cut.py); this workflow only wires it up.
+# `[Unreleased]` empty on a given day is not an error — the run is a no-op
+# and no PR is opened.
+#
+# Merging main triggers release.yml's `:stable` image build automatically
+# (push-to-main trigger). Tagging + the GitHub Release are a separate,
+# deliberately manual step after merge — see the PR body this workflow
+# writes, or docs/RELEASING.md § Release workflow.
+
+on:
+  schedule:
+    - cron: '0 5 * * *' # 05:00 UTC daily — a quiet hour, clear of release-digest.yml (04:00) and the Sunday-only prune-dev-tags.yml
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version segment to bump. minor = daily batch (default). patch = emergency hotfix. major = milestone (human-decided).'
+        type: choice
+        options:
+          - minor
+          - patch
+          - major
+        default: minor
+
+permissions:
+  contents: write # push the release-cut branch
+  pull-requests: write # open the PR
+  issues: write # create/attach the `release-cut` label — PR labels ride the Issues API
+
+concurrency:
+  group: daily-cut
+  cancel-in-progress: false # queue rather than race a manual dispatch against the cron
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Skip if an open release-cut PR already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          COUNT=$(gh pr list --repo "${{ github.repository }}" --label release-cut --state open --json number --jq 'length')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "An open release-cut PR already exists — skipping until it is merged or closed."
+          fi
+
+      - name: Compute the cut
+        if: steps.existing.outputs.count == '0'
+        id: plan
+        env:
+          BUMP: ${{ github.event.inputs.bump || 'minor' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_cut.py --bump "$BUMP" --json | tee /tmp/plan.json
+          echo "noop=$(jq -r .noop /tmp/plan.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version /tmp/plan.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Open the release-cut PR
+        if: steps.existing.outputs.count == '0' && steps.plan.outputs.noop == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="release-cut/v${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add CHANGELOG.md pyproject.toml
+          if [ -f server.json ]; then git add server.json; fi
+          git commit -m "release: ${VERSION}"
+          git push origin "$BRANCH"
+
+          # Idempotent: the label may already exist from a previous run.
+          gh label create release-cut --color 0e8a16 \
+            --description "Automated daily version bump + CHANGELOG rename — a human merges it, never auto-merged" \
+            2>/dev/null || true
+
+          {
+            echo "Automated daily batch cut. Ships every bullet merged into \`[Unreleased]\` since the last cut:"
+            echo
+            jq -r '.bullets[]' /tmp/plan.json
+            echo
+            echo "**Merge this PR yourself when ready — it is never auto-merged.**"
+            echo
+            echo "After merging, tag + publish the GitHub Release (there is no tag-on-merge automation on \`main\` — see docs/RELEASING.md):"
+            echo
+            echo '```'
+            echo "gh workflow run tag-release.yml -f tag=v${VERSION}"
+            echo '```'
+          } > /tmp/pr-body.md
+
+          gh pr create --repo "${{ github.repository }}" \
+            --base main --head "$BRANCH" \
+            --title "release: ${VERSION}" \
+            --label release-cut \
+            --body-file /tmp/pr-body.md

@@ -14,6 +14,18 @@
  *
  * Self-bootstraps on every `.ds-dropdown` present at load — no explicit
  * init call needed, same contract as chip-input.js.
+ *
+ * `window.dsDropdownInit(host)` covers the one case load-time bootstrap
+ * can't: markup built entirely client-side from an async fetch (fixed
+ * option list, just not present in the DOM yet at DOMContentLoaded — see
+ * admin_server_config.html). It's the same internal `init` bootstrapAll()
+ * uses, exported rather than duplicated — call it once per host, right
+ * after that host is inserted. init() still isn't idempotent for the
+ * per-element listeners (each call adds another button/item/menu handler on
+ * the SAME element), so a host bootstrapAll() already caught must not be
+ * passed here too — but re-initing a REBUILT host is safe and expected, and
+ * no longer grows the document-level handler set: Esc and outside-click live
+ * once at module scope and resolve the open menu at event time.
  * ===================================================================== */
 (function () {
   "use strict";
@@ -97,19 +109,49 @@
       }
     });
 
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && isOpen()) close(true);
-    });
-    document.addEventListener("click", (e) => {
-      if (!isOpen()) return;
-      if (host.contains(e.target)) return;
-      close(false);
+    // Esc and outside-click are handled ONCE at module scope, not per host —
+    // see `_closers` below. `init` is called again for every host a page
+    // rebuilds (admin_server_config.html re-renders all its sections on every
+    // save), and a per-host `document.addEventListener` pair has no teardown,
+    // so each save added two permanent document listeners per dropdown and
+    // pinned the detached DOM they closed over. Registering the closer instead
+    // makes re-init idempotent for the global handlers: the WeakMap entry is
+    // overwritten and the old host becomes collectable.
+    _closers.set(host, close);
+  }
+
+  /** host element -> its `close(restoreFocus)`. Weak so a host removed from
+   *  the DOM does not keep its closure alive. */
+  const _closers = new WeakMap();
+
+  function _closeOpenMenusOutside(target, restoreFocus) {
+    // Every open menu whose host does not contain the event target, which is
+    // exactly what the per-host listeners collectively did. In practice at
+    // most one is open, but a page that opens a second without closing the
+    // first must not end up with an undismissable menu.
+    document.querySelectorAll(".ds-dropdown-menu:not([hidden])").forEach((menu) => {
+      const host = menu.closest(".ds-dropdown");
+      if (!host || (target && host.contains(target))) return;
+      const close = _closers.get(host);
+      if (close) close(restoreFocus);
     });
   }
+
+  document.addEventListener("keydown", (e) => {
+    // Esc closes the open menu wherever focus is. No `target` filter: the menu
+    // owns the key while it is open, and its own keydown handler stops
+    // propagation for the in-menu case before this ever runs.
+    if (e.key === "Escape") _closeOpenMenusOutside(null, true);
+  });
+  document.addEventListener("click", (e) => {
+    _closeOpenMenusOutside(e.target, false);
+  });
 
   function bootstrapAll() {
     document.querySelectorAll(".ds-dropdown").forEach(init);
   }
+
+  window.dsDropdownInit = init;
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", bootstrapAll);

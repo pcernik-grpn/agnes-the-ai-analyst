@@ -345,16 +345,15 @@ def test_persist_overlay_token_clear_removes_key(clean_env):
 
 
 @pytest.fixture
-def web_client(clean_env, monkeypatch):
+def web_client(clean_env, monkeypatch, shared_app):
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
     from fastapi.testclient import TestClient
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 
@@ -1105,3 +1104,142 @@ def test_dry_run_warns_on_optional_connector_missing_body(monkeypatch):
     assert summary["ok"] is True
     assert summary["errors"] == []
     assert any("connector-opt" in w for w in summary["warnings"]), summary["warnings"]
+
+
+def test_dry_run_warns_on_unwired_template_placeholder(monkeypatch):
+    """A synced install-prompt template referencing a placeholder nothing
+    substitutes on the git-bound path (only {server_url} + Jinja context
+    are replaced) must surface a warning to the operator."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/template.md.tmpl":
+            return ("Install via {install_cli_block} at {server_url}", "iwt")
+        return None
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    summary = api._compute_render_dry_run()
+    assert summary["ok"] is True
+    assert any("{install_cli_block}" in w for w in summary["warnings"]), summary["warnings"]
+    # {server_url} alone is fine — no warning names it as unwired.
+    assert not any("only {server_url}" in w and "{install_cli_block}" not in w for w in summary["warnings"])
+
+
+def test_dry_run_accepts_bundled_template(monkeypatch):
+    """The shipped bundled template must pass its own dry-run clean."""
+    from app.api import initial_workspace as api
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    summary = api._compute_render_dry_run()
+    assert summary["ok"] is True
+    assert not any("render literally" in w for w in summary["warnings"]), summary["warnings"]
+
+
+def test_dry_run_scans_bound_template_for_unwired_placeholders(monkeypatch):
+    """When the install prompt is git-bound to a custom path, the unwired-
+    placeholder scan must inspect THAT file — the one analysts actually get —
+    not the canonical default template."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/custom.md.tmpl":
+            return ("Broken fork with {connector_tiles} inside", "iwt")
+        if rel == "install-prompt/template.md.tmpl":
+            return ("Clean default at {server_url}", "iwt")
+        return None
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    monkeypatch.setattr(
+        "src.repositories.welcome_template_repo",
+        lambda: _FakePromptMetaRepo({"source_mode": "git", "git_path": "install-prompt/custom.md.tmpl"}),
+    )
+    summary = api._compute_render_dry_run()
+    assert any(
+        "{connector_tiles}" in w and "custom.md.tmpl" in w for w in summary["warnings"]
+    ), summary["warnings"]
+
+
+def test_dry_run_editor_mode_warning_is_qualified(monkeypatch):
+    """In editor mode the seed template is not rendered — the unwired-
+    placeholder warning must say so instead of claiming analysts see it."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/template.md.tmpl":
+            return ("Install via {install_cli_block}", "iwt")
+        return None
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    summary = api._compute_render_dry_run()
+    hits = [w for w in summary["warnings"] if "{install_cli_block}" in w]
+    assert hits and "does not currently render" in hits[0], summary["warnings"]
+
+
+def test_dry_run_tight_jinja_variables_are_not_flagged(monkeypatch):
+    """`{{today}}` without spaces is a substituted Jinja variable, not an
+    unwired single-brace placeholder."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/template.md.tmpl":
+            return ("Rendered on {{today}} for {{instance.name}} at {server_url}", "iwt")
+        return None
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    summary = api._compute_render_dry_run()
+    assert not any("render literally" in w for w in summary["warnings"]), summary["warnings"]
+
+
+def test_dry_run_bound_template_render_error_is_surfaced(monkeypatch):
+    """A git-bound template with a Jinja render error silently falls back to
+    the built-in default for analysts — the dry-run must surface it to the
+    operator as an error (iwt-sourced)."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/custom.md.tmpl":
+            return ("Hello {{ user.email.upper.bogus() }} at {server_url}", "iwt")
+        return None
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    monkeypatch.setattr(
+        "src.repositories.welcome_template_repo",
+        lambda: _FakePromptMetaRepo({"source_mode": "git", "git_path": "install-prompt/custom.md.tmpl"}),
+    )
+    summary = api._compute_render_dry_run()
+    assert summary["ok"] is False
+    assert any("does not render" in e for e in summary["errors"]), summary["errors"]
+
+
+def test_dry_run_meta_read_failure_skips_render_validation(monkeypatch):
+    """A meta-read failure makes `_install_prompt_bound_git_path` fall back
+    to the canonical path (conservative for the `{token}` probe), but render
+    validation must NOT fire on that fallback — an editor-mode instance never
+    renders the seed template, so a transient DB hiccup must not hard-fail
+    the sync over it."""
+    from app.api import initial_workspace as api
+    from src import initial_workspace as iw
+
+    def fake_resolve(rel):
+        if rel == "install-prompt/template.md.tmpl":
+            return ("Hello {{ user.email.bogus() }} at {server_url}", "iwt")
+        return None
+
+    def boom():
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr("src.connectors_manifest.load_manifest", lambda: [])
+    monkeypatch.setattr(iw, "resolve_seed_file", fake_resolve)
+    monkeypatch.setattr("src.repositories.welcome_template_repo", boom)
+    summary = api._compute_render_dry_run()
+    assert not any("does not render" in e for e in summary["errors"]), summary["errors"]

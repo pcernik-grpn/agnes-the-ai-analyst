@@ -141,7 +141,10 @@ class TestAnchorSurvivesRendering:
 class TestRenderedPage:
     def test_paused_admin_sees_the_remedy(self, seeded_app, monkeypatch):
         """End to end: pause elevation, hit an admin page, read the response."""
-        monkeypatch.setattr("app.auth.elevation.elevation_paused", lambda: True)
+        # `*_` because the real signature takes an optional SUBJECT (the pause
+        # applies to the person who paused, not to whoever is being asked
+        # about) — a zero-arg stub broke the moment a second caller passed one.
+        monkeypatch.setattr("app.auth.elevation.elevation_paused", lambda *_: True)
         c = seeded_app["client"]
         c.cookies.set("access_token", seeded_app["admin_token"])
         r = c.get("/admin/server-config", headers={"Accept": "text/html"})

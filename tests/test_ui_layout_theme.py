@@ -24,7 +24,7 @@ from app.instance_config import get_instance_theme, get_ui_layout
 
 
 @pytest.fixture
-def web_client(tmp_path, monkeypatch):
+def web_client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-min-32-characters!!")
@@ -34,9 +34,8 @@ def web_client(tmp_path, monkeypatch):
     from src.db import close_system_db
 
     close_system_db()
-    from app.main import create_app
 
-    app = create_app()
+    app = shared_app
     yield TestClient(app)
     close_system_db()
 
@@ -139,7 +138,6 @@ class TestResolvers:
 
         assert get_experience() == "redesign"
 
-
     def test_default_footer_is_config_driven_not_keboola(self, web_client, admin_cookie, monkeypatch):
         """Default (blue/topnav) instances render the shared config-driven
         footer and no vendor credit. Regression guard for the #896 footer leak.
@@ -162,6 +160,7 @@ class TestResolvers:
         assert "<b>Keboola</b>" not in resp.text
         # No credit configured → no attribution line invented.
         assert "Deployed by" not in resp.text
+
 
 class TestRedesignIsTheOnlyExperience:
     """The redesign contract this wave installs: rail is unconditional, and
@@ -377,33 +376,38 @@ class TestRailOptIn:
         assert "In stack only" not in menu, "the stack toggle must not also sit in the Filter menu"
         assert "fbar-menu__toggle" not in text, "retired in-menu toggle markup"
 
-        # Order on the bar: Filter · In stack only · Sort. The toggle narrows the
-        # list like Filter does, so it reads before the ordering control.
+        # Order on the bar: Search · Filter · the "In stack only" toggle ·
+        # Sort — search is the way into a library of any size, so it leads;
+        # the refinements follow it.
         positions = [
+            text.index('id="lib-search"'),
             text.index('id="lib-filter-btn"'),
-            text.index('id="lib-stack-toggle"'),
             text.index('id="lib-sort"'),
         ]
-        assert positions == sorted(positions), "stack toggle must sit between Filter and Sort"
+        assert positions == sorted(positions), "search must lead the bar, before Filter and Sort"
 
-    def test_stack_toggle_is_wired_as_an_external_facet(self, web_client, admin_cookie, monkeypatch):
-        """The toolbar button is driven by the shared engine as an ordinary
-        facet with `control`, not by page-local click handlers — so clearing and
-        resetting keep working. Because the button shows its own state, the
-        engine must leave it out of the Filter badge count and the chip row;
-        those two exclusions are the whole reason the move is not a regression
-        in discoverability."""
+    def test_stack_filter_is_a_pressed_toggle_not_a_segment(self, web_client, admin_cookie, monkeypatch):
+        """The stack filter is the `.fbar-toggle` button, engine-owned; the
+        acquisition question lives in the Filter menu.
+
+        The fold first shipped a three-way Scope segment (All / Yours /
+        Available to add): "Available to add" framed the Library as a shop,
+        and a segment gave one FILTER tab-rank. Both narrowings are ordinary
+        refinements now — "In stack only" as the bar's pressed-state button
+        (the design system's pattern for a binary condition worth seeing at
+        rest, count riding the button), "Not in stack yet" one level deep in
+        the Filter menu (see REDIRECTED_UNDER_RAIL — the retired browse
+        pages' `?scope=available` links arrive with that one applied).
+        """
         text = web_client.get("/library", cookies=admin_cookie).text
+        # Engine-owned via `control` — so Clear all and reset keep working.
+        # Asserted on the config string because the button itself renders
+        # only when flipping it would change the list.
         assert "control: '#lib-stack-toggle'" in text
-
-        js = web_client.get("/static/js/filter_toolbar.js").text
-        # Excluded from the Filter button's badge...
-        assert "return f.control ? n : n + facetState[f.key].size;" in js
-        # ...and from the chip row.
-        assert "if (f.control) return;" in js
-        # State is pushed back onto the button from the one funnel every
-        # mutation goes through, so Clear all / reset can't desync it.
-        assert "syncExternalControls" in js
+        assert 'data-facet="availability"' in text, "the demoted acquisition filter must exist"
+        # The segment is gone, not merely hidden — a filter is not a tab.
+        assert 'id="lib-scope"' not in text
+        assert "segments: {" not in text
 
     def test_rail_has_no_studio_or_marketplace_entry(self, web_client, admin_cookie, monkeypatch):
         """Studio is retired from the rail and Marketplace is no longer a rail
@@ -450,25 +454,19 @@ class TestRailOptIn:
         assert 'id="global-search"' in text
         assert 'id="globalSearchResults"' in text
 
-    def test_rail_catalog_renders_unified_page(self, web_client, admin_cookie, monkeypatch):
-        """Under the rail layout /catalog is the unified browse surface
-        (kind tabs over one grid); the caller's own holdings live on
-        /library — including its "In stack only" toggle, My Stack's
-        replacement (#1088; see test_library_answers_the_stack_question_in_its_toolbar
-        above and tests/test_web_library.py for that surface's coverage)."""
-        resp = web_client.get("/catalog", cookies=admin_cookie)
-        assert resp.status_code == 200
-        for anchor in (
-            'data-kind="data"',
-            'data-kind="plugins"',
-            'data-kind="memory"',
-            'data-kind="recipes"',
-            'class="uc-kindtabs"',
-        ):
-            assert anchor in resp.text, f"unified catalog is missing {anchor}"
-        # Uploads (file collections) are private user resources — they
-        # live in the caller's Library, not in the shared Catalog.
-        assert 'data-kind="library"' not in resp.text
+    def test_rail_catalog_folds_into_the_library(self, web_client, admin_cookie, monkeypatch):
+        """/catalog is no longer a browse surface.
+
+        It rendered kind tabs (Data · Plugins · Memory · Recipes) over one
+        grid of rows the Library already lists in full, off the same
+        `StackResolver.browse()` — two destinations for one list. It now 302s
+        into the Library with the Scope segment set to `available`, which is
+        the question its tabs were really asking. Every detail route beneath
+        it is untouched; this folded the shell only.
+        """
+        resp = web_client.get("/catalog", cookies=admin_cookie, follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/library?scope=available"
 
     def test_library_page_hosts_uploads(self, web_client, admin_cookie, monkeypatch):
         """The caller's things live on /library — the renamed, widened former
@@ -1594,7 +1592,7 @@ class TestStackWorkspace:
     already renders every kind it did off the same StackResolver.browse()
     call. This class used to pin the page's own DOM (a two-group `stk-*`
     table: Required vs. Added by you); that markup no longer exists, so the
-    business semantics it guarded — a required-tier grant reads "In Stack"
+    business semantics it guarded — a required-tier grant reads "In stack"
     but LOCKED with no remove affordance, an optional self-subscription is
     removable — are folded into the Library's own suite instead:
     ``tests/test_web_library.py::test_library_required_grant_is_locked_in_stack``
@@ -1837,18 +1835,31 @@ class TestSharedDetailLayout:
                 f"{path} leaked the paper-only trust marker into the default theme"
             )
 
-    def test_overflow_menu_holds_the_secondary_action(self, web_client, admin_cookie, monkeypatch):
-        """One prominent action per header; the admin errand moves into the
-        overflow menu (a <details>, so it needs no JavaScript to open)."""
+    def test_the_admin_errand_lives_in_the_rail_not_the_header(self, web_client, admin_cookie, monkeypatch):
+        """One prominent action per header, and the admin errand offered ONCE.
+
+        This used to pin the errand inside the reader's overflow menu, which
+        made "manage this package" a menu item that navigated to
+        `/admin/tables?edit_package=` — the Tables lens, a page about something
+        else. Managing the thing you are standing on now has its own labelled
+        home in the rail (`detail.manage`), and it edits in place through the
+        shared drawer. The overflow menu keeps only what it always promised:
+        the actions a READER has that are not what they came to do.
+
+        The invariant the old test was really protecting is unchanged and still
+        asserted here — the action is offered in exactly one place, and the
+        header is not it.
+        """
         monkeypatch.setenv("AGNES_INSTANCE_THEME", "paper")
         self._package("menu-detail-pkg")
         text = web_client.get("/catalog/p/menu-detail-pkg", cookies=admin_cookie).text
-        assert '<details class="detail-menu">' in text
-        assert 'class="detail-menu__item' in text
-        assert "Edit package metadata" in text
-        # The header's icon-button spelling of the same action is gone, so the
-        # action is not offered twice.
+        assert "data-manage" in text, "the rail must carry the governance cluster"
+        assert 'id="pkg-edit-btn"' in text, "and its in-place editor"
+        # Neither of the two older spellings survives, so it is offered once.
         assert 'class="detail-edit-icon"' not in text
+        assert "Edit package metadata" not in text
+        # And it no longer answers "edit this" by leaving for the Tables lens.
+        assert "/admin/tables?edit_package=" not in text
 
 
 class TestResourceColourTokens:
@@ -2030,11 +2041,24 @@ class TestRedesignedPageContracts:
         assert 'id="lib-search"' in resp.text
         assert "Your collections" not in resp.text
 
-    def test_marketplace_is_one_browse_shelf(self, web_client, admin_cookie, monkeypatch):
-        resp = web_client.get("/marketplace", cookies=admin_cookie)
-        assert resp.status_code == 200
-        assert "data-count-browse" in resp.text
-        assert 'data-tab="flea"' not in resp.text
+    def test_marketplace_browse_folds_into_the_library(self, web_client, admin_cookie, monkeypatch):
+        """The Marketplace browse shell folds into the Library.
+
+        Its Browse and My Stack tabs were "everything there is" and "what I
+        have" over store entities and curated plugins the Library already
+        lists — the same pair the Library now asks of one list: `?tab=my`
+        maps to `scope=mine` (the In stack segment) and the browse tab to
+        `scope=available` (the "Not in stack yet" filter), so an old link
+        lands where it meant to. The store itself is untouched: every
+        detail, edit and submission route under /marketplace still renders.
+        """
+        resp = web_client.get("/marketplace", cookies=admin_cookie, follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/library?scope=available"
+
+        mine = web_client.get("/marketplace?tab=my", cookies=admin_cookie, follow_redirects=False)
+        assert mine.status_code == 302
+        assert mine.headers["location"] == "/library?scope=mine"
 
     def _chat(self, web_client, admin_cookie):
         """GET /chat with chat enabled AND explicitly granted to the Admin

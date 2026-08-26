@@ -161,8 +161,13 @@ uv pip install ".[dev,server]"
 # Run FastAPI locally
 uvicorn app.main:app --reload
 
-# Run tests
-.venv/bin/pytest tests/ --tb=short -n auto -q
+# Run tests (connectors/ too — every connector keeps its tests beside the
+# code, and CI runs both; `tests/` alone silently skips them)
+.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q
+
+# Locally `-n auto` is capped at 6 workers (each is a ~430 MB process, and the
+# suite is I/O-bound past that). Raise or lower it for a one-off run:
+AGNES_TEST_MAX_WORKERS=12 .venv/bin/pytest tests/ -n auto -q
 
 # Trigger sync manually
 curl -X POST http://localhost:8000/api/sync/trigger
@@ -170,6 +175,26 @@ curl -X POST http://localhost:8000/api/sync/trigger
 # Docker
 docker compose up
 ```
+
+### Writing tests: never build the app per test
+
+A function-scoped fixture must NOT call `create_app()` — it measures ~430 ms,
+which for most API tests dwarfs the test itself. Request the session-shared
+**`shared_app`** fixture instead, or **`seeded_app`** when you also want the
+four seeded role users and their tokens:
+
+```python
+@pytest.fixture
+def my_client(tmp_path, monkeypatch, shared_app):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))   # isolation still per-test
+    return TestClient(shared_app)
+```
+
+Per-test isolation is unaffected: repositories read `DATA_DIR` at call time, so
+redirecting it in the fixture body still gives each test its own state. Use
+`seeded_app_fresh` only when the test runs the ASGI lifespan itself, GETs
+`/uploads/...`, or asserts on app construction. `tests/test_shared_app_contract.py`
+enforces this and names the fix when it fails.
 
 ### Parallel Claude Code worktrees
 
@@ -436,8 +461,8 @@ parquet-rewrite pipeline end-to-end — but it is no longer off-limits.)
 Full recipe, deploy workflows, manual rollback runbook, weekly tag-housekeeping, and CI quirks: [`docs/RELEASING.md`](docs/RELEASING.md). The non-negotiable rules:
 
 - **Changelog discipline.** Every PR that changes user-visible behavior MUST add a bullet under `## [Unreleased]` in `CHANGELOG.md`, in the same PR — grouped Added/Changed/Fixed/Removed/Internal, `**BREAKING**` prefix for breaking changes. No follow-ups.
-- **Release-cut belongs to the PR.** The version bump (`pyproject.toml`) + CHANGELOG rename + new empty `[Unreleased]` are the LAST commit on the PR that earned the version — never a standalone follow-up PR. If a PR lands the only `[Unreleased]` content, the release-cut ships in the same merge. After merge: tag `vX.Y.Z` on the merge commit + create the GitHub Release.
-- **Run the full test suite before every push** — `.venv/bin/pytest tests/ --tb=short -n auto -q` (this is what CI runs). Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them.
+- **Release-cut is a dedicated cut PR, never a feature PR.** A feature/fix PR only ever adds an `[Unreleased]` bullet — it never bumps `pyproject.toml`/`server.json` or renames `[Unreleased]`. `.github/workflows/daily-cut.yml` cuts once a day (minor bump; `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR labeled `release-cut` that a human reviews and merges — this is what killed the old CHANGELOG-rename race between competing feature PRs. After merge: `gh workflow run tag-release.yml -f tag=vX.Y.Z` (the cut PR's body carries the exact command) tags the merge commit and creates the GitHub Release.
+- **Run the full test suite before every push** — `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q` (this is what CI runs). `connectors/` is not optional: every connector keeps its tests beside the code, so `tests/` alone skips them and a connector regression passes a "full" local run and fails in CI. Failures in code you touched: fix before pushing. Failures unrelated to your diff: confirm with `git stash` they reproduce on a clean branch, note them in the PR body, don't block on them.
 - **Watch the post-merge `release.yml` run.** On `main` pushes a `smoke-test` job pulls the just-built `:stable` image and runs a docker-compose stack; if it fails, the `rollback-on-smoke-fail` job calls the reusable `rollback.yml` workflow which re-points `:stable` to the previous known-good build and opens a tracking issue labeled `bug`. Success signal after merge = `smoke-test` green + `rollback-on-smoke-fail` skipped. If the rollback fires, the merge shipped a broken image to GHCR — investigate the tracking issue before any further push (the issue body has the failing image, commit SHA, deprecated tag, and rollback target). Manual rollback / forced target / weekly tag-pruning operator commands are in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Specialized agents, skills & commands
@@ -449,14 +474,14 @@ the right tool:
 |---|---|---|
 | Chart a large, foggy effort — destination known, too many decisions open to write a plan | `agnes-wayfinder` | a map + numbered decision tickets as markdown under `docs/superpowers/maps/<effort>/`; resolve one per session (`research` excepted) until the route is clear, then hand off to `superpowers:writing-plans` → `/agnes-build`. Explicit invocation only; if you can already state the steps, skip it. |
 | Verify a change before claiming it's done | `verify-agnes-change` | cheapest-first loop: `scripts/verify_syncmap.py` (instant, the sync-map rows no test guards) → the guards your diff touches → full suite → `/agnes-review`. Fix and re-run each gate until it passes. |
-| Review a change before merge | `/agnes-review` | scope-gated review **team** (rules / architecture / rbac / parity — only the in-scope subset fires) + `agnes-review-consolidator` → one advisory report (`file:line` + severity, ≤15 findings). Read-only working tree; optional comment-only PR post. |
+| Review a change before merge | `/agnes-review` | scope-gated review **team** (rules always fires; adversarial is opt-in via `--adversarial`; architecture / rbac / parity fire only in-scope) + `agnes-review-consolidator` → one advisory report (`file:line` + severity, ≤15 findings). Read-only working tree; optional comment-only PR post. |
 | Implement a whole plan in parallel | `/agnes-build` | decomposes a plan into independent tasks (sync-map coupling), builds each in its own git worktree via `agnes-builder`, integrates (migration serialized last), then runs `/agnes-review`. |
 | Implement a feature (connector / endpoint / web page / repo method / migration) | `agnes-builder` | disciplined implementer (TDD-first, DuckDB↔PG parity in the same change, migration-ladder sync, CHANGELOG, vendor-agnostic, scope discipline). Routes to the `agnes-conventions` playbooks. |
 | Cut a release / tag | `agnes-releaser` | per the release process. |
 | Deep knowledge while editing a subsystem | `agnes-*` knowledge skills | auto-loaded by description. |
 
-**Agents** (`.claude/agents/`): `agnes-reviewer-rules`, `agnes-reviewer-architecture`,
-`agnes-reviewer-rbac`, `agnes-reviewer-parity`
+**Agents** (`.claude/agents/`): `agnes-reviewer-rules`, `agnes-reviewer-adversarial`,
+`agnes-reviewer-architecture`, `agnes-reviewer-rbac`, `agnes-reviewer-parity`
 + `agnes-review-consolidator` (the review team), `agnes-builder` (implementer),
 `agnes-decomposer` + `agnes-integrator` (the build team),
 `agnes-releaser` (release).

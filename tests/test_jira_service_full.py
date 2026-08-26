@@ -96,6 +96,76 @@ class TestJiraServiceWebhookProcessing:
             saved = json.load(f)
         assert "_deleted_at" in saved
 
+    def test_a_comment_deleted_event_does_not_tombstone_the_whole_issue(self, jira_env):
+        """`comment_deleted` is an ordinary content change, not an issue deletion.
+
+        The routing used to match any ``webhookEvent`` containing "deleted", so a
+        single deleted comment stamped `_deleted_at` on the issue and dropped its
+        rows from all six parquet tables. Not permanent — `save_issue` replaces
+        the stored JSON wholesale, so the next event for that issue rebuilt it —
+        but an issue that then went quiet stayed missing until a backfill, with
+        nothing logged to say why (Devin on #1435).
+
+        The correct handling is the ordinary path: refetch the issue, whose
+        comment thread no longer contains the deleted comment.
+        """
+        service = _make_jira_service(jira_env)
+        issue_file = jira_env / "issues" / "PROJ-201.json"
+        issue_file.write_text(json.dumps({"key": "PROJ-201", "fields": {}}))
+
+        event_data = {
+            "webhookEvent": "comment_deleted",
+            "issue": {"key": "PROJ-201", "id": "10003", "fields": {"summary": "still here"}},
+        }
+        with (
+            patch("connectors.jira.service.trigger_incremental_transform", return_value=True),
+            patch.object(service, "fetch_issue", return_value={"key": "PROJ-201", "fields": {"summary": "refetched"}}),
+            patch.object(service, "fetch_remote_links", return_value=[]),
+            patch.object(service, "fetch_refresh_fields", return_value=None),
+            patch.object(service, "download_all_attachments", return_value=[]),
+        ):
+            result = service.process_webhook_event(event_data)
+
+        assert result is True
+        saved = json.loads(issue_file.read_text())
+        assert "_deleted_at" not in saved, "a deleted COMMENT tombstoned the whole issue"
+        assert saved["fields"]["summary"] == "refetched", "the issue was not refetched and re-saved"
+
+    def test_an_attachment_deleted_event_does_not_tombstone_the_whole_issue(self, jira_env):
+        service = _make_jira_service(jira_env)
+        issue_file = jira_env / "issues" / "PROJ-202.json"
+        issue_file.write_text(json.dumps({"key": "PROJ-202", "fields": {}}))
+
+        with (
+            patch("connectors.jira.service.trigger_incremental_transform", return_value=True),
+            patch.object(service, "fetch_issue", return_value={"key": "PROJ-202", "fields": {}}),
+            patch.object(service, "fetch_remote_links", return_value=[]),
+            patch.object(service, "fetch_refresh_fields", return_value=None),
+            patch.object(service, "download_all_attachments", return_value=[]),
+        ):
+            service.process_webhook_event(
+                {"webhookEvent": "attachment_deleted", "issue": {"key": "PROJ-202", "id": "1", "fields": {}}}
+            )
+
+        assert "_deleted_at" not in json.loads(issue_file.read_text())
+
+    def test_a_bare_issue_deleted_spelling_still_tombstones(self, jira_env):
+        """The allowlist carries both spellings on purpose: failing to tombstone a
+        REAL issue deletion is the permanent direction — deletion webhooks fire
+        once and nothing ever re-deletes the row — while tombstoning too eagerly
+        only costs rows until the issue's next event."""
+        service = _make_jira_service(jira_env)
+        issue_file = jira_env / "issues" / "PROJ-203.json"
+        issue_file.write_text(json.dumps({"key": "PROJ-203", "fields": {}}))
+
+        with patch("connectors.jira.service.trigger_incremental_transform", return_value=True):
+            result = service.process_webhook_event(
+                {"webhookEvent": "issue_deleted", "issue": {"key": "PROJ-203", "id": "1", "fields": {}}}
+            )
+
+        assert result is True
+        assert "_deleted_at" in json.loads(issue_file.read_text())
+
     def test_process_missing_issue_key_returns_false(self, jira_env):
         """Webhook event without issue key returns False."""
         service = _make_jira_service(jira_env)

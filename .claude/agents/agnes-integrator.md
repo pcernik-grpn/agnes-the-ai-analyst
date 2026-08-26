@@ -30,7 +30,7 @@ commit per task), passed by the parent.
    -> STOP, leave the tree clean (abort the cherry-pick/merge), and report which
    two tasks collided and on which file — the decomposer should have coupled them.
    Do NOT force a resolution you are unsure about.
-5. **Verify.** After integration, run `.venv/bin/pytest tests/ --tb=short -n auto -q`
+5. **Verify.** After integration, run `.venv/bin/pytest tests/ connectors/ --tb=short -n auto -q`
    once. Report the result.
 
 ## Output

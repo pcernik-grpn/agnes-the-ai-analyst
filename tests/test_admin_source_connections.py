@@ -115,6 +115,262 @@ class TestSourceConnectionsCreate:
         assert resp.status_code == 401
 
 
+class TestSeedFromInstanceCredentials:
+    """``seed_from_instance_credentials=true`` on ``POST`` — the derived
+    Keboola card's "Import as managed connection" button
+    (`app/web/templates/admin_data_sources.html::importKeboolaConnection`).
+
+    Copies the instance-level Keboola token into the new connection's own
+    vault slot, but only when that token lives ONLY in the instance vault
+    (an env var needs no copy — the new row's own ``_resolve_token`` already
+    falls back to that same process-global env var).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stable_vault_key(self, monkeypatch):
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        yield
+        _reset_ephemeral_key_for_tests()
+
+    def test_flag_absent_never_touches_the_resolver(self, seeded_app, monkeypatch):
+        """Every existing caller (the "Add data source" wizard, the CLI,
+        third-party API clients) leaves the flag unset and must see zero
+        behavior change — no resolver call, no response fields."""
+        called = []
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: (called.append(token_env), (None, None))[1],
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "test-seed-flag-absent",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        assert called == []
+        assert "token_seeded" not in resp.json()
+
+    def test_vault_only_credential_is_seeded_and_verified(self, seeded_app, monkeypatch):
+        """Case (3) from the review: the credential lives ONLY in the
+        instance vault. It must land in the new connection's OWN vault slot
+        — preflighted and identity-recorded exactly like a manual
+        `PUT .../secret` — not just get a decorative "env" badge."""
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: ("vault-sourced-token", "vault"),
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                return_value={"isMasterToken": False, "owner": {"id": 555, "name": "Vault Co"}},
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            resp = c.post(
+                BASE,
+                json={
+                    "name": "test-seed-vault-only",
+                    "source_type": "keboola",
+                    "config": {"stack_url": "https://connection.example.com"},
+                    "token_env": "KEBOOLA_STORAGE_TOKEN",
+                    "seed_from_instance_credentials": True,
+                },
+                headers=_auth(token),
+            )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["token_seeded"] is True
+        assert body["has_secret"] is True
+        assert body["config"]["project_id"] == 555
+
+        # The row itself is really usable, not just badged as such.
+        row = c.get(f"{BASE}/{body['id']}", headers=_auth(token)).json()
+        assert row["has_secret"] is True
+
+    def test_env_sourced_credential_needs_no_seeding(self, seeded_app, monkeypatch):
+        """Case (1) from the review: the value is resolvable under the
+        row's own exact `token_env` name — an env var is process-global, so
+        the new connection's own token resolver already finds it — no vault
+        write, and no upstream preflight call either."""
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: ("env-sourced-token", "env_token_env"),
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        with patch("app.api.admin_source_connections.KeboolaStorageClient.verify_token") as verify:
+            resp = c.post(
+                BASE,
+                json={
+                    "name": "test-seed-env-source",
+                    "source_type": "keboola",
+                    "config": {"stack_url": "https://connection.example.com"},
+                    "token_env": "KEBOOLA_STORAGE_TOKEN",
+                    "seed_from_instance_credentials": True,
+                },
+                headers=_auth(token),
+            )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert "token_seeded" not in body
+        assert body["has_secret"] is False
+        verify.assert_not_called()
+
+    def test_generic_env_fallback_behind_a_custom_token_env_is_seeded(self, seeded_app, monkeypatch):
+        """Case (2) from the review: the instance's configured `token_env`
+        is a CUSTOM name that is itself unset, but the generic
+        `KEBOOLA_STORAGE_TOKEN` env var holds the value. The new row
+        inherits the custom name, and its own `_resolve_token` never falls
+        back to the generic name — so unlike case (1), this DOES need
+        seeding, exactly like the vault case."""
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: ("generic-env-fallback-token", "env_generic"),
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                return_value={"isMasterToken": False, "owner": {"id": 777, "name": "Generic Env Co"}},
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            resp = c.post(
+                BASE,
+                json={
+                    "name": "test-seed-generic-env",
+                    "source_type": "keboola",
+                    "config": {"stack_url": "https://connection.example.com"},
+                    "token_env": "KBC_TOKEN",
+                    "seed_from_instance_credentials": True,
+                },
+                headers=_auth(token),
+            )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["token_seeded"] is True
+        assert body["has_secret"] is True
+        assert body["config"]["project_id"] == 777
+
+        row = c.get(f"{BASE}/{body['id']}", headers=_auth(token)).json()
+        assert row["has_secret"] is True
+
+    def test_a_stale_vault_token_reports_the_failure_without_failing_the_create(self, seeded_app, monkeypatch):
+        """The instance vault holds a token, but it no longer verifies (e.g.
+        revoked upstream). The import must not silently look like a success
+        — the create itself still succeeds, but the response says exactly
+        what went wrong so the client can toast something honest."""
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: ("stale-vault-token", "vault"),
+        )
+        from connectors.keboola.storage_api import StorageApiError
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                side_effect=StorageApiError(
+                    "GET https://connection.example.com/v2/storage/tokens/verify -> HTTP 401: "
+                    '{"error": "Invalid access token", "code": "storage.tokenInvalid"}',
+                    status=401,
+                ),
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            resp = c.post(
+                BASE,
+                json={
+                    "name": "test-seed-stale-vault",
+                    "source_type": "keboola",
+                    "config": {"stack_url": "https://connection.example.com"},
+                    "token_env": "KEBOOLA_STORAGE_TOKEN",
+                    "seed_from_instance_credentials": True,
+                },
+                headers=_auth(token),
+            )
+        # A bad instance-vault token must not fail the whole import — the
+        # connection row itself was created fine.
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["token_seeded"] is False
+        assert "storage.tokenInvalid" in body["token_seed_error"]
+        assert body["has_secret"] is False
+
+    def test_a_non_http_seed_error_also_reports_failure_without_failing_the_create(self, seeded_app, monkeypatch):
+        """Devin Review: the seeding step's try/except only caught
+        `HTTPException`, so a non-HTTPException failure inside
+        `_store_connection_secret` (e.g. a `ValueError` from the Keboola
+        client, or a vault failure that isn't `VaultKeyNotConfiguredError`)
+        escaped and turned a connection that WAS created into a 500 the
+        admin reads as total failure."""
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: ("vault-sourced-token", "vault"),
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        with (
+            patch(
+                "app.api.admin_source_connections.KeboolaStorageClient.verify_token",
+                side_effect=ValueError("boom"),
+            ),
+            patch("app.api.admin._validate_url_not_private", return_value=None),
+        ):
+            resp = c.post(
+                BASE,
+                json={
+                    "name": "test-seed-non-http-error",
+                    "source_type": "keboola",
+                    "config": {"stack_url": "https://connection.example.com"},
+                    "token_env": "KEBOOLA_STORAGE_TOKEN",
+                    "seed_from_instance_credentials": True,
+                },
+                headers=_auth(token),
+            )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["token_seeded"] is False
+        assert "boom" in body["token_seed_error"]
+        assert body["has_secret"] is False
+
+        row = c.get(f"{BASE}/{body['id']}", headers=_auth(token)).json()
+        assert row["has_secret"] is False
+
+    def test_flag_is_ignored_for_non_keboola_source_types(self, seeded_app, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            "app.datasource_secrets.keboola_instance_token",
+            lambda token_env: (called.append(token_env), (None, None))[1],
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "test-seed-non-keboola",
+                "source_type": "bigquery",
+                "config": {"project_id": "p"},
+                "seed_from_instance_credentials": True,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        assert called == []
+        assert "token_seeded" not in resp.json()
+
+
 class TestSourceConnectionsGet:
     def test_get_existing_returns_200(self, seeded_app):
         c = seeded_app["client"]
@@ -1862,12 +2118,18 @@ def test_the_secret_path_bookkeeping_is_isolated_too():
     The token is safely stored before `_record_project_identity` runs, so a
     vault or DB fault there turned an already-successful save into an error
     response — the admin retries a store that already worked.
+
+    The preflight/persist/identity-recording body now lives in
+    `_store_connection_secret`, shared with the Keboola "Import as managed
+    connection" vault-seeding step — `set_connection_secret` itself is a
+    thin wrapper around it, so the isolation guard targets the function
+    that actually does the work.
     """
     import inspect
 
     from app.api import admin_source_connections as mod
 
-    src = inspect.getsource(mod.set_connection_secret)
+    src = inspect.getsource(mod._store_connection_secret)
     i = src.index("_record_project_identity(connection_id, row, info)")
     assert src[:i].rstrip().endswith("try:"), "the identity write is not isolated on the secret path"
     assert "could not record its project identity" in src[i:]

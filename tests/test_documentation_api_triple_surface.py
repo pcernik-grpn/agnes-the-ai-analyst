@@ -95,6 +95,10 @@ _COHORT: dict[str, tuple[str, str]] = {
     # tier as search/export/validate-query.
     "/api/semantic-models/context": ("semantic-model context", "get_semantic_context"),
     "/api/semantic-models/schema": ("semantic-model schema", "get_semantic_schema"),
+    # Chat-first authoring (spec 2026-08-24) — the one semantic-layer write
+    # surface with outcome branching (admin → applied, non-admin → queued
+    # for moderation).
+    "/api/semantic-models/apply": ("semantic-model apply", "apply_semantic_model"),
     # Contributed-skill triple-surface (GET list + DELETE; POST contribute is _EXEMPT below).
     "/api/admin/contributed-skills": ("admin skill list", "list_contributed_skills"),
     "/api/admin/contributed-skills/{name}": ("admin skill delete", "delete_contributed_skill"),
@@ -312,9 +316,11 @@ _MEMORY_MINING_REASON = (
     "queue (itself exempt). No analyst CLI/MCP analogue."
 )
 _BUILTIN_DISABLE_REASON = (
-    "admin-only per-plugin disable toggle for built-in marketplace plugins — "
-    "web UI only at /admin/marketplaces, no analyst CLI/MCP analogue (mirrors "
-    "the grandfathered admin marketplace register/sync/delete mutations)"
+    "admin-only per-plugin disable toggle — web UI at /admin/marketplaces plus "
+    "`agnes admin marketplace disable-plugin/enable-plugin` (parity case in "
+    "tests/test_cli_api_parity.py). Deliberately never MCP-exposed: an "
+    "agent-invokable instance-wide kill switch over served plugins is a "
+    "privilege-escalation seam, not a convenience."
 )
 _REPORTS_REASON = (
     "admin-only marketplace usage digest — read-only JSON feed for an external "
@@ -537,11 +543,19 @@ _LIBRARY_MOVE_REASON = (
 )
 
 _AGENTS_REGISTRY_REASON = (
-    "Web Agent-builder CRUD (v103 `agents` registry). The builder at /agents is "
-    "the only producer and the Library the only consumer; an agent cannot yet be "
-    "RUN on any surface, so there is no analyst CLI/MCP workflow to mirror. "
-    "Revisit when agents become runnable — then `agnes agent …` + an MCP tool "
-    "become the triple-surface obligation."
+    "Web Agent-builder CRUD (v103 `agents` registry) — a second registry over "
+    "the same `agents` table as `/api/v1/agents`, which IS runnable and already "
+    "carries full triple-surface coverage (`/api/v1/agents/{slug}/responses` "
+    "in _COHORT, reachable via `agnes chat` / `agent ask`). The builder at "
+    "/agents is the only producer of this registry and the Library the only "
+    "consumer; it writes decorative knowledge/plugins fields the runtime never "
+    "reads and never sets `agent_scope`, so a builder-created agent stays in "
+    "the default all-mode and cannot be issued a PAT (`agent_not_selected_mode` "
+    "until `agnes agent scope set` runs) — unreachable via API by construction, "
+    "not because agents cannot be run. Two registries pending the agent-core "
+    "consolidation program (remediation Track C, 'one agent model'), which "
+    "deletes `/api/agents` and re-points the builder at `/api/v1/agents` — at "
+    "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
 _LIBRARY_SHARING_REASON = (
@@ -593,6 +607,14 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/users/{user_id}/library-preview": (
+        "feeds the Simulate lens's Library-shaped preview on /admin/access — "
+        "a projection of another person's /library page, meaningful only "
+        "beside the why-chain that pane renders around it. The sibling "
+        "/effective-access is grandfathered REST-only for the same reason. "
+        "If an `agnes admin simulate <user>` CLI ever lands, this should "
+        "join its cohort rather than stay exempt"
+    ),
     "/api/auth/keboola/projects": _KEBOOLA_LOGIN_PROJECTS_REASON,
     "/api/admin/doctor/new-instance": (
         "deployment-gate doctor (post-deploy smoke checks) — CLI-reachable via "
@@ -604,6 +626,15 @@ _EXEMPT: dict[str, str] = {
         "bootstrap is still open, email transport state) — one-call "
         "reconnaissance in a prompt-injected agent session, not an agent "
         "affordance"
+    ),
+    "/api/admin/doctor/support": (
+        "support-bundle doctor (redacted state snapshot) — CLI-reachable via "
+        "`agnes doctor` (it renders the server section of the bundle file), "
+        "but deliberately never MCP-exposed per the 'operator security-posture "
+        "diagnostics' standing exemption in CONTRIBUTING.md: the response "
+        "enumerates build fingerprints, schema state and secret PRESENCE — "
+        "one-call reconnaissance in a prompt-injected agent session, not an "
+        "agent affordance"
     ),
     "/api/admin/mcp-tools/{tool_id}/projection-map": (
         "names which of a lister tool's columns carry an app's id, URL and "
@@ -801,6 +832,12 @@ _EXEMPT: dict[str, str] = {
         "credential authenticates against is a privilege-escalation seam). "
         "Reachable via `agnes admin connection chat-tools`; never MCP-exposed"
     ),
+    "/api/admin/data-sources/{source_type}/tables": (
+        "admin-only schema/table discovery for the 'Add data source' wizard's Snowflake "
+        "picker — the connection-less sibling of the Keboola listing below, browse-only "
+        "with no analyst CLI/MCP analogue; `agnes admin register-table` already covers "
+        "the registration step it feeds"
+    ),
     "/api/admin/source-connections/{connection_id}/tables": (
         "admin-only bucket/table discovery for the 'Add data source' wizard (#755) — "
         "keboola-only browse-and-register primitive with no analyst CLI/MCP analogue; "
@@ -909,6 +946,11 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven Databricks semantic layer (Unity Catalog metric "
         "views) sync trigger — admin/scheduler maintenance op, mirrors the "
         "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/run-audit-prune": (
+        "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
+        "seam) — admin/scheduler maintenance op, mirrors the run-blocked-purge "
+        "/ run-reap-stuck-reviews exemptions; no analyst CLI/MCP analogue"
     ),
     "/api/chat/journey": (
         "chat-driven onboarding backend foundation — internal state read/write "

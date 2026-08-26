@@ -39,7 +39,10 @@ def _make_mock_manager(repo: ChatRepository) -> ChatManager:
     workdir_mgr.ensure_user_workdir = MagicMock()
     workdir_mgr.prepare_session_dir = MagicMock(return_value="/tmp/fake")
 
-    config = ChatConfig(enabled=True, concurrency_per_user=3)
+    # Pin the native provider: these tests assert on chat_<hex> session ids,
+    # which `engine_session_id` replaces with UUIDs under the (default)
+    # kai-agent provider.
+    config = ChatConfig(enabled=True, concurrency_per_user=3, provider="docker")
     return ChatManager(
         provider=provider,
         workdir_mgr=workdir_mgr,
@@ -127,6 +130,32 @@ def test_list_sessions(api_client: TestClient, logged_in_user):
     assert arr[0]["surface"] == "web"
 
 
+def test_create_session_reports_the_agent_it_runs_as(api_client: TestClient, logged_in_user):
+    """``agent_id`` on the wire.
+
+    ``chat_sessions.agent_id`` has recorded this since v101 and both backends
+    round-trip it into ``ChatSession``, but no response ever carried it — which
+    is what made the composer's agent picker impossible to build: a client had
+    no way to learn who a conversation was with. Never null, because an unnamed
+    web session is attributed to the caller's default agent.
+    """
+    from src.repositories import agents_repo
+
+    r = api_client.post("/api/chat/sessions", json={"surface": "web"})
+    assert r.status_code == 201, r.text
+    assert r.json()["agent_id"] == agents_repo().get_or_create_default(TEST_USER["id"])["id"]
+
+
+def test_list_sessions_reports_the_agent_of_each(api_client: TestClient, logged_in_user):
+    """Without this the sidebar cannot restore the picker's label on reopen."""
+    created = api_client.post("/api/chat/sessions", json={"surface": "web"})
+    assert created.status_code == 201, created.text
+    r = api_client.get("/api/chat/sessions")
+    assert r.status_code == 200
+    row = next(s for s in r.json() if s["id"] == created.json()["id"])
+    assert row["agent_id"] == created.json()["agent_id"]
+
+
 def test_create_session_accepts_known_profile(api_client: TestClient, logged_in_user):
     r = api_client.post("/api/chat/sessions", json={"surface": "web", "profile": "data-package-builder"})
     assert r.status_code == 201, r.text
@@ -143,6 +172,32 @@ def test_get_messages_empty(api_client: TestClient, logged_in_user):
     r = api_client.get(f"/api/chat/sessions/{c['id']}/messages")
     assert r.status_code == 200
     assert r.json() == []
+
+
+def test_get_messages_exposes_sender_email(api_client: TestClient, logged_in_user):
+    """`chat.js` filters two things on `m.sender_email`: the ArrowUp prompt-recall
+    stack (so a co-drive peer's prompt never surfaces under the owner's history)
+    and `renderMessage`'s peer-attribution badge. Both read rows from THIS
+    endpoint, which did not serialize the field — so `!m.sender_email` was
+    unconditionally true, the recall filter was dead code, and peer names
+    vanished from the transcript after a reload.
+
+    The value is already carried by the repository layer and already exposed to
+    participants by `/api/chat/copresence`; this route is owner-only (a
+    non-owner gets 404 before reaching the payload), so serializing it here
+    discloses nothing new.
+    """
+    c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
+    repo = api_client.app.state.chat_repo
+    repo.append_message(session_id=c["id"], role="user", content="mine", sender_email=None)
+    repo.append_message(session_id=c["id"], role="user", content="theirs", sender_email="peer@example.com")
+
+    rows = api_client.get(f"/api/chat/sessions/{c['id']}/messages").json()
+    assert len(rows) == 2, rows
+    assert all("sender_email" in r for r in rows), (
+        "chat.js's recall filter and peer badge both read m.sender_email -- omitting it makes both dead code"
+    )
+    assert [r["sender_email"] for r in rows] == [None, "peer@example.com"]
 
 
 def test_archive_session(api_client: TestClient, logged_in_user):

@@ -281,6 +281,45 @@ class TestQueryLocalTool:
         assert result["columns"] == ["x"]
         assert result["rows"] == [[42]]
 
+    def test_query_local_tolerates_one_trailing_semicolon(self, tmp_path):
+        """The fourth embed site. `_assert_select_only` and the three
+        server-side subquery wrappers all learned to accept a single trailing
+        `;`; this one — the MCP tool an agent reaches for, and therefore where
+        the habit originates — kept raising a raw DuckDB `ParserException`
+        because `SELECT * FROM (SELECT ...;) AS _q LIMIT n` is a syntax error.
+        Five site-local copies of a one-character rule is why a sixth was
+        missed, so all six now call `strip_one_trailing_semicolon`."""
+        import duckdb
+
+        srv = _import_server()
+
+        db_path = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db_path.parent.mkdir(parents=True)
+        with duckdb.connect(str(db_path)) as conn:
+            conn.execute("CREATE TABLE t (x INTEGER)")
+            conn.execute("INSERT INTO t VALUES (42)")
+
+        with patch.dict("os.environ", {"AGNES_LOCAL_DIR": str(tmp_path)}):
+            result = srv.query_local("SELECT x FROM t;")
+
+        assert result["rows"] == [[42]]
+
+    def test_query_local_still_refuses_two_statements(self, tmp_path):
+        """Non-vacuity: exactly ONE terminator is stripped, so the relaxation
+        is not loopable into smuggling a second statement past the wrap."""
+        import duckdb
+
+        srv = _import_server()
+
+        db_path = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db_path.parent.mkdir(parents=True)
+        with duckdb.connect(str(db_path)) as conn:
+            conn.execute("CREATE TABLE t (x INTEGER)")
+
+        with patch.dict("os.environ", {"AGNES_LOCAL_DIR": str(tmp_path)}):
+            with pytest.raises(Exception):
+                srv.query_local("SELECT x FROM t; SELECT 1;")
+
     def test_table_miss_hints_at_query_tool(self, tmp_path):
         import duckdb
 

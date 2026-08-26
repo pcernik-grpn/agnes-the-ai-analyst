@@ -10,7 +10,10 @@
  *
  * Each accepts either a plain string (the message) or an options object:
  *   { title, message, confirmText, cancelText, okText, danger,
- *     defaultValue, placeholder }
+ *     defaultValue, placeholder, inputType }
+ * `inputType` (promptModal only, default 'text') is passed straight to the
+ * rendered <input type>— pass 'password' to mask a secret being entered
+ * (e.g. a DB connection string containing a password).
  * When `title` is given it becomes the heading and `message` the muted
  * sub-line; with only a string the message is the heading.
  *
@@ -183,7 +186,7 @@
       ui.backdrop._onCancel = function () { ui.settle(null); };
 
       const input = document.createElement('input');
-      input.type = 'text';
+      input.type = opts.inputType || 'text';
       input.value = opts.defaultValue != null ? String(opts.defaultValue) : '';
       if (opts.placeholder) input.placeholder = opts.placeholder;
       // Insert the input above the actions row.

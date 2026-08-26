@@ -213,6 +213,11 @@
         <span>Optional</span>
       </span>
       {% endif %}
+      {# Edit in place — the same shared drawer the detail page opens, so a
+         rename does not cost a navigation. The foot's right slot is the
+         control slot by contract (see _fbar_card.html). #}
+      <button type="button" class="btn btn-secondary btn-sm" data-adp-edit-package="{{ entry.id }}"
+              title="Edit name, description, category and tables in place">Edit</button>
     {% endcall %}
     {% endfor %}
   </div>
@@ -287,6 +292,18 @@
 <script src="{{ static_url('js/components/package_drawer.js') }}" defer></script>
 <script>
   document.addEventListener("click", function (e) {
+    // Per-card "Edit" — the drawer's edit mode over this grid, reload on
+    // save for the same server-side-joins reason create reloads.
+    var editBtn = e.target.closest("[data-adp-edit-package]");
+    if (editBtn) {
+      if (!window.AgnesPackageDrawer) return;
+      window.AgnesPackageDrawer.open({
+        mode: "edit",
+        pkgId: editBtn.getAttribute("data-adp-edit-package"),
+        onSaved: function () { window.location.reload(); },
+      });
+      return;
+    }
     if (!e.target.closest("[data-adp-new-package]")) return;
     // Deferred component, so a click in the first few hundred milliseconds
     // could land before it exists — do nothing rather than throw.

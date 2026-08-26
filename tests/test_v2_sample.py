@@ -683,6 +683,281 @@ class TestPartitionedTablePreview:
         assert resolve_local_parquet_glob("kbc_empty", "keboola") is None
 
 
+class TestRemoteRowLiveSample:
+    """`query_mode='remote'` rows (non-BQ) preview live through their
+    analytics view instead of being refused outright.
+
+    The orchestrator maintains a view over the re-ATTACHed source for every
+    remote row that resolves locally (`_remote_attach` — Snowflake `sf`,
+    Keboola `kbc`, Databricks with attach_enabled), and `/api/query` already
+    serves these rows through that view; the sample endpoint refusing them
+    was a parity gap with the BigQuery live branch above. When the view
+    cannot serve (attach lost, engine with no local view), the pre-existing
+    by-design refusal stays — enriched with the real failure so the admin is
+    not sent hunting a sync job while the actual error goes unreported.
+    """
+
+    @staticmethod
+    def _register_remote(conn, table_id, *, with_policy=False):
+        from src.repositories.table_registry import TableRegistryRepository
+
+        repo = TableRegistryRepository(conn)
+        repo.register(
+            id=table_id,
+            name=table_id,
+            source_type="snowflake",
+            bucket="GOLD",
+            source_table="BI_X",
+            query_mode="remote",
+        )
+        if with_policy:
+            repo.set_access_policy(table_id, sql=f"SELECT * FROM {table_id}", note="test", updated_by="admin")
+
+    @staticmethod
+    def _create_analytics_view(table_id, rows_sql):
+        """Stand in for the orchestrator: materialize the analytics DB with a
+        relation named like the remote row's view."""
+        import os
+        from pathlib import Path
+
+        import duckdb as _duckdb
+
+        data_dir = Path(os.environ["DATA_DIR"])
+        (data_dir / "analytics").mkdir(parents=True, exist_ok=True)
+        c = _duckdb.connect(str(data_dir / "analytics" / "server.duckdb"))
+        try:
+            c.execute(f'CREATE TABLE "{table_id}" AS {rows_sql}')
+        finally:
+            c.close()
+
+    def test_remote_row_returns_live_rows_from_the_analytics_view(self, reload_db):
+        from app.api import v2_sample
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_live")
+            self._create_analytics_view("sf_live", "SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2, 'y'")
+            user = {"id": "admin1", "email": "a@x.com"}
+            data = v2_sample.build_sample(conn, user, "sf_live", n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert data["table_id"] == "sf_live"
+        assert data["source"] == "snowflake"
+        assert len(data["rows"]) == 2
+        assert data["rows"][0] == {"a": 1, "b": "x"}
+
+    def test_n_caps_the_live_rows(self, reload_db):
+        from app.api import v2_sample
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_capped")
+            self._create_analytics_view("sf_capped", "SELECT * FROM range(10)")
+            user = {"id": "admin1", "email": "a@x.com"}
+            data = v2_sample.build_sample(conn, user, "sf_capped", n=3, bq=_bq())
+        finally:
+            conn.close()
+        assert len(data["rows"]) == 3
+
+    def test_remote_wins_over_a_stale_parquet_left_by_a_materialized_era(self, reload_db, monkeypatch):
+        """A row flipped materialized→remote can leave its old parquet on
+        disk. `query_mode='remote'` means every read goes live — serving the
+        stale (possibly empty) copy would silently show outdated data, so the
+        mode check must run BEFORE parquet resolution."""
+        from app.api import v2_sample
+
+        monkeypatch.setattr(
+            "app.api.v2_sample.resolve_local_parquet_glob",
+            lambda *a, **kw: pytest.fail("remote row must not resolve a local parquet"),
+            raising=False,
+        )
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_flipped")
+            self._create_analytics_view("sf_flipped", "SELECT 'live' AS origin")
+            user = {"id": "admin1", "email": "a@x.com"}
+            data = v2_sample.build_sample(conn, user, "sf_flipped", n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert data["rows"] == [{"origin": "live"}]
+
+    def test_missing_view_falls_back_to_the_by_design_refusal(self, reload_db):
+        """No analytics view (attach lost, or an engine with no local view):
+        the by-design message survives — including the pointer at the way to
+        actually read the table — plus the real failure, so nothing lies."""
+        from app.api import v2_sample
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_noview")
+            user = {"id": "admin1", "email": "a@x.com"}
+            with pytest.raises(v2_sample.TableNotPreviewableError) as exc_info:
+                v2_sample.build_sample(conn, user, "sf_noview", n=5, bq=_bq())
+        finally:
+            conn.close()
+        detail = exc_info.value.detail
+        assert "--remote" in detail
+        assert "query_mode='remote'" in detail
+        assert "first sync" not in detail
+        assert "no synced data yet" not in detail
+        # The real failure is reported, not swallowed behind the reassurance.
+        assert "live sample" in detail
+
+    def test_policied_remote_row_fails_closed_for_a_filtered_caller(self, reload_db, monkeypatch):
+        """Same Task-13 ratchet as the BQ live branch: policy rewrite is not
+        wired into this surface, so a caller the policy would filter must
+        never see the raw live rows."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+        from app.api import v2_sample
+
+        monkeypatch.setattr("app.api.v2_sample.can_access_table", lambda user, tid, conn: True)
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_policied", with_policy=True)
+            self._create_analytics_view("sf_policied", "SELECT 'secret' AS s")
+            non_admin = {"id": "viewer1", "email": "viewer@x.com"}
+            with pytest.raises(HTTPException) as exc_info:
+                v2_sample.build_sample(conn, non_admin, "sf_policied", n=2, bq=_bq())
+        finally:
+            conn.close()
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == {"reason": "policy_error", "table": "sf_policied"}
+
+    def test_admin_bypass_on_a_policied_remote_row(self, reload_db, monkeypatch):
+        """Mirrors the BQ branch: `policied_relation` itself decides the
+        admin bypass, so an admin keeps seeing the raw live sample."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+        from app.api import v2_sample
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_policied_adm", with_policy=True)
+            self._create_analytics_view("sf_policied_adm", "SELECT 'admin-visible' AS s")
+            admin = {"id": "admin1", "email": "admin1@test.com"}
+            data = v2_sample.build_sample(conn, admin, "sf_policied_adm", n=2, bq=_bq())
+        finally:
+            conn.close()
+        assert data["rows"] == [{"s": "admin-visible"}]
+
+
+class TestParquetKeyedByRegistryName:
+    """The write side keys the parquet FILENAME by `table_registry.name`
+    (`app/api/sync.py::_run_materialized_pass`: "the parquet filename [is]
+    keyed by `table_registry.name`"; the extractors' `tc["name"]`), while the
+    read surfaces receive the registry `id` off the request path. The
+    register handler derives the id by slugifying the name
+    (`name.strip().lower().replace(" ", "_")`), so the two routinely differ —
+    and then the id-keyed lookup misses a healthy, fully-synced table, which
+    `build_sample` reported as "the first sync is pending or failing"
+    (observed live: uppercase Keboola source-table names registered through
+    the Data-sources wizard)."""
+
+    ID = "orders_90d"
+    NAME = "Orders 90d"  # the exact pair the register handler's slugify produces
+
+    def _register(self, conn):
+        _ensure_admin1(conn)
+        from src.repositories.table_registry import TableRegistryRepository
+
+        TableRegistryRepository(conn).register(
+            id=self.ID,
+            name=self.NAME,
+            source_type="keboola",
+            bucket="in.c-main",
+            source_table="ORDERS_90D",
+            query_mode="materialized",
+        )
+
+    def _write_parquet_by_name(self, data_dir):
+        import duckdb as _duckdb
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        parquet_path = data_dir / f"{self.NAME}.parquet"
+        c = _duckdb.connect(":memory:")
+        try:
+            c.execute(f"COPY (SELECT 1 AS order_id, 'EUR' AS currency) TO '{parquet_path}' (FORMAT PARQUET)")
+        finally:
+            c.close()
+
+    def test_glob_resolver_prefers_the_registry_name_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        self._write_parquet_by_name(tmp_path / "extracts" / "keboola" / "data")
+
+        from app.utils import resolve_local_parquet_glob
+
+        # Pin the gap the keyword exists for: the bare id-keyed lookup misses.
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        target = resolve_local_parquet_glob(self.ID, "keboola", registry_name=self.NAME)
+        assert target is not None and target.endswith(f"{self.NAME}.parquet"), target
+
+    def test_partitioned_directory_keyed_by_name_resolves_too(self, tmp_path, monkeypatch):
+        """The partitioned sync writes `data/<name>/` — same keying convention,
+        same miss."""
+        import pandas as pd
+
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        part_dir = tmp_path / "extracts" / "keboola" / "data" / self.NAME
+        part_dir.mkdir(parents=True)
+        pd.DataFrame({"amount": [1, 2]}).to_parquet(part_dir / "2026_01.parquet")
+
+        from app.utils import resolve_local_parquet_glob
+
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        target = resolve_local_parquet_glob(self.ID, "keboola", registry_name=self.NAME)
+        assert target is not None and target.endswith("*.parquet"), target
+
+    def test_unset_registry_name_changes_nothing(self, tmp_path, monkeypatch):
+        """Callers that don't pass the keyword keep the exact old behavior."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        self._write_parquet_by_name(tmp_path / "extracts" / "keboola" / "data")
+
+        from app.utils import resolve_local_parquet_glob
+
+        assert resolve_local_parquet_glob(self.ID, "keboola") is None
+        assert resolve_local_parquet_glob(self.ID, "keboola", registry_name=None) is None
+
+    def test_sample_resolves_when_wizard_id_differs_from_name(self, reload_db):
+        from app.api import v2_sample
+        from app.utils import get_data_dir
+
+        self._write_parquet_by_name(get_data_dir() / "extracts" / "keboola" / "data")
+        conn = reload_db.get_system_db()
+        try:
+            self._register(conn)
+            user = {"id": "admin1", "email": "a@x.com"}
+            data = v2_sample.build_sample(conn, user, self.ID, n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert data["table_id"] == self.ID
+        assert data["rows"] == [{"order_id": 1, "currency": "EUR"}]
+
+    def test_not_synced_detail_reads_sync_state_under_the_name_key(self, reload_db):
+        """sync_state is keyed by the registry NAME (same write-side
+        convention), so the 404 detail's last-sync-error lookup must try the
+        name too — keyed by id it never surfaced the recorded failure for a
+        wizard-registered row."""
+        from app.api import v2_sample
+        from src.repositories.sync_state import SyncStateRepository
+
+        conn = reload_db.get_system_db()
+        try:
+            self._register(conn)  # no parquet written — genuinely unsynced
+            SyncStateRepository(conn).set_error(self.NAME, "export-async -> HTTP 403: token lacks bucket access")
+            user = {"id": "admin1", "email": "a@x.com"}
+            with pytest.raises(v2_sample.TableNotSyncedError) as exc_info:
+                v2_sample.build_sample(conn, user, self.ID, n=5, bq=_bq())
+        finally:
+            conn.close()
+        assert "last sync error" in exc_info.value.detail, exc_info.value.detail
+        assert "HTTP 403" in exc_info.value.detail
+
+
 class TestSampleAccessPolicyBqBranch:
     """Task 13 (§8 ratchet) — the BQ live-query branch of `build_sample` had
     NO access-policy enforcement at all: `_fetch_bq_sample` pushes straight
@@ -767,3 +1042,106 @@ class TestSampleAccessPolicyBqBranch:
         finally:
             conn.close()
         assert data["rows"] == rows
+
+
+class TestRemoteLiveMeansLive:
+    """The `remote` branch justifies its position — ahead of parquet
+    resolution — with "`remote` means every read goes live", and then wrote
+    its result into a one-hour `TTLCache` under a plain `{table_id}|{n}` key.
+    Serving a 60-minute-old copy is the same staleness the branch was moved to
+    avoid, just from a different store.
+
+    Cost was the reason to cache, and it does not survive contact with the
+    numbers: the read is `SELECT * FROM <view> LIMIT n` with n ≤ 100. For
+    Snowflake and Keboola that is a bounded pull through the extension. Only
+    Databricks-with-`attach_enabled` — off by default and marked experimental
+    — makes it a parquet read, and buying liveness for the two supported
+    engines at that price is the right trade.
+    """
+
+    _register_remote = staticmethod(TestRemoteRowLiveSample._register_remote)
+    _create_analytics_view = staticmethod(TestRemoteRowLiveSample._create_analytics_view)
+
+    @staticmethod
+    def _replace_view(table_id, rows_sql):
+        import os
+        from pathlib import Path
+
+        import duckdb as _duckdb
+
+        c = _duckdb.connect(str(Path(os.environ["DATA_DIR"]) / "analytics" / "server.duckdb"))
+        try:
+            c.execute(f'CREATE OR REPLACE TABLE "{table_id}" AS {rows_sql}')
+        finally:
+            c.close()
+
+    def test_a_second_read_sees_the_upstream_change(self, reload_db):
+        from app.api import v2_sample
+
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_fresh")
+            self._create_analytics_view("sf_fresh", "SELECT 'v1' AS v")
+            user = {"id": "admin1", "email": "a@x.com"}
+            first = v2_sample.build_sample(conn, user, "sf_fresh", n=5, bq=_bq())
+            assert first["rows"] == [{"v": "v1"}]
+
+            self._replace_view("sf_fresh", "SELECT 'v2' AS v")
+            second = v2_sample.build_sample(conn, user, "sf_fresh", n=5, bq=_bq())
+        finally:
+            conn.close()
+
+        assert second["rows"] == [{"v": "v2"}], (
+            "a 'live' remote sample was served from the 1h cache -- the branch's own "
+            "justification for running ahead of parquet resolution says every read goes live"
+        )
+
+    def test_a_local_row_still_caches(self, reload_db, monkeypatch):
+        """Non-vacuity: only `remote` opts out. A local/materialized row keeps
+        the cache it has always had, so this is a targeted exemption rather
+        than a quiet removal of the whole cache."""
+        from app.api import v2_sample
+
+        assert v2_sample._sample_cache is not None
+        conn = reload_db.get_system_db()
+        try:
+            _ensure_admin1(conn)
+            self._register_remote(conn, "sf_cached_check")
+        finally:
+            conn.close()
+        # The decision itself, read directly — no fixture can observe a cache
+        # hit without also observing the fetch it skipped.
+        cacheable = v2_sample._sample_is_cacheable
+        assert cacheable(source_type="snowflake", query_mode="local", has_access_policy=False) is True
+        assert cacheable(source_type="snowflake", query_mode="materialized", has_access_policy=False) is True
+        assert cacheable(source_type="snowflake", query_mode="remote", has_access_policy=False) is False
+        assert cacheable(source_type="snowflake", query_mode="local", has_access_policy=True) is False
+
+    def test_bigquery_remote_previews_stay_cached(self):
+        """The exemption is about liveness for the extension-resolved engines;
+        for BigQuery it would have been a COST regression instead.
+
+        A BQ remote row takes the branch above the new one — `source_type ==
+        "bigquery"` and not `materialized` — into `_fetch_bq_sample`, which
+        pushes the statement to BigQuery. That is a metered, billable scan per
+        call, unlike every other engine on this surface, and it was cacheable
+        before the exemption existed (`cacheable = not has_access_policy`). So
+        every catalog tile render and every `agnes describe` would have billed
+        a fresh query. Caught in review on the train that introduced it.
+
+        A policied BQ row is still uncacheable — the identity-free cache key
+        is the reason there, and it outranks cost."""
+        from app.api import v2_sample as mod
+
+        cacheable = mod._sample_is_cacheable
+        assert cacheable(source_type="bigquery", query_mode="remote", has_access_policy=False) is True
+        assert cacheable(source_type="BigQuery", query_mode="remote", has_access_policy=False) is True, (
+            "source_type comparison must not be case-sensitive"
+        )
+        assert cacheable(source_type="bigquery", query_mode="remote", has_access_policy=True) is False, (
+            "a policied row stays uncacheable regardless of engine -- the key has no identity in it"
+        )
+        # Non-vacuity: the exemption still bites for the engines it was for.
+        assert cacheable(source_type="keboola", query_mode="remote", has_access_policy=False) is False
+        assert cacheable(source_type="databricks", query_mode="remote", has_access_policy=False) is False

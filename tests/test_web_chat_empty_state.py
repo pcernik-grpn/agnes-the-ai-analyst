@@ -168,18 +168,27 @@ class TestChatEmptyStatePill:
         assert "knowledge source</a>" not in line and "knowledge sources</a>" not in line
 
     def test_below_the_input_is_context_only(self, seeded_app, monkeypatch):
-        """Below the composer carries the Stack status line and nothing else —
-        no onboarding, no marketing, no documentation link. The first-run
-        "See how Agnes works" path moved INTO the hero, under its CTA."""
+        """Below the composer carries what this conversation RUNS WITH and
+        nothing else — no onboarding, no marketing, no documentation link. The
+        first-run "See how Agnes works" path moved INTO the hero, under its CTA.
+
+        Two things qualify, sharing one line: the Stack status line (what the
+        agent can reach) and the agent picker (who it is). Both live in the
+        composer's own footer row rather than in ``#chat-empty-extras``,
+        because the picker has to survive the start of a conversation and
+        extras do not — so the region checked here spans from the composer to
+        the suggested-actions block, not one container.
+        """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        extras = body[body.index('id="chat-empty-extras"') :]
-        extras = extras[: extras.index('id="chat-empty-banner"')]
-        assert 'class="rdb-context"' in extras
+        below = body[body.index('id="chat-input"') :]
+        below = below[: below.index('id="chat-empty-banner"')]
+        assert 'class="rdb-context"' in below
+        assert 'id="chat-agent-btn"' in below
         for retired in ("rdb-orient", "New here?", 'href="/how-it-works"'):
-            assert retired not in extras, f"below-input area is not context-only: {retired}"
+            assert retired not in below, f"below-input area is not context-only: {retired}"
 
     def test_hero_carries_the_first_run_orientation_link(self, seeded_app, monkeypatch):
         """ "See how Agnes works" — the first-run path to /how-it-works, which

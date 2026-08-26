@@ -157,6 +157,7 @@ class ChatSessionParticipantPgRepository:
         invitee_email: str,
         invitee_user_id: str,
         seed_summary: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> ChatSession:
         """Atomic fork (single PG transaction): fresh co-session + two
         participant rows + optional seed summary message. Source untouched.
@@ -165,7 +166,7 @@ class ChatSessionParticipantPgRepository:
         maintained in the same transaction so the co-session row stays
         consistent with how chat_messages_pg.append_message rolls up every
         other message insert."""
-        chat_id = _gen_id("chat")
+        chat_id = session_id or _gen_id("chat")
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:
             conn.execute(
@@ -220,6 +221,7 @@ class ChatSessionParticipantPgRepository:
         *,
         source_session_id: str,
         owner_email: str,
+        session_id: Optional[str] = None,
     ) -> str:
         """Atomic fork of a co-session to a private non-ephemeral session.
 
@@ -231,7 +233,7 @@ class ChatSessionParticipantPgRepository:
         msg_repo = ChatMessagePgRepository(self._engine)
         source_msgs = msg_repo.list_messages(source_session_id)
 
-        chat_id = _gen_id("chat")
+        chat_id = session_id or _gen_id("chat")
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:
             conn.execute(

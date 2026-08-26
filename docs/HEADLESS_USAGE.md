@@ -81,7 +81,10 @@ once per day. `agnes auth whoami` always shows the current status
 agnes auth login
 ```
 
-which overwrites the stored token in place. See [`docs/RBAC.md`](./RBAC.md#pat-lifetime--renewal)
+which overwrites the stored token in place. Renewal needs no `--server`
+because the workspace's config already names one; on a machine that has never
+been initialized, pass `--server https://<your-host>` (login refuses rather
+than guessing a local instance). See [`docs/RBAC.md`](./RBAC.md#pat-lifetime--renewal)
 for the rationale behind this model over a refresh-token grant.
 
 For unattended/headless clients using `--ttl`-minted PATs (this doc's main

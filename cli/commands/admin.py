@@ -15,6 +15,7 @@ from cli.commands.admin_data_semantics import admin_data_semantics_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
 from cli.commands.admin_jobs import admin_jobs_app
+from cli.commands.admin_marketplace import admin_marketplace_app
 from cli.commands.admin_mcp import mcp_app as admin_mcp_app
 from cli.commands.admin_memory_domain import admin_memory_domain_app
 from cli.commands.admin_metrics import admin_metrics_app
@@ -60,6 +61,9 @@ admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRU
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
 admin_app.add_typer(
     admin_doctor_app, name="doctor", help="Deployment-gate diagnostics (`agnes admin doctor --new-instance`)"
+)
+admin_app.add_typer(
+    admin_marketplace_app, name="marketplace", help="Curated marketplace ops (list / sync / disable-plugin)"
 )
 admin_app.add_typer(admin_mcp_app, name="mcp", help="Universal MCP source + tool admin")
 admin_app.add_typer(admin_semantic_layer_app, name="semantic-layer", help="Keboola semantic-layer import status")
@@ -611,8 +615,13 @@ def list_tables(as_json: bool = typer.Option(False, "--json")):
     else:
         typer.echo(f"Registered tables: {data['count']}")
         for t in data["tables"]:
+            # `or` rather than `.get(key, default)`: `bucket` is nullable in
+            # table_registry (every non-Keboola row has none) and the key IS
+            # present carrying null, so a default never fired and `None` hit a
+            # `:20s` format spec — TypeError, listing dead after the header.
             typer.echo(
-                f"  {t['name']:30s} src={t.get('source_type', '?'):10s} mode={t.get('query_mode', '?'):6s} bucket={t.get('bucket', ''):20s}"
+                f"  {t.get('name') or '?':30s} src={t.get('source_type') or '?':10s} "
+                f"mode={t.get('query_mode') or '?':6s} bucket={t.get('bucket') or '':20s}"
             )
             # #754 — surface WHY a table shows 0 rows synced (sync_state's
             # status + persisted skip-reason/error), so "N total, 0 synced"

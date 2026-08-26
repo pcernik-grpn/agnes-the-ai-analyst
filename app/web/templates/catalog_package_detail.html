@@ -8,6 +8,14 @@
 {% import "macros/_detail.html" as detail with context %}
 {% import "macros/_trustmark.html" as _pkg_trust %}
 {{ detail.styles() }}
+{% if user.is_admin %}
+{# The shared create/edit drawer, for the rail's "Edit details". Admin-only:
+   a reader who cannot manage the package never downloads the component or
+   its sheet. #}
+<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+{% endif %}
 <style>
   /* ── Tables accordion (page-local — data-package specific) ──────── */
   .pkg-table-row {
@@ -147,19 +155,31 @@
 {# Rail returns to the Library band this package lives in; topnav keeps the
    classic Catalog listing it browses from. #}
 {% set _back = detail_back('data_package', '/catalog', 'All data packages') %}
+{# Context contract: an admin who arrived from this package's admin workspace
+   ("Open analyst page →" carries ?from=admin) gets a way back to the exact
+   page they left, not a teleport to the Library. The origin travels in the
+   URL — the same pattern the store pages proved with ?from=admin-moderation
+   (marketplace_plugin_detail.html) — so the link is shareable and there is
+   no hidden session state. Admin-gated: a non-admin pasting the URL keeps
+   the normal Library back link rather than a door that 403s on them. #}
+{% if user.is_admin and request.query_params.get('from') == 'admin' %}
+  {% set _back = {'href': '/admin/data-packages/' ~ pkg.id, 'label': 'Back to Admin: ' ~ pkg.name} %}
+{% endif %}
 
 {# The overflow menu holds the actions that are not what the reader came to
    do: the admin errand, and — because it is destructive and reversible in one
    click — removing the local copy. #}
+{# The admin errand is NOT in here any more. It was one item in a reader's
+   overflow menu pointing at `/admin/tables?edit_package=` — so the only way to
+   manage a package from the page showing it was a menu entry that left for a
+   page about tables. Managing it now has its own labelled home in the rail
+   (`detail.manage`, below), which is where every detail page will carry it.
+   What is left is what the name always promised: the actions a READER has that
+   are not what they came to do. #}
 {% set _menu_items = [] %}
 {% if effective_requirement != 'required' and in_stack %}
   {% set _ = _menu_items.append({'label': 'Remove local copy', 'icon': 'trash',
                                  'danger': True, 'attrs': 'id="pkg-remove-btn"'}) %}
-{% endif %}
-{% if user.is_admin %}
-  {% if _menu_items %}{% set _ = _menu_items.append({'sep': True}) %}{% endif %}
-  {% set _ = _menu_items.append({'label': 'Edit package metadata', 'icon': 'edit',
-                                 'href': '/admin/tables?edit_package=' ~ pkg.id}) %}
 {% endif %}
 {% set _menu %}{% if _menu_items %}{{ detail.menu(_menu_items) }}{% endif %}{% endset %}
 
@@ -411,7 +431,7 @@
     {{ detail.side_panel_open('ok') }}
       {{ detail.status('Always downloaded', 'ok') }}
       <p class="detail-side__note">
-        Your organization requires this package, so <code>agnes pull</code> always
+        Set to Automatic for your groups, so <code>agnes pull</code> always
         keeps a local copy.
       </p>
     {{ detail.side_panel_close() }}
@@ -432,15 +452,51 @@
   {% endif %}
 {{ detail.side_close() }}
 
+{# ── Managing it ───────────────────────────────────────────────────────
+   LAST in the rail, on purpose: everything above answers "what is this and
+   can I use it", which is why the reader opened the page. This answers "and
+   I am allowed to change it", which is true of very few of them.
+
+   "Edit details" opens the SAME shared drawer the admin package page opens —
+   one component, two lenses — so a rename happens here rather than sending
+   an admin to a third page to do it. Composition, sharing and the delivery
+   read-out stay behind the one door: they are a governance workspace, and
+   this is a reading page (see the design note in
+   docs/superpowers/specs/2026-08-18-admin-authoring-seam-design.md §4.4). #}
+{% if user.is_admin %}
+{{ detail.manage(
+     [{'label': 'Edit details', 'attrs': 'id="pkg-edit-btn"'}],
+     admin_href='/admin/data-packages/' ~ pkg.id,
+     title='Manage this package') }}
+{% endif %}
+
 {% endif %}
 {{ detail.cols_close() }}
 
+{% if user.is_admin %}
+<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
+{% endif %}
 <script>
 'use strict';
 (function() {
   const pkgId = {{ pkg.id | tojson }};
   const addBtn = document.getElementById('pkg-add-btn');
   const removeBtn = document.getElementById('pkg-remove-btn');
+
+  // Rail → "Edit details": the same drawer component /admin/data-packages/{id}
+  // opens, so one editor serves both lenses. Reload on save — the name is in
+  // the hero, the page title and the breadcrumb, and re-rendering three places
+  // by hand is how they drift apart.
+  const editBtn = document.getElementById('pkg-edit-btn');
+  if (editBtn && window.AgnesPackageDrawer) {
+    editBtn.addEventListener('click', function () {
+      window.AgnesPackageDrawer.open({
+        mode: 'edit',
+        pkgId: pkgId,
+        onSaved: function () { window.location.reload(); },
+      });
+    });
+  }
 
   async function call(method, url, body) {
     const opts = { method: method, credentials: 'same-origin' };

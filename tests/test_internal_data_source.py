@@ -246,6 +246,19 @@ def test_user_sql_inside_cte_wrapper_still_resolves(system_db):
     assert rows == [(10,)]
 
 
+def test_trailing_semicolon_does_not_break_the_cte_wrap(system_db):
+    """/api/query's SELECT-only guard tolerates one trailing `;`; this wrap
+    must honor that instead of raising a DuckDB parser error."""
+    db_path = str(_get_state_dir() / "system.duckdb")
+    _, rows, _ = execute_internal_query(
+        db_path,
+        {"email": "alice@example.com", "id": "alice-uuid"},
+        is_admin=False,
+        sql="SELECT SUM(tool_calls) AS n FROM agnes_sessions;",
+    )
+    assert rows == [(10,)]
+
+
 def test_schema_returns_underlying_columns(system_db):
     db_path = str(_get_state_dir() / "system.duckdb")
     cols = get_schema(db_path, "agnes_sessions")

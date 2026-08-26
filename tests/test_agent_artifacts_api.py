@@ -3,10 +3,10 @@
 (V1b Task 5).
 
 Harvest unit tests fake the sandbox at the file-API seam (`handle.files.list`
-/ `handle.files.read` — the real E2B shape, see `E2BSandboxHandle.files` in
-`app/chat/e2b_provider.py`) and the object store / repo at their module-level
+/ `handle.files.read` — the provider file-API shape, see `_SandboxFiles` in
+`app/chat/docker_provider.py`) and the object store / repo at their module-level
 factory functions in `app.chat.artifact_harvest` — these are NOT
-chat-sandbox integration tests, there is no real E2B sandbox involved
+chat-sandbox integration tests, there is no real sandbox involved
 anywhere in this file.
 
 API tests reuse the `env`/`FakeManager`/agent-PAT helpers pattern from
@@ -43,7 +43,7 @@ class FakeEntry:
 
 
 class FakeFilesAPI:
-    """Fakes the E2B `sandbox.files` surface (`.list`/`.read`) at the shape
+    """Fakes the provider `sandbox.files` surface (`.list`/`.read`) at the shape
     `app.chat.artifact_harvest` actually calls it with — NOT a filesystem.
     """
 
@@ -64,7 +64,7 @@ class FakeFilesAPI:
 
 
 class FakeHandle:
-    """Fakes `E2BSandboxHandle` at the one surface `harvest_session_artifacts`
+    """Fakes a sandbox handle at the one surface `harvest_session_artifacts`
     touches: `.files`."""
 
     def __init__(self, outputs: dict[str, bytes] | None = None, raise_on_list: bool = False) -> None:
@@ -344,11 +344,10 @@ class FakeManager:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
     from src.repositories import agents_repo, resource_grants_repo, user_group_members_repo, user_groups_repo
     from src.repositories.users import UserRepository
@@ -368,7 +367,7 @@ def env(tmp_path, monkeypatch):
     other_agent_id = str(uuid.uuid4())
     agents_repo().create(id=other_agent_id, owner_user_id="owner1", name="Other Agent", slug="other-agent")
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {
         "client": client,
         "owner_token": create_access_token("owner1", "owner@test.com"),

@@ -57,9 +57,9 @@ def test_not_downloaded_package_offers_the_download():
     assert "Add to stack" not in html
 
 
-def test_required_package_says_downloaded_required():
+def test_required_package_says_downloaded_automatic():
     html = _render_card(in_stack=True, in_stack_is_local=True, requirement="required")
-    assert "Downloaded (required)" in html
+    assert "Downloaded (automatic)" in html
 
 
 def test_projections_without_the_flag_keep_the_old_wording():

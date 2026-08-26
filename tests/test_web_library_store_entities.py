@@ -214,7 +214,7 @@ def test_authoring_does_not_add_to_your_stack(seeded_app):
 
 
 def test_admin_required_grant_is_locked_in_stack(seeded_app):
-    """An admin-required resource reads "In Stack" like any other member — it is
+    """An admin-required resource reads "In stack" like any other member — it is
     one — and is marked by a lock plus the locked tooltip. There is no control
     beside it: the membership is the admin's, not the caller's."""
     from src.db import get_system_db

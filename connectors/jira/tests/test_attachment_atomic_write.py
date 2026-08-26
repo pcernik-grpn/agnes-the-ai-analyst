@@ -242,21 +242,29 @@ def test_save_issue_retransforms_after_attachment_download(svc, monkeypatch):
     monkeypatch.setattr(file_lock_mod, "issue_json_lock", counting_lock)
     monkeypatch.setattr(
         "connectors.jira.service.trigger_incremental_transform",
-        lambda key, deleted=False: calls.append((key, lock_depth["n"] > 0)) or True,
+        lambda key, deleted=False, warn_unresolved=True: (
+            calls.append((key, lock_depth["n"] > 0, warn_unresolved)) or True
+        ),
     )
     monkeypatch.setattr(JiraService, "download_all_attachments", lambda self, data: [Path("stored.bin")])
     out = svc.save_issue({"key": "PROJ-9", "fields": {}})
     assert out is not None
     # Both transforms run, and BOTH under the per-issue lock — the second one
     # races poll_sla's locked read-modify-write otherwise (Devin on #1297).
-    assert calls == [("PROJ-9", True), ("PROJ-9", True)]
+    #
+    # They differ in exactly one way: the second passes `warn_unresolved=False`.
+    # It re-transforms a payload the first pass already reported on, so leaving
+    # it True logged any missing-`jsdPublic` gap twice — doubling the count an
+    # operator sizes the anomaly by, and only for attachment-bearing events,
+    # which is worse than a uniform overcount.
+    assert calls == [("PROJ-9", True, True), ("PROJ-9", True, False)]
 
-    # And with nothing downloaded, no second transform.
+    # And with nothing downloaded, no second transform — so nothing is silenced.
     calls.clear()
     monkeypatch.setattr(JiraService, "download_all_attachments", lambda self, data: [])
     out = svc.save_issue({"key": "PROJ-9", "fields": {}})
     assert out is not None
-    assert calls == [("PROJ-9", True)]
+    assert calls == [("PROJ-9", True, True)]
 
 
 def test_existing_attachment_is_not_refetched_and_not_reported_new(svc):

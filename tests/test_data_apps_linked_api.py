@@ -27,9 +27,8 @@ def _enable_data_apps(data_dir) -> None:
 
 
 @pytest.fixture
-def linked_env(e2e_env, monkeypatch):
+def linked_env(e2e_env, monkeypatch, shared_app):
     from app.auth.jwt import create_access_token
-    from app.main import create_app
     from fastapi.testclient import TestClient
     from src.db import get_system_db
     from src.repositories.access_tokens import AccessTokenRepository
@@ -90,7 +89,7 @@ def linked_env(e2e_env, monkeypatch):
     finally:
         conn.close()
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {"client": client, "pats": pats}
 
 

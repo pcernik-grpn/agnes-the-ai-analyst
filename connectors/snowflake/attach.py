@@ -459,7 +459,25 @@ def _private_key_pem_and_passphrase(token: str, passphrase: str | None = None) -
             if isinstance(exc, OSError) and exc.errno in (errno.ENAMETOOLONG, errno.EINVAL):
                 pass
             else:
-                raise ValueError(f"snowflake private key file {raw!r} could not be read: {exc}") from exc
+                # Neither the value nor the exception text may appear here.
+                # `raw` is the credential itself (it is only reassigned to file
+                # CONTENTS on the success branch above), and an OSError's own
+                # str() ends with the offending filename — which in this branch
+                # IS that same value. The message travels a long way: into
+                # `init_extract`'s per-table errors, out through
+                # `register-table`'s 500 body, and into `sync_state.error`,
+                # which `GET /api/admin/registry`, /admin/sync and `agnes admin
+                # list-tables` all render unredacted and without a TTL. The
+                # exception class (plus errno symbol) distinguishes a bad mount
+                # from a bad encoding without carrying the payload; the original
+                # stays chained for a local traceback.
+                _why = type(exc).__name__
+                if isinstance(exc, OSError) and exc.errno is not None:
+                    _why = f"{_why}/{errno.errorcode.get(exc.errno, exc.errno)}"
+                raise ValueError(
+                    "snowflake private key looked like a filesystem path but could not be read "
+                    f"({_why}); check the file named by data_source.snowflake.private_key_env"
+                ) from exc
 
     # Defense-in-depth: a key should never contain '$', but a pasted value
     # containing it could close a dollar-quoted SQL literal. Reject early.
@@ -493,8 +511,24 @@ def _create_snowflake_secret_sql(
     params: dict[str, str],
     token: str,
     passphrase: str | None = None,
-) -> str:
-    """Return the ``CREATE OR REPLACE SECRET`` SQL for Snowflake."""
+) -> tuple[str, tuple[str, ...]]:
+    """The ``CREATE OR REPLACE SECRET`` SQL, and the secret values it embedded.
+
+    The second element is what makes the scrub in ``attach_snowflake`` correct
+    rather than merely usually-correct. In the key-pair branch the statement
+    does NOT carry ``token``: it carries
+    ``_private_key_pem_and_passphrase(token, passphrase)``'s output, which
+    *normalizes* the key to an unencrypted PKCS#8 PEM. Whenever the stored
+    credential is PKCS#1, an encrypted key plus passphrase, a JSON wrapper with
+    escaped newlines, or a filesystem path — i.e. most real key-pair
+    deployments — the normalized PEM is not a substring of ``token``, so
+    scrubbing ``token`` alone matches nothing and the whole private key rides
+    out in the driver's echoed statement.
+
+    Returning the embedded values instead of re-deriving them at the scrub site
+    keeps the two from drifting: whatever this function puts into the SQL is
+    exactly what gets redacted out of an error quoting it back.
+    """
     role_sql = ""
     if params.get("role"):
         role_sql = f", ROLE '{escape_sql_string_literal(params['role'])}'"
@@ -524,7 +558,7 @@ def _create_snowflake_secret_sql(
             f"DATABASE '{escape_sql_string_literal(params['database'])}', "
             f"WAREHOUSE '{escape_sql_string_literal(params['warehouse'])}'"
             f"{role_sql})"
-        )
+        ), (private_key_pem,)
 
     return (
         f"CREATE OR REPLACE SECRET {secret_name} ("
@@ -535,7 +569,61 @@ def _create_snowflake_secret_sql(
         f"DATABASE '{escape_sql_string_literal(params['database'])}', "
         f"WAREHOUSE '{escape_sql_string_literal(params['warehouse'])}'"
         f"{role_sql})"
-    )
+    ), (escape_sql_string_literal(token),)
+
+
+# Secret-literal shapes `_create_snowflake_secret_sql` emits, terminated form
+# first. Each is anchored on fixed delimiters with a single non-greedy span
+# between them — linear-time over untrusted text, per the security playbook.
+#
+# The UNTERMINATED variants are not belt-and-braces, they are the ones that
+# fire in practice. A DuckDB parser error quotes the offending statement back
+# TRUNCATED ("LINE 1: " + a prefix), so the closing `$PK$` / `'` the terminated
+# patterns need is exactly what the truncation cut off. Ordering matters: the
+# terminated patterns run first so a complete literal is not over-redacted to
+# end-of-message.
+_SECRET_LITERAL_RES = (
+    re.compile(r"PASSWORD\s*'[^']*'", re.I),
+    re.compile(r"PRIVATE_KEY\s*\$PK\$.*?\$PK\$", re.I | re.S),
+    re.compile(r"PRIVATE_KEY\s*\$PK\$[\s\S]*", re.I),
+    re.compile(r"PASSWORD\s*'[^']*", re.I),
+)
+
+
+class SnowflakeAttachError(RuntimeError):
+    """An ATTACH/SECRET failure whose message has had credential material removed."""
+
+
+def _scrub_secret_material(message: str, *secrets: str | None) -> str:
+    """Strip credential material from a driver error message.
+
+    ``attach_snowflake`` EXECUTES a ``CREATE OR REPLACE SECRET … (PASSWORD '…')``
+    / ``PRIVATE_KEY $PK$…$PK$`` statement, and DuckDB's parser-class errors quote
+    the offending statement back — so on a build whose extension does not
+    recognise one of those options, the raised error carries the Snowflake
+    credential. Every caller then forwards it somewhere durable: the listing
+    endpoint into a 502 body and a log line, the extract build into
+    ``stats["errors"]`` → ``sync_state.error``, which the admin registry,
+    /admin/sync and ``agnes admin list-tables`` render unredacted.
+
+    Scrubs the known secret values first (exact substring, which also covers a
+    driver reformatting the statement), then the literal shapes as a backstop
+    for a value this call does not hold.
+
+    Callers must pass what was actually EMBEDDED, not only what they were
+    given: `_create_snowflake_secret_sql` normalizes a key-pair credential to
+    unencrypted PKCS#8 before embedding it, so for a PKCS#1 / encrypted / JSON
+    / path-shaped credential the two differ and the substring pass matches
+    nothing. That is why it returns its embedded values.
+    """
+    out = message
+    for secret in secrets:
+        # Guard against a degenerate short value turning the message into noise.
+        if secret and len(secret) >= 8:
+            out = out.replace(secret, "<redacted>")
+    for pattern in _SECRET_LITERAL_RES:
+        out = pattern.sub("<redacted>", out)
+    return out
 
 
 def attach_snowflake(
@@ -561,7 +649,21 @@ def attach_snowflake(
     params = parse_remote_attach_url(url)
     secret_name = f"sf_secret_{alias}"
 
-    secret_sql = _create_snowflake_secret_sql(secret_name, params, token, passphrase)
-    conn.execute(secret_sql)
-    conn.execute(f"ATTACH '' AS {alias} (TYPE {SF_EXTENSION}, SECRET {secret_name}, READ_ONLY)")
+    secret_sql, embedded_secrets = _create_snowflake_secret_sql(secret_name, params, token, passphrase)
+    try:
+        conn.execute(secret_sql)
+        conn.execute(f"ATTACH '' AS {alias} (TYPE {SF_EXTENSION}, SECRET {secret_name}, READ_ONLY)")
+    except Exception as exc:
+        # Redact HERE, at the one place that holds the secret, so every caller
+        # inherits the guarantee instead of each remembering to sanitize. Raised
+        # `from None`: the original exception's own message is the thing being
+        # withheld, and a chained cause would put it straight back into any
+        # traceback that gets logged. The class name keeps it diagnosable.
+        raise SnowflakeAttachError(
+            f"snowflake ATTACH failed ({type(exc).__name__}): "
+            # `embedded_secrets` — not just `token` — because the key-pair
+            # branch embeds a NORMALIZED PKCS#8 PEM that need not be a
+            # substring of the stored credential.
+            + _scrub_secret_material(str(exc), token, passphrase, *embedded_secrets)
+        ) from None
     logger.info("Attached Snowflake database %r as catalog %r", params["database"], alias)

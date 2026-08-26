@@ -106,15 +106,6 @@
     padding-bottom: 16px;
 }
 
-@media (max-width: 820px) {
-    .admin-split {
-        grid-template-columns: 1fr;
-    }
-    .admin-nav {
-        display: none;
-    }
-}
-
 /* ── FLUSH WITH THE RAIL, under rail chrome ───────────────────────────────
    The column is the second tier of the chrome, so it should start where the
    rail ends — but it lives inside `.container`, which owns a page gutter for
@@ -194,6 +185,23 @@ html[data-ui-layout="rail"] .admin-split {
     /* Full-height column, so the hairline reads as the edge of a rail rather
        than stopping in mid-page wherever the sections happen to end. */
     height: calc(100vh - var(--admin-nav-top) - 16px);
+}
+
+/* Below this, hide the column entirely rather than let `.admin-split`
+   overflow: it and `.cfg-body` (admin_server_config.html) are the only
+   two-column admin layouts, both un-collapsible below ~800px of combined
+   sidenav + content. Placed AFTER the unconditional `.admin-nav { display:
+   flex }` above (same specificity, so source order decides) — the two rules
+   landed in the opposite order in the original commit, which left this
+   query dead: `display: flex` always won and the column never actually
+   hid. */
+@media (max-width: 820px) {
+    .admin-split {
+        grid-template-columns: 1fr;
+    }
+    .admin-nav {
+        display: none;
+    }
 }
 
 html[data-ui-layout="topnav"] .admin-nav {

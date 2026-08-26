@@ -8,12 +8,11 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
     monkeypatch.setenv("SCRIPT_TIMEOUT", "5")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -26,7 +25,7 @@ def client(tmp_path, monkeypatch):
     grant_admin(conn, "admin1")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     token = create_access_token("admin1", "admin@test.com")
     return c, token
@@ -38,70 +37,78 @@ def _headers(token):
 
 # ---- Script Sandbox ----
 
+
 class TestScriptSandbox:
     def test_blocks_os_system(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "import os\nos.system('whoami')"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "import os\nos.system('whoami')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_dunder_import(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "__import__('subprocess').run(['ls'])"},
-                       headers=_headers(token))
+        resp = c.post(
+            "/api/scripts/run", json={"source": "__import__('subprocess').run(['ls'])"}, headers=_headers(token)
+        )
         assert resp.status_code == 400
 
     def test_blocks_eval(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "eval('print(1)')"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "eval('print(1)')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_exec(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "exec('import os')"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "exec('import os')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_open(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "open('/etc/passwd').read()"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "open('/etc/passwd').read()"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_socket(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "import socket"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "import socket"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_pathlib(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={"source": "from pathlib import Path"},
-                       headers=_headers(token))
+        resp = c.post("/api/scripts/run", json={"source": "from pathlib import Path"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_allows_safe_script(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={
-            "source": "import math\nprint(math.sqrt(144))",
-        }, headers=_headers(token))
+        resp = c.post(
+            "/api/scripts/run",
+            json={
+                "source": "import math\nprint(math.sqrt(144))",
+            },
+            headers=_headers(token),
+        )
         assert resp.status_code == 200
         assert "12" in resp.json()["stdout"]
 
     def test_allows_duckdb(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={
-            "source": "import duckdb\nconn=duckdb.connect(':memory:')\nprint(conn.execute('SELECT 42').fetchone()[0])",
-        }, headers=_headers(token))
+        resp = c.post(
+            "/api/scripts/run",
+            json={
+                "source": "import duckdb\nconn=duckdb.connect(':memory:')\nprint(conn.execute('SELECT 42').fetchone()[0])",
+            },
+            headers=_headers(token),
+        )
         assert resp.status_code == 200
         assert "42" in resp.json()["stdout"]
 
     def test_allows_json(self, client):
         c, token = client
-        resp = c.post("/api/scripts/run", json={
-            "source": "import json\nprint(json.dumps({'a': 1}))",
-        }, headers=_headers(token))
+        resp = c.post(
+            "/api/scripts/run",
+            json={
+                "source": "import json\nprint(json.dumps({'a': 1}))",
+            },
+            headers=_headers(token),
+        )
         assert resp.status_code == 200
         assert '"a"' in resp.json()["stdout"]
 
@@ -109,9 +116,13 @@ class TestScriptSandbox:
         """Even if static check passes, runtime __import__ override catches it."""
         c, token = client
         # This uses string concatenation to bypass static check
-        resp = c.post("/api/scripts/run", json={
-            "source": "x='sub'+'process'\ntry:\n m=type('',(),{'__init__':lambda s:None})()\nexcept:\n pass\nprint('safe')",
-        }, headers=_headers(token))
+        resp = c.post(
+            "/api/scripts/run",
+            json={
+                "source": "x='sub'+'process'\ntry:\n m=type('',(),{'__init__':lambda s:None})()\nexcept:\n pass\nprint('safe')",
+            },
+            headers=_headers(token),
+        )
         # Should still run but without access to dangerous modules
         assert resp.status_code == 200
 
@@ -119,84 +130,115 @@ class TestScriptSandbox:
         """httpx must be blocked — either by pattern check (400) or
         ModuleNotFoundError at runtime due to stripped VIRTUAL_ENV/PYTHONPATH (200 with non-zero exit)."""
         c, token = client
-        resp = c.post("/api/scripts/run", json={
-            "source": "import httpx\nprint('pwned')",
-        }, headers=_headers(token))
-        # Static pattern check should reject it outright
-        assert resp.status_code == 400 or (
-            resp.status_code == 200 and resp.json()["exit_code"] != 0
+        resp = c.post(
+            "/api/scripts/run",
+            json={
+                "source": "import httpx\nprint('pwned')",
+            },
+            headers=_headers(token),
         )
+        # Static pattern check should reject it outright
+        assert resp.status_code == 400 or (resp.status_code == 200 and resp.json()["exit_code"] != 0)
 
 
 # ---- SQL Query Security ----
 
+
 class TestQuerySecurity:
     def test_blocks_copy_to(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "COPY (SELECT 1) TO '/tmp/pwned.csv'"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "COPY (SELECT 1) TO '/tmp/pwned.csv'"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_read_csv(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM read_csv_auto('/etc/passwd')"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM read_csv_auto('/etc/passwd')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_semicolon(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT 1; SELECT 2"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT 1; SELECT 2"}, headers=_headers(token))
         assert resp.status_code == 400
+
+    def test_allows_single_trailing_semicolon(self, client):
+        c, token = client
+        resp = c.post("/api/query", json={"sql": "SELECT 1 as test;"}, headers=_headers(token))
+        assert resp.status_code == 200
+        assert resp.json()["columns"] == ["test"]
+
+    def test_the_terminator_is_normalized_away_before_any_downstream_path(self, client):
+        """`/api/query` accepts one trailing `;`, and then hands the statement
+        to paths that are not DuckDB: the BigQuery dry-run cost guard
+        (`_rewrite_user_sql_for_bq_dry_run` is a textual rewrite and preserves
+        the terminator) and the BQ jobs-API payload. A `;`-terminated text BQ
+        reads as a script reports `totalBytesProcessed: 0`, which is the 5 GiB
+        scan cap measuring nothing — a guardrail reading zero, not an error.
+        Normalizing once at the boundary means no downstream path can be
+        reached with the terminator still attached, so none of them has to be
+        audited for it individually."""
+        c, token = client
+        resp = c.post(
+            "/api/query",
+            json={"sql": "SELECT 1 as test;"},
+            headers=_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["columns"] == ["test"]
+
+        # The normalization point itself, asserted directly: whatever the
+        # handler forwards must not end in `;`.
+        from app.api.query import QueryRequest, strip_one_trailing_semicolon
+
+        req = QueryRequest(sql="SELECT 1 as test;")
+        req.sql = strip_one_trailing_semicolon(req.sql)
+        assert not req.sql.endswith(";")
+        assert strip_one_trailing_semicolon("SELECT 1;;").endswith(";"), (
+            "exactly one terminator is removed -- the guard must not be loopable"
+        )
 
     def test_blocks_non_select(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "CREATE TABLE pwned (id INT)"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "CREATE TABLE pwned (id INT)"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_attach(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "ATTACH '/tmp/pwned.db'"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "ATTACH '/tmp/pwned.db'"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_allows_select(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT 1 as test, 'hello' as msg"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT 1 as test, 'hello' as msg"}, headers=_headers(token))
         assert resp.status_code == 200
         assert resp.json()["columns"] == ["test", "msg"]
 
     def test_allows_with_cte(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "WITH t AS (SELECT 1 as x) SELECT * FROM t"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "WITH t AS (SELECT 1 as x) SELECT * FROM t"}, headers=_headers(token))
         assert resp.status_code == 200
 
     def test_blocks_drop(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "DROP TABLE IF EXISTS users"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "DROP TABLE IF EXISTS users"}, headers=_headers(token))
         assert resp.status_code == 400
-
 
     def test_blocks_parquet_scan(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM parquet_scan('/data/extracts/secret.parquet')"},
-                       headers=_headers(token))
+        resp = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM parquet_scan('/data/extracts/secret.parquet')"},
+            headers=_headers(token),
+        )
         assert resp.status_code == 400
 
     def test_blocks_read_csv_auto(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM read_csv_auto('/etc/passwd')"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM read_csv_auto('/etc/passwd')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_query_table(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM query_table('secret_table')"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM query_table('secret_table')"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_no_auth(self, client):
@@ -208,8 +250,7 @@ class TestQuerySecurity:
         """Verify that a table named 'id' doesn't block queries containing 'id' in other contexts."""
         c, token = client
         # Query contains 'id' in column name and function, but not as a forbidden table reference
-        resp = c.post("/api/query", json={"sql": "SELECT 1 as identity, 2 as valid_id"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT 1 as identity, 2 as valid_id"}, headers=_headers(token))
         # Should succeed (not blocked by false positive substring match)
         assert resp.status_code == 200
 
@@ -218,50 +259,68 @@ class TestQuerySecurity:
         c, token = client
         # Create a scenario where a table named 'id' would be forbidden
         # This tests that word boundaries work correctly
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM id WHERE id = 1"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM id WHERE id = 1"}, headers=_headers(token))
         # Without a real 'id' table and RBAC setup, this will fail with query error,
         # but not with 403 access denied. The regex logic is sound if test_word_boundary_match_no_false_positive passes.
         assert resp.status_code in [400, 200]  # Either query error or success
 
     def test_blocks_information_schema(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT table_name FROM information_schema.tables"},
-                       headers=_headers(token))
+        resp = c.post(
+            "/api/query", json={"sql": "SELECT table_name FROM information_schema.tables"}, headers=_headers(token)
+        )
         assert resp.status_code == 400
 
     def test_blocks_duckdb_tables(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_tables()"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_tables()"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_duckdb_columns(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_columns()"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_columns()"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_duckdb_databases(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_databases()"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_databases()"}, headers=_headers(token))
         assert resp.status_code == 400
 
     def test_blocks_relative_path(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM read_parquet('../secret/data.parquet')"},
-                       headers=_headers(token))
+        resp = c.post(
+            "/api/query", json={"sql": "SELECT * FROM read_parquet('../secret/data.parquet')"}, headers=_headers(token)
+        )
         assert resp.status_code == 400
 
     def test_blocks_pragma_table_info(self, client):
         c, token = client
-        resp = c.post("/api/query", json={"sql": "SELECT * FROM pragma_table_info('users')"},
-                       headers=_headers(token))
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM pragma_table_info('users')"}, headers=_headers(token))
+        assert resp.status_code == 400
+
+    @pytest.mark.parametrize(
+        "table",
+        ["sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema"],
+    )
+    def test_blocks_sqlite_master_family(self, client, table):
+        # DuckDB ships SQLite-compat catalog views that expose every view's
+        # full CREATE VIEW body — including the absolute parquet paths the
+        # orchestrator bakes into `read_parquet('/data/extracts/...')` master
+        # views. Same disclosure class as duckdb_views (already blocked); the
+        # `duckdb_*` denylist just didn't cover the `sqlite_*` aliases.
+        c, token = client
+        resp = c.post("/api/query", json={"sql": f"SELECT sql FROM {table}"}, headers=_headers(token))
+        assert resp.status_code == 400
+
+    def test_blocks_duckdb_external_file_cache(self, client):
+        # Leaks cached external file paths directly (absolute parquet paths).
+        c, token = client
+        resp = c.post("/api/query", json={"sql": "SELECT * FROM duckdb_external_file_cache()"}, headers=_headers(token))
         assert resp.status_code == 400
 
 
 # ---- Auth Edge Cases ----
+
 
 class TestAuthSecurity:
     def test_garbage_token(self, client):
@@ -287,14 +346,14 @@ class TestAuthSecurity:
 
 # ---- Script RBAC ----
 
+
 @pytest.fixture
-def viewer_client(tmp_path, monkeypatch):
+def viewer_client(tmp_path, monkeypatch, shared_app):
     """TestClient with a viewer-role user seeded."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
     monkeypatch.setenv("SCRIPT_TIMEOUT", "5")
 
-    from app.main import create_app
     from src.db import get_system_db
     from src.repositories.users import UserRepository
     from app.auth.jwt import create_access_token
@@ -304,7 +363,7 @@ def viewer_client(tmp_path, monkeypatch):
     UserRepository(conn).create(id="viewer1", email="viewer@test.com", name="Viewer")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     token = create_access_token(user_id="viewer1", email="viewer@test.com")
     return c, token
@@ -323,27 +382,27 @@ class TestScriptRBAC:
     def test_viewer_cannot_run_scripts(self, viewer_client):
         c, token = viewer_client
         headers = {"Authorization": f"Bearer {token}"}
-        resp = c.post("/api/scripts/run", json={
-            "name": "test", "source": "print('hi')"
-        }, headers=headers)
+        resp = c.post("/api/scripts/run", json={"name": "test", "source": "print('hi')"}, headers=headers)
         assert resp.status_code == 403
 
     def test_viewer_cannot_deploy_scripts(self, viewer_client):
         c, token = viewer_client
         headers = {"Authorization": f"Bearer {token}"}
-        resp = c.post("/api/scripts/deploy", json={
-            "name": "test", "source": "print('hi')", "schedule": ""
-        }, headers=headers)
+        resp = c.post(
+            "/api/scripts/deploy", json={"name": "test", "source": "print('hi')", "schedule": ""}, headers=headers
+        )
         assert resp.status_code == 403
 
 
 # ---- JWT Claims ----
+
 
 class TestJwtClaims:
     def test_jwt_contains_jti_claim(self):
         """Token payload must include a jti claim with at least 16 hex chars."""
         os.environ.setdefault("TESTING", "1")
         from app.auth.jwt import create_access_token, verify_token
+
         token = create_access_token("u1", "user@test.com")
         payload = verify_token(token)
         assert payload is not None
@@ -361,10 +420,12 @@ class TestJwtClaims:
         """
         os.environ.setdefault("TESTING", "1")
         from app.auth import jwt as jwt_module
+
         assert jwt_module.ACCESS_TOKEN_EXPIRE_HOURS == 30 * 24
 
 
 # ---- JWT Secret Hardening ----
+
 
 class TestJwtSecretHardening:
     def test_auto_generates_jwt_secret_when_absent(self, tmp_path):
@@ -417,13 +478,13 @@ class TestJwtSecretHardening:
 
 # ---- API hardening (issue #336) ----
 
+
 @pytest.fixture
-def hardening_client(tmp_path, monkeypatch):
+def hardening_client(tmp_path, monkeypatch, shared_app):
     """Minimal seeded app with an admin and a plain analyst for RBAC tests."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from app.main import create_app
     from src.db import get_system_db, SYSTEM_ADMIN_GROUP
     from src.repositories.users import UserRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -433,13 +494,11 @@ def hardening_client(tmp_path, monkeypatch):
     repo = UserRepository(conn)
     repo.create(id="hadmin", email="hadmin@test.com", name="HAdmin")
     repo.create(id="hanalyst", email="hanalyst@test.com", name="HAnalyst")
-    gid = conn.execute(
-        "SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]
-    ).fetchone()[0]
+    gid = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()[0]
     UserGroupMembersRepository(conn).add_member("hadmin", gid, source="system_seed")
     conn.close()
 
-    app = create_app()
+    app = shared_app
     c = TestClient(app)
     return {
         "client": c,
@@ -507,9 +566,7 @@ class TestApiHardening336:
 
     def test_openapi_json_accessible_to_authenticated_user(self, hardening_client):
         token = hardening_client["analyst_token"]
-        resp = hardening_client["client"].get(
-            "/openapi.json", headers={"Authorization": f"Bearer {token}"}
-        )
+        resp = hardening_client["client"].get("/openapi.json", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
         assert "paths" in resp.json()
 
@@ -571,12 +628,11 @@ class TestApiHardening336:
         here is a real auth-bypass on instances with >LIMIT users."""
         import inspect
         from src.repositories.users import UserRepository
+
         sig = inspect.signature(UserRepository.list_all)
         # No params (other than self) means no caller can accidentally
         # pass limit=N and end up with a windowed result.
-        non_self_params = [
-            p for p in sig.parameters.values() if p.name != "self"
-        ]
+        non_self_params = [p for p in sig.parameters.values() if p.name != "self"]
         assert non_self_params == [], (
             f"UserRepository.list_all() must take no arguments other than "
             f"self (got {non_self_params}). Add limit/offset to "
@@ -591,11 +647,12 @@ class TestApiHardening336:
         sites are explicit about which contract they want.
         """
         from src.repositories.users import UserRepository
+
         assert hasattr(UserRepository, "list_paginated"), (
-            "API-surface pagination must live on a separate "
-            "`list_paginated` method, not on `list_all`."
+            "API-surface pagination must live on a separate `list_paginated` method, not on `list_all`."
         )
         import inspect
+
         sig = inspect.signature(UserRepository.list_paginated)
         param_names = {p.name for p in sig.parameters.values() if p.name != "self"}
         assert "limit" in param_names and "offset" in param_names

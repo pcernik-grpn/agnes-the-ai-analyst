@@ -59,6 +59,7 @@ from src.remote_engines import (
     name_reference_re,
     qualified_path_re,
     rewrite_bare_names,
+    strip_one_trailing_semicolon,
 )
 from src.remote_query import _strip_leading_sql_comments
 from src.repositories import (
@@ -366,11 +367,24 @@ def _local_extract_catalogs(conn) -> set[str]:
     """Attached local extract catalogs (per-source ``extract.duckdb`` files).
 
     Each source is ATTACHed as its own catalog named after the source
-    (``src/db.py``). These are file-backed ``duckdb`` attachments; the default
-    catalog (where the analyst-facing master views live) and the
-    remote-extension catalogs (``bq``/``kbc``, type ``bigquery``/``keboola``)
-    are excluded — the latter keep their own registry gate in
-    ``_bq_guardrail_inputs``.
+    (``src/db.py``). These are file-backed ``duckdb`` attachments, so the
+    default catalog (where the analyst-facing master views live) and the
+    remote-extension catalogs (type ``bigquery``/``keboola``) fall outside this
+    set.
+
+    That exclusion is only safe for a prefix that has a gate of its own, and
+    the two are not equal. ``bq`` does (``_bq_guardrail_inputs``), as do ``sf``
+    (``_sf_guardrail_inputs``) and ``dbx``
+    (``connectors.databricks.remote.guardrail_inputs``). **``kbc`` does not** —
+    ``_bq_guardrail_inputs`` scans ``BQ_PATH`` only, Keboola is not registered
+    in ``src.remote_engines._ENGINES``, and no ``_kbc_guardrail_inputs``
+    exists. An earlier version of this docstring asserted the opposite. So on
+    an instance whose Keboola extract wrote a ``_remote_attach`` row (every
+    Keboola sync does — ``connectors/keboola/extractor.py``), a
+    ``kbc."bucket"."table"`` path is gated by neither this catalog check nor a
+    registry/grant/policy one. Pre-existing and tracked separately from the
+    engine-path policy gates; recorded here so the next reader does not infer
+    coverage from the exclusion.
     """
     try:
         default = conn.execute("SELECT current_database()").fetchone()[0]
@@ -730,7 +744,15 @@ def _enforce_non_admin_sql_rbac(analytics, sql_lower: str, allowed) -> None:
         return
     from src.rbac import table_not_in_stack_message
 
-    sql_lower_masked = _mask_backticks(sql_lower)
+    # Layer (a)'s regex scans raw text, so it must run over a copy with
+    # string/dollar-quoted literals and comments blanked first — otherwise a
+    # literal or comment merely CONTAINING a catalog name (`SELECT
+    # 'keboola.com' AS x`) 403s as if it referenced the catalog (#1394).
+    # `_mask_sql_for_guard` leaves quoted IDENTIFIERS visible (a genuine
+    # catalog-qualified reference), so that evasion stays caught. Backtick
+    # masking (BQ full-path noise, issue #201) runs AFTER — not before — so a
+    # stray backtick inside an already-blanked string literal can't desync it.
+    sql_lower_masked = _mask_backticks(_mask_sql_for_guard(sql_lower, mask_comments=True))
     references = _sql_reference_test(sql_lower)
 
     # (a) #868 catalog gate
@@ -917,6 +939,179 @@ _SQL_IDENT_PATH = re.compile(
 )
 
 
+# DuckDB dollar-quoted string literal opener: `$$` or `$tag$`, where a tag
+# must start with a letter/underscore (matching DuckDB's own rule — verified
+# empirically: `$1$…$1$` is a parser error, `$tag1$…$tag1$` is not). Anchored
+# via `.match(sql, i)` (never `.search`), so this is one bounded attempt per
+# `$` encountered, not a scan — no catastrophic backtracking (security
+# playbook rule #5: the body has no nested/overlapping quantifiers, so a
+# failed match backtracks the trailing `\w*` at most once, linearly).
+_DOLLAR_QUOTE_OPEN_RE = re.compile(r"\$([A-Za-z_]\w*)?\$")
+
+
+class _UnterminatedSqlLiteralError(ValueError):
+    """A quoted span (string literal, quoted identifier, dollar-quoted
+    string) or a block comment never closed before end-of-string.
+
+    DuckDB itself refuses every one of these shapes as a parser error
+    (`unterminated quoted string` / `unterminated quoted identifier` /
+    `unterminated dollar-quoted string` / `unterminated /* comment` —
+    verified empirically against 1.5.2), so a query built like this can
+    never actually execute. Silently treating "everything after the opening
+    delimiter is inside it" would still be wrong for a GUARD, though: it
+    would mask whatever real SQL happens to follow the truncated token —
+    hiding it from a security check that runs BEFORE DuckDB ever sees the
+    statement, on the strength of "DuckDB would reject it anyway" alone.
+    Guard call sites (`_mask_sql_for_guard`) turn this into a 400 instead —
+    fail closed. The non-security caller (`_mask_sql_noise`, best-effort
+    audit-tagging only, never gates access) keeps the old permissive
+    "run to end of string" behaviour so a malformed query never crashes
+    telemetry.
+    """
+
+
+def _scan_and_mask_sql(sql: str, *, mask_comments: bool, strict: bool) -> str:
+    """One left-to-right, linear-time pass recognizing every span DuckDB
+    itself treats as opaque, blanking the ones each caller (``_mask_sql_noise``,
+    ``_mask_sql_for_guard``) needs blanked while preserving length and offsets.
+
+    Handles, in priority order at each position (order matters — see below):
+
+    * ``"`` / `` ` `` quoted identifiers — stepped over WITHOUT blanking.
+      Never masked, in any mode: an identifier is always a real name (a
+      catalog/schema/table qualifier, or an alias), never data. This is the
+      one property both call sites below share and the reason this function
+      exists in the first place — see ``_mask_sql_for_guard``'s docstring
+      for why that distinction is the crux of the #1394 fix.
+    * ``'`` single-quoted string literals, with ``''`` escape handling —
+      blanked (delimiters included).
+    * ``$$…$$`` / ``$tag$…$tag$`` dollar-quoted string literals (DuckDB
+      supports these; unlike a single-quoted literal, their body can
+      contain an unescaped ``'``) — blanked. Checked BEFORE the plain
+      single-quote branch reaches any of its body: a ``'`` inside a
+      dollar-quoted span must never be read as opening a *different* string,
+      which would desync the rest of the scan (the same class of bug
+      documented on ``connectors/internal/access.py``'s escape-string
+      regex).
+    * ``--`` line comments and nested ``/* */`` block comments — blanked
+      only when ``mask_comments`` is true. DuckDB nests block comments
+      (verified empirically: ``/* a /* b */ c */`` parses as ONE comment,
+      ``/* a /* b */`` alone is a parser error), so the depth counter below
+      is required for correctness, not just extra caution — a non-nesting
+      scanner would close on the first inner ``*/`` and un-comment real SQL
+      that DuckDB itself still treats as commented out.
+
+    ``strict`` — see ``_UnterminatedSqlLiteralError``.
+    """
+    out = list(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ('"', "`"):
+            close = sql.find(ch, i + 1)
+            if close == -1:
+                if strict:
+                    raise _UnterminatedSqlLiteralError("unterminated quoted identifier")
+                i = n
+            else:
+                i = close + 1
+        elif (
+            ch in ("E", "e")
+            and i + 1 < n
+            and sql[i + 1] == "'"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+        ):
+            # DuckDB E-strings: `E'...'` / `e'...'` accept BACKSLASH escapes
+            # on top of the usual `''` (verified against the engine:
+            # `SELECT E'\''` yields `'`, and `SELECT E'a\'` is a parser
+            # error because the `\'` escapes the quote and the literal
+            # never closes). A scanner that ignored the prefix would read
+            # `E'\''` as an unterminated literal and refuse a valid query,
+            # and would end `E'\'; DROP TABLE x --'` early — exposing text
+            # DuckDB itself treats as data. Both mismatches fail CLOSED
+            # (a 400/403 on a valid query, never a hidden statement), but
+            # false positives are exactly what this masking exists to
+            # remove. The identifier guard on the preceding character keeps
+            # a trailing `e` of some longer word from starting an E-string.
+            j = i + 2
+            closed = False
+            while j < n:
+                if sql[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed and strict:
+                raise _UnterminatedSqlLiteralError("unterminated E-string literal")
+            end = j + 1 if closed else n
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "'":
+            j = i + 1
+            closed = False
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":  # '' escape
+                        j += 2
+                        continue
+                    closed = True
+                    break
+                j += 1
+            if not closed and strict:
+                raise _UnterminatedSqlLiteralError("unterminated string literal")
+            end = j + 1 if closed else n
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "$" and (m := _DOLLAR_QUOTE_OPEN_RE.match(sql, i)) is not None:
+            delim = m.group(0)
+            close = sql.find(delim, m.end())
+            if close == -1:
+                if strict:
+                    raise _UnterminatedSqlLiteralError("unterminated dollar-quoted string")
+                end = n
+            else:
+                end = close + len(delim)
+            for k in range(i, end):
+                out[k] = " "
+            i = end
+        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            if mask_comments:
+                for k in range(i, j):
+                    out[k] = " "
+            i = j
+        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if sql[j] == "/" and j + 1 < n and sql[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                elif sql[j] == "*" and j + 1 < n and sql[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            if depth > 0 and strict:
+                raise _UnterminatedSqlLiteralError("unterminated block comment")
+            end = j if depth == 0 else n
+            if mask_comments:
+                for k in range(i, end):
+                    out[k] = " "
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
+
 def _mask_sql_noise(sql: str) -> str:
     """Blank string literals and comments, preserving length and offsets.
 
@@ -927,42 +1122,70 @@ def _mask_sql_noise(sql: str) -> str:
     and backticked spans are identifiers, not literals, so they are skipped
     over intact: their contents stay matchable as part of a table path, and a
     quote inside them can't open a phantom literal.
+
+    Thin, non-strict wrapper over ``_scan_and_mask_sql`` — this caller is
+    best-effort audit tagging, not a security guard, so an unterminated span
+    degrades to "mask to end of string" instead of raising (see
+    ``_UnterminatedSqlLiteralError``).
     """
-    out = list(sql)
-    i, n = 0, len(sql)
-    while i < n:
-        ch = sql[i]
-        if ch in ('"', "`"):
-            # Quoted identifier — step over it without blanking.
-            close = sql.find(ch, i + 1)
-            i = n if close == -1 else close + 1
-        elif ch == "'":
-            j = i + 1
-            while j < n:
-                if sql[j] == "'":
-                    if j + 1 < n and sql[j + 1] == "'":  # '' escape
-                        j += 2
-                        continue
-                    break
-                j += 1
-            for k in range(i, min(j + 1, n)):
-                out[k] = " "
-            i = j + 1
-        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
-            j = sql.find("\n", i)
-            j = n if j == -1 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
-            j = sql.find("*/", i + 2)
-            j = n if j == -1 else j + 2
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        else:
-            i += 1
-    return "".join(out)
+    return _scan_and_mask_sql(sql, mask_comments=True, strict=False)
+
+
+def _mask_sql_for_guard(sql: str, *, mask_comments: bool) -> str:
+    """The masking every raw-text SQL guard in this module runs input
+    through — shared by ``_assert_select_only``'s keyword blocklist scan
+    (#1513) and ``_assert_no_ungranted_catalog_ref`` (#1394's layer (a),
+    reached via ``_enforce_non_admin_sql_rbac``), so the masking logic
+    exists exactly once rather than hand-copied per guard (this module's
+    recurring drift class — see e.g. the pre-#201 backtick-masking
+    duplication this file used to carry).
+
+    Both guards previously scanned RAW SQL text, so a string literal or
+    comment merely CONTAINING a registered catalog name (#1394) or a
+    DML/DDL-shaped English word (#1513, e.g. ``'load failed'``) was refused
+    as if it were the real thing. Masking string/dollar-quoted literals
+    before either guard's own regex/substring scan fixes both — a value is
+    never SQL syntax.
+
+    They disagree on ``mask_comments``, which is why this takes it as a
+    parameter instead of hard-coding a choice:
+
+    * #1394's catalog gate treats a comment the same as a literal — inert
+      text DuckDB never executes, so a catalog name inside one is noise, not
+      a real reference. ``mask_comments=True``.
+    * #1513's keyword blocklist deliberately keeps comments SCANNED — the
+      blocklist substring scan is the ONLY boundary for DML/DDL keywords (no
+      parser backs it the way the file-table-source and
+      SQL-string-table-function checks do), so a comment must not be able to
+      smuggle one past it (pinned by
+      ``test_blocked_keyword_in_leading_comment_still_blocked``).
+      ``mask_comments=False``.
+
+    Quoted identifiers (``"..."``, `` `...` ``) are NEVER masked, in either
+    mode — see ``_scan_and_mask_sql``'s docstring. For the catalog gate this
+    is the whole point: ``"keboola"."x"`` is a genuine catalog-qualified
+    reference (pinned by ``test_quoted_catalog_qualified_ref_is_403``), not
+    data, and masking it would trade a false-positive bug for a real bypass.
+    One consequence worth being explicit about: an alias like
+    ``AS "keboola.com"`` (a dot INSIDE one quoted segment, not a path of two
+    quoted segments) still 403s after this fix, same as before it — fixing
+    that would require keying the catalog gate off parsed table references
+    instead of a text scan at all (the issue's alternate suggested fix), a
+    larger change than "mask what's actually data" this PR intentionally
+    does not make. Failing closed on that residual case is the safe
+    direction for a security guard to be wrong in.
+
+    Raises ``HTTPException(400)`` instead of letting an unterminated quoted
+    span or comment silently swallow whatever real SQL follows it — see
+    ``_UnterminatedSqlLiteralError``.
+    """
+    try:
+        return _scan_and_mask_sql(sql, mask_comments=mask_comments, strict=True)
+    except _UnterminatedSqlLiteralError:
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed SQL: an unterminated string literal, quoted identifier, or comment",
+        ) from None
 
 
 def _enclosing_calls(masked: str, positions: list) -> dict:
@@ -1142,6 +1365,19 @@ _BLOCKED_SQL_TOKENS = [
     "duckdb_views",
     "duckdb_indexes",
     "duckdb_schemas",
+    # DuckDB's SQLite-compat catalog views. `SELECT sql FROM sqlite_master`
+    # returns every view's full CREATE VIEW body — which for the orchestrator's
+    # master views is `... AS SELECT * FROM read_parquet('/data/extracts/...')`,
+    # disclosing absolute on-disk parquet paths. Same class as duckdb_views
+    # above; the `duckdb_*` names just didn't cover the `sqlite_*` aliases
+    # (sqlite_master / sqlite_schema / sqlite_temp_master / sqlite_temp_schema —
+    # all four resolve in DuckDB).
+    "sqlite_master",
+    "sqlite_schema",
+    "sqlite_temp_master",
+    "sqlite_temp_schema",
+    # Leaks cached external file paths (absolute parquet paths) directly.
+    "duckdb_external_file_cache",
     "pragma_table_info",
     "pragma_storage_info",
     # Relative path traversal
@@ -1319,20 +1555,33 @@ def _assert_select_only(sql_lower: str) -> None:
     """Raise HTTPException(400) unless ``sql_lower`` is a single SELECT/WITH
     query free of the blocked keywords/functions. ``sql_lower`` MUST already
     be ``.strip().lower()``-ed by the caller."""
-    if any(keyword in sql_lower for keyword in _BLOCKED_SQL_TOKENS):
+    # Tolerate exactly one trailing semicolon — a routine SQL-formatting habit
+    # (LLM-generated queries, most CLI/DB clients) rather than a second
+    # statement. A ";" that remains after stripping it is a genuine
+    # multi-statement attempt and still blocked below.
+    body = strip_one_trailing_semicolon(sql_lower)
+    # The blocklist below scans for plain substrings, so it must run over a
+    # copy with string/dollar-quoted literals blanked first — otherwise a
+    # literal that merely CONTAINS an ordinary word like "load " or "delete "
+    # (`SELECT 'load failed' AS x`), or a URL, 400s as if it were the keyword
+    # (#1513). Comments stay SCANNED on purpose — see `_mask_sql_for_guard`'s
+    # docstring — this blocklist is the only boundary for DML/DDL keywords,
+    # so `-- drop this table` must still be caught.
+    masked_body = _mask_sql_for_guard(body, mask_comments=False)
+    if any(keyword in masked_body for keyword in _BLOCKED_SQL_TOKENS):
         raise HTTPException(status_code=400, detail="Only single SELECT queries are allowed")
     # File-path table source anywhere in the FROM graph (direct / comma-list /
     # glob), detected precisely via sqlglot — the position regex is used only as
     # the parse-failure fallback inside _has_file_table_source, so functional
     # FROM clauses (TRIM/EXTRACT/SUBSTRING) don't false-positive.
-    if _has_file_table_source(sql_lower):
+    if _has_file_table_source(body):
         raise HTTPException(
             status_code=400,
             detail="File-path table sources are not allowed; query registered views by name",
         )
     # SQL-as-a-string table functions (query/query_table/…): their target never
     # appears as a matchable token, so the RBAC name denylist cannot see it.
-    if _has_sql_string_table_function(sql_lower):
+    if _has_sql_string_table_function(body):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1346,7 +1595,7 @@ def _assert_select_only(sql_lower: str) -> None:
     # comment isn't rejected — DuckDB and the local `agnes query` path tolerate
     # them. The blocklist above still scans the full SQL, so a comment can't
     # smuggle a blocked keyword through.
-    if not re.match(r"^(select|with)\s", _strip_leading_sql_comments(sql_lower)):
+    if not re.match(r"^(select|with)\s", _strip_leading_sql_comments(body)):
         raise HTTPException(status_code=400, detail="Query must start with SELECT or WITH")
 
 
@@ -1373,6 +1622,29 @@ def execute_query(
     sql_lower = request.sql.strip().lower()
 
     _assert_select_only(sql_lower)
+
+    # One trailing `;` is now accepted (it is a terminator, not a second
+    # statement), so normalize it away HERE, once, instead of at each place
+    # that embeds the statement. Two reasons this is the boundary and not a
+    # sixth site-local strip:
+    #
+    #   - `_bq_quota_and_cap_guard` below passes `request.sql` through
+    #     `_rewrite_user_sql_for_bq_dry_run` — a purely textual rewrite that
+    #     preserves the terminator — into a BigQuery dry run. If BQ classifies
+    #     a `;`-terminated text as a script, the dry run reports
+    #     `totalBytesProcessed: 0` and the scan cap silently passes a query it
+    #     was meant to measure. That is a cost guardrail reading zero, not an
+    #     error message, and it is not something this repo's tests can
+    #     observe. Normalizing removes the question rather than answering it.
+    #   - The jobs-API execution wrap at the bottom of the BQ arm nests the
+    #     statement inside a dollar-quoted payload, so DuckDB never sees the
+    #     `;` — but BigQuery does, verbatim.
+    #
+    # Accepted/rejected outcomes do not change: the guard above has already
+    # ruled on the statement, and `sql_lower` is recomputed from the
+    # normalized text so every check below reads the same string that runs.
+    request.sql = strip_one_trailing_semicolon(request.sql)
+    sql_lower = request.sql.strip().lower()
 
     # ----- Internal-source short-circuit ----------------------------------
     # SQL referencing one of the seeded internal tables (agnes_sessions,
@@ -2115,6 +2387,27 @@ def _bq_guardrail_inputs(
                         "registered_as": row["name"],
                     },
                 )
+            policied = _policied_row_over_physical_source(
+                repo,
+                source_type="bigquery",
+                bucket=bucket_raw,
+                source_table=source_table_raw,
+            )
+            if policied is not None:
+                return (
+                    [],
+                    [],
+                    {
+                        "reason": "bq_path_policied",
+                        "path": f"bq.{quote_ident(bucket_raw)}.{quote_ident(source_table_raw)}",
+                        "registered_as": policied["name"],
+                        "hint": (
+                            "This BigQuery table carries an access policy, which is "
+                            f"enforced under its registered name. Query {policied['name']!r} "
+                            "instead of the direct bq.* path."
+                        ),
+                    },
+                )
         # Add to dry-run set if not already covered by bare-name pass.
         bucket = row["bucket"]
         source_table = row["source_table"]
@@ -2186,6 +2479,27 @@ def _bq_guardrail_inputs(
                             "reason": "bq_path_access_denied",
                             "path": f"`{proj}.{ds}.{tbl}`",
                             "registered_as": row["name"],
+                        },
+                    )
+                policied = _policied_row_over_physical_source(
+                    repo,
+                    source_type="bigquery",
+                    bucket=ds,
+                    source_table=tbl,
+                )
+                if policied is not None:
+                    return (
+                        [],
+                        [],
+                        {
+                            "reason": "bq_path_policied",
+                            "path": f"`{proj}.{ds}.{tbl}`",
+                            "registered_as": policied["name"],
+                            "hint": (
+                                "This BigQuery table carries an access policy, which is "
+                                f"enforced under its registered name. Query {policied['name']!r} "
+                                "instead of the direct path."
+                            ),
                         },
                     )
             bucket = row["bucket"]
@@ -2261,6 +2575,51 @@ def _caller_is_unrestricted_admin(user, sys_conn) -> bool:
     )
 
 
+def _policied_row_over_physical_source(
+    repo,
+    *,
+    source_type: str,
+    bucket: str,
+    source_table: str,
+):
+    """The registry row carrying an access policy over this physical
+    source, if any — the reason an engine-qualified path must be refused.
+
+    ``rewrite_sql`` substitutes policied tables by registry NAME (§5.2), and
+    an ``sf."SCHEMA"."TABLE"`` / ``bq."ds"."tbl"`` reference names the
+    PHYSICAL source instead, so the rewrite never fires for it and the
+    policy simply does not apply. Each engine's gate below already proves
+    the path is registered and that the caller holds a grant on the row it
+    resolved to — neither of which says anything about a policy, and the
+    row it resolves to need not even be the policied one when a source is
+    registered twice. Fail closed and send the caller to the registered
+    name, where enforcement lives.
+
+    Scans ``list_by_source`` (both backends implement it) rather than
+    adding a repository lookup, matching the existing ``sf.*`` gate's own
+    scan; the registry is bounded by an instance's table count.
+
+    Matches on ``(bucket, source_table)`` only, which is what both gates
+    already resolve a path with. A BigQuery row registered with ONLY
+    ``bq_fqn`` and no bucket/source_table is invisible here — but also to
+    ``find_by_bq_path``, so such a path is refused one step earlier as
+    unregistered. The uncovered shape is a policied ``bq_fqn``-only row
+    beside an unpolicied bucket/source_table row for the same table; that
+    pair already escapes ``_policy_physical_source_signals`` (the two
+    signals never intersect), so closing it belongs there, not here.
+    """
+    bucket_l = (bucket or "").lower()
+    table_l = (source_table or "").lower()
+    if not bucket_l or not table_l:
+        return None
+    for row in repo.list_by_source(source_type):
+        if not row.get("access_policy_sql"):
+            continue
+        if (row.get("bucket") or "").lower() == bucket_l and (row.get("source_table") or "").lower() == table_l:
+            return row
+    return None
+
+
 def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> Optional[dict]:
     """Registry + RBAC gate for direct ``sf."schema"."table"`` paths.
 
@@ -2301,6 +2660,23 @@ def _sf_guardrail_inputs(sql: str, sql_lower: str, sys_conn, user, allowed) -> O
                     "reason": "sf_path_access_denied",
                     "path": f"sf.{quote_ident(schema_raw)}.{quote_ident(table_raw)}",
                     "registered_as": row["name"],
+                }
+            policied = _policied_row_over_physical_source(
+                repo,
+                source_type="snowflake",
+                bucket=schema_raw,
+                source_table=table_raw,
+            )
+            if policied is not None:
+                return {
+                    "reason": "sf_path_policied",
+                    "path": f"sf.{quote_ident(schema_raw)}.{quote_ident(table_raw)}",
+                    "registered_as": policied["name"],
+                    "hint": (
+                        "This Snowflake table carries an access policy, which is "
+                        f"enforced under its registered name. Query {policied['name']!r} "
+                        "instead of the direct sf.* path."
+                    ),
                 }
     return None
 

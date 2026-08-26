@@ -42,12 +42,11 @@ def _chat_claim_token(chat_session_id: str) -> str:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
     from app.chat.types import Surface
-    from app.main import create_app
     from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
     from src.repositories import (
         agents_repo,
@@ -91,7 +90,7 @@ def env(tmp_path, monkeypatch):
     propose_session = _make_session(propose_agent)
     auto_session = _make_session(auto_agent)
 
-    client = TestClient(create_app())
+    client = TestClient(shared_app)
     return {
         "client": client,
         "owner_token": create_access_token("owner1", "owner@test.com"),

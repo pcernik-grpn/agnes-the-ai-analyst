@@ -74,8 +74,6 @@ const ICONS = {
   bars: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 20h16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><rect x="5.5" y="11" width="3.4" height="6" rx="1" stroke="currentColor" stroke-width="1.6"/><rect x="10.8" y="7" width="3.4" height="10" rx="1" stroke="currentColor" stroke-width="1.6"/><rect x="16.1" y="13" width="3.4" height="4" rx="1" stroke="currentColor" stroke-width="1.6"/></svg>',
   search:
     '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="6" stroke="currentColor" stroke-width="1.7"/><path d="m20 20-3.4-3.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
-  arrow:
-    '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h13M12 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
 };
 
@@ -139,7 +137,6 @@ const TASKS = [
 //   title        card title
 //   reason       short description (muted, under the title)
 //   icon         inline SVG string
-//   cta          trailing action label ("Start")
 //   priority     ascending sort rank
 //   available    false → disabled card with an unavailable hint
 //   task         the TASKS entry to run
@@ -157,7 +154,6 @@ function buildSuggestedActions(_sessions) {
     title: task.title,
     reason: task.description,
     icon: task.icon,
-    cta: "Start",
     priority: 10 + i,
     available: task.available,
   }));
@@ -174,8 +170,13 @@ function _runAction(action) {
   }
 }
 
-/** One guided-task CARD: pale-mint icon tile, bold title, muted description,
- *  and a bottom-aligned "Start →". The whole card is the button. */
+/** One guided-task row: pale-mint icon tile + bold title, centred under the
+ *  composer. The whole row is the button.
+ *
+ *  It used to carry a trailing "Start →" as well, which was the row saying
+ *  twice what it does: four rows under an input, each already a button, do not
+ *  need a per-row verb — and the four repeated CTAs pulled the eye down the
+ *  right margin, away from the titles that actually differ. */
 function _renderActionCard(action) {
   const li = document.createElement("li");
   li.className = "rdb-action-card";
@@ -195,7 +196,8 @@ function _renderActionCard(action) {
   icon.setAttribute("aria-hidden", "true");
   icon.innerHTML = action.icon;
 
-  // Title + description stacked, so each row reads icon | text | Start.
+  // Title + description stacked; the description is DOM-only (hidden in CSS,
+  // read by the button's aria-label).
   const txt = document.createElement("span");
   txt.className = "rdb-action-txt";
   const title = document.createElement("span");
@@ -209,15 +211,6 @@ function _renderActionCard(action) {
   btn.append(icon, txt);
 
   if (action.available) {
-    const cta = document.createElement("span");
-    cta.className = "rdb-action-cta";
-    cta.setAttribute("aria-hidden", "true"); // the button label carries the name
-    const ctaTxt = document.createElement("span");
-    ctaTxt.textContent = action.cta;
-    const arrow = document.createElement("span");
-    arrow.innerHTML = ICONS.arrow;
-    cta.append(ctaTxt, arrow);
-    btn.appendChild(cta);
     btn.addEventListener("click", () => _runAction(action));
   }
   li.appendChild(btn);

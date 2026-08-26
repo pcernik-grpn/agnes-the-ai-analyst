@@ -224,7 +224,7 @@ def test_load_30_concurrent_sessions(docker_e2e_agnes: str) -> None:
     # one-shot; the rest are minted via /auth/password/register (the
     # bootstrap admin is admin and can mint regular users via the
     # standard signup endpoint).
-    admin_email = f"load-admin@agnes.local"
+    admin_email = "load-admin@agnes.local"
     admin = bootstrap_admin(
         docker_e2e_agnes, email=admin_email, password=E2E_USER_PASSWORD,
     )

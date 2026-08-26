@@ -106,6 +106,25 @@ Real-time sync of Jira support tickets for AI-powered analysis.
 - Attachment: created
 - Issue link: created
 
+Every event is handled by refetching the issue from the API, so the body's own
+contents matter only when that refetch fails. Two facts about those bodies are
+worth knowing when reading the fallback path in `service.py`:
+
+- Since **January 2018**, Cloud `jira:issue_*` bodies carry **no comment objects
+  at all**. Only `comment_created` / `comment_updated` embed an issue, and
+  without `expand`. So the fallback's comment update is confined to those two
+  events even before any completeness check runs.
+- The embedded body carries no `changelog` key either. That is why
+  `transform_changelog` returns `None` for an absent key and the incremental
+  transform preserves the issue's stored history instead of wiping it.
+
+Only an ISSUE deletion (`jira:issue_deleted` / `issue_deleted`) removes stored
+rows. A sub-entity deletion — `comment_deleted`, `attachment_deleted`,
+`worklog_deleted` — is handled as an ordinary content change: the issue is
+refetched, which is what drops the deleted comment from the stored thread. Until
+0.83.88 these were matched by a `"deleted" in webhookEvent` substring and each
+one tombstoned the *whole* issue.
+
 ### 2. Webhook Receiver
 
 **File:** `connectors/jira/webhook.py`
@@ -218,11 +237,71 @@ python -m connectors.jira.transform \
 > the file instead: every row it held belongs to a deleted issue.
 
 **Common transformations (both modes):**
-- Extracts plain text from ADF (Atlassian Document Format)
+- Extracts plain text from ADF (Atlassian Document Format), inlining link URLs
+  into the text — see [ADF link URLs](#adf-link-urls)
 - Maps custom field IDs to human-readable names
 - Normalizes nested structures into flat tables
 - Links attachments to local file paths
 - Enforces explicit PyArrow schema for consistent types across months
+
+#### ADF link URLs
+
+`extract_text_from_adf` feeds three stored columns — `comments.body`,
+`issues.description` and `issues.context` — and two ADF constructs keep their
+target *outside* any text node, so a text-node walk lost both:
+
+| construct | where the URL lives | rendered as |
+|---|---|---|
+| `inlineCard` / `blockCard` / `embedCard` (smart link) | `attrs.url` (or `attrs.data.url` / `attrs.data["@id"]` on a resolved blockCard) — **no text child at all** | the bare URL, as a token in the sentence flow |
+| `text` node with a `link` mark | `marks[].attrs.href` — only the anchor text is a text node | `anchor text (href)` |
+
+Hrefs are emitted verbatim, `mailto:` scheme included, **except that a
+credential-bearing parameter value is replaced with `REDACTED`**. Jira hands out
+URLs carrying bearer credentials in the query string (a Service Desk
+`unsubscribe?jwt=…` link is a signed token authorising an action), and these
+columns are distributed to analyst laptops as parquet and read by agents — so
+the URL is kept whole and identifiable and only the values go. Path, scheme,
+ordering, separators and non-secret parameters are untouched, and the fragment
+is covered as well as the query, because OAuth's implicit flow puts the token
+after the `#`.
+
+Parameter names are matched in two tiers, because over-redacting is the same
+bug class as the loss this renderer exists to fix:
+
+| tier | names | covers |
+|---|---|---|
+| separator-insensitive substring | `token`, `jwt`, `secret`, `password`, `passwd`, `signature`, `credential`, `apikey` | `access_token`, `refresh_token`, `mfaManagementToken`, `api_key`, `api-key` |
+| whole name only | `tok`, `sig`, `key`, `pin`, `auth`, `code`, `sdata` | as substrings these would fire on `design`, `author`, `keyword` |
+
+Two boundaries worth knowing. The autolink comparison runs on the **raw** href:
+redacting first would make a tokened URL stop matching its own anchor text, and
+the labelled form would then print the credential it had just removed. And
+anchor text is prose, never rewritten — an author documenting
+`?token=<project-token>` keeps it, exactly as before this change. Only URLs the
+renderer itself emits are redacted.
+
+The parenthesised copy is suppressed where the anchor text already *is* the
+target: an href differing only by a trailing slash emits the href, and one that
+is the anchor text plus a scheme Jira's autolinker inferred emits the anchor
+text — Jira links a bare `SKILL.md` to `http://SKILL.md`, and emitting that href
+would rewrite an authored word into a URL that never existed.
+
+A fragment that renders to nothing — a `media` node, a `hardBreak`, the
+space-only text node Jira appends after an inline card — is dropped rather than
+joined, so it leaves no gap in the sentence. Only fragment *edges* are
+normalised: a `codeBlock`'s newlines and indentation are content and survive
+verbatim, as does a run of spaces an author typed.
+
+Two things this does **not** cover:
+
+- `changelog.from_value` / `to_value` never touch this renderer. They are Jira's
+  own wiki-markup strings from `fromString` / `toString`.
+- **Rows written before this landed keep their lossy text**, and keep any
+  credential a pre-fix walk had already stored from a pasted tokened URL.
+  Re-transforming them is a separate operation over the cached raw JSON — no
+  Jira traffic needed — and it applies the redaction above as it goes. Table
+  structure (cell and row boundaries collapse to whitespace) and `media` alt
+  text are likewise still flattened away.
 
 ### 5. Data Distribution
 
@@ -536,6 +615,56 @@ SELECT count(*) FROM comments WHERE public_visibility IS FALSE;
 SELECT strftime(created_at, '%Y-%m') AS month, count(*) AS unknown
 FROM comments WHERE public_visibility IS NULL GROUP BY 1 ORDER BY 1;
 ```
+
+#### What `NULL` means, per deployment kind
+
+`jsdPublic` is a **platform** field on Jira Cloud, not a JSM-licensed one.
+Licensing gates the *value*, never the key's presence — Atlassian's v2/v3
+OpenAPI schema documents it as defaulting to `true` "when the site doesn't use
+Jira Service Desk", and that was confirmed live in August 2026 against two
+JSM-unlicensed public Cloud instances, which serialized a boolean on every
+comment sampled (including thread heads from 2003 and 2006).
+
+| Deployment | `public_visibility` behaviour |
+|---|---|
+| Jira Cloud, JSM licensed | `true`/`false` as observed. `NULL` means: a mistyped or explicitly-null flag, a row written before this column existed and not yet re-transformed, or a comment version written from a flagless webhook-fallback embed and not yet refetched. |
+| Jira Cloud, no JSM license | The flag is still serialized on every comment; values are uniformly `true` (the platform default — the column is well-defined but there is no internal/public distinction to make). `NULL` as above, and rare. |
+| Jira Data Center / Server | Out of scope by construction. The field does not exist there, and neither does the `/rest/api/3` surface this connector hardcodes — a DC-pointed install fails every fetch long before this column matters. |
+
+#### Carry-forward: an unflagged comment never nulls an observed value
+
+The incremental comments write is an issue-scoped delete-then-insert, so a
+comment arriving without a boolean `jsdPublic` would not merely fail to add
+information — it would REPLACE a stored value with `NULL`. The write layer
+(`incremental_transform._carry_forward_public_visibility`) therefore fills a
+`NULL` from the stored row when, and only when, that row is **the same comment
+version**: same `(issue_key, comment_id)` and an identical `updated_at`. An
+incoming boolean always wins; a differing `updated_at` means the comment was
+edited — and a visibility flip rides exactly such an edit — so the value stays
+honestly `NULL` until the next successful refetch rather than serving a possibly
+pre-flip boolean as observed. Each incremental write logs how many values it
+carried and how many stayed `NULL`, so a silent never-carry regression is
+visible in the logs rather than only in the data.
+
+**Durability caveat.** Carry-forward is a *parquet-layer* repair: it fills the
+row being written, and does not write anything back into the cached raw JSON. If
+a comment version was saved from a flagless webhook-fallback embed, a full batch
+re-transform (4b) rebuilds that month from the raw JSON and re-`NULL`s those
+rows, because the flag is genuinely not in the cache. Refetch the affected issues
+first (see *Historical Backfill*) if you need a rebuild to keep them.
+
+**Nothing schedules that refetch for you.** Until 0.83.88 a flagless embed failed
+the completeness gate, which marked the issue `_comments_incomplete` and wrote
+the `.incomplete` sidecar, so the next `--skip-existing` backfill refetched it
+and healed the raw cache. That heal came bundled with the cost this release
+removes: the issue's *entire* comment update was deferred until that refetch
+happened. Reusing the marker would reinstate the deferral, so it is deliberately
+not set for a flag gap. In practice the cache heals on ordinary activity anyway —
+any later successful refetch of the issue (its next webhook event, an SLA poll
+while it is open, a consistency-check repair) rewrites the JSON with the flag
+present. It persists only for an issue that goes quiet immediately afterwards.
+The signal that it happened is the per-issue WARNING naming the issue key and the
+count; treat a rebuild of a month containing one as "refetch those keys first".
 
 Rows written before this column existed read as `NULL` (the extract views use
 `union_by_name=true`, so adding the column is non-breaking). To fill them in,

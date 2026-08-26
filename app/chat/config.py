@@ -7,7 +7,6 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
@@ -30,11 +29,20 @@ class SlackConfig:
 @dataclass(frozen=True)
 class ChatConfig:
     enabled: bool = False
-    # Sandbox provider id. ``e2b`` (cloud microVMs) and ``docker``
-    # (self-hosted containers, driven through the apps-runner sidecar)
-    # are the production-supported values; a further variant would
-    # extend the gate in ``app/main.py``.
-    provider: str = "e2b"
+    # Sandbox provider id. ``kai-agent`` (the embedded kai-agent turn engine
+    # — sessions run on the engine's own agent loop + sandbox, see
+    # app/chat/kai_engine_provider.py; requires the KAI_HOST_JWT_SECRET host
+    # wiring from app/api/kai.py) and ``docker`` (self-hosted containers,
+    # driven through the apps-runner sidecar) are the production-supported
+    # values; a further variant would extend the gate in ``app/main.py``.
+    # The ``e2b`` provider was removed in 0.89.0 — a stale ``provider: e2b``
+    # boots with chat disabled and an actionable error log.
+    provider: str = "kai-agent"
+    # Where the embedded engine listens, for ``provider: kai-agent`` only.
+    # The default is the compose service name the customer-instance module
+    # materializes; the engine is loopback/compose-network-only by design,
+    # so this is never a public URL.
+    kai_agent_url: str = "http://kai-agent:3000"
     # Agent harness id — which engine drives the in-sandbox session
     # (app/chat/harness.py seam; validated against APPROVED_HARNESSES at
     # boot). ``claude-code`` is the only production harness today.
@@ -58,21 +66,6 @@ class ChatConfig:
     # gate deny instantly with an actionable message.
     approvals_enabled: bool = True
     marketplace_sha_debounce_seconds: int = 5 * 60
-    # E2B template id (``agnes-chat`` for the default operator build per
-    # Q2 — single mutable ``:latest`` tag). Required when
-    # ``chat.enabled=true`` and ``provider=e2b``; startup gate refuses
-    # otherwise. Operator obtains this from ``e2b template build``.
-    e2b_template_id: Optional[str] = None
-    # Hosts/CIDRs the sandbox may reach outbound, enforced at the E2B VM
-    # level via SandboxNetworkOpts.allow_out. Empty = provider computes a
-    # default (broker host + loopback). NEVER include api.anthropic.com
-    # directly once the broker is live — Anthropic traffic goes via the relay.
-    egress_allow_out: list[str] = field(default_factory=list)
-    # Per-spawn workspace push cap (Q1, 100 MB default). Files past this
-    # cap → WorkspaceTooLarge → user-facing error frame. Irrelevant under
-    # ``provider: docker`` — that provider bind-mounts the workspace, so
-    # nothing is pushed and nothing is capped.
-    e2b_workspace_max_bytes: int = 100 * 1024 * 1024
     # --- Docker sandbox provider (``provider: docker``) ---------------------
     # Operator-built sandbox image (see
     # app/initial_workspace_default/docker-sandbox/). The apps-runner sidecar
@@ -83,14 +76,14 @@ class ChatConfig:
     # attached to, or AGNES_SERVER won't resolve from inside the container.
     docker_network: str = "agnes-apps"
     # Always-set resource bounds (a local sandbox contends with the gateway
-    # host, unlike an offloaded E2B microVM).
+    # host, unlike an offloaded remote sandbox).
     docker_mem_limit: str = "2g"
     docker_cpus: float = 1.0
     docker_pids_limit: int = 512
     # ``open`` — normal bridge, internet reachable (parity with in-sandbox
     # tools that fetch packages). ``none`` — an ``internal`` bridge where the
-    # only reachable origin is whatever else is attached to it (stronger than
-    # E2B's allowlist, but in-sandbox package installs stop working).
+    # only reachable origin is whatever else is attached to it (but
+    # in-sandbox package installs stop working).
     # ``allowlist`` — the internal bridge of ``none`` PLUS an egress-proxy
     # sidecar (services/egress_proxy) dual-homed onto it: sandboxes get
     # HTTP(S)_PROXY pointed at the proxy, which enforces
@@ -109,9 +102,8 @@ class ChatConfig:
     # Host-wide ceiling on live sandboxes, checked at spawn on top of
     # ``concurrency_per_user``.
     docker_max_total_sandboxes: int = 10
-    # Lifecycle when the last sink detaches: "pause" (E2B snapshot, resumable)
+    # Lifecycle when the last sink detaches: "pause" (snapshot, resumable)
     # or "kill" (legacy cost-minimizing behavior).
-    # Deprecated: use on_detach instead of e2b_kill_on_ws_disconnect.
     on_detach: str = "pause"
     detach_linger_seconds: int = 60
     # Grace window (Tier 1, restart-invariant reuse — see
@@ -126,16 +118,22 @@ class ChatConfig:
     # explicitly, so existing configs need no changes.
     idle_grace_seconds: int = 60
     paused_ttl_seconds: int = 7 * 24 * 3600
-    # Back-compat echo only — new code reads on_detach, never this field.
-    e2b_kill_on_ws_disconnect: bool = True
-    # When true, the runner bootstraps the user's RBAC-filtered marketplace
-    # plugins into each sandbox at spawn (clone + `claude plugin install` +
-    # load via setting_sources) so the agent can use marketplace skills.
-    # Off by default: it adds ~10-15 s of per-spawn latency, only worthwhile
-    # once the operator's marketplace actually ships skill/agent content
-    # (an empty placeholder plugin contributes nothing). Independent of the
+    # When true, the caller's RBAC-filtered marketplace skills are delivered
+    # into the agent's project scope, so a stack skill is actually invokable
+    # (`/<skill-name>`) in chat. One mechanism — the server materializes the
+    # skill directories; two placements, since the providers differ in what
+    # Agnes owns (`app.chat.skills_catalog.marketplace_delivery` is the gate):
+    #   - docker: written into the per-user chat workspace the sandbox
+    #     bind-mounts (`app/chat/workdir.py`).
+    #   - kai-agent: overlaid into the workspace tarball the engine
+    #     materializes into its own project scope (`app/api/kai.py`).
+    # ON by default since 0.87.1: with it off the composer's slash menu
+    # advertised marketplace skills the agent had never been given, so
+    # `/<skill>` came back "Unknown command" (#1552). Turning it off (the
+    # `chat_bootstrap_marketplace` switch) makes the menu stop offering
+    # marketplace skills rather than lie about them. Independent of the
     # always-on plugin.json sanitization in the marketplace packager.
-    bootstrap_marketplace: bool = False
+    bootstrap_marketplace: bool = True
     # How the chat broker authenticates to Anthropic. ``api_key`` (default) uses
     # the static ``ANTHROPIC_API_KEY``. ``workload_identity`` mints a short-lived
     # token from the workload's own OIDC identity via Anthropic Workload Identity
@@ -268,14 +266,12 @@ def _parse_on_detach(raw: dict) -> str:
     if on_detach not in ("pause", "kill"):
         if on_detach:
             logger.warning("unknown chat.on_detach %r — falling back to 'pause'", on_detach)
-        # Same parser as the ChatConfig echo of this key — plain truthiness
-        # here would read the string "no" as kill-enabled while the config
-        # surface reports it disabled.
-        if coerce_flag_value(raw.get("e2b_kill_on_ws_disconnect"), default=False):
-            logger.warning("chat.e2b_kill_on_ws_disconnect is deprecated; use chat.on_detach: kill")
-            on_detach = "kill"
-        else:
-            on_detach = "pause"
+        if raw.get("e2b_kill_on_ws_disconnect") is not None:
+            # Removed alias (0.89.0, with the e2b provider): it used to imply
+            # ``on_detach: kill``. Warn-and-ignore — the stale key now gets
+            # the ``pause`` default.
+            logger.warning("chat.e2b_kill_on_ws_disconnect is removed; use chat.on_detach: kill")
+        on_detach = "pause"
     return on_detach
 
 
@@ -316,15 +312,82 @@ def _resolve_chat_enabled(raw: dict) -> bool:
     return coerce_flag_value(raw.get("enabled"), default=False)
 
 
+def _resolve_chat_bootstrap_marketplace(raw: dict) -> bool:
+    """``chat.bootstrap_marketplace`` resolution:
+    ``AGNES_CHAT_BOOTSTRAP_MARKETPLACE`` env > the ``bootstrap_marketplace``
+    key in the parsed ``chat:`` block > ``True``.
+
+    Same precedence convention as :func:`_resolve_chat_enabled` — and the same
+    reason for the env layer: infrastructure pins the flag durably (a fresh
+    data disk boots with no ``instance.yaml``), and ``/admin/server-config``
+    must report the value the running system actually honours rather than the
+    YAML's.
+    """
+    env = os.environ.get("AGNES_CHAT_BOOTSTRAP_MARKETPLACE")
+    if env is not None:
+        return coerce_flag_value(env, default=True)
+    return coerce_flag_value(raw.get("bootstrap_marketplace"), default=True)
+
+
+def _resolve_chat_provider(raw: dict) -> str:
+    """``chat.provider`` resolution: ``AGNES_CHAT_PROVIDER`` env > the
+    ``provider`` key in the parsed ``chat:`` block > ``"kai-agent"``.
+
+    The env override exists so INFRASTRUCTURE can pin the provider durably:
+    the deployment env rides code-reviewed Terraform (the ``customer-instance``
+    module's per-VM ``chat_provider`` field writes it into the app env), while
+    ``instance.yaml`` is a hand-edited overlay on the data disk that a fresh
+    machine starts without. Same precedence convention as
+    ``_resolve_chat_enabled`` above; a blank env value means unset (a key
+    written with nothing after it must not override the yaml, mirroring
+    ``_raw_str``'s treatment of blank yaml values).
+    """
+    env = (os.environ.get("AGNES_CHAT_PROVIDER") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "provider", "kai-agent")
+
+
+def _resolve_kai_agent_url(raw: dict) -> str:
+    """``chat.kai_agent_url`` resolution: ``AGNES_CHAT_KAI_AGENT_URL`` env >
+    the ``kai_agent_url`` key > ``"http://kai-agent:3000"``.
+
+    Same precedence convention and same motivation as
+    :func:`_resolve_chat_provider` — the provider it configures is pinned from
+    the deployment env, so its endpoint has to be pinnable the same way or the
+    pair can only ever be half-configured from infrastructure. It also makes
+    the provider reachable from a laptop: the default names a compose service,
+    which does not resolve outside the compose network, and the local-dev flow
+    deliberately runs without an ``instance.yaml`` (see
+    ``docs/kai-agent-local-dev.md``).
+    """
+    env = (os.environ.get("AGNES_CHAT_KAI_AGENT_URL") or "").strip()
+    if env:
+        return env
+    return _raw_str(raw, "kai_agent_url", "http://kai-agent:3000")
+
+
 def load_chat_config(instance_yaml: Path) -> ChatConfig:
     if not instance_yaml.exists():
-        return ChatConfig(enabled=_resolve_chat_enabled({}), approvals_enabled=_resolve_chat_approvals({}))
+        return ChatConfig(
+            enabled=_resolve_chat_enabled({}),
+            # A fresh machine (no instance.yaml yet) must still honour an
+            # infra-pinned provider — without this the first boot ran the
+            # default provider regardless of the deployment env.
+            provider=_resolve_chat_provider({}),
+            kai_agent_url=_resolve_kai_agent_url({}),
+            approvals_enabled=_resolve_chat_approvals({}),
+            # Same reason as ``provider``: an infra-pinned flag must survive a
+            # machine that has not written its ``instance.yaml`` overlay yet.
+            bootstrap_marketplace=_resolve_chat_bootstrap_marketplace({}),
+        )
     data = yaml.safe_load(instance_yaml.read_text()) or {}
     raw = data.get("chat", {}) or {}
     detach_linger_seconds = _raw_int(raw, "detach_linger_seconds", 60)
     return ChatConfig(
         enabled=_resolve_chat_enabled(raw),
-        provider=_raw_str(raw, "provider", "e2b"),
+        provider=_resolve_chat_provider(raw),
+        kai_agent_url=_resolve_kai_agent_url(raw),
         harness=_raw_str(raw, "harness", "claude-code"),
         concurrency_per_user=_raw_int(raw, "concurrency_per_user", 3),
         idle_ttl_seconds=_raw_int(raw, "idle_ttl_seconds", 30 * 60),
@@ -338,9 +401,6 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         approval_timeout_seconds=_raw_int(raw, "approval_timeout_seconds", 300),
         approvals_enabled=_resolve_chat_approvals(raw),
         marketplace_sha_debounce_seconds=_raw_int(raw, "marketplace_sha_debounce_seconds", 5 * 60),
-        e2b_template_id=raw.get("e2b_template_id") or None,
-        egress_allow_out=list(raw.get("egress_allow_out") or []),
-        e2b_workspace_max_bytes=_raw_int(raw, "e2b_workspace_max_bytes", 100 * 1024 * 1024),
         docker_image=str(raw.get("docker_image") or "agnes-chat-sandbox:latest"),
         docker_network=str(raw.get("docker_network") or "agnes-apps"),
         docker_mem_limit=str(raw.get("docker_mem_limit") or "2g"),
@@ -357,8 +417,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         # — see ChatConfig.idle_grace_seconds's docstring.
         idle_grace_seconds=_raw_int(raw, "idle_grace_seconds", detach_linger_seconds),
         paused_ttl_seconds=_raw_int(raw, "paused_ttl_seconds", 7 * 24 * 3600),
-        e2b_kill_on_ws_disconnect=coerce_flag_value(raw.get("e2b_kill_on_ws_disconnect"), default=True),
-        bootstrap_marketplace=coerce_flag_value(raw.get("bootstrap_marketplace"), default=False),
+        bootstrap_marketplace=_resolve_chat_bootstrap_marketplace(raw),
         llm_auth=_raw_str(raw.get("llm") or {}, "auth", "api_key").lower(),
         agent_api_utility_models=list(raw.get("agent_api_utility_models") or []),
         agent_api_budget_cache_ttl_s=_raw_int(raw, "agent_api_budget_cache_ttl_s", 60),

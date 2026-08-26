@@ -274,6 +274,56 @@
 <a class="detail-edit-icon" href="{{ href }}" title="{{ title }}" aria-label="{{ title }}" data-section-edit>{{ ico('edit') }}</a>
 {% endmacro %}
 
+{# ── The governance cluster ────────────────────────────────────────────
+   ONE way for a detail page to offer the actions that MANAGE the thing it
+   is showing, replacing four different idioms that had grown across these
+   pages: an overflow-menu item here, a bare `edit_icon` there, an inline
+   "Edit · admin-only" text link per row on the memory domain, a
+   status-conditional block on the library file.
+
+   Two rules the shape encodes:
+
+   1. **Object-scoped only.** Every action acts on the thing the reader is
+      standing on — rename it, change what is in it, change who gets it.
+      Instance-scoped work (connect a source, register tables, server
+      config) never appears here; it belongs in Admin, and `admin_href` is
+      the one door to it.
+   2. **It must not outrank the reader's own action.** A caller who can
+      manage this arrived as a reader first, so the primary action stays the
+      reading verb ("Add to stack") and this is quiet secondary chrome — a
+      labelled cluster, never a filled button competing with the hero.
+
+   `can_manage` is the caller's decision and means OWNER **or** admin: files
+   and collections are owner-owned, store entities have both. `admin_href`
+   is admin-only, so pass it as None for an owner who is not one.
+
+   actions: [{'label', 'attrs'|'href', 'danger'}] — a dict with `href`
+   navigates, one without renders a button for the page's own JS to wire
+   (which is how an action opens the shared drawer in place). #}
+{% macro manage(actions, admin_href=None, title='Manage this', scope_label='Admin',
+                admin_label='Manage in Admin') %}
+<section class="detail-side detail-manage" data-manage>
+  <h2 class="detail-side__title detail-manage__head">
+    <span class="detail-manage__key">{{ scope_label }}</span>
+    <span class="detail-manage__ttl">{{ title }}</span>
+  </h2>
+  {% if actions %}
+  <div class="detail-manage__body">
+    {% for a in actions %}
+      {% if a.href %}
+    <a class="btn btn-secondary btn-sm{% if a.danger %} detail-manage__danger{% endif %}" href="{{ a.href }}">{{ a.label }}</a>
+      {% else %}
+    <button type="button" class="btn btn-secondary btn-sm{% if a.danger %} detail-manage__danger{% endif %}" {{ a.attrs | safe }}>{{ a.label }}</button>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if admin_href %}
+  <a class="detail-manage__door" href="{{ admin_href }}">{{ admin_label }} <span aria-hidden="true">&rarr;</span></a>
+  {% endif %}
+</section>
+{% endmacro %}
+
 {# ══════════════════════════════════════════════════════════════════════
    REUSABLE DETAIL COMPONENTS
    ══════════════════════════════════════════════════════════════════════

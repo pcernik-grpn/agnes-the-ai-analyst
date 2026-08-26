@@ -267,13 +267,12 @@ class TestMostPopularSection:
         # No rollups seeded — all zero, JS hides the section
         assert items_with_inv == []
 
-    def test_most_popular_section_placeholder_in_html(self, seeded_app, admin_user):
-        """The Most Popular container div is always emitted by the template;
-        JS shows/hides it based on API data."""
-        c = seeded_app["client"]
-        resp = c.get("/marketplace", headers=admin_user)
-        assert resp.status_code == 200
-        assert "mp-popular-section" in resp.text
+    # test_most_popular_section_placeholder_in_html was retired with the
+    # /marketplace browse page itself (folded into /library — the shell now
+    # 302s, so there is no template to emit `mp-popular-section`). The API
+    # half of the feature is still guarded by the two tests around this
+    # comment; a Most Popular shelf inside the Library's kind sections is the
+    # seam spec's planned home for the UI half.
 
     # The "Search in: Curated / Flea Market" scope checkboxes were retired in
     # the redesign — /marketplace is now one unified Browse shelf with a

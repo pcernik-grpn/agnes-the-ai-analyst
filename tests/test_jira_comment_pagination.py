@@ -28,11 +28,10 @@ AUTH = ("bot@mycompany.com", "test-token")
 def _comment(comment_id: str, *, jsd_public: bool | None = True) -> dict:
     """A comment as Jira serializes one.
 
-    ``jsdPublic`` is part of that shape — present on every comment across every
-    fetch shape measured for the `public_visibility` column — and this fixture
-    predates the column, so it used to omit it. That mattered once
-    `_embedded_comments_are_complete` started requiring the flag: a fixture
-    without it models a payload Jira does not actually send. Pass
+    ``jsdPublic`` is part of that shape — a Jira Cloud platform field, present on
+    every comment across every fetch shape measured for the `public_visibility`
+    column — and this fixture predates the column, so it used to omit it. A
+    fixture without it models a payload Jira does not actually send. Pass
     ``jsd_public=None`` to model one that lacks it deliberately.
 
     Timestamps are distinct and id-ordered (cN -> N seconds past midnight) so
@@ -1228,13 +1227,17 @@ class TestWebhookFallbackPayloadIsNotAuthoritative:
 
         assert "_comments_incomplete" not in payload
 
-    def test_complete_thread_whose_comments_lack_the_visibility_flag_is_marked(self, tmp_path):
-        """Length is not the only kind of incompleteness once a column is read
-        off each comment. The write here is an issue-scoped delete-then-insert,
-        so a comment with no boolean `jsdPublic` replaces an already-observed
-        `public_visibility` with NULL. Preserving the stored rows and healing on
-        the next successful refetch is the safe direction — the same call this
-        class already makes for a short thread."""
+    def test_complete_thread_whose_comments_lack_the_visibility_flag_is_applied(self, tmp_path):
+        """Completeness is about the THREAD, not about the fields on one comment.
+
+        v0.83.70 briefly widened it: a comment with no boolean `jsdPublic` marked
+        the whole issue incomplete, because the delete-then-insert would replace
+        an already-observed `public_visibility` with NULL. That protection now
+        lives at the write layer — `_comment_records` carries a stored
+        same-version value forward — so the update can be applied here instead of
+        deferred to the next successful refetch. The value half is pinned
+        end-to-end in `tests/test_jira_comment_visibility.py`.
+        """
         embedded = {
             "key": "PROJ-703",
             "id": "10003",
@@ -1248,7 +1251,7 @@ class TestWebhookFallbackPayloadIsNotAuthoritative:
 
         payload = self._run_fallback(tmp_path, embedded)
 
-        assert payload.get("_comments_incomplete") is True
+        assert "_comments_incomplete" not in payload
 
     def test_payload_without_comment_field_is_marked_incomplete(self, tmp_path):
         embedded = {"key": "PROJ-702", "id": "10002", "fields": {"summary": "no comment field"}}

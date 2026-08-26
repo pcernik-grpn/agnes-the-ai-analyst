@@ -316,6 +316,30 @@ class AgentsPgRepository:
             )
         return [dict(r) for r in rows]
 
+    def get_scope_for_agents(self, agent_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """``{agent_id: [{item_type, item_id}, ...]}`` — see the DuckDB sibling
+        for why the list endpoint needs a batched read instead of an N+1."""
+        if not agent_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT agent_id, item_type, item_id FROM agent_scope "
+                        "WHERE agent_id = ANY(:agent_ids) ORDER BY agent_id, item_type, item_id"
+                    ),
+                    {"agent_ids": list(agent_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["agent_id"], []).append(
+                {"item_type": r["item_type"], "item_id": r["item_id"]}
+            )
+        return out
+
     def agent_for_scope_item(self, item_type: str, item_id: str) -> Optional[Dict[str, Any]]:
         """The non-deleted agent holding scope item ``(item_type, item_id)``,
         or None. Routing lookup (e.g. Slack `slack_channel` bindings) — the

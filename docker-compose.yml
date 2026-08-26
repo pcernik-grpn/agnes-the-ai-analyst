@@ -104,7 +104,35 @@ services:
     # Joins agnes-apps so the app can reach data-app runtime containers
     # directly (e.g. readiness probes); apps-runner is the only process
     # that talks to the Docker socket, but the app shares the network.
-    networks: [default, agnes-apps, agnes-apps-internal]
+    #
+    # `default` is pinned as the app's gateway network so its default route —
+    # hence all its egress, including the GCP metadata server for BigQuery
+    # GCE-metadata auth — always leaves via `default`, never via `agnes-apps`.
+    # Why the gateway pin matters: the container-metadata-hardening firewall
+    # rule (infra/modules/customer-instance/startup-script.sh.tpl) DROPs
+    # `agnes-apps -> 169.254.169.254`, source-scoped to the agnes-apps subnet
+    # precisely so the app itself is spared; a multi-homed app whose default
+    # route landed on agnes-apps would send its own metadata traffic into that
+    # DROP and break BigQuery auth. Both pin fields are set because they answer
+    # different questions on different engine generations:
+    #   - `gw_priority` (Compose >= v2.33.1, effective on Docker Engine >= 28,
+    #     where it is the ONLY field that selects the gateway network —
+    #     `priority` deliberately does not; older engines ignore the value):
+    #     the authoritative pin. Without it, Engine 28+ tie-breaks all-zero
+    #     gateway priorities away from this intent.
+    #   - `priority` (older field, controls connection ORDER): keeps `default`
+    #     the first-connected network, which is what pre-28 engines derive the
+    #     default route from.
+    # Either way the pin is a config guarantee, not an incidental of Docker's
+    # tie-break. NOTE: `gw_priority` sets the minimum Compose CLI at v2.33.1
+    # (Feb 2025) — older Compose rejects the key at validation
+    # (`docker compose config` to check yours).
+    networks:
+      default:
+        priority: 100
+        gw_priority: 100
+      agnes-apps: {}
+      agnes-apps-internal: {}
 
   # One-shot: run extractor then rebuild orchestrator views
   extract:
@@ -266,6 +294,45 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Development stand-in for the kai-agent turn engine, which lives outside
+  # this repository — so `chat.provider: kai-agent` had no way to be exercised
+  # locally at all, and the frame path it drives (renderer included) could
+  # only be tested by hand. Speaks the engine's SSE contract with scripted
+  # turns; no model, no key, no database. See docs/kai-agent-local-dev.md.
+  #
+  # NOT named `kai-agent`: that name belongs to the real engine, which a
+  # deployment runs as a compose service of its own (see the
+  # customer-instance module's docker-compose.kai-agent.yml overlay), and
+  # which the default `chat.kai_agent_url` (http://kai-agent:3000) therefore
+  # resolves to with no configuration at all. A fixture must not squat the
+  # production name: compose merges same-named services across the files in
+  # COMPOSE_FILE and the overlay would inherit the `command` below, launching
+  # the real engine image as this stub. Local dev points at the stub with
+  # `AGNES_CHAT_KAI_AGENT_URL` instead — one env var in a flow that already
+  # sets `KAI_HOST_JWT_SECRET`; see docs/kai-agent-local-dev.md.
+  #
+  # Gated behind its own profile too, so it can never appear in a stack that
+  # did not ask for it by name. NEVER enable this profile in production: it
+  # answers every turn with a canned script.
+  kai-agent-stub:
+    build: .
+    command: python -m services.kai_engine_stub
+    profiles: ["kai-stub"]
+    environment:
+      # Must match the Agnes process, or the stub rejects the host-minted
+      # session JWT exactly as the real engine would. Soft-default (`:-`)
+      # rather than required (`:?`): compose validates interpolation for the
+      # whole file before filtering profiles, so a hard requirement here
+      # would break every `docker compose up` that never selects this
+      # profile (the lesson from the apps-runner token, rolled back in #1007).
+      - KAI_HOST_JWT_SECRET=${KAI_HOST_JWT_SECRET:-}
+      - KAI_HOST_JWT_ISSUER=${KAI_HOST_JWT_ISSUER:-agnes}
+      - KAI_HOST_JWT_AUDIENCE=${KAI_HOST_JWT_AUDIENCE:-kai-agent}
+      # Pause between SSE records — the interleaving is the thing under
+      # observation, so it defaults to human-visible rather than instant.
+      - KAI_STUB_STEP_DELAY=${KAI_STUB_STEP_DELAY:-0.35}
+    restart: unless-stopped
 
   telegram-bot:
     build: .

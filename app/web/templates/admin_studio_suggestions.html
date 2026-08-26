@@ -47,13 +47,13 @@
   <p class="sug-sub" style="color: var(--ds-text-secondary);">Proposals submitted by non-admins from the authoring studio. Approve or reject each.</p>
 
   <div class="sug-toolbar" role="tablist" aria-label="Filter by status">
-    <button class="sug-tab" role="tab" data-status="pending" aria-selected="true">Pending</button>
-    <button class="sug-tab" role="tab" data-status="approved" aria-selected="false">Approved</button>
-    <button class="sug-tab" role="tab" data-status="rejected" aria-selected="false">Rejected</button>
+    <button class="sug-tab" role="tab" data-status="pending" aria-selected="true" aria-controls="sug-list">Pending</button>
+    <button class="sug-tab" role="tab" data-status="approved" aria-selected="false" aria-controls="sug-list">Approved</button>
+    <button class="sug-tab" role="tab" data-status="rejected" aria-selected="false" aria-controls="sug-list">Rejected</button>
     <button class="btn btn-secondary" id="sug-run-mining" type="button" style="margin-left: auto;">Run memory mining</button>
   </div>
 
-  <div class="sug-list" id="sug-list" aria-live="polite"></div>
+  <div class="sug-list" id="sug-list" role="tabpanel" aria-live="polite"></div>
 </div>
 {% endblock %}
 

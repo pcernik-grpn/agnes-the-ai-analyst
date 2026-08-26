@@ -9,9 +9,8 @@ POST /api/chat/uploads
     - table_name: optional name for the registered table
 
   Writes the file into the caller's per-user workspace under an ``uploads/``
-  subdirectory so it syncs into their E2B chat sandbox on next spawn
-  (the same 100 MB workspace sync cap applies; this endpoint enforces a
-  per-file cap well under that limit).
+  subdirectory so it reaches their chat sandbox on next spawn (this
+  endpoint enforces a per-file size cap).
 
   When register_as_table=true on a data file (CSV/parquet/XLSX), the file is
   also registered as a workspace-local queryable table by writing/refreshing

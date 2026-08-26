@@ -63,7 +63,7 @@ def persist_overlay_token(env_name: str, value: Optional[str]) -> None:
 
     Single shared helper for every code path that writes a secret this way
     (today: marketplaces PATs, the initial-workspace template PAT, and the
-    E2B/Anthropic chat-sandbox keys). ``value=None`` or ``value=""`` removes
+    Anthropic chat key). ``value=None`` or ``value=""`` removes
     the key; a non-empty value writes/replaces it.
 
     Two storage backends, chosen by whether the control-plane vault is

@@ -40,6 +40,7 @@ from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
 from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
     "Agnes",
@@ -415,7 +416,10 @@ def query_local(sql: str, limit: int = 1000) -> dict:
     with _open_duckdb(str(db_path), read_only=True) as conn:
         # Apply LIMIT at the DuckDB level to protect against accidental
         # full-table scans on large cached parquets.
-        wrapped = f"SELECT * FROM ({sql}) AS _q LIMIT {limit}"
+        # A trailing `;` is legal at the top level and fatal inside this wrap.
+        # Same one-character rule the four server-side embed sites apply; the
+        # shared helper is why this one no longer drifts from them.
+        wrapped = f"SELECT * FROM ({strip_one_trailing_semicolon(sql)}) AS _q LIMIT {limit}"
         try:
             result = conn.execute(wrapped)
             columns = [d[0] for d in result.description]

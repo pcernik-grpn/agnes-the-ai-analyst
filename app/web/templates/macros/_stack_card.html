@@ -78,7 +78,7 @@
         out of the stack and deleting the card is right. #}
      data-in-stack-is-local="{{ '1' if entry.in_stack_is_local else '0' }}">
   {% if entry.requirement == 'required' %}
-    <div class="stack-card__req-badge" title="Required by your organization">Required</div>
+    <div class="stack-card__req-badge" title="Automatic — set by your organization">Automatic</div>
   {% elif entry.in_stack %}
     {# #1206: `in_stack` carries the local-download state on any projection that
        sets `in_stack_is_local` (see _data_package_entry_dict). Same key, two
@@ -216,8 +216,8 @@
     {% endif %}
     {% if entry.requirement == 'required' %}
       <button class="stack-card__btn stack-card__btn--required" disabled
-              title="Required by your organization — managed by admin">
-        {{ 'Downloaded (required)' if entry.in_stack_is_local else 'In stack (required)' }}
+              title="Automatic — set by your organization, managed by admin">
+        {{ 'Downloaded (automatic)' if entry.in_stack_is_local else 'In stack (automatic)' }}
       </button>
     {% elif entry.in_stack %}
       <button class="stack-card__btn stack-card__btn--remove"

@@ -135,6 +135,31 @@ class TestListTables:
         data = json.loads(result.output)
         assert data["count"] == 1
 
+    def test_list_tables_survives_null_columns(self):
+        """A NULL `bucket` (or source_type / query_mode) must not crash the
+        listing.
+
+        `bucket` is nullable in `table_registry` — every non-Keboola row has
+        none — and the row formatter passed the value straight into a `:20s`
+        format spec, so `None` raised `TypeError: unsupported format string
+        passed to NoneType.__format__` and took the whole command down after
+        printing the header. `.get(key, default)` does not help: the key IS
+        present, its value is null.
+        """
+        payload = {
+            "count": 2,
+            "tables": [
+                {"name": "orders", "source_type": "keboola", "query_mode": "local", "bucket": None},
+                {"name": "events", "source_type": None, "query_mode": None, "bucket": None},
+            ],
+        }
+        with patch("cli.commands.admin.api_get", return_value=_resp(200, payload)):
+            result = runner.invoke(app, ["admin", "list-tables"])
+        assert result.exit_code == 0, result.output
+        assert "orders" in result.output
+        # The row after the null-bucket one still gets printed.
+        assert "events" in result.output
+
     def test_list_tables_text_surfaces_sync_status_and_reason(self):
         """#754: `agnes admin list-tables` must surface WHY a table shows
         0 rows synced — the per-row line includes the sync status and,

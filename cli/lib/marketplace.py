@@ -1,20 +1,20 @@
 """Shared constants for the Claude Code marketplace clone.
 
-`agnes init` (via setup_instructions) clones the per-user filtered
-marketplace bare-repo to `~/.agnes/marketplace`, then registers that path
-with Claude Code via `claude plugin marketplace add <path>`. The marketplace
-is named "agnes" inside Claude Code's registry.
+`agnes refresh-marketplace --bootstrap` clones the per-user filtered
+marketplace repo to `~/.agnes/marketplace`, then registers that path with
+Claude Code via `claude plugin marketplace add <path>`. The marketplace is
+named "agnes" inside Claude Code's registry.
 
-Both the clone path and the registry name are referenced from multiple
-places (`agnes refresh-marketplace`, future `agnes init` automation, the
-clipboard-copied setup script in `app/web/setup_instructions.py`). Having
-them as constants here keeps them in sync — drift between the setup script
-and the refresh command would silently break the refresh flow.
+Every consumer of the clone reaches it through the constants below —
+`agnes refresh-marketplace` (bootstrap + incremental pull), `agnes update`
+and `agnes global` (staleness reconcile), and `agnes onboard`, which drives
+the bootstrap during install. Keeping the path and the registry name here,
+rather than re-spelling them per call site, is what stops a refresh from
+reconciling a different directory than the one the bootstrap created.
 
-The setup-instructions clipboard text MUST keep the literal string
-`~/.agnes/marketplace` for the clone target so users can copy-paste without
-needing the agnes CLI to be installed yet (chicken-and-egg). The CLI side
-uses `Path.home() / ".agnes" / "marketplace"` for portability.
+The install prompt (`app/web/setup_instructions.py`) no longer spells the
+clone path out: it delegates the whole marketplace stage to `agnes onboard`,
+so the CLI is the only writer of this location.
 """
 
 from __future__ import annotations
@@ -24,15 +24,16 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-# Filesystem location of the marketplace clone. Synchronized with
-# `app/web/setup_instructions.py:_marketplace_block` which writes the
-# literal `~/.agnes/marketplace` into the clipboard-copied setup script.
+# Filesystem location of the marketplace clone. Owned end-to-end by
+# `cli/commands/refresh_marketplace.py` — it creates the clone under
+# `--bootstrap` and every later reconcile (`agnes update`, `agnes global`,
+# `agnes onboard`) reads it back through this constant.
 CLONE_DIR: Path = Path.home() / ".agnes" / "marketplace"
 
 # The marketplace name as registered in Claude Code (`claude plugin
 # marketplace list` shows this). Must match
-# `app.marketplace_server.packager.MARKETPLACE_NAME` server-side and the
-# `_MARKETPLACE_NAME` literal in `setup_instructions.py`.
+# `app.marketplace_server.packager.MARKETPLACE_NAME`, which is what the
+# server writes into the served `marketplace.json`.
 MARKETPLACE_NAME: str = "agnes"
 
 

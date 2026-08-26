@@ -232,6 +232,93 @@ def _decode(raw: Any, fallback: Any) -> Any:
         return fallback
 
 
+# --- Builder declaration -> enforced scope -------------------------------
+#
+# The builder's `knowledge` / `plugins` columns are the UI's declaration;
+# `agent_scope` + the four `*_mode` columns are what the runtime actually
+# enforces (`src/agent_scope_intersection.py`). Before this, the builder
+# wrote only the former, leaving every mode at the repo default 'all' — so
+# an agent the UI showed as scoped to two packages ran with its owner's
+# ENTIRE stack. The two are kept in agreement by deriving the latter from
+# the former on every create/update; the JSON columns stay authoritative for
+# what the page renders, so they cannot drift out of sync.
+
+#: Knowledge-section item types, in probe order. A knowledge id is one of
+#: these three kinds (see `agents_page`'s `knowledge_sources`), and only the
+#: id reaches the API, so the server re-derives the kind by lookup.
+_KNOWLEDGE_ITEM_TYPES = ("data_package", "memory_domain", "collection")
+
+#: Scope rows the builder OWNS and may therefore replace wholesale. Any other
+#: item_type — `slack_channel` routing bindings, `table` / `connection` rows
+#: set through `/api/v1/agents` or `agnes agent scope set` — belongs to the
+#: governance surface and must survive a builder edit untouched.
+_BUILDER_ITEM_TYPES = frozenset({*_KNOWLEDGE_ITEM_TYPES, "plugin"})
+
+
+def _classify_knowledge(ids: List[str]) -> List[tuple]:
+    """Map builder knowledge ids onto ``(item_type, item_id)`` scope rows.
+
+    Deliberately does NOT check whether the caller can reach the resource:
+    the runtime intersects every declared id with the owner's live grants
+    (`compute_agent_intersection`), so an id the owner cannot reach is inert
+    rather than dangerous, and refusing it here would 422 a builder save for
+    a package whose grant is merely being reorganized.
+
+    An id matching no registry is dropped with a log line — storing it would
+    be an enforced-scope row that can never resolve.
+    """
+    from src.repositories import data_packages_repo, file_corpora_repo, memory_domains_repo
+
+    out: List[tuple] = []
+    for raw in ids:
+        item_id = (raw or "").strip()
+        if not item_id:
+            continue
+        for item_type, lookup in (
+            ("data_package", lambda i: data_packages_repo().get(i)),
+            ("memory_domain", lambda i: memory_domains_repo().get(i)),
+            ("collection", lambda i: file_corpora_repo().get(i)),
+        ):
+            try:
+                if lookup(item_id):
+                    out.append((item_type, item_id))
+                    break
+            except Exception as e:  # a registry blip must not fail the save
+                logger.warning("agents: %s lookup failed for %s: %s", item_type, item_id, e)
+        else:
+            logger.warning("agents: knowledge id %s matches no known resource — not scoped", item_id)
+    return out
+
+
+def _sync_builder_scope(agent_id: str, knowledge: List[str], plugins: List[str]) -> None:
+    """Rewrite the agent's builder-owned ``agent_scope`` rows from a
+    declaration, preserving every governance-owned row.
+
+    ``set_scope`` replaces the whole set, so the preserved rows have to be
+    read and passed back through — dropping a `slack_channel` binding here
+    would silently unroute a channel whose turns then fall back to the
+    mentioning user's own authority.
+    """
+    repo = agents_repo()
+    preserved = [
+        (i["item_type"], i["item_id"])
+        for i in repo.get_scope(agent_id)
+        if i.get("item_type") not in _BUILDER_ITEM_TYPES
+    ]
+    declared = _classify_knowledge(knowledge or [])
+    declared += [("plugin", p.strip()) for p in (plugins or []) if (p or "").strip()]
+    # Dedupe, preserving order: `agent_scope`'s composite PK rejects a
+    # repeated pair, and `set_scope` inserts row by row.
+    seen: set = set()
+    items: List[tuple] = []
+    for pair in preserved + declared:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        items.append(pair)
+    repo.set_scope(agent_id, items)
+
+
 def _granted_agent_ids(user_id: str) -> set:
     """Agent ids granted to one of ``user_id``'s groups."""
     try:
@@ -241,13 +328,63 @@ def _granted_agent_ids(user_id: str) -> set:
         return set()
 
 
-def _agent_out(row: dict, *, uid: str) -> Dict[str, Any]:
+def _hydrate_builder_axes(
+    agent_id: str,
+    knowledge: List[str],
+    plugins: List[str],
+    scope_rows: Optional[List[dict]] = None,
+) -> tuple:
+    """Fill empty ``knowledge``/``plugins`` from the stored ``agent_scope`` rows.
+
+    The two writers disagree about where a builder-axis scope lives.
+    ``/api/v1/agents`` and ``agnes agent scope set`` write ``agent_scope`` rows
+    and never touch the JSON columns; the builder writes both. The same agent
+    is listed in ``/agents`` either way (``list_for_user`` returns every owned
+    agent), so a governance-created agent rendered "0 sources · 0 tools" while
+    holding real scope — and the first declaration edit wiped all four
+    builder-owned axes through :func:`_sync_builder_scope`, with the user never
+    having seen what they were destroying.
+
+    Hydrating on read makes the screen agree with what the runtime enforces and
+    makes a save round-trip lossless. Only EMPTY lists are filled: once the
+    builder has written a declaration, that declaration is the truth and an
+    axis the user cleared must stay cleared.
+
+    ``scope_rows`` lets a caller supply this agent's rows from a batched read.
+    The list endpoint projects every agent the caller can see, so leaving each
+    to fetch its own made the listing an N+1 (Devin Review on #1520). Omitted,
+    the rows are read here for the single-agent path.
+    """
+    if knowledge and plugins:
+        return knowledge, plugins
+    if scope_rows is not None:
+        rows = scope_rows
+    else:
+        try:
+            rows = agents_repo().get_scope(agent_id)
+        except Exception as e:  # a scope read must never 500 the builder
+            logger.warning("agents: could not hydrate builder axes for %s: %s", agent_id, e)
+            return knowledge, plugins
+    if not knowledge:
+        knowledge = [r["item_id"] for r in rows if r.get("item_type") in _KNOWLEDGE_ITEM_TYPES]
+    if not plugins:
+        plugins = [r["item_id"] for r in rows if r.get("item_type") == "plugin"]
+    return knowledge, plugins
+
+
+def _agent_out(row: dict, *, uid: str, scope_rows: Optional[List[dict]] = None) -> Dict[str, Any]:
     """Wire shape — the builder's in-browser object 1:1, projected off main's
     canonical row (``owner_user_id`` → ``created_by``, ``system_prompt`` →
     ``instructions``, JSON-text id-lists decoded), plus server-side ownership
     so the Library can label rows without a second call.
     """
     owner = row.get("owner_user_id")
+    knowledge, plugins = _hydrate_builder_axes(
+        row["id"],
+        _decode(row.get("knowledge"), []),
+        _decode(row.get("plugins"), []),
+        scope_rows=scope_rows,
+    )
     return {
         "id": row["id"],
         "slug": row.get("slug"),
@@ -256,8 +393,8 @@ def _agent_out(row: dict, *, uid: str) -> Dict[str, Any]:
         "instructions": row.get("system_prompt") or "",
         "tone": row.get("tone") or "concise",
         "greeting": row.get("greeting") or "",
-        "knowledge": _decode(row.get("knowledge"), []),
-        "plugins": _decode(row.get("plugins"), []),
+        "knowledge": knowledge,
+        "plugins": plugins,
         "surfaces": _decode(row.get("surfaces"), {}),
         "status": row.get("status") or "draft",
         # The seeded default agent cannot be deleted (see ``delete_agent``), so
@@ -320,11 +457,11 @@ async def list_agents(user: dict = Depends(get_current_user)):
     """
     uid = user["id"]
     repo = agents_repo()
-    out: List[Dict[str, Any]] = []
+    rows: List[dict] = []
     seen: set = set()
     try:
         for row in repo.list_for_user(uid):
-            out.append(_agent_out(row, uid=uid))
+            rows.append(row)
             seen.add(row["id"])
     except Exception as e:
         logger.warning("agents: could not enumerate for %s: %s", uid, e)
@@ -333,7 +470,25 @@ async def list_agents(user: dict = Depends(get_current_user)):
             continue
         row = _live(agent_id)
         if row:
-            out.append(_agent_out(row, uid=uid))
+            rows.append(row)
+    # ONE scope read for the whole page. `_agent_out` hydrates an empty
+    # declaration axis from these rows, so letting each agent fetch its own
+    # turned the listing into an N+1 (Devin Review on #1520). A failure here
+    # degrades to per-agent reads inside `_hydrate_builder_axes`, never to a
+    # 500 and never to a silently empty declaration.
+    scope_by_agent: Dict[str, List[dict]] = {}
+    try:
+        scope_by_agent = repo.get_scope_for_agents([r["id"] for r in rows])
+    except Exception as e:
+        logger.warning("agents: batched scope read failed for %s: %s", uid, e)
+    out: List[Dict[str, Any]] = [
+        _agent_out(
+            r,
+            uid=uid,
+            scope_rows=scope_by_agent.get(r["id"], []) if scope_by_agent else None,
+        )
+        for r in rows
+    ]
     return {"agents": out}
 
 
@@ -444,7 +599,21 @@ async def create_agent(payload: AgentCreate, user: dict = Depends(get_current_us
         # explicit surfaces payload overrides it.
         surfaces=json.dumps(payload.surfaces if payload.surfaces is not None else {"web": True}),
         status=payload.status or "draft",
+        # All four axes enforced from birth, matching /api/v1/agents. The
+        # repo's own defaults are 'all' (correct only for the seeded default
+        # agent), which made every builder agent a passthrough riding its
+        # owner's whole stack. A blank new agent therefore starts with an
+        # EMPTY enforced scope — fail-closed is the right shape for a row the
+        # user has not yet put anything in, and each save widens it to exactly
+        # what they picked. `connections_mode` is 'selected' with no rows
+        # because the builder has no connections section: an axis the UI never
+        # offers must not silently pass through.
+        plugins_mode="selected",
+        connections_mode="selected",
+        tables_mode="selected",
+        memory_mode="selected",
     )
+    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [])
     logger.info("agent created id=%s slug=%s by=%s", agent_id, slug, user.get("email"))
     mark_journey(uid, agent_created=True)
     row = _live(agent_id)
@@ -488,8 +657,40 @@ async def update_agent(
     new_slug = _draft_slug_rename(before, fields.get("name"), before.get("owner_user_id") or user["id"])
     if new_slug:
         fields["slug"] = new_slug
+    # Editing the declaration re-derives the enforced scope, and forces the
+    # axes it governs to 'selected' — a pre-fix row still sitting at 'all'
+    # must not keep passing its owner's whole stack through just because the
+    # migration has not run yet (an instance can be upgraded mid-session).
+    # Both lists are needed: `set_scope` replaces the builder-owned set
+    # wholesale, so the half the PATCH did not send is read off the row —
+    # through :func:`_hydrate_builder_axes`, NOT off the raw JSON columns.
+    # For an agent scoped through `agnes agent scope set` those columns are
+    # empty while real `agent_scope` rows exist, so deriving the unsent axis
+    # from them replaced it with nothing. The read fix made that worse rather
+    # than better: `GET` now shows the true scope, so the screen the user acts
+    # on looks correct right up until a partial save drops half of it
+    # (Devin Review on #1520).
+    rescope = "knowledge" in supplied or "plugins" in supplied
+    if rescope:
+        fields.setdefault("plugins_mode", "selected")
+        fields.setdefault("connections_mode", "selected")
+        fields.setdefault("tables_mode", "selected")
+        fields.setdefault("memory_mode", "selected")
     if fields:
         agents_repo().update(agent_id, **fields)
+    if rescope:
+        # Hydrated BEFORE the rewrite — `_sync_builder_scope` is what replaces
+        # the rows this reads.
+        held_knowledge, held_plugins = _hydrate_builder_axes(
+            agent_id,
+            _decode(before.get("knowledge"), []),
+            _decode(before.get("plugins"), []),
+        )
+        _sync_builder_scope(
+            agent_id,
+            supplied.get("knowledge", held_knowledge),
+            supplied.get("plugins", held_plugins),
+        )
     row = _live(agent_id)
     if not row:
         raise HTTPException(status_code=404, detail="agent_not_found")

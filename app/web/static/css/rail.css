@@ -394,6 +394,19 @@ html[data-ui-layout="rail"] .rail-i:focus-visible {
     outline-offset: var(--ds-focus-outline-offset);
 }
 
+/* A row that reports a STATE rather than offering a destination of the same
+   rank — today only "Admin paused" (elevation is off for this browser, so the
+   Admin row is correctly gone and this says why). Quieter than a live
+   destination and never carries the active tint: it must not compete with the
+   rows that actually take you somewhere in the app. It is still a link — to
+   the switch on /me/profile — so hover behaves normally. */
+html[data-ui-layout="rail"] .rail-i--muted {
+    color: var(--ds-text-muted);
+}
+html[data-ui-layout="rail"] .rail-i--muted .rail-i-label {
+    font-style: italic;
+}
+
 /* The label takes the free space so any trailing element in a nav item hugs
    the right edge, and truncates rather than wrapping — same treatment the
    conversation titles get, so a long label can never re-flow the ladder. */

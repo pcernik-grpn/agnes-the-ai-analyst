@@ -290,7 +290,7 @@
                  print in monospace. #}
               <span class="pf-row-meta">
                 {%- if m.source == 'google_sync' -%}Synced from Google Workspace
-                {%- elif m.source == 'auto' -%}Automatic — everyone here is a member
+                {%- elif m.source == 'auto' -%}Auto-joined — everyone here is a member
                 {%- elif m.source == 'admin' -%}Added by an admin
                 {%- else -%}Added via {{ m.source }}{%- endif -%}
                 {%- if m.added_at %} · {{ m.added_at | string | truncate(10, true, '') }}{% endif -%}

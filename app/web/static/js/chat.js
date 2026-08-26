@@ -87,6 +87,12 @@ function renderMarkdownSafe(text) {
 let ws = null;
 let currentChatId = null;
 let inFlightToolCalls = new Map();
+// Cards rendered by renderToolCallStart during the turn in progress. Collapsed
+// in one pass once the turn ends (see _collapseFinishedToolCalls) so the
+// transcript settles into answer + a scannable trail of "what ran" instead of
+// a permanently-expanded dump of every stdout/stderr. Cleared by that same
+// pass — a card belongs to exactly one turn's collapse.
+let _currentTurnToolCards = [];
 // tool_use_ids of in-flight preview tools. tool_result frames carry the call id
 // in `frame.tool` (NOT the tool name — see runner._emit_tool_result), so a
 // non-directive preview result (error / data_apps_disabled) is identified by
@@ -171,7 +177,7 @@ function _maybeOpenInitialSession() {
 // the server after we open a WebSocket. ``ws.readyState === 1`` (the TCP/HTTP
 // handshake) does NOT mean the server-side ``ChatManager.attach`` has finished
 // spawning the runner and populated ``live[chat_id]`` — that takes ~5 s for
-// E2B sandbox creation. If we send ``user_msg`` during that window the server
+// sandbox creation. If we send ``user_msg`` during that window the server
 // raises ``SessionNotFound``, closes the WS with 4404, and the user sees
 // "Disconnected — click the conversation again to resume." with no idea why.
 // All ``user_msg`` sends now ``await`` this promise first.
@@ -1167,6 +1173,224 @@ function _takeAgentSlugFromUrl() {
   }
 }
 
+// --- Composer agent picker ------------------------------------------------
+// Which of the caller's agents a conversation runs AS. The runtime for this
+// has existed since the agent-as-API work (`POST /api/chat/sessions` takes an
+// `agent_slug`, and `chat_sessions.agent_id` has recorded the answer since
+// v101) — but the only door into it was the Chat button on an agent card, and
+// nothing in the chat window ever said who you were talking to.
+//
+// An agent is bound at session CREATION: its scope, memory notebook, pinned
+// model and token budget are fixed for the life of the session. So this
+// control cannot re-target a conversation, and it does not pretend to —
+// choosing an agent starts a NEW session as that agent, and once a
+// conversation has turns the button goes disabled with a title that names the
+// way out. An EMPTY session is not a dead end though: picking a different
+// agent there just spawns another one, and `ChatManager.create_session`
+// already soft-archives the orphan (the same GC that keeps repeated "+ New
+// chat" clicks from littering the sidebar).
+
+/** Resolves when the /api/agents fetch has settled (successfully or not).
+ * `loadAndRenderHistory` awaits it before looking up an agent's greeting: the
+ * `/chat?agent=<slug>` deep link and a picker click both open a session within
+ * the same tick as the fetch, and without this the greeting silently lost the
+ * race about as often as it won it. */
+let _agentsLoaded = Promise.resolve();
+
+/** The caller's OWN agents, newest-listed-first as the API returns them.
+ * Deliberately excludes agents merely SHARED with them: `_resolve_agent_id`
+ * in app/api/chat.py resolves a slug against the caller's own rows only, so
+ * offering a shared agent here would produce a 404 on click. */
+let _agentsCache = [];
+/** `agents.id` this conversation runs as — null before any session opens. */
+let _currentAgentId = null;
+/** Whether the open conversation has any turns yet. Drives the disabled
+ * state: the rule is "has this conversation started", not "does a session row
+ * exist", because a session row exists the moment you click "+ New chat". */
+let _sessionHasTurns = false;
+
+/** What to call an agent in the picker. The seeded default agent is named the
+ * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
+ * answer to "who am I talking to?" — show the instance brand there instead.
+ * A default the owner has since RENAMED keeps its own name. */
+function _agentLabel(a, brand) {
+  if (!a) return brand;
+  if (a.is_default && (!a.name || a.name === "Default")) return brand;
+  return a.name || "Untitled agent";
+}
+
+function _agentById(id) {
+  return id ? _agentsCache.find(a => a.id === id) || null : null;
+}
+
+function _defaultAgent() {
+  return _agentsCache.find(a => a.is_default) || null;
+}
+
+/** Which of the two agent elements is showing, and what it says.
+ *
+ * Before the first turn there is a real choice, so the picker button shows.
+ * After it there is not — the agent is fixed at session creation — so the
+ * button is swapped for a plain label. A disabled button was the first
+ * version of this and it was worse in two ways: it still announced itself as
+ * a button to assistive tech, and it still looked like something to click.
+ *
+ * The button keeps its server-rendered brand text as the fallback name, so a
+ * failed /api/agents fetch degrades to today's behaviour rather than a blank
+ * pill. */
+function _syncAgentPicker() {
+  const btn = $("chat-agent-btn");
+  if (!btn) return;
+  const btnLabel = $("chat-agent-btn-label");
+  const staticLabel = $("chat-agent-label");
+  if (!btn.dataset.fallbackLabel) {
+    btn.dataset.fallbackLabel = btnLabel ? btnLabel.textContent : "Agnes";
+  }
+  const agent = _agentById(_currentAgentId) || _defaultAgent();
+  const name = _agentLabel(agent, btn.dataset.fallbackLabel);
+  if (btnLabel) btnLabel.textContent = name;
+  btn.title = "Choose which agent to chat with";
+  btn.hidden = _sessionHasTurns;
+  if (staticLabel) {
+    staticLabel.textContent = name;
+    staticLabel.title = `This conversation runs as ${name} — start a new chat to switch agent`;
+    staticLabel.hidden = !_sessionHasTurns;
+  }
+  if (_sessionHasTurns) _closeAgentMenu();
+}
+
+function _closeAgentMenu() {
+  const btn = $("chat-agent-btn");
+  const menu = $("chat-agent-menu");
+  if (!btn || !menu) return;
+  menu.hidden = true;
+  btn.classList.remove("is-open");
+  btn.setAttribute("aria-expanded", "false");
+}
+
+function _renderAgentMenu() {
+  const menu = $("chat-agent-menu");
+  if (!menu) return;
+  menu.innerHTML = "";
+  if (!_agentsCache.length) {
+    const note = document.createElement("li");
+    note.className = "cloud-chat-agent-menu-note";
+    note.textContent = "No agents yet — build one on the Agents page.";
+    menu.appendChild(note);
+    return;
+  }
+  const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
+  for (const a of _agentsCache) {
+    const li = document.createElement("li");
+    li.className = "cloud-chat-agent-menu-item";
+    if (a.id === currentId) li.classList.add("is-current");
+    li.setAttribute("role", "menuitem");
+    li.tabIndex = 0;
+    li.dataset.agentSlug = a.slug || "";
+
+    const tick = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    tick.setAttribute("class", "cloud-chat-agent-menu-item-tick");
+    tick.setAttribute("viewBox", "0 0 24 24");
+    tick.setAttribute("fill", "none");
+    tick.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", "M5 13l4 4L19 7");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "2.4");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    tick.appendChild(path);
+    li.appendChild(tick);
+
+    // textContent throughout — agent name/role are user-authored strings and
+    // this menu is rebuilt from the API on every open.
+    const text = document.createElement("span");
+    text.className = "cloud-chat-agent-menu-item-text";
+    const name = document.createElement("span");
+    name.className = "cloud-chat-agent-menu-item-label";
+    const btnEl = $("chat-agent-btn");
+    name.textContent = _agentLabel(a, (btnEl && btnEl.dataset.fallbackLabel) || "Agnes");
+    text.appendChild(name);
+    const hint = a.role || (a.is_default ? "Your default agent" : "");
+    if (hint) {
+      const hintEl = document.createElement("span");
+      hintEl.className = "cloud-chat-agent-menu-item-hint";
+      hintEl.textContent = hint;
+      text.appendChild(hintEl);
+    }
+    li.appendChild(text);
+
+    const choose = () => {
+      _closeAgentMenu();
+      if (!a.slug) return;
+      hideCapabilities();
+      newChat(a.slug).catch((err) => {
+        console.error("chat: could not start a session as agent", err);
+        if (window.appToast) {
+          window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
+        }
+      });
+    };
+    li.addEventListener("click", choose);
+    li.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); choose(); }
+    });
+    menu.appendChild(li);
+  }
+}
+
+/** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
+ * leaves the composer exactly as it is today — brand label, no menu — because
+ * failing to enumerate agents must not block chatting with the default one. */
+async function _refreshAgents() {
+  try {
+    const res = await api("/api/agents");
+    _agentsCache = (res.agents || []).filter(a => a.mine && a.slug);
+  } catch (err) {
+    console.warn("chat: could not load agents for the picker", err);
+  }
+}
+
+/** Fetch the agent list and wire the button. Best-effort: any failure leaves
+ * the composer exactly as it is today (brand label, no menu), because being
+ * unable to LIST agents must not block chatting with the default one. */
+async function initAgentPicker() {
+  const btn = $("chat-agent-btn");
+  const menu = $("chat-agent-menu");
+  if (!btn || !menu) return;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (_sessionHasTurns) return;
+    if (menu.hidden) {
+      // Paint from cache first (no open-delay), then reconcile. The list goes
+      // stale in one ordinary way: the DEFAULT agent row is seeded lazily, on
+      // the owner's first session — so a boot-time fetch on a fresh account
+      // misses it, and without this refresh someone who switched to a named
+      // agent would have no way back to their default except "+ New chat".
+      _renderAgentMenu();
+      menu.hidden = false;
+      btn.classList.add("is-open");
+      btn.setAttribute("aria-expanded", "true");
+      _refreshAgents().then(() => {
+        if (!menu.hidden) _renderAgentMenu();
+        _syncAgentPicker();
+      });
+    } else {
+      _closeAgentMenu();
+    }
+  });
+  document.addEventListener("click", (e) => {
+    if (menu.hidden) return;
+    if (!menu.contains(e.target) && e.target !== btn) _closeAgentMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !menu.hidden) { _closeAgentMenu(); btn.focus(); }
+  });
+  _agentsLoaded = _refreshAgents();
+  await _agentsLoaded;
+  _syncAgentPicker();
+}
+
 async function newChat(agentSlug) {
   const body = { surface: "web" };
   if (agentSlug) body.agent_slug = agentSlug;
@@ -1193,6 +1417,13 @@ async function newChat(agentSlug) {
  * logic made callable a second time. */
 async function loadAndRenderHistory(chatId) {
   $("chat-messages").innerHTML = "";
+  // Reset recall state for the chat being loaded up front, not after a
+  // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
+  // browsing the PREVIOUS conversation's prompts under the new chatId.
+  _promptHistory = [];
+  _historyPos = 0;
+  _historyDraft = "";
+  _historyBrowsing = false;
   let history = [];
   try {
     history = await api(`/api/chat/sessions/${chatId}/messages`);
@@ -1201,14 +1432,47 @@ async function loadAndRenderHistory(chatId) {
     return;
   }
   if (history.length === 0) {
-    showCapabilities();
+    // A conversation with an agent opens with that agent introducing itself —
+    // the `greeting` its owner authored in the builder (agents.greeting, v110),
+    // which until now was only ever shown in the builder's preview bubble.
+    // Rendered client-side and never persisted: generating a hello through the
+    // model would force a sandbox spawn and burn a turn before the user
+    // has typed anything, and the whole point of an authored greeting is that
+    // the words already exist. Re-rendered on every open of a still-empty
+    // session, so a reload before the first message keeps it.
+    await _agentsLoaded;
+    const agent = _agentById(_currentAgentId);
+    if (agent && agent.greeting) {
+      hideCapabilities();
+      renderMessage({ role: "assistant", content: agent.greeting });
+    } else {
+      showCapabilities();
+    }
   } else {
     hideCapabilities();
+    _sessionHasTurns = true;
+    _syncAgentPicker();
     lastAssistantArticle = null;
     lastUserText = "";
     for (const m of history) {
       renderMessage(m);
-      if (m.role === "user") lastUserText = m.content || "";
+      if (m.role === "user") {
+        lastUserText = m.content || "";
+        // Recall is "this conversation's own sent messages" — a co-drive
+        // peer's prompt (sender_email set and not ours) must not surface
+        // under MY ArrowUp, matching submitUserMessage's live-send path,
+        // which only ever appends the local sender's own text and skips a
+        // repeat of the immediately preceding entry (same reason here: a
+        // reload/full_refresh must rebuild the identical recall stack a
+        // live session would have ended up with, not re-materialize
+        // duplicates the live path would have collapsed).
+        if (
+          (!m.sender_email || m.sender_email === currentUserEmail) &&
+          _promptHistory[_promptHistory.length - 1] !== lastUserText
+        ) {
+          _promptHistory.push(lastUserText);
+        }
+      }
     }
     // A reload must end in the same state as the live turn: the follow-up
     // chips belong under the newest assistant answer — and only while it is
@@ -1224,6 +1488,10 @@ async function loadAndRenderHistory(chatId) {
       );
     }
   }
+  // Only _historyPos needs re-syncing here — the else branch above grew
+  // _promptHistory via push(); draft/browsing were already reset up top
+  // and nothing since has touched them.
+  _historyPos = _promptHistory.length;
   // Re-draw any approval still waiting for an answer. The wipe above is a
   // transcript redraw, and a pending card is not transcript — without this
   // a full_refresh racing a replayed card erases it and the blocked command
@@ -1263,12 +1531,28 @@ async function openSession(chatId, wsUrlOverride) {
   answeredApprovalIds.clear();
   pendingQuestionFrames.clear();
   answeredQuestionIds.clear();
+  // Are we ATTACHING to a different conversation, or re-opening this one? Not
+  // the same thing: submitUserMessage -> ensureWsReady re-enters openSession
+  // for the CURRENT session whenever the socket is closed, so treating every
+  // open as a fresh conversation re-enabled the agent picker one tick after
+  // the first message disabled it.
+  const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
   setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // Who this conversation runs as. Read from the sidebar row (agent_id is
+  // projected by GET /api/chat/sessions) rather than a per-open round-trip;
+  // newChat() refreshes that cache before calling us, so a just-created
+  // session is present too. Set BEFORE loadAndRenderHistory so the empty-
+  // transcript branch can render the agent's greeting.
+  _currentAgentId = (meta && meta.agent_id) || null;
+  // Only a genuinely different conversation starts out "no turns yet";
+  // loadAndRenderHistory raises the flag again if this one has messages.
+  if (_switchingSession) _sessionHasTurns = false;
+  _syncAgentPicker();
   setStatus("");
 
   // Hydrate history. Show the capability/intro panel only when this
@@ -1438,7 +1722,8 @@ function handleFrame(frame) {
       resolveQuestionCard(frame);
       break;
     // The terminal frames below all disarm the long-run notification nudge —
-    // a turn that has stopped is no longer worth offering to be pinged about.
+    // a turn that has stopped is no longer worth offering to be pinged about
+    // — and collapse this turn's tool-call cards down to their header line.
     case "cancelled":
       _flushStreamingTail();
       renderSystemNote("Turn cancelled.", "warn");
@@ -1446,6 +1731,7 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       clearThinkingPlaceholder();
       onboardingNoteTurnEnded();
+      _collapseFinishedToolCalls();
       break;
     case "confirmation_required":
       // The runner stopped the turn at the per-turn tool budget — often no
@@ -1460,6 +1746,7 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       clearThinkingPlaceholder();
       onboardingNoteTurnEnded();
+      _collapseFinishedToolCalls();
       break;
     case "error":
       _flushStreamingTail();
@@ -1471,6 +1758,7 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       clearThinkingPlaceholder();
       onboardingNoteTurnEnded();
+      _collapseFinishedToolCalls();
       break;
     case "done":
       // A turn that stopped without ever finalizing (interrupt surfaced as
@@ -1479,6 +1767,7 @@ function handleFrame(frame) {
       _resetStreamingState();
       $("cancel-btn").hidden = true;
       onboardingNoteTurnEnded();
+      _collapseFinishedToolCalls();
       break;
     case "session_participants":
       // §5.3 Co-presence: full re-render of the participant roster.
@@ -1646,6 +1935,17 @@ async function copyTextToClipboard(text) {
 // submitUserMessage() on every send.
 let lastUserText = "";
 
+// ArrowUp/ArrowDown recall of this chat's own sent messages, shell-history
+// style. _promptHistory is seeded from persisted history on load/reconnect
+// (loadAndRenderHistory) and appended to on every send (submitUserMessage).
+// _historyPos indexes into it; _promptHistory.length means "not browsing,
+// show the live draft". _historyDraft holds that draft so ArrowDown past
+// the newest entry restores whatever the user was mid-typing.
+let _promptHistory = [];
+let _historyPos = 0;
+let _historyDraft = "";
+let _historyBrowsing = false;
+
 // Tracks the most recent assistant message so the "Ask again"
 // affordance + any other "latest only" UI can be moved as the
 // conversation progresses. _markLatestAssistant clears the prior
@@ -1730,14 +2030,99 @@ function attachMessageActions(article, copyText) {
   bubble.appendChild(wrap);
 }
 
+/** A message from history.
+ *
+ *  An assistant turn is a SEQUENCE — prose, a tool call, more prose about what
+ *  came back — and `m.parts` is that sequence (schema v123, see
+ *  app/chat/message_parts.py). This walks it in ORDER and emits one node per
+ *  part, so a reload puts every tool card back where it actually ran (#1504).
+ *
+ *  Nothing is hoisted. An earlier version painted the first TEXT part into the
+ *  message bubble regardless of its position, which silently reversed a turn
+ *  that OPENS with a tool call (an agent calling a tool before saying
+ *  anything): the prose came out above the card that ran first, while the live
+ *  stream renders card-then-text for the same turn. Order is array order, and
+ *  the only way to guarantee that is to never reorder.
+ *
+ *  The first text bubble is the PRIMARY article — it owns the avatar,
+ *  timestamp, sender attribution, sources chips, the copy row and the collapse
+ *  cap. Later text parts are continuation bubbles under the card above them,
+ *  which is what a sealed live segment looks like.
+ *
+ *  A row written before v123 has no `parts`; it falls back to `content` plus
+ *  the positionless `tool_calls` after it. That is not a degraded choice but
+ *  the only honest one — the ordering those rows lost is not in the data, and
+ *  placing cards by guess would show tool calls where they never ran.
+ */
 function renderMessage(m) {
-  const article = createMessageShell({ role: m.role, createdAt: m.created_at });
-  const bubble = article.querySelector(".msg-bubble");
-  const body = bubble.querySelector(".msg-body");
-  body.innerHTML = renderAnswerMarkdown(m.content);
-  enhanceCodeBlocks(body);
-  enhanceTables(body);
-  renderMermaidBlocks(body);
+  const parts = Array.isArray(m.parts) && m.parts.length ? m.parts : null;
+  //: DOM nodes in the order they will be appended. Built first, appended
+  //: after, so the collapse cap can measure a node that is already in the
+  //: document.
+  const nodes = [];
+  let primary = null;
+
+  const pushTextBubble = (text) => {
+    const isPrimary = primary === null;
+    const article = isPrimary
+      ? createMessageShell({ role: m.role, createdAt: m.created_at })
+      : createMessageShell({ role: m.role });
+    const body = article.querySelector(".msg-body");
+    body.innerHTML = renderAnswerMarkdown(text || "");
+    enhanceCodeBlocks(body);
+    enhanceTables(body);
+    renderMermaidBlocks(body);
+    if (isPrimary) {
+      primary = article;
+    } else {
+      // A continuation is the same speaker mid-answer: no second avatar, no
+      // second actions row. Both belong to the message, not to a segment.
+      article.classList.add("is-continuation");
+      const actions = article.querySelector(".msg-actions");
+      if (actions) actions.remove();
+    }
+    nodes.push(article);
+    return article;
+  };
+
+  if (!parts) {
+    pushTextBubble(m.content);
+    for (const tc of (m.tool_calls && m.tool_calls.length ? m.tool_calls : [])) {
+      // A row can carry no `tool` name at all — the cancelled/interrupted
+      // markers manager.py stores in place of a real call. Rendering those
+      // unconditionally produced `tool: undefined` and an empty fence.
+      if (!formatToolCall(tc)) continue;
+      nodes.push(_buildToolCard({ tool: tc.tool, args: tc.args || {}, status: "replayed" }));
+    }
+  } else {
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.type === "text") {
+        pushTextBubble(part.text);
+        continue;
+      }
+      if (part.type === "tool" && part.tool) {
+        nodes.push(
+          _buildToolCard({
+            tool: part.tool,
+            args: part.args || {},
+            // The persisted state IS the outcome, so a replayed card no
+            // longer has to omit the icon and edge to avoid claiming one.
+            status: "replayed",
+            state: part.state,
+            result: Object.prototype.hasOwnProperty.call(part, "result") ? part.result : undefined,
+            isError: part.is_error === true,
+          }),
+        );
+      }
+    }
+    // Degenerate row: tools but no text at all. The message still needs a
+    // primary article to carry the copy row — appended LAST so the cards keep
+    // the positions they actually had.
+    if (primary === null) pushTextBubble(m.content);
+  }
+
+  const bubble = primary.querySelector(".msg-bubble");
 
   // §5.3 Co-presence: per-message sender attribution for foreign senders.
   // sender_email is an optional co-drive field — single-user sessions never
@@ -1747,46 +2132,23 @@ function renderMessage(m) {
     who.className = "msg-sender-attr";
     who.textContent = m.sender_email;
     who.style.cssText = "font-size:var(--ds-text-xs,0.75rem);color:var(--ds-text-secondary);margin-bottom:2px;";
-    bubble.insertBefore(who, body);
+    bubble.insertBefore(who, bubble.querySelector(".msg-body"));
   }
 
-  if (m.tool_calls && m.tool_calls.length) {
-    for (const tc of m.tool_calls) {
-      // A row can carry no `tool` name at all — the cancelled/interrupted
-      // markers manager.py stores in place of a real tool call. Rendering
-      // those unconditionally produced `tool: undefined` and an empty fence.
-      const call = formatToolCall(tc);
-      if (!call) continue;
-      const det = document.createElement("details");
-      // F3: build via textContent, not innerHTML — tc.tool / tc.args are
-      // untrusted and were previously interpolated into innerHTML unescaped.
-      const summary = document.createElement("summary");
-      summary.textContent = `tool: ${call.label}`;
-      summary.title = call.tool;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      code.textContent = call.argsJson;
-      pre.appendChild(code);
-      det.appendChild(summary);
-      det.appendChild(pre);
-      bubble.appendChild(det);
-      enhanceCodeBlocks(det);
-    }
-  }
-
-  // After the tool blocks: the chips summarise what those calls support, so
-  // they read as the conclusion of the evidence above them rather than as a
-  // header over it.
+  // Chips stay on the primary bubble, so they read as part of the answer.
   if (m.role === "assistant") renderSourcesChips(bubble, m.sources);
 
   // Copy keeps the sources fence — provenance is record, hidden from the eye
   // only (see the note on stripSourcesFence) — but drops the next_actions
   // trailer: suggestions are chrome, and a copied transcript loses nothing
-  // without them.
-  attachMessageActions(article, stripNextActionsFence(m.content || ""));
-  $("chat-messages").appendChild(article);
-  if (m.role === "assistant") _markLatestAssistant(article);
-  maybeMakeCollapsible(article);
+  // without them. It carries the WHOLE answer, not just this bubble's segment.
+  attachMessageActions(primary, stripNextActionsFence(m.content || ""));
+
+  for (const node of nodes) $("chat-messages").appendChild(node);
+  if (m.role === "assistant") _markLatestAssistant(primary);
+  // Measured after insertion, and against the primary article only: the cards
+  // and continuations are siblings, not part of the answer's height.
+  maybeMakeCollapsible(primary);
   maybeScrollToBottom();
 }
 
@@ -1892,8 +2254,25 @@ function _sortTableByColumn(table, headers, columnIdx) {
 // body height with a fade-out gradient and surface a "Show more"
 // toggle. Keeps the scroll feed scannable; expanded state is per-
 // message-element so it doesn't bleed across re-renders.
+//
+// Why the threshold is this high. The collapse runs at FINALIZE, never
+// mid-stream (_renderStreamingMarkdown paints uncapped) — so a body over
+// the threshold streams in fully and then snaps shut under a reader who
+// was mid-sentence. At the original 480px (~20 lines) that fired on
+// nearly every real answer, which made the toggle a "Show more" whose
+// only job was to undo a limit we had imposed ourselves — the pattern
+// the rail retired on purpose (see rail_history.js). The cap is kept for
+// genuine extremes, where an unbounded body would swallow the whole
+// viewport and bury the composer, and moved far above the height of an
+// ordinary answer.
+//
+// Must stay equal to the `max-height` on `.msg-bubble.is-collapsible
+// .msg-body` in chat.css: this constant decides WHETHER to collapse,
+// that declaration decides WHERE the cut lands, and a mismatch clamps a
+// body at a height it was never judged against. Pinned by
+// tests/test_chat_tool_rendering_ui.py.
 
-const COLLAPSE_THRESHOLD_PX = 480;
+const COLLAPSE_THRESHOLD_PX = 2500;
 
 function maybeMakeCollapsible(article) {
   if (!article) return;
@@ -2028,9 +2407,16 @@ function clearThinkingPlaceholder() {
 
 // Streaming state — captured per turn so finalize knows what to
 // re-render and what raw text to hand the copy button.
+// `currentAssistantText` holds the CURRENT SEGMENT only: a tool/approval/
+// question block seals the streaming bubble (#1504 — the transcript must
+// keep the frame order, text → block → text, instead of one pre-block
+// bubble swallowing everything), and the sealed segments accumulate in
+// `_turnSealedText` so finalize can subtract what is already on screen.
 let currentAssistantArticle = null;
 let currentAssistantBody = null;
 let currentAssistantText = "";
+let _turnSealedText = "";
+let _turnSealedArticles = [];
 
 // ---------- Streaming markdown ---------------------------------------------
 // Tokens used to append as plain textContent, so the reader watched raw
@@ -2156,6 +2542,11 @@ function _resetStreamingState() {
   currentAssistantArticle = null;
   currentAssistantBody = null;
   currentAssistantText = "";
+  // Sealed segments are already finished on screen — an orphan turn keeps
+  // them as they stand; only the bookkeeping resets so the next turn's
+  // finalize doesn't subtract THIS turn's text.
+  _turnSealedText = "";
+  _turnSealedArticles = [];
   if (!article || !body) return;
   article.classList.remove("is-streaming");
   if (!text.trim()) return; // an empty bubble has nothing to finish
@@ -2166,6 +2557,37 @@ function _resetStreamingState() {
   attachMessageActions(article, stripNextActionsFence(text));
   _markLatestAssistant(article);
   maybeMakeCollapsible(article);
+}
+
+/** Seal the streaming bubble at an inline block boundary (tool card,
+ *  approval card, question card). The block is about to be appended AFTER
+ *  the bubble, and any text still to come belongs BELOW the block — so the
+ *  bubble is finished as it stands (full segment flush + the light
+ *  enhancement passes; no actions row, chips or latest-marking — those
+ *  belong to the turn's LAST bubble, at finalize) and the pointers drop so
+ *  the next token opens a fresh bubble under the block. Frame order IS the
+ *  turn order (#1504); this keeps the transcript telling it. No-op when
+ *  nothing has streamed yet, so back-to-back tool calls seal once. */
+function _sealStreamingSegment() {
+  if (!currentAssistantArticle || !currentAssistantBody) return;
+  if (!currentAssistantText.trim()) {
+    // An empty bubble (token frame raced ahead with only whitespace) —
+    // drop it rather than sealing a blank paragraph above the block.
+    currentAssistantArticle.remove();
+  } else {
+    _flushStreamingTail();
+    currentAssistantArticle.classList.remove("is-streaming");
+    enhanceCodeBlocks(currentAssistantBody);
+    enhanceTables(currentAssistantBody);
+    renderMermaidBlocks(currentAssistantBody);
+    // Exact concatenation, no separator: finalize's content is the plain
+    // join of every streamed delta, and the subtraction below relies on it.
+    _turnSealedText += currentAssistantText;
+    _turnSealedArticles.push(currentAssistantArticle);
+  }
+  currentAssistantArticle = null;
+  currentAssistantBody = null;
+  currentAssistantText = "";
 }
 
 function appendToken(text) {
@@ -2193,10 +2615,51 @@ function finalizeAssistantMessage(frame) {
   // A completed assistant message is a successful answer — advance the
   // journey counter (errors arrive on the separate "error" frame).
   onboardingNoteAnswered();
-  const content = (frame && frame.content) || currentAssistantText;
+  const content = (frame && frame.content) || _turnSealedText + currentAssistantText;
+  // Which text this bubble paints depends on whether the turn was SEGMENTED
+  // (#1504 — an inline block sealed at least one earlier bubble).
+  //
+  // Unsegmented: repaint from the server's `content`. It is the authoritative
+  // record (a partial-save or a rewrite lands there) and there is nothing on
+  // screen it could contradict.
+  //
+  // Segmented: paint the locally accumulated tail instead, and leave the
+  // sealed bubbles alone. `content` is NOT a concatenation of the deltas —
+  // the engine provider builds it as `"\n\n".join(part.strip() …)` over text
+  // parts (`_TurnState.text`), and the native runner likewise consolidates
+  // TextBlocks — so subtracting a "sealed prefix" from it only works while a
+  // turn happens to have a single text part. On a real multi-part turn the
+  // arithmetic misses, and any fallback that then re-renders `content` whole
+  // resurrects the exact bug this segmentation fixes: all the text below all
+  // the cards. The deltas the client actually displayed are the one source
+  // that is guaranteed ordered and complete, so display is derived from them
+  // and `content` is used only as the RECORD — the copy row and the
+  // next-actions/sources trailers below all still read from it.
+  const segmented = _turnSealedArticles.length > 0;
+  const tail = segmented ? currentAssistantText : content;
+  // No trailing text after the last block: the last sealed bubble is the
+  // answer's end — chips, sources and the copy row (carrying the FULL
+  // content) land there instead of on a phantom empty bubble.
+  if (!currentAssistantArticle && !tail.trim() && segmented) {
+    const article = _turnSealedArticles[_turnSealedArticles.length - 1];
+    const bubble = article.querySelector(".msg-bubble");
+    renderSourcesChips(bubble, frame && frame.sources);
+    renderNextActions(bubble, extractNextActions(content).actions);
+    attachMessageActions(article, stripNextActionsFence(content));
+    _markLatestAssistant(article);
+    // Every other finish path caps an over-long answer; this one must too, or
+    // a turn that ends on a tool card leaves its final segment uncapped.
+    maybeMakeCollapsible(article);
+    _turnSealedText = "";
+    _turnSealedArticles = [];
+    maybeScrollToBottom();
+    return;
+  }
+  _turnSealedText = "";
+  _turnSealedArticles = [];
   if (currentAssistantArticle && currentAssistantBody) {
     currentAssistantArticle.classList.remove("is-streaming");
-    currentAssistantBody.innerHTML = renderAnswerMarkdown(content);
+    currentAssistantBody.innerHTML = renderAnswerMarkdown(tail);
     enhanceCodeBlocks(currentAssistantBody);
     enhanceTables(currentAssistantBody);
     renderMermaidBlocks(currentAssistantBody);
@@ -2205,6 +2668,8 @@ function finalizeAssistantMessage(frame) {
     // identically by GET /sessions/{id}/messages.
     renderSourcesChips(currentAssistantBody.closest(".msg-bubble"), frame && frame.sources);
     renderNextActions(currentAssistantBody.closest(".msg-bubble"), extractNextActions(content).actions);
+    // The copy row hands over the WHOLE answer — the bubble shows the tail,
+    // but nobody copying "the answer" wants it cut at the last tool card.
     attachMessageActions(currentAssistantArticle, stripNextActionsFence(content));
     _markLatestAssistant(currentAssistantArticle);
     maybeMakeCollapsible(currentAssistantArticle);
@@ -2215,7 +2680,9 @@ function finalizeAssistantMessage(frame) {
   } else {
     renderMessage({
       role: "assistant",
-      content,
+      // `tail`, not `content` — with sealed segments on screen the full
+      // content would render them a second time (tail === content otherwise).
+      content: tail,
       tool_calls: frame && frame.tool_calls,
       sources: frame && frame.sources,
       created_at: new Date().toISOString(),
@@ -2233,19 +2700,26 @@ function finalizeAssistantMessage(frame) {
 }
 
 // ---------- Inline tool-call blocks --------------------------------------
-// Each tool call renders as a self-contained block in the message stream:
+// Each tool call renders as a self-contained block in the message stream,
+// COLLAPSED to its header line by default:
 //
-//   ┌─ ⏳ run_query ························ args ─┐    while running
-//   ├─ ✓ run_query · 1.2s ······························┤    once result arrives
-//   │   <result preview — first N rows as a table, or  │
-//   │    a short text snippet, or a JSON code block>    │
-//   └────────────────────────────────────────────────────┘
+//   ┌─ ⏳ run_query ························ args · running… ›┐   header only
+//   ┌─ ✓ run_query ····························· args · 1.2s ›┐   header only
 //
-// Args + full result are always reachable behind "Show args" / "Show
-// full result" toggles so power users can dig in. Tabular results
-// (the most common — `agnes catalog`, `agnes query`, `agnes describe`)
-// get a real <table> preview so the user sees what came back without
-// having to expand.
+// Clicking the header expands the card:
+//
+//   ├─ ✓ run_query · 1.2s ······································┤
+//   │   ARGS    <formatted, highlighted JSON>                   │
+//   │   RESULT  <first N rows as a real table, markdown, or     │
+//   │            formatted, highlighted JSON>                   │
+//   └────────────────────────────────────────────────────────────┘
+//
+// The card header is the one click — args and result render directly in
+// the body, no nested toggles (only oversize payloads keep a "show all"
+// route). Tabular results (`agnes catalog`, `agnes query`,
+// `agnes describe`) get a real <table>; markdown-ish strings render as
+// markdown; everything else is pretty-printed JSON. A FAILED call opens
+// itself — its output is the diagnosis.
 //
 // Status icons: ⏳ = running, ✓ = done, ⚠ = error, ⊘ = cancelled. The
 // status class on the wrapper tints the left border accordingly so a
@@ -2253,6 +2727,51 @@ function finalizeAssistantMessage(frame) {
 
 const _TOOL_RESULT_PREVIEW_ROWS = 5;
 const _TOOL_RESULT_TEXT_PREVIEW_CHARS = 280;
+const _TOOL_JSON_PREVIEW_CHARS = 4000;
+
+/** A labeled, syntax-highlighted JSON block for a card body. `language-json`
+ *  pins hljs's detection — auto-detect misreads short payloads — and the
+ *  shared enhanceCodeBlocks pass adds the dark chrome + copy button.
+ *  Payloads over _TOOL_JSON_PREVIEW_CHARS render capped, with the whole
+ *  thing one toggle away, filled lazily on first open (same idiom as the
+ *  table preview's raw-JSON route). */
+function _jsonPanel(label, value, className) {
+  const panel = document.createElement("div");
+  panel.className = className;
+  const lab = document.createElement("div");
+  lab.className = "cloud-chat-tool-panel-label";
+  lab.textContent = label;
+  panel.appendChild(lab);
+  const text = JSON.stringify(value, null, 2) ?? String(value);
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.className = "language-json";
+  code.textContent = text.length > _TOOL_JSON_PREVIEW_CHARS
+    ? text.slice(0, _TOOL_JSON_PREVIEW_CHARS) + "\n…"
+    : text;
+  pre.appendChild(code);
+  panel.appendChild(pre);
+  if (text.length > _TOOL_JSON_PREVIEW_CHARS) {
+    const det = document.createElement("details");
+    det.className = "cloud-chat-tool-result-full";
+    const sum = document.createElement("summary");
+    sum.textContent = `Show all (${text.length.toLocaleString()} chars)`;
+    det.appendChild(sum);
+    const fullPre = document.createElement("pre");
+    const fullCode = document.createElement("code");
+    fullPre.appendChild(fullCode);
+    det.appendChild(fullPre);
+    let filled = false;
+    det.addEventListener("toggle", () => {
+      if (!det.open || filled) return;
+      filled = true;
+      fullCode.textContent = text;
+    });
+    panel.appendChild(det);
+  }
+  enhanceCodeBlocks(panel);
+  return panel;
+}
 
 function _toolCallId(frame) {
   // Pair tool_call ↔ tool_result via the runner's dedicated tool_use_id:
@@ -2355,6 +2874,7 @@ function renderApprovalRequest(frame) {
   if (document.querySelector(`[data-approval-id="${CSS.escape(frame.request_id)}"]`)) return;
   pendingApprovalFrames.set(frame.request_id, frame);
   clearThinkingPlaceholder();
+  _sealStreamingSegment();
   const wrap = document.createElement("section");
   wrap.className = "cloud-chat-tool cloud-chat-approval is-running";
   wrap.dataset.approvalId = frame.request_id;
@@ -2461,6 +2981,7 @@ function renderQuestionRequest(frame) {
   if (!questions.length) return;
   pendingQuestionFrames.set(frame.request_id, frame);
   clearThinkingPlaceholder();
+  _sealStreamingSegment();
 
   const wrap = document.createElement("section");
   wrap.className = "cloud-chat-tool cloud-chat-question is-running";
@@ -2682,21 +3203,51 @@ function resolveQuestionCard(frame) {
   }
 }
 
-function renderToolCallStart(frame) {
-  clearThinkingPlaceholder();
-  const wrap = document.createElement("section");
-  wrap.className = "cloud-chat-tool is-running";
-  wrap.dataset.tool = frame.tool;
-  wrap.dataset.startedAt = String(performance.now());
+/** The tool card, shared by the live stream and the reload path so a
+ *  refresh cannot silently downgrade to a different-looking block (it used
+ *  to render a flat grey `tool: <label>` box instead — same information,
+ *  none of the design).
+ *
+ *  `status`: "running" (live, awaiting its result) or "replayed" (rebuilt
+ *  from a persisted part). A replayed card now renders its real outcome:
+ *  since schema v123 the part carries `state` / `result` / `is_error`, so
+ *  the icon, the status edge and the result body are the recorded ones. Two
+ *  things it still cannot show, because nothing persists them: the duration
+ *  (neither producer puts elapsed time on the wire — the client measures it
+ *  live between the two frames) and, for a pre-v123 row, any outcome at all
+ *  — `state` is absent there and the card stays deliberately neutral rather
+ *  than claim a success the row cannot evidence.
+ *
+ *  <details>/<summary> — COLLAPSED by default: the header line (status,
+ *  name, args summary, timing) is the transcript trail; one click opens the
+ *  formatted args + result. A FAILED call opens itself. */
+function _buildToolCard({ tool, args, status, state, result, isError }) {
+  const wrap = document.createElement("details");
+  // One status vocabulary for both paths: a replayed part's `state` maps onto
+  // the same is-done / is-error classes a live result produces, so the card
+  // cannot look like a different component depending on where it came from.
+  let statusClass = "is-replayed";
+  if (status === "running") statusClass = "is-running";
+  else if (state === "output-error" || isError) statusClass = "is-error";
+  else if (state === "output-available") statusClass = "is-done";
+  const wrapIsError = statusClass === "is-error";
+  wrap.className = `cloud-chat-tool ${statusClass}`;
+  wrap.dataset.tool = tool || "";
+  // A failed call opens itself — the error text is the one body a reader
+  // must not have to know to click for. Same rule live and replayed.
+  if (wrapIsError) wrap.open = true;
 
-  // Header line — icon + tool name + args summary. Always visible.
-  const head = document.createElement("div");
+  // Header line — status + tool name + args summary. Always visible, even
+  // collapsed: it's a <summary>, not a body element.
+  const head = document.createElement("summary");
   head.className = "cloud-chat-tool-head";
   const icon = document.createElement("span");
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
-  icon.textContent = "⏳";
-  head.appendChild(icon);
+  if (status === "running") icon.textContent = "⏳";
+  else if (wrapIsError) icon.textContent = "⚠";
+  else if (state === "output-available") icon.textContent = "✓";
+  if (icon.textContent) head.appendChild(icon);
 
   // A semantic-layer lookup is the one tool call that is PROVENANCE rather
   // than plumbing: it says the answer you are reading was built on the
@@ -2704,7 +3255,7 @@ function renderToolCallStart(frame) {
   // "revenue" means. Rendered as a plain-language link to the definition
   // instead of a raw tool id, so the reader can check the wording without
   // leaving the conversation to go hunting for it.
-  const definition = _definitionLookupLabel(frame.tool);
+  const definition = _definitionLookupLabel(tool);
   let name;
   if (definition) {
     name = document.createElement("a");
@@ -2715,42 +3266,63 @@ function renderToolCallStart(frame) {
   } else {
     name = document.createElement("span");
     name.className = "cloud-chat-tool-name";
-    name.textContent = _toolLabel(frame.tool, frame.args);
-    name.title = frame.tool || "";
+    name.textContent = _toolLabel(tool, args);
+    name.title = tool || "";
   }
   head.appendChild(name);
 
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
-  summary.textContent = _summarizeArgs(frame.args);
+  summary.textContent = _summarizeArgs(args);
   head.appendChild(summary);
 
-  const meta = document.createElement("span");
-  meta.className = "cloud-chat-tool-meta";
-  meta.textContent = "running…";
-  head.appendChild(meta);
+  if (status === "running") {
+    const meta = document.createElement("span");
+    meta.className = "cloud-chat-tool-meta";
+    meta.textContent = "running…";
+    head.appendChild(meta);
+  }
+
+  // Chevron — the only visual cue once collapsed that this header still
+  // hides a body. .cloud-chat-tool-head sets display:flex, which drops the
+  // <summary>'s native disclosure marker, so the affordance has to be explicit.
+  const chevron = document.createElement("span");
+  chevron.className = "cloud-chat-tool-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.textContent = "›";
+  head.appendChild(chevron);
 
   wrap.appendChild(head);
 
-  // Args panel — collapsed by default. Surfaced as a small <details>
-  // so the noise is one click away when needed.
-  if (frame.args && Object.keys(frame.args).length > 0) {
-    const argsDet = document.createElement("details");
-    argsDet.className = "cloud-chat-tool-args";
-    const argsSum = document.createElement("summary");
-    argsSum.textContent = "Show args";
-    argsDet.appendChild(argsSum);
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    code.textContent = JSON.stringify(frame.args, null, 2);
-    pre.appendChild(code);
-    argsDet.appendChild(pre);
-    wrap.appendChild(argsDet);
-    enhanceCodeBlocks(argsDet);
+  // Args — formatted JSON, visible the moment the card is expanded. The
+  // card header is the one click now; the old nested args toggle inside a
+  // collapsed card was two clicks to see what a tool was asked to do.
+  if (args && Object.keys(args).length > 0) {
+    wrap.appendChild(_jsonPanel("Args", args, "cloud-chat-tool-args"));
   }
 
+  // A replayed card's result, from the persisted part. Routed through the
+  // SAME preview builder the live path uses in renderToolCallEnd, so a table
+  // is a table and an MCP envelope is unwrapped on both paths — the card is
+  // one component with one body, not two that resemble each other.
+  if (status !== "running" && result !== undefined) {
+    const body = _renderToolResultPreview(result);
+    if (body) wrap.appendChild(body);
+  }
+  return wrap;
+}
+
+function renderToolCallStart(frame) {
+  clearThinkingPlaceholder();
+  // The card lands AFTER the streamed text so far and any further text
+  // belongs below it — seal the streaming bubble first (#1504: the
+  // transcript keeps the frame order, text → card → text).
+  _sealStreamingSegment();
+  const wrap = _buildToolCard({ tool: frame.tool, args: frame.args, status: "running" });
+  wrap.dataset.startedAt = String(performance.now());
   $("chat-messages").appendChild(wrap);
   inFlightToolCalls.set(_toolCallId(frame), wrap);
+  _currentTurnToolCards.push(wrap);
   maybeScrollToBottom();
   $("cancel-btn").hidden = false;
 }
@@ -2763,9 +3335,17 @@ function renderToolCallEnd(frame) {
 
   // Status update — error/cancel surfaced; otherwise success.
   const result = frame.result;
-  const isError = _looksLikeToolError(result);
+  // The producer's own verdict wins when it sent one (`is_error`, emitted by
+  // both the native runner and the engine provider). _looksLikeToolError is
+  // the fallback for a frame without it — a heuristic over the payload text,
+  // which silently passed real failures whose message starts anywhere other
+  // than "error"/"traceback" ("Catalog Error: Table … does not exist").
+  const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
+  // A FAILED call opens itself: cards start collapsed, and the error text
+  // is the one body a reader must not have to know to click for.
+  if (isError) wrap.open = true;
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
   if (icon) icon.textContent = isError ? "⚠" : "✓";
 
@@ -2793,6 +3373,30 @@ function renderToolCallEnd(frame) {
   maybeScrollToBottom();
 }
 
+/** Fold every tool-call card of the turn that just ended back down to its
+ *  header line. Cards start collapsed now, so this mostly restores the ones
+ *  the user (or an error) expanded mid-turn. Called once per turn, from each
+ *  of handleFrame's terminal cases (done / cancelled / error /
+ *  confirmation_required) — a turn that stops for any reason leaves behind
+ *  the same settled transcript: the answer (or note) plus a scannable trail
+ *  of "what ran", not an expanded dump of every stdout/stderr sitting under
+ *  the finished answer. Each card's own <details> toggle still opens it
+ *  back up on click.
+ *
+ *  A FAILED card is left open. `renderToolCallEnd` marks it `is-error` (red
+ *  border, warning icon) precisely because its output is the thing the reader
+ *  needs, and the `error` terminal case is the one where that matters most: a
+ *  turn that died mid-tool would otherwise fold shut the very card explaining
+ *  why, behind a click nobody knows to make. Folding is for the noise, not
+ *  for the diagnosis. */
+function _collapseFinishedToolCalls() {
+  for (const wrap of _currentTurnToolCards) {
+    if (wrap.classList.contains("is-error")) continue;
+    wrap.open = false;
+  }
+  _currentTurnToolCards = [];
+}
+
 /** Heuristic: a stringified tool error coming back from the agent SDK
  *  often starts with "error:" / "Error:" or contains "is_error":true
  *  when it's a JSON object. Best-effort — we just need a signal to
@@ -2810,22 +3414,69 @@ function _looksLikeToolError(result) {
   return false;
 }
 
+/** {content: [{type:"text", text}, …]} — the MCP result envelope
+ *  (the kai-agent provider delivers it verbatim; the sandbox runner
+ *  usually pre-joins). The reader cares about the payload, not the
+ *  envelope: join the text blocks, and if the joined text is itself
+ *  JSON hand back the parsed value, so it renders as formatted JSON —
+ *  or even a table — instead of a string-in-a-string with escaped
+ *  newlines. A result that arrives as a JSON *string* is inspected too
+ *  — handleFrame's parse is a local for the preview-directive check and
+ *  never reaches this layer.
+ *
+ *  Narrowly scoped on purpose: a string is only replaced when it turns
+ *  out to BE an envelope. A JSON string that is anything else (a tool
+ *  returning `agnes … --json` output, say) is handed back verbatim so it
+ *  keeps its existing string/markdown rendering — parsing every
+ *  JSON-shaped string here would quietly re-route unrelated tools
+ *  through the table/JSON panel, which is a bigger behaviour change than
+ *  this function is for. */
+function _unwrapMcpEnvelope(result) {
+  if (typeof result === "string") {
+    let parsed;
+    try {
+      parsed = JSON.parse(result);
+    } catch (_e) {
+      return result;
+    }
+    // Only an envelope earns the substitution; everything else keeps the
+    // string it arrived as.
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.content)) return result;
+    result = parsed;
+  }
+  if (!result || typeof result !== "object" || !Array.isArray(result.content)) return result;
+  if (result.content.length === 0) return result;
+  if (!result.content.every((b) => b && b.type === "text" && typeof b.text === "string")) {
+    return result;
+  }
+  const text = result.content.map((b) => b.text).join("\n");
+  try {
+    return JSON.parse(text);
+  } catch (_e) {
+    return text;
+  }
+}
+
 /** Build the preview block for a tool result. The CLI tools route
  *  most JSON / table output via agnes which speaks Markdown — so
  *  result strings often contain `|---|---|` table markup that
  *  marked.parse() can render natively. We:
  *
- *  1. attempt to extract a tabular preview from a parsed JSON result
+ *  1. unwrap an MCP text envelope down to its payload;
+ *  2. attempt to extract a tabular preview from a parsed JSON result
  *     (array of objects, or a {columns, rows} shape);
- *  2. fall back to running ``marked.parse`` over a string result so
+ *  3. fall back to running ``marked.parse`` over a string result so
  *     embedded Markdown tables get rendered as real <table>s with the
  *     `.ds-table` sort+sticky-header enhancement; and
- *  3. fall back to a JSON code block for everything else.
+ *  4. render everything else as a formatted, highlighted JSON block —
+ *     shown directly: the collapsed card's header is the one click.
  *
  *  Returns a DOM element ready to append, or null if the result is
  *  empty.
  */
 function _renderToolResultPreview(result) {
+  if (result == null || result === "") return null;
+  result = _unwrapMcpEnvelope(result);
   if (result == null || result === "") return null;
 
   // Already-tabular JSON shapes — render a real <table> preview.
@@ -2876,29 +3527,13 @@ function _renderToolResultPreview(result) {
     return wrap;
   }
 
-  // Everything else — a one-line summary with the raw JSON one click away.
-  // A pretty-printed payload as the primary rendering is exactly the thing
-  // this function exists to avoid.
+  // Everything else — formatted, highlighted JSON, rendered directly. The
+  // card itself starts collapsed, so its header is already the "one click
+  // away" that a nested Structured-result toggle used to provide; opening
+  // the card must show what the tool returned, not offer a second click.
   const wrap = document.createElement("div");
   wrap.className = "cloud-chat-tool-result is-json";
-  const det = document.createElement("details");
-  det.className = "cloud-chat-tool-result-full";
-  const sum = document.createElement("summary");
-  const fieldCount =
-    result && typeof result === "object" && !Array.isArray(result)
-      ? Object.keys(result).length
-      : 0;
-  sum.textContent = fieldCount > 0
-    ? `Structured result · ${fieldCount} field${fieldCount === 1 ? "" : "s"} — show raw JSON`
-    : "Structured result — show raw JSON";
-  det.appendChild(sum);
-  const pre = document.createElement("pre");
-  const code = document.createElement("code");
-  code.textContent = JSON.stringify(result, null, 2).slice(0, 4000);
-  pre.appendChild(code);
-  det.appendChild(pre);
-  wrap.appendChild(det);
-  enhanceCodeBlocks(wrap);
+  wrap.appendChild(_jsonPanel("Result", result, "cloud-chat-tool-json"));
   return wrap;
 }
 
@@ -3358,6 +3993,12 @@ async function submitUserMessage(text) {
   //    capability cards for the ~5 s it takes the runner to boot, then
   //    everything flips at once — feels like the page is frozen.
   hideCapabilities();
+  // The conversation is now under way, so the agent is settled for good: a
+  // session's scope/memory/model/budget are fixed at creation and cannot be
+  // re-pointed mid-thread. Disabling here rather than at session creation is
+  // what keeps an empty "+ New chat" from dead-ending the picker.
+  _sessionHasTurns = true;
+  _syncAgentPicker();
   const ta = $("chat-input");
   if (ta) {
     ta.value = "";
@@ -3380,9 +4021,22 @@ async function submitUserMessage(text) {
   try {
     await ensureWsReady();
     hideCapabilities();
+    // Re-asserted for exactly the reason hideCapabilities() is, one line up.
+    // For a brand-new chat this submit created the session itself, so
+    // openSession saw a session id it had never opened and reset the turns
+    // flag — flipping the settled agent label back into a live picker
+    // mid-send. The session is new; the conversation is not.
+    _sessionHasTurns = true;
+    _syncAgentPicker();
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
+    // The turn never started, so nothing is settled — hand the picker back
+    // with the dashboard. Otherwise a chat backend that is down strands the
+    // reader on a label they cannot change and a conversation that never
+    // began.
+    _sessionHasTurns = false;
+    _syncAgentPicker();
     return;
   }
   // 3. Now ``#chat-messages`` is stable — render the user bubble and
@@ -3395,6 +4049,12 @@ async function submitUserMessage(text) {
   _clearNextActions();
   renderMessage({ role: "user", content: text });
   lastUserText = text;
+  if (_promptHistory[_promptHistory.length - 1] !== text) {
+    _promptHistory.push(text);
+  }
+  _historyPos = _promptHistory.length;
+  _historyDraft = "";
+  _historyBrowsing = false;
 
   // Chat-driven onboarding: greet once, advance the journey, and — on an empty
   // Stack — resolve the knowledge gap right here before the model runs. When it
@@ -3525,6 +4185,41 @@ $("chat-input").addEventListener("keydown", (e) => {
       return;
     }
   }
+  // Recall this chat's own sent messages, shell-history style. ArrowUp only
+  // starts browsing once the caret is already at the very top of the draft
+  // (so it first moves you through a multi-line message the normal way,
+  // same as a shell only recalling once you're on the top line); once
+  // browsing is underway either key keeps cycling regardless of caret
+  // position so Up/Down chain smoothly like a real history stack.
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    const ta = e.target;
+    const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0;
+    if (e.key === "ArrowUp" && (_historyBrowsing || atStart) && _historyPos > 0) {
+      e.preventDefault();
+      if (_historyPos === _promptHistory.length) _historyDraft = ta.value;
+      _historyPos -= 1;
+      _historyBrowsing = true;
+      ta.value = _promptHistory[_historyPos];
+      // Caret to the END, matching the ArrowDown branch below and the shell
+      // history this is modelled on. Caret-at-0 would put it in the one place
+      // a reader recalling a prompt to tweak its tail has to navigate away
+      // from — and, since `_historyBrowsing` makes further Up/Down
+      // caret-independent, it bought nothing.
+      const upPos = ta.value.length;
+      ta.setSelectionRange(upPos, upPos);
+      autosizeComposer();
+      return;
+    } else if (e.key === "ArrowDown" && _historyBrowsing && _historyPos < _promptHistory.length) {
+      e.preventDefault();
+      _historyPos += 1;
+      ta.value = _historyPos === _promptHistory.length ? _historyDraft : _promptHistory[_historyPos];
+      if (_historyPos === _promptHistory.length) _historyBrowsing = false;
+      const pos = ta.value.length;
+      ta.setSelectionRange(pos, pos);
+      autosizeComposer();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     $("chat-form").dispatchEvent(new SubmitEvent("submit", { cancelable: true }));
@@ -3535,6 +4230,11 @@ $("chat-input").addEventListener("keydown", (e) => {
   }
 });
 $("chat-input").addEventListener("input", () => {
+  // A manual edit ends history browsing — it becomes the new draft, so the
+  // next ArrowUp starts over from the newest entry rather than resuming
+  // mid-history with a value that no longer matches what's stored there.
+  _historyPos = _promptHistory.length;
+  _historyBrowsing = false;
   autosizeComposer();
   _onSlashInputChanged();
 });
@@ -4655,6 +5355,10 @@ function renderCoPresence(host, participants) {
   wireSuggestionButtons();
   wireCopyTranscript();
   autosizeComposer();
+  // Composer agent picker. Not awaited: the fetch behind it must never delay
+  // the composer becoming usable, and it degrades to the brand label on
+  // failure.
+  initAgentPicker();
   // Rail pre-conversation Dashboard (no-op on topnav): greeting fix-up +
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact

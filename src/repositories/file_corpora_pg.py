@@ -87,18 +87,42 @@ class FileCorporaPgRepository:
         self,
         *,
         search: Optional[str] = None,
+        created_by: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
-        """List live (non-soft-deleted) corpora, name-ordered."""
+        """List live (non-soft-deleted) corpora, name-ordered.
+
+        ``created_by`` filters to one creator in SQL — see the DuckDB
+        sibling for why the agent-scope intersection needs the predicate
+        rather than a full read.
+        """
         query = "SELECT * FROM file_corpora WHERE deleted_at IS NULL"
         params: Dict[str, Any] = {}
         if search:
             query += " AND name ILIKE :search"
             params["search"] = f"%{search}%"
+        if created_by:
+            query += " AND created_by = :created_by"
+            params["created_by"] = created_by
         query += " ORDER BY name LIMIT :limit"
         params["limit"] = limit
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(query), params).mappings().all()
+        return [dict(r) for r in rows]
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every live corpus, name-ordered — no cap.
+
+        The unbounded twin of :meth:`list`, whose ``limit`` defaults to 200.
+        See the DuckDB sibling for why an access decision must not read a
+        capped list.
+        """
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(sa.text("SELECT * FROM file_corpora WHERE deleted_at IS NULL ORDER BY name"))
+                .mappings()
+                .all()
+            )
         return [dict(r) for r in rows]
 
     def soft_delete(self, corpus_id: str) -> None:

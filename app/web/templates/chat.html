@@ -232,6 +232,70 @@
       </div>
       {# Closes .cloud-chat-composer, opened above. #}
       </div>
+
+      {# Composer footer — the strip UNDER the input, in both states.
+
+         Two things share the line, reading left to right as a sentence about
+         the conversation: what it runs WITH (the Stack context line) and WHO
+         it runs AS (the agent). The agent trails, landing under the send
+         button — an answer you glance at, not a decision the row leads with.
+
+         The agent element lives in the FORM, not in #chat-empty-extras,
+         because it has to survive the start of a conversation: extras hide
+         the moment #chat-capabilities does. The Stack line keeps the old
+         behaviour and hides with them (rule in chat.css), so in a live
+         conversation this row carries the agent label alone, right-aligned. #}
+      <div class="cloud-chat-composer-foot">
+        <p class="rdb-context">
+          {% if knowledge_source_count or capability_count %}
+          <svg class="rdb-context-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 8.5 12 4l9 4.5-9 4.5-9-4.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m3 12.5 9 4.5 9-4.5M3 16.5l9 4.5 9-4.5" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+          {# The link points at the LIBRARY with its "In stack only" filter already
+             applied (`/library?stack=in_stack`), not at /stack: My Stack is not a
+             rail destination any more (#1088), so pointing at it landed the caller
+             on a surface with no nav entry and no active state. The Library
+             renders every kind that page did — data packages and memory domains
+             come from the SAME StackResolver.browse() read — and its toggle
+             narrows that list to exactly what this line is counting. #}
+          <span>
+            Using
+            {%- if knowledge_source_count %}
+            {{ knowledge_source_count }} knowledge source{{ '' if knowledge_source_count == 1 else 's' }}
+            {%- if capability_count %} and{% endif %}
+            {%- endif %}
+            {%- if capability_count %}
+            {{ capability_count }} capabilit{{ 'y' if capability_count == 1 else 'ies' }}
+            {%- endif %}
+            from your <a href="/library?stack=in_stack">Stack</a>
+          </span>
+          {% endif %}
+        </p>
+        {# Agent picker — which of the caller's agents this conversation runs
+           AS. Trails the row so it sits under the send button, with the Stack
+           line leading: the reader's eye goes to what the conversation runs
+           with first, and the identity is the quiet right-hand answer.
+
+           TWO elements, one at a time. An agent is bound at session CREATION
+           (scope, memory notebook, pinned model and token budget are fixed for
+           the session's life), so mid-conversation there is nothing to choose
+           and the control becomes a plain label — not a greyed-out button,
+           which still announces itself as a button to a screen reader and
+           still invites the click it will refuse. chat.js swaps them on the
+           first turn and back on "+ New chat". #}
+        <span class="cloud-chat-agent-wrap">
+          <button type="button" id="chat-agent-btn"
+                  class="cloud-chat-agent-btn"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                  aria-controls="chat-agent-menu">
+            <span class="cloud-chat-agent-btn-label" id="chat-agent-btn-label">{{ instance_brand_short or 'Agnes' }}</span>
+            <svg class="cloud-chat-agent-btn-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          {# The in-conversation form: says who, offers nothing. #}
+          <span id="chat-agent-label" class="cloud-chat-agent-label" hidden></span>
+          <ul id="chat-agent-menu" class="cloud-chat-agent-menu" hidden
+              role="menu" aria-label="Choose an agent"></ul>
+        </span>
+      </div>
     </form>
 
     {# ── Upload dialogs ─────────────────────────────────────────────────────
@@ -391,46 +455,17 @@
       </div>
     </div>
 
-    {# Empty-state extras that sit BELOW the composer — the Stack status line
-       and the Suggested-next-actions card row. Placed after #chat-form in the
-       DOM; flex order (chat.css) renders it below the composer. Auto-hides
-       once a conversation starts via the
-       ``#chat-capabilities[hidden] ~ #chat-empty-extras`` rule. #}
+    {# Empty-state extras that sit BELOW the composer — the Suggested-next-
+       actions card row. Placed after #chat-form in the DOM; flex order
+       (chat.css) renders it below the composer. Auto-hides once a
+       conversation starts via the
+       ``#chat-capabilities[hidden] ~ #chat-empty-extras`` rule.
+
+       The Stack status line used to lead this block; it moved up into the
+       composer's own footer row so it could share that line with the agent
+       picker. It still hides when a conversation starts — by its own rule
+       now, since it no longer rides this container. #}
     <div id="chat-empty-extras" class="cloud-chat-empty-extras">
-      {# Stack status line — flat under the composer (chat_dashboard.css). The
-         ONLY thing below the input: what context this conversation runs with.
-         No onboarding, no marketing, no docs link — those live in the hero.
-
-         One sentence, one link. "Stack" is what the reader would click to see
-         (or change) the context, so it carries the href; the counts are plain
-         text — making each count its own link turned a status line into a row
-         of controls and put three link targets in one 13px sentence.
-
-         Capabilities are omitted entirely at zero rather than rendered as
-         "and 0 capabilities", and the whole line hides at 0/0. #}
-      <p class="rdb-context">
-        {% if knowledge_source_count or capability_count %}
-        <svg class="rdb-context-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 8.5 12 4l9 4.5-9 4.5-9-4.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m3 12.5 9 4.5 9-4.5M3 16.5l9 4.5 9-4.5" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
-        {# The link points at the LIBRARY with its "In stack only" filter already
-           applied (`/library?stack=in_stack`), not at /stack: My Stack is not a
-           rail destination any more (#1088), so pointing at it landed the caller
-           on a surface with no nav entry and no active state. The Library
-           renders every kind that page did — data packages and memory domains
-           come from the SAME StackResolver.browse() read — and its toggle
-           narrows that list to exactly what this line is counting. #}
-        <span>
-          Using
-          {%- if knowledge_source_count %}
-          {{ knowledge_source_count }} knowledge source{{ '' if knowledge_source_count == 1 else 's' }}
-          {%- if capability_count %} and{% endif %}
-          {%- endif %}
-          {%- if capability_count %}
-          {{ capability_count }} capabilit{{ 'y' if capability_count == 1 else 'ies' }}
-          {%- endif %}
-          from your <a href="/library?stack=in_stack">Stack</a>
-        </span>
-        {% endif %}
-      </p>
 
       <div class="rdb">
         {# Guided Agnes conversation-starters, sitting directly under the composer

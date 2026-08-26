@@ -55,8 +55,15 @@
 
 {% block page_prehead %}
 {# The way back names its DESTINATION, matching the sidebar row that lights
-   up on arrival — see `.apg-back` in admin_page.css. #}
+   up on arrival — see `.apg-back` in admin_page.css. An arrival from the
+   Simulate lens (?from=simulate&user=) overrides it: the errand is "fix
+   THIS person's access", and back means back to their preview, not to the
+   package index. #}
+{% if preview_ctx %}
+<a class="apg-back" href="{{ preview_ctx.back_href }}"><span aria-hidden="true">&larr;</span> Back to preview: {{ preview_ctx.name }}</a>
+{% else %}
 <a class="apg-back" href="/admin/data-packages"><span aria-hidden="true">&larr;</span> Packages</a>
+{% endif %}
 {% endblock %}
 
 {% block head_extra %}
@@ -70,6 +77,10 @@
                         be an invisible control on the theme this page is
                         being drawn for #}
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+{# package_drawer.css dresses the fields of the shared create/edit drawer.
+   Linked here because this page now opens that component for "Edit details"
+   instead of sending the admin to the Tables lens for it. #}
+<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/section_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
@@ -275,9 +286,9 @@
 {# NO standing-facts strip above the work. It carried five facts and a link,
    and every one of them was said again on the same screen: the table count,
    the sources and the newest sync were already three rows of **At a glance**
-   (category and status have joined them), and "View as analyst" is the
-   button on **Appears as**, where it belongs — beside the sentence about how
-   analysts see this package. A banner that repeats the column beside it is
+   (category and status have joined them), and the open-analyst-page link is
+   the button on **Appears as**, where it belongs — beside the sentence about
+   how analysts see this package. A banner that repeats the column beside it is
    not a summary, it is a second copy that can fall out of step with the
    first. What remains above the columns is the two WARNING strips below,
    which are conditions to meet before acting rather than facts to read. #}
@@ -286,6 +297,23 @@
    by counting rows in a panel further down. Each carries the control that
    fixes it, so meeting the problem and solving it is one motion. The share
    band is hidden client-side the moment a grant is written. #}
+{# ── Arrival context: "you came here to fix THIS person's access" ─────
+   Rendered only on a ?from=simulate&user= arrival (see the route). Info,
+   not warning: it is orientation, and the two warn strips below must keep
+   outranking it. The person's groups are named so "which group do I grant
+   to?" is answered on the same screen the grant is written on. #}
+{% if preview_ctx %}
+<div class="apg-strip" id="apd-preview-note">
+  <span>
+    <b>Fixing access for {{ preview_ctx.name }}</b>{% if preview_ctx.groups %}
+    — their groups: <b>{{ preview_ctx.groups | join(', ') }}</b>{% endif %}.
+    Share this package with one of them, then re-check the preview.
+  </span>
+  <span class="apg-strip__end">
+    <a class="btn btn-secondary btn-sm" href="{{ preview_ctx.back_href }}">Re-check {{ preview_ctx.name }} &rarr;</a>
+  </span>
+</div>
+{% endif %}
 {% if not tables %}
 <div class="apg-strip apg-strip--warn">
   <span>
@@ -470,16 +498,22 @@
         How analysts find this package in their Library — its name, icon, category
         and description are what they read before adding it.
       </p>
-      {# The editor for exactly these fields — name, description, status,
-         category, icon, colour, and Delete package — already exists as the
-         Tables lens' `?edit_package=` drawer, and the create drawer's own copy
-         promises the package "stays editable on the package's own page
-         afterwards". Nothing linked to it: rename and delete were reachable
-         only by typing the URL. Until the drawer grows an edit mode that can
-         open in place, this page at least names the door. #}
-      <a class="btn btn-secondary btn-sm" href="/admin/tables?edit_package={{ pkg.id }}">Edit details…</a>
+      {# Edits in place. This used to be a LINK to `/admin/tables?edit_package=`
+         — the package's own page could not edit the package, because the only
+         editor was page furniture on the Tables lens. The create drawer grew
+         an edit mode (js/components/package_drawer.js), so the verb now happens
+         on the object you are standing on, exactly as create already does.
+         Reload on save: the hero, the "Appears as" copy and the status chip all
+         render server-side from the row this just changed. #}
+      <button type="button" class="btn btn-secondary btn-sm" id="apd-edit-details">Edit details…</button>
+      {# "Open analyst page" — an honest label where the old view-as wording
+         claimed a preview: the reader arrives as THEMSELVES (admin chrome
+         swapped for the reading page, manage cluster still visible), not as
+         any analyst. The access preview is the Access → Simulate lens.
+         ?from=admin is the context contract: the analyst page turns its
+         back link into "Back to Admin: {name}" pointing right back here. #}
       {% if pkg.slug %}
-      <a class="btn btn-secondary btn-sm" href="/catalog/p/{{ pkg.slug }}">View as analyst →</a>
+      <a class="btn btn-secondary btn-sm" href="/catalog/p/{{ pkg.slug }}?from=admin">Open analyst page →</a>
       {% endif %}
     {% endcall %}
   </div>
@@ -682,6 +716,9 @@
 <div class="apd-toast" id="apd-toast" role="status" aria-live="polite"></div>
 
 <script src="{{ static_url('js/filter_toolbar.js') }}"></script>
+{# NOT deferred: the click handler below is wired at parse time and would
+   otherwise reference window.AgnesPackageDrawer before it exists. #}
+<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -697,6 +734,21 @@
   const PKG_API    = "/api/admin/data-packages/" + encodeURIComponent(PKG_ID);
 
   const $ = (id) => document.getElementById(id);
+
+  // "Edit details…" — the shared create/edit drawer, opened over this page.
+  // A full reload on save rather than a patch of the DOM: the name shows in
+  // the hero, the breadcrumb, the "Appears as" block and the page title, and
+  // re-rendering four places by hand is how they drift apart.
+  const editBtn = $("apd-edit-details");
+  if (editBtn) {
+    editBtn.addEventListener("click", () => {
+      window.AgnesPackageDrawer.open({
+        mode: "edit",
+        pkgId: PKG_ID,
+        onSaved: () => window.location.reload(),
+      });
+    });
+  }
   const toastEl = $("apd-toast");
 
   // A grant change moves numbers this page CANNOT re-derive client-side: the

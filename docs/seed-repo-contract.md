@@ -186,22 +186,32 @@ that overrides the prompt should stay in the same shape; the design
 rationale is in
 `docs/superpowers/specs/2026-08-19-thin-install-prompt-design.md`.
 
-The placeholders the server still substitutes (see
-`app/web/setup_instructions.py::resolve_lines`):
+What a forked template can reference — and this is narrower than the
+built-in renderer's internal substitutions, because a git-bound or
+DB-override prompt is rendered by the sandboxed Jinja path
+(`app/web/router.py::setup_page`), not by
+`app/web/setup_instructions.py::resolve_lines`:
 
-| Placeholder                | Replaced by                                          |
+| Reference                  | Replaced by                                          |
 |----------------------------|------------------------------------------------------|
-| `{server_url}`             | Browser-side at click time (JS clipboard renderer)   |
-| `{wheel_filename}`         | Server-side (real PEP 427 filename of the wheel)     |
-| `{server_host}`            | Server-side (bare host, no scheme)                   |
-| `{workspace_dir}`          | Server-side (`workspace_dir_name` from instance.yaml)|
-| `{instance_brand}`         | Server-side (`instance_brand` from instance.yaml)    |
-| `{tls_trust_block}`        | Server-side — full step 0 content, empty when no CA  |
-| `{install_cli_block}`      | Server-side — CA-aware step 1 body                   |
+| `{server_url}`             | Browser-side at click time (JS clipboard renderer) and in the read-only preview |
+| `{{ instance.name }}`      | Jinja render context (`src/welcome_template.py::build_context`) |
+| `{{ instance.subtitle }}`, `{{ server.url }}`, `{{ server.hostname }}`, `{{ user.* }}`, `{{ today }}` | Same Jinja context |
 
-Retired with the blocks they injected: `{marketplace_block}`,
-`{connector_tiles}`, `{ca_bundle_finale_bullet}`. A template that still
-references them renders them literally (see below), so drop them.
+Any OTHER single-brace `{name}` in a forked template renders literally —
+deliberately (a typo must surface as visible text, not a 500 on `/home`).
+That includes the names the built-in renderer substitutes only into its own
+generated lines (`{wheel_filename}`, `{server_host}`, `{workspace_dir}`,
+`{instance_brand}`) and the block placeholders the fat prompt used
+(`{tls_trust_block}`, `{install_cli_block}` — never wired for forks) —
+the bundled template inlines the CLI-install step instead. Retired with
+the thin prompt: `{marketplace_block}`, `{connector_tiles}`,
+`{ca_bundle_finale_bullet}`. `tests/test_bundled_seed_install_prompt.py`
+enforces all of this on the bundled reference template.
+
+An instance serving a self-signed / private-CA certificate should prefer
+the shipped default prompt (it auto-emits the cross-platform TLS trust
+block); a forked template has no way to inject that block today.
 
 `{wheel_filename}` no longer appears in the built-in body either — step 1
 downloads through the unversioned `/cli/download` endpoint, which always

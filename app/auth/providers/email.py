@@ -16,6 +16,7 @@ from app.auth.jwt import create_access_token, SESSION_COOKIE_MAX_AGE_SECONDS
 from app.auth.token_hash import hash_token
 from app.auth.access import is_user_admin
 from app.auth.dependencies import _get_db, is_local_dev_mode
+from app.auth.public_url import public_base_url
 from app.auth.provider_registry import require_provider
 from app.auth.rate_limit import limiter as _rate_limiter
 
@@ -67,11 +68,22 @@ def _has_email_transport() -> bool:
     return bool(os.environ.get("SMTP_HOST"))
 
 
-def _build_magic_link(email: str, token: str, next_path: str = "") -> str:
+def _build_magic_link(email: str, token: str, next_path: str = "", base_url: str | None = None) -> str:
+    """Absolute sign-in URL for the emailed link.
+
+    ``base_url`` is the caller's already-resolved public origin (the handlers
+    pass ``public_base_url(request=request)``, which is proxy-aware). Without
+    it this resolves the same way every other outbound link does — pinned
+    ``AGNES_BASE_URL`` / ``SERVER_URL`` first, ``http://localhost:8000`` only
+    as the local-dev floor. This used to read ``SERVER_URL`` alone with a hard
+    localhost default, so an instance behind a TLS terminator that never set
+    ``SERVER_URL`` mailed its users a sign-in link pointing at their own
+    laptop — a dead end with nothing naming the cause.
+    """
     # URL-encode email: a literal '+' in a query string decodes to space per
     # application/x-www-form-urlencoded, which would break addresses like
     # "user+tag@gmail.com" on the GET /verify side.
-    server_url = os.environ.get("SERVER_URL", "http://localhost:8000")
+    server_url = (base_url or public_base_url()).rstrip("/")
     link = f"{server_url}/auth/email/verify?email={quote(email, safe='')}&token={token}"
     # Carry the post-login destination through the emailed link so the click-
     # through verify can land the user where they originally asked. next_path
@@ -82,7 +94,9 @@ def _build_magic_link(email: str, token: str, next_path: str = "") -> str:
     return link
 
 
-def _generate_and_deliver_magic_link(email: str, next_path: str = "") -> tuple[dict | None, str | None, str | None]:
+def _generate_and_deliver_magic_link(
+    email: str, next_path: str = "", base_url: str | None = None
+) -> tuple[dict | None, str | None, str | None]:
     """Look up the user, mint + persist a magic-link token, and attempt
     delivery via SMTP. Shared by the JSON (``/send-link``) and web
     form (``/send-link/web``) variants so the token/email plumbing lives in
@@ -115,11 +129,11 @@ def _generate_and_deliver_magic_link(email: str, next_path: str = "") -> tuple[d
     # spelling that was typed — the link's own verify path folds case either
     # way, but a mail sent to the typed string is a mail to an unverified
     # address.
-    link = _build_magic_link(user["email"], token, next_path)
+    link = _build_magic_link(user["email"], token, next_path, base_url)
     send_error: str | None = None
     if _has_email_transport():
         try:
-            _send_email(user["email"], token, next_path)
+            _send_email(user["email"], token, next_path, base_url)
         except Exception as e:
             send_error = str(e)
             logger.error("Failed to send magic link email to %s: %s", email, e)
@@ -143,7 +157,11 @@ async def send_magic_link(
     # The delivery helper does a blocking SMTP send (+ sync repo writes);
     # offload it so a slow mail server can't freeze the single event
     # loop for every other request (the Tier-1 convention in get_current_user).
-    user, link, send_error = await run_in_threadpool(_generate_and_deliver_magic_link, body.email)
+    user, link, send_error = await run_in_threadpool(
+        _generate_and_deliver_magic_link,
+        body.email,
+        base_url=public_base_url(request=request),
+    )
 
     # Always return success to prevent email enumeration
     if not user:
@@ -218,7 +236,12 @@ async def send_magic_link_web(
 
     # Offload the blocking SMTP send off the event loop — same Tier-1
     # rationale as the JSON /send-link variant.
-    user, link, send_error = await run_in_threadpool(_generate_and_deliver_magic_link, email, next_path)
+    user, link, send_error = await run_in_threadpool(
+        _generate_and_deliver_magic_link,
+        email,
+        next_path,
+        base_url=public_base_url(request=request),
+    )
 
     console_mode = bool(user) and is_local_dev_mode()
     if send_error and not console_mode:
@@ -362,7 +385,7 @@ async def verify_magic_link_get(
     return response
 
 
-def _send_email(email: str, token: str, next_path: str = ""):
+def _send_email(email: str, token: str, next_path: str = "", base_url: str | None = None):
     """Send the magic-link email via SMTP (raises on delivery failure).
 
     SMTP relay is the only transport — SendGrid works through
@@ -371,5 +394,5 @@ def _send_email(email: str, token: str, next_path: str = ""):
     """
     from app.auth._common import send_smtp_email
 
-    link = _build_magic_link(email, token, next_path)
+    link = _build_magic_link(email, token, next_path, base_url)
     send_smtp_email(email, "Login Link", f"Login link: {link}")

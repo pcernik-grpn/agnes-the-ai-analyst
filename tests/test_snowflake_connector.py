@@ -944,6 +944,109 @@ def test_admin_register_snowflake_remote_not_configured_is_not_a_500(seeded_app,
     assert "not configured" in (body.get("message") or "").lower()
 
 
+def test_admin_register_snowflake_rebuild_error_is_visible_twice(seeded_app, snowflake_instance, monkeypatch):
+    """A per-table rebuild error — in practice a schema/table name that does not
+    exist in the account — must reach the operator through BOTH channels.
+
+    Pre-fix it reached neither. The 500 body carried the real upstream reason
+    under ``message`` only, and every admin-UI error path reads ``detail``
+    (``typeof b.detail === "string" ? b.detail : "failed"``), so the operator
+    saw a bare "✗ failed". Meanwhile the registry row — inserted before the
+    rebuild is attempted, and deliberately kept so the name can be corrected by
+    editing rather than re-typing — reported ``pending``, i.e. "never synced",
+    indistinguishable from a row simply waiting for its first tick. Live
+    incident 2026-08-19: four rows sat pending for days pointing at tables that
+    never existed.
+    """
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 0,
+                "errors": [
+                    {
+                        "table": "orders_typo",
+                        "error": "Catalog Error: Table with name BI_TYPO does not exist!",
+                    }
+                ],
+            }
+        ),
+    )
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    resp = c.post(
+        "/api/admin/register-table",
+        json=_sf_payload(name="orders_typo"),
+        headers=_auth(token),
+    )
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "rebuild_failed"
+    # `detail` is what every client renders; it must carry the upstream reason.
+    assert "BI_TYPO" in body["detail"]
+    # `message` stays for existing consumers, same content.
+    assert body["detail"] == body["message"]
+
+    # ...and the row must read as failed, not as "never synced".
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    row = next(t for t in reg["tables"] if t["id"] == "orders_typo")
+    assert row["last_sync_status"] == "error"
+    assert "BI_TYPO" in (row["last_sync_error"] or "")
+
+
+def test_fixing_a_bad_snowflake_name_clears_the_recorded_failure(seeded_app, snowflake_instance, monkeypatch):
+    """Correcting the typo must clear the row's failed state, not leave a stale one.
+
+    Registration marks a row failed when its remote-extract rebuild errors (so
+    it stops reading "never synced"). The obvious next move is to edit the name
+    — and `PUT /registry/{id}` re-runs the rebuild. If that success does not
+    clear `sync_state.error`, `GET /api/admin/registry` and `/admin/sync` keep
+    showing the OLD failure until the next full orchestrator sweep re-derives
+    state from `_meta`, i.e. the fix looks like it did not take. A status that
+    lies about a corrected row is the same defect class this whole change set
+    exists to remove.
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+
+    # 1. a registration whose rebuild fails → row is marked failed
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 0,
+                "errors": [{"table": "orders_fix", "error": "Catalog Error: Table with name NOPE does not exist!"}],
+            }
+        ),
+    )
+    resp = c.post("/api/admin/register-table", json=_sf_payload(name="orders_fix"), headers=_auth(token))
+    assert resp.status_code == 500, resp.text
+    row = next(
+        t for t in c.get("/api/admin/registry", headers=_auth(token)).json()["tables"] if t["id"] == "orders_fix"
+    )
+    assert row["last_sync_status"] == "error"
+
+    # 2. the admin corrects the name; this rebuild succeeds
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(return_value={"skipped": False, "tables_registered": 1, "errors": []}),
+    )
+    resp = c.put(
+        "/api/admin/registry/orders_fix",
+        json={"source_table": "orders"},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = next(
+        t for t in c.get("/api/admin/registry", headers=_auth(token)).json()["tables"] if t["id"] == "orders_fix"
+    )
+    assert row["last_sync_status"] != "error", row
+    assert not (row["last_sync_error"] or ""), row
+
+
 def test_admin_register_snowflake_custom_sql_foreign_catalog_refused(seeded_app, snowflake_instance):
     """Finding #9: the materialize session ATTACHes only ``sf``. Custom SQL naming
     another catalog registers happily today and then fails at COPY time on the
@@ -1155,6 +1258,39 @@ def test_unnameable_single_line_value_is_treated_as_an_inline_key_not_a_path(pkc
     assert passphrase is None
 
 
+def test_unreadable_private_key_path_is_not_echoed_into_the_error(tmp_path):
+    """The failure message must not carry the credential value.
+
+    The path probe fires on any single-line, non-PEM value under 4 KiB — which a
+    pasted base64 DER key is. If such a value happens to name a real file that
+    cannot be decoded (or read at all), the raised `ValueError` used to
+    interpolate `{raw!r}`, i.e. the key material itself, and `{exc}` too — an
+    `OSError`'s own `str()` ends with the offending filename, which here IS the
+    credential. That string then travels: `attach_snowflake` →
+    `extract_init` → `register-table`'s 500 body → and, since the row is now
+    marked failed, into `sync_state.error`, where `GET /api/admin/registry`,
+    `/admin/sync` and `agnes admin list-tables` all read it with no redaction
+    and no TTL. Admin-only, but a Snowflake service-account key's
+    confidentiality boundary is not Agnes's admin boundary.
+    """
+    from connectors.snowflake.attach import _private_key_pem_and_passphrase
+
+    # A real file whose bytes are not valid UTF-8 → read_text(errors="strict")
+    # raises UnicodeDecodeError, the branch that used to echo the value.
+    secret_looking_path = tmp_path / "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj"
+    secret_looking_path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+
+    with pytest.raises(ValueError) as exc_info:
+        _private_key_pem_and_passphrase(str(secret_looking_path))
+
+    msg = str(exc_info.value)
+    assert secret_looking_path.name not in msg, msg
+    assert str(secret_looking_path) not in msg, msg
+    # Still has to be diagnosable: name the setting and the failure class.
+    assert "private key" in msg.lower(), msg
+    assert "UnicodeDecodeError" in msg or "unicode" in msg.lower(), msg
+
+
 def test_private_key_path_that_cannot_be_expanded_raises_valueerror(monkeypatch):
     """When the credential really is meant to be a key *path* but '~user' cannot
     be resolved, the loader must surface the typed `ValueError` its own contract
@@ -1163,3 +1299,220 @@ def test_private_key_path_that_cannot_be_expanded_raises_valueerror(monkeypatch)
 
     with pytest.raises(ValueError, match="could not be read"):
         _private_key_pem_and_passphrase("~no_such_user_42/snowflake_key.pem")
+
+
+def test_another_rows_rebuild_error_does_not_mark_the_new_row_failed(seeded_app, snowflake_instance, monkeypatch):
+    """A healthy new row must not inherit somebody else's rebuild failure.
+
+    `rebuild_from_registry` walks EVERY `query_mode='remote'` Snowflake row, not
+    just the one being registered, and `_rebuild_snowflake_remote_extract`
+    collapses all per-table errors into one aggregate string. Stamping that
+    string on `request.name` therefore marked the row the operator just added
+    as `error` — quoting a completely different table's name — whenever any
+    pre-existing row was broken. On an instance that already has a few phantom
+    rows (the live case this change set came from) every subsequent valid
+    registration read as failed until the next orchestrator sweep re-derived
+    state from `_meta`.
+
+    The 500 itself is deliberately left alone here: the extract rebuild really
+    did fail, so telling the caller "something went wrong" is not the lie — the
+    lie was pinning it on their row.
+    """
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 1,
+                "errors": [
+                    {
+                        "table": "other_broken_row",
+                        "error": "Catalog Error: Table with name BI_GONE does not exist!",
+                    }
+                ],
+            }
+        ),
+    )
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    resp = c.post(
+        "/api/admin/register-table",
+        json=_sf_payload(name="orders_good"),
+        headers=_auth(token),
+    )
+    assert resp.status_code == 500, resp.text
+
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    row = next(t for t in reg["tables"] if t["id"] == "orders_good")
+    assert row["last_sync_status"] != "error", (
+        "the newly registered row was marked failed by another row's error; "
+        f"last_sync_error={row.get('last_sync_error')!r}"
+    )
+    assert "BI_GONE" not in (row.get("last_sync_error") or "")
+    assert "other_broken_row" not in (row.get("last_sync_error") or "")
+
+
+def test_a_skipped_rebuild_does_not_clear_a_recorded_failure(seeded_app, snowflake_instance, monkeypatch):
+    """A rebuild that never ran must not wipe the row's real failure.
+
+    `_rebuild_snowflake_remote_extract` reports ``ok=True`` for a benign SKIP
+    (`not_configured` / `no_remote_rows`) on purpose, so a skip cannot turn a
+    successful registration into a 500. The edit path's background wrapper
+    branched on `ok` alone and called `clear_error`, which sets
+    ``status='ok'`` and blanks the message — so editing a row on an instance
+    whose Snowflake password no longer resolves at rebuild time made a table
+    the operator still cannot query read as green in `/admin/sync` and
+    `GET /api/admin/registry`, with nothing to correct it until the next full
+    orchestrator sweep. Nothing was verified; the recorded failure was still
+    true.
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+
+    # Register with a per-table error so the row is recorded as failed.
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 0,
+                "errors": [{"table": "orders_broken", "error": "Catalog Error: nope"}],
+            }
+        ),
+    )
+    resp = c.post(
+        "/api/admin/register-table",
+        json=_sf_payload(name="orders_broken"),
+        headers=_auth(token),
+    )
+    assert resp.status_code == 500, resp.text
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    assert next(t for t in reg["tables"] if t["id"] == "orders_broken")["last_sync_status"] == "error"
+
+    # Now the rebuild is SKIPPED rather than run — nothing is verified.
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": True,
+                "reason": "not_configured",
+                "tables_registered": 0,
+                "errors": [],
+            }
+        ),
+    )
+    from app.api.admin import _rebuild_snowflake_remote_extract_bg
+
+    _rebuild_snowflake_remote_extract_bg("orders_broken")
+
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    row = next(t for t in reg["tables"] if t["id"] == "orders_broken")
+    assert row["last_sync_status"] == "error", (
+        "a skipped rebuild cleared the row's recorded failure — the table is still unusable but now reads as healthy"
+    )
+    assert "Catalog Error" in (row["last_sync_error"] or "")
+
+
+def test_fixing_one_row_clears_its_error_even_while_another_row_is_broken(seeded_app, snowflake_instance, monkeypatch):
+    """A corrected row must clear, whoever else on the instance is broken.
+
+    `_rebuild_snowflake_remote_extract` walks EVERY registered remote row and
+    reports ``ok=False`` as soon as any one of them errors. Gating the clear on
+    that aggregate means a single pre-existing phantom row — the live scenario
+    this change set came from — keeps `ok` permanently False, so the row the
+    operator just fixed never loses its recorded failure and `/admin/sync` and
+    `GET /api/admin/registry` keep serving the old error. The fix then reads as
+    if it did not take, which is the exact symptom being removed.
+
+    The recording side already attributes per row (`failed_tables`); the
+    clearing side has to use the same attribution.
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 0,
+                "errors": [{"table": "orders_typo", "error": "Catalog Error: BI_TYPO"}],
+            }
+        ),
+    )
+    resp = c.post(
+        "/api/admin/register-table",
+        json=_sf_payload(name="orders_typo"),
+        headers=_auth(token),
+    )
+    assert resp.status_code == 500, resp.text
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    assert next(t for t in reg["tables"] if t["id"] == "orders_typo")["last_sync_status"] == "error"
+
+    # The operator corrects that row. The rebuild RUNS and this row now builds
+    # — but a different, pre-existing row is still broken, so the aggregate
+    # outcome stays ok=False.
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(
+            return_value={
+                "skipped": False,
+                "tables_registered": 1,
+                "errors": [{"table": "some_other_phantom_row", "error": "Catalog Error: GONE"}],
+            }
+        ),
+    )
+    from app.api.admin import _rebuild_snowflake_remote_extract_bg
+
+    _rebuild_snowflake_remote_extract_bg("orders_typo")
+
+    reg = c.get("/api/admin/registry", headers=_auth(token)).json()
+    row = next(t for t in reg["tables"] if t["id"] == "orders_typo")
+    assert row["last_sync_status"] != "error", (
+        "the corrected row kept its old failure because an unrelated row is broken — "
+        f"last_sync_error={row.get('last_sync_error')!r}"
+    )
+
+
+def test_rename_edit_attributes_the_rebuild_to_the_new_name(seeded_app, snowflake_instance, monkeypatch):
+    """A PUT that renames the row must hand the rebuild the row's NEW name.
+
+    `sync_state.table_id == table_registry.name` by convention, and
+    `_rebuild_snowflake_remote_extract` attributes its per-table errors from
+    the CURRENT registry rows. Passing `existing["name"]` — the pre-update
+    name — means the old name is absent from `failed_tables` no matter what
+    the rebuild found, so the "not in failed_tables" guard always passes and a
+    rename that left the table broken would clear the only record of the
+    failure. Renames are an anticipated case on this path (the surrounding
+    comment says the rebuild exists so the view picks them up).
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+
+    monkeypatch.setattr(
+        "connectors.snowflake.extract_init.rebuild_from_registry",
+        MagicMock(return_value={"skipped": False, "tables_registered": 1, "errors": []}),
+    )
+    resp = c.post(
+        "/api/admin/register-table",
+        json=_sf_payload(name="orders_before"),
+        headers=_auth(token),
+    )
+    assert resp.status_code == 201, resp.text
+    table_id = resp.json()["id"]
+
+    seen: list = []
+    monkeypatch.setattr(
+        "app.api.admin._rebuild_snowflake_remote_extract_bg",
+        lambda table_name=None: seen.append(table_name),
+    )
+    resp = c.put(
+        f"/api/admin/registry/{table_id}",
+        json={"name": "orders_after"},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen == ["orders_after"], (
+        "the rebuild was attributed to the pre-update name; a rename that leaves the "
+        f"table broken would then clear its recorded failure — got {seen!r}"
+    )

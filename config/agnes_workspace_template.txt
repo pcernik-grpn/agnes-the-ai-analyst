@@ -98,7 +98,7 @@ agnes pull
 agnes status
 
 # Re-generate this workspace from scratch (preserves CLAUDE.local.md)
-agnes init --server-url https://agnes.example.com --token <PAT> --force
+agnes init --server-url {server_url} --token <PAT> --force
 ```
 
 ---

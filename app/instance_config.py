@@ -1403,6 +1403,13 @@ def get_corporate_memory_config() -> dict:
 _DATA_APPS_ENV_DEFAULTS = {
     "runtime_image": "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24",
     "subdomain_base": "",
+    # Serve hosted apps on the main origin (same origin as `/api`)? Off by
+    # default — see `app/api/data_apps.py::_CONFIG_DEFAULTS`. Resolution
+    # (env > merged config > default) lives in the switch registry
+    # (`app/switches.py`, entry `data_apps_allow_same_origin`) read by the
+    # call site (`same_origin_serving_allowed`), so this backfill only
+    # matters for an instance.yaml-configured value.
+    "allow_same_origin": False,
     "default_idle_timeout_s": 1800,
     "default_sleep_mode": "recreate",
     "default_mem_limit": "1g",
@@ -1622,6 +1629,24 @@ def get_guardrails_stuck_review_grace_seconds() -> int:
         return max(0, int(val))
     except (TypeError, ValueError):
         return 1800
+
+
+def get_audit_retention_days() -> int:
+    """How many days to keep ``audit_log`` rows before the daily
+    ``audit-prune`` scheduler job deletes them.
+
+    Reads ``audit.retention_days``. Default 365. Set to 0 to keep audit
+    rows forever (disables the prune job's DELETE, mirroring
+    ``blocked_bundle_ttl_days``'s "0 = retain indefinitely" convention).
+    Every other audit/observability trail (chat transcripts, CLI session
+    JSONLs, usage rollups, sync_history, llm_usage, agent-runtime
+    forensics) has no retention policy yet — see docs/observability.md.
+    """
+    val = get_value("audit", "retention_days", default=365)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 365
 
 
 def get_guardrails_min_description_chars() -> int:

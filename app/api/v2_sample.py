@@ -91,9 +91,16 @@ def _not_previewable_detail(table_id: str, *, query_mode: str) -> str:
     )
 
 
-def _not_synced_detail(table_id: str) -> str:
+def _not_synced_detail(table_id: str, *, registry_name: str | None = None) -> str:
     """Explain a registered-but-dataless table, with the last sync error
-    when sync_state recorded one."""
+    when sync_state recorded one.
+
+    ``sync_state.table_id`` is keyed by the registry ``name`` — the same
+    write-side convention the parquet filename follows (see
+    `app/utils.py::_physical_key_candidates`) — so the error lookup tries the
+    name first and the id as a fallback. Keyed by id alone, the recorded
+    failure never surfaced for a row whose id was slugified from its name.
+    """
     detail = (
         f"table {table_id!r} is registered but has no synced data yet — "
         "the first sync is pending or failing (see the sync status on "
@@ -102,8 +109,14 @@ def _not_synced_detail(table_id: str) -> str:
     try:
         from src.repositories import sync_state_repo
 
-        state = sync_state_repo().get_table_state(table_id) or {}
-        err = state.get("error") or ""
+        err = ""
+        for key in dict.fromkeys((registry_name, table_id)):
+            if not key:
+                continue
+            state = sync_state_repo().get_table_state(key) or {}
+            err = state.get("error") or ""
+            if err:
+                break
         if err:
             detail += f"; last sync error: {str(err)[:300]}"
     except Exception:
@@ -180,6 +193,89 @@ def _fetch_bq_sample(bq, dataset: str, table: str, n: int) -> list[dict]:
             raise translate_bq_error(e, bq.projects, bad_request_status="upstream_error")
 
 
+def _fetch_remote_view_sample(table_id: str, row: dict, n: int) -> list[dict]:
+    """Live sample for a ``query_mode='remote'`` row through its analytics view.
+
+    The orchestrator maintains a view over the re-ATTACHed source for every
+    remote row that resolves locally (``_remote_attach`` — Snowflake ``sf``,
+    Keboola ``kbc``, Databricks with ``attach_enabled``), and
+    ``get_analytics_db_readonly()`` re-ATTACHes those catalogs, so this is the
+    same object ``/api/query`` serves these rows through. BigQuery never
+    reaches here — its live branch in ``build_sample`` runs first.
+
+    An engine whose remote rows have no local view (Databricks without
+    attach), or a currently-broken ATTACH, surfaces as a query error — mapped
+    back to the by-design :class:`TableNotPreviewableError`, with the real
+    failure prepended so the admin is not reassured past an actual outage.
+    Including the engine's error text discloses nothing new: the caller has
+    already passed ``can_access_table`` for this row, and ``/api/query``
+    hands the same caller the identical engine error verbatim for the same
+    table.
+    """
+    from src.db import get_analytics_db_readonly
+    from src.identifier_validation import validate_identifier
+    from src.sql_ident import quote_ident
+
+    view_name = row.get("name") or table_id
+    # Registry rows are admin-written, not trusted: the orchestrator applies
+    # the same strict validator before creating the view, so a name that
+    # fails it has no view to read anyway — refuse before touching SQL.
+    if not validate_identifier(view_name, "remote sample view"):
+        raise ValueError(f"unsafe table name in registry: {view_name!r}")
+
+    conn = get_analytics_db_readonly()
+    try:
+        df = conn.execute(f"SELECT * FROM {quote_ident(view_name)} LIMIT {int(n)}").fetchdf()
+        return df.to_dict(orient="records")
+    except Exception as exc:
+        raise TableNotPreviewableError(
+            table_id,
+            f"live sample through the server's analytics view failed "
+            f"({type(exc).__name__}: {str(exc)[:200]}); " + _not_previewable_detail(table_id, query_mode="remote"),
+        )
+    finally:
+        conn.close()
+
+
+def _sample_is_cacheable(*, source_type: str, query_mode: str, has_access_policy: bool) -> bool:
+    """Whether this row's 5-row preview may be served from ``_sample_cache``.
+
+    Two exemptions, for different reasons, and one carve-out inside the second.
+
+    A policied row is uncacheable because the cache key is ``{table_id}|{n}``
+    with no identity in it, so one caller's slice would be handed to the next.
+    (Today a policied row fails closed on this surface before it could cache
+    anything, but the key would be wrong the moment enforcement is wired in.)
+
+    A ``remote`` row is uncacheable because ``remote`` means the read goes live
+    — that is the whole argument for evaluating the remote branch AHEAD of
+    parquet resolution, so that a row flipped materialized→remote cannot
+    preview its stale leftover parquet. Serving a copy up to
+    ``_sample_cache``'s hour old is that same staleness from a different
+    store, and it would make the branch's own comment untrue. The cost that
+    gives up is small and bounded: ``SELECT * FROM <view> LIMIT n`` with
+    ``n <= _MAX_N``, a capped pull through the extension for Snowflake and
+    Keboola. Only Databricks with the experimental, off-by-default
+    ``attach_enabled`` turns it into a parquet read.
+
+    **BigQuery is excluded from that exemption**, and the reason is not
+    liveness but billing. A BQ remote row takes the branch above this one
+    (``source_type == "bigquery"`` and not ``materialized``) into
+    ``_fetch_bq_sample``, which pushes the statement to BigQuery — a metered,
+    billable scan per call, unlike every other engine here. It was cacheable
+    before this exemption existed (``cacheable = not has_access_policy``), so
+    exempting it would have made every catalog tile render and every ``agnes
+    describe`` bill a fresh query. That is a cost regression, not a
+    correctness gain, and it is also outside the scope of a change about the
+    NON-BigQuery live branch: BQ's caching is left exactly as it was.
+    """
+    if has_access_policy:
+        return False
+    if (source_type or "").lower() == "bigquery":
+        return True
+    return query_mode != "remote"
+
+
 def build_sample(
     conn: duckdb.DuckDBPyConnection,
     user: dict,
@@ -251,7 +347,11 @@ def build_sample(
     has_access_policy = bool(row.get("access_policy_sql"))
 
     cache_key = f"{table_id}|{n}"
-    cacheable = not has_access_policy
+    cacheable = _sample_is_cacheable(
+        source_type=str(source_type or ""),
+        query_mode=str(row.get("query_mode") or ""),
+        has_access_policy=has_access_policy,
+    )
     if cacheable:
         cached = _sample_cache.get(cache_key)
         if cached is not None:
@@ -300,6 +400,29 @@ def build_sample(
             if bq_relation.policied:
                 raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": table_id})
         rows = _fetch_bq_sample(bq, row.get("bucket") or "", row.get("source_table") or table_id, n)
+    elif (row.get("query_mode") or "") == "remote":
+        # Non-BQ remote rows: live sample through the analytics view — the
+        # parity twin of the BQ branch above (these rows used to be refused
+        # outright as not-previewable). Checked BEFORE parquet resolution on
+        # purpose: a row flipped materialized→remote can leave a stale
+        # parquet on disk, and `remote` means every read goes live. The same
+        # sentence is why `_sample_is_cacheable` exempts these rows from
+        # `_sample_cache` — an hour-old copy is the same staleness with a
+        # different store.
+        if has_access_policy:
+            # Same fail-closed ratchet as the BQ branch above (Task 13):
+            # policy rewrite is not wired into this surface either, so a
+            # caller the policy would filter must never see the raw live
+            # rows. Admin bypass preserved — `policied_relation` decides.
+            try:
+                remote_relation = policied_relation(table_id, user)
+            except PolicyIdentityUnresolvable:
+                raise HTTPException(status_code=403, detail={"reason": "policy_identity_unresolvable"})
+            except PolicyError as exc:
+                raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+            if remote_relation.policied:
+                raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": table_id})
+        rows = _fetch_remote_view_sample(table_id, row, n)
     else:
         # Resolve by source-name-agnostic lookup — the extract directory is not
         # necessarily the source_type (e.g. the bundled `demo` extract).
@@ -309,20 +432,25 @@ def build_sample(
         # having a pending or failing first sync (Devin Review on #1189).
         from app.utils import LOCAL_PARQUET_READ_EXPR, resolve_local_parquet_glob
 
-        parquet = resolve_local_parquet_glob(table_id, source_type)
+        # `registry_name`: the write side keys the parquet filename by the
+        # row's `name`, not its `id` — see `_physical_key_candidates` in
+        # app/utils.py. Without it, any row whose id was slugified from the
+        # name (the register handler lowercases + underscores it) read as
+        # "no synced data yet" while fully synced.
+        parquet = resolve_local_parquet_glob(table_id, source_type, registry_name=row.get("name"))
         if parquet is None:
-            # The registry row exists (checked above), so this is never "no such
-            # table" — but WHY there is no parquet decides what to tell the
-            # viewer. Only `query_mode='remote'` is never materialized: every
-            # query goes live to the upstream source. `server_only` is NOT in
-            # this branch on purpose — it suppresses distribution to analyst
-            # laptops, not materialization here, so a missing parquet for one of
-            # those rows is a real pending/failing sync and must keep saying so.
-            query_mode = row.get("query_mode") or ""
-            if query_mode == "remote":
-                raise TableNotPreviewableError(table_id, _not_previewable_detail(table_id, query_mode=query_mode))
-            # Genuinely "no data has landed yet" — including for server_only.
-            raise TableNotSyncedError(table_id, _not_synced_detail(table_id))
+            # The registry row exists (checked above), so this is never "no
+            # such table" — and `query_mode='remote'` never reaches this
+            # branch (it takes the live-view branch above), so a missing
+            # parquet here is genuinely "no data has landed yet" — including
+            # for `server_only`, which suppresses distribution to analyst
+            # laptops, not materialization here.
+            #
+            # `registry_name`: sync_state is keyed by the row's `name`, the
+            # same write-side convention the parquet filename follows, so the
+            # last-sync-error lookup must try the name first. Keyed by id
+            # alone, a recorded failure never surfaced for a slugified row.
+            raise TableNotSyncedError(table_id, _not_synced_detail(table_id, registry_name=row.get("name")))
 
         # Table access policies (§5): this connection is a throwaway
         # :memory: DB with nothing but the parquet attached — no analytics

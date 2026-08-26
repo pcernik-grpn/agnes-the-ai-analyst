@@ -438,6 +438,10 @@ _NON_SQL_QUOTED_FAMILIES: list[tuple[str, str]] = [
     (r"(?i)etag", "HTTP entity tag: quotes are part of the ETag grammar (RFC 7232)"),
     (r'"\{\}"', "empty JSON object as a literal default / json.loads fallback"),
     (r'\.replace\("\{', "template placeholder substitution, not SQL"),
+    (
+        r'"\{server_url\}"',
+        "install-prompt click-time placeholder literal (compared/filtered as a string), not SQL",
+    ),
     (r'<\w+[^>]*="\{', "HTML/XML attribute value"),
     (r"launch_cmd", "shell/batch command quoting in the launcher shortcut"),
     (r'", "\.join\(f\'"\{n\}": \{n\}\'', "building a Python dict literal for generated code"),

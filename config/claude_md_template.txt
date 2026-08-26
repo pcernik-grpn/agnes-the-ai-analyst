@@ -7,7 +7,10 @@
      server.url, server.hostname
      sync_interval                — string from instance.yaml
      data_source.type             — keboola | bigquery | local
-     tables                       — list of {name, description, query_mode}
+     data_source.source_types     — sorted distinct source_type values of the
+                                     tables visible to the calling user
+     tables                       — list of {name, description, query_mode,
+                                     source_type}
      metrics.count, metrics.categories
      semantic_layer.has_models    — True iff the calling user can read >=1
                                      valid semantic model
@@ -296,11 +299,13 @@ Claude Code to apply the change to the running session — no restart needed.
   (e.g. `claude plugin install <plugin>@agnes`). The SessionStart hook runs
   `agnes refresh-marketplace --check` to detect upstream changes.
 
-## Remote Queries (BigQuery) — when data isn't on the laptop
+## Remote Queries — when data isn't on the laptop
+{%- set has_bigquery = data_source.type == 'bigquery' or 'bigquery' in data_source.source_types %}
+{%- set has_databricks = 'databricks' in data_source.source_types %}
 
 Not every table is synced. Tables registered with `query_mode: "remote"` live in
-BigQuery, accessed server-side via DuckDB's BQ extension — no parquet on disk.
-Tables you don't see in `server/parquet/` may still be queryable.
+an upstream source the server queries on demand — no parquet on disk. Tables you
+don't see in `server/parquet/` may still be queryable.
 
 ### Discovery first — read `agnes catalog --json` BEFORE every cross-table decision
 
@@ -308,10 +313,10 @@ Tables you don't see in `server/parquet/` may still be queryable.
 
 | Field | What it tells you | How to use it |
 |---|---|---|
-| `query_mode` | `local` (parquet on laptop) / `remote` (BQ on demand) / `materialized` (synced parquet of a BQ result) | Picks the tool — see decision tree below |
+| `query_mode` | `local` (parquet on laptop) / `remote` (queried upstream on demand) / `materialized` (synced parquet of a server-side query result) | Picks the tool — see decision tree below |
 | `server_only` | `true` = materialized/local on the server but NOT synced to your laptop (`agnes pull` skips it) | If `true`, query via `agnes query --remote` regardless of `query_mode` — local `agnes query` fails with "table does not exist" |
-| `source_type` | `keboola` / `bigquery` / `jira` | Determines SQL dialect |
-| `sql_flavor` | `duckdb` for local sources, `bigquery` for `--remote` queries on BQ rows | What syntax `--where` expects |
+| `source_type` | Which upstream system the row comes from | Together with `query_mode`, decides `sql_flavor` |
+| `sql_flavor` | The SQL dialect this table's `--where` predicates and `--remote` statements expect | Write in that dialect — `duckdb` unless the row executes in the upstream engine itself |
 | `where_examples` | 1–3 example WHERE predicates that are valid for this table's dialect | Copy as starting point for `--where` |
 | `fetch_via` | The canonical command to get this table's data (`agnes query` for local, `agnes snapshot create …` for remote, `agnes query --remote` for server-only) | Copy it — it's the right "how do I get this table" command |
 | `rough_size_hint` | Coarse size hint (`small` / `medium` / `large` or null when unknown) | Bigger than `medium` → never `agnes query --remote` without a tight `--where`; use `agnes snapshot create` |
@@ -319,7 +324,7 @@ Tables you don't see in `server/parquet/` may still be queryable.
 ```
 agnes catalog --json                              # full structured view (use this in scripts)
 agnes catalog                                     # human-readable summary
-agnes schema <table>                              # columns + types (BIGQUERY/DUCKDB dialect printed in header)
+agnes schema <table>                              # columns + types (dialect printed in header)
 agnes describe <table> -n 5                       # sample rows (works on local & materialized only)
 ```
 
@@ -351,40 +356,51 @@ query_mode of <table>  ├─ materialized → agnes query (parquet was synced b
 | Pattern | Tool | Use when |
 |---------|------|----------|
 | **`agnes snapshot create`** (preferred) | materializes a filtered subset locally → query the snapshot | repeated questions on same slice, OR joining a remote table with a local one (snapshot the remote side, join locally) |
-| **`agnes query --remote`** | one-shot, server-side execution against BigQuery (works for BASE TABLE rows directly + VIEW/MATERIALIZED_VIEW rows via the BQ jobs API; cost-guarded by a 5 GiB scan cap configurable in /admin/server-config) | single aggregate / cheap probe |
+| **`agnes query --remote`** | one-shot, server-side execution against the upstream source{% if has_bigquery %} (works for BASE TABLE rows directly + VIEW/MATERIALIZED_VIEW rows via the BQ jobs API; cost-guarded by a 5 GiB scan cap configurable in /admin/server-config){% endif %} | single aggregate / cheap probe |
 
 ### Common mistakes — avoid on first try
 
 - **`--estimate` is on `agnes snapshot create` ONLY.** Do NOT pass it to `agnes query` — fails with `No such option: --estimate`. The estimate flow is a snapshot-creation cost gate, not a query primitive.
-- **Old `agnes fetch` / `da fetch` / `da query` references in stale docs** — the CLI is `agnes`; `agnes fetch` was renamed to `agnes snapshot create`. If you see those names, translate before running.
-- **Don't attempt personal GCP auth** if a BQ query fails with permission errors. BQ access uses the **server's service account**, not your Google identity — escalate to admin instead.
-- **Don't `agnes query --remote "SELECT * FROM <large_table>"`** without a `--where`. Even if the scan-byte gate refuses, you've wasted the round-trip; gate yourself first by reading `rough_size_hint` and `where_examples` from `agnes catalog --json`.
+- **Old `agnes fetch` or legacy two-letter-CLI references in stale docs** — the CLI is `agnes`; `agnes fetch` was renamed to `agnes snapshot create`. If you see those names, translate before running.
+{%- if has_bigquery %}
+- **Don't attempt personal GCP auth** if a BigQuery query fails with permission errors. BQ access uses the **server's service account**, not your Google identity — escalate to admin instead.
+{%- endif %}
+- **Don't `agnes query --remote "SELECT * FROM <large_table>"`** without a `--where`. Even if the server's scan/size gate refuses, you've wasted the round-trip; gate yourself first by reading `rough_size_hint` and `where_examples` from `agnes catalog --json`.
 - **Pass SQL via `--sql "<text>"`, not as a bare positional argument**, when the query text might start with a `--` comment — canonical metric SQL pulled from `agnes catalog --metrics --show <id> --json` almost always does (a `-- ...` header line). A leading `--` on a positional argument can be misread by the CLI's argument parser as an option flag instead of the query text. `agnes query --sql "<text>"` / `agnes query --remote --sql "<text>"` take the exact same text unambiguously, whatever it starts with.
 
 ### Failure-mode dictionary — what each error means + the right response
 
 | Error wording (substring) | Cause | Response |
 |---|---|---|
+{%- if has_bigquery %}
 | `Binder Error: Query execution exceeded the timeout. Job ID: ...` | BQ-side query took >~200 s wall-clock; the DuckDB BQ extension's `bq_query_timeout_ms` (default 90 s, server may bump to 600 s) elapsed | Narrow `--where` (especially partition column), drop unused columns from `--select`, or switch to `agnes snapshot create` to materialise once + query locally |
-| `HTTP 400: remote_scan_too_large` | Server's `bq_max_scan_bytes` cost gate refused the query (default 5 GiB) | Tighten `--where`; consider `agnes snapshot create` so the cost is paid once, then local queries are free |
+{%- endif %}
+| `HTTP 400: remote_scan_too_large` | The server's cost/size gate refused the query — the predicted scan or the result was too big | Tighten `--where` / `--select`; consider `agnes snapshot create` so the cost is paid once, then local queries are free |
 | `HTTP 401: ... unauthorized` | PAT expired or wrong | `agnes init --server-url ... --token <new-PAT>`; re-mint via the dashboard's "Personal Access Tokens" page |
+{%- if has_bigquery %}
 | `HTTP 403: cross_project_forbidden` (with `serviceusage` mention) | Server SA lacks `serviceusage.services.use` on the BQ data project | Escalate to admin to set `data_source.bigquery.billing_project`; do NOT try personal auth |
+{%- endif %}
 | `ReadTimeout` (client-side) on `agnes query --remote` | CLI is older than 0.35.1 (had 30 s default) | `agnes --version`; if <0.35.1, upgrade with `uv tool install --force <wheel-from-server>` (the URL is in the `[update]` banner that prints on every command). Then retry. |
 | `unknown columns: [...]` from `agnes snapshot create` | `--select` lists columns that don't exist | Run `agnes schema <table>` and copy column names verbatim |
 | `No such option: -- ...` on `agnes query [--remote] "<sql>"` | SQL passed as a positional argument starts with a `--` comment; the CLI parser mistakes it for an option flag instead of query text | Re-run with `--sql "<sql>"` instead of the positional argument — works with any leading text, including comments |
 
-### Cost discipline — every BQ query bills bytes scanned
+### Cost discipline — remote queries run upstream, and may bill per query
+{%- if has_bigquery %}
 
-A naive `SELECT * FROM <large_table>` can cost real money. ALWAYS:
+Every BigQuery query bills bytes scanned — a naive `SELECT * FROM <large_table>`
+can cost real money.
+{%- endif %}
+
+ALWAYS:
 - filter via `--where` on the partition column (typically a date) — read `where_examples` in `agnes catalog --json`
-- list specific columns in `--select` — column-store BQ skips the rest
+- list specific columns in `--select` — a column-store source skips the rest
 - run `--estimate` first (only valid on `agnes snapshot create`) when the table is partitioned/clustered or when `rough_size_hint` is unknown
 
 ### `agnes snapshot create` discipline
 
 ```
 # 1. ESTIMATE first — refuses to fetch without knowing the cost
-agnes snapshot create <table> --select col1,col2 --where "date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)" --estimate
+agnes snapshot create <table> --select col1,col2 --where "{% if has_bigquery %}date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY){% else %}date >= CURRENT_DATE - INTERVAL 30 DAY{% endif %}" --estimate
 
 # 2. If reasonable, fetch as a named snapshot
 agnes snapshot create <table> --select col1,col2 --where "..." --as my_recent
@@ -407,7 +423,7 @@ Rules of thumb:
 
 ### Snapshot freshness — when to refresh
 
-Snapshots are point-in-time copies. They go stale as the source data updates (most BQ tables refresh daily; check `sync_schedule` per `agnes catalog`). For each new conversation:
+Snapshots are point-in-time copies. They go stale as the source data updates (most sources refresh on a schedule; check `sync_schedule` per `agnes catalog`). For each new conversation:
 
 ```
 agnes snapshot list                            # see existing snapshots + their ages
@@ -419,7 +435,7 @@ If the question is time-sensitive (e.g. "today's orders"), assume any snapshot o
 
 ### Hybrid query example — local + remote in one query
 
-To join a local table with remote BigQuery data: `agnes snapshot create` a
+To join a local table with remote data: `agnes snapshot create` a
 filtered slice of the remote table, then query the local join. Snapshot the
 remote side aggressively (WHERE + only the columns you need) so the cached
 parquet stays under ~100 MB; the join itself runs locally over the snapshot
@@ -429,7 +445,7 @@ parquet stays under ~100 MB; the join itself runs locally over the snapshot
 # 1. snapshot the remote side, narrow + aggregated
 agnes snapshot create web_sessions \
     --select date,country,views \
-    --where "date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)" \
+    --where "{% if has_bigquery %}date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY){% else %}date >= CURRENT_DATE - INTERVAL 30 DAY{% endif %}" \
     --as traffic
 
 # 2. local join (orders is a local table, traffic is the snapshot from step 1)
@@ -444,6 +460,7 @@ If the remote side is too big to snapshot even after filtering, push the
 whole join server-side: `agnes query --remote "<SQL>"` runs on the server
 where local tables and remote tables are already in the same DuckDB
 session.
+{%- if has_bigquery %}
 
 ### BigQuery SQL flavor for `--where`
 
@@ -455,10 +472,27 @@ Source-typed `bigquery` tables use BigQuery dialect, not DuckDB:
 - Date arithmetic: `DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)`
 - Regex: `REGEXP_CONTAINS(col, r'pattern')` (raw string!)
 - Cast: `CAST(x AS INT64)` (NOT `INT`)
+{%- endif %}
+{%- if has_databricks %}
+
+### Databricks SQL flavor for `--where` and `--remote`
+
+Rows with `sql_flavor: "databricks"` (Databricks tables with `query_mode: "remote"`)
+run on the SQL warehouse in Databricks SQL dialect — a `materialized` Databricks
+row is local parquet and stays DuckDB:
+
+- Date literal: `DATE '2026-01-01'`; now: `CURRENT_DATE`, `CURRENT_TIMESTAMP`
+- Date arithmetic: `CURRENT_DATE - INTERVAL 30 DAYS` or `DATE_SUB(CURRENT_DATE, 30)`
+- Regex: `col RLIKE 'pattern'`
+- There is no scan-cost dry-run: the server caps the RESULT size instead, and a
+  result over the cap is refused outright, never silently truncated — tighten
+  `--where`, aggregate more, or ask an admin to register the query as a
+  `materialized` table so it syncs on a schedule.
+{%- endif %}
 
 ### When the table you want isn't in `agnes catalog`
 
-The table may exist in BigQuery but not be registered with Agnes yet. Tell the user the table isn't registered and ask an admin to register it with `query_mode: "remote"` so it shows up in `agnes catalog` and supports `agnes snapshot create` / `agnes query --remote`. Direct `bq."<dataset>"."<table>"` paths are registry-gated server-side (403 `bq_path_not_registered`) — there's no analyst-side workaround for an unregistered table; registration is the right path.
+The table may exist upstream but not be registered with Agnes yet. Tell the user the table isn't registered and ask an admin to register it with `query_mode: "remote"` so it shows up in `agnes catalog` and supports `agnes snapshot create` / `agnes query --remote`.{% if has_bigquery %} Direct `bq."<dataset>"."<table>"` paths are registry-gated server-side (403 `bq_path_not_registered`) — there's no analyst-side workaround for an unregistered table; registration is the right path.{% endif %}
 
 ### Deeper guidance
 

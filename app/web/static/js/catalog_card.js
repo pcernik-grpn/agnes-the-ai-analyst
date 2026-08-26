@@ -66,7 +66,7 @@
   function footerAction(a) {
     a = a || {};
     if (a.mode === 'required') {
-      return '<span class="cc-required"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.7"/></svg>Required</span>';
+      return '<span class="cc-required"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.7"/></svg>Automatic</span>';
     }
     if (a.mode === 'stack' || a.mode === 'download') {
       const kind = a.mode === 'download' ? 'download' : 'stack';

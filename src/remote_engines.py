@@ -419,3 +419,31 @@ def resolve_single_engine(refs: Dict[str, List[dict]]) -> str | None:
     if len(refs) > 1:
         raise CrossEngineError(list(refs))
     return next(iter(refs))
+
+
+def strip_one_trailing_semicolon(sql: str) -> str:
+    """``sql`` without a single trailing statement terminator.
+
+    A terminator is legal at the top level of every engine Agnes talks to and
+    fatal the moment the statement is embedded — ``SELECT * FROM (<body>) AS
+    _q LIMIT n`` is a syntax error if ``<body>`` ends in ``;``. Six call sites
+    need the same one-character rule: the ``SELECT``-only validators
+    (``app/api/query.py``, ``src/remote_query.py`` ×2) so a terminator is not
+    read as a second statement, and the subquery wrappers
+    (``src/remote_query.py:register_bq``, ``connectors/databricks/remote.py``,
+    ``connectors/internal/access.py``, ``cli/mcp/server.py``) so it is gone
+    before the embed.
+
+    It exists because those sites were first written as five separate copies
+    of the rule, in two slightly different idioms — and the sixth,
+    ``cli/mcp/server.py``'s ``query_local``, was missed, so the MCP tool an
+    agent reaches for kept raising a raw DuckDB ``ParserException`` on exactly
+    the input the other five had learned to accept. One helper, so a seventh
+    embed site is a one-line call rather than a rediscovery.
+
+    Exactly ONE terminator is removed. ``SELECT 1;;`` keeps a ``;`` and is
+    still refused as multi-statement by the validators — the guards must not
+    become loopable.
+    """
+    body = sql.rstrip()
+    return body[:-1] if body.endswith(";") else body

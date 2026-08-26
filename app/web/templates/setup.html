@@ -9,6 +9,19 @@
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<style>
+  /* Honest guidance pane (Step 2) — same shape as the CSV guidance already
+     shipped on /admin/data-sources (`.ds-wguide` in admin_data_sources.html):
+     there is no CSV connector, so instead of a dead-end tile the wizard
+     points at the Library. */
+  .ds-wguide {
+    border: 1px solid var(--ds-border); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px;
+    background: var(--ds-surface-dim); font-size: 13px;
+    color: var(--ds-text-secondary);
+  }
+  .ds-wguide a { color: var(--ds-primary); }
+</style>
 {% endblock %}
 
 {% block content %}
@@ -71,7 +84,6 @@
                         style="width: 100%; padding: 10px 12px; border: 1px solid var(--ds-border); border-radius: 6px; margin-bottom: 12px; font-size: 14px; box-sizing: border-box; background: var(--ds-surface); color: var(--ds-text-primary);">
                         <option value="keboola">Keboola</option>
                         <option value="bigquery">BigQuery</option>
-                        <option value="local">Local / CSV</option>
                     </select>
                     {{ ds.dropdown(
                         id='data-source-dd', target='data-source',
@@ -79,9 +91,18 @@
                         options=[
                           {'value': 'keboola', 'label': 'Keboola'},
                           {'value': 'bigquery', 'label': 'BigQuery'},
-                          {'value': 'local', 'label': 'Local / CSV'},
                         ],
                     ) }}
+
+                    {# Honest guidance: there is no CSV connector (files enter
+                       through Library Collections). Was a dead-end "Local /
+                       CSV" tile that landed on Step 4's "Start First Sync"
+                       with no upload UI. #}
+                    <div class="ds-wguide">
+                        <p>Need to load files instead? There's no CSV connector —
+                           skip this step and upload documents into a Collection in
+                           the <a href="/library">Library</a> once you're signed in.</p>
+                    </div>
 
                     <div id="keboola-fields">
                         <label style="display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500;">Keboola URL</label>
@@ -186,18 +207,26 @@ function toggleSourceFields() {
     document.getElementById('bigquery-fields').style.display = src === 'bigquery' ? 'block' : 'none';
 }
 
+/* A dead setup token has to be cleared, not just reported: every later step
+   keeps failing while it sits in sessionStorage. Extracted so the data-source
+   step — which posts through saveConnectionConfig rather than apiCall — cannot
+   quietly lose the handling. */
+function handleExpiredSetupSession() {
+    token = '';
+    sessionStorage.removeItem('setup_token');
+    showStatus('Session expired. Please refresh the page and start over.', 'error');
+    return new Error('Session expired');
+}
+
 async function apiCall(url, body) {
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
     const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
     if (resp.status === 401) {
-        token = '';
-        sessionStorage.removeItem('setup_token');
-        showStatus('Session expired. Please refresh the page and start over.', 'error');
-        throw new Error('Session expired');
+        throw handleExpiredSetupSession();
     }
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || 'Request failed');
+    if (!resp.ok) throw new Error(window.apiDetailText(data.detail, 'Request failed'));
     return data;
 }
 
@@ -238,13 +267,23 @@ async function configureSource(e) {
             body.bigquery_project = document.getElementById('bq-project').value;
             body.bigquery_location = document.getElementById('bq-location').value;
         }
-        await apiCall('/api/admin/configure', body);
-        showStatus('Connection verified!', 'success');
-        if (src === 'local') {
-            goToStep(4);
-        } else {
-            goToStep(3);
+        /* Re-running setup on an instance that already has registered tables
+           can repoint a live connection, which the server refuses until
+           confirmed. saveConnectionConfig (js/connection_repoint.js) shows the
+           blast radius and re-sends on confirm — the same dialog the Add-data
+           wizard and instance settings use. */
+        const saved = await window.saveConnectionConfig(
+            '/api/admin/configure', body,
+            { headers: token ? { Authorization: 'Bearer ' + token } : {} }
+        );
+        if (saved.status === 401) throw handleExpiredSetupSession();
+        if (saved.cancelled) {
+            showStatus('Cancelled — the data source was left unchanged.', '');
+            return false;
         }
+        if (!saved.ok) throw new Error(window.apiDetailText(saved.data.detail, 'Request failed'));
+        showStatus('Connection verified!', 'success');
+        goToStep(3);
     } catch (err) {
         showStatus(err.message, 'error');
     } finally {
@@ -263,7 +302,7 @@ async function discoverTables() {
         if (token) headers['Authorization'] = 'Bearer ' + token;
         const resp = await fetch('/api/admin/discover-and-register', { method: 'POST', headers });
         const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || 'Discovery failed');
+        if (!resp.ok) throw new Error(window.apiDetailText(data.detail, 'Discovery failed'));
 
         const el = document.getElementById('discover-result');
         el.style.display = 'block';

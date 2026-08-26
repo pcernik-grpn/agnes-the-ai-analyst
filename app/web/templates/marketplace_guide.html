@@ -260,8 +260,12 @@
   <div class="guide-cta">
     {{ ds.button('+ Upload to Flea Market', variant='primary',
                  href='/store/new') }}
-    {{ ds.button('Browse Curated →', variant='secondary',
-                 href='/marketplace?tab=curated') }}
+    {# The reciprocal of the curated guide's fastpath link: with the
+       /marketplace browse shell folded into the Library, this cross-link is
+       the curated guide's one inbound door (test_web_nav_user_parity pins
+       reachability — and its scanner reads literal href="…" attributes,
+       which is why this is a plain anchor rather than a ds.button kwarg). #}
+    <a class="btn btn-secondary" href="/marketplace/guide/curated">How curated publishing works &rarr;</a>
   </div>
   {% endif %}
 </div>

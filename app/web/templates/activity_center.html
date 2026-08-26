@@ -13,6 +13,14 @@
 {% set page_hero_title = "Audit log" %}
 {% set page_hero_subtitle = "Every admin and user-mutating action — RBAC writes, sync triggers, marketplace edits, …" %}
 
+{# B8: fan-out to the other audit-trail viewers this page does NOT cover —
+   CLI session transcripts and tool/skill telemetry. Real links, not an
+   embedded re-implementation; each destination keeps its own page and URL. #}
+{% block toolbar %}
+{{ ds.button('Analyst sessions', variant='secondary', size='sm', href='/admin/sessions') }}
+{{ ds.button('Telemetry', variant='secondary', size='sm', href='/admin/telemetry') }}
+{% endblock %}
+
 {% block page %}
 {# Design-system component macros — the buttons (Reset, Load more, side-panel
    close + quick-filter actions) render via `ds.button` (auto-imported by
@@ -94,20 +102,19 @@
   <section class="obs-filters" aria-label="Filter audit log">
     <div class="obs-filter">
       <label for="f-user">User</label>
-      {# Not converted to ds.dropdown() (#1055): options are entirely
-         built at runtime from /api/admin/observability/facets
-         (fillSelect() below), and ds_dropdown.js snapshots its menu items
-         once at page load with no public API to re-init a host after its
-         menu is rebuilt — mirroring this control would mean duplicating
-         ds_dropdown.js's selection/keyboard-nav logic in page-local JS.
-         Left as a plain native select. #}
-      <select id="f-user" class="obs-select"><option value="">Any</option></select>
+      {# Options are built at runtime from /api/admin/observability/facets
+         (fillSelect() below); the paired .ds-dropdown is kept in sync by
+         syncObsFacetDropdown() (see below), using ds_dropdown.js's exported
+         re-init hook (#1473). Same for #f-action / #f-source below. #}
+      <select id="f-user" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='f-user-dd', target='f-user', aria_label='Filter by user',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="f-action">Action</label>
-      {# Not converted — see the f-user comment above; same dynamic-options
-         constraint (fillSelect() from facets). #}
-      <select id="f-action" class="obs-select"><option value="">Any</option></select>
+      <select id="f-action" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='f-action-dd', target='f-action', aria_label='Filter by action',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="f-result">Result</label>
@@ -136,9 +143,9 @@
     </div>
     <div class="obs-filter">
       <label for="f-source">Source</label>
-      {# Not converted — see the f-user comment above; same dynamic-options
-         constraint (fillSelect() from facets). #}
-      <select id="f-source" class="obs-select"><option value="">Any</option></select>
+      <select id="f-source" class="obs-select ds-dropdown-native"><option value="">Any</option></select>
+      {{ ds.dropdown(id='f-source-dd', target='f-source', aria_label='Filter by source',
+                     options=[{'value': '', 'label': 'Any'}]) }}
     </div>
     <div class="obs-filter">
       <label for="f-resource">Resource</label>
@@ -391,6 +398,36 @@
       sel.appendChild(o);
     });
     if (current) sel.value = current;
+    syncObsFacetDropdown(sel);
+  }
+
+  // Rebuilds the paired `.ds-dropdown`'s button AND menu from a facet
+  // select's own freshly-set <option>s, then re-runs ds_dropdown.js's init
+  // via the exported `dsDropdownInit` hook — needed because fillSelect()
+  // above rebuilds the whole option list (not just its selection), unlike
+  // f-result/f-resource's static lists which syncDropdownFromSelect handles
+  // by mutating the EXISTING items in place. The button is rebuilt too, not
+  // just the menu: init() isn't idempotent for its per-element listeners, so
+  // leaving the same persisting <button> node across two init() calls (one
+  // from ds_dropdown.js's own DOMContentLoaded bootstrap, one from here)
+  // double-registers its click handler — the second open()/close() undoes
+  // the first, and the menu never appears to open. Recreating the button
+  // discards that stale listener along with the old node.
+  function syncObsFacetDropdown(sel) {
+    const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+    if (!dd) return;
+    const ddId = sel.id + '-dd';
+    const opts = Array.from(sel.options);
+    const currentOpt = opts.find(o => o.value === sel.value) || opts[0];
+    const menuEl = dd.querySelector('.ds-dropdown-menu');
+    const ariaLabel = menuEl ? menuEl.getAttribute('aria-label') || '' : '';
+    const nameHtml = ariaLabel ? `<span class="ds-dropdown-name" id="${ddId}-name">${escapeHtml(ariaLabel)}</span>` : '';
+    const labelledBy = ariaLabel ? ` aria-labelledby="${ddId}-name ${ddId}-btn-label"` : '';
+    const items = opts
+      .map(o => `<li class="ds-dropdown-menu-item${o === currentOpt ? ' is-selected' : ''}" role="menuitemradio" aria-checked="${o === currentOpt}" tabindex="0" data-value="${escapeHtml(o.value)}">${escapeHtml(o.textContent)}</li>`)
+      .join('');
+    dd.innerHTML = `<button type="button" class="ds-dropdown-btn" id="${ddId}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${ddId}-menu"${labelledBy}>${nameHtml}<span class="ds-dropdown-btn-label" id="${ddId}-btn-label">${currentOpt ? escapeHtml(currentOpt.textContent.trim()) : ''}</span><svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button><ul class="ds-dropdown-menu" id="${ddId}-menu" role="menu" aria-label="${escapeHtml(ariaLabel || 'Options')}" hidden>${items}</ul>`;
+    if (window.dsDropdownInit) window.dsDropdownInit(dd);
   }
 
   // ---------------------------------------------------------------------

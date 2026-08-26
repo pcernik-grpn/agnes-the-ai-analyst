@@ -676,3 +676,50 @@ def test_resolve_plugin_metadata_includes_explicit_empty_only_via_resolver_contr
     assert "description" not in resolved, (
         "empty string `description` must not reach `out` — resolver contract"
     )
+
+
+# ---------------------------------------------------------------------------
+# Curator-side deprecation (lifecycle fields)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_plugin_metadata_deprecated_fields():
+    metadata = {
+        "version": 1,
+        "plugins": {
+            "p": {
+                "deprecated": True,
+                "deprecation_note": "generates unreliable output",
+                "replacement": "other-plugin",
+            }
+        },
+    }
+    out = resolve_plugin_metadata(metadata, "p")
+    assert out["deprecated"] is True
+    assert out["deprecation_note"] == "generates unreliable output"
+    assert out["replacement"] == "other-plugin"
+
+
+def test_resolve_plugin_metadata_deprecated_requires_literal_true():
+    """Strict ``is True`` — a typo ("true", 1, [...]) must not retire a plugin,
+    and note/replacement without the flag are ignored."""
+    for bad in ("true", "yes", 1, [True], {"v": True}):
+        out = resolve_plugin_metadata(
+            {"version": 1, "plugins": {"p": {"deprecated": bad}}}, "p",
+        )
+        assert "deprecated" not in out, f"deprecated={bad!r} must be rejected"
+
+    out = resolve_plugin_metadata(
+        {"version": 1, "plugins": {"p": {"deprecation_note": "n", "replacement": "r"}}},
+        "p",
+    )
+    assert "deprecated" not in out
+    assert "deprecation_note" not in out
+    assert "replacement" not in out
+
+
+def test_resolve_plugin_metadata_deprecated_false_is_absent():
+    out = resolve_plugin_metadata(
+        {"version": 1, "plugins": {"p": {"deprecated": False}}}, "p",
+    )
+    assert "deprecated" not in out

@@ -12,7 +12,7 @@ import math
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -711,6 +711,17 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "hint": (
                 "ON by default: a tool call the agent asks about is routed to an "
                 "approval card. Turning it OFF auto-allows those calls instead. "
+                "Resolved from the same overlay-only source as chat.enabled."
+            ),
+        },
+        "bootstrap_marketplace": {
+            "kind": "bool",
+            "default": _flag_default("chat", "bootstrap_marketplace", True),
+            "hint": (
+                "ON by default: the skills in a user's stack are materialized into "
+                "their chat session, so the composer's /<skill-name> menu entries "
+                "actually resolve. Turning it OFF removes marketplace skills from "
+                "that menu too — the menu never offers what nothing delivers. "
                 "Resolved from the same overlay-only source as chat.enabled."
             ),
         },
@@ -1987,12 +1998,94 @@ def _public_view(config: dict) -> dict:
     return _redact(copy.deepcopy(config))
 
 
+_REPOINT_SAMPLE_SIZE = 5
+
+
+def _guard_connection_repoint(
+    before: dict,
+    sections: Dict[str, Dict[str, Any]],
+    confirmed: bool,
+) -> None:
+    """Refuse an unconfirmed change to *which upstream* a data source points at.
+
+    Registrations resolve their upstream against the instance's one connection
+    per source (see `app/connection_identity.py`), and the result is baked into
+    the extract's `_remote_attach.url` and each remote view's
+    ``sf."SCHEMA"."TABLE"``. Repointing the connection therefore invalidates
+    every existing row of that source at once — and the failure is silent from
+    the operator's seat: reads fail at bind time deep in a query, materialized
+    syncs fail at COPY time, and `last_sync_status` keeps showing the last
+    successful run. The save path used to apply such a patch without a word.
+
+    Fires only when the source already HAS registrations: first-time setup has
+    nothing to break, and nagging there would train operators to click through.
+    """
+    if confirmed:
+        return
+    patch = sections.get("data_source")
+    if not isinstance(patch, dict):
+        return
+
+    before_ds = before.get("data_source")
+    before_ds = before_ds if isinstance(before_ds, dict) else {}
+
+    from app.connection_identity import identity_changes
+    from src.repositories import table_registry_repo
+
+    for source, source_patch in patch.items():
+        if not isinstance(source_patch, dict):
+            continue
+        before_block = before_ds.get(source)
+        changes = identity_changes(source, before_block if isinstance(before_block, dict) else {}, source_patch)
+        if not changes:
+            continue
+
+        try:
+            affected = table_registry_repo().list_by_source(source)
+        except Exception:
+            # A registry the guard cannot read is not a reason to block a
+            # config save — the operator may be fixing exactly that.
+            logger.exception("connection-repoint guard: registry lookup failed for %s", source)
+            continue
+        if not affected:
+            continue
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "connection_change_affects_registrations",
+                "source": source,
+                # Same masking rule as the audit diff — the field name carries
+                # the operator-relevant signal, so a credential-pointer leaf
+                # does not need its value echoed to be understood.
+                "changes": [
+                    {
+                        "field": c["field"],
+                        "before": _mask(c["before"]) if _is_secret_key(c["field"]) else c["before"],
+                        "after": _mask(c["after"]) if _is_secret_key(c["field"]) else c["after"],
+                    }
+                    for c in changes
+                ],
+                "affected_tables": len(affected),
+                "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
+                "hint": (
+                    f"{len(affected)} registered table(s) resolve against the current "
+                    f"{source} connection and will stop resolving after this change; "
+                    "they need re-registering (or a matching schema on the new "
+                    "upstream). Resend with confirm_connection_change=true to apply."
+                ),
+            },
+        )
+
+
 class ServerConfigUpdateRequest(BaseModel):
     """Patch payload for POST /api/admin/server-config.
 
     Only the sections listed in `_EDITABLE_SECTIONS` are accepted; anything
     else is rejected with 400. `confirm_danger` must be true if the patch
-    touches any danger-zone section (auth.*, server.*).
+    touches any danger-zone section (auth.*, server.*), and
+    `confirm_connection_change` must be true to repoint a data source that
+    already has registrations.
     """
 
     sections: Dict[str, Dict[str, Any]] = Field(
@@ -2002,6 +2095,14 @@ class ServerConfigUpdateRequest(BaseModel):
     confirm_danger: bool = Field(
         default=False,
         description="Must be true to apply changes touching auth.* or server.*",
+    )
+    confirm_connection_change: bool = Field(
+        default=False,
+        description=(
+            "Must be true to repoint a data_source connection that registered "
+            "tables already resolve against (see 409 "
+            "connection_change_affects_registrations)"
+        ),
     )
 
 
@@ -2184,14 +2285,23 @@ def _feature_flags_inventory() -> List[Dict[str, Any]]:
             # there warns about). Same row shape as the leading experience
             # row: value_label carries the mode, effective mirrors
             # "resolved away from the default".
-            from app.switches import switch_value
-
-            value = str(switch_value(flag.name))
-            if os.environ.get(flag.env_var) is not None:
-                source = "env"
+            if flag.name in _CHAT_RUNTIME_FLAGS:
+                # A select that is ALSO chat-runtime-resolved (chat_provider):
+                # switch_value() raises for runtime_view switches by design —
+                # the runtime reads the overlay file alone, via
+                # load_chat_config — so its string comes from the same view
+                # the boolean chat flags use below.
+                value_raw, source = _chat_flag_runtime_view(flag)
+                value = str(value_raw)
             else:
-                probe = get_value(*flag.config_keys, default=_UNSET)
-                source = "default" if probe is _UNSET else "config"
+                from app.switches import switch_value
+
+                value = str(switch_value(flag.name))
+                if os.environ.get(flag.env_var) is not None:
+                    source = "env"
+                else:
+                    probe = get_value(*flag.config_keys, default=_UNSET)
+                    source = "default" if probe is _UNSET else "config"
             out.append(
                 {
                     "name": flag.name,
@@ -2278,7 +2388,14 @@ def _chat_flag_runtime_view(flag) -> tuple:
     key = _CHAT_RUNTIME_FLAGS[flag.name]
     overlay_path = _state_dir() / "instance.yaml"
     effective = getattr(load_chat_config(overlay_path), key)
-    if os.environ.get(flag.env_var) is not None:
+    env_raw = os.environ.get(flag.env_var)
+    # The "env" label must mirror each flag's own resolver: the boolean chat
+    # flags coerce ANY set value (blank included), but the select resolver
+    # (`_resolve_chat_provider`) treats a blank env as unset and falls
+    # through to yaml/default — labeling that "env" would tell the operator
+    # a pin exists where none does.
+    env_set = env_raw is not None and (flag.kind != "select" or env_raw.strip() != "")
+    if env_set:
         return effective, "env"
     try:
         raw = yaml.safe_load(overlay_path.read_text()) or {}
@@ -2414,6 +2531,11 @@ async def update_server_config(
         # we acquired the lock.
         reset_cache()
         before = _load_current_instance_yaml()
+
+        # Blast-radius gate, INSIDE the lock and before any write: `before` is
+        # the snapshot the merge below is computed from, so the count the
+        # operator confirmed against is the one that actually applies.
+        _guard_connection_repoint(before, scrubbed_sections, request.confirm_connection_change)
 
         # Deep merge — section-by-section so we never accidentally delete a
         # sibling section the patch didn't touch. Use the redaction-scrubbed
@@ -3468,20 +3590,42 @@ def _validate_snowflake_register_payload(req: "RegisterTableRequest") -> None:
         return
 
 
-def _rebuild_snowflake_remote_extract() -> tuple[bool, str]:
-    """Rebuild ``extracts/snowflake/extract.duckdb`` for remote rows.
+class _SnowflakeRebuild(NamedTuple):
+    """Outcome of one ``extracts/snowflake/extract.duckdb`` rebuild.
 
-    Returns ``(ok, message)``. ``ok=False`` is reserved for a *hard* failure
-    (an exception, or per-table errors) — a skipped rebuild is a message, so a
-    benign skip never turns a successful registration into a 500.
+    ``ok=False`` is reserved for a *hard* failure (an exception, or per-table
+    errors) — a skipped rebuild is a message, so a benign skip never turns a
+    successful registration into a 500.
+
+    ``failed_tables`` names the registry rows the rebuild could not build.
+    ``rebuild_from_registry`` walks EVERY remote row, not just the one being
+    registered, so the aggregate message routinely describes somebody else's
+    broken row; a caller that records the failure against a specific row must
+    check this set first or it marks a healthy new row as failed. Empty on a
+    hard exception, where there is no per-table attribution to be had and the
+    rebuild genuinely failed for every row.
+
+    ``rebuilt`` separates "ran and produced views" from "skipped" — both of
+    which report ``ok=True``. A caller that CLEARS recorded state (rather than
+    recording new state) must gate on this: a skip verified nothing, so wiping
+    a row's real failure on the back of one turns a broken table green.
     """
+
+    ok: bool
+    message: str
+    failed_tables: set[str]
+    rebuilt: bool
+
+
+def _rebuild_snowflake_remote_extract() -> _SnowflakeRebuild:
+    """Rebuild ``extracts/snowflake/extract.duckdb`` for remote rows."""
     from connectors.snowflake.extract_init import rebuild_from_registry
 
     try:
         result = rebuild_from_registry()
     except Exception as exc:
         logger.exception("snowflake remote extract rebuild failed")
-        return (False, f"snowflake remote extract rebuild failed: {exc}")
+        return _SnowflakeRebuild(False, f"snowflake remote extract rebuild failed: {exc}", set(), False)
 
     if result.get("skipped"):
         # A *skipped* rebuild is a message, never a failed registration —
@@ -3495,31 +3639,70 @@ def _rebuild_snowflake_remote_extract() -> tuple[bool, str]:
         # to re-register.
         reason = result.get("reason")
         if reason == "not_configured":
-            return (
+            return _SnowflakeRebuild(
                 True,
                 "snowflake remote extract skipped: Snowflake is not configured, so the "
                 "sf catalog was not attached. Set data_source.snowflake.* + the password "
                 "env/vault secret, then POST /api/sync/trigger to build the extract.",
+                set(),
+                False,
             )
-        return (True, f"snowflake remote extract skipped: {reason}")
+        return _SnowflakeRebuild(True, f"snowflake remote extract skipped: {reason}", set(), False)
 
     errors = result.get("errors") or []
     if errors:
-        return (False, f"snowflake remote extract rebuilt with errors: {errors}")
+        failed = {str(e.get("table")) for e in errors if isinstance(e, dict) and e.get("table")}
+        return _SnowflakeRebuild(False, f"snowflake remote extract rebuilt with errors: {errors}", failed, True)
 
-    return (
+    return _SnowflakeRebuild(
         True,
         f"snowflake remote extract rebuilt; {result.get('tables_registered', 0)} table(s) registered",
+        set(),
+        True,
     )
 
 
-def _rebuild_snowflake_remote_extract_bg() -> None:
-    """Fire-and-forget wrapper used by ``update_table`` BackgroundTasks."""
-    ok, message = _rebuild_snowflake_remote_extract()
-    if ok:
-        logger.info("%s", message)
-    else:
-        logger.error("%s", message)
+def _rebuild_snowflake_remote_extract_bg(table_name: Optional[str] = None) -> None:
+    """Fire-and-forget wrapper used by ``update_table`` BackgroundTasks.
+
+    ``table_name`` is the edited row's registry ``name``. Correcting a
+    schema/table that does not exist upstream is the whole point of this edit
+    path, and registration records such a failure on the row (see
+    ``register_table``), so a rebuild that now succeeds has to CLEAR it —
+    otherwise ``GET /api/admin/registry`` and /admin/sync keep serving the old
+    error until the next full orchestrator sweep re-derives ``sync_state`` from
+    ``_meta``, and the fix reads as if it did not take.
+    """
+    outcome = _rebuild_snowflake_remote_extract()
+    (logger.info if outcome.ok else logger.error)("%s", outcome.message)
+
+    # Clear on THIS row's outcome, never on the aggregate. Two separate traps
+    # live here, and `outcome.ok` alone walks into both:
+    #
+    #   * `ok` is False as soon as ANY registered remote row errors, and the
+    #     rebuild walks every one of them. On the instance this whole change
+    #     set came from — which carries pre-existing phantom rows — `ok` is
+    #     permanently False, so gating on it means the row the operator just
+    #     corrected NEVER gets its error cleared, and the fix reads as if it
+    #     did not take. That is the exact symptom being removed here.
+    #   * `ok` is True for a benign SKIP (`not_configured` / `no_remote_rows`)
+    #     by design, so a skip cannot 500 a registration. But a skip verified
+    #     nothing, and the row's recorded failure is still true — clearing it
+    #     would flip a table the operator cannot query to a green row.
+    #
+    # So: the rebuild must have actually RUN, and this row must not be among
+    # the ones it could not build. Mirrors the attribution `register_table`
+    # uses on the recording side.
+    if table_name and outcome.rebuilt and table_name not in outcome.failed_tables:
+        try:
+            sync_state_repo().clear_error(table_name)
+        except Exception as exc:
+            logger.warning(
+                "rebuild for %s succeeded but its recorded failure could not be "
+                "cleared (%s); /admin/sync may show a stale error until the next sweep",
+                table_name,
+                exc,
+            )
 
 
 # Source types that don't depend on a `data_source.<name>.*` block — they
@@ -3811,6 +3994,7 @@ class ConfigureRequest(BaseModel):
     bigquery_location: Optional[str] = None
     instance_name: Optional[str] = None
     allowed_domain: Optional[str] = None
+    confirm_connection_change: bool = False
 
 
 @router.get("/discover-tables")
@@ -3839,14 +4023,12 @@ async def discover_tables(
             from app.instance_config import get_value
             from connectors.keboola.client import KeboolaClient
 
+            from app.datasource_secrets import keboola_instance_token
+
             url = get_value("data_source", "keboola", "stack_url", default="")
             token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-            token = os.environ.get(token_env, "") if token_env else ""
-            if not token:
-                from app.datasource_secrets import datasource_secret
-
-                token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-            client = KeboolaClient(token=token, url=url)
+            token, _provenance = keboola_instance_token(token_env)
+            client = KeboolaClient(token=token or "", url=url)
             tables = client.discover_all_tables()
             return {"tables": tables, "count": len(tables), "source": "keboola"}
 
@@ -3964,16 +4146,20 @@ async def list_registry(
     tables = repo.list_all()
 
     # Single batched read of sync_state — avoid N+1 GETs against
-    # `sync_state` for large registries. The sync_state row is keyed on
-    # `table_id` which mirrors `table_registry.name` (see comment in
-    # _run_materialized_pass / _build_manifest_for_user about name vs id).
-    state_by_name: Dict[str, Dict[str, Any]] = {}
+    # `sync_state` for large registries. B1: writers resolve `table_id` to
+    # the registry `id` when a matching row exists at write time (see
+    # `src.sync_state_key.resolve_sync_state_key`), so the join below tries
+    # `id` first. A row still keyed by `name` — a legacy row the backfill
+    # migration hasn't reached yet, or a fallback write for a table whose
+    # `_meta.table_name` had no registry match — is picked up by name so it
+    # doesn't silently vanish from this view.
+    state_by_key: Dict[str, Dict[str, Any]] = {}
     try:
         rows = sync_state_repo().get_all_states()
         for row in rows:
             tid = row.get("table_id")
             if tid:
-                state_by_name[tid] = row
+                state_by_key[tid] = row
     except Exception:
         # Defensive: if sync_state is unreadable for any reason, the
         # registry response still serializes — operators just lose the
@@ -3981,8 +4167,7 @@ async def list_registry(
         logger.exception("Failed to read sync_state for registry")
 
     for t in tables:
-        # Sync_state.table_id == table_registry.name by convention.
-        state = state_by_name.get(t.get("name"))
+        state = state_by_key.get(t.get("id")) or state_by_key.get(t.get("name"))
         status = state.get("status") if state else None
         error = state.get("error") if state else None
         ls = state.get("last_sync") if state else None
@@ -4355,6 +4540,7 @@ def register_table(
         source_query=request.source_query,
         query_mode=request.query_mode,
         server_only=bool(request.server_only),
+        has_access_policy=False,
         exclude_id=None,
     )
 
@@ -4412,8 +4598,36 @@ def register_table(
             # Snowflake remote rows need a local extract.duckdb with the
             # _remote_attach row and per-table views so the orchestrator can
             # ATTACH the sf catalog and create master views.
-            ok, message = _rebuild_snowflake_remote_extract()
+            ok, message, failed_tables, _rebuilt = _rebuild_snowflake_remote_extract()
             if not ok:
+                # The row stays registered on purpose — the usual cause is a
+                # mistyped schema/table, and editing the existing row beats
+                # re-entering everything. But a bare row would then read
+                # `pending` ("never synced") in /admin/sync and
+                # `GET /api/admin/registry` forever: nothing retries a remote
+                # rebuild except a re-save, so the operator has no way to tell
+                # "this name does not exist upstream" from "waiting for the
+                # first tick". Record the failure against the row so both
+                # surfaces say so.
+                # …but ONLY when this row is the one that failed. The rebuild
+                # walks every registered remote row, so a single pre-existing
+                # broken row (a schema dropped upstream, say) otherwise stamps
+                # its error onto every healthy table registered afterwards —
+                # the operator reads "error" plus somebody else's table name on
+                # a row that is in fact fine, until the next orchestrator sweep
+                # re-derives state from _meta. An empty `failed_tables` means a
+                # hard exception with no per-table attribution, where the
+                # rebuild did fail for this row too.
+                if not failed_tables or request.name in failed_tables:
+                    try:
+                        sync_state_repo().set_error(request.name, message)
+                    except Exception as exc:
+                        logger.warning(
+                            "could not record rebuild failure for %s in sync_state (%s); the 500 "
+                            "response still carries the reason",
+                            table_id,
+                            exc,
+                        )
                 return JSONResponse(
                     status_code=500,
                     content={
@@ -4421,6 +4635,12 @@ def register_table(
                         "name": request.name,
                         "status": "rebuild_failed",
                         "view_name": table_id,
+                        # `detail` is the key every client renders (FastAPI's own
+                        # error shape, and what the admin UI reads); `message` is
+                        # kept for existing consumers. Same content — pre-fix only
+                        # `message` was set, so the UI fell through to a bare
+                        # "✗ failed" and threw the real reason away.
+                        "detail": message,
                         "message": message,
                     },
                 )
@@ -4816,29 +5036,32 @@ def _find_policied_physical_source_twin(
     return None
 
 
-def _find_distributable_physical_source_twin(
+def _find_unpolicied_physical_source_twin(
     my_signals: set,
     *,
     exclude_id: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """The mirror of :func:`_find_policied_physical_source_twin`: the first
-    existing registry row that is itself DISTRIBUTABLE and whose
-    physical-source signals intersect ``my_signals``. ``None`` when there
-    is no such row.
+    """The first existing registry row that carries NO policy and whose
+    physical-source signals intersect ``my_signals`` — the row a caller
+    granted it reads the raw data through, no matter what policy protects
+    the other name.
 
-    This is the direction the attach path needs. A row carrying a policy
-    is by construction non-distributable (§3.1 forces ``query_mode=
-    'remote'`` or ``server_only=true``), so
-    ``_check_access_policy_physical_source_conflict`` — which returns
-    early unless the row it is called for is itself distributable — can
-    only ever reject the TWIN's own write. Nothing PUTs a twin that was
-    registered before the policy existed, so without this scan the leak
-    stays open indefinitely.
+    Supersedes the distributable-only scan this file shipped first. That
+    one keyed on ``agnes pull``: a twin that never leaves the server was
+    treated as harmless, and two undistributed rows over one source were
+    explicitly allowed to coexist. Verified against a live instance, that
+    is false — ``/api/query`` resolves the twin's own name server-side and
+    returns the unfiltered, unmasked rows to anyone granted it, which is
+    the same disclosure the parquet would have made, minus the file. The
+    scan is therefore on physical-source overlap plus "has no policy of
+    its own", not on distributability. Two POLICIED rows over one source
+    stay legal: each read goes through a policy, and which one an admin
+    wants where is their call.
     """
     if not my_signals:
         return None
     for other in table_registry_repo().list_all():
-        if other.get("id") == exclude_id or not _is_distributable_registry_row(other):
+        if other.get("id") == exclude_id or other.get("access_policy_sql"):
             continue
         if my_signals & _policy_physical_source_signals(other):
             return other
@@ -4855,6 +5078,8 @@ def _check_access_policy_physical_source_conflict(
     source_query: Optional[str],
     query_mode: Optional[str],
     server_only: bool,
+    has_access_policy: bool = False,
+    clearing_policy: bool = False,
     exclude_id: Optional[str] = None,
 ) -> None:
     """§3.2 (table access policies design doc) — the physical-source twin.
@@ -4863,18 +5088,20 @@ def _check_access_policy_physical_source_conflict(
     ``register_table``, or the merged shape ``update_table`` is about to
     persist) when BOTH:
 
-    - it would itself be distributable (``query_mode in ('local',
-      'materialized')`` and not ``server_only`` — the shape ``agnes pull``
-      downloads), AND
+    - it carries no policy of its own (``has_access_policy=False``), AND
     - its physical source (``bq_fqn`` / ``(source_type, connection_id,
       bucket, source_table)`` / non-Keboola ``source_query`` — see
       ``_policy_physical_source_signals``) matches that of ANY existing
       registry row carrying ``access_policy_sql``.
 
-    A row that stays undistributed never hands the raw rows to an analyst
-    via ``agnes pull``, so it is never blocked here regardless of
-    physical-source overlap — mirrors the update-time interlock this was
-    extracted from.
+    The first draft of this check also required the row to be
+    DISTRIBUTABLE, on the reasoning that a row which never leaves the
+    server hands nothing to an analyst. That is wrong, and was wrong in
+    production: ``/api/query`` resolves an undistributed row by name
+    server-side and returns its raw rows to anyone granted it, so an
+    unpolicied ``server_only`` / ``remote`` twin discloses exactly what
+    the policy withholds. Distributability now only changes the wording of
+    the rejection, never whether it fires.
 
     Shared between ``register_table`` (a brand-new row, not yet persisted —
     call with ``exclude_id=None``) and ``update_table`` (an existing row
@@ -4885,15 +5112,26 @@ def _check_access_policy_physical_source_conflict(
     (for ``register_table``) before any materialization can run — a row
     rejected here must never reach disk.
 
-    The ATTACH direction — a policy going onto a row that already has a
-    distributable twin — is the mirror check
-    ``_check_policied_row_has_no_distributable_twin`` below; this one
-    structurally cannot cover it (a policied row is never distributable,
-    so the guard above returns early).
+    The ATTACH direction — a policy going onto a row that already has an
+    unpolicied twin — is the mirror check
+    ``_check_policied_row_has_no_unpolicied_twin`` below; this one
+    structurally cannot cover it (the row being written IS the policied
+    one there, so the guard above returns early).
+
+    ``clearing_policy`` changes only the WORDING, never the verdict. Two
+    policied rows over one source are legal, and clearing either one's policy
+    leaves an unpolicied name over a source the other still policies — the
+    disclosure this check exists to refuse, so it must still fire. But the
+    default wording ("attach a policy to this row too") is nonsense addressed
+    to an admin who is *removing* one, and it names neither escape that
+    actually works: repoint this row at a different physical source first (its
+    policy travels with it, so the clear then succeeds), or unregister one of
+    the pair. Set by ``update_table`` when the pre-write row carried a policy
+    and the merged one does not.
 
     Raises ``HTTPException(422, "access_policy_physical_source_conflict")``.
     """
-    if not _is_distributable_registry_row({"query_mode": query_mode, "server_only": server_only}):
+    if has_access_policy:
         return
     my_signals = _policy_physical_source_signals(
         {
@@ -4907,61 +5145,92 @@ def _check_access_policy_physical_source_conflict(
     )
     other = _find_policied_physical_source_twin(my_signals, exclude_id=exclude_id)
     if other is not None:
+        if clearing_policy:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "access_policy_physical_source_conflict: clearing this "
+                    "table's access policy would leave it an unpolicied name "
+                    "over the same physical source as table "
+                    f"{other.get('id')!r} ({other.get('name')!r}), which still "
+                    "carries one -- and an unpolicied name returns the "
+                    "unfiltered rows to anyone granted it. Point this row at a "
+                    "different physical source first (its policy travels with "
+                    "it, so the clear then succeeds), or unregister one of the "
+                    "two rows"
+                ),
+            )
         raise HTTPException(
             status_code=422,
             detail=(
                 "access_policy_physical_source_conflict: this table's "
                 f"physical source matches table {other.get('id')!r} "
                 f"({other.get('name')!r}), which has an access policy "
-                "attached -- keep this row server_only=true (or "
-                "query_mode='remote') so the policy can't be routed "
-                "around, or point it at a different physical source"
+                "attached -- a second, unpolicied name over the same "
+                "source returns the unfiltered rows to anyone granted it, "
+                "so attach a policy to this row too, point it at a "
+                "different physical source, unregister one of the two rows, "
+                "or read the policied table by its own name"
             ),
         )
 
 
-def _check_policied_row_has_no_distributable_twin(merged: Dict[str, Any], *, table_id: str) -> None:
+def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_id: str) -> None:
     """§3.2, the ATTACH direction — refuse to leave a policy on a row that
-    an EXISTING distributable row already resolves to the same physical
-    source as.
+    an EXISTING unpolicied row resolves to the same physical source as.
 
     ``_check_access_policy_physical_source_conflict`` above asks "is THIS
-    row a distributable twin of a policied one" and returns early unless
-    the row is itself distributable. A row carrying a policy never is
-    (§3.1 forces ``query_mode='remote'`` or ``server_only=true``), so on
-    the attach path that check always short-circuits: registering
-    ``twin`` (``query_mode='local'``, same bucket/source_table) and only
-    THEN attaching the policy to ``orig`` used to be accepted with no scan
-    at all — and since nothing ever PUTs ``twin`` again, the twin-side
-    interlock never runs and ``agnes pull`` keeps distributing its
-    unfiltered parquet. This is the symmetric scan that closes it.
+    row an unpolicied twin of a policied one", so on the attach path it
+    always short-circuits: the row being written is the policied one.
+    Registering ``twin`` first and only THEN attaching the policy to
+    ``orig`` would otherwise be accepted with no scan at all — and since
+    nothing ever PUTs ``twin`` again, the twin-side interlock never runs
+    for it. This is the symmetric scan that closes it.
+
+    A distributable twin leaks through ``agnes pull``; an undistributed
+    one leaks through ``/api/query`` resolving its name server-side for
+    anyone granted it. Both are refused here — the first draft exempted
+    the second, which a live instance disproved.
 
     Evaluated against the MERGED record on every write that leaves a
     policy attached — not only the PUT that attaches one — exactly like
     the §3.1 interlock, so the incoherent shape can't be reached in two
-    steps either. Clearing ``access_policy_sql`` short-circuits (no policy
-    on the merged record, nothing to protect), which keeps the safety
-    valve: an admin can always undo the policy.
+    steps either. Clearing ``access_policy_sql`` short-circuits HERE (no
+    policy on the merged record, nothing to protect) — but that is not by
+    itself a safety valve, and the earlier version of this docstring claiming
+    "an admin can always undo the policy" was wrong. The twin check on the
+    other side then sees an unpolicied row over a still-policied source and
+    refuses, which is correct: two policied rows over one source are legal,
+    an unpolicied one beside a policied one is the disclosure. What unwinds
+    such a pair is repointing one row (its policy travels with it, so the
+    clear then succeeds) or unregistering one — both named in that
+    rejection.
 
     Raises ``HTTPException(422, "access_policy_physical_source_conflict")``.
     """
     if not merged.get("access_policy_sql"):
         return
     my_signals = _policy_physical_source_signals(merged)
-    other = _find_distributable_physical_source_twin(my_signals, exclude_id=table_id)
+    other = _find_unpolicied_physical_source_twin(my_signals, exclude_id=table_id)
     if other is not None:
+        distributable = _is_distributable_registry_row(other)
+        reach = (
+            "agnes pull would hand out the unfiltered rows this policy exists to withhold"
+            if distributable
+            else "any caller granted it reads the unfiltered rows "
+            "server-side under that name, which is the same disclosure "
+            "without the parquet"
+        )
         raise HTTPException(
             status_code=422,
             detail=(
                 "access_policy_physical_source_conflict: table "
                 f"{other.get('id')!r} ({other.get('name')!r}) points at this "
-                "table's physical source and is distributable "
+                "table's physical source and carries no policy of its own "
                 f"(query_mode={str(other.get('query_mode') or 'local')!r}, "
-                "server_only=false), so agnes pull would hand out the "
-                "unfiltered rows this policy exists to withhold -- set that "
-                "row server_only=true (or query_mode='remote'), unregister "
-                "it, or point it at a different physical source, then "
-                "attach the policy"
+                f"server_only={bool(other.get('server_only'))}), so {reach} "
+                "-- attach a policy to that row, unregister it, or point it "
+                "at a different physical source, then attach this policy"
             ),
         )
 
@@ -5005,6 +5274,35 @@ async def update_table(
     # old "null = no-op" semantics for some field, it should omit the field
     # from the body instead of sending null — that's the canonical PUT shape.
     updates = request.model_dump(exclude_unset=True)
+    # View-name / id collision guard, mirrored from register_table's
+    # `existing_by_name` check. `table_registry.name` has no DB-level
+    # uniqueness constraint and register_table only pre-checks it against
+    # OTHER names on the way in (a duplicate matching another row's ID is
+    # already caught there, indirectly, by the derived-id collision check —
+    # PUT never re-derives an id, so that protection doesn't carry over
+    # here). Left unchecked, a rename could collide with another table's
+    # `name` (the original register_table concern: a silent view overwrite
+    # at next rebuild) OR — since B1 — with another table's `id`: every
+    # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
+    # the distribution mirror job in `app/worker/kinds.py`, this module's
+    # own `list_registry`) tries a raw key against the registry BY ID
+    # before falling back to name, so a legacy name-keyed sync_state row
+    # sharing that string would resolve to the WRONG registry entry.
+    if "name" in updates and updates["name"] != existing.get("name"):
+        new_name = updates["name"]
+        collision = next(
+            (
+                r
+                for r in repo.list_all()
+                if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
+            ),
+            None,
+        )
+        if collision is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
+            )
     # Run BQ-shape validation BEFORE persisting whenever the merged record
     # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
     # or the patch touches BQ-relevant fields on an already-BQ row). Without
@@ -5321,15 +5619,17 @@ async def update_table(
                 ),
             )
 
-        # §3.2 — the physical-source twin: a DIFFERENT, distributable row
-        # pointing at the exact same physical source as an existing policied
-        # table would hand every granted analyst (via agnes pull) the raw
-        # rows the policy exists to withhold. Runs on every write to a
-        # distributable row, independent of which fields this particular
-        # PUT changed — the danger is the merged row's current shape, not
-        # the delta. Shared with register_table's own call to the same
-        # helper via _check_access_policy_physical_source_conflict, so a
-        # brand-new twin is caught at registration too, not only here.
+        # §3.2 — the physical-source twin: a DIFFERENT row with no policy of
+        # its own, pointing at the exact same physical source as an existing
+        # policied table, hands every granted analyst the raw rows the policy
+        # exists to withhold — through `agnes pull` when it is distributable,
+        # and through `/api/query` resolving its name server-side when it is
+        # not. Runs on every write that leaves the merged row UNPOLICIED (the
+        # earlier draft keyed on distributability, which a live instance
+        # disproved), independent of which fields this particular PUT changed —
+        # the danger is the merged row's current shape, not the delta. Shared
+        # with register_table's own call to the same helper, so a brand-new twin
+        # is caught at registration too, not only here.
         _check_access_policy_physical_source_conflict(
             source_type=merged.get("source_type"),
             connection_id=merged.get("connection_id"),
@@ -5339,17 +5639,22 @@ async def update_table(
             source_query=merged.get("source_query"),
             query_mode=merged.get("query_mode"),
             server_only=bool(merged.get("server_only")),
+            has_access_policy=bool(merged.get("access_policy_sql")),
+            # Wording only — see the helper. A PUT that REMOVES a policy is
+            # still refused while another policied row covers the same source
+            # (that is the disclosure), but the default message tells the admin
+            # to attach a policy they are in the middle of removing.
+            clearing_policy=bool(existing.get("access_policy_sql")) and not merged.get("access_policy_sql"),
             exclude_id=table_id,
         )
 
         # §3.2, the OTHER direction — the check just above is structurally
-        # blind to it. It returns early unless the row it is called for is
-        # itself distributable, and a policied row never is (the §3.1 check
-        # right above forces remote/server_only), so on the attach path it
-        # can only ever reject the TWIN's own write. A twin registered
-        # BEFORE the policy existed is never PUT again, so nothing would
-        # ever run that check for it: scan for one here instead.
-        _check_policied_row_has_no_distributable_twin(merged, table_id=table_id)
+        # blind to it. It returns early whenever the row it is called for
+        # carries a policy of its own, which on the attach path is always the
+        # case, so it can only ever reject the TWIN's own write. A twin
+        # registered BEFORE the policy existed is never PUT again, so nothing
+        # would ever run that check for it: scan for one here instead.
+        _check_policied_row_has_no_unpolicied_twin(merged, table_id=table_id)
 
         # §14.6 — the live LIMIT 0 execution probe. Runs LAST among the
         # policy-write checks: after static validation (rule 1-5, above)
@@ -5420,7 +5725,14 @@ async def update_table(
     if after.get("source_type") == "bigquery":
         _schedule_bq_materialize(background)
     if after.get("source_type") == "snowflake" and after.get("query_mode") == "remote":
-        background.add_task(_rebuild_snowflake_remote_extract_bg)
+        # The POST-update name, not `existing`'s. `sync_state.table_id ==
+        # table_registry.name` by convention, and the rebuild attributes its
+        # per-table errors from the CURRENT registry rows — so on a PUT that
+        # renames the row, the old name is absent from `failed_tables` no
+        # matter what happened, the "not in failed_tables" guard passes, and a
+        # rename that left the table still broken would clear the only record
+        # of the failure. Renames are an anticipated case here (see above).
+        background.add_task(_rebuild_snowflake_remote_extract_bg, after.get("name") or table_id)
 
     from app.api.v2_catalog import invalidate_for_table
 
@@ -6316,6 +6628,34 @@ async def configure_instance(
                     "back up and remove the file, or fix it by hand",
                 ) from e
 
+        # Same repoint gate as POST /server-config. This endpoint writes the
+        # very same `data_source.<source>` coordinates, so skipping it here
+        # would leave a second, unguarded door to the same silent breakage
+        # (the wizard is admin-callable long after first boot). Compared
+        # against the EFFECTIVE config, not the overlay: a connection that
+        # lives in the static instance.yaml is what registrations resolved
+        # against, and reading only the overlay would score it as unset and
+        # report a change where there is none.
+        repoint_patch: Dict[str, Dict[str, Any]] = {}
+        if request.data_source == "keboola":
+            repoint_patch = {"keboola": {"stack_url": request.keboola_url, "token_env": "KEBOOLA_STORAGE_TOKEN"}}
+        elif request.data_source == "bigquery":
+            repoint_patch = {
+                "bigquery": {
+                    "project": request.bigquery_project,
+                    "location": request.bigquery_location or "us",
+                }
+            }
+        if repoint_patch:
+            from app.instance_config import reset_cache as _reset_config_cache
+
+            _reset_config_cache()
+            _guard_connection_repoint(
+                _load_current_instance_yaml(),
+                {"data_source": repoint_patch},
+                request.confirm_connection_change,
+            )
+
         # Merge instance settings into the overlay only — never seed from the
         # env-resolved merged config.
         if request.instance_name:
@@ -6622,9 +6962,10 @@ def _build_keboola_discovery_plan(
                         "access_policy_physical_source_conflict: this source is already "
                         f"registered as {policied_twin.get('id')!r} "
                         f"({policied_twin.get('name')!r}) with an access policy attached -- "
-                        "auto-discovery would register a distributable copy that routes the "
-                        "policy around; register it by hand with server_only=true if you "
-                        "need a second row"
+                        "auto-discovery would register a copy with no policy of its own, "
+                        "which routes the policy around; if you need a second row, register "
+                        "it by hand and attach a policy to it in the same breath, or point "
+                        "it at a different physical source"
                     ),
                 }
             )
@@ -6669,17 +7010,14 @@ def _discover_and_register_tables(
         }
 
     from connectors.keboola.client import KeboolaClient
+    from app.datasource_secrets import keboola_instance_token
 
     # Read from data_source.keboola (matches what /api/admin/configure writes)
     url = get_value("data_source", "keboola", "stack_url", default="")
     token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-    token = os.environ.get(token_env, "") if token_env else ""
-    if not token:
-        from app.datasource_secrets import datasource_secret
+    token, _provenance = keboola_instance_token(token_env)
 
-        token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-
-    client = KeboolaClient(token=token, url=url)
+    client = KeboolaClient(token=token or "", url=url)
     discovered = client.discover_all_tables()
 
     plan = _build_keboola_discovery_plan(conn, discovered)
@@ -7948,6 +8286,41 @@ async def run_blocked_purge(
         action="run_blocked_purge",
         resource="job:store-blocked-purge",
         params={"ttl_days": ttl, "purged": result.get("purged", 0), "skipped": result.get("skipped", False)},
+    )
+    return {"ok": True, "details": result}
+
+
+# ---------------------------------------------------------------------------
+# B8: scheduled retention pruning of audit_log
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run-audit-prune")
+async def run_audit_prune(
+    user: dict = Depends(require_admin),
+):
+    """Trigger the retention-based ``audit_log`` prune.
+
+    Wraps :func:`src.audit_retention.prune_audit_log`. The scheduler service
+    hits this endpoint daily (under ``SCHEDULER_API_TOKEN`` like the
+    corporate-memory + blocked-purge jobs); admins can also run it on demand.
+
+    ``retention_days`` comes from ``audit.retention_days`` (default 365, 0
+    keeps rows forever). Only ``audit_log`` has a retention policy — see
+    docs/observability.md for the other audit/observability trails.
+    """
+    from app.instance_config import get_audit_retention_days
+    from src.audit_retention import prune_audit_log
+
+    retention_days = get_audit_retention_days()
+    result = prune_audit_log(retention_days=retention_days)
+
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="run_audit_prune",
+        resource="job:audit-prune",
+        params={"retention_days": retention_days, **result},
     )
     return {"ok": True, "details": result}
 

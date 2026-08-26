@@ -75,6 +75,7 @@ const DBState = {
 
   renderState(data) {
     const backend = data.backend;
+    this._currentBackend = backend;
 
     // Status header — hero strip on /admin/database, or the legacy
     // single-card view (#db-state-card) that older calls still render.
@@ -100,6 +101,7 @@ const DBState = {
     const transitionBtns = data.allowed_transitions.map(t => ({
       target: t,
       label: this._transitionLabel(backend, t),
+      disabled: this._isNotYetSupported(t),
     }));
 
     if (actionsEl) {
@@ -111,14 +113,14 @@ const DBState = {
         }
       } else {
         actionsEl.innerHTML = transitionBtns
-          .map(b => `<button class="btn" data-target="${b.target}">${b.label}</button>`)
+          .map(b => `<button class="btn btn-primary" data-target="${b.target}"${b.disabled ? ' disabled title="Not yet available"' : ''}>${b.label}</button>`)
           .join(' ');
         if (helpEl) {
           helpEl.textContent = `Pick a target to start a migration. The
             host applier will copy data, restart the app on the new backend,
             and verify row counts. Progress shows below.`;
         }
-        actionsEl.querySelectorAll('button[data-target]').forEach(btn => {
+        actionsEl.querySelectorAll('button[data-target]:not([disabled])').forEach(btn => {
           btn.addEventListener('click', () => this.handleTransitionClick(btn.dataset.target));
         });
       }
@@ -127,8 +129,11 @@ const DBState = {
       // section in case any installation still has it embedded).
       const legacyEl = document.getElementById('db-state-card');
       if (legacyEl) {
+        // Same `disabled` treatment as the primary view above: this branch is
+        // reached only by an installation still embedding the old card, and a
+        // clickable "Migrate to duckdb" there fails exactly the same way.
         const html = transitionBtns
-          .map(b => `<button class="btn btn-primary" data-target="${b.target}">${b.label}</button>`)
+          .map(b => `<button class="btn btn-primary" data-target="${b.target}"${b.disabled ? ' disabled title="Not yet available"' : ''}>${b.label}</button>`)
           .join(' ');
         legacyEl.innerHTML = `
           <div class="card">
@@ -138,7 +143,7 @@ const DBState = {
             <div class="actions">${html}</div>
           </div>
         `;
-        legacyEl.querySelectorAll('button[data-target]').forEach(btn => {
+        legacyEl.querySelectorAll('button[data-target]:not([disabled])').forEach(btn => {
           btn.addEventListener('click', () => this.handleTransitionClick(btn.dataset.target));
         });
       }
@@ -171,15 +176,54 @@ const DBState = {
         ? 'Migrate straight to managed Postgres'
         : 'Migrate to managed Postgres';
     }
+    if (target === 'duckdb_quack') {
+      return 'Migrate to DuckDB Quack (coming soon)';
+    }
+    if (target === 'duckdb') {
+      return 'Migrate back to DuckDB (not yet supported)';
+    }
     return `Migrate to ${target}`;
   },
 
+  // Targets reserved in the state-machine's transition graph but not yet
+  // runtime-supported (the migrate endpoint always 501s them today).
+  // Must equal the set app/api/db_state.py refuses with 501 — today
+  // ("duckdb", "duckdb_quack"). `duckdb` is in `allowed_transitions` from
+  // side_car, cloud AND duckdb_quack (src/db_state_machine.py), which is every
+  // backend an operator would ever open this page from, so leaving it out left
+  // an ENABLED button labelled "Migrate to duckdb" (raw enum, the exact bug
+  // class the duckdb_quack label fixes) that pops the irreversibility warning
+  // and then 501s. Pinned by test_admin_database_migration_ux.py, which reads
+  // both sets and compares them.
+  _isNotYetSupported(target) {
+    return target === 'duckdb_quack' || target === 'duckdb';
+  },
+
   async handleTransitionClick(target) {
+    const label = this._transitionLabel(this._currentBackend, target);
     let cloudUrl = null;
     if (target === 'cloud') {
-      cloudUrl = await promptModal('Cloud PG connection string (postgresql+psycopg://user:pass@host:5432/db):');
+      cloudUrl = await promptModal({
+        title: 'Migrate to managed cloud Postgres',
+        message: 'Cloud PG connection string (postgresql+psycopg://user:pass@host:5432/db):',
+        inputType: 'password',
+      });
       if (!cloudUrl) return;
     }
+    const confirmed = await confirmModal({
+      title: `${label}?`,
+      // "not implemented yet", NOT "impossible". src/db_state_machine.py
+      // documents `SIDE_CAR / CLOUD -> DUCKDB` and CLAUDE.md's dual-backend
+      // section explicitly retires the forward-only framing — an absolute that
+      // is wrong in principle is how an operator talks themselves out of a
+      // supported migration.
+      message: 'This starts a real backend cutover. It cannot be cancelled '
+        + 'once the copy completes, and reverse migration back to DuckDB is '
+        + 'not implemented yet — so treat it as one-way for now.',
+      danger: true,
+      confirmText: 'Migrate',
+    });
+    if (!confirmed) return;
     try {
       const { job_id } = await this.startMigration(target, cloudUrl);
       this.startPolling(job_id);
