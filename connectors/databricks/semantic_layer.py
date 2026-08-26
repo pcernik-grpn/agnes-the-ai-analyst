@@ -259,6 +259,17 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     ``created_or_updated``/``pruned`` count ``semantic_models`` upserts/prunes
     (mirrors ``ImportReport.models_written``/``models_pruned`` in the generic
     pipeline — the flat-table equivalents would be permanently zero here).
+    A ``documents == []`` pass from ``extract_documents`` (zero metric views
+    found, or every view's ``SHOW CREATE TABLE`` call failing transiently —
+    neither raises ``DatabricksApiError``) never prunes previously-stored
+    ``semantic_models`` documents for this workspace; it is indistinguishable
+    from "upstream genuinely has none now", so the prune is skipped and
+    logged instead — mirrors ``connectors/keboola/semantic_layer.py
+    ::_sync_one_source``'s own ``if not models`` guard. (``project_document``'s
+    own ``safe_prune=True`` below is a SEPARATE guard, scoped to the flat
+    ``metric_definitions``/glossary tables it writes — it does not, by
+    itself, protect ``semantic_models``.)
+
     Any row still stamped with the retired
     ``source='databricks_semantic_layer'`` label is purged within this
     workspace's own scope once at least one metric view's document was
@@ -367,7 +378,30 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
         )
         counters["created_or_updated"] += 1
 
-    pruned_slugs = repo.delete_missing(source=SOURCE_LABEL, source_ref=source_ref, keep_slugs=keep_slugs)
+    # A `documents == []` pass — zero metric views found, or every view's
+    # `SHOW CREATE TABLE` call failing transiently and being swallowed into
+    # `skipped_unparseable` by `extract_documents` (neither raises
+    # `DatabricksApiError`, so the `except` above never fires) — is
+    # indistinguishable here from "upstream genuinely has zero metric views
+    # now". Calling `delete_missing` with an empty `keep_slugs` in that case
+    # would wipe every previously-stored document for this workspace on what
+    # may be a transient fetch failure. Mirrors
+    # `connectors/keboola/semantic_layer.py::_sync_one_source`'s own
+    # `if not models: return empty_result` guard — skip only the prune (the
+    # rest of this pass, e.g. discovery counters, still runs) and log loudly
+    # instead of silently deleting good data.
+    if not documents and existing_by_slug:
+        logger.warning(
+            "Databricks semantic layer: upstream returned zero metric-view documents for "
+            "workspace %s while %d document(s) were previously stored — skipping the "
+            "semantic_models prune this pass instead of risking a wipe on a transient fetch "
+            "failure (see connectors/databricks/semantic_ossie.py::extract_documents).",
+            source_ref,
+            len(existing_by_slug),
+        )
+        pruned_slugs: list[str] = []
+    else:
+        pruned_slugs = repo.delete_missing(source=SOURCE_LABEL, source_ref=source_ref, keep_slugs=keep_slugs)
     counters["pruned"] = len(pruned_slugs)
 
     merged: dict[str, list] = {"semantic_model": []}

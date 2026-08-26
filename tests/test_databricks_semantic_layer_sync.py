@@ -135,15 +135,46 @@ class TestSyncSemanticLayer:
         assert result["created_or_updated"] == 0
         assert result["pruned"] == 0
 
-    def test_prunes_documents_removed_upstream(self, e2e_env):
+    def test_prunes_documents_actually_removed_upstream(self, e2e_env):
+        """When the upstream fetch itself is non-empty, a view genuinely
+        dropped from one pass to the next is still pruned — only a
+        `documents == []` pass is guarded (see
+        test_zero_fetch_does_not_wipe_existing_documents)."""
+        from src.repositories import semantic_model_repo
+
+        two_views = [
+            ("main", "sales", "orders_metrics", "Sales KPIs"),
+            ("main", "sales", "customers_metrics", "Customer KPIs"),
+        ]
+        other_doc_id = "databricks_metrics/dbc-test.cloud.databricks.com/main.sales.customers_metrics"
+        _sync(FakeStatementClient(views=two_views))
+        assert semantic_model_repo().get(_DOC_ID) is not None
+        assert semantic_model_repo().get(other_doc_id) is not None
+
+        result = _sync(FakeStatementClient(views=[two_views[0]]))
+        assert result["pruned"] == 1
+        assert semantic_model_repo().get(_DOC_ID) is not None
+        assert semantic_model_repo().get(other_doc_id) is None
+
+    def test_zero_fetch_does_not_wipe_existing_documents(self, e2e_env):
+        """A successful-but-empty metric-view fetch (`documents == []` —
+        either zero views found, or every view's `SHOW CREATE TABLE` call
+        failing transiently, see
+        connectors/databricks/semantic_ossie.py::extract_documents) must NOT
+        prune every previously-stored `semantic_models` document for this
+        workspace — mirrors Keboola's own `if not models` guard
+        (connectors/keboola/semantic_layer.py::_sync_one_source,
+        tests/test_keboola_semantic_layer_sync.py
+        ::test_empty_metrics_does_not_wipe_existing_rows)."""
         from src.repositories import semantic_model_repo
 
         _sync(FakeStatementClient())
         assert semantic_model_repo().get(_DOC_ID) is not None
 
         result = _sync(FakeStatementClient(views=[]))
-        assert result["pruned"] == 1
-        assert semantic_model_repo().get(_DOC_ID) is None
+        assert result["status"] == "ok"
+        assert result["pruned"] == 0
+        assert semantic_model_repo().get(_DOC_ID) is not None
 
     def test_unparseable_view_is_counted_not_fatal(self, e2e_env):
         result = _sync(FakeStatementClient(yaml_by_view={"orders_metrics": None}))
