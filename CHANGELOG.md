@@ -31,6 +31,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unrelated upgrade (new helper `scripts/ops/agnes-chat-sandbox-image.sh`,
   idempotent via an `agnes.chat-sandbox.source` label carrying the hash of
   the whole build context).
+- **Alternate / private image registry support (`AGNES_IMAGE_REPO`).** The
+  app-image repository is now a single seam instead of a hardcoded
+  reference: the compose overlays interpolate
+  `${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}`, the
+  recurring host scripts (`agnes-auto-upgrade.sh`,
+  `agnes-state-applier.sh`) read the same key from `/opt/agnes/.env` and
+  export it for compose, and the Terraform module writes it from its
+  existing `image_repo` variable. For a GCP Artifact Registry repository
+  (`*-docker.pkg.dev` — `release.yml` can already mirror images there) the
+  startup script runs `gcloud auth configure-docker` before the first
+  pull, so the VM's own service account authenticates and the recurring
+  ticks inherit the credential helper — an instance can run entirely from
+  a private registry with no long-lived registry secret on the VM. Default
+  behavior is unchanged.
+
 - **Shared-agent runtime: a user an agent was shared with can now run it**
   (remediation program Track C, C2.3). Previously only an agent's OWNER
   could open a session against it — a `ResourceType.AGENT` grant (the

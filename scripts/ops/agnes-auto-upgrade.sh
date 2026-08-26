@@ -70,6 +70,11 @@ COMPOSE_FILE="$(_env_get COMPOSE_FILE)"
 # later wave (this one only makes the host scripts role-split-ready).
 SCHEDULER_API_TOKEN="$(_env_get SCHEDULER_API_TOKEN)"
 COMPOSE_PROFILES="$(_env_get COMPOSE_PROFILES)"
+# AGNES_IMAGE_REPO: alternate registry/repository for the app image (e.g. a
+# GCP Artifact Registry mirror when the default registry needs auth the VM
+# doesn't have). Written by startup-script.sh.tpl from the module's
+# `image_repo` variable; empty → the compose files' default. Exported so
+# `docker compose` interpolates the same repo this script pulls/inspects.
 # Hosted data apps run under the `apps` compose profile, applied as a --profile
 # flag below (NOT via COMPOSE_PROFILES: compose ignores that env var whenever any
 # --profile flag — e.g. `--profile tls` — is present; the two are not merged).
@@ -83,7 +88,8 @@ CHAT_PROVIDER="$(_env_get AGNES_CHAT_PROVIDER)"
 # The runtime image data apps actually run. Pre-pulled below so the first
 # deploy on this host isn't a 1.3 GB fetch inside the runner's request.
 DATA_APPS_RUNTIME_IMAGE="$(_env_get AGNES_DATA_APPS_RUNTIME_IMAGE)"
-export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES
+AGNES_IMAGE_REPO="$(_env_get AGNES_IMAGE_REPO)"
+export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES AGNES_IMAGE_REPO
 
 STATE_DIR="${STATE_DIR:-/data/state}"
 
@@ -131,7 +137,7 @@ if [ -e "$CONFIG_DEVICE" ]; then
   mount --make-rprivate "$STATE_DIR" 2>/dev/null || true
 fi
 
-IMAGE="ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}"
+IMAGE="${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}"
 # Array form (vs. word-split string) — quoted expansion survives paths
 # with spaces and is the modern bash idiom. Functionally identical here
 # since /opt/agnes paths are tame, but it's a cheap habit to keep.

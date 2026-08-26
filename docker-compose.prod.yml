@@ -6,24 +6,24 @@
 # docker-compose.host-mount.yml — which binds the `data` named volume to /data.
 services:
   app:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   scheduler:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   extract:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   telegram-bot:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # apps-runner (compose profile `apps`) is a `build: .` service like the four
   # above and MUST get the same image override: production/Terraform VMs extract
   # only the compose files + host scripts into /opt/agnes (no Dockerfile / source
   # on disk), so without this `docker compose --profile apps up` would try to
   # build it, find no Dockerfile, and abort the whole stack's boot.
   apps-runner:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # egress-proxy (compose profile `chat-docker-egress`) — same source-less
   # prod-VM reasoning as apps-runner above.
   egress-proxy:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # kai-agent-stub (compose profile `kai-stub`) is the DEVELOPMENT stub engine
   # and has no business running on a prod VM — but it carries `build: .`, and
   # the override is what keeps a source-less host from trying to build it if
@@ -33,6 +33,6 @@ services:
   # answers with fixtures. The real engine is the `kai-agent` service a
   # deployment brings its own overlay for.
   kai-agent-stub:
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # corporate-memory and session-collector were dropped in #176 —
   # the scheduler container drives them via /api/admin/run-* endpoints.
