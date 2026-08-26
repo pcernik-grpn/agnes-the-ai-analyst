@@ -1346,8 +1346,23 @@ the registry that replaced the builder's browser-only draft store. Reads are
 grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
 only the owner or an admin may edit or delete.
 
+`POST /api/agents/{agent_id}/builder/turn` (owner only) runs one turn of the
+builder's conversational assistant: it takes the owner's message plus the
+transcript so far, asks the configured LLM for a configuration patch, and
+applies the patch through the same `PATCH /api/agents/{agent_id}` path a hand
+edit uses — so the builder-declaration → enforced-scope derivation is
+identical either way. The model's proposal is filtered before it is written:
+unknown fields, knowledge/plugin ids outside the caller's own candidate
+lists, and tones outside the four the UI offers are dropped, and neither
+`status` nor the `*_mode` scope columns are writable from a conversation.
+Returns `{reply, patch, agent, suggestions}` — `agent` is the updated row (or
+`null` when the turn only asked a question). Answers `503
+builder_llm_unavailable` when no AI credential is configured, since the
+builder's form remains fully usable by hand.
+
 - /api/agents
 - /api/agents/{agent_id}
+- /api/agents/{agent_id}/builder/turn
 
 ### `/api/sharing` — Owner-initiated sharing of Library items
 

@@ -2723,6 +2723,11 @@ KNOWN_UNTESTED = {
     "GET /api/agents/{agent_id}",
     "PATCH /api/agents/{agent_id}",
     "DELETE /api/agents/{agent_id}",
+    # Builder-assistant turn — covered by tests/test_agent_builder_turns.py
+    # (DuckDB). It has no PG-specific behaviour of its own: every write it
+    # makes goes through PATCH /api/agents/{agent_id} above, whose backend
+    # split is already exercised by tests/db_pg/test_agents_contract.py.
+    "POST /api/agents/{agent_id}/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
