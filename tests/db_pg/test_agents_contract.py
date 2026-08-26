@@ -140,6 +140,16 @@ def test_get_runnable_by_slug_denies_stranger(stack):
     assert agents.get_runnable_by_slug("u2", "a1") is None
 
 
+def test_get_runnable_by_slug_unknown_returns_none(stack):
+    """A slug/id that matches no agent at all resolves to None on both
+    backends — the outright miss branch, distinct from an agent that exists
+    but the caller may not reach."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    assert agents.get_runnable_by_slug("u1", "does-not-exist") is None
+    assert agents.get_runnable_by_slug("u1", "a9999") is None
+
+
 def test_get_runnable_by_slug_via_group_grant_resolves_by_id(stack):
     """A shared agent is addressed by its id, not the owner's slug — slug
     is only unique per-owner, so it is meaningless in a grantee's

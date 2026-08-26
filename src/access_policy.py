@@ -30,11 +30,15 @@ Two outcomes:
   enforcement site's job, not this resolver's.
 
 Identity resolution (§12): a plain user dict binds itself; an
-``AgentPrincipal`` binds its *owner*'s identity (an agent's declared scope
-narrows which tables it reaches, never who it reaches them as — handing it
-``$user_groups`` for anyone but the owner would be a privilege escalation);
-a ``SessionPrincipal`` (co-drive, several live participants, no single
-identity) has nothing to bind and is refused outright rather than guessed.
+``AgentPrincipal`` binds its *caller*'s identity — the user actually
+running the (possibly shared) agent — falling back to the owner only when
+no distinct caller is set (the owner running their own agent). A shared
+agent runs *as* its caller, so row policies filter by the caller's
+``$user_email``/``$user_id``/``$user_groups``, never the owner's; an
+agent's declared scope narrows which tables it reaches, never who it
+reaches them as. A ``SessionPrincipal`` (co-drive, several live
+participants, no single identity) has nothing to bind and is refused
+outright rather than guessed.
 """
 
 from __future__ import annotations
@@ -904,10 +908,11 @@ def policy_cache_identity(principal, *, table_id: str) -> tuple[str | None, tupl
 
     Reuses ``_resolve_identity``'s own principal-shape handling rather than
     inventing a second one: a plain user dict binds itself, an
-    ``AgentPrincipal`` binds its OWNER -- the same identity
+    ``AgentPrincipal`` binds its CALLER -- the same identity
     ``policied_relation`` would actually execute the policy as for it, so
     an agent's cached slice is correctly shared with (and only with) other
-    callers reading as that same owner -- and a ``SessionPrincipal`` raises
+    requests reading as that same caller (never leaked across grantees) --
+    and a ``SessionPrincipal`` raises
     ``PolicyIdentityUnresolvable`` here exactly as ``policied_relation``
     would a moment later: refused before a cache lookup ever computes a key
     from an identity the resolver is about to refuse outright, rather than
