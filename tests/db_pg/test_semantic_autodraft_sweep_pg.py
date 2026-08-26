@@ -70,17 +70,18 @@ def fake_chat_manager():
     set_current_chat_manager(None)
 
 
-def _patch_run_one_shot(monkeypatch, *, raise_cap_for=(), apply_for=(), calls=None):
+def _patch_run_one_shot(monkeypatch, *, raise_cap_for=(), apply_for=(), raise_error_for=(), calls=None):
     """Mock ``app.chat.headless.run_one_shot`` — the sweep endpoint imports
     it locally per-request, so patching the module attribute (not any
     importer's copy) is the correct seam, mirroring
     ``tests/test_agent_responses_api.py``.
 
-    ``raise_cap_for`` / ``apply_for`` are iterables of substrings matched
-    against the rendered prompt (which always embeds the table id) to
-    decide, per call, whether to raise ``ConcurrencyCapHit`` or simulate an
-    ``apply_semantic_model`` call by writing a real ``authoring_suggestions``
-    row.
+    ``raise_cap_for`` / ``apply_for`` / ``raise_error_for`` are iterables of
+    substrings matched against the rendered prompt (which always embeds the
+    table id) to decide, per call, whether to raise ``ConcurrencyCapHit``,
+    simulate an ``apply_semantic_model`` call by writing a real
+    ``authoring_suggestions`` row, or raise an arbitrary non-cap error
+    (a broker/LLM/spawn failure).
     """
     from app.chat import headless
 
@@ -98,6 +99,8 @@ def _patch_run_one_shot(monkeypatch, *, raise_cap_for=(), apply_for=(), calls=No
         )
         if any(marker in prompt for marker in raise_cap_for):
             raise ConcurrencyCapHit("cap")
+        if any(marker in prompt for marker in raise_error_for):
+            raise RuntimeError("broker exploded")
         if any(marker in prompt for marker in apply_for):
             from src.repositories import authoring_suggestions_repo
 
@@ -120,7 +123,14 @@ class TestNoChatManager:
         r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body == {"triggered": 0, "applied": 0, "no_apply_call": 0, "skipped_cap": 0, "remaining": 1}
+        assert body == {
+            "triggered": 0,
+            "applied": 0,
+            "no_apply_call": 0,
+            "skipped_cap": 0,
+            "errored": 0,
+            "remaining": 1,
+        }
 
         from src.repositories import table_registry_repo
 
@@ -263,6 +273,54 @@ class TestConcurrencyCapDegradation:
         assert r2.status_code == 200, r2.text
         assert r2.json()["triggered"] == 1
         assert len(calls) == 1 and "capped" in calls[0]["prompt"]
+
+
+class TestSessionErrorDegradation:
+    """A non-cap session failure is the same stuck-flag hazard, one step
+    wider: nothing would ever clear the stamp, so the table would be
+    filtered out of every later tick silently — and one bad table would
+    500 the whole request, abandoning the rest of the batch (Devin review).
+    """
+
+    def test_session_error_is_counted_not_raised_and_does_not_strand_the_batch(
+        self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
+    ):
+        _skip_unless_pg(state_backend)
+        from src.repositories import table_registry_repo
+
+        _register_uncovered("boom")
+        _register_uncovered("fine")
+        calls = _patch_run_one_shot(monkeypatch, raise_error_for=("boom",))
+
+        c = seeded_app_both["client"]
+        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["errored"] == 1
+        # The failure did not abandon the rest of the batch.
+        assert body["triggered"] == 1
+        assert len(calls) == 2
+
+        registry = table_registry_repo()
+        assert registry.get("boom")["semantic_draft_pending_at"] is None
+        assert registry.get("fine")["semantic_draft_pending_at"] is not None
+
+    def test_errored_table_is_retried_on_a_later_tick(
+        self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
+    ):
+        _skip_unless_pg(state_backend)
+        _register_uncovered("boom")
+        _patch_run_one_shot(monkeypatch, raise_error_for=("boom",))
+
+        c = seeded_app_both["client"]
+        h = _auth(seeded_app_both["admin_token"])
+        assert c.post("/api/admin/semantic-auto-draft-sweep", headers=h).json()["errored"] == 1
+
+        calls = _patch_run_one_shot(monkeypatch)
+        r2 = c.post("/api/admin/semantic-auto-draft-sweep", headers=h)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["triggered"] == 1
+        assert len(calls) == 1 and "boom" in calls[0]["prompt"]
 
 
 class TestAppliedDetection:

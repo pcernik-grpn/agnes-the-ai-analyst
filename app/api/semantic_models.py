@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -44,6 +45,8 @@ from src.semantic.projection import project_document, prune_model
 from src.semantic_context import get_semantic_context as _get_semantic_context
 from src.semantic_context import get_semantic_schema as _get_semantic_schema
 from src.semantic_validation import validate_query
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["semantic-models"])
 
@@ -350,8 +353,18 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     suggestion will ever exist to clear the flag on resolution. Left set,
     the flag would exclude the table from every future sweep permanently.
 
+    ANY other failure from a table's session is treated the same way and
+    for the same reason (counted in ``errored``): the table is un-stamped,
+    logged, and the sweep moves on to the next one rather than letting one
+    transient broker/LLM/spawn error 500 the whole tick and abandon the
+    rest of the batch. Un-stamping on an error the session may have
+    survived can at worst cost a duplicate draft — one extra queued
+    suggestion an admin rejects — whereas leaving it stamped costs the
+    table its eligibility forever, silently. The bounded, visible failure
+    is the right one to choose.
+
     Returns ``{"triggered": N, "applied": A, "no_apply_call": X,
-    "skipped_cap": M, "remaining": R}`` — ``applied`` counts a table whose
+    "skipped_cap": M, "errored": E, "remaining": R}`` — ``applied`` counts a table whose
     session produced a NEW ``authoring_suggestions`` row before this
     call's wait ended, detected by diffing the semantic-drafter's pending
     suggestion count immediately before and after each session (sessions
@@ -385,7 +398,14 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     if manager is None:
         # Chat disabled instance-wide — nothing this tick can do. Leave
         # every candidate untouched (no pending stamp) for a later tick.
-        result = {"triggered": 0, "applied": 0, "no_apply_call": 0, "skipped_cap": 0, "remaining": len(candidates)}
+        result = {
+            "triggered": 0,
+            "applied": 0,
+            "no_apply_call": 0,
+            "skipped_cap": 0,
+            "errored": 0,
+            "remaining": len(candidates),
+        }
         audit_repo().log(
             user_id=user.get("id"),
             client_kind=client_kind_from_user(user),
@@ -417,6 +437,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     applied = 0
     no_apply_call = 0
     skipped_cap = 0
+    errored = 0
 
     for table in batch:
         registry.mark_semantic_draft_pending(table["id"])
@@ -443,6 +464,25 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
             registry.clear_semantic_draft_pending(table["id"])
             skipped_cap += 1
             continue
+        except Exception:
+            # Same stuck-flag hazard as the cap branch, one step wider: a
+            # broker/LLM error, a session-spawn failure, anything at all.
+            # Left stamped, the table is filtered out of every future
+            # tick's candidates and is never drafted again — silently.
+            # Un-stamping can at worst cost a duplicate draft (if the
+            # session did start and still lands a suggestion later, an
+            # admin rejects one extra queued proposal); that is bounded and
+            # visible, where permanent exclusion is neither. Swallowing the
+            # error also keeps one bad table from 500-ing the tick and
+            # abandoning the rest of the batch.
+            logger.exception(
+                "semantic auto-draft sweep: session failed for table %s — "
+                "clearing its pending flag so a later tick can retry it",
+                table["id"],
+            )
+            registry.clear_semantic_draft_pending(table["id"])
+            errored += 1
+            continue
         triggered += 1
         if _pending_count() > before:
             applied += 1
@@ -454,6 +494,7 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
         "applied": applied,
         "no_apply_call": no_apply_call,
         "skipped_cap": skipped_cap,
+        "errored": errored,
         "remaining": remaining,
     }
     audit_repo().log(
