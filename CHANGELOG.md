@@ -40,6 +40,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   MCP-exposed — issuing a setup token is credential provisioning, covered by
   the standing exemption in `CONTRIBUTING.md`.
 
+
+- **Per-caller usage attribution for shared agents** (remediation program
+  Track C, C2.4). A shared agent (C2.3) run by multiple callers now
+  records WHICH caller incurred each `llm_usage` row (`caller_user_id`,
+  Postgres-only column — see Internal below) rather than attributing every
+  call to the agent alone; the pre-existing `user_id` column keeps its old
+  meaning (the agent's owner). `GET /api/v1/agents/{slug}/usage` gains a
+  `by_caller` field — a per-caller token breakdown — visible to the
+  agent's owner or an admin only; a plain runnable grantee (C2.3) still
+  sees the aggregate total but never other callers' usage
+  (`by_caller: null`). Token-budget enforcement (`token_budget_monthly`)
+  is unchanged — still summed across the whole agent regardless of caller.
 - **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
   subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
   ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
@@ -436,6 +448,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   0073_agent_scope_granted_by.py` backfills every pre-existing row to its
   agent's `owner_user_id`.
 
+
+- **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
+  second genuine schema change on an existing DuckDB↔Postgres pair under
+  the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
+  "Adding a PG-only feature".** No DuckDB `_vN_to_v(N+1)` step, no
+  `SCHEMA_VERSION` bump; `LlmUsageRepository.insert_batch` (DuckDB) accepts
+  the same `caller_user_id` row key for call-site symmetry but has no
+  column to persist it into, and its new
+  `usage_breakdown_by_caller_for_month` degrades to a single, honestly
+  unattributed (`caller_user_id=None`) bucket there, while the Postgres
+  sibling groups by the real column. `migrations/versions/
+  0074_llm_usage_caller_user_id.py` adds the column with NO backfill — a
+  pre-existing row's actual caller is genuinely unknown, unlike
+  `granted_by`'s owner backfill (every pre-C2.1 write path was
+  ownership-gated; no equivalent fact exists for who was driving a past
+  turn).
 - **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
 - **PG-first development rule (remediation-program Track A3): the DuckDB

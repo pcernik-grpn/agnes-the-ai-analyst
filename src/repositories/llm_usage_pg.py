@@ -20,6 +20,9 @@ class LlmUsagePgRepository:
         self._engine = engine
 
     def insert_batch(self, rows: List[Dict[str, Any]]) -> None:
+        """``caller_user_id`` (C2.4, per-caller attribution) persists here —
+        see ``LlmUsageRepository.insert_batch``'s docstring for why the
+        DuckDB sibling accepts-but-drops it instead."""
         if not rows:
             return
         with self._engine.begin() as conn:
@@ -27,10 +30,10 @@ class LlmUsagePgRepository:
                 sa.text(
                     """
                     INSERT INTO llm_usage
-                      (id, agent_id, user_id, session_id, model,
+                      (id, agent_id, user_id, caller_user_id, session_id, model,
                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
                     VALUES
-                      (:id, :agent_id, :user_id, :session_id, :model,
+                      (:id, :agent_id, :user_id, :caller_user_id, :session_id, :model,
                        :input_tokens, :output_tokens, :cache_read_tokens, :cache_creation_tokens)
                     """
                 ),
@@ -39,6 +42,7 @@ class LlmUsagePgRepository:
                         "id": row["id"],
                         "agent_id": row.get("agent_id"),
                         "user_id": row.get("user_id"),
+                        "caller_user_id": row.get("caller_user_id"),
                         "session_id": row.get("session_id"),
                         "model": row.get("model"),
                         "input_tokens": row.get("input_tokens", 0),
@@ -93,6 +97,50 @@ class LlmUsagePgRepository:
             "cache_creation_tokens": cache_creation_tokens,
             "total_tokens": input_tokens + output_tokens + cache_creation_tokens,
         }
+
+    def usage_breakdown_by_caller_for_month(self, agent_id: str, year_month: str) -> List[Dict[str, Any]]:
+        """See `LlmUsageRepository.usage_breakdown_by_caller_for_month`'s
+        docstring — this backend actually groups by the real column, so a
+        shared agent (C2.3) run by several callers gets one row per
+        caller. `caller_user_id` is `NULL` for a row written before this
+        column existed, or by a caller who no longer resolves — never
+        silently merged into another caller's bucket."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    """
+                    SELECT
+                        caller_user_id,
+                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                        COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
+                    FROM llm_usage
+                    WHERE agent_id = :agent_id AND to_char(created_at, 'YYYY-MM') = :ym
+                    GROUP BY caller_user_id
+                    """
+                ),
+                {"agent_id": agent_id, "ym": year_month},
+            ).all()
+        result = []
+        for caller_user_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens in rows:
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens = (
+                int(input_tokens),
+                int(output_tokens),
+                int(cache_read_tokens),
+                int(cache_creation_tokens),
+            )
+            result.append(
+                {
+                    "caller_user_id": caller_user_id,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "total_tokens": input_tokens + output_tokens + cache_creation_tokens,
+                }
+            )
+        return result
 
     def list_for_agent(self, agent_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         with self._engine.connect() as conn:
