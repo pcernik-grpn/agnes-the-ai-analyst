@@ -32,20 +32,30 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # implementation) — list them here (route -> one-line reason) instead of
 # letting the sweep flag them. `assert_pg_only_exemptions_fail_clean` below
 # still requires each one to fail CLEAN (a typed 501) on DuckDB, not crash or
-# merely return some unrelated 4xx. Empty until the first PG-only route ships
-# (Track C); the mechanism itself is proven in
+# merely return some unrelated 4xx. The mechanism itself is proven in
 # `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
-_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {}
+_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "GET /api/admin/semantic-model/coverage": (
+        "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
+    ),
+}
 
 
 def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
 
+    # WHILE DuckDB IS STILL THE ACTIVE BACKEND. `build_seeded_client("pg", …)`
+    # below sets AGNES_DB_URL and reloads the repo factory process-wide, so
+    # `duck_client` stops being a DuckDB client the moment that runs — calling
+    # this after it re-ran every exempted route against Postgres and read the
+    # 200 as "the exemption is unjustified". Invisible while the exemption list
+    # was empty; the first real PG-only route (F4.1) is what surfaced it.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
+
     pg_client, pg_token = build_seeded_client("pg", tmp_path / "pg", monkeypatch, pg_engine)
     pg = collect_statuses(pg_client, pg_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
 
-    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
     divergences = diff_statuses(duck, pg, exempt=_PG_ONLY_ROUTE_EXEMPTIONS)
     assert not divergences, "GET status diverges between DuckDB and Postgres (backend-split):\n" + "\n".join(
         f"  {k}: duck={d} pg={g}" for k, (d, g) in sorted(divergences.items())

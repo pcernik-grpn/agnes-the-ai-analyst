@@ -120,6 +120,17 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # semantic layer against the table registry. Triple-surface with
     # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
     "admin_semantic_layer_coverage",
+    # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
+    # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
+    # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
+    # semantic-model coverage[ tag| untag]`. The tag/untag pair is NOT
+    # read_only and is deliberately NOT MCP-exempt: CONTRIBUTING.md's only
+    # standing exemptions are credential-provisioning writes and
+    # security-posture diagnostics, and "low-frequency admin action" is
+    # neither.
+    "semantic_model_coverage",
+    "semantic_model_coverage_tag",
+    "semantic_model_coverage_untag",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -1573,6 +1584,102 @@ def register_foundation_tools(
             )
             r.raise_for_status()
             return r.json()
+
+    @tool(read_only=True)
+    async def semantic_model_coverage(source: str = "") -> dict:
+        """What each connected data source still lacks, across every domain (admin only).
+
+        One entry per data source, one status per domain — semantic model,
+        metrics, glossary, skill, agent, knowledge base — as ``ok`` /
+        ``partial`` / ``missing`` / ``not_applicable``, each with a
+        one-sentence ``detail`` and, where a create flow exists, an
+        ``action``. Use it to answer "what is undocumented here" rather than
+        guessing from an empty catalog.
+
+        ``not_applicable`` is NOT a gap: it means the domain cannot be filled
+        for that source type in this build (e.g. no semantic-layer adapter
+        exists for it), so do not report it as work to do.
+
+        Broader than ``admin_semantic_layer_coverage`` above, which covers
+        Keboola's metric binding only — that report is one provider inside
+        this one, and rides along per-source as ``domains.semantic.raw``.
+
+        Args:
+            source: Optional source connection id to narrow to. ``__local__``
+                is the synthetic bucket for registered tables that belong to
+                no connection.
+
+        Mirrors ``GET /api/admin/semantic-model/coverage`` and
+        ``agnes semantic-model coverage``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-model/coverage",
+                params={"source": source} if source else None,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_tag(resource_type: str, resource_id: str, source_id: str) -> dict:
+        """Record that a skill / agent / knowledge domain is ABOUT a data source (admin only).
+
+        The one input the coverage report cannot derive: skills, agents and
+        memory domains live in their own tables with no notion of a source.
+
+        Args:
+            resource_type: ``marketplace_plugin`` (a skill) | ``agent`` |
+                ``memory_domain`` (a knowledge base).
+            resource_id: The same id format the RBAC grant for that type
+                uses — ``<marketplace_id>/<plugin_name>`` for a plugin, the
+                row id for an agent or memory domain.
+            source_id: The ``source_connections.id`` the resource is about.
+
+        Mirrors ``POST /api/admin/semantic-model/coverage/tags`` and
+        ``agnes semantic-model coverage tag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-model/coverage/tags",
+                json={
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "source_id": source_id,
+                },
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_untag(tag_id: str) -> dict:
+        """Remove one source tag (admin only).
+
+        Args:
+            tag_id: The tag's id, as carried in
+                ``semantic_model_coverage``'s ``domains.<domain>.raw``.
+
+        Mirrors ``DELETE /api/admin/semantic-model/coverage/tags/{tag_id}``
+        and ``agnes semantic-model coverage untag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-model/coverage/tags/{tag_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return {"deleted": tag_id}
 
     @tool(read_only=True)
     async def admin_knowledge_digests_list() -> dict:

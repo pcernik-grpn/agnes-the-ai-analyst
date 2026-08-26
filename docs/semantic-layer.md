@@ -239,6 +239,35 @@ custom_extensions:
 Not to be confused with `agnes admin semantic-model validate <file>` below,
 which schema-checks a *document*, offline, before it is ever stored.
 
+## Coverage: what each source still lacks
+
+`GET /api/admin/semantic-model/coverage` (admin, `/admin/semantic-layer` →
+**Coverage**) asks one question of **every** connected data source, not just
+the ones with a semantic model: is there a semantic model, are there metrics,
+glossary terms, a skill, a specialized agent, a knowledge base? Each answer is
+`ok` / `partial` / `missing` / `not_applicable`.
+
+Three things about it are deliberate:
+
+- **`not_applicable` is not a gap.** Only three adapters exist (see *Adapters*
+  above), so a BigQuery connection has no semantic-layer adapter at all.
+  Reporting that as `missing`, next to a link into a create flow that does not
+  exist for it, would invent work nobody can do.
+- **Detail depth follows the connector, not the vendor.** Every cell has one
+  `raw` slot in one place in the UI. Keboola's is fat because
+  `connectors/keboola/semantic_layer.py::compute_semantic_coverage` computes a
+  lot (token-identity mismatches, metrics blocked by their own definition,
+  unregistered dataset tables); Snowflake's is thin because its adapter does
+  not compute that yet. That report is a *provider* inside this one — it is
+  neither replaced nor duplicated, and its own endpoint
+  (`/api/admin/semantic-layer/coverage`) is unchanged.
+- **Skills, agents and knowledge domains have to be told.** They live in their
+  own registries with no notion of a data source, so the link is an explicit
+  admin act — `resource_source_tags`, maintained via `… coverage tag/untag`.
+  That table is **Postgres-only** (see `docs/migrations.md` → "Adding a PG-only
+  feature"), so on the frozen DuckDB app-state backend these routes answer
+  `501 requires_postgres_backend`.
+
 ## Commands
 
 ```bash
@@ -251,6 +280,10 @@ agnes admin semantic-model validate <file>   # offline: no server, no token
 agnes admin semantic-source add ... | list | sync <id>
 
 agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
+
+agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
+agnes semantic-model coverage tag <type> <resource-id> <source-id>
+agnes semantic-model coverage untag <tag-id>
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a

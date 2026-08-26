@@ -99,6 +99,7 @@ from src.models.rbac import (
 )
 from src.models.oauth import OAuthAccessToken, OAuthAuthCode, OAuthClient, OAuthRefreshToken
 from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
+from src.models.semantic_coverage import ResourceSourceTag
 from src.models.vault import SystemSecret
 
 
@@ -153,6 +154,7 @@ __all__ = [
     "PersonalAccessToken",
     "Recipe",
     "ResourceGrant",
+    "ResourceSourceTag",
     "SetupToken",
     "ScriptRegistry",
     "SemanticModel",

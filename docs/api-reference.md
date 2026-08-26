@@ -1189,6 +1189,49 @@ semantic layer routinely describes more of a project than an instance registers.
 CLI: `agnes admin semantic-layer coverage [--json]`. MCP:
 `admin_semantic_layer_coverage`.
 
+### `/api/admin/semantic-model/coverage` — Cross-domain completeness (admin)
+
+- /api/admin/semantic-model/coverage
+- /api/admin/semantic-model/coverage/tags
+- /api/admin/semantic-model/coverage/tags/{tag_id}
+
+`GET /api/admin/semantic-model/coverage` (admin) answers the wider question
+the endpoint above cannot: for **every** connected data source, not just
+Keboola, what is still missing across **six** domains — `semantic`, `metrics`,
+`glossary`, `skill`, `agent`, `knowledge_base`. Each is
+`{status, detail, action, raw}` with `status` one of `ok` / `partial` /
+`missing` / `not_applicable`.
+
+Note the path: `semantic-model` (singular), deliberately distinct from
+`semantic-layer` above. The Keboola report is not superseded — it is one
+provider inside this one, and rides along per-source as
+`domains.semantic.raw`, which is why a Keboola row's detail is richer than a
+Snowflake row's. That is a fact about what each connector computes, not a
+per-vendor design.
+
+`not_applicable` is not a gap: it means the domain cannot be filled for that
+source type in this build (e.g. no semantic-layer adapter exists for it), so
+it is never reported as work to do. `?source=<id>` narrows to one source;
+`__local__` is the synthetic bucket for registered tables that belong to no
+connection.
+
+`POST /api/admin/semantic-model/coverage/tags`
+(`{resource_type, resource_id, source_id}`) and
+`DELETE …/coverage/tags/{tag_id}` maintain the one input the report cannot
+derive: which skill (`marketplace_plugin`), agent (`agent`) or knowledge base
+(`memory_domain`) is *about* a source. 409 when the triple is already tagged,
+404 when the source or tag does not exist.
+
+**Postgres-only.** All three routes read `resource_source_tags`, which exists
+on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on
+an instance still running the frozen DuckDB app-state backend they answer
+`501` with `error: "requires_postgres_backend"`.
+
+CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
+`… coverage tag <type> <resource-id> <source-id>`, `… coverage untag <tag-id>`.
+MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
+`semantic_model_coverage_untag`.
+
 ### `/api/admin/semantic-models` and `/api/semantic-models` — Open semantic-layer contract
 
 Admin CRUD over canonical Apache Ossie semantic-model documents, plus a

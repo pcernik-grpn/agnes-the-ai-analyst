@@ -12,9 +12,9 @@ either a false-positive failure or a silent blind spot that could hide a real
 ``_parity_sweep_util.diff_statuses(..., exempt=...)`` +
 ``assert_pg_only_exemptions_fail_clean`` are that mechanism. These are unit
 tests against the mechanism itself (the "error path directly", per the A3
-work-package acceptance) — no live route exists yet that uses it (the first
-lands with Track C); the two production sweep files already wire an empty
-exemption dict ready for that.
+work-package acceptance); the live routes that use it are
+``/api/admin/semantic-model/coverage*`` (F4.1), listed in both production
+sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS``.
 
 The fail-clean check is intentionally narrow: TYPED 501
 (``body["error"] == "requires_postgres_backend"``), not "any 4xx/501" — a
@@ -163,10 +163,9 @@ def test_assert_pg_only_exemptions_fail_clean_no_exemptions_is_a_noop():
 
 
 def test_production_pg_only_exemptions_all_have_reasons():
-    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` are dicts today (empty
-    — no PG-only route exists yet); this guards the shape from the day the
-    first one lands (Track C) so an exemption can never be added without a
-    reason."""
+    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` are ``dict[str, str]``,
+    so an exemption can never be added without a stated reason a reviewer can
+    weigh."""
     import tests.db_pg.test_get_status_parity_sweep as get_sweep
     import tests.db_pg.test_mutation_status_parity_sweep as mutation_sweep
 

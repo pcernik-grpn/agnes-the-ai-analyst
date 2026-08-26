@@ -566,6 +566,13 @@ def cli_client_both(seeded_app_both, monkeypatch):
     # creates a local binding that is NOT updated by setattr on _v2_client above.
     # Under xdist, command modules are imported early in the process (before this
     # fixture runs), so we must also patch their local references directly.
+    #
+    # IDENTITY-checked, not name-checked: `api_delete` exists in BOTH cli.client
+    # (returns an httpx.Response) and cli.v2_client (returns parsed JSON, raises
+    # V2ClientError). Fourteen command modules import the former; a blanket
+    # patch-by-name handed them the latter, so any CLI DELETE driven through this
+    # fixture died on `.status_code`. cli.client's own helpers already route
+    # through the patched `get_client` above, so leaving them alone is correct.
     import sys as _sys
 
     _cmd_patches = {
@@ -577,7 +584,7 @@ def cli_client_both(seeded_app_both, monkeypatch):
     for _mod_name, _mod in list(_sys.modules.items()):
         if _mod_name.startswith("cli.commands.") and _mod is not None:
             for _attr, _replacement in _cmd_patches.items():
-                if hasattr(_mod, _attr):
+                if getattr(_mod, _attr, None) is getattr(_v2_client, _attr, None):
                     monkeypatch.setattr(_mod, _attr, _replacement)
 
     runner = CliRunner()

@@ -80,6 +80,24 @@ _COHORT: dict[str, tuple[str, str]] = {
         "admin semantic-layer coverage",
         "admin_semantic_layer_coverage",
     ),
+    # Cross-domain, cross-source completeness (F4.1) — deliberately a
+    # DIFFERENT path from the Keboola-only report above, which it aggregates
+    # rather than replaces. The tag/untag mutations are in the cohort, not
+    # _EXEMPT: neither standing exemption (credential-provisioning writes,
+    # security-posture diagnostics) covers an admin tagging a skill to a
+    # source.
+    "/api/admin/semantic-model/coverage": (
+        "semantic-model coverage show",
+        "semantic_model_coverage",
+    ),
+    "/api/admin/semantic-model/coverage/tags": (
+        "semantic-model coverage tag",
+        "semantic_model_coverage_tag",
+    ),
+    "/api/admin/semantic-model/coverage/tags/{tag_id}": (
+        "semantic-model coverage untag",
+        "semantic_model_coverage_untag",
+    ),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
     # this same endpoint (wraps its raw YAML text into a dict); `agnes admin

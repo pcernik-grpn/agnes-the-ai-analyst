@@ -22,11 +22,25 @@ from typing import List, Optional
 
 import typer
 
-from cli.client import api_get, api_post
+from cli.client import api_delete, api_get, api_post
 
 semantic_model_app = typer.Typer(help="Read the semantic layer: validate queries, browse context, inspect schema")
 
 _SEMANTIC_TYPES = ("dataset", "metric", "relationship")
+
+# Cross-domain coverage (F4.1) — admin-facing, so it lives in its own
+# sub-group rather than crowding the read-tier commands above.
+coverage_app = typer.Typer(
+    help="What each data source still lacks: semantic model, metrics, glossary, skill, agent, knowledge base",
+    invoke_without_command=True,
+)
+semantic_model_app.add_typer(coverage_app, name="coverage")
+
+_COVERAGE_PATH = "/api/admin/semantic-model/coverage"
+_COVERAGE_TAGS_PATH = "/api/admin/semantic-model/coverage/tags"
+_COVERAGE_DOMAINS = ("semantic", "metrics", "glossary", "skill", "agent", "knowledge_base")
+_COVERAGE_TAGGABLE = ("marketplace_plugin", "agent", "memory_domain")
+_STATUS_GLYPHS = {"ok": "ok", "partial": "partial", "missing": "MISSING", "not_applicable": "n/a"}
 
 
 @semantic_model_app.command("apply")
@@ -271,3 +285,168 @@ def schema(
         def_name = ref.get("$ref", "").rsplit("/", 1)[-1]
         typer.echo(f"=== {type_name} ({def_name}) ===")
         typer.echo(json.dumps(body["$defs"].get(def_name, {}), indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Cross-domain coverage (F4.1) — `agnes semantic-model coverage …`
+# ---------------------------------------------------------------------------
+
+
+def _print_coverage(*, source: Optional[str], as_json: bool) -> None:
+    """Render `GET /api/admin/semantic-model/coverage` as a source × domain grid.
+
+    Server-side computation, so there is no local/server scope to choose:
+    the report is a fact about the SERVER's registry and connections, and a
+    laptop has neither. (Command-UX standard: no new boolean scope flag —
+    there is no second scope to name here.)
+    """
+    params = {"source": source} if source else None
+    resp = api_get(_COVERAGE_PATH, params=params)
+    if resp.status_code == 501:
+        typer.echo(
+            "Coverage needs the Postgres app-state backend — this instance still runs the frozen "
+            "DuckDB backend. Migrate it (see docs/migrations.md) to use this report.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+
+    sources = body.get("sources") or []
+    if not sources:
+        hint = f" for --source {source}" if source else ""
+        typer.echo(f"No data sources to report on{hint}.")
+        typer.echo("  Connect one at /admin/data-sources, or `agnes admin connection add`.")
+        return
+
+    widths = {d: max(len(d), 12) for d in _COVERAGE_DOMAINS}
+    name_width = max(max(len(s.get("name") or s["source_id"]) for s in sources), 6)
+    header = "SOURCE".ljust(name_width) + "  " + "  ".join(d.ljust(widths[d]) for d in _COVERAGE_DOMAINS)
+    typer.echo(header)
+    for entry in sources:
+        domains = entry.get("domains") or {}
+        cells = []
+        for domain in _COVERAGE_DOMAINS:
+            status = (domains.get(domain) or {}).get("status") or "?"
+            cells.append(_STATUS_GLYPHS.get(status, status).ljust(widths[domain]))
+        typer.echo((entry.get("name") or entry["source_id"]).ljust(name_width) + "  " + "  ".join(cells))
+
+    # The grid says WHICH cell is short; the lines below say what to do about
+    # it. A grid on its own is a scoreboard, and the report is not one.
+    for entry in sources:
+        gaps = [
+            (domain, cell)
+            for domain, cell in (entry.get("domains") or {}).items()
+            if (cell or {}).get("status") in ("missing", "partial")
+        ]
+        if not gaps:
+            continue
+        typer.echo("")
+        typer.echo(f"{entry.get('name') or entry['source_id']} ({entry.get('source_type') or 'unknown'}):")
+        for domain, cell in gaps:
+            action = cell.get("action") or {}
+            suffix = f" → {action['label']}: {action['href']}" if action.get("href") else ""
+            typer.echo(f"  {domain}: {cell.get('detail') or cell.get('status')}{suffix}")
+
+
+@coverage_app.callback(invoke_without_command=True)
+def coverage(
+    ctx: typer.Context,
+    source: Optional[str] = typer.Option(
+        None, "--source", help="Only this source connection id (`__local__` for tables with no connection)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """What each connected data source still lacks (admin only).
+
+    One row per source, one column per domain — semantic model, metrics,
+    glossary, skill, agent, knowledge base — as
+    `ok` / `partial` / `MISSING` / `n/a`. `n/a` is not a gap: it means the
+    domain cannot be filled for that source type in this build (e.g. no
+    semantic-layer adapter exists for it), so it is deliberately not
+    reported as work to do.
+
+    Mirrors `GET /api/admin/semantic-model/coverage` and the MCP
+    `semantic_model_coverage` tool. `coverage show` is the explicit form of
+    this bare invocation.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    _print_coverage(source=source, as_json=as_json)
+
+
+@coverage_app.command("show")
+def coverage_show(
+    source: Optional[str] = typer.Option(
+        None, "--source", help="Only this source connection id (`__local__` for tables with no connection)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Explicit form of the bare `agnes semantic-model coverage` (same output)."""
+    _print_coverage(source=source, as_json=as_json)
+
+
+@coverage_app.command("tag")
+def coverage_tag(
+    resource_type: str = typer.Argument(..., help=f"One of: {', '.join(_COVERAGE_TAGGABLE)}"),
+    resource_id: str = typer.Argument(..., help="Same id format the RBAC grant for that type uses"),
+    source_id: str = typer.Argument(..., help="source_connections.id this resource is ABOUT"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Record that a skill / agent / knowledge domain is about a data source.
+
+    This is the only input the coverage report cannot derive: those three
+    live in their own tables with no notion of a source. Mirrors
+    `POST /api/admin/semantic-model/coverage/tags` and the MCP
+    `semantic_model_coverage_tag` tool.
+    """
+    if resource_type not in _COVERAGE_TAGGABLE:
+        typer.echo(
+            f"Unknown resource type {resource_type!r} — expected one of {', '.join(_COVERAGE_TAGGABLE)}", err=True
+        )
+        raise typer.Exit(1)
+
+    resp = api_post(
+        _COVERAGE_TAGS_PATH,
+        json={"resource_type": resource_type, "resource_id": resource_id, "source_id": source_id},
+    )
+    if resp.status_code == 409:
+        typer.echo(f"Already tagged: {resource_type} {resource_id!r} → {source_id}", err=True)
+        typer.echo("  See the current tags: agnes semantic-model coverage --json", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 404:
+        typer.echo(f"No source connection {source_id!r}.", err=True)
+        typer.echo("  List them: agnes admin connection list", err=True)
+        raise typer.Exit(1)
+    if resp.status_code not in (200, 201):
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    typer.echo(f"Tagged: {resource_type} {resource_id!r} → {source_id} (tag {body.get('id')})")
+
+
+@coverage_app.command("untag")
+def coverage_untag(
+    tag_id: str = typer.Argument(..., help="Tag id from `agnes semantic-model coverage --json`"),
+):
+    """Remove one source tag.
+
+    Mirrors `DELETE /api/admin/semantic-model/coverage/tags/{tag_id}` and the
+    MCP `semantic_model_coverage_untag` tool.
+    """
+    resp = api_delete(f"{_COVERAGE_TAGS_PATH}/{tag_id}")
+    if resp.status_code == 404:
+        typer.echo(f"No coverage tag {tag_id!r}.", err=True)
+        typer.echo("  Find the id: agnes semantic-model coverage --json", err=True)
+        raise typer.Exit(1)
+    if resp.status_code not in (200, 204):
+        _fail(resp)
+    typer.echo(f"Untagged: {tag_id}")
