@@ -150,6 +150,35 @@ def test_upgrade_tick_keeps_the_sidecar_and_refreshes_the_sandbox_image():
     assert '/opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE"' in body
 
 
+def test_upgrade_tick_rebuilds_a_missing_sandbox_image_without_drift():
+    """A failed boot build must self-heal within one tick, not wait for drift.
+
+    The boot build is best-effort by design — it must not abort a VM boot — so
+    a transient failure leaves the image missing, and the app refuses the
+    ChatManager without it (every chat route 503s). The drift-gated refresh
+    never fires on a no-change tick, so a stable VM would stay chat-less until
+    something unrelated to chat happened to change. Mirrors the kai-agent
+    engine's every-tick down-retry, and is gated the same way — on the image
+    being ABSENT, so a healthy box does not extract the build context out of
+    the app image every five minutes.
+    """
+    body = Path("scripts/ops/agnes-auto-upgrade.sh").read_text()
+    call = '/opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE"'
+    # Two call sites now: the drift-branch refresh (a context that MOVED, which
+    # an image-presence check cannot see) and this presence-gated self-heal.
+    assert body.count(call) == 2
+    guard = "if ! docker image inspect agnes-chat-sandbox:latest >/dev/null 2>&1; then"
+    assert guard in body
+    # The self-heal runs on EVERY tick, i.e. before the drift branch — which is
+    # the whole point; ordering it after would inherit the gate it exists to
+    # bypass.
+    drift_branch = 'if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then'
+    assert body.index(guard) < body.index(drift_branch)
+    # Both call sites stay best-effort: a failed rebuild must not abort the
+    # tick and leave the config marker unwritten.
+    assert body.count(f"{call} \\\n            || logger -t agnes-auto-upgrade") == 2
+
+
 def test_sandbox_image_helper_is_idempotent_and_shipped_to_the_host():
     helper = Path("scripts/ops/agnes-chat-sandbox-image.sh")
     body = helper.read_text()

@@ -494,6 +494,26 @@ if [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
     fi
 fi
 
+# The chat sandbox image is the same boot-failure shape, one provider over.
+# The boot build is deliberately best-effort (a failed build must not abort a
+# VM boot), so a box whose build failed once — daemon not up yet, a transient
+# registry error — comes up with the image MISSING, and the app refuses the
+# ChatManager without it: every chat route 503s. The drift-gated refresh below
+# never fires on a no-change tick, so without this the VM would stay chat-less
+# until something unrelated to chat happened to change.
+# Gated on the image being ABSENT, for the same reason the engine retry is
+# gated on the engine being down: the helper is idempotent, but its no-op path
+# still extracts the build context out of the app image, which is not worth
+# doing every 5 minutes on a healthy box. A context that legitimately MOVED is
+# the drift branch's job — that is the case an image-presence check cannot see.
+# The tag mirrors the helper's own default; neither caller passes one.
+if [ "$CHAT_PROVIDER" = "docker" ] && [ -x /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh ]; then
+    if ! docker image inspect agnes-chat-sandbox:latest >/dev/null 2>&1; then
+        /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE" \
+            || logger -t agnes-auto-upgrade "WARN: chat sandbox image is missing and the rebuild failed — chat stays disabled; retrying next tick"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Role-split (m-tier) rolling-recreate support (spec §3.8/§3.9).
 #

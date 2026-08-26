@@ -23,10 +23,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   apps for a chat-only VM), and builds the sandbox image on boot from the
   build context that ships inside the app image — so the sandbox and the
   server always come from one release, and a VM recreate no longer needs a
-  hand-run `docker build`. `agnes-auto-upgrade.sh` keeps the profile and
-  refreshes the image on the recreate tick when the context actually changed
-  (new helper `scripts/ops/agnes-chat-sandbox-image.sh`, idempotent via an
-  `agnes.chat-sandbox.source` label).
+  hand-run `docker build`. `agnes-auto-upgrade.sh` keeps the profile,
+  refreshes the image on the recreate tick when the context actually changed,
+  and — because the boot build is best-effort and must never abort a boot —
+  rebuilds a *missing* image on any tick, so a VM whose build failed once
+  recovers within five minutes instead of 503ing every chat route until an
+  unrelated upgrade (new helper `scripts/ops/agnes-chat-sandbox-image.sh`,
+  idempotent via an `agnes.chat-sandbox.source` label carrying the hash of
+  the whole build context).
 - **Shared-agent runtime: a user an agent was shared with can now run it**
   (remediation program Track C, C2.3). Previously only an agent's OWNER
   could open a session against it — a `ResourceType.AGENT` grant (the
