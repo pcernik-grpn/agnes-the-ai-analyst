@@ -107,3 +107,49 @@ class TestTheOldInlineSwitchIsGone:
     def test_its_styles_went_with_it(self):
         css = (ROOT / "app" / "web" / "static" / "style-custom.css").read_text(encoding="utf-8")
         assert "cset-devsw" not in css, "dead styles for a switch that no longer exists"
+
+
+class TestUseAgnesElsewhere:
+    """The rail's route out of the product.
+
+    Everything else in the rail is a destination INSIDE Agnes. This one is how
+    you take Agnes somewhere else — an editor, a terminal — so it sits in the
+    foot beside the profile rather than in the nav above, and it points at the
+    section that actually hands you the endpoint and the install command.
+    """
+
+    @pytest.fixture(scope="class")
+    def rail(self) -> str:
+        return (ROOT / "app" / "web" / "templates" / "_app_rail.html").read_text(encoding="utf-8")
+
+    def test_it_links_to_the_section_not_the_page(self, rail):
+        """`/how-it-works` alone drops you at the top of a long page you then
+        have to scan for the thing you came for."""
+        assert 'href="/how-it-works#connect"' in rail
+
+    def test_the_anchor_it_points_at_exists(self):
+        """A fragment that matches no id fails silently — you land at the top
+        of the page and nothing says why."""
+        page = (ROOT / "app" / "web" / "templates" / "how_it_works.html").read_text(encoding="utf-8")
+        assert 'id="connect"' in page, "the #connect section is gone — the rail link now goes nowhere"
+        assert "Set up your tools" in page
+
+    def test_it_sits_above_the_profile_row(self, rail):
+        assert rail.index("Use {{ instance_brand_short }} elsewhere") < rail.index('id="userMenu"')
+
+    def test_it_is_outside_the_collapsible_nav(self, rail):
+        """Same reason the profile is: it stays reachable in the ≤1024px bar
+        with the nav collapsed."""
+        assert rail.index('<div class="rail-foot">') < rail.index("Use {{ instance_brand_short }} elsewhere")
+
+    def test_it_is_not_styled_as_a_muted_state(self, rail):
+        """`rail-i--muted` italicises the label and exists for "Admin paused"
+        — a condition being reported, not a place to go."""
+        i = rail.index("Use {{ instance_brand_short }} elsewhere")
+        anchor = rail.rfind("<a class=", 0, i)
+        assert "rail-i--muted" not in rail[anchor:i]
+
+    def test_it_uses_the_instance_brand(self, rail):
+        """"Use Agnes elsewhere" on an instance that calls itself something
+        else would be the one place the rename did not reach."""
+        assert "Use {{ instance_brand_short }} elsewhere" in rail
