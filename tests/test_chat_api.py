@@ -200,6 +200,31 @@ def test_get_messages_exposes_sender_email(api_client: TestClient, logged_in_use
     assert [r["sender_email"] for r in rows] == [None, "peer@example.com"]
 
 
+def test_wire_timestamps_carry_a_utc_offset(api_client: TestClient, logged_in_user):
+    """Sessions and messages must emit offset-bearing datetimes on the wire.
+
+    Both routes used to pre-stringify with ``.isoformat()``, which bypassed
+    the app-wide datetime encoder (``app/serialization.py``) — a naive-UTC
+    read went out offset-less, ``new Date(...)`` in the browser parsed it as
+    LOCAL time, and every reloaded timestamp shifted by the viewer's UTC
+    offset (a message sent at 14:21 CEST reloaded as 12:21). Returning the
+    raw ``datetime`` lets the encoder label it ``+00:00``.
+    """
+    import app.serialization  # noqa: F401 — installs the ENCODERS_BY_TYPE override
+
+    from tests.test_datetime_serialization import ISO_WITH_OFFSET
+
+    c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
+    repo = api_client.app.state.chat_repo
+    repo.append_message(session_id=c["id"], role="user", content="hi", sender_email=None)
+
+    session = api_client.get("/api/chat/sessions").json()[0]
+    assert ISO_WITH_OFFSET.match(session["started_at"]), session["started_at"]
+
+    row = api_client.get(f"/api/chat/sessions/{c['id']}/messages").json()[0]
+    assert ISO_WITH_OFFSET.match(row["created_at"]), row["created_at"]
+
+
 def test_archive_session(api_client: TestClient, logged_in_user):
     c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
     r = api_client.delete(f"/api/chat/sessions/{c['id']}")

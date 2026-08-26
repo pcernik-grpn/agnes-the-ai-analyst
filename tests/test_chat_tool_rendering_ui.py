@@ -53,9 +53,9 @@ def test_clipboard_strips_next_actions_but_keeps_sources():
     tests/test_chat_sources_ui.py for the full rationale)."""
     js = _read(CHAT_JS)
     assert "attachMessageActions(currentAssistantArticle, stripNextActionsFence(content))" in js
-    assert 'attachMessageActions(primary, stripNextActionsFence(m.content || ""))' in js
+    assert 'attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""))' in js
     assert "attachMessageActions(currentAssistantArticle, stripSourcesFence" not in js
-    assert "attachMessageActions(primary, stripSourcesFence" not in js
+    assert "attachMessageActions(tailArticle, stripSourcesFence" not in js
 
 
 def test_extract_next_actions_executable():
@@ -759,9 +759,9 @@ def test_replayed_cards_are_siblings_in_the_messages_column():
     assert 'for (const node of nodes) $("chat-messages").appendChild(node)' in body, (
         "every node — bubbles and cards alike — is appended to the messages column in order"
     )
-    # The collapse measures the primary article after insertion; the cards and
-    # continuations are siblings, not part of the answer's height.
-    assert body.index('for (const node of nodes)') < body.index("maybeMakeCollapsible(primary)")
+    # The collapse measures the tail article after insertion; the cards and
+    # earlier segments are siblings, not part of the answer's height.
+    assert body.index("for (const node of nodes)") < body.index("maybeMakeCollapsible(tailArticle)")
 
 
 def test_history_renders_parts_in_order_with_nothing_hoisted():
@@ -825,7 +825,6 @@ def test_a_tool_first_turn_reloads_card_before_prose():
     # And the shipped code contains no index-based text selection that would
     # reintroduce the hoist.
     assert "textParts[0]" not in fn
-
 
 
 def test_the_tool_card_comment_does_not_claim_a_persisted_record():
