@@ -205,9 +205,13 @@
 {# The panels container language is the scaffold's shared default under the
    redesign (see `panels` in macros/_detail.html), so this page no longer opts
    into it by hand — every resource detail page now speaks it. #}
+{# No cover_image_url, icon or color below: a package's presentation comes
+   from its KIND now (`cards.kind_glyph`), the same glyph the index cards use,
+   so every package reads consistently instead of depending on whether an admin
+   filled three optional fields in. The builder no longer offers them either —
+   see package_drawer.js. #}
 {% call detail.hero(
-     kind='data', name=pkg.name, color=pkg.color,
-     cover_image_url=pkg.cover_image_url, icon=pkg.icon,
+     kind='data', name=pkg.name,
      type_label='Data package', menu=_menu|trim,
      trust=_pkg_trust_level,
      badges=badges, owner_name=_hero_owner_name, owner_team=_hero_owner_team,

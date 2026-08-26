@@ -6,7 +6,7 @@
  * two problems the drawer fixes by construction:
  *
  *   1. It was the tallest form in the admin surface (name, slug,
- *      description, lifecycle, category, icon, colour, cover image, and
+ *      description, lifecycle, category, and
  *      a group-access matrix) inside a card sized for one decision — so
  *      on a laptop its footer sat on top of its own last field.
  *   2. Only /admin/tables carried the scaffolding, so the Packages lens
@@ -26,7 +26,6 @@
  *
  * No endpoint is new here — the same three the modal used:
  *   POST /api/admin/data-packages        (create)
- *   POST /api/admin/uploads/cover-image  (cover, on pick)
  *   POST /api/admin/grants               (one per chosen group)
  *
  * Chrome: css/drawer.css (the shared drawer) + css/filter_toolbar.css
@@ -42,7 +41,6 @@
   var CONNECTIONS_API = '/api/admin/source-connections';
   var GRANTS_API = '/api/admin/grants';
   var GROUPS_API = '/api/admin/groups';
-  var COVER_API = '/api/admin/uploads/cover-image';
 
   /* Display names for the sources that group tables when no source CONNECTION
      owns them (internal tables, and the connectors that have no connection
@@ -147,24 +145,12 @@
       '          <p class="ds-drawer__hint">The eyebrow line above the card title in the Library.</p>' +
       '        </div>' +
       '      </div>' +
-      // Icon and Colour are GONE. Under the paper/rail redesign the resource
-      // hero draws a kind glyph (`cards.kind_glyph`), and macros/_detail.html
-      // takes `icon` and `color` as parameters but never emits either — so
-      // these were two fields whose only effect was to be stored. The cover
-      // image below is different: it IS still painted, overlaying the glyph.
-      '      <div class="ds-drawer__field">' +
-      '        <label for="pdw-cover-file">Cover image <span class="ds-drawer__opt">(optional)</span></label>' +
-      '        <div class="pdw-cover">' +
-      '          <div class="pdw-cover__preview" id="pdw-cover-preview">No image</div>' +
-      '          <div class="pdw-cover__pick">' +
-      '            <input type="file" id="pdw-cover-file" class="ds-drawer__file"' +
-      '                   accept="image/png,image/jpeg,image/gif,image/webp">' +
-      '            <input type="hidden" id="pdw-cover-url" value="">' +
-      '            <p class="ds-drawer__hint">PNG / JPEG / GIF / WebP, max 5 MiB.' +
-      '              <button type="button" class="ds-drawer__linkbtn" id="pdw-cover-clear" hidden>Remove</button></p>' +
-      '          </div>' +
-      '        </div>' +
-      '      </div>' +
+      // Icon, Colour and Cover image are GONE. Under the paper/rail redesign
+      // the resource hero draws a kind glyph (`cards.kind_glyph`), so a
+      // package's presentation is decided by its KIND rather than by three
+      // fields an admin had to fill in for every package they made. The
+      // detail page no longer paints a cover either — see
+      // catalog_package_detail.html.
       // Composition, in BOTH modes. It was edit-only on the reasoning that a
       // package being created has no id to attach a table to — but the group
       // picks below are collected the same way and applied after the POST
@@ -214,10 +200,6 @@
       desc: root.querySelector('#pdw-desc'),
       status: root.querySelector('#pdw-status'),
       category: root.querySelector('#pdw-category'),
-      coverFile: root.querySelector('#pdw-cover-file'),
-      coverUrl: root.querySelector('#pdw-cover-url'),
-      coverPreview: root.querySelector('#pdw-cover-preview'),
-      coverClear: root.querySelector('#pdw-cover-clear'),
       access: root.querySelector('#pdw-access'),
       groups: root.querySelector('#pdw-groups'),
       tablesField: root.querySelector('#pdw-tables-field'),
@@ -252,8 +234,6 @@
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.submit.click(); }
     });
-    els.coverFile.addEventListener('change', onCoverPicked);
-    els.coverClear.addEventListener('click', clearCover);
     els.access.addEventListener('toggle', function () {
       if (els.access.open) hydrateGroups();
     });
@@ -712,11 +692,6 @@
     els.desc.value = '';
     els.status.value = 'prod';
     els.category.value = '';
-    // Reset the cover on every open so a picked-then-cancelled image can
-    // never ride along into the next package.
-    els.coverFile.value = '';
-    els.coverUrl.value = '';
-    renderCover('');
     els.access.open = false;
     els.groups.innerHTML = '';
     els.err.hidden = true;
@@ -778,8 +753,6 @@
       els.desc.value = pkg.description || '';
       els.status.value = pkg.status || 'prod';
       els.category.value = pkg.category || '';
-      els.coverUrl.value = pkg.cover_image_url || '';
-      renderCover(pkg.cover_image_url || '');
       els.submit.disabled = false;
     }).catch(function (e) {
       fail('Could not load the package: ' + e.message);
@@ -835,54 +808,6 @@
     els.err.textContent = msg;
     els.err.hidden = false;
     els.submit.disabled = false;
-  }
-
-  /* ── Cover image ──────────────────────────────────────────────────────
-     Uploaded on pick rather than on save: the admin gets the preview and
-     any failure immediately, and the returned URL rides along on the
-     create body. */
-
-  function renderCover(url) {
-    els.coverClear.hidden = !url;
-    if (!url) { els.coverPreview.textContent = 'No image'; return; }
-    els.coverPreview.innerHTML = '<img src="' + esc(url) + '" alt="">';
-  }
-
-  function clearCover() {
-    els.coverFile.value = '';
-    els.coverUrl.value = '';
-    renderCover('');
-  }
-
-  function onCoverPicked() {
-    var file = els.coverFile.files && els.coverFile.files[0];
-    if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      clearCover();
-      fail('That image is larger than 5 MiB.');
-      return;
-    }
-    els.err.hidden = true;
-    els.coverPreview.textContent = 'Uploading…';
-    var fd = new FormData();
-    fd.append('file', file);
-    fetch(COVER_API, { method: 'POST', credentials: 'include', body: fd })
-      .then(function (r) {
-        if (!r.ok) {
-          return r.json().catch(function () { return {}; }).then(function (b) {
-            throw new Error((b && b.detail) || 'HTTP ' + r.status);
-          });
-        }
-        return r.json();
-      })
-      .then(function (body) {
-        els.coverUrl.value = body.url || '';
-        renderCover(els.coverUrl.value);
-      })
-      .catch(function (e) {
-        clearCover();
-        fail('The cover image did not upload: ' + e.message);
-      });
   }
 
   /* ── Who gets it ──────────────────────────────────────────────────────
@@ -1011,16 +936,15 @@
       els.submit.disabled = true;
       els.submit.textContent = 'Saving…';
       var pkgId = st.pkgId;
-      // `category` and `cover_image_url` honour an empty-string-clears
-      // contract server-side (see update_data_package), so an emptied field
-      // must send "" rather than null — null means "leave unchanged", which
-      // would make clearing a category impossible from here.
+      // `category` honours an empty-string-clears contract server-side (see
+      // update_data_package), so an emptied field must send "" rather than
+      // null — null means "leave unchanged", which would make clearing a
+      // category impossible from here.
       api(PKG_API + '/' + encodeURIComponent(pkgId), {
         method: 'PUT',
         body: JSON.stringify({
           name: name,
           description: els.desc.value.trim() || null,
-          cover_image_url: els.coverUrl.value || '',
           status: els.status.value || 'prod',
           category: els.category.value.trim(),
         }),
@@ -1107,7 +1031,6 @@
         name: name,
         slug: slug,
         description: els.desc.value.trim() || null,
-        cover_image_url: els.coverUrl.value || null,
         status: els.status.value || 'prod',
         category: els.category.value.trim() || null,
       }),

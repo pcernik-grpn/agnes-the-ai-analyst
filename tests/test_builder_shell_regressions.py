@@ -256,26 +256,47 @@ class TestThePackageBuilderShipsItsOwnControls:
 
 
 class TestDeadPresentationFieldsAreGone:
-    """Icon and Colour were two fields whose only effect was to be stored.
+    """Icon, Colour and Cover image are gone from the package builder.
 
-    Under the paper/rail redesign the resource hero draws a kind glyph
-    (`cards.kind_glyph`); macros/_detail.html accepts `icon` and `color` as
-    parameters and emits neither. The cover image is deliberately KEPT — it is
-    still painted, overlaying that glyph — so this is not "remove the
-    presentation fields", it is "remove the two that do nothing".
+    Icon and Colour never had an effect: under the paper/rail redesign the
+    resource hero draws a kind glyph (`cards.kind_glyph`), and
+    macros/_detail.html accepts `icon`/`color` as parameters and emits
+    neither. The cover image DID paint — it was dropped as a decision, not a
+    bug: a package is identified by what it carries, and an admin uploading
+    artwork per package is work with no reader on the other end.
+
+    The `hero()` macro still supports `cover_image_url` for whoever else calls
+    it; what changed is that the package detail page stops passing one, so
+    there is no longer anything for the builder to set.
     """
 
-    def test_icon_and_colour_are_not_offered(self, drawer):
-        for dead in ("pdw-icon", "pdw-color", "els.icon", "els.color"):
-            assert dead not in drawer, f"{dead} is back — it has no effect on any surface"
+    def test_none_of_the_three_are_offered(self, drawer):
+        for dead in (
+            "pdw-icon",
+            "pdw-color",
+            "els.icon",
+            "els.color",
+            "pdw-cover-file",
+            "els.cover",
+            "renderCover",
+        ):
+            assert dead not in drawer, f"{dead} is back in the builder"
 
-    def test_the_cover_image_is_still_offered(self, drawer):
-        assert "pdw-cover-file" in drawer, "the cover image still renders on the package detail page"
+    def test_the_builder_does_not_send_them_either(self, drawer):
+        """Removing the controls but still posting the keys would leave a
+        package quietly carrying artwork nobody can change."""
+        for key in ("cover_image_url", "icon", "color"):
+            assert f'"{key}"' not in drawer and f"'{key}'" not in drawer, (
+                f"the builder still puts {key} in a payload"
+            )
 
-    def test_the_hero_still_ignores_icon_and_colour(self):
-        """If this fails the fields may be worth having again — the macro
-        started using them, and the builder can no longer set them."""
-        macro = (ROOT / "app" / "web" / "templates" / "macros" / "_detail.html").read_text(encoding="utf-8")
-        body = macro[macro.index("{% macro hero("):]
-        assert not re.search(r"\{\{ *icon *\}\}", body), "the hero now emits `icon` — the builder cannot set it"
-        assert "cover_image_url" in body, "the hero stopped using the cover image — then it can go too"
+    def test_the_detail_page_asks_for_no_presentation(self):
+        """The hero macro keeps supporting all three for its other callers;
+        what must stay true is that the package page passes none of them."""
+        page = (
+            ROOT / "app" / "web" / "templates" / "catalog_package_detail.html"
+        ).read_text(encoding="utf-8")
+        hero = page[page.index("detail.hero(") :]
+        hero = hero[: hero.index(") }}") + 4]
+        for key in ("cover_image_url", "icon=", "color="):
+            assert key not in hero, f"the package hero is passed {key} again"

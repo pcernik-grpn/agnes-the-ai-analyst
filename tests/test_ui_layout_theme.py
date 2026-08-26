@@ -758,14 +758,18 @@ class TestRailChatHistory:
         assert "Your Journey" not in text
         assert "Get started" not in text
         assert "rail-getstarted-check" not in text
-        # The row CLOSES the bottom zone: under Admin, above the profile.
-        row_pos = text.find('class="rail-getstarted"')
-        assert text.find('class="rail-admin"') < row_pos < text.find('class="rail-foot"'), (
-            "the onboarding row belongs under Admin, above the profile"
-        )
-        # ...and the foot below it is the profile alone.
+        # The row lives in the FOOT — the zone that survives collapse — under
+        # "Use Agnes elsewhere" and above the profile. It is not part of the
+        # nav proper: setup is a thing you finish and stop seeing, so it sits
+        # with the other always-reachable rows rather than among destinations.
         foot = text.split('class="rail-foot"', 1)[1]
-        assert "rail-getstarted" not in foot
+        row_pos = foot.find('class="rail-getstarted"')
+        assert row_pos != -1, "the onboarding row belongs in the rail foot"
+        assert foot.find('href="/how-it-works#connect"') < row_pos < foot.find('id="userMenu"'), (
+            "the onboarding row belongs under 'Use Agnes elsewhere', above the profile"
+        )
+        # …and nothing left it behind in the collapsible nav above.
+        assert "rail-getstarted" not in text.split('class="rail-foot"', 1)[0]
         # The journey render target moved into the popover — and out of the list.
         journey_pos = text.find('id="chat-journey"')
         panel_pos = text.find('id="rail-getstarted-panel"')
@@ -1039,9 +1043,10 @@ class TestRailTwoZones:
             'href="/library"',
             'href="/agents"',
             'class="rail-admin"',  # ...Admin behind a divider
-            'class="rail-getstarted"',  # ...then the onboarding card
-            'class="rail-foot"',
-            'id="userMenu"',  # profile, at the very bottom
+            'class="rail-foot"',  # zone 3 — always reachable, never collapsed
+            'href="/how-it-works#connect"',  # …take Agnes elsewhere,
+            'class="rail-getstarted"',  # …then the onboarding row,
+            'id="userMenu"',  # …then profile, at the very bottom
         ]
         positions = [rail.find(anchor) for anchor in sequence]
         assert -1 not in positions, [a for a, p in zip(sequence, positions) if p == -1]

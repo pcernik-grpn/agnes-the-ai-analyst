@@ -22,6 +22,13 @@
    and unstyled buttons: the markup is package_drawer.js's, so its sheet has
    to come with it wherever it is mounted. #}
 <link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
+{# package_drawer.css only TWEAKS `.fbar-seg` — its own header says the base
+   lives in filter_toolbar.css, along with `.fbar-select`. Without this the
+   Optional/Automatic tier control renders as two default browser buttons. #}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+{# ...and `.cf-palette-row` / the shared card bits come from stack_card.css,
+   the third sheet that header names. #}
+<link rel="stylesheet" href="{{ static_url('css/stack_card.css') }}">
 {# The category picker is a ds-dropdown; unstyled it falls back to a bare
    <select> beside its own chevron. #}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
