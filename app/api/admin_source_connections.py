@@ -30,13 +30,22 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        in the stored config but omitted from an empty/partial
                                                        replacement config counts as a change, since this
                                                        endpoint REPLACES ``config`` wholesale) or if
-                                                       ``is_default: true`` would demote a different
-                                                       connection of the same source_type, and the source
-                                                       already has registrations — resend with
+                                                       ``is_default`` changes WHICH row (if any) is the
+                                                       source_type's default — ``true`` demoting a different
+                                                       connection, or ``false`` demoting the current default to
+                                                       no default at all — and the source already has
+                                                       registrations — resend with
                                                        ``confirm_connection_change: true`` to apply (D2.3 +
                                                        RBAC review Findings 1/2, 2026-08-26; see
                                                        ``_guard_row_repoint`` / ``_guard_default_repoint``).
-  DELETE /api/admin/source-connections/{id}         — delete; 404 if missing
+  DELETE /api/admin/source-connections/{id}         — delete; 404 if missing; 409
+                                                       ``connection_in_use`` if tables are pinned to it, or
+                                                       ``connection_change_affects_registrations`` if it is
+                                                       the source_type's current default and the source has
+                                                       registrations — resend with
+                                                       ``?confirm_connection_change=true`` to apply (RBAC
+                                                       review second round, 2026-08-26; see
+                                                       ``_guard_default_repoint``).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
@@ -430,15 +439,16 @@ def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirme
 
 def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirmed: bool) -> None:
     """Refuse an unconfirmed change of WHICH row is the ``source_type``
-    default, on a source that already has registrations (RBAC review
-    Finding 1, 2026-08-26).
+    default (including "no row at all"), on a source that already has
+    registrations (RBAC review Finding 1, 2026-08-26; extended to demote and
+    delete in the second review round, same date).
 
     ``is_default`` — not any one row's ``config`` — is what
     ``resolve_source_connection(source_type)`` actually reads
-    (``src.connection_resolver``), so promoting a DIFFERENT row to default
-    repoints every registration of that source_type just as surely as
-    editing the current default's identity does, and neither of the two ways
-    to do that go through :func:`_guard_row_repoint` at all:
+    (``src.connection_resolver``), so ANY change to which row (if any)
+    answers that call repoints every registration of that source_type just
+    as surely as editing the current default's identity does. Four call
+    sites reach this, none of them through :func:`_guard_row_repoint`:
 
     - ``create_connection`` with ``is_default=true`` — the repo's
       ``create()`` unconditionally ``UPDATE ... SET is_default=FALSE WHERE
@@ -449,6 +459,15 @@ def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirme
       ``if config is not None`` block :func:`_guard_row_repoint` lives in
       entirely, yet ``other_id`` becomes the default, demoting the current
       one.
+    - ``update_connection`` demoting the CURRENT default to no default at
+      all — ``PUT /{current_default_id} {is_default: false}``. The repo's
+      ``update()`` False-branch clears the flag without promoting anything
+      else, so the source_type is left with NO default and every unpinned
+      registration silently falls back to the legacy
+      ``data_source.<type>.*`` yaml this slice does not delete.
+    - ``delete_connection`` removing the row that is the current default —
+      same end state as the demote-to-none case (no default left), reached
+      by deleting instead of editing.
 
     Same 409 ``connection_change_affects_registrations`` contract as
     :func:`_guard_row_repoint`, and the same notion of "affected
@@ -457,8 +476,9 @@ def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirme
     connection_id, so every row of that source_type counts).
 
     ``demoted_id`` is the id of the row that WOULD stop being the default —
-    ``None`` when there is nothing to demote (no current default, or the
-    promoted row already IS the current default), in which case this is a
+    ``None`` when there is nothing to demote (no current default, the
+    promoted row already IS the current default, or the row being
+    demoted/deleted is not currently the default), in which case this is a
     no-op call. Scoped to :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES`, same as
     the config guard — Keboola/BigQuery identity relocation is out of scope
     for this slice.
@@ -490,9 +510,9 @@ def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirme
             "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
             "hint": (
                 f"{len(affected)} registered table(s) resolve against the current "
-                f"{source_type} default connection ({demoted_id}); making a different "
-                "connection the default will repoint them to it. Resend with "
-                "confirm_connection_change=true to apply."
+                f"{source_type} default connection ({demoted_id}); this change would "
+                "leave them resolving against a different connection (or none at all). "
+                "Resend with confirm_connection_change=true to apply."
             ),
         },
     )
@@ -775,10 +795,13 @@ async def update_connection(
     present in the stored config but omitted from the new one (including an
     empty ``config: {}``) counts as a change too, not as "untouched" (RBAC
     review Finding 2, 2026-08-26). The same 409/confirm contract also covers
-    ``is_default: true`` demoting a DIFFERENT connection of the same
-    source_type that has registrations, even with no ``config`` key in the
-    request body at all (RBAC review Finding 1; see
-    :func:`_guard_default_repoint`).
+    ANY change of which row (if any) is the source_type's default — a request
+    body with no ``config`` key at all — for a source that has registrations:
+    ``is_default: true`` demoting a DIFFERENT connection (RBAC review
+    Finding 1), and ``is_default: false`` demoting the CURRENT default to no
+    default at all, which falls back to the legacy
+    ``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See
+    :func:`_guard_default_repoint`.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -829,14 +852,32 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
-    if body.is_default:
-        # RBAC review Finding 1: this must run regardless of whether `config`
-        # was sent — `PUT /{other_id} {is_default: true}` with no `config`
-        # key skips the block above entirely, yet still demotes whichever
-        # row is currently the default.
+    if body.is_default is not None:
+        # RBAC review Finding 1 (2026-08-26): this must run regardless of
+        # whether `config` was sent — `PUT /{other_id} {is_default: true}`
+        # with no `config` key skips the block above entirely, yet still
+        # demotes whichever row is currently the default.
+        #
+        # Second RBAC review round (2026-08-26): `is_default: false` needs
+        # the SAME guard, not just `is_default: true` — `PUT
+        # /{current_default_id} {is_default: false}` demotes the row to NO
+        # default at all (the repo's `update()` False-branch clears the flag
+        # without promoting anything else), and `resolve_source_connection`
+        # then returns `None` for the type, silently falling back to the
+        # legacy `data_source.<type>.*` yaml for every unpinned
+        # registration — the same repoint threat model as promoting a
+        # different row, just landing on "no row" instead of "another row".
         source_type = existing_row.get("source_type")
         current_default = repo.get_default(source_type)
-        demoted_id = current_default["id"] if current_default and current_default["id"] != connection_id else None
+        current_default_id = current_default["id"] if current_default else None
+        if body.is_default:
+            # Promoting THIS row: whichever OTHER row currently holds the
+            # default is what gets demoted (no-op if it's already this row).
+            demoted_id = current_default_id if current_default_id != connection_id else None
+        else:
+            # Demoting THIS row: only a repoint if it IS the current
+            # default — demoting an already-non-default row changes nothing.
+            demoted_id = connection_id if current_default_id == connection_id else None
         _guard_default_repoint(source_type, demoted_id, body.confirm_connection_change)
     repo.update(
         connection_id,
@@ -928,11 +969,19 @@ def _resync_derived_chat_tools(connection_id: str) -> None:
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
+    confirm_connection_change: bool = False,
     _user: dict = Depends(require_admin),
 ):
-    """Delete a source connection. 404 if not found; 409 if tables still reference it."""
+    """Delete a source connection. 404 if not found; 409 if tables still
+    reference it (``connection_in_use``, pinned tables) or if it is the
+    ``source_type``'s current default and that source has registrations
+    (``connection_change_affects_registrations`` — second RBAC review round,
+    2026-08-26; ``?confirm_connection_change=true`` to apply). See
+    :func:`_guard_default_repoint`.
+    """
     repo = source_connections_repo()
-    if repo.get(connection_id) is None:
+    row = repo.get(connection_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
     # Refuse to orphan tables: a registry row pinned to this connection would
     # start failing its sync with "connection_not_found" once the row is gone.
@@ -946,6 +995,15 @@ async def delete_connection(
                 "tables": referencing,
             },
         )
+    # Second RBAC review round (2026-08-26): the pinned-table check above
+    # never caught deleting the row that is the source_type's DEFAULT — an
+    # unpinned registration resolves through it (`resolve_source_connection`)
+    # without ever referencing its `connection_id`, so deleting the sole/
+    # default Snowflake/Databricks connection broke every such
+    # registration's resolution with no 409/confirm. Same guard, same
+    # "affected registrations" notion as the `is_default` PUT case.
+    if row.get("is_default"):
+        _guard_default_repoint(row.get("source_type"), connection_id, confirm_connection_change)
     # BEFORE the row goes, not after. A derived chat-tools source outlives its
     # connection otherwise, keeping a live Keboola credential in the vault and
     # still offering the project's tools to the agent — and since this step now

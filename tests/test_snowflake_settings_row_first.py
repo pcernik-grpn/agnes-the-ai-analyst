@@ -141,10 +141,17 @@ class TestRowFromLegacySeed:
     def test_row_seeded_with_only_top_level_token_env_still_resolves(self, sf_env, monkeypatch):
         """A row seeded by app.connections_seed (D2.1) carries the secret-ref
         name on the row's top-level `token_env` column, not embedded in
-        config. The row-first path must still find the right env var."""
+        config. The row-first path must still find the right env var —
+        provided the name is on the remote-attach allowlist (RBAC review,
+        second round, 2026-08-26: `connectors.snowflake.settings._resolve_
+        secret` refuses an off-allowlist name regardless of where it's
+        stored), same as an operator who wants a non-default token_env name
+        has to opt it in via AGNES_REMOTE_ATTACH_TOKEN_ENVS — mirrors
+        `test_databricks_settings_row_first.py`'s sibling test."""
         from src.repositories import source_connections_repo
 
         monkeypatch.setenv("MY_CUSTOM_SF_PASSWORD", "custom-secret")
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "MY_CUSTOM_SF_PASSWORD")
         source_connections_repo().create(
             id="sf-legacy",
             name="snowflake",

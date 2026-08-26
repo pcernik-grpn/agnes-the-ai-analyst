@@ -15,7 +15,50 @@ SF_PRIVATE_KEY_PASSPHRASE_ENV = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"
 
 
 def _resolve_secret(name: str) -> str:
-    """Resolve a named credential: env var first, then the vault."""
+    """Resolve a named credential: env var first, then the vault.
+
+    SECURITY (RBAC review, second round, 2026-08-26): ``name`` is a
+    config-embedded secret-ref NAME — ``token_env``, ``private_key_env``, or
+    ``private_key_passphrase_env`` — on a Snowflake ``source_connections``
+    row's ``config``, or the legacy ``data_source.snowflake.*`` yaml
+    equivalent. Both are admin-writable, so ``name`` is untrusted the same
+    way a request body is: without this check an admin could point one of
+    those fields at an UNRELATED secret's env var (``ANTHROPIC_API_KEY``,
+    ``JWT_SECRET_KEY``, ...) and have it ship out as the Snowflake credential
+    on the very next attach.
+
+    This is the single function every Snowflake named-secret lookup in this
+    module funnels through — the row path's env fallback
+    (:func:`_resolve_row_secret`), the legacy yaml path
+    (:func:`_resolve_from_instance_config`), and the key-pair passphrase
+    lookup for both — which is itself the sole credential dependency of
+    :func:`resolve_snowflake_settings`, the one entry point every Snowflake
+    consumer (``connectors/snowflake/{extract_init,extractor,remote,
+    discovery,semantic_ossie}.py``) calls. Gating here — instead of at each
+    of those call sites — closes the gap for all of them at once, matching
+    where ``connectors.databricks.semantic_layer._resolve_row_token`` places
+    the identical guard for Databricks. The write-time guard
+    (``app.api.admin_source_connections._reject_disallowed_config_token_envs``)
+    already refuses a bad name at save; this is the resolve-time backstop —
+    for a row written before that guard existed, and for the legacy yaml
+    path it never covered at all. ``extract_init.py``'s own pre-existing
+    ``token_env`` check (checked again right before its ATTACH) is now
+    redundant defense-in-depth, not the only gate.
+    """
+    if not name:
+        return ""
+
+    from src.orchestrator_security import is_token_env_allowed
+
+    if not is_token_env_allowed(name):
+        logger.warning(
+            "snowflake: secret-ref env var %r is not on the remote-attach "
+            "allowlist; refusing to read it (add it to "
+            "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+            name,
+        )
+        return ""
+
     from app.datasource_secrets import datasource_secret
 
     value = os.environ.get(name, "")
@@ -38,6 +81,11 @@ def _resolve_row_secret(connection: Dict[str, Any], env_name: str) -> str:
     carry up to three independent secret-ref names (``token_env`` OR
     ``private_key_env``, plus an optional passphrase), more than the
     generic single-column resolver supports.
+
+    The connection's OWN vault slot (checked first, below) is unaffected by
+    the allowlist :func:`_resolve_secret` applies to the env-var fallback —
+    it is not selected by an admin-controlled NAME, so there is nothing for
+    an attacker-controlled ``env_name`` to redirect.
     """
     try:
         from src.repositories import connection_secrets_repo

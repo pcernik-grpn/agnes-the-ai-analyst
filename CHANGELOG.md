@@ -150,35 +150,53 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   one-shot exfiltration path where an admin could point one of these at an
   unrelated secret's env name and have it shipped out as a Snowflake/
   Databricks credential on the first attach, now that the row is
-  load-bearing. `connectors/snowflake/extract_init.py`'s own allowlist check
-  now runs BEFORE the ATTACH (defense in depth), refusing instead of merely
-  warning after the credential had already been sent — and, closing the same
-  gap for the other connector, `connectors/databricks/semantic_layer.py`'s
-  `resolve_databricks_settings()` (the single choke point every Databricks
-  consumer resolves through: the live Unity Catalog ATTACH, `agnes query
-  --remote`, schema/scan discovery, the semantic-layer sync) now applies the
-  identical allowlist check at credential-resolve time, for both a
-  connection row's `token_env` and the legacy `data_source.databricks.*` yaml
-  path — Databricks previously had no such check at all.
-- **Security: the `source_connections` row-repoint guard now also fires on
-  an `is_default` change and on an identity-wiping empty-config replace.**
-  Two more ways to silently repoint a Snowflake/Databricks connection with
-  existing table registrations, past the write-time 409
-  `connection_change_affects_registrations` guard added in the previous
-  bullet: (1) `POST /api/admin/source-connections` (and `PUT .../{id}`) with
-  `is_default: true` demotes whichever connection currently answers
-  `resolve_source_connection(source_type)` without ever touching that
-  connection's own `config` — the guard now checks every `is_default`
-  transition, not just a `config` change on the demoted row itself, and
-  `CreateConnectionBody` gains the same `confirm_connection_change` override
-  `PUT` already had; (2) `PUT .../{id}` REPLACES `config` wholesale, and an
-  empty `{"config": {}}` used to slip past the guard because an identity
-  leaf simply absent from the new config read as "untouched" rather than
-  "wiped" — `app.connection_identity.identity_changes` gains a
-  `replace_semantics` flag the row endpoint opts into, so a leaf present
-  before and missing after now counts as a change (the yaml-overlay PATCH
-  caller is unaffected — an absent leaf there still means untouched, which
-  is correct for its merge semantics).
+  load-bearing. Both connectors' credential resolvers are now allowlist-gated
+  at their single choke point, closing every consumer at once rather than
+  one call site at a time: `connectors/databricks/semantic_layer.py`'s
+  `resolve_databricks_settings()` (the live Unity Catalog ATTACH, `agnes
+  query --remote`, schema/scan discovery, the semantic-layer sync) and
+  `connectors/snowflake/settings.py`'s `resolve_snowflake_settings()` (every
+  Snowflake consumer — the scheduler's materialized pass, the
+  `query_mode='remote'` schema fetch, discovery, the semantic-layer sync, and
+  the extract-init rebuild) — both for a connection row's `token_env` and the
+  legacy `data_source.<type>.*` yaml path. A second RBAC review round
+  (2026-08-26) found Snowflake's first-round fix had only reached
+  `connectors/snowflake/extract_init.py` (now redundant defense-in-depth,
+  checked again immediately before its own ATTACH) and left every other
+  consumer resolving an unchecked env var; the fix moved into
+  `settings.py`'s shared `_resolve_secret`, the one function every named
+  lookup in the module (including the key-pair passphrase) funnels through.
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` was added to the default remote-attach
+  token-env allowlist alongside `SNOWFLAKE_PASSWORD`/`SNOWFLAKE_PRIVATE_KEY`
+  so the module's own default key-pair passphrase path keeps working
+  unconfigured.
+- **Security: the `source_connections` default/identity-repoint guard now
+  covers every way to change WHICH connection (if any) a source_type
+  resolves against — promote, demote, wipe, and delete.** Guarded from the
+  start: `PUT .../{id}` changing a connection-identity leaf in `config`. A
+  first RBAC review round (2026-08-26) added three more paths past the same
+  guard: (1) `POST`/`PUT .../{id}` with `is_default: true` demoting whichever
+  connection currently answers `resolve_source_connection(source_type)`
+  without ever touching that connection's own `config`; (2) `PUT .../{id}`
+  REPLACING `config` wholesale with an identity leaf simply absent from the
+  new config (including an empty `{"config": {}}`), previously read as
+  "untouched" rather than "wiped" (`app.connection_identity.identity_changes`
+  gained a `replace_semantics` flag for this endpoint; the yaml-overlay PATCH
+  caller is unaffected — an absent leaf there still means untouched, correct
+  for its merge semantics). A second review round (same date) closed two
+  more: (3) `PUT .../{id} {"is_default": false}` demoting the CURRENT
+  default to no default at all — `resolve_source_connection(type)` then
+  returns `None` and every unpinned registration silently falls back to the
+  legacy `data_source.<type>.*` yaml, which this slice does not delete; (4)
+  `DELETE .../{id}` on the source_type's current default — the pre-existing
+  `connection_in_use` check only ever caught tables PINNED to the deleted
+  connection via `connection_id`, never the unpinned registrations that
+  resolve through it being the default. All five now share one guard
+  (`_guard_default_repoint` for (1)/(3)/(4), `_guard_row_repoint` for the
+  `config`-identity cases) and the same 409
+  `connection_change_affects_registrations` / `confirm_connection_change`
+  contract — `DELETE` takes it as `?confirm_connection_change=true` (query
+  param, no body) rather than a JSON field.
 
 ### Changed
 
