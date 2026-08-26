@@ -178,6 +178,38 @@ class TestPortedFlagsAreUnchanged:
         assert "apps" in s.lock_reason
 
 
+class TestDataAppsAllowSameOriginSwitch:
+    """`data_apps.allow_same_origin` resolves through the registry (the
+    sync-map's "new user-visible switch" row — never a hand-rolled
+    os.environ/get_value pair) and stays locked in the panel: flipping it
+    hands every hosted app's JS the viewer's session, a deployment decision
+    rather than a live toggle (and its `data_apps` section is locked
+    regardless — see `test_no_section_mixes_editable_and_locked_switches`)."""
+
+    def test_identity_and_lock(self):
+        s = get_switch("data_apps_allow_same_origin")
+        assert s.config_keys == ("data_apps", "allow_same_origin")
+        assert s.env_var == "AGNES_DATA_APPS_ALLOW_SAME_ORIGIN"
+        assert s.kind == "bool"
+        assert s.default is False
+        assert s.editable is False
+        assert s.lock_reason.strip()
+
+    def test_serving_gate_reads_the_registry(self, monkeypatch):
+        """`same_origin_serving_allowed()` resolves via `switch_value`, so
+        the registry's resolution order (env > merged config > default) IS
+        the serving gate's resolution order."""
+        import app.switches as sw
+        from app.api.data_apps import same_origin_serving_allowed
+
+        monkeypatch.delenv("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert same_origin_serving_allowed() is False
+        monkeypatch.setenv("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN", "1")
+        assert same_origin_serving_allowed() is True
+        assert sw.switch_value("data_apps_allow_same_origin") is True
+
+
 class TestGetSwitch:
     def test_returns_the_entry(self):
         assert get_switch("chat").name == "chat"

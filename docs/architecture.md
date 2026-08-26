@@ -658,9 +658,13 @@ idempotent `DOCKER-USER` iptables DROP from the `agnes-apps` source subnet to
 block in `infra/modules/customer-instance/startup-script.sh.tpl`). It is
 source-scoped, not a blanket block, so the Agnes app container's own metadata
 use (e.g. BigQuery GCE-metadata auth) is unaffected — the `app` service pins
-`default` as its highest-priority network (`docker-compose.yml`
-`networks.default.priority`) so its egress routes via `default`, keeping its
-source IP out of the `agnes-apps` subnet the rule matches. The rule resolves the
+`default` as its gateway network (`docker-compose.yml` sets BOTH
+`networks.default.gw_priority` — the field that actually selects the gateway
+on Docker Engine ≥ 28, where `priority` deliberately does not — and the older
+`priority`, which pre-28 engines derive the default route from via connection
+order) so its egress routes via `default`, keeping its source IP out of the
+`agnes-apps` subnet the rule matches. `gw_priority` requires Compose CLI ≥
+v2.33.1 — older Compose rejects the key at validation. The rule resolves the
 subnet at boot; re-run the block (or reboot) after any manual `agnes-apps`
 network recreation. For a non-Terraform host
 (plain docker-compose), install the equivalent rule yourself:

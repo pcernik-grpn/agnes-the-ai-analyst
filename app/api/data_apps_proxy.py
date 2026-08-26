@@ -151,20 +151,27 @@ def _get_row_or_404(slug: str) -> dict:
 def _resolve_proxy_caller(request: Request, slug: str, conn: Optional[object]) -> tuple[Optional[dict], bool]:
     """Resolve who's allowed to view ``/apps/<slug>/...``.
 
-    Returns ``(user, via_preview)``. Tries the normal session-cookie/PAT
-    chain first (``get_current_user``'s exact resolution, called directly
-    rather than via ``Depends`` so its 401 can be caught and traded for the
-    preview-token fallback below instead of short-circuiting the route).
+    Returns ``(user, via_preview)``. A ``data-app-preview:<slug>`` scoped
+    token (cookie named ``preview_cookie_name(slug)``, or ``Authorization:
+    Bearer``) is tried FIRST, before the normal session-cookie/PAT chain —
+    deliberately, not as a fallback: the in-chat preview iframe of a
+    logged-in user carries the viewer's ``access_token`` session cookie
+    ALONGSIDE the preview cookie (browsers attach both), and a
+    session-first ordering resolved such a request as a plain session
+    caller (``via_preview=False``), which the same-origin gate then
+    refused in the default posture — breaking the exact flow the preview
+    token exists for (Devin Review on this PR). Scope-pinning mirrors the
+    ``data-app-git`` precedent in ``app/api/data_apps_git.py``: the
+    resolved identity is trusted to VIEW THIS SLUG ONLY when the token's
+    verified scope claim is exactly ``data-app-preview:<slug>``.
 
-    If normal auth fails, falls back to a ``data-app-preview:<slug>``
-    scoped token (cookie named ``preview_cookie_name(slug)``, or
-    ``Authorization: Bearer``) — mirroring the ``data-app-git`` scope-pin precedent in
-    ``app/api/data_apps_git.py``: the resolved identity is trusted to VIEW
-    THIS SLUG ONLY when the token's scope claim is exactly
-    ``data-app-preview:<slug>``. A token minted for a different app, or one
-    that's expired/revoked (caught by ``resolve_token_to_user``'s normal PAT
-    checks), resolves to ``(None, False)`` here — never falls through to
-    treating the caller as unauthenticated-but-otherwise-fine.
+    A credential that is not a validly-scoped preview token for THIS slug
+    grants nothing here: an expired/revoked/forged token fails
+    ``verify_token``/``resolve_token_to_user``, a token minted for a
+    different app fails the scope pin — either way resolution falls
+    through to the normal ``get_current_user`` chain (called directly
+    rather than via ``Depends`` so its 401 can be caught), never to
+    treating the caller as authenticated-via-preview.
 
     ``via_preview=True`` tells the caller to skip the normal ``_can_view``
     RBAC check entirely: the mint-time call to
@@ -174,32 +181,35 @@ def _resolve_proxy_caller(request: Request, slug: str, conn: Optional[object]) -
     ``resolve_token_to_user`` there defaults to rejecting the scope).
     """
     auth_header = request.headers.get("authorization")
+
+    # Every syntactically-present preview-shaped credential: bearer first,
+    # then the per-app cookie (`preview_cookie_name`), then the bare legacy
+    # cookie name (still accepted so a preview already open across an
+    # upgrade keeps working for the rest of its 30-minute TTL). Merely
+    # carrying a candidate grants nothing — the scope pin below decides.
+    candidates = []
+    if auth_header and auth_header.startswith("Bearer "):
+        candidates.append(auth_header.removeprefix("Bearer "))
+    cookie_token = request.cookies.get(preview_cookie_name(slug)) or request.cookies.get(_PREVIEW_COOKIE_NAME)
+    if cookie_token:
+        candidates.append(cookie_token)
+
+    for token in candidates:
+        # Cheap signature+scope check first: a normal PAT in the bearer slot
+        # (no preview scope) skips straight past without the DB-backed
+        # resolution below double-running its audit/last-used bookkeeping.
+        payload = verify_token(token) or {}
+        if (payload.get("scope") or "") != f"{DATA_APP_PREVIEW_SCOPE_PREFIX}{slug}":
+            continue
+        user, _reason = resolve_token_to_user(conn, token, request, allow_data_app_preview_scope=True)
+        if user:
+            return user, True
+
     try:
         user = get_current_user(request=request, authorization=auth_header, conn=conn)
         return user, False
     except HTTPException:
-        pass
-
-    token = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.removeprefix("Bearer ")
-    if not token:
-        # Per-app cookie name first (`preview_cookie_name`); the bare legacy
-        # name is still accepted so a preview already open across an upgrade
-        # keeps working for the rest of its 30-minute TTL. Either way the scope
-        # check below is what decides — reading a cookie grants nothing.
-        token = request.cookies.get(preview_cookie_name(slug)) or request.cookies.get(_PREVIEW_COOKIE_NAME)
-    if not token:
         return None, False
-
-    user, _reason = resolve_token_to_user(conn, token, request, allow_data_app_preview_scope=True)
-    if not user:
-        return None, False
-    payload = verify_token(token) or {}
-    scope = payload.get("scope") or ""
-    if scope != f"{DATA_APP_PREVIEW_SCOPE_PREFIX}{slug}":
-        return None, False
-    return user, True
 
 
 def _touch(app_row: dict) -> None:
@@ -668,26 +678,26 @@ async def proxy_app(slug: str, path: str, request: Request, conn=Depends(_get_db
     return _not_running_response(slug, state, accepts_json)
 
 
-def _ws_authenticate(websocket: WebSocket) -> Optional[dict]:
-    """Resolve the caller for a WS handshake using the exact same
-    session-cookie/PAT resolution as ``get_current_user`` — called
-    directly (not via ``Depends``) because FastAPI's dependency solver
-    only fills ``Request``-typed params from HTTP scopes; websocket routes
-    in this codebase (``app/api/chat.py``, ``app/api/notifications_ws.py``)
-    all authenticate by calling into the auth helper directly for the same
-    reason. ``WebSocket`` duck-types every attribute ``get_current_user``
-    actually touches (``.cookies``, ``.headers``, ``.state``), so passing
-    it in place of a ``Request`` is safe.
+def _ws_resolve_caller(websocket: WebSocket, slug: str) -> tuple[Optional[dict], bool]:
+    """Resolve the caller for a WS handshake through the exact same
+    resolution as the HTTP proxy (:func:`_resolve_proxy_caller`) — preview
+    token first with the same slug-scoping, then the normal
+    session-cookie/PAT chain — so a WS-based app (Streamlit/Dash) reached
+    from the in-chat preview authorizes the same way its HTTP assets do.
+    Called directly (not via ``Depends``) because FastAPI's dependency
+    solver only fills ``Request``-typed params from HTTP scopes; websocket
+    routes in this codebase (``app/api/chat.py``,
+    ``app/api/notifications_ws.py``) all authenticate by calling into the
+    auth helper directly for the same reason. ``WebSocket`` duck-types
+    every attribute the resolution chain actually touches (``.cookies``,
+    ``.headers``, ``.state``, ``.url``), so passing it in place of a
+    ``Request`` is safe.
     """
     from contextlib import contextmanager
 
-    auth_header = websocket.headers.get("authorization")
     conn_cm = contextmanager(_get_db)
-    try:
-        with conn_cm() as conn:
-            return get_current_user(request=websocket, authorization=auth_header, conn=conn)
-    except HTTPException:
-        return None
+    with conn_cm() as conn:
+        return _resolve_proxy_caller(websocket, slug, conn)
 
 
 @router.websocket("/apps/{slug}/{path:path}")
@@ -698,7 +708,7 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
         await websocket.close(code=4404, reason="data_apps_disabled")
         return
 
-    user = _ws_authenticate(websocket)
+    user, via_preview = _ws_resolve_caller(websocket, slug)
     if user is None:
         await websocket.close(code=4403, reason="forbidden")
         return
@@ -708,14 +718,19 @@ async def proxy_ws(websocket: WebSocket, slug: str, path: str):
         await websocket.close(code=4404, reason="data_app_not_found")
         return
 
-    if not _can_view(user, row):
+    # `via_preview` skips `_can_view` exactly as the HTTP handler does — the
+    # mint-time `POST /{slug}/preview-grant` already required it to pass.
+    if not via_preview and not _can_view(user, row):
         await websocket.close(code=4403, reason="forbidden")
         return
 
-    # Same-origin serving gate — mirrors the HTTP proxy. A WS on the main
-    # origin shares the viewer's session with app-authored code; refuse unless
-    # the request arrived on a data-app subdomain or the operator opted in.
-    if not websocket.scope.get("agnes_data_app_subdomain") and not same_origin_serving_allowed():
+    # Same-origin serving gate — mirrors the HTTP proxy
+    # (`_same_origin_serving_refused`). A WS on the main origin shares the
+    # viewer's session with app-authored code; refuse unless the request
+    # arrived on a data-app subdomain, carries a per-app preview token (the
+    # in-chat preview of a WS-based app — Streamlit/Dash — connects here
+    # same-origin), or the operator opted in.
+    if not websocket.scope.get("agnes_data_app_subdomain") and not via_preview and not same_origin_serving_allowed():
         await websocket.close(code=4403, reason="same_origin_disabled")
         return
 
