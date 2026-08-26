@@ -224,15 +224,16 @@ def test_column_metadata_save_accepts_source_ref(ctx):
         assert saved["source_ref"] == "dbc-test.cloud.databricks.com"
         assert fetched["source_ref"] == "dbc-test.cloud.databricks.com"
         assert listed["region"]["source_ref"] == "dbc-test.cloud.databricks.com"
-    else:
-        assert saved["source_ref"] is None
-        assert fetched["source_ref"] is None
-        assert listed["region"]["source_ref"] is None
 
-    # Omitted entirely — stays NULL on both backends, same as every other
-    # nullable provenance column on this repo (no implicit default).
-    no_ref = repo.save(table_id="orders", column_name="amount", basetype="DECIMAL", source="manual")
-    assert no_ref["source_ref"] is None
+        # Omitted entirely — stays NULL, same as every other nullable
+        # provenance column on this repo (no implicit default).
+        no_ref = repo.save(table_id="orders", column_name="amount", basetype="DECIMAL", source="manual")
+        assert no_ref["source_ref"] is None
+    else:
+        # No DuckDB column at all — not even a NULL, the key is absent.
+        assert "source_ref" not in saved
+        assert "source_ref" not in fetched
+        assert "source_ref" not in listed["region"]
 
 
 # ---------------------------------------------------------------------------
