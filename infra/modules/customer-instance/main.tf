@@ -104,6 +104,17 @@ locals {
   #
   # Each map keeps ONLY the keys the caller actually set (drop null + ""), so
   # partial branding (e.g. a logo but no theme colours) emits exactly its subset.
+  #
+  # D1 (config-ownership remediation, 2026-08): `theme` (the palette NAME —
+  # "blue"/"paper"/etc., not the colour-override `theme:` block below) and
+  # `experience` moved into this seed from an always-wins `.env` line the
+  # startup script used to rewrite on EVERY boot, which permanently shadowed
+  # the admin UI's `/admin/server-config` control of the same knob. Seeded
+  # here instead: Terraform still sets the day-1 value, the admin UI owns it
+  # from day 2 onward. Per-instance, like the branding fields above.
+  # `home_route` is the same handoff but module-wide (one value for every VM,
+  # mirroring its historical `var.home_route` env behavior) rather than
+  # per-instance.
   instance_brand_scalars = {
     for inst in local.all_instances : inst.name => {
       for k, v in {
@@ -113,6 +124,9 @@ locals {
         subtitle    = try(inst.subtitle, "")
         copyright   = try(inst.copyright, "")
         favicon     = try(inst.favicon, "")
+        theme       = try(inst.theme, "")
+        experience  = try(inst.experience, "")
+        home_route  = var.home_route
       } : k => v if v != null && v != ""
     }
   }
@@ -136,10 +150,18 @@ locals {
       } : k => v if v != null && v != ""
     }
   }
+  # D1: studio toggle — same first-boot-seed handoff as theme/experience/
+  # home_route above, module-wide (studio_enabled applies uniformly to every
+  # VM, mirroring its historical `var.studio_enabled` env behavior). Emitted
+  # only when explicitly false: true is both the Terraform default and the
+  # app's own default, so a non-customized instance's seed stays
+  # byte-for-byte identical to before this change.
+  instance_studio_map = var.studio_enabled ? {} : { enabled = false }
   # Assemble the top-level YAML map, dropping empty sub-blocks: `instance:` gets
   # the scalar branding keys plus custom_scripts (verbatim); `theme:` gets the
-  # set colours. base64(yamlencode(...)) — but only when the map is non-empty, so
-  # a no-branding VM resolves to "" and the startup script appends nothing.
+  # set colours; `studio:` gets the toggle above. base64(yamlencode(...)) — but
+  # only when the map is non-empty, so a no-branding VM resolves to "" and the
+  # startup script appends nothing.
   instance_branding_map = {
     for inst in local.all_instances : inst.name => merge(
       (length(local.instance_brand_scalars[inst.name]) > 0 || length(try(inst.custom_scripts, [])) > 0) ? {
@@ -148,7 +170,8 @@ locals {
           length(try(inst.custom_scripts, [])) > 0 ? { custom_scripts = inst.custom_scripts } : {}
         )
       } : {},
-      length(local.instance_theme_colors[inst.name]) > 0 ? { theme = local.instance_theme_colors[inst.name] } : {}
+      length(local.instance_theme_colors[inst.name]) > 0 ? { theme = local.instance_theme_colors[inst.name] } : {},
+      length(local.instance_studio_map) > 0 ? { studio = local.instance_studio_map } : {}
     )
   }
   instance_branding_b64 = {
@@ -502,10 +525,16 @@ resource "google_compute_instance" "vm" {
     # unconditional in the app (Wave 0, 2026-08), so there is no env line to
     # write. The variable stays declared + validated in variables.tf so a root
     # still asking for "topnav" fails the plan instead of silently getting rail.
-    theme      = each.value.theme
-    experience = each.value.experience
+    #
+    # theme / experience are likewise NOT forwarded as separate template vars
+    # (D1, 2026-08): they ride the `instance_branding_b64` first-boot seed
+    # blob below instead of an always-wins `.env` line — see
+    # `instance_brand_scalars` above.
     # Web-chat provider pin (AGNES_CHAT_PROVIDER) — "" writes no env line and
-    # the instance follows instance.yaml / the app default.
+    # the instance follows instance.yaml / the app default. Unlike theme/
+    # experience above, this ONE stays an env line: it pins deployment-
+    # provisioned backing (the kai-agent sidecar / apps-runner), not a pure
+    # presentation choice, so it is out of scope for the D1 handoff.
     chat_provider = each.value.chat_provider
     # Vendor-neutral branding for the FIRST-boot instance.yaml (logo/brand/
     # theme colours/custom_scripts), pre-rendered to a base64'd YAML fragment —
@@ -520,27 +549,28 @@ resource "google_compute_instance" "vm" {
     oauth_client_id_secret_name     = try(local.per_vm_oauth[each.value.name].id, "")
     oauth_client_secret_secret_name = try(local.per_vm_oauth[each.value.name].secret, "")
     runtime_secret_env              = var.runtime_secret_env
-    home_route                      = var.home_route
-    studio_enabled                  = var.studio_enabled
-    data_apps_enabled               = each.value.data_apps_enabled
-    data_apps_runtime_image         = var.data_apps_runtime_image
-    enable_watchdog                 = var.enable_watchdog
-    enable_gcp_logging              = var.enable_gcp_logging
-    alert_webhook_url               = var.alert_webhook_url
-    watchdog_files_b64              = local.watchdog_files_b64
-    dispatcher_enabled              = each.value.dispatcher_enabled
-    dispatcher_image                = var.dispatcher_image
-    dispatcher_key_secret           = var.dispatcher_key_secret
-    dispatcher_vertex_sa_secret     = var.dispatcher_vertex_sa_secret
-    dispatcher_policies_b64         = base64encode(var.dispatcher_policies)
-    kai_agent_enabled               = each.value.kai_agent_enabled
-    kai_agent_mem_limit             = each.value.kai_agent_mem_limit
-    kai_agent_cpus                  = each.value.kai_agent_cpus
-    kai_agent_pg_mem_limit          = each.value.kai_agent_pg_mem_limit
-    kai_agent_broker_mcp_enabled    = each.value.kai_agent_broker_mcp_enabled
-    kai_agent_image                 = var.kai_agent_image
-    kai_agent_jwt_secret            = var.kai_agent_jwt_secret
-    kai_agent_e2b_key_secret        = var.kai_agent_e2b_key_secret
+    # home_route / studio_enabled are likewise NOT forwarded as separate
+    # template vars (D1, 2026-08) — see the theme/experience note above; both
+    # ride instance_branding_b64 now.
+    data_apps_enabled            = each.value.data_apps_enabled
+    data_apps_runtime_image      = var.data_apps_runtime_image
+    enable_watchdog              = var.enable_watchdog
+    enable_gcp_logging           = var.enable_gcp_logging
+    alert_webhook_url            = var.alert_webhook_url
+    watchdog_files_b64           = local.watchdog_files_b64
+    dispatcher_enabled           = each.value.dispatcher_enabled
+    dispatcher_image             = var.dispatcher_image
+    dispatcher_key_secret        = var.dispatcher_key_secret
+    dispatcher_vertex_sa_secret  = var.dispatcher_vertex_sa_secret
+    dispatcher_policies_b64      = base64encode(var.dispatcher_policies)
+    kai_agent_enabled            = each.value.kai_agent_enabled
+    kai_agent_mem_limit          = each.value.kai_agent_mem_limit
+    kai_agent_cpus               = each.value.kai_agent_cpus
+    kai_agent_pg_mem_limit       = each.value.kai_agent_pg_mem_limit
+    kai_agent_broker_mcp_enabled = each.value.kai_agent_broker_mcp_enabled
+    kai_agent_image              = var.kai_agent_image
+    kai_agent_jwt_secret         = var.kai_agent_jwt_secret
+    kai_agent_e2b_key_secret     = var.kai_agent_e2b_key_secret
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [
