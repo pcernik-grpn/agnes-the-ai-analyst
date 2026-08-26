@@ -161,88 +161,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   put a database lookup in a helper every login calls, to close something that
   is not a general open redirect, since the target is always this deployment's
   own infrastructure behind the same RBAC.
-### Changed
-
-- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
-  `none` (internal-only network, no route to the internet) instead of `open`.
-  The chat agent runs with bypassed tool permissions over a read-write
-  workspace, so an open default was a file-exfiltration surface. Operators who
-  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
-  with `chat.docker_egress_mode: open`, or `allowlist` +
-  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
-  or blank value now fails closed to `none`.
-
-### Fixed
-
-- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
-  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
-  labels now render via `textContent`, keeping the static sort markup trusted.
-- Agent-session principals no longer crash (500) when reaching collection
-  authorization (`accessible_collection_ids`, `require_collection_access`);
-  an `AgentPrincipal` now resolves to its live scoped-collection intersection
-  or a clean 403, matching the existing co-session/agent-session seam and
-  never inheriting owner-owned collections.
-- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
-  the same canonical subpath used for policy and dispatcher classification, and
-  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
-  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
-  path like `/v1/./messages` that classified as a non-message call — skipping
-  its pinned-model allowlist and monthly token budget — while HTTPX
-  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
-  duplicate-slash message paths can likewise no longer route the destination
-  somewhere the authorization decision did not intend.
-- Token persistence refuses to write (instead of silently downgrading to
-  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
-  valid Fernet key; a genuinely unset key still uses the plaintext keyless
-  fallback as before. A previously-silent misconfigured production vault now
-  fails loudly on secret saves instead of writing the secret in cleartext.
-
-### Security
-
-- Knowledge-digest generation now frames corpus source chunks as untrusted
-  data — behind an explicit do-not-follow-instructions notice and a per-call
-  nonce-delimited fence — before they reach the LLM, so retrieved content can
-  no longer be elevated into persistent agent instructions through the
-  generated `.claude/rules/ka_<slug>.md` digest.
-
-### Internal
-
-- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
-  genuine schema change on an existing DuckDB↔Postgres pair under the A3
-  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
-  schema change on an existing pair's table … follows 'Adding a PG-only
-  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
-  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
-  an identical call shape (accepts the same `granted_by` keyword) but has no
-  column to persist it into. `migrations/versions/
-  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
-  agent's `owner_user_id`.
-
-- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
-
-- **PG-first development rule (remediation-program Track A3): the DuckDB
-  app-state backend is frozen.** No user-visible change. Development-rule
-  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
-  app-state repositories/schema changes to be Postgres-only (a
-  `src/repositories/<name>_pg.py` module registered `PG`-only in the
-  `_REGISTRY` factory table, an Alembic-only migration) — no new
-  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
-  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
-  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
-  Resolving a Postgres-only repository on an instance still running the
-  frozen DuckDB app-state backend now raises a typed
-  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
-  handler into a clean `501` instead of an unhandled `500`. New ratchets:
-  `tests/test_repository_registry_pg_first_ratchet.py`,
-  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
-  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
-  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
-  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
-  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
-  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
-  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
-  dev-kit agents are updated to match.
-### Added
 
 - **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
   the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
@@ -347,6 +265,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   or blank value now fails closed to `none`.
 
 
+- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
+  `none` (internal-only network, no route to the internet) instead of `open`.
+  The chat agent runs with bypassed tool permissions over a read-write
+  workspace, so an open default was a file-exfiltration surface. Operators who
+  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
+  with `chat.docker_egress_mode: open`, or `allowlist` +
+  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
+  or blank value now fails closed to `none`.
+
+
 - **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
   Databricks panes now save the connection onto the `source_connections` ROW
   (`POST`/`PUT /api/admin/source-connections*` + the row's own vault slot via
@@ -416,6 +344,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   admin-granted row to owner-granted.
 
 ### Fixed
+
+- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
+  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
+  labels now render via `textContent`, keeping the static sort markup trusted.
+- Agent-session principals no longer crash (500) when reaching collection
+  authorization (`accessible_collection_ids`, `require_collection_access`);
+  an `AgentPrincipal` now resolves to its live scoped-collection intersection
+  or a clean 403, matching the existing co-session/agent-session seam and
+  never inheriting owner-owned collections.
+- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
+  the same canonical subpath used for policy and dispatcher classification, and
+  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
+  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
+  path like `/v1/./messages` that classified as a non-message call — skipping
+  its pinned-model allowlist and monthly token budget — while HTTPX
+  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
+  duplicate-slash message paths can likewise no longer route the destination
+  somewhere the authorization decision did not intend.
+- Token persistence refuses to write (instead of silently downgrading to
+  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
+  valid Fernet key; a genuinely unset key still uses the plaintext keyless
+  fallback as before. A previously-silent misconfigured production vault now
+  fails loudly on secret saves instead of writing the secret in cleartext.
+
 
 - **A signed-out visitor opening a data-app URL on an app subdomain no longer
   hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
@@ -525,6 +477,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   no longer be elevated into persistent agent instructions through the
   generated `.claude/rules/ka_<slug>.md` digest.
 
+
+- Knowledge-digest generation now frames corpus source chunks as untrusted
+  data — behind an explicit do-not-follow-instructions notice and a per-call
+  nonce-delimited fence — before they reach the LLM, so retrieved content can
+  no longer be elevated into persistent agent instructions through the
+  generated `.claude/rules/ka_<slug>.md` digest.
+
 ### Removed
 
 - **BREAKING: the `/api/agents` builder-CRUD router is deleted**
@@ -559,6 +518,42 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   section). `deployment.role` is unaffected.
 
 ### Internal
+
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
+
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
 
 - **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
   A fast, pure-file-parse test that catches the recurring silent-rebase
