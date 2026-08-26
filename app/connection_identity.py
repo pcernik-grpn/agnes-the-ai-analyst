@@ -48,6 +48,13 @@ CONNECTION_IDENTITY_LEAVES: Dict[str, frozenset[str]] = {
             "auth_type",
             "token_env",
             "private_key_env",
+            # `private_key_passphrase_env` is deliberately absent, even though it is a
+            # secret-ref like the two `*_env` leaves above: the passphrase never reaches
+            # Snowflake — it only locally decrypts the already-selected private key (the
+            # `key_pair` branch of `resolve_snowflake_settings` → `attach._load_private_key`)
+            # — so changing it cannot swap which secret is presented upstream (which grants
+            # apply), and a wrong value fails key decryption loudly rather than silently
+            # serving the stale data this guard exists to catch.
         }
     ),
     # `location` is deliberately absent. It is not a coordinate a registration
