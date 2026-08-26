@@ -3,14 +3,18 @@
 `experience` is the one-line adoption switch (app >= 0.83.1): it flips the
 app-side DEFAULTS of the coupled knobs (theme → paper,
 features.stack_auto_membership → on). Chrome layout stopped being one of them
-in Wave 0 (2026-08) — the rail is unconditional. The per-VM module field writes
-`AGNES_INSTANCE_EXPERIENCE` so a VM recreate cannot silently strip the
-preset an instance runs with.
+in Wave 0 (2026-08) — the rail is unconditional.
+
+D1 (config-ownership remediation, 2026-08): the per-VM module field no
+longer writes an always-wins `AGNES_INSTANCE_EXPERIENCE` `.env` line — that
+permanently shadowed the admin UI's own control of the same knob on every
+boot. It now rides the first-boot-only `instance.yaml` seed instead (see
+`test_startup_ui_config_ownership.py` for the full seed-vs-env contract), so
+a fresh VM still gets the day-1 value and `/admin/server-config` owns it
+from day 2 onward.
 
 Same read-the-template pattern as `test_startup_ui_layout_theme_toggle.py`,
-whose fields this one mirrors exactly — per-VM (dev-first rollout), empty
-default writes NO env line (an `AGNES_INSTANCE_EXPERIENCE=` empty line
-would shadow whatever `instance.experience` says in instance.yaml), and the
+whose fields this one mirrors exactly — per-VM (dev-first rollout), and the
 Terraform allowlist must track the app's own accepted set. The app-side set
 lives on the `experience` Switch in `app/switches.py` (kind="select") —
 `get_experience()` resolves through `switch_value`, so the options tuple IS
@@ -53,22 +57,20 @@ def test_both_object_types_declare_the_experience_field():
         )
 
 
-def test_main_tf_forwards_experience_per_vm():
+def test_main_tf_folds_experience_into_the_first_boot_seed_per_vm():
     body = (MODULE / "main.tf").read_text()
-    assert re.search(r"experience\s*=\s*each\.value\.experience", body), (
-        "main.tf must forward experience per-VM (each.value), not module-wide"
+    assert re.search(r'experience\s*=\s*try\(inst\.experience,\s*""\)', body), (
+        "main.tf must fold experience per-VM (inst.experience) into the "
+        "instance_brand_scalars first-boot seed map, not forward it as a "
+        "raw templatefile() var"
     )
 
 
-def test_tpl_emits_the_env_line_only_when_set():
+def test_tpl_never_writes_the_env_line():
     body = (MODULE / "startup-script.sh.tpl").read_text()
-    assert re.search(
-        r'%\{\s*if\s+experience\s*!=\s*""\s*~?\}\s*\nAGNES_INSTANCE_EXPERIENCE=\$\{experience\}\s*\n%\{\s*endif\s*~?\}',
-        body,
-    ), "tpl must emit AGNES_INSTANCE_EXPERIENCE guarded by a non-empty experience"
-    assert body.count("\nAGNES_INSTANCE_EXPERIENCE=") == 1, (
-        "AGNES_INSTANCE_EXPERIENCE must be emitted exactly once — a second, "
-        "unguarded line would write an empty value and shadow instance.yaml"
+    assert "AGNES_INSTANCE_EXPERIENCE" not in body, (
+        "startup-script.sh.tpl must not write AGNES_INSTANCE_EXPERIENCE — the "
+        "preset reaches the VM only through the first-boot instance.yaml seed"
     )
 
 

@@ -727,6 +727,25 @@ def test_ws_same_origin_refused_by_default(client_granted, running_app, proxy_en
     assert excinfo.value.code == 4403
 
 
+def test_ws_preview_token_passes_the_same_origin_gate(proxy_env, running_app, mint_preview):
+    """WS mirror of the HTTP gate's `via_preview` allowance: a logged-in
+    browser's in-chat preview of a WS-based app (Streamlit/Dash) opens the
+    handshake with session + preview cookies, and must pass auth, RBAC and
+    the same-origin gate on the preview credential in the default posture.
+    The bridge then fails to reach the nonexistent upstream container and
+    closes 1011 — which is the proof every gate passed: without the WS
+    preview path this handshake closed 4403 instead (Devin Review on this
+    PR)."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    with proxy_env["client"].websocket_connect(
+        "/apps/s/ws", headers={"cookie": f"{_session_cookie()}; {tok.cookie}"}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_text()
+    assert excinfo.value.code == 1011
+
+
 # ---------------------------------------------------------------------------
 # same_origin_serving_warning() — the startup log when apps are enabled but no
 # hosted app can be served (same-origin off, no isolated origin configured).
@@ -876,12 +895,73 @@ def test_preview_token_serves_same_origin_without_global_ack(
     `allow_same_origin=False` — the in-chat preview works WITHOUT the global
     flag. A plain navigation (no preview token) to the same origin is still
     refused (see `test_same_origin_serving_refused_by_default`), so enabling the
-    preview does not re-open drive-by same-origin serving for every app."""
+    preview does not re-open drive-by same-origin serving for every app.
+
+    NOTE: this sends ONLY the preview cookie — an anonymous caller. That shape
+    alone let the session-first resolution bug slip (Devin Review on this PR):
+    a real logged-in browser sends the session cookie TOO, which is the twin
+    `test_logged_in_browser_with_preview_cookie_serves_same_origin` below."""
     _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
     tok = mint_preview("s", ttl_s=1800)
     r = proxy_client.get("/apps/s/hello", headers={"cookie": tok.cookie})
     assert r.status_code == 200, r.text
     assert r.text == "hello from app"
+
+
+def _session_cookie(user_id: str = "owner1", email: str = "owner@test.local") -> str:
+    """The `access_token` session cookie a logged-in browser attaches — the
+    same JWT `_set_login_cookie` sets after OAuth/password login."""
+    from app.auth.jwt import create_access_token
+
+    return f"access_token={create_access_token(user_id, email)}"
+
+
+def test_logged_in_browser_with_preview_cookie_serves_same_origin(
+    proxy_client, fake_runner, respx_upstream, running_app, mint_preview, proxy_env
+):
+    """THE browser reality the anonymous test above misses: the in-chat
+    preview iframe of a logged-in user carries the viewer's `access_token`
+    session cookie ALONGSIDE the preview cookie. The preview credential must
+    win — the earlier session-first resolution returned `via_preview=False`
+    for this request, and the same-origin gate 403'd the preview in the
+    default posture (no subdomain_base, flag off): Devin Review on this PR."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": f"{_session_cookie()}; {tok.cookie}"})
+    assert r.status_code == 200, r.text
+    assert r.text == "hello from app"
+
+
+def test_logged_in_browser_without_preview_token_still_refused(proxy_client, running_app, proxy_env):
+    """Default posture: a plain logged-in navigation (session cookie only, no
+    preview token) to `/apps/<slug>/` is still refused — the preview-first
+    ordering must not widen what a session alone can reach."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = proxy_client.get(
+        "/apps/s/hello",
+        headers={"cookie": _session_cookie(), "accept": "application/json"},
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
+
+
+def test_logged_in_browser_with_wrong_slug_preview_token_still_refused(
+    proxy_client, running_app, mint_preview, proxy_env
+):
+    """A preview token minted for ANOTHER app grants nothing on this slug:
+    the scope pin skips it, resolution falls back to the session (the caller
+    stays authenticated), and the same-origin gate refuses exactly as if no
+    preview token were present. Delivered via the legacy bare cookie name —
+    the per-app cookie name for this slug would not even be consulted."""
+    from app.api.data_apps import _PREVIEW_COOKIE_NAME
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    _create_app_row(slug="other", state="running")
+    tok = mint_preview("other", ttl_s=1800)
+    cookies = f"{_session_cookie()}; {_PREVIEW_COOKIE_NAME}={tok.jwt}"
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": cookies, "accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
 
 
 def test_expired_preview_token_403(proxy_client, running_app, mint_preview):

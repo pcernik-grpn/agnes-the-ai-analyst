@@ -54,15 +54,9 @@ def _resolve_env_refs(value: Any, _path: str = "") -> Any:
             )
         return resolved
     if isinstance(value, dict):
-        return {
-            k: _resolve_env_refs(v, _path=f"{_path}.{k}" if _path else k)
-            for k, v in value.items()
-        }
+        return {k: _resolve_env_refs(v, _path=f"{_path}.{k}" if _path else k) for k, v in value.items()}
     if isinstance(value, list):
-        return [
-            _resolve_env_refs(item, _path=f"{_path}[{i}]")
-            for i, item in enumerate(value)
-        ]
+        return [_resolve_env_refs(item, _path=f"{_path}[{i}]") for i, item in enumerate(value)]
     return value
 
 
@@ -84,8 +78,7 @@ def _validate_config_version(config: dict) -> None:
         version = 0
     if version not in SUPPORTED_CONFIG_VERSIONS:
         logger.warning(
-            "Unsupported config_version: %s. Supported versions: %s. "
-            "Update your instance.yaml config_version field.",
+            "Unsupported config_version: %s. Supported versions: %s. Update your instance.yaml config_version field.",
             version,
             sorted(SUPPORTED_CONFIG_VERSIONS),
         )
@@ -101,7 +94,8 @@ def load_instance_config() -> dict[str, Any]:
     Raises:
         FileNotFoundError: If instance.yaml not found.
         yaml.YAMLError: If YAML is invalid.
-        ValueError: If config is empty or missing required fields.
+        ValueError: If config is empty (a parsed-but-empty file, not merely
+            missing individual fields — see `_validate_config`).
     """
     path = CONFIG_DIR / "instance.yaml"
     if not path.exists():
@@ -129,10 +123,22 @@ def load_instance_config() -> dict[str, Any]:
 
 
 def _validate_config(config: dict) -> None:
-    """Validate required configuration fields.
+    """Warn about commonly-needed fields that are missing or empty.
 
-    Raises:
-        ValueError: If required fields are missing or empty.
+    These are NOT enforced as hard requirements — this function used to raise
+    `ValueError` for a missing field, which looked like a real gate but never
+    was one in practice: a provisioning-created VM ships no static
+    `config/instance.yaml` at all, so `load_instance_config()` raises
+    `FileNotFoundError` before this function is ever reached; and even a
+    static file that IS present but fails this check is caught by
+    `app.instance_config.load_instance_config`'s deliberately broad
+    `except Exception` (see its docstring), which serves built-in defaults
+    either way. The only thing the raise actually did was punish a direct
+    caller of `config.loader.load_instance_config()` that isn't routed
+    through that wrapper (e.g. a connector script) with an exception on an
+    otherwise-bootable config. Warn instead, so a genuinely incomplete
+    instance.yaml is still visible in the logs without pretending it blocks
+    startup.
     """
     required_paths = [
         ("instance", "name"),
@@ -160,9 +166,11 @@ def _validate_config(config: dict) -> None:
                 missing.append(path_str)
 
     if missing:
-        raise ValueError(
-            f"Missing required instance config fields: {', '.join(missing)}. "
-            f"Check config/instance.yaml and .env"
+        logger.warning(
+            "instance.yaml is missing recommended field(s): %s. The app boots "
+            "on built-in defaults for these — see config/instance.yaml.example "
+            "and docs/CONFIGURATION.md.",
+            ", ".join(missing),
         )
 
 

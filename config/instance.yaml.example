@@ -153,28 +153,13 @@ instance:
 server:
   hostname: ""                    # DNS name (e.g., "data.acme.com")
   host: ""                        # IP address
-  app_dir: "/opt/data-analyst"    # Installation directory
   # public_url: ""                # Absolute base URL, e.g. "https://data.acme.com".
                                   # Used to build absolute links from request-less
                                   # surfaces — notably the Slack bot's /slack/bind
                                   # magic links. The PUBLIC_URL env var overrides this.
-  # --- Client setup (shown in "Get Started" on dashboard) ---
-  # ssh_alias: "data-analyst"     # SSH config Host alias for analysts (default: "data-analyst")
-  # ssh_key: "~/.ssh/data_analyst_server"  # SSH key path for analysts (default: "~/.ssh/data_analyst_server")
-  # project_dir: "data-analyst"   # Local project folder name (default: "data-analyst")
-
-# --- Admin users ---
-# Manage the server, own data files, get unlimited resource limits.
-# SSH keys are used by server/setup.sh during provisioning.
-admins:
-  - username: "admin"
-    ssh_public_key: "ssh-ed25519 AAAA..."
 
 # --- Deployment ---
 deployment:
-  method: "manual"                # manual | github_actions
-  repo_url: ""                    # e.g., "git@github.com:acme/ai-data-analyst.git"
-  branch: "main"
   # role: "all"                    # api | gateway | worker | all, comma-separable (e.g. "api,gateway").
                                    # AGNES_ROLE env var overrides this. Default "all" keeps the
                                    # single-process, zero-ops S-tier behavior. Splitting into
@@ -551,10 +536,6 @@ email:
   # Sender address. `SMTP_FROM` (or the legacy `EMAIL_FROM_ADDRESS`) wins if
   # set; this value is the fallback.
   from_address: "noreply@example.com"
-  # NOT IMPLEMENTED — the SMTP transport sends a bare address with no display
-  # name, so this key is inert. Left in place because removing it would silently
-  # drop it from existing instance.yaml files on the next template diff.
-  from_name: "AI Harness"
   smtp_host: "${SMTP_HOST}"          # e.g., "smtp.gmail.com"
   smtp_port: 587                     # 587 for STARTTLS, 465 for SSL
   smtp_user: "${SMTP_USER}"
@@ -578,16 +559,14 @@ notifications:
   alert_webhook_url: ""
 
 # --- Jira integration (optional) ---
-jira:
-  domain: ""
-  email: ""
-  api_token: "${JIRA_API_TOKEN}"
-  webhook_secret: "${JIRA_WEBHOOK_SECRET}"
-  # Custom fields to refresh onto tickets (generic; no defaults). field_id or
-  # field_id:column, comma-separated. Discover with:
-  #   python -m connectors.jira.scripts.verify_sla_access --list-fields
-  refresh_fields: "${JIRA_REFRESH_FIELDS}"
-  cloud_id: ""  # set only for a scoped API token (gateway URL)
+# NOT configured here. connectors/jira/service.py reads JIRA_* environment
+# variables directly (os.environ) — there is no instance.yaml wiring for this
+# connector at all. Set in .env: JIRA_DOMAIN, JIRA_EMAIL, JIRA_API_TOKEN,
+# JIRA_WEBHOOK_SECRET, JIRA_REFRESH_FIELDS (custom fields to refresh onto
+# tickets — field_id or field_id:column, comma-separated; discover with
+# `python -m connectors.jira.scripts.verify_sla_access --list-fields`),
+# JIRA_CLOUD_ID (only for a scoped API token / gateway URL). See
+# docs/CONFIGURATION.md's ".env infrastructure variables".
 
 # --- Corporate Memory AI (optional) ---
 # Extracts shared knowledge from team members' CLAUDE.local.md files.

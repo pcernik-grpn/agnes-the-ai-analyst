@@ -551,7 +551,6 @@ const SECTION_META = {
   data_source: { title: "Data source", help: "Switch source type or update connection details. Optional BQ + Keboola knobs render below as structured fields with hints; expand each to edit." },
   email: { title: "Email (SMTP)", help: "SMTP relay for magic-link login. Leave blank to disable." },
   telegram: { title: "Telegram", help: "Bot credentials for notifications." },
-  jira: { title: "Jira", help: "Jira webhook + REST credentials." },
   theme: { title: "Theme", help: "Brand colors and typography." },
   server: { title: "Server", help: "Hostname and host. Changing these can break OAuth callbacks." },
   auth: { title: "Authentication", help: "Allowed sign-in domain and Google OAuth keys. Misconfiguration can lock everyone out." },
@@ -1157,7 +1156,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "jira", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in

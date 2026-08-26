@@ -2,8 +2,14 @@
 
 Agnes's app state lives in Postgres (via SQLAlchemy 2.0 + Alembic). Analytics
 stays on DuckDB. This document is the operator + developer playbook for the
-PG side; the DuckDB inline ladder in `src/db.py` is unrelated and is being
-retired as repository ports complete.
+PG side; the DuckDB inline ladder in `src/db.py` is **frozen** (PG-first
+ratchet, A3 — see `CLAUDE.md` → "Dual-backend discipline"): existing
+`src/repositories/*.py` ↔ `*_pg.py` pairs and DuckDB schema steps stay
+maintained, but no new one may be added. `SCHEMA_VERSION` is pinned at
+`src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`; every new migration from here on
+is Alembic-only. See "Adding a PG-only feature" below for the developer
+recipe, and "Extending an EXISTING (frozen pre-A3) pair" for the no-schema-
+change case on a repo that already has a DuckDB half.
 
 ## Module layout
 
@@ -178,41 +184,75 @@ DATABASE_URL=... alembic revision --autogenerate -m "your message"
 # (then hand-review the file in migrations/versions/)
 ```
 
-## Adding a new model
+## Adding a PG-only feature (post-A3)
 
-The pattern this repo has standardised on:
+**This is the default path for any new app-state table or repository.** The
+DuckDB app-state backend is frozen (`CLAUDE.md` → "Dual-backend
+discipline") — a new feature never touches `src/db.py` or gets a DuckDB
+repo module.
 
 1. **Define the SQLAlchemy model** under `src/models/<cluster>.py`. Import
-   `Base` from `src.db_pg`.
-2. **Add the import** to `src/models/__init__.py` so Alembic's
-   autogenerate sees the new metadata.
-3. **Confirm the drift test fires red** —
-   `pytest tests/db_pg/test_alembic_roundtrip.py::test_no_model_migration_drift`
-   should fail with "model vs migration drift detected" listing your new
-   table.
-4. **Generate the migration** —
-   `alembic revision --autogenerate -m "<table_name>"`. Read the
-   generated file; verify the `downgrade()` body is the true inverse of
-   `upgrade()` (it should explicitly `drop_index` every index added in
-   `upgrade()` before `drop_table`).
-5. **Run round-trip + drift + pairwise tests** — all green is required
-   before merging:
+   `Base` from `src.db_pg`, and add the import to `src/models/__init__.py`.
+2. **Generate the Alembic migration** — `alembic revision --autogenerate -m
+   "<table_name>"`. Read the generated file; verify `downgrade()` is the
+   true inverse of `upgrade()`. Nothing lands in `src/db.py` —
+   `SCHEMA_VERSION` does not move.
+3. **Run round-trip + drift + pairwise tests**:
    ```bash
    pytest tests/db_pg/test_alembic_skeleton.py tests/db_pg/test_alembic_roundtrip.py
    ```
-6. **Add a `MigrationTask` to `scripts/migrate_duckdb_to_pg/__init__.py:TASKS`**
-   so the DuckDB→PG bulk copy includes the new table. If the table has
-   JSONB columns that come from DuckDB JSON, add the (table, column)
-   pair to `_JSON_COLUMNS` so the INSERT casts correctly.
-7. **Build the PG repository** under `src/repositories/<name>_pg.py`,
-   mirroring the existing DuckDB repository's public surface. Reuse
-   helpers from the DuckDB module where shape-compatible (e.g.
-   `table_registry_pg` imports `_encode_primary_key` from the DuckDB
-   module).
-8. **Write PG-side tests** under `tests/db_pg/test_<cluster>_pg.py`
-   covering at minimum: CRUD round-trip, unique/composite constraint
-   enforcement, and any cluster-specific invariants (e.g. system-group
-   protection, ON CONFLICT semantics).
+4. **Build ONLY the PG repository**, `src/repositories/<name>_pg.py`. There
+   is no DuckDB sibling to mirror.
+5. **Register it PG-only** in `src/repositories/__init__.py` `_REGISTRY`:
+   ```python
+   "<name>": {PG: ("src.repositories.<name>_pg", "<Name>PgRepository")},
+   ```
+   No `DUCKDB` key. `tests/test_repository_registry.py::test_registry_backends_are_symmetric`
+   accepts this shape; `tests/test_repository_registry_pg_first_ratchet.py`
+   and `tests/db_pg/test_repo_module_pg_first_ratchet.py` are the ratchets
+   that keep a *new* DuckDB-backed entry or module from sneaking in
+   elsewhere.
+6. **A route that can reach this repo on a DuckDB-backed instance must fail
+   clean, not crash.** Resolving the repo there raises
+   `src.repositories.RequiresPostgresBackend` automatically (the factory's
+   `_build()` does this for any PG-only entry) — the app-wide handler in
+   `app/main.py` turns it into a `501` naming the feature. You do not need a
+   bespoke try/except in the handler; just let the exception propagate.
+7. **If the route is swept by `tests/db_pg/test_get_status_parity_sweep.py`
+   / `test_mutation_status_parity_sweep.py`**, add its `"METHOD path"` key
+   (with a one-line reason as the value — `_PG_ONLY_ROUTE_EXEMPTIONS` is a
+   `dict[str, str]`) to that file's `_PG_ONLY_ROUTE_EXEMPTIONS` — the sweep's
+   `assert_pg_only_exemptions_fail_clean` still requires the DuckDB side to
+   answer a TYPED `501` (`body["error"] == "requires_postgres_backend"`),
+   not merely some 4xx, so a genuine crash — or an unrelated 403/404 that
+   fires before the repo is even reached — is still caught.
+8. **Write PG-side tests** under `tests/db_pg/test_<cluster>_pg.py` and a
+   PG-only-shaped test in the style of `tests/db_pg/test_mcp_sources_contract.py`
+   (there is no DuckDB half to parametrize against — just exercise the PG
+   repo directly).
+
+Skip the `scripts/migrate_duckdb_to_pg/__init__.py:TASKS` step entirely — a
+brand-new table has no DuckDB-side data to carry over.
+
+## Extending an EXISTING (frozen pre-A3) pair — no schema change
+
+A new **method** on a repository that already has a DuckDB↔PG pair — a new
+query or write path over columns that already exist — is not a schema
+change and is unaffected by the freeze:
+
+1. Add the method to the PG repo (`src/repositories/<name>_pg.py`) **and**
+   its DuckDB sibling (`src/repositories/<name>.py`) in the same PR — this
+   pair is frozen at "maintained", not "abandoned". Mirror signatures
+   (`tests/db_pg/test_repo_method_parity.py` checks this statically).
+2. Extend `tests/db_pg/test_<cluster>_contract.py` with the new behavior,
+   parametrized over both backends.
+
+**A genuine schema change on an existing pair's table (new column, new
+index, new constraint) follows "Adding a PG-only feature" above, not this
+section** — the DuckDB ladder is frozen regardless of whether the table
+itself predates the ratchet. The new column lands in Postgres only; the
+DuckDB side of that repo simply does not gain the capability that depends on
+it. (`src/db_pg.py` `Base.metadata` still needs the model change either way.)
 
 ## The four load-bearing tests
 

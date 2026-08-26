@@ -11,6 +11,7 @@
 # stdout clean without hiding warnings from any other package.
 import warnings as _warnings
 from src.repositories import (
+    RequiresPostgresBackend,
     memory_domains_repo,
     user_group_members_repo,
     user_groups_repo,
@@ -1149,6 +1150,18 @@ async def lifespan(app):
             logger.warning("Microsoft auth check: %s", warning)
     except Exception:
         logger.exception("Microsoft auth startup check crashed (non-fatal)")
+
+    # Google: unlike Microsoft, there is no tenant to serve as even a partial
+    # identity boundary — an enabled provider without auth.allowed_domain
+    # means ANY Google account can sign in and self-provision. Same wiring as
+    # the Microsoft check above (RBAC review on PR #1569).
+    try:
+        from app.auth.providers.google import startup_warnings as google_startup_warnings
+
+        for warning in google_startup_warnings():
+            logger.warning("Google auth check: %s", warning)
+    except Exception:
+        logger.exception("Google auth startup check crashed (non-fatal)")
 
     # Bring the Postgres schema to the app's expected Alembic head. The
     # DuckDB ladder self-migrates on every connect (src/db.py); Postgres
@@ -3121,6 +3134,21 @@ def create_app() -> FastAPI:
         keep = ("loc", "msg", "type", "url")
         redacted = [{k: error[k] for k in keep if k in error} for error in exc.errors()]
         return JSONResponse(status_code=422, content=jsonable_encoder({"detail": redacted}))
+
+    @app.exception_handler(RequiresPostgresBackend)
+    async def _requires_postgres_backend_handler(request, exc: RequiresPostgresBackend):
+        """A3 PG-first ratchet: a route resolved a Postgres-only repository on
+        an instance still running the frozen DuckDB app-state backend. Fail
+        clean with a 501 naming the feature — never an unhandled 500 — see
+        CLAUDE.md -> "Dual-backend discipline" and docs/migrations.md."""
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": str(exc),
+                "error": "requires_postgres_backend",
+                "feature": exc.feature,
+            },
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _html_auth_redirect_handler(request, exc: StarletteHTTPException):
