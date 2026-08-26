@@ -138,6 +138,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- Web chat: a user message's hover actions (timestamp + copy) now hang
+  BELOW the bubble instead of renting an invisible second row inside it —
+  a one-line message no longer renders as a two-row-tall bubble. On touch
+  devices (no hover) the row stays visible and the turn reserves the space.
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a

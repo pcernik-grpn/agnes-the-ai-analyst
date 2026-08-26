@@ -571,6 +571,27 @@ body.chat-page-body main { margin: 0; padding: 0; }
   transition: opacity var(--transition-fast);
 }
 .msg-user .msg-actions { justify-content: flex-end; }
+/* User turns: the row hangs BELOW the bubble (absolute, pinned to its right
+   edge) instead of renting a second row inside it — in flow, the opacity-0
+   row still kept a one-line bubble two rows tall, and revealed it sat inside
+   the fill rather than under the bubble. padding-top (not margin) bridges
+   the visual gap while staying hover surface, so the pointer can travel from
+   bubble to copy button without the row fading out mid-way. width:max-content
+   lets the row outgrow a bubble narrower than [time + button] leftward.
+   pointer-events gates the invisible row from swallowing clicks in the
+   message gap it now overlays. */
+.msg-user .msg-bubble { position: relative; }
+.msg-user .msg-actions {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  width: max-content;
+  margin-top: 0;
+  padding-top: 4px;
+  pointer-events: none;
+}
+.msg-user:hover .msg-actions,
+.msg-user .msg-actions:focus-within { pointer-events: auto; }
 .msg:hover .msg-actions,
 .msg-actions:focus-within { opacity: 1; }
 /* While the model is streaming, keep the actions hidden — a half-
@@ -1808,6 +1829,12 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   .code-block-copy {
     opacity: 1;
   }
+  /* The user-turn actions row hangs below the bubble out of flow and is
+     always visible here — re-enable its pointer events (the hover gate
+     above never fires on touch) and reserve the hang height under the
+     article so the row doesn't overlap the next turn. */
+  .msg-user .msg-actions { pointer-events: auto; }
+  .msg-user { margin-bottom: var(--space-2); }
 }
 
 /* Reduced-motion: drop the press transform on the primary buttons
