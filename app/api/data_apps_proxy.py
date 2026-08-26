@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -67,6 +67,7 @@ from app.api.data_apps import (
     try_acquire_op_lease,
 )
 from app.auth.dependencies import _get_db, get_current_user
+from app.auth.rate_limit import limiter as _rate_limiter
 from app.auth.jwt import verify_token
 from app.auth.pat_resolver import DATA_APP_PREVIEW_SCOPE_PREFIX, resolve_token_to_user
 from app.coordination.base import CoordinationUnavailable
@@ -77,6 +78,70 @@ from src.repositories import data_apps_repo
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["data-apps-proxy"])
+
+
+@router.get("/api/data-apps-tls-check", include_in_schema=False)
+@_rate_limiter.limit("120/minute")
+async def tls_check(request: Request, domain: str = Query(...)):
+    """Caddy's on-demand-TLS gate: may this hostname have a certificate?
+
+    Note the path: ``/api/data-apps-tls-check``, NOT ``/api/data-apps/…``.
+    The CRUD router owns the ``/api/data-apps`` prefix and is registered first,
+    so ``/api/data-apps/tls-check`` is swallowed by its ``GET /{slug}`` detail
+    route and answers 401 to Caddy — which reads as "cancel issuance". Reserving
+    the slug instead (the ``detail`` / ``git`` pattern) would work, but growing
+    ``RESERVED_SLUGS`` is its own footgun: an app already named ``tls-check``
+    would break, exactly as an app named ``git`` once did. A sibling path
+    cannot collide by construction. Do not "tidy" this into the prefix.
+
+    Contract is Caddy's (`on_demand_tls { ask <url> }`): it sends
+    ``GET <url>?domain=<name>``, treats **any 2xx as permission to issue** and
+    anything else as "cancel issuance". Serving one certificate per app instead
+    of a single wildcard is what keeps the deployment off DNS-01 — and off the
+    DNS-zone credential that would otherwise have to sit on the very host that
+    runs user-authored app code.
+
+    This endpoint is therefore the ONLY thing standing between a stranger and
+    an ACME flood: Caddy's own docs steer operators here rather than to the
+    `interval`/`burst` knobs. So it answers 2xx for exactly one shape — a
+    registered, non-hidden app slug directly under the configured
+    ``subdomain_base`` — and 404 for everything else, the bare base and
+    multi-label names included (the latter mirrors
+    ``DataAppSubdomainMiddleware``'s ``"." not in slug`` rule: a name this
+    deployment cannot route must not get a certificate either).
+
+    **Unauthenticated by necessity** — Caddy sends a plain GET and cannot carry
+    a credential. That leaks nothing new: ``proxy_app`` resolves
+    ``_get_row_or_404`` BEFORE authenticating, so a stranger can already tell a
+    real slug (401) from a made-up one (404) on the proxy itself.
+
+    The rate limit is deliberately generous. Certificate issuance is rare, so a
+    legitimate deployment never approaches it, while it still caps the DB churn
+    an unauthenticated caller can drive. Exhausting the bucket degrades softly:
+    Caddy is refused and retries later, rather than anything being served wrong.
+    """
+    from app.instance_config import get_data_apps_config
+
+    cfg = get_data_apps_config()
+    if not cfg.get("enabled"):
+        raise HTTPException(status_code=404, detail="not_issuable")
+    base = (cfg.get("subdomain_base") or "").strip().strip(".").lower()
+    if not base:
+        raise HTTPException(status_code=404, detail="not_issuable")
+
+    # Normalize the way DNS does: case-insensitive, trailing root dot optional.
+    host = (domain or "").strip().rstrip(".").lower()
+    suffix = "." + base
+    if not host.endswith(suffix):
+        raise HTTPException(status_code=404, detail="not_issuable")
+    slug = host[: -len(suffix)]
+    if not slug or "." in slug:
+        raise HTTPException(status_code=404, detail="not_issuable")
+
+    row = data_apps_repo().get_by_slug(slug)
+    if not row or row.get("state") == "linked_hidden":
+        raise HTTPException(status_code=404, detail="not_issuable")
+    return {"ok": True, "domain": host}
 
 # Hop-by-hop headers (RFC 7230 §6.1) plus `host` — stripped in BOTH
 # directions. `host` specifically must not ride through to the upstream
