@@ -21,6 +21,7 @@ agent) — token issuance requires all four scope modes to be `'selected'`.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import uuid
@@ -35,6 +36,7 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import is_user_admin, require_agent_profiles_enabled
 from app.auth.dependencies import _get_db, require_session_or_user_pat, require_session_token
 from app.auth.jwt import create_access_token
+from app.resource_types import ResourceType
 from src.object_store import object_store
 from src.repositories import (
     access_token_repo,
@@ -44,6 +46,7 @@ from src.repositories import (
     agent_webhooks_repo,
     agents_repo,
     audit_repo,
+    resource_grants_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +83,8 @@ _SCOPE_MODE_VALUES = frozenset({"all", "selected"})
 _MEMORY_WRITE_MODE_VALUES = frozenset({"off", "propose", "auto"})
 
 # Mirrors `src.repositories.agents._UPDATABLE` minus `slug` (immutable via
-# this API — see `update_agent`).
+# this API — see `update_agent`; the draft-slug-follow rule still writes it
+# internally, just never from a client-supplied value).
 _UPDATABLE_FIELDS = frozenset(
     {
         "name",
@@ -93,17 +97,48 @@ _UPDATABLE_FIELDS = frozenset(
         "tables_mode",
         "memory_mode",
         "memory_write_mode",
+        # Builder-shape projections (Task C1.1) — the same superset columns
+        # `app.api.agents.update_agent` writes for the /agents builder.
+        "role",
+        "tone",
+        "greeting",
+        "knowledge",
+        "plugins",
+        "surfaces",
+        "status",
     }
 )
 
 
 class CreateAgentRequest(BaseModel):
     name: str
-    slug: str
+    # Optional (Task C1.1): auto-derived from `name` when omitted, the same
+    # way `app.api.agents._unique_slug` does for the /agents builder — a
+    # caller supplying one explicitly keeps the pre-existing contract.
+    slug: Optional[str] = None
     description: Optional[str] = None
     system_prompt: Optional[str] = None
     model: Optional[str] = None
     token_budget_monthly: Optional[int] = None
+    # --- Builder-shape projections (Task C1.1) — the /agents builder's own
+    # wire fields, accepted here so ONE surface can do everything either
+    # used to. `instructions` aliases the canonical `system_prompt` column
+    # (an explicit `system_prompt` wins if both are sent); the rest are
+    # literally the same column names the builder writes.
+    instructions: Optional[str] = None
+    role: Optional[str] = None
+    tone: Optional[str] = None
+    greeting: Optional[str] = None
+    knowledge: Optional[List[str]] = None
+    plugins: Optional[List[str]] = None
+    surfaces: Optional[Dict[str, bool]] = None
+    #: 'draft' | 'ready'. Omitted keeps the pre-existing v1 default
+    #: ('ready') — a v1 client that never mentions status is unaffected.
+    status: Optional[str] = None
+    #: Start from a Library Agent Template — mirrors
+    #: `app.api.agents.AgentCreate.template_entity_id` (behaviour only, see
+    #: `app.api.agents._template_prefill`).
+    template_entity_id: Optional[str] = None
 
 
 class UpdateAgentRequest(BaseModel):
@@ -120,6 +155,15 @@ class UpdateAgentRequest(BaseModel):
     tables_mode: Optional[str] = None
     memory_mode: Optional[str] = None
     memory_write_mode: Optional[str] = None
+    # --- Builder-shape projections (Task C1.1), see CreateAgentRequest.
+    instructions: Optional[str] = None
+    role: Optional[str] = None
+    tone: Optional[str] = None
+    greeting: Optional[str] = None
+    knowledge: Optional[List[str]] = None
+    plugins: Optional[List[str]] = None
+    surfaces: Optional[Dict[str, bool]] = None
+    status: Optional[str] = None
 
 
 class ScopeItem(BaseModel):
@@ -147,11 +191,39 @@ def _audit(actor: str, action: str, target: str, params: Optional[dict] = None) 
         pass
 
 
-def _serialize(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize(row: Dict[str, Any], *, scope_rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Wire shape for one agent row.
+
+    Builder-shape projections (Task C1.1): `knowledge`/`plugins`/`surfaces`
+    are opaque JSON TEXT columns — decoded here into real lists/dicts so a
+    caller sees the same round-trip shape the /agents builder shows, not an
+    unparsed string. `knowledge`/`plugins` are additionally hydrated from
+    `agent_scope` when the JSON columns are empty (`app.api.agents.
+    _hydrate_builder_axes`) — an agent scoped through `agnes agent scope
+    set` or the `PUT .../scope` route never touches those columns, so
+    without this a v1 read would show "no declaration" for an agent that in
+    fact has real scope. `instructions` aliases the canonical
+    `system_prompt` column under the builder's own field name.
+    `scope_rows` lets a caller (the list endpoint) supply a batched read so
+    hydrating every row does not turn a listing into an N+1 — see
+    `app.api.agents.list_agents`'s own `scope_by_agent` pattern.
+    """
+    from app.api.agents import _decode, _hydrate_builder_axes
+
     out = dict(row)
     for key in ("created_at", "updated_at", "deleted_at"):
         if out.get(key) is not None:
             out[key] = str(out[key])
+    out["instructions"] = out.get("system_prompt") or ""
+    knowledge, plugins = _hydrate_builder_axes(
+        row["id"],
+        _decode(row.get("knowledge"), []),
+        _decode(row.get("plugins"), []),
+        scope_rows=scope_rows,
+    )
+    out["knowledge"] = knowledge
+    out["plugins"] = plugins
+    out["surfaces"] = _decode(row.get("surfaces"), {})
     return out
 
 
@@ -211,22 +283,31 @@ def _load_agent(
     *,
     require_owner: bool,
 ) -> Dict[str, Any]:
-    """Fetch `agent_id`, enforcing the ownership/admin auth matrix.
+    """Fetch `agent_id`, enforcing the ownership/admin/grantee auth matrix.
 
-    404s for anyone who isn't the owner or an admin — existence of another
-    user's agent is never leaked. Admins pass the existence check (so GET
-    works for governance) but `require_owner=True` (every mutating route,
-    including token issuance) still 403s them on a foreign agent.
+    404s for anyone who isn't the owner, an admin, or (READ-only, Task
+    C1.1) a grantee — existence of another user's agent is never leaked.
+    Admins pass the existence check (so GET works for governance) but
+    `require_owner=True` (every mutating route, including token issuance)
+    still 403s them on a foreign agent. A grantee (a `ResourceType.AGENT`
+    row via one of the caller's groups — the /agents builder's own sharing
+    reach, `app.api.agents._granted_agent_ids`) may likewise only READ:
+    `require_owner=True` 404s a grantee exactly like any other non-owner,
+    non-admin caller — a share conveys *use*, never *manage*.
     """
     row = agents_repo().get_by_id(agent_id)
     if not row or row.get("deleted_at") is not None:
         raise _err(404, "agent_not_found", "Agent not found")
     is_owner = row["owner_user_id"] == user["id"]
     if not is_owner:
-        if not is_user_admin(user["id"], conn):
-            raise _err(404, "agent_not_found", "Agent not found")
-        if require_owner:
-            raise _err(403, "agent_not_owned", "Admins may inspect but not modify another user's agent")
+        if is_user_admin(user["id"], conn):
+            if require_owner:
+                raise _err(403, "agent_not_owned", "Admins may inspect but not modify another user's agent")
+        else:
+            from app.api.agents import _granted_agent_ids
+
+            if require_owner or agent_id not in _granted_agent_ids(user["id"]):
+                raise _err(404, "agent_not_found", "Agent not found")
     return row
 
 
@@ -239,46 +320,75 @@ async def create_agent(
     name = payload.name.strip()
     if not name:
         raise _err(400, "invalid_name", "name is required")
-    slug = payload.slug.strip()
-    _validate_new_slug(slug)
+
+    prefill: Dict[str, str] = {}
+    if payload.template_entity_id:
+        from app.api.agents import _template_prefill
+
+        prefill = _template_prefill(payload.template_entity_id, user)
+
+    def _field(key: str, given: Optional[str], fallback: str = "") -> str:
+        """Caller's value, else the template's, else a fallback — mirrors
+        `app.api.agents.create_agent`'s own closure of the same name."""
+        if (given or "").strip():
+            return given
+        return prefill.get(key) or fallback
+
+    slug = (payload.slug or "").strip()
+    if slug:
+        _validate_new_slug(slug)
+    else:
+        # Auto-derive, exactly like the /agents builder does when the
+        # caller has no opinion on the address (Task C1.1).
+        from app.api.agents import _auto_slug, _unique_slug
+
+        slug = _unique_slug(_auto_slug(name), user["id"])
 
     repo = agents_repo()
     if repo.get_by_slug(user["id"], slug) is not None:
         raise _err(409, "slug_taken", f"slug '{slug}' is already in use")
+
+    # status: 'ready' unless the caller explicitly asks for 'draft' (the
+    # builder-shape create). A pre-existing v1 client never sends `status`,
+    # so it keeps landing on 'ready' — this route's original rationale
+    # (an explicit, caller-chosen or auto-derived slug means the agent is
+    # published) still holds by default. Opting into 'draft' is what makes
+    # the slug-follow rule below live: `_draft_slug_rename` only re-derives
+    # the slug for a `status='draft'` row, so a 'ready' agent's slug is
+    # frozen exactly as before. See `_v114_to_v115` (src/db.py) for the
+    # one-time backfill the original builder-address bug required.
+    status = (payload.status or "").strip() or "ready"
+
+    system_prompt_given = payload.system_prompt if payload.system_prompt is not None else payload.instructions
+    system_prompt = _field("instructions", system_prompt_given, "") or None
 
     agent_id = str(uuid.uuid4())
     try:
         # API-created agents default all four scope modes to 'selected'
         # (spec §1) — the repo's own defaults are 'all', which is only
         # correct for the seeded default agent, so pass them explicitly.
-        #
-        # status='ready': this route requires an explicit, caller-chosen
-        # slug and refuses to change it afterwards (`update_agent` 400s
-        # `slug_immutable`) — the agent is published by definition the
-        # moment it exists. Leaving `status` unset here left the row
-        # COALESCEd to 'draft' (both repositories' create() default), which
-        # is indistinguishable from a /agents builder placeholder that was
-        # never named. The builder's draft-rename rule
-        # (app/api/agents.py::_draft_slug_rename) only freezes a slug once
-        # it is 'ready', so a governance-created agent's deliberately-chosen
-        # slug — the one a PAT may already be minted against — stayed
-        # renameable forever through the builder's PATCH. See
-        # `_v114_to_v115` (src/db.py) for the one-time backfill this
-        # required for agents created before the fix.
         repo.create(
             id=agent_id,
             owner_user_id=user["id"],
             name=name,
             slug=slug,
             description=payload.description,
-            system_prompt=payload.system_prompt,
+            system_prompt=system_prompt,
             model=payload.model,
             token_budget_monthly=payload.token_budget_monthly,
             plugins_mode="selected",
             connections_mode="selected",
             tables_mode="selected",
             memory_mode="selected",
-            status="ready",
+            status=status,
+            # Builder-shape projections (Task C1.1) — same columns, same
+            # opaque JSON-text encoding `app.api.agents.create_agent` uses.
+            role=_field("role", payload.role, ""),
+            tone=_field("tone", payload.tone, "concise"),
+            greeting=_field("greeting", payload.greeting, ""),
+            knowledge=json.dumps(payload.knowledge) if payload.knowledge is not None else None,
+            plugins=json.dumps(payload.plugins) if payload.plugins is not None else None,
+            surfaces=json.dumps(payload.surfaces) if payload.surfaces is not None else None,
         )
     except (duckdb.ConstraintException, sa_exc.IntegrityError):
         # Covers the tombstoned-slug race the pre-check above can't see
@@ -289,6 +399,14 @@ async def create_agent(
         # 500, not a slug conflict, and must propagate.
         raise _err(409, "slug_taken", f"slug '{slug}' is already in use")
 
+    # SAME scope-write path as the /agents builder (Task C1.1) — one
+    # enforcement mapping regardless of which surface created the agent.
+    # A no-op for a plain (non-builder-shape) create: a brand-new agent has
+    # no existing `agent_scope` rows to replace.
+    from app.api.agents import _sync_builder_scope
+
+    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [])
+
     row = repo.get_by_id(agent_id)
     _audit(user["id"], "agent.create", agent_id, {"slug": slug})
     return _serialize(row)  # type: ignore[arg-type]
@@ -296,8 +414,32 @@ async def create_agent(
 
 @router.get("")
 async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True))):
-    rows = agents_repo().list_for_user(user["id"])
-    return {"data": [_serialize(r) for r in rows], "has_more": False, "next_cursor": None}
+    """The caller's own agents plus any shared into a group they belong to
+    (Task C1.1 — same reach as the /agents builder's `list_agents`, via the
+    same `ResourceType.AGENT` grant)."""
+    from app.api.agents import _granted_agent_ids
+
+    repo = agents_repo()
+    uid = user["id"]
+    rows: List[Dict[str, Any]] = list(repo.list_for_user(uid))
+    seen = {r["id"] for r in rows}
+    for agent_id in _granted_agent_ids(uid):
+        if agent_id in seen:
+            continue
+        row = repo.get_by_id(agent_id)
+        if row and row.get("deleted_at") is None:
+            rows.append(row)
+            seen.add(agent_id)
+    # ONE scope read for the whole page — `_serialize` hydrates an empty
+    # knowledge/plugins declaration from `agent_scope`, and per-agent reads
+    # would turn this listing into an N+1 (mirrors `app.api.agents.
+    # list_agents`'s own batched read, Devin Review on #1520).
+    scope_by_agent = repo.get_scope_for_agents([r["id"] for r in rows]) if rows else {}
+    return {
+        "data": [_serialize(r, scope_rows=scope_by_agent.get(r["id"], [])) for r in rows],
+        "has_more": False,
+        "next_cursor": None,
+    }
 
 
 @router.get("/{agent_id}")
@@ -307,11 +449,14 @@ async def get_agent(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     row = _load_agent(agent_id, user, conn, require_owner=False)
-    out = _serialize(row)
+    # One scope read, reused both for the builder-shape hydration in
+    # `_serialize` and for the raw `scope` list below.
+    scope_rows = agents_repo().get_scope(agent_id)
+    out = _serialize(row, scope_rows=scope_rows)
     # Detail view carries the scope items so callers (the CLI's replace-not-
     # merge warning, the wiring runbooks) can see what a scope PUT would drop
     # without a second bespoke endpoint. List view stays lean.
-    out["scope"] = agents_repo().get_scope(agent_id)
+    out["scope"] = scope_rows
     return out
 
 
@@ -322,18 +467,30 @@ async def update_agent(
     user: dict = Depends(require_session_token),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    _load_agent(agent_id, user, conn, require_owner=True)
+    before = _load_agent(agent_id, user, conn, require_owner=True)
 
-    updates = payload.model_dump(exclude_unset=True)
-    if "slug" in updates:
+    supplied = payload.model_dump(exclude_unset=True)
+    if "slug" in supplied:
         raise _err(400, "slug_immutable", "slug cannot be changed after creation")
 
+    # Builder-shape wire fields (Task C1.1): `instructions` aliases the
+    # canonical `system_prompt` column (an explicit `system_prompt` in the
+    # same payload wins); `knowledge`/`plugins`/`surfaces` are opaque JSON
+    # text on the row, encoded here exactly like `app.api.agents.
+    # update_agent` encodes them for the /agents builder.
+    updates: Dict[str, Any] = {k: v for k, v in supplied.items() if k != "instructions"}
+    if "instructions" in supplied and "system_prompt" not in updates:
+        updates["system_prompt"] = supplied["instructions"]
+    for key in ("knowledge", "plugins", "surfaces"):
+        if key in updates:
+            updates[key] = json.dumps(updates[key])
+
     # Belt-and-suspenders: today `set(updates)` (Pydantic's exclude_unset
-    # field set, minus slug) is always a subset of _UPDATABLE_FIELDS by
-    # construction — UpdateAgentRequest declares no other fields. Keeps this
-    # guard live so a future field added to the request model without a
-    # matching _UPDATABLE_FIELDS entry fails loudly instead of silently
-    # reaching `agents_repo().update()`.
+    # field set, minus slug/instructions) is always a subset of
+    # _UPDATABLE_FIELDS by construction — UpdateAgentRequest declares no
+    # other fields. Keeps this guard live so a future field added to the
+    # request model without a matching _UPDATABLE_FIELDS entry fails loudly
+    # instead of silently reaching `agents_repo().update()`.
     bad = set(updates) - _UPDATABLE_FIELDS
     if bad:
         raise _err(400, "invalid_field", f"cannot update field(s): {sorted(bad)}")
@@ -374,9 +531,41 @@ async def update_agent(
                 "the owner's plain identity",
             )
 
+    # Renaming a draft re-derives its slug, exactly like the /agents
+    # builder's own PATCH (`app.api.agents._draft_slug_rename`, Task
+    # C1.1). Inert for every pre-existing v1 agent — this route only ever
+    # created `status='ready'` rows until this task, and 'ready' never
+    # re-derives.
+    from app.api.agents import _draft_slug_rename
+
+    new_slug = _draft_slug_rename(before, updates.get("name"), before.get("owner_user_id") or user["id"])
+    if new_slug:
+        updates["slug"] = new_slug
+
     if updates:
         agents_repo().update(agent_id, **updates)
         _audit(user["id"], "agent.update", agent_id, {"fields": sorted(updates)})
+
+    # SAME scope-write path as the /agents builder (Task C1.1): a
+    # knowledge/plugins PUT replaces the builder-owned `agent_scope` rows
+    # while preserving governance-owned ones (slack_channel/table/
+    # connection) — `_sync_builder_scope` handles both. The unsent axis is
+    # read back off the SAME hydrated view the builder shows
+    # (`_hydrate_builder_axes`), not the raw JSON columns, so a PUT
+    # touching only one axis cannot silently wipe the other.
+    if "knowledge" in supplied or "plugins" in supplied:
+        from app.api.agents import _decode, _hydrate_builder_axes, _sync_builder_scope
+
+        held_knowledge, held_plugins = _hydrate_builder_axes(
+            agent_id,
+            _decode(before.get("knowledge"), []),
+            _decode(before.get("plugins"), []),
+        )
+        _sync_builder_scope(
+            agent_id,
+            supplied.get("knowledge", held_knowledge),
+            supplied.get("plugins", held_plugins),
+        )
 
     return _serialize(agents_repo().get_by_id(agent_id))  # type: ignore[arg-type]
 
@@ -404,6 +593,13 @@ async def delete_agent(
     # deleted agent's PAT dies even if this revoke call never runs.
     access_token_repo().revoke_for_agent(agent_id)
     _cascade_delete_agent_resources(agent_id)
+    # Same cleanup the /agents builder's own delete does (Task C1.1): drop
+    # any sharing grants too, so a later agent can never inherit a dangling
+    # grant through id reuse and /admin/access shows no orphan row.
+    try:
+        resource_grants_repo().delete_by_resource(ResourceType.AGENT.value, agent_id)
+    except Exception:
+        logger.warning("agents_admin: grant cleanup failed for %s", agent_id, exc_info=True)
     _audit(user["id"], "agent.delete", agent_id)
 
 
