@@ -139,6 +139,12 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "semantic_mutes_list",
     "mute_semantic_check",
     "unmute_semantic_check",
+    # Is the layer trustworthy right now (F4.2) — sync failures, models whose
+    # source is gone, invalid documents, three static document-quality checks,
+    # F4.1's coverage roll-up, and every active mute, in one call. Triple-
+    # surface with GET /api/admin/semantic-layer/health + `agnes
+    # semantic-model health`.
+    "semantic_layer_health",
     # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
     # here an ORDINARY caller may use — the agent that cannot ground its own
     # answer is the intended reporter, which is why it is not admin-gated and
@@ -1789,6 +1795,36 @@ def register_foundation_tools(
             )
             r.raise_for_status()
             return {"unmuted": mute_id}
+
+    @tool(read_only=True)
+    async def semantic_layer_health() -> dict:
+        """Is the semantic layer trustworthy right now (admin only)?
+
+        Sync failures, models whose source was deleted or renamed away from
+        under them, documents that failed schema validation, three static
+        document-quality checks (a metric with no description, one name
+        defined twice with a different formula, a cross-dataset metric with
+        no declared relationship between the datasets it touches),
+        ``semantic_model_coverage``'s missing/partial counts rolled up into
+        one pair of numbers, and every currently active mute — so a finding
+        already silenced by an admin does not get reported as news twice.
+
+        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes
+        semantic-model health``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend`` — the mute overlay
+        has no DuckDB implementation, and a health report that silently
+        dropped it would hide exactly what F4.3 exists to keep visible).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/health",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
 
     @tool(read_only=False, idempotent=False)
     async def flag_semantic_issue(

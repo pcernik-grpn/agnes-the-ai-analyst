@@ -59,6 +59,9 @@ _FEEDBACK_STATUSES = ("open", "acknowledged", "resolved")
 _MUTES_PATH = "/api/admin/semantic-layer/mutes"
 _MUTE_SCOPE_FORMS = ("source:<source-id>", "domain:<domain>", "source:<source-id>:domain:<domain>")
 
+# Health roll-up (F4.2).
+_HEALTH_PATH = "/api/admin/semantic-layer/health"
+
 
 @semantic_model_app.command("apply")
 def apply(
@@ -790,3 +793,85 @@ def mutes(
         # not a detail the reader has to ask for with a flag.
         typer.echo(f"    muted by {item.get('muted_by') or 'unknown'} at {item.get('muted_at')}")
         typer.echo(f"    reason: {item.get('reason') or '(none given)'}")
+
+
+# ---------------------------------------------------------------------------
+# Health roll-up (F4.2) — `agnes semantic-model health`
+# ---------------------------------------------------------------------------
+
+
+@semantic_model_app.command("health")
+def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
+    """Is the semantic layer trustworthy right now (admin only)?
+
+    Sync failures, models whose source was deleted or renamed away from under
+    them, documents that failed validation, three static quality checks (a
+    metric with no description, one name defined twice with a different
+    formula, a cross-dataset metric with no declared relationship), a roll-up
+    of `coverage`'s missing/partial counts, and every active mute.
+
+    Mirrors `GET /api/admin/semantic-layer/health` and the MCP
+    `semantic_layer_health` tool.
+    """
+    resp = api_get(_HEALTH_PATH)
+    _fail_mute_needs_postgres(resp, "The health report")
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+
+    sources = body.get("sources") or []
+    failed = [s for s in sources if s.get("last_sync_status") == "error"]
+    if failed:
+        typer.echo(f"Sync failures ({len(failed)}):")
+        for s in failed:
+            typer.echo(f"  {s.get('name') or s['source_id']}: {s.get('last_sync_error') or 'unknown error'}")
+        typer.echo("")
+
+    orphaned = body.get("orphaned_models") or []
+    if orphaned:
+        typer.echo(f"Models whose source is gone ({len(orphaned)}):")
+        for m in orphaned:
+            typer.echo(f"  {m.get('slug') or m['model_id']} (source_ref={m.get('source_ref')})")
+        typer.echo("")
+
+    invalid = body.get("invalid_models") or []
+    if invalid:
+        typer.echo(f"Invalid documents ({len(invalid)}):")
+        for m in invalid:
+            typer.echo(f"  {m.get('slug') or m['model_id']}: {m.get('validation_errors')}")
+        typer.echo("")
+
+    missing_desc = body.get("metrics_missing_description") or []
+    if missing_desc:
+        typer.echo(f"Metrics with no description ({len(missing_desc)}):")
+        for m in missing_desc:
+            typer.echo(f"  {m.get('name')}")
+        typer.echo("")
+
+    dupes = body.get("duplicate_metric_names") or []
+    if dupes:
+        typer.echo(f"Metric names defined more than once, differently ({len(dupes)}):")
+        for d in dupes:
+            typer.echo(f"  {d.get('name')} — {len(d.get('expressions') or [])} different formula(s)")
+        typer.echo("")
+
+    missing_rel = body.get("metrics_missing_relationships") or []
+    if missing_rel:
+        typer.echo(f"Cross-dataset metrics with no declared relationship ({len(missing_rel)}):")
+        for m in missing_rel:
+            typer.echo(f"  {m.get('metric_name')} spans {', '.join(m.get('datasets') or [])}")
+        typer.echo("")
+
+    summary = body.get("coverage_summary") or {}
+    typer.echo(f"Coverage: {summary.get('missing_count', 0)} missing, {summary.get('partial_count', 0)} partial")
+
+    mutes_list = body.get("mutes") or []
+    if mutes_list:
+        typer.echo(f"Muted ({len(mutes_list)} of the above are silenced — see `agnes semantic-model mutes`)")
+
+    if not (failed or orphaned or invalid or missing_desc or dupes or missing_rel):
+        typer.echo("No sync failures, disconnected models, or invalid documents.")

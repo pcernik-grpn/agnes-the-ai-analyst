@@ -103,6 +103,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "semantic_mutes_list": "List Silenced Semantic Layer Checks",
     "mute_semantic_check": "Silence Semantic Layer Check",
     "unmute_semantic_check": "Restore Semantic Layer Check",
+    "semantic_layer_health": "Get Semantic Layer Health",
     "flag_semantic_issue": "Open Semantic Layer Issue Report",
     "semantic_feedback_resolve": "Close Semantic Layer Issue Report",
     "apply_semantic_model": "Apply Semantic Model Document",

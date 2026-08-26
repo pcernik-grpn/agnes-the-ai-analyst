@@ -25804,6 +25804,57 @@
         "summary": "Get Semantic Layer Coverage"
       }
     },
+    "/api/admin/semantic-layer/health": {
+      "get": {
+        "description": "Is the semantic layer trustworthy right now (admin only)?\n\nSync failures, models whose source was deleted or renamed away from under\nthem, documents that failed validation, three cheap static quality checks\n(a metric with no description, one name defined twice with a different\nformula, a cross-dataset metric with no declared relationship between the\ndatasets it touches), a roll-up of F4.1's coverage counts, and every\nactive mute (F4.3) \u2014 one report for the admin banner, the CLI, and MCP.\n\n``mutes_repo`` is resolved as a dependency for the same reason the\ncoverage/tags routes are: on a DuckDB-backed instance this must answer\nthe typed ``501`` before any work runs, not a partial report missing the\none field (which findings are silenced) F4.3 exists to keep visible.",
+        "operationId": "get_semantic_layer_health_api_admin_semantic_layer_health_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Layer Health"
+      }
+    },
     "/api/admin/semantic-layer/mutes": {
       "get": {
         "description": "Every check currently silenced, and by whom (admin only).\n\nIts own route rather than a corner of the health report: this is the answer\nto \"what are we not being told about\", and an admin auditing that should\nnot have to fetch (and re-compute) the whole health roll-up to read it.\nF4.2's health response includes the same rows \u2014 the list is deliberately\nreachable from both.\n\n``?include_expired=true`` adds the lapsed ones. The silence ends at the\nexpiry; the record of who chose it does not.",

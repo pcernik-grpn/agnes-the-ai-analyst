@@ -268,6 +268,38 @@ Three things about it are deliberate:
   feature"), so on the frozen DuckDB app-state backend these routes answer
   `501 requires_postgres_backend`.
 
+## Health: is the layer trustworthy right now
+
+Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
+(admin, `/admin/semantic-layer` → **Health**) answers "is what exists broken,
+stale, or internally inconsistent" — a different question, in one response:
+
+- **`sources`** — every `semantic_sources` row's last sync outcome, verbatim.
+- **`orphaned_models`** — non-`manual` models whose `source_ref` names no live
+  source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
+  not cascade to the models it fed, so a project can vanish and leave its
+  models silently pointing at nothing.
+- **`invalid_models`** — documents with `status='invalid'`, and why.
+- **Three static, document-only quality checks**, none of which touch live
+  data: `metrics_missing_description` (a formula with no business decision
+  written down — is "Revenue" gross or net?), `duplicate_metric_names` (the
+  same name defined twice with a *different* formula — the "four sources of
+  truth" anti-pattern), and `metrics_missing_relationships` (a metric whose
+  SQL table-qualifies columns from two datasets with no declared relationship
+  between them, read straight off the Ossie document — a substring heuristic
+  over the expression text, advisory rather than authoritative, since exact
+  parsing would need a grammar per dialect).
+- **`coverage_summary`** — the missing/partial cell counts from Coverage,
+  rolled up into two numbers.
+- **`mutes`** — every currently active silence, so a finding already signed
+  for by an admin is never reported as news a second time.
+
+`semantic_health_mutes` is **Postgres-only**, and it is resolved *first* —
+before any of the other, backend-agnostic checks run — so a DuckDB-backed
+instance answers one clean `501 requires_postgres_backend` for the whole
+report rather than a partial one that silently drops the one field muting
+exists to keep visible.
+
 ## Muting: turning a check off is a signature
 
 An admin who has read a finding, decided it is expected and put the work in a
@@ -353,6 +385,8 @@ agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
 agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
 agnes semantic-model coverage tag <type> <resource-id> <source-id>
 agnes semantic-model coverage untag <tag-id>
+
+agnes semantic-model health [--json]   # admin, see "Health" above
 
 agnes semantic-model mute <scope> [--reason "..."] [--expires <ISO8601>]  # admin
 agnes semantic-model unmute <mute-id>                                    # admin

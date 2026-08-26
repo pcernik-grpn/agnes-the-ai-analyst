@@ -1232,6 +1232,33 @@ CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
 MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
 `semantic_model_coverage_untag`.
 
+### `/api/admin/semantic-layer/health` — is the layer trustworthy right now?
+
+- /api/admin/semantic-layer/health
+
+`GET /api/admin/semantic-layer/health` (admin) answers "is what exists broken,
+stale, or internally inconsistent", as opposed to `…/coverage`'s "what
+exists". One response carries: `sources` (every `semantic_sources` row's
+`last_sync_status`/`last_sync_at`/`last_sync_error`, verbatim); `orphaned_models`
+(non-`manual` models whose `source_ref` names no live source — the deletion
+that fed them never cascades); `invalid_models` (`status='invalid'` documents,
+with their `validation_errors`); three static, document-only quality checks —
+`metrics_missing_description` (a measure with no business decision written
+down), `duplicate_metric_names` (the same name with two different formulas —
+"four sources of truth"), and `metrics_missing_relationships` (a metric whose
+SQL table-qualifies columns from two datasets with no declared relationship
+between them, read straight off the Ossie document — a substring heuristic,
+advisory not authoritative); `coverage_summary` (`…/coverage`'s missing/partial
+cell counts, rolled up); and `mutes` (every active silence from F4.3, so a
+finding already signed for is never reported as news twice).
+
+**Postgres-only.** The mute overlay reads `semantic_health_mutes`; resolved
+FIRST, before any other check runs, so a DuckDB-backed instance answers a
+clean `501 requires_postgres_backend` for the whole report rather than one
+silently missing the one field F4.3 exists to keep visible.
+
+CLI: `agnes semantic-model health [--json]`. MCP: `semantic_layer_health`.
+
 ### `/api/admin/semantic-layer/mutes` — silencing a check, on the record
 
 - /api/admin/semantic-layer/mutes

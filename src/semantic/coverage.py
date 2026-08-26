@@ -422,6 +422,206 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     return {"sources": sources}
 
 
+def _sync_status(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "source_id": s["id"],
+            "name": s.get("name") or s["id"],
+            "last_sync_status": s.get("last_sync_status"),
+            "last_sync_at": s.get("last_sync_at"),
+            "last_sync_error": s.get("last_sync_error"),
+        }
+        for s in sources
+    ]
+
+
+def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> List[Dict[str, Any]]:
+    """Models whose ``source_ref`` names no live ``semantic_sources`` row.
+
+    ``source='manual'`` models are excluded on purpose: they were never fed by
+    a source and have no ``source_ref`` to go stale, so including them would
+    flag every hand-authored model as "disconnected" from a source it never
+    had. ``DELETE /api/admin/semantic-sources/{id}`` does not cascade to the
+    models it fed (K0.12) — this is the source-agnostic successor to the
+    retired page's Keboola-only "orphaned" count (see the module docstring),
+    over the canonical document instead of the flat projections.
+    """
+    return [
+        {"model_id": m["id"], "slug": m.get("slug"), "source": m.get("source"), "source_ref": m.get("source_ref")}
+        for m in models
+        if (m.get("source") or "manual") != "manual" and m.get("source_ref") not in known_source_ids
+    ]
+
+
+def _invalid_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {"model_id": m["id"], "slug": m.get("slug"), "validation_errors": m.get("validation_errors")}
+        for m in models
+        if (m.get("status") or "") == "invalid"
+    ]
+
+
+def _metrics_missing_description(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A metric with no ``description`` is a measure wearing a metric's name.
+
+    ``SUM(order_amount)`` is a measure; "Revenue" is a metric, and revenue
+    means gross or net depending who you ask — the business decision that
+    makes it one lives in the description, not the SQL. No description means
+    that decision was never written down.
+    """
+    return [{"metric_id": m["id"], "name": m.get("name")} for m in metrics if not (m.get("description") or "").strip()]
+
+
+def _duplicate_metric_names(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The same metric name defined more than once, with a different formula.
+
+    Two rows with the same name and the SAME sql are one metric imported
+    twice (harmless, common with multi-source syncs); two rows with the same
+    name and DIFFERENT sql are the "four sources of truth" anti-pattern — an
+    agent or a dashboard picking whichever it resolves first gets a different
+    number than a colleague who picked the other.
+    """
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    for m in metrics:
+        by_name.setdefault(m.get("name") or "", []).append(m)
+    findings = []
+    for name, rows in by_name.items():
+        if not name or len(rows) < 2:
+            continue
+        expressions = {(r.get("sql") or "").strip() for r in rows}
+        if len(expressions) > 1:
+            findings.append(
+                {
+                    "name": name,
+                    "sources": [r.get("source") for r in rows],
+                    "expressions": sorted(expressions),
+                }
+            )
+    return findings
+
+
+def _dataset_names_touched(expression: Dict[str, Any], dataset_names: set) -> set:
+    """Which declared dataset names appear as a ``name.column`` prefix in a
+    metric's SQL — a substring heuristic, not a parser.
+
+    Exact SQL parsing would need a dialect-aware grammar for every engine the
+    document declares (ANSI_SQL/SNOWFLAKE/DATABRICKS/…); a metric this check
+    is worth running on almost always table-qualifies its columns (that is
+    what makes a cross-dataset JOIN readable at all), so the substring match
+    catches the real cases cheaply. It can both under- and over-match on
+    adversarial input — a name that is also a common word, or a metric that
+    skips qualification — which is why this feeds an ADVISORY finding, never
+    a hard failure.
+    """
+    text = ""
+    for dialect in (expression or {}).get("dialects") or []:
+        text += " " + str(dialect.get("expression") or "")
+    return {name for name in dataset_names if f"{name}." in text}
+
+
+def _metrics_missing_relationships(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A metric whose SQL spans two datasets with no declared relationship
+    between them.
+
+    Reads the DOCUMENT, not the flat ``metric_definitions`` projection: a
+    projected metric's multi-table ``tables[]`` is only ever populated when
+    the projector already resolved a relationship (``src/semantic/
+    projection.py``'s foreign-alias join composition) — checking the
+    projection would find nothing, because a relationship-less cross-dataset
+    metric never reaches it (K0.5/the projector silently drops it). The gap
+    only shows up in the source document a human or an importer wrote, before
+    anything filtered it.
+    """
+    findings: List[Dict[str, Any]] = []
+    for model in models:
+        if (model.get("status") or "") != "valid" or not model.get("document_json"):
+            continue
+        doc = model["document_json"]
+        semantic_models = doc.get("semantic_model") or []
+        for sm in semantic_models:
+            dataset_names = {d.get("name") for d in sm.get("datasets") or [] if d.get("name")}
+            connected: set = set()
+            for rel in sm.get("relationships") or []:
+                a, b = rel.get("from"), rel.get("to")
+                if a and b:
+                    connected.add(frozenset((a, b)))
+            for metric in sm.get("metrics") or []:
+                touched = _dataset_names_touched(metric.get("expression") or {}, dataset_names)
+                if len(touched) < 2:
+                    continue
+                touched_list = sorted(touched)
+                has_link = any(
+                    frozenset((touched_list[i], touched_list[j])) in connected
+                    for i in range(len(touched_list))
+                    for j in range(i + 1, len(touched_list))
+                )
+                if not has_link:
+                    findings.append(
+                        {
+                            "model_id": model["id"],
+                            "metric_name": metric.get("name"),
+                            "datasets": touched_list,
+                        }
+                    )
+    return findings
+
+
+def _coverage_summary(report: Dict[str, Any]) -> Dict[str, int]:
+    missing = partial = 0
+    for source in report.get("sources") or []:
+        for cell in (source.get("domains") or {}).values():
+            if cell.get("status") == STATUS_MISSING:
+                missing += 1
+            elif cell.get("status") == STATUS_PARTIAL:
+                partial += 1
+    return {"missing_count": missing, "partial_count": partial}
+
+
+def compute_semantic_layer_health() -> Dict[str, Any]:
+    """Is the semantic layer itself trustworthy right now?
+
+    Cross-domain coverage (:func:`compute_cross_domain_coverage`) answers
+    "what exists"; this answers "is what exists broken, stale, or internally
+    inconsistent" — sync failures, models that lost their source, documents
+    that failed validation, and three cheap static quality checks over the
+    documents themselves (no description, the same name defined twice, a
+    cross-dataset metric with no declared relationship). All of it feeds one
+    admin screen, one CLI command, one MCP tool.
+
+    **Postgres-only**: the mute overlay (F4.3) reads ``semantic_health_
+    mutes``, which has no DuckDB implementation. Resolved FIRST, before any
+    of the (backend-agnostic) checks below run, so a DuckDB-backed instance
+    fails the same documented way every other PG-only route in this module
+    does — a whole report that silently omitted which findings are muted
+    would be exactly the anonymous disappearance F4.3 exists to prevent.
+    """
+    from src.repositories import (
+        metric_repo,
+        semantic_health_mutes_repo,
+        semantic_model_repo,
+        semantic_source_repo,
+    )
+
+    mutes_repo = semantic_health_mutes_repo()  # PG gate first — see docstring
+
+    sources = semantic_source_repo().list_all()
+    models = semantic_model_repo().list_all()
+    metrics = metric_repo().list()
+
+    known_source_ids = {s["id"] for s in sources}
+
+    return {
+        "sources": _sync_status(sources),
+        "orphaned_models": _orphaned_models(models, known_source_ids),
+        "invalid_models": _invalid_models(models),
+        "metrics_missing_description": _metrics_missing_description(metrics),
+        "duplicate_metric_names": _duplicate_metric_names(metrics),
+        "metrics_missing_relationships": _metrics_missing_relationships(models),
+        "coverage_summary": _coverage_summary(compute_cross_domain_coverage()),
+        "mutes": mutes_repo.list_active(),
+    }
+
+
 def _local_bucket(
     local_tables: List[Dict[str, Any]],
     local_terms: int,

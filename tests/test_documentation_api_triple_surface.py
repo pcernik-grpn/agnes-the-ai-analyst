@@ -98,6 +98,10 @@ _COHORT: dict[str, tuple[str, str]] = {
         "semantic-model coverage untag",
         "semantic_model_coverage_untag",
     ),
+    # Semantic-layer health roll-up (F4.2) — sync failures, disconnected
+    # models, invalid documents, static document-quality checks, F4.1's
+    # coverage counts, and F4.3's active mutes, in one read.
+    "/api/admin/semantic-layer/health": ("semantic-model health", "semantic_layer_health"),
     # Muting a semantic-layer health check (F4.3) — "I know, it is deliberate".
     # Same reasoning as the tag/untag pair above for why the mutations are in
     # the cohort rather than _EXEMPT; and a mute an agent can create but not

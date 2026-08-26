@@ -319,6 +319,18 @@ class TestToolRegistration:
             "semantic_model_coverage",
             "semantic_model_coverage_tag",
             "semantic_model_coverage_untag",
+            # Muting a semantic-layer health check (F4.3) — "I know, it is
+            # deliberate". Triple-surface with /api/admin/semantic-layer/mutes*
+            # + `agnes semantic-model mute|unmute|mutes`.
+            "semantic_mutes_list",
+            "mute_semantic_check",
+            "unmute_semantic_check",
+            # Is the layer trustworthy right now (F4.2) — sync failures,
+            # disconnected models, invalid documents, static document-quality
+            # checks, F4.1's coverage roll-up, and F4.3's active mutes.
+            # Triple-surface with GET /api/admin/semantic-layer/health +
+            # `agnes semantic-model health`.
+            "semantic_layer_health",
             # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the
             # one write here an ordinary caller may make — an agent that cannot
             # ground its answer is the intended reporter; the other two are the

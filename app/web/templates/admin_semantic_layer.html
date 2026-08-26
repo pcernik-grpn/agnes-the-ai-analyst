@@ -241,11 +241,21 @@
     {% endif %}
   </section>
   {% elif active_tab == 'health' %}
-  <div class="sl-placeholder" id="sl-health">
-    <strong>Health</strong> lands in the next wave: sync failures, models whose source was deleted, and the
-    static document checks (a metric with no description, one name defined twice, a cross-dataset metric with
-    no declared relationship). Nothing to show here yet.
-  </div>
+  <section id="sl-health">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Health</h2>
+    </div>
+    <p class="apg-sec-desc">
+      <a href="/admin/semantic-layer?tab=coverage">Coverage</a> answers what exists; this answers whether what
+      exists is broken, stale, or internally inconsistent — sync failures, models whose source was deleted or
+      renamed away from under them, documents that failed validation, and three static checks over the
+      documents themselves. A finding already
+      <a href="/admin/semantic-layer?tab=mute">muted</a> is still listed here, marked as silenced, never
+      dropped — silently omitting it would be exactly the anonymous disappearance muting exists to prevent.
+    </p>
+    <div class="sl-empty" id="sl-health-empty" hidden></div>
+    <div id="sl-health-body"></div>
+  </section>
   {% elif active_tab == 'mute' %}
   <section id="sl-mute">
     <div class="apg-sechead">
@@ -1009,6 +1019,185 @@ async function mtLoad() {
 })();
 
 mtLoad();
+</script>
+{% endif %}
+
+{% if active_tab == 'health' %}
+<script>
+// Fetched after paint for the same reason as the coverage grid: the report
+// is Postgres-only (the mute overlay has no DuckDB implementation), so a
+// DuckDB instance must still render the page and say why.
+//
+// EVERY string below was typed by an admin or read off the database. Nodes
+// are built and filled with textContent; nothing here goes near innerHTML.
+const HEALTH_URL = "/api/admin/semantic-layer/health";
+
+function hlEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function hlWhen(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function hlMutedScopes(mutes) {
+  // A finding is "muted" when its own scope, its whole domain, or its whole
+  // source is silenced — the three forms `agnes semantic-model mute` accepts.
+  const scopes = new Set();
+  for (const m of mutes) if (m.scope) scopes.add(m.scope);
+  return scopes;
+}
+
+function hlIsMuted(mutedScopes, ...candidates) {
+  for (const c of candidates) if (c && mutedScopes.has(c)) return true;
+  return false;
+}
+
+function hlSection(container, title, items, renderItem) {
+  if (!items.length) return;
+  const section = hlEl("div", "sl-fb-context");
+  section.style.marginTop = "20px";
+  const head = hlEl("div", "sl-detail-title", `${title} (${items.length})`);
+  section.appendChild(head);
+  const list = hlEl("ul");
+  list.style.margin = "8px 0 0";
+  list.style.paddingLeft = "18px";
+  for (const item of items) {
+    const li = hlEl("li");
+    li.style.marginBottom = "6px";
+    li.style.fontSize = "12px";
+    li.style.color = "var(--ds-text-secondary)";
+    renderItem(li, item);
+    list.appendChild(li);
+  }
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function hlMutedBadge(muted) {
+  const badge = hlEl("span", "sl-badge sl-badge--na", "muted");
+  badge.style.marginLeft = "8px";
+  return muted ? badge : null;
+}
+
+function hlRender(body) {
+  const container = document.getElementById("sl-health-body");
+  const empty = document.getElementById("sl-health-empty");
+  container.textContent = "";
+  empty.hidden = true;
+
+  const mutedScopes = hlMutedScopes(body.mutes || []);
+  const failedSources = (body.sources || []).filter((s) => s.last_sync_status === "error");
+  const orphaned = body.orphaned_models || [];
+  const invalid = body.invalid_models || [];
+  const missingDesc = body.metrics_missing_description || [];
+  const dupes = body.duplicate_metric_names || [];
+  const missingRel = body.metrics_missing_relationships || [];
+  const summary = body.coverage_summary || {};
+
+  const nothingWrong =
+    !failedSources.length && !orphaned.length && !invalid.length && !missingDesc.length && !dupes.length && !missingRel.length;
+
+  const headline = hlEl(
+    "p",
+    "apg-sec-desc",
+    nothingWrong
+      ? "No sync failures, disconnected models, or invalid documents."
+      : "Findings below, newest checks first within each group."
+  );
+  container.appendChild(headline);
+
+  const coverageLine = hlEl(
+    "p",
+    "sl-note",
+    `Coverage: ${summary.missing_count || 0} missing cell(s), ${summary.partial_count || 0} partial — see the Coverage tab.`
+  );
+  container.appendChild(coverageLine);
+
+  hlSection(container, "Sync failures", failedSources, (li, s) => {
+    const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
+    li.appendChild(hlEl("strong", null, s.name || s.source_id));
+    li.appendChild(document.createTextNode(": " + (s.last_sync_error || "unknown error")));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "Models whose source is gone", orphaned, (li, m) => {
+    li.appendChild(hlEl("span", "sl-mono", m.slug || m.model_id));
+    li.appendChild(document.createTextNode(` — source_ref ${m.source_ref} no longer exists`));
+  });
+
+  hlSection(container, "Documents that failed validation", invalid, (li, m) => {
+    li.appendChild(hlEl("span", "sl-mono", m.slug || m.model_id));
+    const errors = Array.isArray(m.validation_errors) ? m.validation_errors.join("; ") : String(m.validation_errors || "");
+    if (errors) li.appendChild(document.createTextNode(": " + errors));
+  });
+
+  hlSection(container, "Metrics with no description", missingDesc, (li, m) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", m.name));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "The same metric name defined twice, differently", dupes, (li, d) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", d.name));
+    li.appendChild(document.createTextNode(` — ${(d.expressions || []).length} different formula(s)`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "Cross-dataset metrics with no declared relationship", missingRel, (li, m) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", m.metric_name));
+    li.appendChild(document.createTextNode(` spans ${(m.datasets || []).join(", ")}`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+}
+
+async function hlLoad() {
+  const empty = document.getElementById("sl-health-empty");
+  const body = document.getElementById("sl-health-body");
+  try {
+    const r = await fetch(HEALTH_URL, { credentials: "include" });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.status === 501 && respBody.error === "requires_postgres_backend") {
+      body.textContent = "";
+      empty.hidden = false;
+      empty.textContent = "";
+      empty.appendChild(
+        document.createTextNode(
+          "Health needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to see this report:"
+        )
+      );
+      empty.appendChild(document.createTextNode(" "));
+      const link = hlEl("a", null, "Database backend");
+      link.href = "/admin/database";
+      empty.appendChild(link);
+      return;
+    }
+    if (!r.ok) {
+      body.textContent = "";
+      empty.hidden = false;
+      empty.textContent = "Could not load health: " + (respBody.detail || r.statusText);
+      return;
+    }
+    hlRender(respBody);
+  } catch (e) {
+    body.textContent = "";
+    empty.hidden = false;
+    empty.textContent = "Could not load health: " + e.message;
+  }
+}
+
+hlLoad();
 </script>
 {% endif %}
 {% endblock %}

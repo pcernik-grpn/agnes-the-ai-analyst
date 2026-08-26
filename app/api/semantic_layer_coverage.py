@@ -106,6 +106,30 @@ async def get_cross_domain_coverage(
     return await asyncio.to_thread(compute_cross_domain_coverage, source)
 
 
+@router.get("/api/admin/semantic-layer/health")
+async def get_semantic_layer_health(
+    user: dict = Depends(require_admin),
+    mutes_repo: Any = Depends(_mutes_repo),
+):
+    """Is the semantic layer trustworthy right now (admin only)?
+
+    Sync failures, models whose source was deleted or renamed away from under
+    them, documents that failed validation, three cheap static quality checks
+    (a metric with no description, one name defined twice with a different
+    formula, a cross-dataset metric with no declared relationship between the
+    datasets it touches), a roll-up of F4.1's coverage counts, and every
+    active mute (F4.3) — one report for the admin banner, the CLI, and MCP.
+
+    ``mutes_repo`` is resolved as a dependency for the same reason the
+    coverage/tags routes are: on a DuckDB-backed instance this must answer
+    the typed ``501`` before any work runs, not a partial report missing the
+    one field (which findings are silenced) F4.3 exists to keep visible.
+    """
+    from src.semantic.coverage import compute_semantic_layer_health
+
+    return await asyncio.to_thread(compute_semantic_layer_health)
+
+
 @router.post("/api/admin/semantic-model/coverage/tags", status_code=201)
 async def create_coverage_tag(
     body: CoverageTagCreate,

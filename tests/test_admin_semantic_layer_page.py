@@ -74,16 +74,15 @@ class TestTheTabStrip:
         assert 'id="sl-coverage"' in body
         assert "?tab=health" in body
 
-    def test_another_tab_renders_its_own_placeholder_not_coverage(self, seeded_app):
-        """Health lands in a later wave. The tab exists so the page's shape is
-        settled, and says plainly that it is empty — an invisible tab would be
-        re-designed from scratch by whoever lands it. (Feedback and Mute are no
-        longer among them — see TestTheFeedbackTab / TestTheMuteTab.)"""
+    def test_the_health_tab_renders_its_own_section_not_coverage(self, seeded_app):
+        """F4.2: Health is no longer a placeholder — it renders its own
+        section (fetched after paint, like Feedback and Mute), never the
+        coverage grid."""
         body = (
             seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
         )
         assert 'id="sl-coverage"' not in body
-        assert "sl-placeholder" in body
+        assert 'id="sl-health"' in body
 
     def test_an_unknown_tab_falls_back_to_coverage(self, seeded_app):
         body = (
@@ -182,6 +181,39 @@ class TestTheTaggingForm:
         )
         assert 'value="conn-a" selected' in body
         assert 'value="agent" selected' in body
+
+
+class TestTheHealthTab:
+    """F4.2 — is the semantic layer trustworthy right now."""
+
+    def _body(self, seeded_app) -> str:
+        return (
+            seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
+        )
+
+    def test_it_replaced_its_placeholder(self, seeded_app):
+        body = self._body(seeded_app)
+        assert 'id="sl-health"' in body
+        assert 'class="sl-placeholder"' not in body
+
+    def test_the_report_is_filled_from_the_health_endpoint(self, seeded_app):
+        """Fetched after paint, like the coverage grid and the mute list: the
+        mute overlay is Postgres-only, so server-rendering it would refuse to
+        load the whole page on a DuckDB instance."""
+        assert "/api/admin/semantic-layer/health" in self._body(seeded_app)
+
+    def test_a_duckdb_instance_is_told_why_the_report_is_empty(self, seeded_app):
+        """ "Nothing wrong" would read as "everything is fine" on an instance
+        that cannot even compute the mute half of the report."""
+        assert "requires_postgres_backend" in self._body(seeded_app)
+
+    def test_it_links_to_coverage_and_mute(self, seeded_app):
+        """The health report and the coverage grid answer different
+        questions about the same layer — the tab says so and links between
+        them, rather than leaving the reader to notice on their own."""
+        body = self._body(seeded_app)
+        assert "?tab=coverage" in body
+        assert "?tab=mute" in body
 
 
 class TestTheFeedbackTab:
