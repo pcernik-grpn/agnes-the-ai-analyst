@@ -40,11 +40,11 @@ mirror is missing.
 
 | Change | Mirror surface that MUST update | Severity | CI guard? |
 |---|---|---|---|
-| Method in `src/repositories/X.py` | sibling in `src/repositories/X_pg.py` | BLOCKING | partial |
-| New repo class (either backend) | dispatch entry in `src/repositories/__init__.py` factory table (symmetric across backends) | BLOCKING | `tests/test_repository_registry.py` (static) |
-| New callsite reading app-state | go through a `*_repo()` factory fn — never direct repo instantiation or raw `get_system_db()` | BLOCKING | `tests/test_backend_split_guard.py` (static) + `tests/db_pg/_parity_sweep_util.py` (dynamic) |
-| New repo method | extend the matching `tests/db_pg/test_<cluster>_contract.py` | BLOCKING | partial |
-| Alembic migration (PG) | matching `_vN_to_v(N+1)` in `src/db.py`; both ladders reach the same `SCHEMA_VERSION` | BLOCKING | `tests/test_db_schema_version.py` |
+| Method on an EXISTING (frozen pre-A3) `src/repositories/X.py` pair | sibling in `src/repositories/X_pg.py` | BLOCKING | partial |
+| New app-state repo (PG-first ratchet, A3 — DuckDB app-state is frozen) | `src/repositories/<name>_pg.py` ONLY, registered `PG`-only in the `_REGISTRY` factory table — no DuckDB module, no DuckDB `_REGISTRY` entry | BLOCKING | `tests/test_repository_registry.py` + `tests/test_repository_registry_pg_first_ratchet.py` + `tests/db_pg/test_repo_module_pg_first_ratchet.py` (all static) |
+| New callsite reading app-state | go through a `*_repo()` factory fn — never direct repo instantiation or raw `get_system_db()` | BLOCKING | `tests/test_backend_split_guard.py` (static) + `tests/db_pg/_parity_sweep_util.py` (dynamic; PG-only routes use the documented `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism, not a bare skip) |
+| New repo method on an EXISTING (frozen pre-A3) pair | extend the matching `tests/db_pg/test_<cluster>_contract.py` | BLOCKING | partial |
+| New schema change (A3 — DuckDB ladder frozen) | Alembic revision ONLY (`migrations/versions/`) + `src/db_pg.py` `Base.metadata` — no `_vN_to_v(N+1)` step in `src/db.py`; `SCHEMA_VERSION` must stay at `FROZEN_DUCKDB_SCHEMA_VERSION` | BLOCKING | `tests/test_db_schema_version_frozen.py` (freeze) — `tests/test_db_schema_version.py` remains the integration gate for the frozen ladder's pre-A3 steps |
 | `SCHEMA_VERSION` bump in `src/db.py` | the version stated in `docs/runbooks/wal-recovery.md` — it is what an operator compares a recovered database against, so a stale one sends them to restore a database the binary would reject | BLOCKING | `tests/test_runbook_wal_recovery.py` |
 | New `ResourceType` enum value | `ResourceTypeSpec` in `app/resource_types.py` `RESOURCE_TYPES` | BLOCKING | `scripts/verify_syncmap.py` (full sweep) |
 | New entity-scoped endpoint | `Depends(require_admin)` or `require_resource_access(...)` from `app/auth/access.py` | BLOCKING | `tests/test_route_auth_guard.py` (proves *some* auth) + `scripts/verify_syncmap.py` (WARN on authn-only entity routes) |
@@ -70,7 +70,12 @@ functions, not repo classes. Two guards back the sync-map:
 - **Static:** `tests/test_backend_split_guard.py` scans for direct repo
   instantiation + `get_system_db()` callers.
 - **Dynamic:** `tests/db_pg/_parity_sweep_util.py` drives both backends through a
-  `TestClient` and diffs the HTTP status of every parameter-free route.
+  `TestClient` and diffs the HTTP status of every parameter-free route. A
+  route backed by a Postgres-only repo (PG-first ratchet, A3) is legitimately
+  expected to diverge — it is listed in the sweep's `_PG_ONLY_ROUTE_EXEMPTIONS`
+  and excluded from the diff, but `assert_pg_only_exemptions_fail_clean` still
+  requires it to answer a clean 4xx/501 on DuckDB (the translated
+  `RequiresPostgresBackend`), never a raw 500.
 
 The parity reviewer flags exactly what these guards cannot see.
 

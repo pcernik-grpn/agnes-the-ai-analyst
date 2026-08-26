@@ -22,6 +22,7 @@ touch ``app.state`` slots only populated by the lifespan). Those are not
 backend-split bugs — a diff ignores them; a flat no-5xx assertion would flag
 them as false positives.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -100,17 +101,13 @@ def build_seeded_client(backend, tmp_path, monkeypatch, pg_engine):
     u.create(id="analyst1", email="analyst@test.com", name="Analyst")
 
     if backend == "duckdb":
-        admin_gid = get_system_db().execute(
-            "SELECT id FROM user_groups WHERE name = 'Admin'"
-        ).fetchone()[0]
+        admin_gid = get_system_db().execute("SELECT id FROM user_groups WHERE name = 'Admin'").fetchone()[0]
     else:
         import sqlalchemy as sa
         from src.db_pg import get_engine
 
         with get_engine().connect() as conn:
-            admin_gid = conn.execute(
-                sa.text("SELECT id FROM user_groups WHERE name = 'Admin'")
-            ).scalar()
+            admin_gid = conn.execute(sa.text("SELECT id FROM user_groups WHERE name = 'Admin'")).scalar()
     user_group_members_repo().add_member("admin1", admin_gid, source="system_seed")
 
     from app.auth.jwt import create_access_token
@@ -138,16 +135,46 @@ def collect_statuses(client, token, *, methods, skip_substr=()):
                 if method == "GET":
                     r = client.get(path, headers=auth, follow_redirects=False)
                 else:
-                    r = client.request(
-                        method, path, json={}, headers=auth, follow_redirects=False
-                    )
+                    r = client.request(method, path, json={}, headers=auth, follow_redirects=False)
                 seen[key] = r.status_code
             except Exception:  # noqa: BLE001 — record transport failure as a sentinel
                 seen[key] = -1
     return seen
 
 
-def diff_statuses(duck, pg):
-    """Return ``{key: (duck_status, pg_status)}`` for keys that differ."""
+def diff_statuses(duck, pg, *, exempt=frozenset()):
+    """Return ``{key: (duck_status, pg_status)}`` for keys that differ.
+
+    ``exempt`` (A3 PG-first ratchet, see CLAUDE.md -> "Dual-backend
+    discipline") names routes backed by a Postgres-only repository — they
+    are EXPECTED to differ across backends (DuckDB has no implementation to
+    resolve), so they are excluded from the strict diff here. That
+    exclusion is only safe combined with :func:`assert_pg_only_exemptions_fail_clean`,
+    which proves the DuckDB side fails *clean* (4xx/501, the translated
+    ``RequiresPostgresBackend``) rather than hiding an actual crash.
+    """
     keys = set(duck) | set(pg)
-    return {k: (duck.get(k), pg.get(k)) for k in keys if duck.get(k) != pg.get(k)}
+    return {k: (duck.get(k), pg.get(k)) for k in keys if k not in exempt and duck.get(k) != pg.get(k)}
+
+
+def assert_pg_only_exemptions_fail_clean(duck_statuses, exempt):
+    """For every ``exempt`` route, the DuckDB-backend status must be a clean
+    4xx or 501 (a ``RequiresPostgresBackend`` translated to an HTTP error by
+    ``app/main.py``), never a raw 5xx crash.
+
+    Call this alongside ``diff_statuses(..., exempt=exempt)`` in every sweep
+    that accepts an exemption set — the exemption itself does not verify
+    anything; this is what stops it from silently hiding a real 500. A route
+    missing from ``duck_statuses`` entirely (e.g. skipped by a ``skip_substr``
+    filter) is not checked here — it simply never ran.
+    """
+    dirty = {
+        k: duck_statuses[k]
+        for k in exempt
+        if k in duck_statuses and not (400 <= duck_statuses[k] < 500 or duck_statuses[k] == 501)
+    }
+    assert not dirty, (
+        "PG-only route exemption(s) did not fail clean on DuckDB (expected a "
+        "4xx/501 -- a RequiresPostgresBackend translated to an HTTP error -- "
+        "got a raw crash instead):\n" + "\n".join(f"  {k}: {v}" for k, v in sorted(dirty.items()))
+    )

@@ -542,22 +542,72 @@ Full playbook + review checklist: `.claude/skills/agnes-conventions/references/c
 ### Issue economy — fix or close, don't spawn
 The default reaction to "I noticed something while doing X" is **fix it now**, **close it as moot after audit**, or **leave a `TODO` in the touching diff** — not "file an issue". Before filing any follow-up issue: verify the claim is still true on current `main` (issues routinely cite moved line numbers and deleted call sites — if the premise is gone, close the parent), and check whether it's a ≤30-min, ≤1-file fix you could just do in the current PR. Filing is acceptable only for multi-file refactors with open design questions, production changes needing operator coordination, unclear cross-team ownership, or bugs whose fix would balloon the current PR ≥3×. When investigating an existing issue, reproduce the symptom on current `main` first; if it doesn't fire, close with a comment documenting the audit. When in doubt: fix it, or close it.
 
-### Dual-backend discipline (DuckDB + Postgres parity)
+### Dual-backend discipline — PG-first ratchet (A3)
 
-DuckDB and Postgres are **both** first-class long-term backends for app-state, not a legacy/destination pair. Every feature must work on either engine, with cross-engine contract tests catching drift.
+Postgres is the canonical, only-growing app-state backend. **The DuckDB
+app-state backend is frozen (A3, remediation-program Track A):** the ~65
+existing DuckDB↔PG repo pairs and the `src/db.py` migration ladder stay
+maintained (bugfixes, contract tests, method parity) until they are deleted
+outright by a later cleanup pass, but **no new DuckDB app-state surface may
+be added** — no new `src/repositories/<name>.py` DuckDB repo module, no new
+`_REGISTRY` entry with a DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)`
+schema step. (This freeze is scoped to *app-state* only — analytics DuckDB,
+the `extract.duckdb` contract, `analytics.duckdb`, and DuckDB extensions
+like BQ/FTS are untouched and stay DuckDB-only by design.)
 
-Non-negotiable rules:
+**New app-state work is Postgres-only:**
 
-- **Add a method to `src/repositories/X.py` (DuckDB)? Add the matching method to `src/repositories/X_pg.py` (PG) in the same PR.** No exceptions for "I'll do PG later". The DuckDB-bias drift in the codebase happens commit-by-commit; one PR with only `_pg.py` change is the canonical first step toward unmaintainable parity gaps.
-- **Cross-engine contract tests must stay green.** `tests/db_pg/test_<cluster>_contract.py` parametrizes both backends through the same assertion set. If you add a method, extend the contract test in the same PR.
-- **Reach repos through the factory, never instantiate them directly.** Backend selection lives in `src/repositories/__init__.py` (a `{backend: (module, class)}` dispatch table keyed off `use_pg()` / `DATABASE_URL`); callsites import factory functions (`*_repo()`), not repo classes. Two guards enforce this: `tests/test_backend_split_guard.py` is a **static** ratchet that scans for `get_system_db()` callers + direct repo instantiation (the backend-split bug class), and the **dynamic** status-parity sweeps (`tests/db_pg/_parity_sweep_util.py`) drive both backends through a `TestClient` and diff the HTTP status of every parameter-free route to catch handlers reading off a raw `Depends(_get_db)` connection.
-- **Alembic migration for PG? Matching `_vN_to_v(N+1)` step in `src/db.py` for DuckDB.** Both ladders must reach the same schema endpoint; `tests/test_db_schema_version.py` is the integration gate.
-- **No PG-only optimizations without a DuckDB fallback path.** If a query has a PG-native window function, the DuckDB sibling either uses the same syntax (DuckDB ⊇ PG in most window-function support) or implements an equivalent in DuckDB's flavor.
-- **DuckDB extensions (BQ, FTS, etc.) are not "DuckDB legacy".** They live next to the PG repos; analytics and state both ride DuckDB where appropriate.
+- **New repository = `src/repositories/<name>_pg.py` only**, no DuckDB
+  sibling. Register it in `src/repositories/__init__.py` `_REGISTRY` with
+  only the `PG` backend. Reach it through the `*_repo()` factory, never
+  instantiate directly — same rule as always.
+- **New schema change = an Alembic revision only** (`migrations/versions/`),
+  no matching `_vN_to_v(N+1)` step in `src/db.py`. `src/db_pg.py`
+  (`Base.metadata`) still needs the SQLAlchemy model, as always.
+- **A PG-only feature must fail clean, never with an unhandled 500, on an
+  instance still running the frozen DuckDB app-state backend.** Resolving a
+  PG-only repo key while the active backend is DuckDB raises the typed
+  `src.repositories.RequiresPostgresBackend` (naming the feature); the
+  app-wide handler in `app/main.py` translates it to a `501`. See
+  `docs/migrations.md` → "Adding a PG-only feature" for the full recipe.
+- The static ratchet is `tests/test_repository_registry.py::test_registry_backends_are_symmetric`
+  (a `_REGISTRY` entry may carry every backend — a frozen pre-A3 pair — or
+  Postgres-only, never DuckDB alone), plus the frozen-key/frozen-module
+  pins in `tests/test_repository_registry_pg_first_ratchet.py` and
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py` (no *new* full pair or
+  DuckDB-only module either, even a well-formed one). The DuckDB ladder's
+  ceiling is `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`, gated by
+  `tests/test_db_schema_version_frozen.py`.
 
-When DuckDB-Quack matures (DuckDB 2.0, ~fall 2026), it becomes a fourth backend state (`duckdb_quack`); the dual-repo pattern absorbs it via the same factory layer. The state machine in `src/db_state_machine.py` already reserves the enum value.
+**Existing DuckDB↔PG pairs stay under the pre-A3 rule until deleted:**
 
-The framing of *"DuckDB only for analytics, Postgres for state"* (from the PR #388 era) is **explicitly retired** — both backends are valid for state, and the platform supports multi-destination transitions in either direction.
+- **Touching a method on an existing `src/repositories/X.py` that still has
+  a `_pg.py` sibling? Update `X_pg.py` in the same PR.** No exceptions for
+  "I'll do PG later" — a frozen pair is "maintained", not "abandoned".
+- **Cross-engine contract tests for existing pairs must stay green.**
+  `tests/db_pg/test_<cluster>_contract.py` parametrizes both backends
+  through the same assertion set. If you add a method to an existing pair,
+  extend the contract test in the same PR.
+- **Reach repos through the factory, never instantiate them directly** —
+  unaffected by the ratchet, applies to every repo regardless of backend
+  count. Two guards enforce this: `tests/test_backend_split_guard.py` is a
+  **static** ratchet that scans for `get_system_db()` callers + direct repo
+  instantiation, and the **dynamic** status-parity sweeps
+  (`tests/db_pg/_parity_sweep_util.py`) drive both backends through a
+  `TestClient` and diff the HTTP status of every parameter-free route. A
+  route backed by a PG-only repo is legitimately expected to diverge; list
+  it in the sweep's `_PG_ONLY_ROUTE_EXEMPTIONS` and the mechanism still
+  requires `assert_pg_only_exemptions_fail_clean` to prove the DuckDB side
+  answers 4xx/501, never a raw 500.
+- **No PG-only optimizations without a DuckDB fallback path** on an existing
+  frozen pair — unchanged by the ratchet. If a query has a PG-native window
+  function, the DuckDB sibling either uses the same syntax (DuckDB ⊇ PG in
+  most window-function support) or implements an equivalent in DuckDB's
+  flavor.
+
+DuckDB-Quack (DuckDB 2.0, ~fall 2026) and any other future backend join
+through the same factory layer regardless of how this freeze resolves; the
+state machine in `src/db_state_machine.py` already reserves the enum value.
 
 ### Git commits & pull requests
 - Keep commit messages clean and concise.

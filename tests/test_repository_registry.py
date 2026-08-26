@@ -15,6 +15,7 @@ and backends are added:
 
 Pure import-level checks — no database required, so this runs on any box.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -37,9 +38,7 @@ def test_every_public_factory_has_a_registry_entry():
         assert callable(fn), f"{fname} in __all__ but not a callable on the module"
         if key not in factory._REGISTRY:
             missing.append(f"{fname} -> expected registry key '{key}'")
-    assert not missing, (
-        "public factory functions with no _REGISTRY entry:\n  " + "\n  ".join(missing)
-    )
+    assert not missing, "public factory functions with no _REGISTRY entry:\n  " + "\n  ".join(missing)
 
 
 def test_no_orphan_registry_entries():
@@ -52,20 +51,32 @@ def test_no_orphan_registry_entries():
 
 
 def test_registry_backends_are_symmetric():
-    """Every repo must register the exact same set of backends.
+    """Every repo must register EITHER every backend (a frozen pre-A3 pair)
+    OR Postgres-only (a post-A3 PG-first repo) — never DuckDB alone.
 
-    A repo present for one backend but not another is the structural form of
-    backend drift — the thing this whole effort exists to prevent.
+    A3 PG-first ratchet (see CLAUDE.md -> "Dual-backend discipline"): the
+    DuckDB app-state backend is frozen, so a brand-new repo registers with
+    only the ``PG`` backend (no DuckDB fallback exists by design — resolving
+    it on a DuckDB-backed instance raises ``RequiresPostgresBackend``
+    instead). A repo present on DuckDB with no Postgres backend at all is
+    never a legal shape, before or after the ratchet — that would be a
+    permanently orphaned DuckDB-only surface.
+
+    ``tests/test_repository_registry_pg_first_ratchet.py`` is the
+    complementary ratchet: it pins the exact set of keys still allowed to
+    carry a DuckDB backend, so a brand-new *full pair* (not just a new
+    DuckDB-only entry) is also caught.
     """
-    expected = set(factory._ARG_PROVIDERS)
-    asymmetric = {
-        key: sorted(backends)
-        for key, backends in factory._REGISTRY.items()
-        if set(backends) != expected
+    full = set(factory._ARG_PROVIDERS)  # {"duckdb", "pg"} — the frozen shape
+    pg_only = {factory.PG}  # the sanctioned post-A3 shape
+    bad_shape = {
+        key: sorted(backends) for key, backends in factory._REGISTRY.items() if set(backends) not in (full, pg_only)
     }
-    assert not asymmetric, (
-        f"repos not registered for every backend {sorted(expected)}:\n  "
-        + "\n  ".join(f"{k}: has {v}" for k, v in sorted(asymmetric.items()))
+    assert not bad_shape, (
+        "every repo must register either every backend (frozen pre-A3 pair) "
+        "or Postgres-only (post-A3 PG-first repo); no repo may register a "
+        "DuckDB backend without a Postgres one:\n  "
+        + "\n  ".join(f"{k}: has {v}" for k, v in sorted(bad_shape.items()))
     )
 
 
@@ -88,7 +99,5 @@ def test_registry_backends_match_arg_providers():
 def test_every_registered_class_is_importable(key, backend, module_path, class_name):
     module = importlib.import_module(module_path)
     obj = getattr(module, class_name, None)
-    assert obj is not None, (
-        f"{key}[{backend}] -> {module_path}.{class_name} does not exist"
-    )
+    assert obj is not None, f"{key}[{backend}] -> {module_path}.{class_name} does not exist"
     assert inspect.isclass(obj), f"{module_path}.{class_name} is not a class"
