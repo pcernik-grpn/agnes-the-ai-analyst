@@ -37,20 +37,27 @@ unknown `source_type` or a malformed config (e.g. a non-`https://`
 already-exists copy, not a live sync; editing `instance.yaml` afterwards logs a
 deprecation warning and is otherwise ignored.
 
-The row is meant to become the single live source of truth per source type,
-but that migration is happening in stages:
+The row is the single live source of truth per source type, resolved fresh on
+every call (`resolve_snowflake_settings()` / `resolve_databricks_settings()` /
+`get_bq_access()`), with `instance.yaml` as a fallback only for an
+un-migrated instance that has no row yet:
 
 | Source | Config actually used at query time TODAY | Row seeded on first boot |
 |---|---|---|
 | `keboola` | the `source_connections` row (multi-project, #1530) | yes |
-| `bigquery` | still `instance.yaml` (`data_source.bigquery`) / `/admin/server-config` | yes |
-| `snowflake` | still `instance.yaml` (`data_source.snowflake`) / `/admin/server-config` | yes |
-| `databricks` | still `instance.yaml` (`data_source.databricks`) / `/admin/server-config` | yes |
+| `bigquery` | the `source_connections` row; `instance.yaml` (`data_source.bigquery`) only when no row exists | yes |
+| `snowflake` | the `source_connections` row; `instance.yaml` (`data_source.snowflake`) only when no row exists | yes |
+| `databricks` | the `source_connections` row; `instance.yaml` (`data_source.databricks`) only when no row exists | yes |
 
-Until BigQuery/Snowflake/Databricks resolution reads the row live (a
-follow-up), a `source_connections` row for those three types exists but is
-**not yet load-bearing** — the actual settings an in-flight sync or query uses
-still come from `instance.yaml`. Only Keboola's row is consulted today.
+Every type is fully migrated: the row is load-bearing everywhere, an admin
+edit is visible on the very next call with no restart, and the "Add data
+source" wizard's Snowflake/Databricks panes save onto the row (and its own
+vault slot) directly rather than the `data_source.<type>` yaml overlay. A
+hand-edited `data_source.<type>.*` yaml block is IGNORED (not merely stale)
+once a row of that type exists — `app/connections_seed.py`'s deprecation
+warning names the field. Multi-connection-per-type (more than one Snowflake/
+Databricks/BigQuery connection per instance) is an explicit follow-up — see
+`docs/superpowers/plans/2026-08-26-derived-connection-model.md`.
 
 ## Query Modes
 

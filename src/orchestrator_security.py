@@ -50,6 +50,13 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
         "DATABRICKS_TOKEN",  # workspace PAT for the Unity Catalog ATTACH
         "SNOWFLAKE_PASSWORD",  # Snowflake user password for the snowflake extension ATTACH
         "SNOWFLAKE_PRIVATE_KEY",  # Snowflake key-pair private key (may contain passphrase JSON)
+        # Decrypts SNOWFLAKE_PRIVATE_KEY locally before the ATTACH — never sent
+        # as the TOKEN itself, but resolved by the same name-selected lookup
+        # (connectors.snowflake.settings._resolve_secret) as the two names
+        # above, so it needs the same allowlist membership or the module's
+        # own default key-pair passphrase path breaks for every deploy that
+        # relies on it (RBAC review second round, 2026-08-26).
+        "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
     }
 )
 

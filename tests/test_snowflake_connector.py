@@ -835,10 +835,14 @@ def test_init_extract_default_token_env_is_the_module_default(tmp_path, monkeypa
     assert token_env == SF_TOKEN_ENV
 
 
-def test_init_extract_warns_when_token_env_not_allowlisted(tmp_path, monkeypatch, caplog):
-    """Finding #5: a non-allowlisted ``token_env`` still builds, but the operator
-    must be told — otherwise the ATTACH is silently skipped at replay time and the
-    only symptom is a missing view. The allowlist gate itself is NOT weakened."""
+def test_init_extract_refuses_when_token_env_not_allowlisted(tmp_path, monkeypatch, caplog):
+    """Finding #5, tightened by D2.2's security must-fix: a non-allowlisted
+    ``token_env`` used to still build (attach + write the row), warning only
+    AFTER the credential had already been sent — now the orchestrator refuses
+    BEFORE the attach, since writable `source_connections` rows (D2.2) make an
+    admin-set `config.token_env` an untrusted input, not just an operator
+    typo. The allowlist gate itself is NOT weakened; a real ATTACH must never
+    happen with a disallowed name."""
     import logging
 
     from src.orchestrator_security import is_token_env_allowed
@@ -848,8 +852,9 @@ def test_init_extract_warns_when_token_env_not_allowlisted(tmp_path, monkeypatch
     assert not is_token_env_allowed("SF_SECRET_PASSWORD")
 
     out = tmp_path / "extracts" / "snowflake"
-    with caplog.at_level(logging.WARNING, logger="connectors.snowflake.extract_init"):
-        init_extract(
+    attach_calls = []
+    with caplog.at_level(logging.ERROR, logger="connectors.snowflake.extract_init"):
+        stats = init_extract(
             str(out),
             SF_SETTINGS["account"],
             SF_SETTINGS["database"],
@@ -859,9 +864,12 @@ def test_init_extract_warns_when_token_env_not_allowlisted(tmp_path, monkeypatch
             [{"name": "orders", "bucket": "public", "source_table": "orders"}],
             token="secret",
             token_env="SF_SECRET_PASSWORD",
-            attach_fn=lambda conn, *, url, token, passphrase=None: None,
+            attach_fn=lambda conn, *, url, token, passphrase=None: attach_calls.append(url),
         )
     assert "AGNES_REMOTE_ATTACH_TOKEN_ENVS" in caplog.text
+    assert not attach_calls, "the credential must never reach a real ATTACH with a disallowed token_env"
+    assert stats["tables_registered"] == 0
+    assert stats["errors"] and "token_env" in stats["errors"][0]["error"]
 
 
 def test_sf_guardrail_tolerates_null_bucket_rows(monkeypatch):

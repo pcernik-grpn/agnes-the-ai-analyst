@@ -451,7 +451,7 @@ def test_missing_agent_row_drops_store_installs(store_stub):
 
 
 def test_unrecognized_plugins_mode_drops_store_installs(store_stub):
-    """Same fail-closed rule ``compute_agent_intersection`` applies to an
+    """Same fail-closed rule ``resolve_agent_authority`` applies to an
     unrecognized mode value."""
     store_stub["agent"]["plugins_mode"] = "bogus"
     assert _served(_agent_principal(marketplace_plugin={"mk/p1"})) == ["p1"]

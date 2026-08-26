@@ -1162,13 +1162,14 @@ class TestSourceCardHierarchy:
 
 
 class TestSnowflakeWizardCredentialNames:
-    """The wizard's Snowflake pane stores credentials under an env-var name it
-    reads back from `GET /api/admin/server-config` — which redacts exactly
-    those keys (see
-    `test_admin_server_config.py::test_get_redacts_the_snowflake_credential_env_NAMES`).
-    Trusting that read put the `***` sentinel in the PUT path, so once
-    Snowflake had been configured through the wizard no credential could be
-    stored or rotated through it again."""
+    """D2.3: the wizard's Snowflake pane saves the connection (account/user/
+    database/warehouse/role/auth_type) onto the SF `source_connections` row
+    (`PUT`/`POST /api/admin/source-connections*`), not the
+    `data_source.snowflake` server-config yaml overlay — a row is read live
+    by every process, so there is no cross-process staleness left to warn
+    about, and the credential is stored in the row's own vault slot by
+    connection id rather than under a redaction-prone env-var name read back
+    from `GET /api/admin/server-config`."""
 
     def _template(self):
         from pathlib import Path
@@ -1177,88 +1178,51 @@ class TestSnowflakeWizardCredentialNames:
 
         return (Path(web_router.__file__).parent / "templates" / "admin_data_sources.html").read_text()
 
-    def test_env_names_from_the_config_read_are_shape_checked(self):
-        src = self._template()
-        assert "_sfEnvNameOr(sf.token_env," in src
-        assert "_sfEnvNameOr(sf.private_key_env," in src
-        assert "_sfEnvNameOr(sf.private_key_passphrase_env," in src
-        # The unguarded form is what shipped the bug — it must not come back.
-        assert "sf.token_env || " not in src
-        assert "sf.private_key_env || " not in src
-        assert "sf.private_key_passphrase_env || " not in src
-
-    def test_the_shape_check_rejects_the_redaction_sentinel(self):
-        """`***` and `<empty>` are the two sentinels `_mask` produces; neither
-        is a legal env-var name, so the guard's regex must reject both."""
-        import re
-
-        src = self._template()
-        m = re.search(r"const _ENV_NAME_RE = /(.+?)/;", src)
-        assert m, "the env-name shape guard is gone"
-        pattern = re.compile(m.group(1))
-        for sentinel in ("***", "<empty>", ""):
-            assert not pattern.match(sentinel), f"{sentinel!r} must not pass as an env-var name"
-        for legal in ("SNOWFLAKE_PASSWORD", "SNOWFLAKE_PRIVATE_KEY", "_x9"):
-            assert pattern.match(legal), f"{legal!r} must pass as an env-var name"
-
-    def test_the_save_never_writes_a_credential_env_name_back(self):
-        """`token_env` / `private_key_env` / `private_key_passphrase_env` come
-        back from the config read redacted, so the wizard cannot know which name
-        is configured. Writing its fallback back would REPLACE an operator's
-        custom name with the default and break every Snowflake query and sync.
-
-        (Before the shape guard the wizard POSTed the `***` sentinel, which
-        `_strip_redacted_sentinels` dropped server-side — a harmless no-op. A
-        plausible-looking default is not, which is what makes this a write the
-        wizard must not perform at all.)
-
-        Nothing is lost: `resolve_snowflake_settings` defaults each name to
-        exactly what the wizard stores the credential under."""
+    def test_the_save_writes_the_connection_row_not_the_yaml_overlay(self):
         src = self._template()
         save = src[src.index("async function _saveSnowflakeAndContinue") : src.index("function openWizard")]
-        assert "sf.token_env" not in save
-        assert "sf.private_key_env" not in save
-        assert "sf.private_key_passphrase_env" not in save
+        assert "API_CONNECTIONS" in save
+        assert "sections: { data_source:" not in save, "must not write the yaml overlay any more"
+        assert "API_SERVER_CONFIG" not in save
 
-    def test_the_save_omits_a_blank_role_rather_than_clearing_it(self):
-        """`POST /api/admin/server-config` deep-merges per leaf, so a
-        present-but-empty `role` overwrites a stored one — and the prefill is
-        empty whenever the config read failed."""
+    def test_the_save_updates_the_existing_row_when_the_wizard_found_one(self):
+        """One connection per source_type in this slice — the wizard must not
+        create a second snowflake row if it already loaded one."""
         src = self._template()
         save = src[src.index("async function _saveSnowflakeAndContinue") : src.index("function openWizard")]
-        assert "if (role) sf.role = role;" in save
-        assert "warehouse, role," not in save
+        assert "_sfConnId" in save
+        assert 'method: "PUT"' in save or "method: 'PUT'" in save
 
-    def test_the_stored_under_note_fires_on_a_save_not_on_every_page_open(self):
-        """`token_env` is redacted on every instance that has ever configured
-        Snowflake, so a note keyed on "the name was unreadable" alone would fire
-        for the majority that use the default names — noise that trains
-        operators to ignore it. It is keyed on a credential having actually been
-        stored, and says which name it went under."""
+    def test_the_credential_is_stored_on_the_connection_not_a_named_env_var(self):
+        """The password / private key both go through the connection's own
+        vault slot by id. The key-pair passphrase is the one exception —
+        the row has no second vault slot for it, so it keeps going through
+        the generic named-secret vault under its well-known default name
+        (`_SF_PASSPHRASE_ENV_DEFAULT`), the same fallback
+        `connectors.snowflake.settings._resolve_secret` reads."""
         src = self._template()
-        render = src[src.index("function _renderSfCredStatus") : src.index("async function _saveSnowflakeAndContinue")]
-        assert "_storedUnderNote" not in render, "the note is back on the badge, where it fires unconditionally"
         save = src[src.index("async function _saveSnowflakeAndContinue") : src.index("function openWizard")]
-        assert save.count("storedUnder.push(") == 3, "a stored credential is not recorded for every kind"
-        banner = src[src.index("function _renderSfRowsEditor") :]
-        # Renamed from `_sfStoredUnderNote` when the Databricks pane started
-        # sharing it — the text was never Snowflake-specific.
-        assert "_storedUnderNote(_sfStoredUnder)" in banner
-        assert "_sfStoredUnder = [];" in src[src.index("function openWizard") :]
+        assert "/secret" in save
+        assert 'kind: "storage"' in save or "kind: 'storage'" in save
+        assert save.count("datasource-secrets") == 1, "only the passphrase should use the named-secret vault"
+        assert "_SF_PASSPHRASE_ENV_DEFAULT" in save
 
-    def test_a_server_config_save_surfaces_restart_required(self):
-        """`POST /api/admin/server-config` answers `restart_required: true` and
-        resets only the in-process config cache. This wizard is the first
-        server-config writer outside /admin/server-config, so dropping that
-        field left a role-split deployment registering tables against a config
-        the scheduler had not re-read, with nothing saying so."""
+    def test_role_is_always_sent_since_put_replaces_the_whole_config(self):
+        """Unlike the old yaml-overlay POST (which deep-merged per leaf, so a
+        present-but-empty `role` would clobber a stored one), `PUT .../
+        {id}` replaces `config` wholesale — an empty role is simply the
+        unset value, so it can always be included."""
         src = self._template()
-        save = src.index("_saveSnowflakeAndContinue")
-        assert "_sfRestartRequired = !!savedCfg.restart_required;" in src[save:]
-        # ...and it has to reach the operator, not just a variable.
-        assert "_sfRestartRequired" in src[src.index("_renderSfRowsEditor") :]
-        # Reset per wizard open, so a later source cannot inherit the note.
-        assert "_sfRestartRequired = false;" in src[src.index("function openWizard") :]
+        save = src[src.index("async function _saveSnowflakeAndContinue") : src.index("function openWizard")]
+        assert "auth_type: authType" in save
+        assert "role" in save
+
+    def test_no_restart_warning_copy_remains(self):
+        """D2.3's headline: a row is read live by every process, so there is
+        nothing left to restart for."""
+        src = self._template()
+        assert "_sfRestartRequired" not in src
+        assert "Restart the instance" not in src[src.index("_saveSnowflakeAndContinue") :][:4000]
 
     def test_a_saved_credential_box_is_cleared_before_the_badge_is_redrawn(self):
         """`_renderSfCredStatus` reads "ready to save" off a non-empty input,
@@ -1273,13 +1237,16 @@ class TestSnowflakeWizardCredentialNames:
 
 
 class TestDatabricksWizardCredentialAndRestartNotice:
-    """The Databricks pane is the newest arrival in the Add-data wizard and
-    repeated three defects the Snowflake pane had already been fixed for: an
-    unstyled credential-status row, a `restart_required` flag thrown away, and
-    a credential written under a hardcoded name the backend may not read.
+    """D2.3: like the Snowflake pane above, the Databricks pane saves the
+    connection (host/warehouse_id/catalog) onto the DBX `source_connections`
+    row, not the `data_source.databricks` server-config yaml overlay, and
+    stores the token in the row's own vault slot by connection id — a row is
+    read live by every process, so the old `restart_required` notice (and
+    the two-click "hold the wizard open" flow it justified) is gone: the
+    wizard is a straight line to /admin/tables again.
 
-    Source-level assertions, like the Snowflake class above: this is inline
-    template JS with no module boundary to import."""
+    Source-level assertions: this is inline template JS with no module
+    boundary to import."""
 
     def _template(self):
         from pathlib import Path
@@ -1297,55 +1264,41 @@ class TestDatabricksWizardCredentialAndRestartNotice:
         assert rule, "the credential-status row rule is gone"
         assert ".ds-dbxcred" in rule, "the Databricks badge row is not styled like the BigQuery/Snowflake rows"
 
-    def test_the_credential_is_read_and_written_under_the_configured_name(self):
-        """`resolve_databricks_settings` reads the env var named by
-        `data_source.databricks.token_env`, so a wizard that always writes
-        `DATABRICKS_TOKEN` can report a stored credential the backend never
-        looks at. Both the status lookup and the PUT go through the resolved
-        name now, and the name is shape-guarded because the config read redacts
-        it."""
-        src = self._template()
-        assert "_envNameOr(dbx.token_env, _DBX_TOKEN_ENV_DEFAULT)" in src
-        assert "s.name === _dbxTokenEnv" in src
-        assert "datasource-secrets/${encodeURIComponent(_dbxTokenEnv)}" in src
-        # The hardcoded constant must not be the thing either path reaches for.
-        assert "s.name === _DBX_TOKEN_ENV_DEFAULT" not in src
-        assert "encodeURIComponent(_DBX_TOKEN_ENV_DEFAULT)" not in src
-
-    def test_the_env_name_guard_is_one_helper_for_both_connectors(self):
-        """The redaction is a property of `_is_secret_key`, not of a connector —
-        two copies of the same shape check would drift."""
-        src = self._template()
-        assert "function _envNameOr(" in src
-        assert src.count("const _ENV_NAME_RE") == 1
-        # The Snowflake wrapper keeps its own redaction flag but delegates.
-        sf = src[src.index("function _sfEnvNameOr(") : src.index("async function _loadSfConfigAndStatus")]
-        assert "_envNameOr(fromConfig, fallback)" in sf
-
-    def test_a_saved_connection_change_reports_that_a_restart_is_needed(self):
-        """`POST /api/admin/server-config` always answers `restart_required`
-        and only resets the calling process's config cache. The Snowflake path
-        carries that onto its step-2 banner; the Databricks path has no step 2 —
-        it closes the wizard and navigates — so an ignored flag means the
-        operator is never told, and on a role-split deployment the scheduler
-        keeps the old warehouse while freshly registered tables fail."""
+    def test_the_save_writes_the_connection_row_not_the_yaml_overlay(self):
         src = self._template()
         save = src[src.index("async function _saveDatabricksAndContinue") : src.index("function openWizard")]
-        assert "savedCfg.restart_required" in save, "the restart signal is discarded again"
-        # The unconditional navigate is what swallowed it.
-        assert save.count('window.location.href = "/admin/tables"') == 1, (
-            "the save must not navigate away when it has something to report"
-        )
-        assert "_dbxSaveDone = true" in save
+        assert "API_CONNECTIONS" in save
+        assert "sections: { data_source:" not in save, "must not write the yaml overlay any more"
+        assert "API_SERVER_CONFIG" not in save
 
-    def test_the_held_open_save_can_still_reach_the_tables_page(self):
-        """Holding the wizard open must not strand the operator: the same
-        primary button navigates on the next click."""
+    def test_the_save_updates_the_existing_row_when_the_wizard_found_one(self):
+        src = self._template()
+        save = src[src.index("async function _saveDatabricksAndContinue") : src.index("function openWizard")]
+        assert "_dbxConnId" in save
+        assert 'method: "PUT"' in save or "method: 'PUT'" in save
+
+    def test_the_credential_is_stored_on_the_connection_not_a_named_env_var(self):
+        src = self._template()
+        save = src[src.index("async function _saveDatabricksAndContinue") : src.index("function openWizard")]
+        assert "/secret" in save
+        assert 'kind: "storage"' in save or "kind: 'storage'" in save
+        assert "datasource-secrets" not in save
+
+    def test_no_restart_notice_and_the_wizard_is_a_straight_line(self):
+        """D2.3's headline: a row is read live by every process, so the save
+        navigates straight to /admin/tables — no held-open second click."""
+        src = self._template()
+        assert "_dbxSaveDone" not in src
+        assert "restart_required" not in src
+        save = src[src.index("async function _saveDatabricksAndContinue") : src.index("function openWizard")]
+        assert save.count('window.location.href = "/admin/tables"') == 1
+
+    def test_the_databricks_branch_of_the_connect_button_just_saves(self):
         src = self._template()
         handler = src[src.index('if (_wizardSource === "databricks") {') :]
         handler = handler[: handler.index("connectAndValidate();")]
-        assert "if (_dbxSaveDone) {" in handler
-        assert 'window.location.href = "/admin/tables"' in handler
+        assert "_saveDatabricksAndContinue();" in handler
+        assert "_dbxSaveDone" not in handler
 
 
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):

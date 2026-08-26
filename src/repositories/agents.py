@@ -143,6 +143,52 @@ class AgentsRepository:
         ).fetchone()
         return self._row_to_dict(row)
 
+    def get_runnable_by_slug(self, user_id: str, slug: str) -> Optional[Dict[str, Any]]:
+        """Agent *user_id* may RUN at a `/api/v1/agents/{slug}/...` runtime
+        route: owned, or reachable via a ``ResourceType.AGENT`` grant
+        through one of the caller's groups (remediation-program C2.3,
+        shared-agent runtime).
+
+        ``slug`` is resolved first in the caller's OWN slug namespace —
+        ``(owner_user_id, slug)`` is the only UNIQUE key on ``agents.slug``
+        (see :meth:`get_by_slug`), so a slug string is meaningless outside
+        its owner's namespace. A caller who does not own an agent under
+        ``slug`` cannot address someone else's agent by a borrowed name;
+        for a shared (not owned) agent, ``slug`` is instead resolved as the
+        target agent's globally-unique ``id`` — the shape the v1 list's
+        ``runnable=true`` filter hands back to a non-owner caller. The
+        owner may ALSO address their own agent by id this way (falls
+        through the same branch, short-circuited by the ownership check
+        before the grant lookup) — "runtime paths accept slug or id" holds
+        for every caller, not only grantees.
+
+        Deliberately does NOT apply the Admin god-mode short-circuit
+        (``app.auth.access.can_access``): per the agent-runtime auth
+        matrix, admin god-mode covers management/inspection only, never an
+        implicit "run any agent" grant, so this method reads
+        ``resource_grants`` directly instead of going through
+        ``can_access``.
+        """
+        owned = self.get_by_slug(user_id, slug)
+        if owned is not None:
+            return owned
+
+        agent = self.get_by_id(slug)
+        if agent is None or agent.get("deleted_at") is not None:
+            return None
+        if agent["owner_user_id"] == user_id:
+            return agent
+
+        from src.repositories.resource_grants import ResourceGrantsRepository
+
+        # "agent" mirrors ``ResourceType.AGENT.value`` (kept inline so the
+        # repo layer stays free of the app.resource_types import — same
+        # convention as ResourceGrantsRepository.delete_for_marketplace_plugins).
+        granted_ids = ResourceGrantsRepository(self.conn).list_resource_ids_for_user(user_id, "agent")
+        if agent["id"] in granted_ids:
+            return agent
+        return None
+
     def list_for_user(self, owner_user_id: str) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             """SELECT * FROM agents

@@ -26,10 +26,11 @@ v96 schema) into the existing spawn-time `ChatProfile` mechanism
    Live enforcement lives elsewhere: the broker mints an ``agent_session``
    JWT for a narrowing agent (``app/api/broker.py::_mint_identity_jwt``),
    the resolver turns it into an ``AgentPrincipal`` whose ``intersection`` is
-   ``compute_agent_intersection(owner grants, agent scope)``
-   (``src/agent_scope_intersection.py``, recomputed live per request), and
+   ``resolve_agent_authority(agent_id)`` — the agent's OWN resolved
+   authority per ``agent_scope.granted_by`` (C2.2's D-C2 resolution;
+   ``src/agent_scope_intersection.py``, recomputed live per request) — and
    the tables/marketplace/MCP seams honor that principal directly. This
-   module's snapshot and that live intersection are computed from the same
+   module's snapshot and that live resolution are computed from the same
    inputs (``agent_row`` + ``agent_scope`` rows) via the same mode→type
    mapping, so they cannot drift out of agreement — see
    ``tests/test_agent_scope_e2e.py::test_audit_snapshot_matches_enforced_intersection``.
