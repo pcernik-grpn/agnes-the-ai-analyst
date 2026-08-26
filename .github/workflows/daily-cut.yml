@@ -83,7 +83,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add CHANGELOG.md pyproject.toml server.json
+          git add CHANGELOG.md pyproject.toml
+          if [ -f server.json ]; then git add server.json; fi
           git commit -m "release: ${VERSION}"
           git push origin "$BRANCH"
 
