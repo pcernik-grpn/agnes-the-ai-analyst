@@ -42,6 +42,10 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "GET /api/admin/semantic-layer/mutes": (
         "the muted-check list reads `semantic_health_mutes`, a PG-only table (F4.3)"
     ),
+    "GET /api/admin/semantic-layer/health": (
+        "the health roll-up resolves `semantic_health_mutes` (the mute overlay) as a "
+        "gate dependency before any other check runs, a PG-only table (F4.2)"
+    ),
 }
 
 
