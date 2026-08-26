@@ -70,6 +70,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (a missing `auth.allowed_domain` discarded the whole static config with an
   ERROR log) and is now a passive warning, so the gap needed its own explicit
   check.
+- Snowflake connection spec in `src/connection_specs.py` (config keys
+  `account`/`user`/`database`/`warehouse`/`role`/`auth_type`, mirroring
+  `resolve_snowflake_settings`'s read set), and first-boot seeding
+  (`app/connections_seed.py`) of default Snowflake and Databricks
+  `source_connections` rows from `instance.yaml`, matching the existing
+  Keboola/BigQuery seeding. These rows are not yet consulted at query time —
+  Snowflake/Databricks/BigQuery still resolve from `instance.yaml` until a
+  follow-up makes the row live — see the connection-ownership table in
+  `docs/DATA_SOURCES.md`.
 
 ### Changed
 
@@ -117,6 +126,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   warning naming the missing field(s) instead of raising, so a direct caller
   of `config.loader.load_instance_config()` (e.g. a connector script) no
   longer gets an exception on an otherwise-bootable config.
+- `POST`/`PUT /api/admin/source-connections` now validate `source_type` +
+  `config` via `src.connection_specs.validate_connection_config`: an unknown
+  `source_type` or a malformed config (e.g. a non-`https://` `stack_url`, a
+  BigQuery config missing `project`) is rejected with `400` naming the
+  offending field, instead of being stored unchecked and only surfacing
+  later as a confusing sync failure. An empty config at create/update still
+  succeeds — the "Add data source" wizard creates a connection row before
+  its config is complete.
 
 ## [0.89.1] - 2026-08-26
 

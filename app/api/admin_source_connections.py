@@ -271,6 +271,41 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
         )
 
 
+def _validate_config_for_source_type(source_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """400 on an unknown ``source_type`` or a malformed config, naming the
+    offending field (spec 2026-08-26 Track D2 task D2.1).
+
+    An EMPTY config is passed through unvalidated (only the source_type is
+    checked): the "Add data source" wizard creates a connection row before
+    its config is complete — a stack_url, a project, a host, an account all
+    typically arrive from a LATER step (a repoint, a discovery pick, a
+    secret store) — same rationale as the SSRF guard's own
+    ``required=False`` branch (:func:`_validate_stack_url`). Once ANY field
+    is set, the type's full spec runs and normalizes/validates it, so a
+    malformed value (a non-https URL, a missing required key) is caught
+    immediately instead of surfacing later as a confusing sync failure.
+    """
+    from src.connection_specs import validate_connection_config
+
+    cfg = config or {}
+    if not cfg:
+        try:
+            validate_connection_config(source_type, {})
+        except ValueError as exc:
+            message = str(exc)
+            if not message.startswith("unknown source_type"):
+                # A "requires config.X" complaint about the otherwise-empty
+                # config is expected here — the row is allowed to start
+                # incomplete.
+                return cfg
+            raise HTTPException(status_code=400, detail=message) from exc
+        return cfg
+    try:
+        return validate_connection_config(source_type, cfg)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _record_project_identity(connection_id: str, row: Dict[str, Any], payload: Dict[str, Any]) -> None:
     """Persist the upstream project's id + name onto the connection config.
 
@@ -437,12 +472,13 @@ async def create_connection(
     # path skips validation on the stated premise that the stored URL was
     # already checked here. Now it is. (Devin Review on this PR.)
     _validate_stack_url(body.config, required=False, resolve=False)
+    config = _validate_config_for_source_type(body.source_type, body.config)
     conn_id = str(uuid4())
     repo.create(
         id=conn_id,
         name=body.name,
         source_type=body.source_type,
-        config=body.config,
+        config=config,
         token_env=body.token_env,
         is_default=body.is_default,
         created_by=_user.get("id"),
@@ -495,6 +531,7 @@ async def update_connection(
     _validate_stack_url(body.config, required=False, resolve=False)  # see create_connection
     config = body.config
     if config is not None:
+        config = _validate_config_for_source_type(existing_row.get("source_type"), config)
         old_config = existing_row.get("config") or {}
         old_stack = (old_config.get("stack_url") or "").rstrip("/")
         new_stack = (config.get("stack_url") or "").rstrip("/")
