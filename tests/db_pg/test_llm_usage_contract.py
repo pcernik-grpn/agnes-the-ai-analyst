@@ -249,3 +249,157 @@ def test_list_for_session_limit(repo):
         ]
     )
     assert len(repo.list_for_session("session-limit", limit=2)) == 2
+
+
+# ---------------------------------------------------------------------------
+# C2.4 — caller_user_id (per-caller usage attribution). PG-only column
+# under the A3 ratchet (migrations/versions/0074_llm_usage_caller_user_id.py)
+# — mirrors agent_scope.granted_by's persists-on-PG / dropped-on-DuckDB
+# pattern (tests/db_pg/test_agents_contract.py).
+# ---------------------------------------------------------------------------
+
+
+def test_insert_batch_accepts_caller_user_id_kwarg_on_both_backends(repo):
+    """Every backend accepts `caller_user_id` in the row dict without
+    raising — proof of call-site symmetry regardless of whether the
+    backend actually persists it (see the persists/drops pair below)."""
+    repo.insert_batch(
+        [
+            {
+                "id": "r1",
+                "agent_id": "a1",
+                "user_id": "owner1",
+                "caller_user_id": "caller1",
+                "session_id": "c1",
+                "model": "claude-sonnet-5",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            }
+        ]
+    )
+    assert len(repo.list_for_agent("a1")) == 1
+
+
+def test_caller_user_id_persists_on_postgres(pg_engine, monkeypatch):
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    repo.insert_batch(
+        [
+            {
+                "id": "r1",
+                "agent_id": "a1",
+                "user_id": "owner1",
+                "caller_user_id": "caller1",
+                "session_id": "c1",
+                "model": "claude-sonnet-5",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            }
+        ]
+    )
+    rows = repo.list_for_agent("a1")
+    assert rows[0]["caller_user_id"] == "caller1"
+
+
+def test_caller_user_id_is_dropped_on_duckdb(tmp_path):
+    """DuckDB has no `caller_user_id` column: `insert_batch` accepts the
+    row key (call-site symmetry with PG) but there is nothing to persist
+    it into — the returned row simply has no such key."""
+    repo, conn = _make_duckdb_repo(tmp_path)
+    repo.insert_batch(
+        [
+            {
+                "id": "r1",
+                "agent_id": "a1",
+                "user_id": "owner1",
+                "caller_user_id": "caller1",
+                "session_id": "c1",
+                "model": "claude-sonnet-5",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            }
+        ]
+    )
+    rows = repo.list_for_agent("a1")
+    assert "caller_user_id" not in rows[0]
+    conn.close()
+
+
+def test_usage_breakdown_by_caller_for_month_no_rows_returns_empty(repo):
+    assert repo.usage_breakdown_by_caller_for_month("a-none", "2020-01") == []
+
+
+def _insert_two_callers(repo, ym_ok: bool = True) -> None:
+    repo.insert_batch(
+        [
+            {
+                "id": "r1",
+                "agent_id": "a1",
+                "user_id": "owner1",
+                "caller_user_id": "caller1",
+                "session_id": "c1",
+                "model": "claude-sonnet-5",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_tokens": 1,
+                "cache_creation_tokens": 0,
+            },
+            {
+                "id": "r2",
+                "agent_id": "a1",
+                "user_id": "owner1",
+                "caller_user_id": "caller2",
+                "session_id": "c2",
+                "model": "claude-sonnet-5",
+                "input_tokens": 20,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 2,
+            },
+        ]
+    )
+
+
+def test_usage_breakdown_by_caller_distinguishes_callers_on_postgres(pg_engine, monkeypatch):
+    """Two DIFFERENT callers running one shared agent produce
+    DISTINGUISHABLE per-caller breakdown rows on Postgres."""
+    from datetime import datetime, timezone
+
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    _insert_two_callers(repo)
+    ym = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    breakdown = repo.usage_breakdown_by_caller_for_month("a1", ym)
+    by_caller = {r["caller_user_id"]: r for r in breakdown}
+    assert set(by_caller) == {"caller1", "caller2"}
+    assert by_caller["caller1"]["total_tokens"] == 10 + 5
+    assert by_caller["caller2"]["total_tokens"] == 20 + 10 + 2
+
+    # Sanity: the two per-caller totals sum to the SAME agent-level total
+    # `usage_breakdown_for_month` reports — attribution splits the ledger,
+    # it never changes the aggregate budget-governing quantity.
+    agent_total = repo.usage_breakdown_for_month("a1", ym)["total_tokens"]
+    assert sum(r["total_tokens"] for r in breakdown) == agent_total
+
+
+def test_usage_breakdown_by_caller_duckdb_returns_single_unattributed_bucket(tmp_path):
+    """DuckDB cannot distinguish callers it never recorded a column for —
+    it reports one combined, honestly-unattributed (`caller_user_id=None`)
+    bucket covering the agent's whole month total, matching
+    `usage_breakdown_for_month`."""
+    from datetime import datetime, timezone
+
+    repo, conn = _make_duckdb_repo(tmp_path)
+    _insert_two_callers(repo)
+    ym = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    breakdown = repo.usage_breakdown_by_caller_for_month("a1", ym)
+    assert len(breakdown) == 1
+    assert breakdown[0]["caller_user_id"] is None
+    assert breakdown[0]["total_tokens"] == repo.usage_breakdown_for_month("a1", ym)["total_tokens"]
+    conn.close()
