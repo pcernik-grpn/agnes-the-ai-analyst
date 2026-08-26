@@ -154,13 +154,20 @@ database:
   backend: side_car
 YAML
     # Vendor-neutral per-instance branding (logo_svg / brand / subtitle /
-    # copyright / favicon / theme colours / custom_scripts) from the Terraform variables,
-    # pre-rendered to a base64'd top-level `instance:` + `theme:` YAML fragment.
-    # Appended ONLY here, inside the "file absent" branch, so it seeds a fresh
-    # instance without ever clobbering an operator's later edits or a migrated
-    # database.backend. The app reads these keys back from this same file (see
-    # app/instance_config.py; theme colours recolor the design-system --ds-*
-    # tokens). Empty when the caller set no branding -> the block is skipped
+    # copyright / favicon / theme colours / custom_scripts) PLUS — since D1,
+    # 2026-08 — the presentation knobs that used to be always-wins `.env`
+    # lines: `instance.theme` (palette name), `instance.experience`,
+    # `instance.home_route` and `studio.enabled`. All of it comes from the
+    # Terraform variables, pre-rendered to a base64'd top-level
+    # `instance:` + `theme:` + `studio:` YAML fragment. Appended ONLY here,
+    # inside the "file absent" branch, so it seeds a fresh instance without
+    # ever clobbering an operator's later edits or a migrated
+    # database.backend — from day 2 onward, `/admin/server-config` (or a
+    # hand-edit of this file) is the only way to change any of these, exactly
+    # like the branding fields. The app reads these keys back from this same
+    # file (see app/instance_config.py; theme colours recolor the
+    # design-system --ds-* tokens). Empty when the caller set no branding and
+    # left every presentation knob at its default -> the block is skipped
     # entirely and instance.yaml is byte-for-byte the database-only file above.
     # base64 carries the multi-line SVG / script HTML across the metadata
     # boundary without any heredoc-delimiter or shell-expansion hazard.
@@ -1024,20 +1031,15 @@ AGNES_APP_MEM_LIMIT=${app_mem_limit}
 AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
-%{ if home_route != "" ~}
-AGNES_HOME_ROUTE=${home_route}
-%{ endif ~}
-%{ if !studio_enabled ~}
-AGNES_STUDIO_ENABLED=false
-%{ endif ~}
-%{ if experience != "" ~}
-AGNES_INSTANCE_EXPERIENCE=${experience}
-%{ endif ~}
+# home_route / studio_enabled / theme / experience do NOT write env lines
+# here (D1, 2026-08): an always-wins line rewritten into this file on EVERY
+# boot permanently shadowed the admin UI's `/admin/server-config` control of
+# the same knob. They ride the instance_branding_b64 first-boot-only seed
+# instead — see section 2's INSTANCE_YAML block above. chat_provider is the
+# one exception: it pins deployment-provisioned backing (the kai-agent
+# sidecar / apps-runner), not a pure presentation choice.
 %{ if chat_provider != "" ~}
 AGNES_CHAT_PROVIDER=${chat_provider}
-%{ endif ~}
-%{ if theme != "" ~}
-AGNES_INSTANCE_THEME=${theme}
 %{ endif ~}
 ACME_EMAIL=$ACME_EMAIL
 GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID

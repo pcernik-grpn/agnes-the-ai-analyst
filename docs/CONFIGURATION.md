@@ -54,8 +54,62 @@ pattern serving the instance:
   Terraform variables. If the module doesn't expose a knob, that instance falls
   through to the `instance.yaml` tier (admin UI) for it.
 
-The module's `home_route` variable is the canonical example — it writes
-`AGNES_HOME_ROUTE` only when set, otherwise leaving the route YAML-settable.
+The module's `dispatcher_image` / `runtime_secret_env` family are the
+canonical always-wins-env example — those write real `.env` lines every boot,
+by design (they're bootstrap secrets, not admin-owned presentation choices).
+
+A separate, THIRD path exists for knobs that are UI-owned but still need a
+day-1 value from Terraform: the **first-boot instance.yaml seed** (see
+[Config ownership map](#config-ownership-map) below). `home_route`, `theme`,
+`experience` and `studio_enabled` are the canonical examples — the module
+writes them into `/data/state/instance.yaml` the very first time a VM boots
+and never again, so `/admin/server-config` is the sole owner from day 2
+onward. This is deliberately NOT the env-var tier: it never touches `.env`
+and a later Terraform apply/recreate cannot silently re-assert a value an
+admin already changed.
+
+---
+
+## Config ownership map
+
+Every knob has exactly one process that writes it after an instance is up and
+running — this table names it, so "why doesn't my `/admin/server-config`
+change stick" has one place to check. Four owner shapes:
+
+- **bootstrap-env** — a real `.env` line, rewritten on every boot by the
+  provisioning script or set once by a self-contained deployment. Always
+  wins over `instance.yaml` (see [How configuration resolves](#how-configuration-resolves));
+  an admin cannot override it without hand-editing `.env` (or, on the
+  upstream module, changing the Terraform variable and re-applying).
+- **secret-manager** — fetched fresh from GCP Secret Manager at boot and
+  written into `.env` as a bootstrap-env line; same reachability rule as
+  bootstrap-env, plus rotation requires a new Secret Manager version (see
+  `docs/RELEASING.md`'s Secret Manager gotcha).
+- **first-boot-seed** — written into the writable `instance.yaml` overlay
+  (`${DATA_DIR}/state/instance.yaml`) only when that file does not exist yet
+  (a brand-new VM). Every later boot (recreate, apply, auto-upgrade) leaves
+  the file alone. This is the D1 (2026-08) pattern: Terraform states the
+  day-1 value, the admin UI owns everything after.
+- **UI** — the admin overlay (`${DATA_DIR}/state/instance.yaml`), written
+  exclusively through `/admin/server-config` (or `agnes admin config` /
+  hand-editing the file). Agnes has no DB-native config store yet — "the UI"
+  means this YAML overlay, not a database table.
+
+| Knob | Owner | Change it via | What wins |
+|------|-------|----------------|-----------|
+| `instance.theme` (UI palette) | first-boot-seed (was bootstrap-env before D1) | `/admin/server-config` → Branding & UI (after day 1); `prod_instance.theme` / `dev_instances[].theme` (day-1 seed only) | `AGNES_INSTANCE_THEME` env (if hand-set) > `instance.yaml` > default |
+| `instance.home_route` | first-boot-seed (was bootstrap-env before D1) | `/admin/server-config` (after day 1); `var.home_route` (day-1 seed only, module-wide) | `AGNES_HOME_ROUTE` env (if hand-set) > `instance.yaml` > default |
+| `studio.enabled` | first-boot-seed (was bootstrap-env before D1) | `/admin/server-config` (after day 1); `var.studio_enabled` (day-1 seed only, module-wide) | `AGNES_STUDIO_ENABLED` env (if hand-set) > `instance.yaml` > default |
+| `instance.experience` | first-boot-seed (was bootstrap-env before D1) | `/admin/server-config` (after day 1); `prod_instance.experience` / `dev_instances[].experience` (day-1 seed only) | `AGNES_INSTANCE_EXPERIENCE` env (if hand-set) > `instance.yaml` > default |
+| `instance.{brand,brand_short,subtitle,copyright,logo_svg,favicon,custom_scripts}` | first-boot-seed (unchanged — the pattern D1 extends) | `/admin/server-config` (after day 1); the matching `prod_instance`/`dev_instances[]` fields (day-1 seed only) | env (per-field, if hand-set) > `instance.yaml` > default |
+| `theme:` colour overrides (`theme.primary`, etc. — distinct from `instance.theme` above) | first-boot-seed (unchanged) | `/admin/server-config` (after day 1); `prod_instance.theme_colors` / `dev_instances[].theme_colors` (day-1 seed only) | `instance.yaml` > default (YAML-only, no env override) |
+| `database.backend` | first-boot-seed (unchanged — the A1 pattern D1 follows) | the DB backend state machine / migration UI (after day 1); seeded `side_car` on a fresh VM | state-machine-managed; not a plain env/YAML precedence |
+| `DATA_SOURCE` / `data_source.*` connection settings | bootstrap-env | `.env` (self-contained infra) or the module's `data_source` variable + re-apply; `/admin/server-config` also writes `instance.yaml`, but env still wins | env > `instance.yaml` > default — **unchanged, see D2** (a connection model for derived sources) |
+| `SERVER_URL` / `AGNES_BASE_URL` / `DOMAIN` | bootstrap-env | `.env` (self-contained infra) or the module's `domain`/TLS variables + re-apply | env only (no `instance.yaml` path) — **unchanged, out of scope for D1** |
+| `tls_mode` / Caddy TLS | bootstrap-env | the module's `tls_mode` variable + re-apply | Terraform-driven compose overlay selection — **unchanged, out of scope for D1** |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, `KEBOOLA_STORAGE_TOKEN`, `JWT_SECRET_KEY`, `SESSION_SECRET`, `POSTGRES_PASSWORD` | secret-manager | Secret Manager version + re-apply (or hand-edit `.env` for self-contained infra) | env only — **unchanged, out of scope for D1** |
+| `chat.provider` (`AGNES_CHAT_PROVIDER`) | bootstrap-env | `.env` or the module's per-VM `chat_provider` field + re-apply; `/admin/server-config` also writes `instance.yaml`, but env still wins | env > `instance.yaml` > default — **deliberately excluded from D1**: it pins deployment-provisioned backing (the kai-agent sidecar / apps-runner), not a pure presentation choice |
+| Per-connection settings for derived sources (Snowflake / BigQuery / Databricks rows) | bootstrap-env / `instance.yaml` (mixed, no single connection model yet) | `/admin/server-config` writes `instance.yaml`; some credentials are env-only | see `docs/DATA_SOURCES.md` — **unchanged, see D2** |
 
 ---
 
@@ -197,7 +251,6 @@ silently burned by a corporate mail scanner before the human clicks.
 ```yaml
 email:
   from_address: "noreply@acme.com"
-  from_name: "Acme Data Analyst"
   smtp_host: "${SMTP_HOST}"
   smtp_port: 587
   smtp_user: "${SMTP_USER}"
@@ -317,8 +370,12 @@ values. Never commit `.env`.
 | `TELEGRAM_BOT_TOKEN` | For Telegram notifications |
 | `ANTHROPIC_API_KEY` | For Corporate Memory AI extraction AND `agnes admin ask` (LLM text-to-SQL on telemetry). Without this, both features show a clear 503 error and skip silently. |
 | `LLM_API_KEY` | API key for LLM proxy (LiteLLM, OpenRouter, etc.) |
+| `JIRA_DOMAIN` | Jira Cloud site domain (e.g. `acme.atlassian.net`) |
+| `JIRA_EMAIL` | Jira account email paired with `JIRA_API_TOKEN` |
 | `JIRA_WEBHOOK_SECRET` | For Jira webhook integration |
 | `JIRA_API_TOKEN` | For Jira REST API access |
+| `JIRA_REFRESH_FIELDS` | Custom fields to refresh onto tickets — `field_id` or `field_id:column`, comma-separated. Discover with `python -m connectors.jira.scripts.verify_sla_access --list-fields` |
+| `JIRA_CLOUD_ID` | Only for a scoped API token (gateway URL) |
 | `DESKTOP_JWT_SECRET` | HS256 secret the notifications WebSocket (`/api/notifications/ws`) validates client tokens against. Unset = every connection fails auth (fail-closed). No in-repo flow mints these tokens yet — see issue #412. |
 | `CONFIG_DIR` | Override config directory path |
 | `LOG_LEVEL` | Logging level: `debug`, `info`, `warning`, `error` |
