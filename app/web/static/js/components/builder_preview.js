@@ -34,7 +34,8 @@
   'use strict';
 
   function blankState() {
-    return { session: null, socket: null, msgs: [], busy: false, err: null, stream: '', draft: '', slug: null };
+    return { session: null, socket: null, msgs: [], busy: false, err: null,
+             stream: '', draft: '', slug: null, key: null };
   }
 
   /* Engine errors arrive as internal kinds (`kai_integration_not_configured`,
@@ -60,6 +61,11 @@
   function create(opts) {
     var state = blankState();
     var resolveSlug = opts.resolveSlug;
+    /* Extra fields for the session being opened. /skills uses it to send the
+       draft SKILL the session should make invokable; /agents sends nothing.
+       Kept as a callback rather than a value so it is read at open time — the
+       draft the author wants to try is the one on screen NOW. */
+    var sessionExtras = opts.sessionExtras || function () { return {}; };
     var onUpdate = opts.onUpdate || function () {};
     var label = opts.label || 'preview';
 
@@ -70,6 +76,7 @@
       state.socket = null;
       state.session = null;
       state.slug = null;
+      state.key = null;
     }
 
     function reset() {
@@ -84,15 +91,30 @@
       Promise.resolve()
         .then(function () { return resolveSlug(); })
         .then(function (slug) {
-          if (!slug) throw new Error('Nothing to preview yet.');
-          if (state.session && state.socket && state.slug === slug) { then(); return null; }
+          /* `null`/`undefined` means "there is nothing to preview"; an EMPTY
+             STRING means "no named agent — the caller's default", which is
+             how a skill preview runs (the skill is added to a normal session
+             rather than becoming an agent). Falsy would conflate the two. */
+          if (slug === null || slug === undefined) throw new Error('Nothing to preview yet.');
+          /* Reusable only while bound to the SAME slug AND the same draft.
+             A skill is materialized into the session's workspace at spawn, so
+             editing it and reusing the session would answer with the previous
+             version under the new one's name — the failure is silent, which
+             is what makes it worth a key rather than a comment. */
+          var key = slug + '|' + JSON.stringify(sessionExtras() || {});
+          if (state.session && state.socket && state.key === key) { then(); return null; }
           closeSocket();
           state.err = null; state.busy = true; onUpdate();
           return fetch('/api/chat/sessions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'same-origin',
-            body: JSON.stringify({ surface: 'web', agent_slug: slug }),
+            body: JSON.stringify(Object.assign(
+              // Omit agent_slug entirely when empty, so the server resolves
+              // the caller's default rather than looking up "".
+              slug ? { surface: 'web', agent_slug: slug } : { surface: 'web' },
+              sessionExtras() || {}
+            )),
           }).then(function (r) {
             if (!r.ok) {
               return r.json().catch(function () { return {}; }).then(function (b) {
@@ -104,7 +126,7 @@
             }
             return r.json();
           }).then(function (session) {
-            state.session = session; state.slug = slug;
+            state.session = session; state.slug = slug; state.key = key;
             var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
             var ws = new WebSocket(proto + location.host + session.ws_url);
             state.socket = ws;

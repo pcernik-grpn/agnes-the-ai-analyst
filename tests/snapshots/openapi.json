@@ -3378,6 +3378,16 @@
             ],
             "title": "Agent Slug"
           },
+          "preview_skill": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewSkill"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "profile": {
             "anyOf": [
               {
@@ -7408,6 +7418,25 @@
           "type"
         ],
         "title": "PreviewResponse",
+        "type": "object"
+      },
+      "PreviewSkill": {
+        "description": "A draft skill to make invokable for one session. Both fields are\nuntrusted; see the note on CreateSessionBody.preview_skill.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewSkill",
         "type": "object"
       },
       "ProjectionMapRequest": {

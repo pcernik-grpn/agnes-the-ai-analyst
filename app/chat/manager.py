@@ -417,6 +417,12 @@ class ChatManager:
         # map is empty, but the profile is already materialized on disk in the
         # session workdir, so resume still resolves the persona + skill.
         self._session_profiles: dict[str, str] = {}
+        #: Draft skills being PREVIEWED, keyed by session id. Same shape and
+        #: lifetime as `_session_profiles`: set at create, read once at spawn,
+        #: dropped with the session. In memory only and never persisted — the
+        #: draft belongs to the author's browser, and a preview that outlived
+        #: the tab would be a copy of unfinished work nobody asked us to keep.
+        self._session_preview_skills: dict[str, dict] = {}
         # Chat sandbox secret broker: chat_ids this process has itself pushed
         # a current-protocol ticket to (see RELAY_PROTOCOL_VERSION /
         # _push_ticket_frame). Tier 1 (restart-invariant reuse): the
@@ -615,6 +621,7 @@ class ChatManager:
         title: Optional[str] = None,
         profile: Optional[str] = None,
         agent_id: Optional[str] = None,
+        preview_skill: Optional[dict] = None,
     ) -> ChatSession:
         if not self._config.enabled:
             raise RuntimeError("chat.enabled is false")
@@ -652,6 +659,8 @@ class ChatManager:
         )
         if profile is not None:
             self._session_profiles[created.id] = profile
+        if preview_skill:
+            self._session_preview_skills[created.id] = preview_skill
         # Garbage-collect orphan empty sessions for this user on every
         # web-surface create. Clicking "+ New chat" repeatedly was
         # accumulating ten-plus 'Untitled chat' rows in the sidebar
@@ -1028,6 +1037,21 @@ class ChatManager:
                     dynamic_prof = None
             prof = dynamic_prof or prof
             session_dir = self._workdir_mgr.prepare_session_dir(session.user_email, chat_id, profile=prof)
+            # A draft skill being previewed. Written into THIS session's own
+            # .claude (forced to a copy, never the shared workspace) so the
+            # skills catalog reports it and the agent can actually load it —
+            # see WorkdirManager.materialize_preview_skill for the containment
+            # this depends on. A failure here must not take the session down
+            # with it: the preview degrades to a chat without the skill, which
+            # is worth more than an error page.
+            draft = self._session_preview_skills.get(chat_id)
+            if draft:
+                try:
+                    self._workdir_mgr.materialize_preview_skill(
+                        session_dir, session.user_email, draft.get("name", ""), draft.get("body", "")
+                    )
+                except Exception:
+                    logger.exception("preview skill materialization failed for session=%s", chat_id)
 
         # V1c Task 3: materialize this agent's active memories into the
         # workdir BEFORE spawn — the same host-dir-then-uploaded seam
@@ -3383,6 +3407,7 @@ class ChatManager:
         # Spawn-time profile is no longer needed once the session is torn down;
         # drop it so the map doesn't grow unboundedly with studio usage.
         self._session_profiles.pop(chat_id, None)
+        self._session_preview_skills.pop(chat_id, None)
         self._known_protocol_sessions.discard(chat_id)
         # Revoke any broker tickets for this session so the rows don't linger
         # in the DB until TTL expiry (the raw values only ever lived in the

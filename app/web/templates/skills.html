@@ -570,9 +570,22 @@
      Preview stays the card. */
   var preview = BuilderPreview({
     label: 'skills',
+    /* A SKILL previews by being made invokable: the session is opened with
+       the draft, the server writes it into that session's own workspace, and
+       the agent can load it. Nothing is sent for a template — that runs as an
+       agent, not as a skill — and nothing for a plugin, whose contents are an
+       archive we do not unpack. */
+    sessionExtras: function () {
+      if (type !== 'skill') return {};
+      return { preview_skill: { name: draft.name || '', body: draft.body || '' } };
+    },
     resolveSlug: function () {
       var body = (draft && draft.body || '').trim();
       if (!body) return null;
+      /* A skill runs inside a normal session — the caller's own default
+         agent, with the draft skill added to it. There is no scratch agent
+         to point anywhere. */
+      if (type === 'skill') return Promise.resolve('');
       return fetch('/api/store/entities/builder/preview-agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -585,8 +598,13 @@
     },
     onUpdate: function () { renderLeftPane(); },
   });
-  /* Only an agent template can be tried live. */
-  function canPreviewLive() { return type === 'agent'; }
+  /* A skill and an agent template can both be tried live, by different
+     routes: a template BECOMES an agent (a scratch one, pointed at the
+     draft), a skill is added TO one (materialized into the session's
+     workspace). A plugin can be neither — its contents are an uploaded
+     archive, and unpacking an untrusted zip into a session workspace is a
+     bigger question than this tab. Its Preview stays the card. */
+  function canPreviewLive() { return type === 'agent' || type === 'skill'; }
   var bundle = null;      // plugin only: the attached File (never persisted)
   var check = null;       // last Check result, or null
   var inFlight = false;
@@ -1080,12 +1098,15 @@
         return '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>';
       }
       var pv = preview.state;
+      var needs = type === 'skill'
+        ? 'Write the skill on the right, then try invoking it here.'
+        : 'Write the role on the right, then talk to it here.';
       if (!(draft.body || '').trim()) {
         return BuilderShell.conversationEmpty({
-            id: 'sk-pv-conv', icon: ICONS.agent,
-            text: 'Write the role on the right, then talk to it here.',
+            id: 'sk-pv-conv', icon: ICONS[type],
+            text: needs,
           }) + BuilderShell.composer({
-            kind: 'preview', value: '', placeholder: 'Write the role first…', busy: true,
+            kind: 'preview', value: '', placeholder: 'Write it first…', busy: true,
           });
       }
       var rows = pv.msgs.slice();
@@ -1093,8 +1114,10 @@
       var body = rows.length || pv.err || pv.busy
         ? BuilderShell.conversation({ id: 'sk-pv-conv', rows: rows, busy: pv.busy, err: pv.err })
         : BuilderShell.conversationEmpty({
-            id: 'sk-pv-conv', icon: ICONS.agent,
-            text: 'Talk to it the way someone who installs it would.',
+            id: 'sk-pv-conv', icon: ICONS[type],
+            text: type === 'skill'
+              ? 'Ask for something this skill covers — it is loaded in this session.'
+              : 'Talk to it the way someone who installs it would.',
           });
       /* Answers render as plain text — this page has no HTML sanitizer and an
          engine answer is model output. The full chat page has the real
@@ -1103,8 +1126,10 @@
         ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
         : '';
       return body +
-        '<p class="ag-live-note">A real session running this template as its brief. ' +
-        'It has no data access of its own — neither will anyone who installs it.' + full + '</p>' +
+        '<p class="ag-live-note">' + (type === 'skill'
+          ? 'A real session with this draft skill loaded, and nothing else changed. It exists here only.'
+          : 'A real session running this template as its brief. It has no data access of its own — ' +
+            'neither will anyone who installs it.') + full + '</p>' +
         BuilderShell.composer({
           kind: 'preview', value: pv.draft,
           placeholder: 'Ask it something…', busy: pv.busy,

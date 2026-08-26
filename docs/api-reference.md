@@ -1841,6 +1841,19 @@ server actually offers, and everything is length-capped. With no AI credential
 configured it answers `503 builder_llm_unavailable` and the form stays fully
 usable by hand.
 
+`POST /api/chat/sessions` accepts an optional `preview_skill` (`{name, body}`)
+that backs the `/skills` builder's Preview for SKILLS. The skills catalog
+reports what is on disk in a session's project scope, so previewing a skill
+that exists nowhere but the author's browser means writing it there: the draft
+is materialized into that one session's own `.claude/skills/`, which is forced
+to be a copy so it can never reach the author's shared workspace. Both fields
+are untrusted — the name becomes a directory name and is *replaced* rather
+than sanitized, and the body is length-capped. Nothing is persisted beyond the
+session. Both delivery paths carry it: native providers mount the session
+directory, and the kai-agent provider packs the same bytes into its workspace
+tarball, so the preview cannot work on one provider and silently do nothing on
+the other.
+
 `POST /api/store/entities/builder/preview-agent` backs that builder's Preview
 tab for agent TEMPLATES. A template is a system prompt, so trying one means
 running an agent with it — which needs a row, because a chat session runs as

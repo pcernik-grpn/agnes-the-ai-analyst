@@ -220,10 +220,22 @@ class TestTheLivePreview:
         for page, text in (("agents.html", agents), ("skills.html", markup)):
             assert "new WebSocket(" not in text, f"{page} has grown its own socket again"
 
-    def test_only_an_agent_template_can_be_tried_live(self, markup):
-        """A skill or a plugin has no equivalent: making one invokable means
-        materializing it into a session workspace, which is its own phase."""
-        assert re.search(r"function canPreviewLive\(\) \{ return type === 'agent'; \}", markup)
+    def test_a_template_and_a_skill_can_be_tried_live_but_not_a_plugin(self, markup):
+        """Two types, two routes: a template BECOMES an agent (a scratch one
+        pointed at the draft), a skill is added TO one (materialized into the
+        session's own workspace).
+
+        A plugin is neither, and that is the line: its contents are an
+        uploaded archive, and unpacking an untrusted zip into a session
+        workspace is a bigger question than a preview tab. Its Preview stays
+        the card — which is a deliberate limit, not an oversight, so it is
+        pinned rather than left to be "fixed" by someone who has not thought
+        about the archive.
+        """
+        assert re.search(r"return type === 'agent' \|\| type === 'skill';", markup)
+        block = re.search(r"sessionExtras: function \(\) \{(.*?)\n    \},", markup, re.S)
+        assert block, "the draft is not handed to the session"
+        assert "type !== 'skill'" in block.group(1), "a non-skill draft is being sent as a preview_skill"
 
     def test_a_bodyless_template_says_what_to_do_rather_than_failing(self, markup):
         """There is nothing to run yet; the composer is disabled with the
