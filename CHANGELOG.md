@@ -12,6 +12,99 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Cross-domain semantic-layer coverage.** `/admin/semantic-layer` (rebuilt
+  on tabs — Coverage · Health · Mute · Feedback) now reports, for **every**
+  connected data source, whether it has a semantic model, metrics, glossary
+  terms, a skill, a specialized agent, and a knowledge base — not only
+  Keboola projects, and not only sync-time binding. `not_applicable` marks a
+  domain no adapter can fill yet (e.g. BigQuery has no semantic-layer adapter
+  in this build) and is never counted as missing work. Which skill / agent /
+  knowledge domain is *about* a given source is the one input the report
+  cannot derive on its own — record it with `agnes semantic-model coverage
+  tag|untag` (new `resource_source_tags` table). New: `GET /api/admin/
+  semantic-model/coverage` (+ `POST`/`DELETE .../coverage/tags`), `agnes
+  semantic-model coverage [show|tag|untag]`, MCP `semantic_model_coverage` /
+  `semantic_model_coverage_tag` / `semantic_model_coverage_untag`. The
+  existing Keboola binding-coverage report (`GET /api/admin/semantic-layer/
+  coverage`) is unchanged — it is now one provider inside this wider one,
+  surfaced per-source as `domains.semantic.raw`.
+- **Semantic-layer health: is what exists broken, stale, or inconsistent.**
+  `GET /api/admin/semantic-layer/health` (`agnes semantic-model health`, MCP
+  `semantic_layer_health`) rolls up: per-source sync failures; models whose
+  source was deleted or renamed away from under them (`DELETE
+  /api/admin/semantic-sources/{id}` never cascaded to the models it fed);
+  documents that failed schema validation; three static, document-only
+  quality checks (a metric with no description, the same metric name defined
+  twice with a different formula, a cross-dataset metric with no declared
+  relationship between the datasets it touches); the coverage report's
+  missing/partial counts; and every active mute, so a finding an admin
+  already silenced is never reported as news twice.
+- **Muting a semantic-layer check is a signature, never a silence.** An
+  admin who has read a finding and judged it expected can silence it —
+  scoped to one domain, one source, or a single coverage cell — but the
+  mute always carries who did it, when, and why, and every read hands all
+  three back. New `semantic_health_mutes` table; `POST`/`GET`/`DELETE
+  /api/admin/semantic-layer/mutes`, `agnes semantic-model mute|unmute|
+  mutes`, MCP `mute_semantic_check` / `unmute_semantic_check` /
+  `semantic_mutes_list`. Admin-only on every surface, both mutations
+  audit-logged.
+- **Semantic-layer feedback: "that answer looked wrong."** Coverage says
+  what is undocumented and health says what is broken; neither can see a
+  wrong *answer* over a layer that looked complete. Any signed-in caller can
+  now file one — `POST /api/semantic-feedback`, `agnes semantic-model
+  feedback submit`, or the chat agent's own MCP tool `flag_semantic_issue`,
+  which the agent is now instructed to *offer* (never file silently, never
+  wait for the user to remember) when it cannot ground its own answer.
+  Admins work the queue at `/admin/semantic-layer` → Feedback (`GET
+  /api/admin/semantic-feedback`, `POST .../resolve`, `agnes semantic-model
+  feedback list|resolve`) with a resolution note that stays on the record; a
+  second admin closing the same report gets `409` instead of overwriting who
+  actually fixed it. New `semantic_feedback` table.
+- **Agent grounding rules, and a live-LLM eval that measures them.** The
+  agent workspace `CLAUDE.md` now tells the agent two things it was never
+  told: when a question turns on a term the semantic layer defines no
+  dataset, metric or glossary entry for, ask or say the term is undefined
+  instead of inventing SQL; and when the `sources` block cannot be filled,
+  say so in the answer text rather than silently omitting it. A new
+  `@pytest.mark.real_llm` eval (`tests/e2e/test_semantic_layer_eval.py`, 15
+  questions) asks each question twice against a real model — once with no
+  semantic layer, once with one — and scores at the tool-call level; gates
+  at 80% for the semantic arm and a 25-point improvement over baseline. Runs
+  on the existing secret-gated `e2e-real-llm` CI job.
+- All of the above's new app-state tables (`resource_source_tags`,
+  `semantic_health_mutes`, `semantic_feedback`) are **Postgres-only**, per
+  the frozen DuckDB app-state backend (see Internal, below) — an instance
+  still running DuckDB app-state answers a typed `501
+  requires_postgres_backend` on every one of these surfaces.
+
+### Changed
+
+- **`/admin/semantic-layer` is rebuilt on tabs** (Coverage · Health · Mute ·
+  Feedback). A Keboola connection with no owner token is now an ordinary row
+  in the coverage report instead of a separate footnote — it used to be
+  invisible to the old page's coverage engine entirely.
+
+### Removed
+
+- **The old page's Keboola-specific "orphaned rows" count, "also connected
+  but not syncing" list, and "legacy / unattributed" bucket are gone.** All
+  three measured the flat `metric_definitions` / `glossary_terms`
+  projections rather than the canonical document they are derived from, and
+  only for Keboola. Their successors, all cross-source: the "also
+  connected" list is now a row in Coverage; "orphaned" is Health's
+  `orphaned_models`, computed over the canonical document; "legacy /
+  unattributed" is Coverage's synthetic `__local__` bucket.
+
+### Internal
+
+- `RequiresPostgresBackend` moved out of `src/repositories/__init__.py`
+  into its own import-free `src/repository_errors.py`. A PG-side test
+  fixture's `importlib.reload(src.repositories)` was rebinding the
+  exception to a new class object, which silently broke `app/main.py`'s
+  exception-handler match (a clean `501` degrading to an unhandled `500`)
+  the first time this session's work exercised the reload path against a
+  genuinely PG-only route.
+
 - **Shared-agent runtime: a user an agent was shared with can now run it**
   (remediation program Track C, C2.3). Previously only an agent's OWNER
   could open a session against it — a `ResourceType.AGENT` grant (the
