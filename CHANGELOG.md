@@ -287,6 +287,37 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   is unaffected (it pins deployment-provisioned backing, not a presentation
   choice, so it is out of scope). See the new "Config ownership map" in
   `docs/CONFIGURATION.md`.
+- **A THIRD-PARTY admin-granted agent scope item now reaches its agent
+  unconditionally, instead of being silently narrowed to the owner's own
+  grants** (remediation-program Track C2.2, consuming C2.1's `granted_by`).
+  `src/agent_scope_intersection.py::resolve_agent_authority` replaces
+  `compute_agent_intersection`: a `'selected'`-mode `agent_scope` row whose
+  `granted_by` is a THIRD PARTY — distinct from the agent's own owner — who
+  is (currently) an admin resolves unconditionally — a `data_package` an
+  admin shared with an agent now expands to its member tables even when the
+  agent's OWNER holds no grant on it at all, closing the "package invisible
+  to an admin-built agent" bug class. Every other row — a non-admin
+  granter, OR a granter who IS the agent's own owner (including an admin
+  owner) — still narrows to `item ∩ that GRANTER's CURRENT access` —
+  today's owner-intersection shape, just keyed to whoever wrote the row
+  instead of hard-coded to the agent's owner, so it now also stops
+  resolving if the ORIGINAL GRANTER (not the owner, not any future caller)
+  later loses access. **On Postgres only** — DuckDB has no `granted_by`
+  column (C2.1), so every row there reads back with no granter and falls
+  back to the agent's owner, making this a no-op on DuckDB and a
+  byte-identical no-op on Postgres for every agent whose scope predates C2
+  (migration 0073 backfilled `granted_by := owner_user_id`) — including for
+  an agent whose owner is itself an admin, which always narrows rather than
+  taking the unconditioned branch.
+  `AgentPrincipal.intersection` (the broker/pat-resolver, chat spawn, and
+  every table/marketplace/MCP seam that reads it) is unaffected in shape —
+  only its computation changed. Also fixes a related gap found while
+  building this: `agent_scope.set_scope`'s full-replace (Postgres) now
+  preserves the EXISTING `granted_by` for a row that is re-declared
+  unchanged, so a later owner save (e.g. the `/agents` builder syncing an
+  unrelated `knowledge`/`plugins` edit, which reads back and re-submits
+  every governance-owned row) can no longer silently downgrade an
+  admin-granted row to owner-granted.
 
 ### Removed
 

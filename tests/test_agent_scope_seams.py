@@ -15,6 +15,17 @@ pins what it is allowed to do once it gets there:
 
 Plus the crash-surface sweep: every widened seam must return/raise for an
 ``AgentPrincipal`` instead of blowing up on ``user["id"]``.
+
+C2.2 note (remediation Track C, ``docs/superpowers/plans/
+2026-08-26-one-agent-model.md``): every principal below is hand-built with an
+explicit ``intersection=`` dict, so this suite is agnostic to HOW that dict
+was computed — it pins consumption, not production. In real traffic
+``.intersection`` is produced by ``resolve_agent_authority``
+(``src/agent_scope_intersection.py``, replacing ``compute_agent_intersection``)
+rather than an owner-only lookup; the D-C2 admin/self-granted split it
+implements is covered where it is actually produced
+(``tests/test_agent_scope_intersection.py``,
+``tests/db_pg/test_resolve_agent_authority_pg.py``), not here.
 """
 
 from __future__ import annotations

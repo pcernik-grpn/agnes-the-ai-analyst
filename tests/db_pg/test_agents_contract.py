@@ -302,9 +302,43 @@ def test_granted_by_persists_on_postgres(pg_engine, monkeypatch):
         {"item_type": "table", "item_id": "t1", "granted_by": "admin1"},
     ]
     # A later replace with a different writer re-attributes every row this
-    # call writes — one `set_scope` call always has exactly one writer.
+    # call writes that is NEW — one `set_scope` call has exactly one writer
+    # for the rows it actually introduces. "p2" was never declared before,
+    # so it is attributed to the new writer.
     repo.set_scope("a1", [("plugin", "p2")], granted_by="owner1")
     assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2", "granted_by": "owner1"}]
+
+
+def test_granted_by_is_preserved_across_a_replace_for_unchanged_rows(pg_engine, monkeypatch):
+    """C2.2 must-handle: a full-replace `set_scope` call that re-declares a
+    row UNCHANGED must not re-attribute it to the new writer.
+
+    `_sync_builder_scope` (`app/api/agents_builder_shared.py`) reads back
+    every governance-owned row it does not itself own (`preserved`) and
+    passes it straight through `set_scope` alongside the builder's own
+    `declared` items — one call, one `granted_by` kwarg. Without this
+    preservation, an admin-granted `data_package` row would silently
+    downgrade to owner-granted (and lose D-C2's unconditioned resolution)
+    the next time the (non-admin) owner saves the builder page for an
+    unrelated reason (adding a plugin, say) — see
+    `docs/superpowers/plans/2026-08-26-one-agent-model.md` C2.2's
+    must-handle note.
+    """
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    repo.create(id="a1", owner_user_id="owner1", name="A", slug="x")
+
+    # Admin grants a data_package.
+    repo.set_scope("a1", [("data_package", "pkg1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [{"item_type": "data_package", "item_id": "pkg1", "granted_by": "admin1"}]
+
+    # Owner later does a full-replace save touching an unrelated axis
+    # (adding a plugin), re-declaring pkg1 unchanged alongside it — the
+    # exact shape `_sync_builder_scope` produces (preserved + declared).
+    repo.set_scope("a1", [("data_package", "pkg1"), ("plugin", "p1")], granted_by="owner1")
+
+    scope = {(r["item_type"], r["item_id"]): r["granted_by"] for r in repo.get_scope("a1")}
+    assert scope[("data_package", "pkg1")] == "admin1"  # UNCHANGED — still admin-granted
+    assert scope[("plugin", "p1")] == "owner1"  # genuinely new -> attributed to this writer
 
 
 def test_granted_by_is_dropped_on_duckdb(tmp_path):
