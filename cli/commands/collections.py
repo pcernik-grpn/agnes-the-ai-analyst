@@ -66,7 +66,13 @@ def create_collection(
     if as_json:
         typer.echo(json_lib.dumps(body, indent=2, default=str))
         return
-    typer.echo(f"Created: id={body['id']}  slug={body.get('slug', '')}  name={body['name']}")
+    line = f"Created: id={body['id']}  slug={body.get('slug', '')}  name={body['name']}"
+    # Older servers don't return `visibility`; say where the upload landed
+    # only when the server said so (it may be "workspace" under
+    # library.auto_share_admin_uploads).
+    if body.get("visibility"):
+        line += f"  visibility={body['visibility']}"
+    typer.echo(line)
 
 
 # ---------------------------------------------------------------------------
