@@ -1028,6 +1028,183 @@ def test_anthropic_proxy_happy_path_records_usage_and_budget_headers(broker_app,
     assert len(rows) == 1
     assert rows[0]["input_tokens"] == 11
     assert rows[0]["output_tokens"] == 7
+
+
+# ---------------------------------------------------------------------------
+# C2.4 — per-caller usage attribution (remediation Track C,
+# docs/superpowers/plans/2026-08-26-one-agent-model.md §C2.4). A shared
+# agent (C2.3) can be run by many callers; usage rows must be attributed to
+# WHICH caller incurred them, while the agent-level budget stays shared.
+# ---------------------------------------------------------------------------
+
+
+def _grantee_session_ticket(agent_id: str) -> dict:
+    """A second user's own session bound to the SAME agent as
+    ``broker_agent_session`` — standing in for a grantee (C2.3, shared-agent
+    runtime) driving a turn against an agent they don't own. The broker
+    layer under test here doesn't itself check the `ResourceType.AGENT`
+    grant (that's enforced earlier, at session creation — `app/api/chat.py`
+    / `app/api/agent_sessions.py`); this fixture only needs a real session
+    row naming a DIFFERENT `user_email` than the owner's, exactly what
+    those routes would have produced for an authorized grantee."""
+    tag = uuid.uuid4().hex[:8]
+    email = f"broker_grantee_{tag}@test.com"
+    user_id = f"broker_grantee_user_{tag}"
+
+    conn = get_system_db()
+    UserRepository(conn).create(id=user_id, email=email, name="Broker Grantee")
+    conn.close()
+
+    session = chat_session_repo().create_session(user_email=email, surface=Surface.WEB, agent_id=agent_id)
+    tok = ticket_repo().mint(session.id, "main", ttl_seconds=60)
+    return {"session_id": session.id, "tok": tok, "user_id": user_id}
+
+
+def test_two_callers_on_one_shared_agent_produce_distinguishable_usage_rows(
+    broker_app, broker_agent_session, monkeypatch
+):
+    """C2.4: the owner and a grantee each run a turn against the SAME
+    shared agent — the rows handed to `llm_usage_repo().insert_batch` carry
+    each caller's OWN `caller_user_id`, never the agent owner's, for both
+    calls. Asserted against the row dicts the accumulator actually builds
+    (backend-agnostic — DuckDB has no column to persist `caller_user_id`
+    into, see `tests/db_pg/test_llm_usage_contract.py` for that half)."""
+    import json
+
+    import app.api.broker as broker_mod
+    from app.api import broker_agent_policy as pol
+
+    ctx = broker_agent_session(model="claude-opus-4-7", token_budget_monthly=100_000)
+    grantee = _grantee_session_ticket(ctx["agent_id"])
+
+    captured: list = []
+
+    class _CapturingLlmUsageRepo:
+        def insert_batch(self, rows):
+            captured.extend(rows)
+
+        def month_total_tokens(self, agent_id, year_month):
+            return 0
+
+    monkeypatch.setattr(pol, "llm_usage_repo", lambda: _CapturingLlmUsageRepo())
+
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = json.dumps(
+        {"id": "msg1", "model": "claude-opus-4-7", "usage": {"input_tokens": 11, "output_tokens": 7}}
+    ).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _call(tok):
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-opus-4-7", "messages": []},
+            )
+
+    r_owner = asyncio.run(_call(ctx["tok"]))
+    r_grantee = asyncio.run(_call(grantee["tok"]))
+    assert r_owner.status_code == 200, r_owner.text
+    assert r_grantee.status_code == 200, r_grantee.text
+
+    pol.usage_accumulator.flush()
+    assert len(captured) == 2
+    by_agent = [row for row in captured if row["agent_id"] == ctx["agent_id"]]
+    assert len(by_agent) == 2
+    caller_ids = {row["caller_user_id"] for row in by_agent}
+    assert caller_ids == {ctx["user_id"], grantee["user_id"]}
+    # `user_id` (unchanged, pre-C2.4 meaning) stays the agent's OWNER for
+    # BOTH rows -- only `caller_user_id` distinguishes who actually spent
+    # the tokens.
+    assert {row["user_id"] for row in by_agent} == {ctx["user_id"]}
+
+
+def test_agentless_session_costs_no_caller_lookup(broker_app, broker_agent_session, e2e_env, monkeypatch):
+    """C2.4 must not tax sessions it does not serve. A Slack/legacy session
+    with no bound agent discards both halves of the result (every
+    `caller_user_id` consumer sits behind `agent_row is not None`), so the
+    user lookup must not run at all for it — the cost promised by
+    `_agent_and_caller_for_ticket`'s docstring.
+
+    The agent-bound half is asserted too, so the test fails if the lookup is
+    dropped entirely rather than merely made conditional."""
+    import app.api.broker as broker_mod
+
+    real_users_repo = broker_mod.users_repo
+    calls: list = []
+
+    def _counting_users_repo():
+        calls.append(1)
+        return real_users_repo()
+
+    monkeypatch.setattr(broker_mod, "users_repo", _counting_users_repo)
+
+    # No bound agent -> zero user lookups.
+    tag = uuid.uuid4().hex[:8]
+    email = f"broker_agentless_{tag}@test.com"
+    conn = get_system_db()
+    UserRepository(conn).create(id=f"broker_agentless_user_{tag}", email=email, name="Agentless")
+    conn.close()
+    plain = chat_session_repo().create_session(user_email=email, surface=Surface.WEB)
+
+    agent_row, caller_user_id = broker_mod._agent_and_caller_for_ticket({"session_id": plain.id})
+    assert agent_row is None
+    assert caller_user_id is None
+    assert calls == [], "agent-less session must not pay for a caller lookup"
+
+    # Bound agent -> the lookup still happens and still attributes.
+    ctx = broker_agent_session()
+    agent_row, caller_user_id = broker_mod._agent_and_caller_for_ticket({"session_id": ctx["session_id"]})
+    assert agent_row is not None and agent_row["id"] == ctx["agent_id"]
+    assert caller_user_id == ctx["user_id"]
+    assert len(calls) == 1
+
+
+def test_shared_agent_budget_enforced_across_callers_not_per_caller(broker_app, broker_agent_session, monkeypatch):
+    """Budget enforcement is UNCHANGED by C2.4 — still keyed on `agent_id`
+    alone. The owner's turn pushing a shared agent over its
+    `token_budget_monthly` must 429 a DIFFERENT caller's very next turn on
+    that SAME agent, not just the owner's own."""
+    import json
+
+    import app.api.broker as broker_mod
+
+    ctx = broker_agent_session(model="claude-opus-4-7", token_budget_monthly=15)
+    grantee = _grantee_session_ticket(ctx["agent_id"])
+
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = json.dumps(
+        {"id": "msg1", "model": "claude-opus-4-7", "usage": {"input_tokens": 11, "output_tokens": 7}}
+    ).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _call(tok):
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-opus-4-7", "messages": []},
+            )
+
+    # Owner's turn: 11 + 7 = 18 tokens, pushing the agent's 15-token budget
+    # over the top (recorded synchronously into the shared budget cache by
+    # `UsageAccumulator._incr_budget_counter`, no DB flush needed).
+    r_owner = asyncio.run(_call(ctx["tok"]))
+    assert r_owner.status_code == 200, r_owner.text
+    assert r_owner.headers.get("x-agnes-budget-used") == "0"  # pre-call total
+
+    # The GRANTEE's very next turn on the SAME agent -- not the owner's --
+    # is refused. Enforcement is per-AGENT, not per-caller.
+    r_grantee = asyncio.run(_call(grantee["tok"]))
+    assert r_grantee.status_code == 429, r_grantee.text
+    assert r_grantee.json()["detail"]["code"] == "budget_exhausted"
+    assert r_grantee.headers.get("x-agnes-budget-used") == "18"
+
+
 # --- POST /api/broker/data-apps (Task 7, wave 3B) ---------------------------
 #
 # Mirrors the `agnes-api`/`agnes-mcp` twin-endpoint pattern: a `data_apps`
@@ -1340,15 +1517,12 @@ def test_anthropic_sse_stream_records_agent_usage(broker_app, broker_agent_sessi
 
                 async def aiter_bytes(self):
                     yield (
-                        b'event: message_start\n'
+                        b"event: message_start\n"
                         b'data: {"type":"message_start","message":{"model":"claude-opus-4-7",'
                         b'"usage":{"input_tokens":11,"output_tokens":0}}}\n\n'
                     )
                     yield b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
-                    yield (
-                        b'event: message_delta\n'
-                        b'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n'
-                    )
+                    yield (b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}\n\n')
 
                 async def aclose(self):
                     pass

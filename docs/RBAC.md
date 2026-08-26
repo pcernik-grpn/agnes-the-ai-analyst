@@ -254,6 +254,9 @@ The one editor rule has two deliberate exceptions, both *transposes* rather than
 ### CLI
 
 ```bash
+agnes admin add-user alice@example.com --name "Alice" --invite
+agnes admin reset-password alice@example.com   # setup link for an existing account
+
 agnes admin group list
 agnes admin group create Engineering --description "Eng team"
 agnes admin group delete Engineering
