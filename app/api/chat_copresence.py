@@ -100,7 +100,10 @@ async def co_session_messages(
             "content": m.content,
             "tool_calls": m.tool_calls,
             "sender_email": m.sender_email,
-            "created_at": m.created_at.isoformat(),
+            # Raw datetime — app/serialization.py labels it `+00:00` on the
+            # wire; .isoformat() here bypassed that and shipped a naive
+            # string the browser mis-parsed as local time.
+            "created_at": m.created_at,
         }
         for m in msgs
     ]

@@ -148,6 +148,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   already put them — instead of stapling them after the first segment,
   mid-turn. The reload timestamp also reads the row's real `created_at` on
   every segment rather than "now" on continuations.
+- Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
+  The sessions/messages endpoints (incl. copresence) pre-stringified their
+  naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
+  that labels them `+00:00` — the browser then parsed the offset-less
+  string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
+  They now return raw datetimes and the encoder stamps the offset.
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a
