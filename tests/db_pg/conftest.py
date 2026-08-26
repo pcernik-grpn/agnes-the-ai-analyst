@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 from typing import Iterator
 
@@ -104,6 +105,27 @@ def _start_embedded() -> Iterator[str]:
             executor.stop()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+#: xdist hands out ``master`` (no xdist) or ``gw<N>``. Anything else means the
+#: caller is not xdist, and the value must not reach ``CREATE DATABASE``.
+_WORKER_ID_RE = re.compile(r"\A(master|gw\d+)\Z")
+
+
+def _worker_database_name(worker_id: str) -> str | None:
+    """Database this worker owns on the shared server; ``None`` for ``master``.
+
+    ``master`` is the no-xdist case and keeps the server's default database.
+
+    Raises ``ValueError`` for anything that is not an xdist worker id. The name
+    is interpolated into ``CREATE DATABASE``, which accepts no bind parameters;
+    xdist owns the value, so this is not an untrusted-input path, but the guard
+    is what lets a reader see that the interpolation is safe instead of having
+    to go and verify where the id came from.
+    """
+    if not _WORKER_ID_RE.match(worker_id):
+        raise ValueError(f"not an xdist worker id: {worker_id!r}")
+    return None if worker_id == "master" else f"agnes_{worker_id}"
 
 
 def _start_dedicated_pgserver() -> Iterator[str]:
@@ -198,10 +220,10 @@ def _start_pgserver(testrun_uid: str, worker_id: str) -> Iterator[str]:
 
         # Per-worker database on the shared server. `master` is the no-xdist
         # case and keeps the default database.
-        if worker_id == "master":
+        dbname = _worker_database_name(worker_id)
+        if dbname is None:
             yield admin_url
         else:
-            dbname = f"agnes_{worker_id}"
             admin = _sa.create_engine(admin_url, future=True, isolation_level="AUTOCOMMIT")
             try:
                 with admin.connect() as conn:

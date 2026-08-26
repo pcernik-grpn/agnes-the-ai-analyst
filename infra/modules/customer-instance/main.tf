@@ -341,6 +341,30 @@ resource "google_secret_manager_secret_iam_member" "vm_oauth" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
+# Cloud Logging writer for Docker's gcplogs log driver
+# (docker-compose.gcp-logging.yml, gated by var.enable_gcp_logging). The
+# driver authenticates as the VM's service account — the dedicated SA above,
+# attached to every instance below — and without this role it cannot
+# initialize. Docker refuses to START a container whose log driver fails to
+# initialize, so a VM running the overlay without the role goes fully down
+# on its next routine container recreate (the auto-upgrade cron), not at
+# provisioning time. The startup script's boot-time driver probe keeps such
+# a VM alive by disabling the overlay with a loud warning, but logs then
+# never reach Cloud Logging; this binding is what makes the default-on
+# feature actually work. Unlike the secret grants above this one is
+# project-level: roles/logging.logWriter only permits writing log entries,
+# and the driver's log target has no narrower resource to bind on. The
+# identity running `terraform apply` must be able to modify project IAM
+# policy (e.g. roles/resourcemanager.projectIamAdmin) — if it cannot, the
+# apply fails visibly here, which beats a latent VM that dies on a cron
+# tick; either grant the role out-of-band or set enable_gcp_logging=false.
+resource "google_project_iam_member" "vm_log_writer" {
+  count   = var.enable_gcp_logging ? 1 : 0
+  project = var.gcp_project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.vm.email}"
+}
+
 # --- Network ---
 
 # Web firewall: 80/443 for Caddy (TLS), 8000 only when TLS is disabled (direct HTTP).

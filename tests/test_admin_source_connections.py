@@ -361,7 +361,7 @@ class TestSeedFromInstanceCredentials:
             json={
                 "name": "test-seed-non-keboola",
                 "source_type": "bigquery",
-                "config": {"project_id": "p"},
+                "config": {"project": "p"},
                 "seed_from_instance_credentials": True,
             },
             headers=_auth(token),
@@ -891,7 +891,7 @@ class TestSourceConnectionsTables:
             json={
                 "name": "test-bq-tables",
                 "source_type": "bigquery",
-                "config": {"project_id": "p"},
+                "config": {"project": "p"},
             },
             headers=_auth(token),
         )
@@ -1293,7 +1293,7 @@ class TestSourceConnectionsMasterSecret:
             json={
                 "name": "test-master-bq",
                 "source_type": "bigquery",
-                "config": {"project_id": "p"},
+                "config": {"project": "p"},
             },
             headers=_auth(token),
         )
@@ -1980,23 +1980,27 @@ class TestOnlyKeboolaCarriesItsProjectForward:
     brought it straight back.
     """
 
-    def test_a_bigquery_project_id_can_be_cleared(self, seeded_app):
+    def test_a_bigquery_typed_field_can_be_cleared(self, seeded_app):
+        # `project` is bigquery's one REQUIRED field (src.connection_specs) and
+        # must stay present through the PUT below, or the new config-validation
+        # gate (spec 2026-08-26 Track D2 task D2.1) rejects the update outright
+        # — `dataset` is the arbitrary, non-required field this test clears.
         c, token = seeded_app["client"], seeded_app["admin_token"]
         created = c.post(
             BASE,
             json={
                 "name": "bq-clearable",
                 "source_type": "bigquery",
-                "config": {"project_id": "my-gcp-project", "dataset": "analytics"},
+                "config": {"project": "my-gcp-project", "dataset": "analytics"},
             },
             headers=_auth(token),
         )
         assert created.status_code == 201, created.text
         conn_id = created.json()["id"]
 
-        r = c.put(f"{BASE}/{conn_id}", json={"config": {"dataset": "analytics"}}, headers=_auth(token))
+        r = c.put(f"{BASE}/{conn_id}", json={"config": {"project": "my-gcp-project"}}, headers=_auth(token))
         assert r.status_code == 200, r.text
-        assert "project_id" not in r.json()["config"], "a typed BigQuery field could not be cleared"
+        assert "dataset" not in r.json()["config"], "a typed BigQuery field could not be cleared"
 
     def test_a_keboola_binding_is_still_carried_forward(self, seeded_app):
         c, token = seeded_app["client"], seeded_app["admin_token"]

@@ -121,6 +121,27 @@ The split is worth getting right: mermaid draws relationships and cannot plot
 values, matplotlib plots values and should not be used to draw a box diagram.
 A trend over months is a chart; how three tables feed a report is a diagram.
 
+## Icons — never emoji
+
+**NEVER use emoji characters in a reply** — not in headings, not in lists, not
+as decoration. Emoji render inconsistently and read as unpolished next to the
+rest of the UI. When a heading or line genuinely benefits from an icon, use the
+inline icon syntax instead: `icon:<name>` (backticks included). The chat
+renders it as a real SVG icon. ONLY use names from this exact list — any other
+name stays as plain text: arrow-down, arrow-left, arrow-right, arrow-up, ban,
+bell, book-open, bookmark, box, calendar, chart-bar, chart-line, chart-pie,
+check, circle-alert, circle-check, circle-help, circle-x, clock, cloud, copy,
+database, download, external-link, eye, file, file-text, filter, flag, folder,
+gauge, git-branch, globe, hand, hard-drive, history, hourglass, info, key,
+layers, lightbulb, link, list, list-checks, lock, mail, minus, package, pause,
+pencil, pin, play, plus, refresh-cw, rocket, search, server, settings, shield,
+sparkles, star, table, trash-2, trending-down, trending-up, triangle-alert,
+upload, user, users, workflow, wrench, x, zap.
+
+Example: `icon:database` **Catalog** — renders a database icon before the word.
+Use icons sparingly: a section heading, a status line. Never more than one per
+line.
+
 ## Discovering more data
 
 If `agnes catalog` doesn't have what you need, there may be more data packages

@@ -30,8 +30,9 @@ _UPDATABLE = frozenset(
         "surfaces",
         "status",
         # Renaming a DRAFT re-derives its slug off the new name
-        # (app/api/agents.py::_draft_slug_rename) — the builder creates the
-        # row before the user types anything, so the slug would otherwise
+        # (app/api/agents_builder_shared.py::_draft_slug_rename) — the
+        # builder creates the row before the user types anything, so the
+        # slug would otherwise
         # stay the literal "agent" placeholder that the public address
         # (POST /api/v1/agents/{slug}/responses) is built from. Writers must
         # keep the (owner_user_id, slug) UNIQUE intact: resolve through
@@ -141,6 +142,52 @@ class AgentsRepository:
             [owner_user_id, slug],
         ).fetchone()
         return self._row_to_dict(row)
+
+    def get_runnable_by_slug(self, user_id: str, slug: str) -> Optional[Dict[str, Any]]:
+        """Agent *user_id* may RUN at a `/api/v1/agents/{slug}/...` runtime
+        route: owned, or reachable via a ``ResourceType.AGENT`` grant
+        through one of the caller's groups (remediation-program C2.3,
+        shared-agent runtime).
+
+        ``slug`` is resolved first in the caller's OWN slug namespace —
+        ``(owner_user_id, slug)`` is the only UNIQUE key on ``agents.slug``
+        (see :meth:`get_by_slug`), so a slug string is meaningless outside
+        its owner's namespace. A caller who does not own an agent under
+        ``slug`` cannot address someone else's agent by a borrowed name;
+        for a shared (not owned) agent, ``slug`` is instead resolved as the
+        target agent's globally-unique ``id`` — the shape the v1 list's
+        ``runnable=true`` filter hands back to a non-owner caller. The
+        owner may ALSO address their own agent by id this way (falls
+        through the same branch, short-circuited by the ownership check
+        before the grant lookup) — "runtime paths accept slug or id" holds
+        for every caller, not only grantees.
+
+        Deliberately does NOT apply the Admin god-mode short-circuit
+        (``app.auth.access.can_access``): per the agent-runtime auth
+        matrix, admin god-mode covers management/inspection only, never an
+        implicit "run any agent" grant, so this method reads
+        ``resource_grants`` directly instead of going through
+        ``can_access``.
+        """
+        owned = self.get_by_slug(user_id, slug)
+        if owned is not None:
+            return owned
+
+        agent = self.get_by_id(slug)
+        if agent is None or agent.get("deleted_at") is not None:
+            return None
+        if agent["owner_user_id"] == user_id:
+            return agent
+
+        from src.repositories.resource_grants import ResourceGrantsRepository
+
+        # "agent" mirrors ``ResourceType.AGENT.value`` (kept inline so the
+        # repo layer stays free of the app.resource_types import — same
+        # convention as ResourceGrantsRepository.delete_for_marketplace_plugins).
+        granted_ids = ResourceGrantsRepository(self.conn).list_resource_ids_for_user(user_id, "agent")
+        if agent["id"] in granted_ids:
+            return agent
+        return None
 
     def list_for_user(self, owner_user_id: str) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
@@ -273,7 +320,25 @@ class AgentsRepository:
         )
         return self.get_by_id(agent_id)  # type: ignore[return-value]
 
-    def set_scope(self, agent_id: str, items: List[Tuple[str, str]]) -> None:
+    def set_scope(
+        self,
+        agent_id: str,
+        items: List[Tuple[str, str]],
+        granted_by: Optional[str] = None,
+    ) -> None:
+        """Replace the whole scope set for ``agent_id``.
+
+        ``granted_by`` is accepted for signature symmetry with the Postgres
+        repo (``AgentsPgRepository.set_scope``) so call sites work
+        identically regardless of the active backend, but it is a no-op
+        here: ``agent_scope.granted_by`` is a genuine schema change under
+        the A3 PG-first ratchet, so it landed Postgres-only
+        (``migrations/versions/0073_agent_scope_granted_by.py``) — the
+        DuckDB side of this pair does not gain the capability that depends
+        on it (see ``.claude/skills/agnes-conventions/references/
+        migration.md``). ``get_scope``/``get_scope_for_agents`` always read
+        back ``granted_by: None`` here.
+        """
         self.conn.execute("DELETE FROM agent_scope WHERE agent_id = ?", [agent_id])
         if items:
             self.conn.executemany(
@@ -283,18 +348,21 @@ class AgentsRepository:
 
     def get_scope(self, agent_id: str) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT item_type, item_id FROM agent_scope WHERE agent_id = ? ORDER BY item_type, item_id",
+            "SELECT item_type, item_id, NULL AS granted_by FROM agent_scope "
+            "WHERE agent_id = ? ORDER BY item_type, item_id",
             [agent_id],
         ).fetchall()
         return self._rows_to_dicts(rows)
 
     def get_scope_for_agents(self, agent_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-        """``{agent_id: [{item_type, item_id}, ...]}`` for many agents at once.
+        """``{agent_id: [{item_type, item_id, granted_by}, ...]}`` for many
+        agents at once.
 
         The list endpoint projects every agent's declaration, which needs the
         scope rows when the JSON columns are empty; calling :meth:`get_scope`
         per row made that an N+1 (Devin Review on #1520). Ids with no rows are
         absent from the mapping, so callers should use ``.get(id, [])``.
+        ``granted_by`` is always ``None`` here — see :meth:`set_scope`.
         """
         if not agent_ids:
             return {}
@@ -306,7 +374,7 @@ class AgentsRepository:
         ).fetchall()
         out: Dict[str, List[Dict[str, Any]]] = {}
         for agent_id, item_type, item_id in rows:
-            out.setdefault(agent_id, []).append({"item_type": item_type, "item_id": item_id})
+            out.setdefault(agent_id, []).append({"item_type": item_type, "item_id": item_id, "granted_by": None})
         return out
 
     def agent_for_scope_item(self, item_type: str, item_id: str) -> Optional[Dict[str, Any]]:

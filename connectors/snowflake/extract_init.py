@@ -122,6 +122,34 @@ def init_extract(
                 f"Snowflake host {url!r} is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; "
                 "refusing to send credential during extract build"
             )
+
+        # SECURITY: checked BEFORE the attach, not after. A `token_env` not on
+        # the orchestrator's allowlist means the connector does not get to pick
+        # which secret gets shipped — but `token` here was already resolved
+        # from that env var (or the connection's vault) by the caller, so a
+        # check that ran only AFTER `attach()` had already sent it over the
+        # network to `url` (defense-in-depth: writable `source_connections`
+        # rows since D2.2 make an admin-set `config.token_env` an untrusted
+        # input, not just an operator typo — see
+        # `app.api.admin_source_connections._reject_disallowed_config_token_envs`
+        # for the write-time half of this same guard) would have been a
+        # warning after the leak, not a refusal before it. `resolve_remote_
+        # attach_token`/replay-time ATTACH (src/orchestrator.py, src/db.py)
+        # apply the identical allowlist, so a refusal here is consistent with
+        # what a rebuild would do anyway — no working configuration is broken
+        # by moving the check earlier.
+        if token_env and not is_token_env_allowed(token_env):
+            message = (
+                f"snowflake extract: token_env {token_env!r} is not in the remote-attach "
+                "token-env allowlist; refusing to attach. Add it to "
+                "AGNES_REMOTE_ATTACH_TOKEN_ENVS (the override REPLACES the defaults), "
+                "or store the credential in the connection's vault instead."
+            )
+            logger.error(message)
+            for tc in table_configs:
+                stats["errors"].append({"table": tc.get("name"), "error": message})
+            return stats
+
         try:
             attach(conn, url=url, token=token, passphrase=passphrase)
         except Exception as exc:
@@ -129,22 +157,6 @@ def init_extract(
             for tc in table_configs:
                 stats["errors"].append({"table": tc.get("name"), "error": f"Snowflake ATTACH failed: {exc}"})
             return stats
-
-        # Both replay paths (src/orchestrator.py, src/db.py) refuse a
-        # `token_env` that is not on the orchestrator's allowlist — correctly:
-        # the connector does not get to pick which secret gets shipped. But a
-        # refusal there is silent from the operator's seat (the symptom is a
-        # missing master view), so an operator who configured
-        # `data_source.snowflake.token_env` without allowlisting the name gets
-        # told here, while they are still looking at a register/sync result.
-        # The gate itself is NOT weakened.
-        if token_env and not is_token_env_allowed(token_env):
-            logger.warning(
-                "snowflake extract: token_env %r is not in the remote-attach token-env "
-                "allowlist; the ATTACH will be skipped at query time. Add it to "
-                "AGNES_REMOTE_ATTACH_TOKEN_ENVS (the override REPLACES the defaults).",
-                token_env,
-            )
 
         write_remote_attach(conn, account, database, warehouse, user, role, token_env=token_env)
 
@@ -198,9 +210,11 @@ def rebuild_from_registry(output_dir: str | None = None) -> dict[str, Any]:
         output_dir = str(Path(os.environ.get("DATA_DIR", "./data")) / "extracts" / "snowflake")
 
     token = settings.get("password") or settings.get("private_key") or ""
-    token_env = settings.get("token_env") or (
-        settings.get("private_key_env") if settings.get("auth_type") == "key_pair" else SF_TOKEN_ENV
-    ) or SF_TOKEN_ENV
+    token_env = (
+        settings.get("token_env")
+        or (settings.get("private_key_env") if settings.get("auth_type") == "key_pair" else SF_TOKEN_ENV)
+        or SF_TOKEN_ENV
+    )
 
     result = init_extract(
         output_dir,

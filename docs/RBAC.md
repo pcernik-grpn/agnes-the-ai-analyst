@@ -81,6 +81,21 @@ app, and sharing is their call to publish that view. Admins retain full
 oversight: every grant is visible and revocable in `/admin/access`, and grant
 writes are audited like any other.
 
+### Auto-share for admin uploads (opt-in)
+
+Collections are private to their creator by default — without a grant, only
+the owner (and admins, via god-mode) can see an upload, in every surface at
+once: the Library, the chat agent's `collections_*`/`knowledge_search` tools,
+and the `agnes pull` knowledge artifacts. An instance whose expectation is
+"what an admin uploads is for the whole workspace" can opt into
+`library.auto_share_admin_uploads: true` (env
+`AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`; default false): a collection an
+admin creates via the Library/API is then granted to `Everyone` at creation.
+The grant is an ordinary `resource_grants` row — visible in `/admin/access`
+and revocable per collection in the Share dialog. Scope is deliberately
+narrow: non-admin uploads stay private, and chat file drops (which create
+private one-file artefacts through a separate path) are never auto-shared.
+
 ---
 
 ## Authorization API

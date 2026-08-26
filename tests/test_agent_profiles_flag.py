@@ -139,22 +139,14 @@ class TestRouterLevelGuard:
         assert resp.status_code == 403
         assert resp.json()["detail"] == {"kind": "agent_profiles_disabled"}
 
-    def test_builder_crud_router(self, flag_env, monkeypatch):
-        """The /api/agents builder CRUD router (paper-theme redesign) works
-        the same `agents` table as /api/v1/agents* — the kill switch must
-        close it too, or a disabled instance keeps managing agent profiles
-        through the second API."""
-        monkeypatch.setenv("AGNES_AGENT_PROFILES_ENABLED", "0")
-        c = flag_env["client"]
-        resp = c.get("/api/agents", headers=_auth(flag_env["owner_token"]))
-        assert resp.status_code == 403
-        assert resp.json()["detail"] == {"kind": "agent_profiles_disabled"}
-        resp = c.post(
-            "/api/agents",
-            json={"name": "Sneaky", "description": ""},
-            headers=_auth(flag_env["owner_token"]),
-        )
-        assert resp.status_code == 403
+    # `test_builder_crud_router` used to live here: it asserted the kill
+    # switch also closed the /agents builder's OWN CRUD router
+    # (`/api/agents`), a second registry over the same `agents` table as
+    # `/api/v1/agents*`. That router was deleted outright by the
+    # remediation-program's "one agent model" Track C1 (Task C1.2) — v1
+    # absorbed its wire shape in Task C1.1 — so there is no longer a second
+    # API for the flag to leave open; the coverage above is complete on its
+    # own.
 
     def test_re_enabling_restores_access_without_data_loss(self, flag_env, monkeypatch):
         """Data survives a disable/re-enable cycle, like Studio."""

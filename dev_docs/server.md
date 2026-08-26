@@ -183,14 +183,23 @@ A disk space alert fires when `/data` exceeds 85% for 5 minutes.
 On GCE deployments the container stdout/stderr (app INFO + uncaught-exception
 tracebacks, scheduler, etc.) ships to **GCP Cloud Logging** via Docker's
 `gcplogs` driver, engaged by the `docker-compose.gcp-logging.yml` overlay.
-Activation is **placement-driven**: the overlay is not baked into the image and
-not in any default `COMPOSE_FILE` — `agnes-auto-upgrade.sh` /
-`agnes-state-applier.sh` append it only when the file is present on disk
-(`[ -f ]`), and the file is placed solely by the GCE deploy layer (the customer
-infra Terraform `startup.sh` fetches it into `/opt/agnes/`). Non-GCP hosts never
-get the file and keep the default `json-file` driver. To enable it on a GCE host
-manually, drop the overlay into `/opt/agnes/docker-compose.gcp-logging.yml` and
-run `docker compose up -d` (or wait for the next image upgrade to recreate the containers). Entries land under
+Activation is **placement + probe driven**: the overlay ships baked into the
+image, the Terraform startup script extracts it into `/opt/agnes/` (and removes
+it again when `enable_gcp_logging=false`), and every `COMPOSE_FILE` builder
+(the boot script, `agnes-auto-upgrade.sh`, `agnes-state-applier.sh` — all via
+`scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active`) appends it only
+when the file is present on disk **and** the driver probe has armed
+`/opt/agnes/.gcp-logging-ok`. The probe (`agnes_gcp_logging_probe`) starts a
+no-op container with `--log-driver=gcplogs` at boot — and on any auto-upgrade
+tick where the overlay sits marker-less — because Docker refuses to *start* a
+container whose log driver cannot initialize: an armed overlay without
+`roles/logging.logWriter` on the VM service account (the module grants it with
+`enable_gcp_logging`) would otherwise take the instance down on the next
+routine recreate. A failed probe logs a warning and leaves the stack on
+`json-file`. Non-GCP hosts never get the file and keep the default `json-file`
+driver. To enable it on a GCE host manually, drop the overlay into
+`/opt/agnes/docker-compose.gcp-logging.yml` and let the next auto-upgrade tick
+probe + recreate. Entries land under
 resource `gce_instance` (next to the VM/system logs), logName
 `gcplogs-docker-driver`, tagged with `jsonPayload.instance.name` /
 `jsonPayload.container.name`. The app's own JSON log line (with its `lvl`,

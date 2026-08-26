@@ -339,92 +339,6 @@
         "title": "AdminTokenItem",
         "type": "object"
       },
-      "AgentCreate": {
-        "properties": {
-          "greeting": {
-            "default": "",
-            "title": "Greeting",
-            "type": "string"
-          },
-          "instructions": {
-            "default": "",
-            "title": "Instructions",
-            "type": "string"
-          },
-          "knowledge": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Knowledge",
-            "type": "array"
-          },
-          "name": {
-            "default": "",
-            "maxLength": 200,
-            "title": "Name",
-            "type": "string"
-          },
-          "plugins": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Plugins",
-            "type": "array"
-          },
-          "role": {
-            "default": "",
-            "maxLength": 500,
-            "title": "Role",
-            "type": "string"
-          },
-          "status": {
-            "default": "draft",
-            "maxLength": 30,
-            "title": "Status",
-            "type": "string"
-          },
-          "surfaces": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "boolean"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Surfaces"
-          },
-          "template_entity_id": {
-            "anyOf": [
-              {
-                "maxLength": 200,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Template Entity Id"
-          },
-          "tone": {
-            "anyOf": [
-              {
-                "maxLength": 50,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tone"
-          }
-        },
-        "title": "AgentCreate",
-        "type": "object"
-      },
       "AgentResponseRequest": {
         "properties": {
           "background": {
@@ -470,125 +384,6 @@
           "input"
         ],
         "title": "AgentResponseRequest",
-        "type": "object"
-      },
-      "AgentUpdate": {
-        "description": "All fields optional \u2014 a PATCH sends only what changed.",
-        "properties": {
-          "greeting": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Greeting"
-          },
-          "instructions": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Instructions"
-          },
-          "knowledge": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Knowledge"
-          },
-          "name": {
-            "anyOf": [
-              {
-                "maxLength": 200,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
-          },
-          "plugins": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Plugins"
-          },
-          "role": {
-            "anyOf": [
-              {
-                "maxLength": 500,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Role"
-          },
-          "status": {
-            "anyOf": [
-              {
-                "maxLength": 30,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Status"
-          },
-          "surfaces": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "boolean"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Surfaces"
-          },
-          "tone": {
-            "anyOf": [
-              {
-                "maxLength": 50,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tone"
-          }
-        },
-        "title": "AgentUpdate",
         "type": "object"
       },
       "AnalystInitialWorkspaceResponse": {
@@ -2090,6 +1885,42 @@
             ],
             "title": "Description"
           },
+          "greeting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Greeting"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge"
+          },
           "model": {
             "anyOf": [
               {
@@ -2105,9 +1936,66 @@
             "title": "Name",
             "type": "string"
           },
+          "plugins": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugins"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "slug": {
-            "title": "Slug",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "surfaces": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaces"
           },
           "system_prompt": {
             "anyOf": [
@@ -2120,6 +2008,17 @@
             ],
             "title": "System Prompt"
           },
+          "template_entity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Entity Id"
+          },
           "token_budget_monthly": {
             "anyOf": [
               {
@@ -2130,11 +2029,21 @@
               }
             ],
             "title": "Token Budget Monthly"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tone"
           }
         },
         "required": [
-          "name",
-          "slug"
+          "name"
         ],
         "title": "CreateAgentRequest",
         "type": "object"
@@ -2214,6 +2123,11 @@
             "additionalProperties": true,
             "title": "Config",
             "type": "object"
+          },
+          "confirm_connection_change": {
+            "default": false,
+            "title": "Confirm Connection Change",
+            "type": "boolean"
           },
           "is_default": {
             "default": false,
@@ -9515,6 +9429,42 @@
             ],
             "title": "Description"
           },
+          "greeting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Greeting"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge"
+          },
           "memory_mode": {
             "anyOf": [
               {
@@ -9559,6 +9509,20 @@
             ],
             "title": "Name"
           },
+          "plugins": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugins"
+          },
           "plugins_mode": {
             "anyOf": [
               {
@@ -9570,6 +9534,17 @@
             ],
             "title": "Plugins Mode"
           },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "slug": {
             "anyOf": [
               {
@@ -9580,6 +9555,31 @@
               }
             ],
             "title": "Slug"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "surfaces": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaces"
           },
           "system_prompt": {
             "anyOf": [
@@ -9613,6 +9613,17 @@
               }
             ],
             "title": "Token Budget Monthly"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tone"
           }
         },
         "title": "UpdateAgentRequest",
@@ -9631,6 +9642,11 @@
               }
             ],
             "title": "Config"
+          },
+          "confirm_connection_change": {
+            "default": false,
+            "title": "Confirm Connection Change",
+            "type": "boolean"
           },
           "is_default": {
             "anyOf": [
@@ -27728,7 +27744,7 @@
         ]
       },
       "post": {
-        "description": "Create a named source connection. 409 if the name is already taken.",
+        "description": "Create a named source connection. 409 if the name is already taken.\n\nSnowflake/Databricks: 409 ``connection_change_affects_registrations`` if\n``is_default: true`` would demote the source_type's current default\nconnection and that source already has registrations \u2014 resend with\n``confirm_connection_change: true`` to apply. See\n:func:`_guard_default_repoint`.",
         "operationId": "create_connection_api_admin_source_connections_post",
         "parameters": [
           {
@@ -27792,7 +27808,7 @@
     },
     "/api/admin/source-connections/{connection_id}": {
       "delete": {
-        "description": "Delete a source connection. 404 if not found; 409 if tables still reference it.",
+        "description": "Delete a source connection. 404 if not found; 409 if tables still\nreference it (``connection_in_use``, pinned tables) or if it is the\n``source_type``'s current default and that source has registrations\n(``connection_change_affects_registrations`` \u2014 second RBAC review round,\n2026-08-26; ``?confirm_connection_change=true`` to apply). See\n:func:`_guard_default_repoint`.",
         "operationId": "delete_connection_api_admin_source_connections__connection_id__delete",
         "parameters": [
           {
@@ -27802,6 +27818,16 @@
             "schema": {
               "title": "Connection Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "confirm_connection_change",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Confirm Connection Change",
+              "type": "boolean"
             }
           },
           {
@@ -27909,7 +27935,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The TOP-LEVEL ``token_env`` field \u2014 a\nsibling of ``config``, not nested inside it \u2014 is an identity leaf in its\nown right (connectors fall back to it whenever\n``config.token_env``/``config.private_key_env`` is unset, the shape a\nlegacy-seeded row carries), so a bare ``PUT {token_env: <other>}`` with\nno ``config`` key sent at all is guarded the same way (third RBAC review\nround, 2026-08-26). The same 409/confirm contract also covers\nANY change of which row (if any) is the source_type's default \u2014 a request\nbody with no ``config`` key at all \u2014 for a source that has registrations:\n``is_default: true`` demoting a DIFFERENT connection (RBAC review\nFinding 1), and ``is_default: false`` demoting the CURRENT default to no\ndefault at all, which falls back to the legacy\n``data_source.<type>.*`` yaml (second RBAC review round, 2026-08-26). See\n:func:`_guard_default_repoint`.",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {
@@ -31177,312 +31203,6 @@
         ]
       }
     },
-    "/api/agents": {
-      "get": {
-        "description": "The caller's agents plus any shared into a group they belong to.\n\nDeliberately NOT admin god-mode: an admin sees their own agent list here,\nnot every agent in the instance (that audit view is /admin/access).",
-        "operationId": "list_agents_api_agents_get",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "List Agents",
-        "tags": [
-          "agents"
-        ]
-      },
-      "post": {
-        "description": "Create an agent owned by (and private to) the caller.\n\nAn unnamed agent is legal \u2014 the builder creates the row first and the user\nnames it as they go, so a blank name must not 422 the whole flow.\n\n``template_entity_id`` starts the agent from a Library Agent Template. It\nonly ever fills fields the caller left blank, so an explicit value in the\npayload still wins \u2014 the template is a starting point, not an override.",
-        "operationId": "create_agent_api_agents_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Create Agent",
-        "tags": [
-          "agents"
-        ]
-      }
-    },
-    "/api/agents/{agent_id}": {
-      "delete": {
-        "description": "Soft-delete an agent the caller owns, and drop its grants.\n\nGrants are removed too, so a later agent can never inherit a dangling\ngrant through id reuse and /admin/access shows no orphan rows.\n\nThe seeded default agent is exempt: it is infrastructure every web chat\nsession is attributed to (``app/api/chat.py::_default_agent_id``), not a\nuser artifact, so deleting it would make the agent vanish from the Library\nand silently reappear on the next chat. `/api/v1/agents` refuses this for\nthe same reason (``agents_admin.py::delete_agent``).",
-        "operationId": "delete_agent_api_agents__agent_id__delete",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "agent_id",
-            "required": true,
-            "schema": {
-              "title": "Agent Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Delete Agent",
-        "tags": [
-          "agents"
-        ]
-      },
-      "get": {
-        "description": "One agent \u2014 owner, grantee, or admin.",
-        "operationId": "get_agent_api_agents__agent_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "agent_id",
-            "required": true,
-            "schema": {
-              "title": "Agent Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Agent",
-        "tags": [
-          "agents"
-        ]
-      },
-      "patch": {
-        "description": "Patch an agent the caller owns. Only supplied fields change.\n\nRenaming a draft also re-derives its slug, so the address it answers\non matches what it is called. Marking the agent ready freezes the\nslug \u2014 from then on it is an address other things may hold.",
-        "operationId": "update_agent_api_agents__agent_id__patch",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "agent_id",
-            "required": true,
-            "schema": {
-              "title": "Agent Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Update Agent",
-        "tags": [
-          "agents"
-        ]
-      }
-    },
     "/api/attachments/{source}/{attachment_id}/download": {
       "get": {
         "description": "Stream one connector-catalogued attachment binary.\n\nOutcomes a client can tell apart:\n\n- 404 ``unknown_attachment_source`` \u2014 ``{source}`` has no declaration\n  (decided before any catalogue or filesystem work).\n- 403 \u2014 caller lacks read access to the source's catalogue table.\n- 404 ``attachment_not_found`` \u2014 no catalogue row with this id.\n- 404 ``attachment_not_stored`` \u2014 the row exists but the server holds\n  no bytes (over-size skip, transform-time miss, or removed since);\n  fall back to the upstream system's own API for these.\n- 503 ``attachment_unreadable`` \u2014 the row exists and points at a file\n  the server cannot OPEN (permissions/I/O) \u2014 a malfunction, logged,\n  never disguised as a miss.\n- 200 \u2014 the bytes, with the original filename in Content-Disposition.",
@@ -33416,7 +33136,7 @@
         ]
       },
       "post": {
-        "description": "Create a new file corpus (any authenticated user).\n\nThe corpus is owned by the creator (``created_by``) and is private to\nthem \u2014 reachable via ownership without a ``resource_grants`` row (see\n``can_access_collection``). Admins may additionally grant a corpus to\ngroups to share it.\n\nReturns the created collection object (id, slug, name, \u2026).\n``slug`` is auto-generated from ``name`` when omitted, and an explicit\n``slug`` is normalised to a URL-safe form (``[a-z0-9-]``) so it always\nresolves via ``/library/{slug}``; a collision on the unique slug index\nreturns **409**.",
+        "description": "Create a new file corpus (any authenticated user).\n\nThe corpus is owned by the creator (``created_by``) and is private to\nthem \u2014 reachable via ownership without a ``resource_grants`` row (see\n``can_access_collection``). Admins may additionally grant a corpus to\ngroups to share it. When the instance opts into\n``library.auto_share_admin_uploads``, a corpus created by an admin is\ngranted to the Everyone group at creation (workspace-visible, still\nrevocable in the share dialog).\n\nReturns the created collection object (id, slug, name, \u2026) plus\n``visibility`` (``\"workspace\"`` when auto-shared, else ``\"private\"``).\n``slug`` is auto-generated from ``name`` when omitted, and an explicit\n``slug`` is normalised to a URL-safe form (``[a-z0-9-]``) so it always\nresolves via ``/library/{slug}``; a collision on the unique slug index\nreturns **409**.",
         "operationId": "create_collection_api_collections_post",
         "parameters": [
           {
@@ -48414,8 +48134,21 @@
     },
     "/api/v1/agents": {
       "get": {
+        "description": "The caller's own agents plus any shared into a group they belong to\n(Task C1.1 \u2014 same reach as the /agents builder's `list_agents`, via the\nsame `ResourceType.AGENT` grant).\n\n``runnable=true`` (C2.3) additionally filters to rows\n`agents_repo().get_runnable_by_slug` would actually resolve for this\ncaller \u2014 the same owned-or-granted check the runtime routes\n(`/api/v1/agents/{slug}/...`) enforce, so this list can never claim an\nagent is runnable that the runtime would then 404. Today that check\nhappens to accept every row this endpoint already returns, but it goes\nthrough the real resolver rather than re-deriving \"owned or granted\" a\nsecond time, so the two cannot drift apart later (e.g. a per-agent\nruntime precondition added down the line).",
         "operationId": "list_agents_api_v1_agents_get",
         "parameters": [
+          {
+            "description": "When true, the response is scoped to exactly the agents the caller may start a session against (owned, or shared via a ResourceType.AGENT grant) \u2014 the data source for a runtime agent picker (e.g. `agnes chat`).",
+            "in": "query",
+            "name": "runnable",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "When true, the response is scoped to exactly the agents the caller may start a session against (owned, or shared via a ResourceType.AGENT grant) \u2014 the data source for a runtime agent picker (e.g. `agnes chat`).",
+              "title": "Runnable",
+              "type": "boolean"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -53515,7 +53248,7 @@
     },
     "/library": {
       "get": {
-        "description": "Library \u2014 everything the caller has: artefacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artefacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
+        "description": "Library \u2014 everything the caller has: artefacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artefacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/v1/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
         "operationId": "library_page_library_get",
         "parameters": [
           {

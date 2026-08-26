@@ -33,6 +33,7 @@ helpers; the per-user table arrives with its own migration in Phase 4b.
 
 from __future__ import annotations
 
+import enum
 import logging
 import os
 from typing import Optional
@@ -52,22 +53,65 @@ class VaultKeyNotConfiguredError(RuntimeError):
     silently lose the secret on restart."""
 
 
+class VaultKeyInvalidError(RuntimeError):
+    """Raised when AGNES_VAULT_KEY is set but is NOT a valid Fernet key, on a
+    write path whose only fallback would be silently downgrading to plaintext
+    storage (e.g. ``app.secrets.persist_overlay_token``'s keyless-mode
+    ``.env_overlay`` file).
+
+    Deliberately distinct from :class:`VaultKeyNotConfiguredError` (key
+    ABSENT — a legitimate keyless/local-dev choice): a malformed key is a
+    misconfiguration, not an intentional mode, so it must fail loudly rather
+    than fold into the same "no key" fallback."""
+
+
+class VaultKeyState(enum.Enum):
+    """Tri-state read of ``$AGNES_VAULT_KEY``.
+
+    Conflating ABSENT and INVALID (both used to answer ``False`` from a
+    single boolean predicate) is what let a misconfigured production vault
+    key be treated the same as a deliberately keyless deployment — see
+    :func:`vault_key_configured` for the narrower boolean callers that only
+    need "can I use the vault right now" still use, and
+    ``app.secrets.persist_overlay_token`` for the write path that needs the
+    full distinction to fail closed instead of downgrading to plaintext.
+    """
+
+    ABSENT = "absent"
+    VALID = "valid"
+    INVALID = "invalid"
+
+
 def _is_local_dev_mode() -> bool:
     # Mirror app.auth.dependencies.is_local_dev_mode without importing it
     # (keeps app.secrets_vault free of an app.auth import edge).
     return os.environ.get("LOCAL_DEV_MODE", "").strip().lower() in ("1", "true", "yes")
 
 
-def vault_key_configured() -> bool:
-    """True iff AGNES_VAULT_KEY is set to a syntactically valid Fernet key."""
+def vault_key_state() -> VaultKeyState:
+    """Tri-state read of ``$AGNES_VAULT_KEY`` — see :class:`VaultKeyState`."""
     raw = os.environ.get(_ENV_KEY_NAME, "").strip()
     if not raw:
-        return False
+        return VaultKeyState.ABSENT
     try:
         Fernet(raw.encode("ascii"))
-        return True
+        return VaultKeyState.VALID
     except (ValueError, InvalidToken):
-        return False
+        return VaultKeyState.INVALID
+
+
+def vault_key_configured() -> bool:
+    """True iff AGNES_VAULT_KEY is set to a syntactically valid Fernet key.
+
+    A narrow "is the vault usable right now" boolean — both the ABSENT and
+    INVALID states of :func:`vault_key_state` answer ``False`` here, which is
+    fine for callers that only gate "should I use the vault vs. some other
+    read-only fallback" (health checks, admin UI badges). A write path that
+    would otherwise silently downgrade to plaintext on ``False`` MUST use
+    :func:`vault_key_state` directly instead, to refuse the INVALID case
+    rather than treating it like ABSENT.
+    """
+    return vault_key_state() is VaultKeyState.VALID
 
 
 def can_store_secrets() -> bool:

@@ -2177,7 +2177,7 @@ async def library_page(
 
     Agents are deliberately NOT here — they have their own home at ``/agents``
     (they are still real server-side rows in the v103 ``agents`` registry, and
-    ``/api/agents`` reads honour agent grants; the Library just isn't their
+    ``/api/v1/agents`` reads honour agent grants; the Library just isn't their
     listing surface).
 
     Scope is grant-aware: items you OWN plus anything shared into a group you

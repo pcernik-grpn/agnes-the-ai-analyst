@@ -372,6 +372,13 @@ auth:
 # yaml/admin-overlay only.
 # library:
 #   show_unverified_trust: true      # 'Community' marker on unverified Store items
+#   auto_share_admin_uploads: true   # collections an ADMIN creates in the Library are
+#                                    # granted to Everyone at creation (workspace-visible
+#                                    # with no manual share step; still revocable per
+#                                    # collection in the share dialog). Default false —
+#                                    # an upgrade never changes who sees data. Analyst
+#                                    # uploads and chat file drops stay private. Env:
+#                                    # AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS
 # store:
 #   verification_enabled: true       # "Request verification" + admin Verify workflow
 
@@ -926,6 +933,10 @@ chat:
   # docker_mem_limit: "2g"
   # docker_cpus: 1.0
   # docker_pids_limit: 512
+  # Default is `none` (fail-closed): the agent runs with bypassed permissions
+  # over a read-write workspace, so unrestricted egress is an exfiltration
+  # surface. Opt into `open`/`allowlist` explicitly when a sandbox needs the
+  # network.
   # open — normal bridge, internet reachable (in-sandbox `pip install` etc.
   #        keep working).
   # none — internal-only network: the sandbox reaches nothing but the
@@ -936,7 +947,7 @@ chat:
   #        connection re-checked post-DNS against link-local/metadata/private
   #        ranges (DNS-rebinding protection). Ignoring the proxy is not a
   #        bypass — the internal network has no other route out.
-  # docker_egress_mode: open
+  # docker_egress_mode: none
   # Hostnames reachable in allowlist mode (exact or *.suffix wildcards).
   # Cloud metadata endpoints stay blocked even if listed.
   # docker_egress_allow_hosts: [pypi.org, "*.pypi.org", files.pythonhosted.org]

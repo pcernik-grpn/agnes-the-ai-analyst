@@ -39,7 +39,7 @@ import duckdb
 from fastapi import Depends, HTTPException, Request, status
 
 from app.auth.dependencies import _get_db, get_current_user
-from app.auth.session_principal import PRINCIPAL_TYPES, Principal, SessionPrincipal
+from app.auth.session_principal import PRINCIPAL_TYPES, Principal
 from app.resource_types import ResourceType
 from src.db import SYSTEM_ADMIN_GROUP
 
@@ -655,13 +655,20 @@ def accessible_collection_ids(user, conn=None):
     """COLLECTION ids the caller may access — group grants (admin => None,
     meaning "all") unioned with the collections they own. ``None`` means
     every collection (admin). The list-surface counterpart to
-    :func:`can_access_collection` (My Stack uploads, /library, search)."""
+    :func:`can_access_collection` (My Stack uploads, /library, search).
+
+    A restricted ``Principal`` (co-session or agent-session) has no
+    ``created_by`` identity to union in — its authority is the live
+    intersection ``get_accessible_ids`` already returned, full stop.
+    Consulting ownership here would either crash (``AgentPrincipal`` is a
+    frozen dataclass, not a dict — no ``.get("id")``) or, worse, elevate an
+    agent past its declared scope via its owner's uploads."""
     from src.rbac import get_accessible_ids
 
     granted = get_accessible_ids(user, ResourceType.COLLECTION.value, conn)
     if granted is None:
         return None  # admin — sees everything
-    if isinstance(user, SessionPrincipal):
+    if isinstance(user, PRINCIPAL_TYPES):
         return granted
     user_id = user.get("id")
     if not user_id:
@@ -700,7 +707,10 @@ def require_collection_access(path_template: str):
                     f"require_collection_access: path_template {path_template!r} references missing path_param {e}"
                 ),
             )
-        if isinstance(user, SessionPrincipal):
+        if isinstance(user, PRINCIPAL_TYPES):
+            # Restricted principal (co-session or agent-session): the live
+            # intersection is the sole authority — no ownership fallback,
+            # and no ``user["id"]`` to subscript.
             allowed = can_access_session(user, ResourceType.COLLECTION.value, resource_id)
         else:
             allowed = can_access_collection(user["id"], resource_id, conn)
@@ -785,11 +795,11 @@ def mint_agent_session_jwt(session_id: str, *, ttl: int = 3600) -> str:
     UUID or the agent_id) — the same no-baked-in-authority contract as
     ``mint_co_session_jwt``: no grants, no real user id, no agent identity.
 
-    The resolver (``app.auth.pat_resolver``) rebuilds the owner-grants ∩
-    agent-scope intersection live per request
-    (``src.agent_scope_intersection.compute_agent_intersection``), so
-    narrowing an agent or revoking a grant takes effect on the very next
-    request — no stale-replay window.
+    The resolver (``app.auth.pat_resolver``) rebuilds the agent's resolved
+    authority live per request
+    (``src.agent_scope_intersection.resolve_agent_authority``), so narrowing
+    an agent or revoking a grant takes effect on the very next request — no
+    stale-replay window.
 
     Encoded with the canonical auth secret (app/auth/jwt) so verify_token
     decodes it in every env.
