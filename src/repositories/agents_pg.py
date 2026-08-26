@@ -147,6 +147,30 @@ class AgentsPgRepository:
             )
         return dict(row) if row else None
 
+    def get_runnable_by_slug(self, user_id: str, slug: str) -> Optional[Dict[str, Any]]:
+        """PG mirror of ``AgentsRepository.get_runnable_by_slug`` — see that
+        docstring for the slug-vs-id resolution rule and why the Admin
+        god-mode short-circuit is deliberately not applied here."""
+        owned = self.get_by_slug(user_id, slug)
+        if owned is not None:
+            return owned
+
+        agent = self.get_by_id(slug)
+        if agent is None or agent.get("deleted_at") is not None:
+            return None
+        if agent["owner_user_id"] == user_id:
+            return agent
+
+        from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+
+        # "agent" mirrors ``ResourceType.AGENT.value`` — kept inline, see the
+        # DuckDB sibling's docstring for why the repo layer avoids importing
+        # app.resource_types.
+        granted_ids = ResourceGrantsPgRepository(self._engine).list_resource_ids_for_user(user_id, "agent")
+        if agent["id"] in granted_ids:
+            return agent
+        return None
+
     def list_for_user(self, owner_user_id: str) -> List[Dict[str, Any]]:
         with self._engine.connect() as conn:
             rows = (

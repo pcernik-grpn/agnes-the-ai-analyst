@@ -217,12 +217,31 @@ def resolve_token_to_user(
             owner = users_repo().get_by_id(agent.get("owner_user_id") or "")
             if not owner:
                 return None, "invalid_token"
+            # C2.3 caller binding: WHO is actually driving this turn — the
+            # owner when they run their own agent, a different user when the
+            # agent was shared to them. The JWT itself carries no identity
+            # (`mint_agent_session_jwt`'s "no baked-in authority" contract —
+            # synthetic `sub`, empty `email`), so this is NOT read off
+            # `payload`: it is looked up from `session.user_email`, the
+            # value `ChatManager.create_session` stored server-side from the
+            # AUTHENTICATED caller at session-creation time. A client cannot
+            # forge this by shaping the token or any request field — the only
+            # way to change it is to actually authenticate as someone else
+            # and create a new session, which is exactly the intended
+            # boundary. Fails closed like every other link above: a session
+            # naming an email that no longer resolves to a user must not
+            # silently fall back to the owner identity.
+            caller = users_repo().get_by_email(session.user_email)
+            if not caller:
+                return None, "invalid_token"
             agent_principal = AgentPrincipal(
                 session_id=co_session_id,
                 agent_id=agent_id,
                 owner_user_id=owner["id"],
                 owner_email=owner["email"],
                 intersection=resolve_agent_authority(agent_id),
+                caller_user_id=caller["id"],
+                caller_email=caller["email"],
             )
             _stash_payload(request, payload)
             return agent_principal, None

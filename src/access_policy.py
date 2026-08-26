@@ -356,8 +356,19 @@ def _resolve_identity(principal, *, table_id: str):
             "open the table in a solo session"
         )
     if isinstance(principal, AgentPrincipal):
-        owner_id, owner_email = principal.owner_user_id, principal.owner_email
-        return owner_id, owner_email, lambda: _live_groups(owner_id)
+        # C2.3, shared-agent runtime: `$user_*` binds to the CALLER — whoever
+        # is actually driving this turn — never the agent's owner. For an
+        # owner running their own agent the two are the same identity, so
+        # this is a no-op change there; the whole point is a shared agent's
+        # row policy filtering by the GRANTEE who is asking, not the person
+        # who built it. `caller_user_id`/`caller_email` default to None only
+        # for constructors that predate C2.3 (older tests) — every real
+        # production `AgentPrincipal` (`app.auth.pat_resolver`) always
+        # supplies both, so the owner fallback below is never exercised
+        # there.
+        user_id = principal.caller_user_id or principal.owner_user_id
+        user_email = principal.caller_email or principal.owner_email
+        return user_id, user_email, lambda: _live_groups(user_id)
     if isinstance(principal, dict):
         user_id, user_email = principal.get("id"), principal.get("email")
         return user_id, user_email, lambda: _live_groups(user_id)

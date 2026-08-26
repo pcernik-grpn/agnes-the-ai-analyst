@@ -50,6 +50,124 @@ def repo(request, tmp_path, pg_engine, monkeypatch):
         yield r
 
 
+def _make_duckdb_stack(tmp_path):
+    from src.db import _ensure_schema
+    from src.duckdb_conn import _open_duckdb
+    from src.repositories.agents import AgentsRepository
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = _open_duckdb(str(tmp_path / "duck.duckdb"))
+    _ensure_schema(conn)
+    return (
+        AgentsRepository(conn),
+        UserGroupsRepository(conn),
+        UserGroupMembersRepository(conn),
+        ResourceGrantsRepository(conn),
+        conn,
+    )
+
+
+def _make_pg_stack(pg_engine, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    engine = db_pg.get_engine()
+
+    from src.repositories.agents_pg import AgentsPgRepository
+    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+    from src.repositories.user_group_members_pg import UserGroupMembersPgRepository
+    from src.repositories.user_groups_pg import UserGroupsPgRepository
+
+    return (
+        AgentsPgRepository(engine),
+        UserGroupsPgRepository(engine),
+        UserGroupMembersPgRepository(engine),
+        ResourceGrantsPgRepository(engine),
+        None,
+    )
+
+
+@pytest.fixture(params=["duckdb", "pg"])
+def stack(request, tmp_path, pg_engine, monkeypatch):
+    """``(agents_repo, user_groups_repo, user_group_members_repo,
+    resource_grants_repo)`` sharing one connection/engine — for tests that
+    need to seed groups + grants alongside agent rows (C2.3
+    ``get_runnable_by_slug``)."""
+    if request.param == "duckdb":
+        agents, groups, members, grants, conn = _make_duckdb_stack(tmp_path)
+        yield agents, groups, members, grants
+        conn.close()
+    else:
+        agents, groups, members, grants, _ = _make_pg_stack(pg_engine, monkeypatch)
+        yield agents, groups, members, grants
+
+
+def test_get_runnable_by_slug_owned(stack):
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    row = agents.get_runnable_by_slug("u1", "finance")
+    assert row is not None and row["id"] == "a1"
+
+
+def test_get_runnable_by_slug_owner_may_also_address_by_id(stack):
+    """ "Runtime paths accept slug or id" holds for the OWNER too, not only
+    a grantee — addressing by id must not require a grant just because it
+    took the id-shaped branch."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    row = agents.get_runnable_by_slug("u1", "a1")
+    assert row is not None and row["id"] == "a1"
+
+
+def test_get_runnable_by_slug_denies_stranger(stack):
+    """Neither the owner's slug nor the agent's id resolve for a user with
+    no ownership and no grant — this is the pre-C2.3 behavior (404
+    everywhere) and must stay true absent a grant."""
+    agents, _groups, _members, _grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    assert agents.get_runnable_by_slug("u2", "finance") is None
+    assert agents.get_runnable_by_slug("u2", "a1") is None
+
+
+def test_get_runnable_by_slug_via_group_grant_resolves_by_id(stack):
+    """A shared agent is addressed by its id, not the owner's slug — slug
+    is only unique per-owner, so it is meaningless in a grantee's
+    namespace."""
+    agents, groups, members, grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    group = groups.create(name="finance-team", created_by="admin")
+    members.add_member("u2", group["id"], source="admin")
+    grants.create(group["id"], "agent", "a1", assigned_by="admin")
+
+    row = agents.get_runnable_by_slug("u2", "a1")
+    assert row is not None and row["id"] == "a1"
+    # borrowing the OWNER's slug string must not resolve for the grantee
+    assert agents.get_runnable_by_slug("u2", "finance") is None
+
+
+def test_get_runnable_by_slug_excludes_soft_deleted(stack):
+    agents, groups, members, grants = stack
+    agents.create(id="a1", owner_user_id="u1", name="A", slug="finance")
+    group = groups.create(name="finance-team", created_by="admin")
+    members.add_member("u2", group["id"], source="admin")
+    grants.create(group["id"], "agent", "a1", assigned_by="admin")
+    agents.soft_delete("a1")
+
+    assert agents.get_runnable_by_slug("u2", "a1") is None
+    assert agents.get_runnable_by_slug("u1", "finance") is None
+
+
 def test_create_get_roundtrip(repo):
     repo.create(id="a1", owner_user_id="u1", name="Sales reporter", slug="sales-reporter")
     row = repo.get_by_slug("u1", "sales-reporter")
