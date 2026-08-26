@@ -163,7 +163,15 @@ def _maybe_auto_share_admin_upload(corpus_id: str, user: dict) -> str:
     the response plus a warning log) rather than silently reproducing the
     "only admin sees the files" state this flag exists to prevent.
     """
+    from app.auth.session_principal import PRINCIPAL_TYPES
     from app.switches import switch_value
+
+    if isinstance(user, PRINCIPAL_TYPES):
+        # Restricted principal (co-session / agent-session): never an admin,
+        # so never an auto-share. Explicit per the PRINCIPAL_TYPES seam
+        # contract (app/auth/session_principal.py) — without this the same
+        # outcome would ride an accidental TypeError into the except below.
+        return "private"
 
     try:
         if not switch_value("library_auto_share_admin_uploads"):
