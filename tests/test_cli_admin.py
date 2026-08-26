@@ -66,6 +66,52 @@ class TestAddUser:
             result = runner.invoke(app, ["admin", "add-user", "dup@x.com"])
         assert result.exit_code == 1
 
+    def test_add_user_without_invite_does_not_request_one(self):
+        """Default stays non-inviting — no surprise mail from an existing script."""
+        created = {"email": "newuser@x.com", "id": "uid-1"}
+        with patch("cli.commands.admin.api_post", return_value=_resp(201, created)) as post:
+            result = runner.invoke(app, ["admin", "add-user", "newuser@x.com"])
+        assert result.exit_code == 0
+        assert post.call_args.kwargs["json"]["send_invite"] is False
+        # The account exists but has no way in yet — say so and name the next step.
+        assert "--invite" in result.output
+
+    def test_add_user_invite_emailed(self):
+        created = {
+            "email": "newuser@x.com",
+            "id": "uid-1",
+            "invite_url": "https://agnes.example.com/auth/password/setup?token=abc",
+            "invite_email_sent": True,
+        }
+        with patch("cli.commands.admin.api_post", return_value=_resp(201, created)) as post:
+            result = runner.invoke(app, ["admin", "add-user", "newuser@x.com", "--invite"])
+        assert result.exit_code == 0
+        assert post.call_args.kwargs["json"]["send_invite"] is True
+        assert "emailed" in result.output.lower()
+        assert "https://agnes.example.com/auth/password/setup?token=abc" in result.output
+
+    def test_add_user_invite_without_mail_transport_prints_link(self):
+        """No SMTP configured: the link is the only delivery path — never silent."""
+        created = {
+            "email": "newuser@x.com",
+            "id": "uid-1",
+            "invite_url": "https://agnes.example.com/auth/password/setup?token=abc",
+            "invite_email_sent": False,
+        }
+        with patch("cli.commands.admin.api_post", return_value=_resp(201, created)):
+            result = runner.invoke(app, ["admin", "add-user", "newuser@x.com", "--invite"])
+        assert result.exit_code == 0
+        assert "https://agnes.example.com/auth/password/setup?token=abc" in result.output
+        assert "not configured" in result.stderr.lower()
+
+    def test_add_user_invite_without_link_fails_loudly(self):
+        """Invite asked for, none issued — exit non-zero rather than imply one went out."""
+        created = {"email": "newuser@x.com", "id": "uid-1"}
+        with patch("cli.commands.admin.api_post", return_value=_resp(201, created)):
+            result = runner.invoke(app, ["admin", "add-user", "newuser@x.com", "--invite"])
+        assert result.exit_code == 1
+        assert "reset-password" in result.stderr
+
 
 class TestRemoveUser:
     def test_remove_user_success(self):
