@@ -234,6 +234,89 @@ def test_keyless_fallback_never_touches_vault(env):
 
 
 # ---------------------------------------------------------------------------
+# Invalid (present-but-malformed) AGNES_VAULT_KEY — must refuse, never
+# silently downgrade to the plaintext keyless fallback. This is the fix for
+# the "invalid vault downgrade" finding: a misconfigured production key used
+# to read as `vault_key_configured() == False`, indistinguishable from the
+# deliberate keyless case, so the token got written in plaintext to
+# `.env_overlay` under a warning that falsely claimed the key was merely
+# "not configured".
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_vault_key_refuses_write(env, monkeypatch):
+    from app.secrets import persist_overlay_token
+    from app.secrets_vault import VaultKeyInvalidError
+
+    monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
+
+    with pytest.raises(VaultKeyInvalidError):
+        persist_overlay_token("AGNES_TEST_TOKEN", "shh-secret")
+
+
+def test_invalid_vault_key_does_not_write_plaintext_file(env, monkeypatch):
+    from app.secrets import _state_dir, persist_overlay_token
+    from app.secrets_vault import VaultKeyInvalidError
+
+    monkeypatch.delenv("AGNES_TEST_TOKEN", raising=False)
+    monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
+
+    with pytest.raises(VaultKeyInvalidError):
+        persist_overlay_token("AGNES_TEST_TOKEN", "shh-secret")
+
+    overlay_path = _state_dir() / ".env_overlay"
+    assert not overlay_path.exists() or "shh-secret" not in overlay_path.read_text()
+    assert "AGNES_TEST_TOKEN" not in os.environ
+
+
+def test_invalid_vault_key_does_not_write_to_vault_either(env, monkeypatch):
+    """An invalid key can't build a Fernet, so the vault path is equally
+    unreachable — confirm the refusal happens before any DB write, not just
+    before the file write."""
+    from app.secrets import persist_overlay_token
+    from app.secrets_vault import VaultKeyInvalidError
+    from src.repositories import system_secrets_repo
+
+    monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
+
+    with pytest.raises(VaultKeyInvalidError):
+        persist_overlay_token("AGNES_TEST_TOKEN", "shh-secret")
+
+    assert system_secrets_repo().has("env_overlay/AGNES_TEST_TOKEN") is False
+
+
+def test_invalid_vault_key_error_message_distinguishes_from_absent(env, monkeypatch):
+    """The error text must name the actual problem (set-but-malformed), never
+    the "not configured" phrasing reserved for the deliberate keyless case —
+    that phrasing is exactly what made the downgrade silent/confusing."""
+    from app.secrets import persist_overlay_token
+    from app.secrets_vault import VaultKeyInvalidError
+
+    monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
+
+    with pytest.raises(VaultKeyInvalidError, match="is set but is not a valid"):
+        persist_overlay_token("AGNES_TEST_TOKEN", "shh-secret")
+
+
+def test_absent_vault_key_keyless_fallback_still_works(env, caplog):
+    """Backward compatibility: an ABSENT key (the deliberate keyless/S-tier
+    mode) must be unaffected by the invalid-key guard — same file fallback,
+    same one-time warning, as before this fix."""
+    from app.secrets import _state_dir, persist_overlay_token
+
+    caplog.set_level(logging.WARNING, logger="app.secrets")
+
+    persist_overlay_token("AGNES_TEST_TOKEN", "v1")
+
+    overlay_text = (_state_dir() / ".env_overlay").read_text()
+    assert "AGNES_TEST_TOKEN=v1" in overlay_text
+    assert os.environ["AGNES_TEST_TOKEN"] == "v1"
+
+    warnings = [r for r in caplog.records if "AGNES_VAULT_KEY is not configured" in r.message]
+    assert len(warnings) == 1
+
+
+# ---------------------------------------------------------------------------
 # Periodic re-read (belt-and-braces)
 # ---------------------------------------------------------------------------
 

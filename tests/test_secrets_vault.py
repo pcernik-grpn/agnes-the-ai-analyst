@@ -11,9 +11,12 @@ from cryptography.fernet import Fernet
 
 from app.secrets_vault import (
     SharedSecretsRepository,
+    VaultKeyState,
     _reset_ephemeral_key_for_tests,
     decrypt_secret,
     encrypt_secret,
+    vault_key_configured,
+    vault_key_state,
 )
 
 
@@ -63,6 +66,33 @@ def test_invalid_env_key_raises(monkeypatch):
     monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
     with pytest.raises(RuntimeError, match="not a valid Fernet key"):
         encrypt_secret("x")
+
+
+# ── vault_key_state() tri-state read ─────────────────────────────────────
+
+
+def test_vault_key_state_absent_when_unset(monkeypatch):
+    monkeypatch.delenv("AGNES_VAULT_KEY", raising=False)
+    assert vault_key_state() is VaultKeyState.ABSENT
+    assert vault_key_configured() is False
+
+
+def test_vault_key_state_valid_for_real_fernet_key(monkeypatch):
+    monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+    assert vault_key_state() is VaultKeyState.VALID
+    assert vault_key_configured() is True
+
+
+def test_vault_key_state_invalid_for_malformed_key(monkeypatch):
+    """A set-but-malformed key must read as INVALID, not fold into ABSENT —
+    that conflation is what let a misconfigured production vault silently
+    downgrade to plaintext overlay storage (see app.secrets.persist_overlay_token)."""
+    monkeypatch.setenv("AGNES_VAULT_KEY", "not-a-valid-fernet-key")
+    assert vault_key_state() is VaultKeyState.INVALID
+    # vault_key_configured() stays a narrow "usable right now" boolean —
+    # both ABSENT and INVALID answer False, but callers that must react
+    # differently to a misconfiguration use vault_key_state() directly.
+    assert vault_key_configured() is False
 
 
 # ── SharedSecretsRepository ───────────────────────────────────────────────

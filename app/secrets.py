@@ -66,12 +66,12 @@ def persist_overlay_token(env_name: str, value: Optional[str]) -> None:
     Anthropic chat key). ``value=None`` or ``value=""`` removes
     the key; a non-empty value writes/replaces it.
 
-    Two storage backends, chosen by whether the control-plane vault is
-    usable (``AGNES_VAULT_KEY`` configured — see
-    ``app.secrets_vault.vault_key_configured``):
+    Three states of ``AGNES_VAULT_KEY`` (see
+    ``app.secrets_vault.vault_key_state``), two storage backends:
 
-    * **Vault mode** (production / multi-process): the token is written to
-      the ``system_secrets`` vault table (namespaced ``env_overlay/<name>``,
+    * **Vault mode** (key present and a syntactically valid Fernet key —
+      production / multi-process): the token is written to the
+      ``system_secrets`` vault table (namespaced ``env_overlay/<name>``,
       Fernet-encrypted at rest — see ``app/secrets_vault.py``) and an
       ``env-overlay-changed`` event is published on the coordination backend
       so every other process re-reads that key (see ``app/main.py``'s
@@ -82,11 +82,19 @@ def persist_overlay_token(env_name: str, value: Optional[str]) -> None:
       next periodic re-read (≤ ``AGNES_STATE_CHECKPOINT_INTERVAL_S``,
       default 300s) or its next restart — acceptable because these tokens
       change rarely (an admin rotating a PAT), not on a hot path.
-    * **Keyless / S-tier mode** (``AGNES_VAULT_KEY`` unset): unchanged
+    * **Keyless / S-tier mode** (key ABSENT — deliberately unset): unchanged
       legacy behavior — read-merge-write into ``${STATE_DIR}/.env_overlay``
       under ``_overlay_lock``, plus a one-time-per-process warning that
       cross-process reload isn't available in this mode (there's only ever
       one process here, so there's nothing to synchronize).
+    * **Invalid key** (key set but NOT a valid Fernet key — a misconfigured
+      production deployment, not a deliberate mode choice): refuses the
+      write and raises ``app.secrets_vault.VaultKeyInvalidError`` rather than
+      falling back to the plaintext file. Silently downgrading here would
+      write caller-supplied token material (marketplace PATs, the
+      initial-workspace PAT, the Anthropic chat key) to disk in cleartext
+      under a warning that falsely claimed the key was merely "not
+      configured" — fail fast instead so a malformed key surfaces loudly.
 
     Path resolution for the file mode matches ``app/main.py``'s startup-time
     read; without this alignment, PATs persisted under the flat-mount layout
@@ -94,11 +102,22 @@ def persist_overlay_token(env_name: str, value: Optional[str]) -> None:
     while the app reads from ``/data-state/.env_overlay``, silently
     dropping the token on the next restart.
     """
-    from app.secrets_vault import vault_key_configured
+    from app.secrets_vault import VaultKeyInvalidError, VaultKeyState, vault_key_state
 
-    if vault_key_configured():
+    state = vault_key_state()
+
+    if state is VaultKeyState.VALID:
         _persist_overlay_token_vault(env_name, value)
         return
+
+    if state is VaultKeyState.INVALID:
+        raise VaultKeyInvalidError(
+            f"AGNES_VAULT_KEY is set but is not a valid Fernet key "
+            f"(URL-safe-base64-encoded 32-byte key required) — refusing to "
+            f"persist {env_name} to the plaintext '.env_overlay' fallback. "
+            "Fix the key, or unset AGNES_VAULT_KEY to run in keyless/S-tier "
+            "mode intentionally."
+        )
 
     global _warned_vault_unusable
     if not _warned_vault_unusable:
