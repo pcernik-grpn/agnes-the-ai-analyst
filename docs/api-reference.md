@@ -718,7 +718,19 @@ checks against.
 
 ### `/api/admin/data-packages` — Data packages
 
+`POST /api/admin/data-packages/builder/turn` (admin) runs one turn of the
+package drawer's conversation and returns `{reply, patch, suggestions}`. It
+**writes nothing, and has no `apply` flag at all** — creating a package writes
+grants, so a turn only ever proposes into the open drawer and the admin
+presses Create having seen the access matrix they are about to write. Unlike
+the two builder-turn endpoints under `/api/store` and `/api/agents`, the
+candidate lists are fetched server-side rather than accepted from the caller:
+the worst case here is a group, so the set of grantable groups is the
+server's answer. Proposed table and group ids are validated against it, and a
+fabricated one is dropped rather than corrected.
+
 - /api/admin/data-packages
+- /api/admin/data-packages/builder/turn
 - /api/admin/data-packages/{pkg_id}
 - /api/admin/data-packages/{pkg_id}/restore
 - /api/admin/data-packages/{pkg_id}/tables

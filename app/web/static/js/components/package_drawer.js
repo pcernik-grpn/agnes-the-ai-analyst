@@ -101,6 +101,7 @@
     // global handler in _app_scripts.html, which hides overlays with an
     // inline display:none and would leave our state half-open.
     root.dataset.noEscClose = '1';
+    bindConversation(root);
     root.innerHTML =
       '<div class="ds-drawer__backdrop" data-pdw-close></div>' +
       '<div class="ds-drawer__panel" role="dialog" aria-modal="true" aria-labelledby="pdw-title">' +
@@ -538,12 +539,118 @@
     });
   }
 
+  /* ── Builder mode ──
+     Opened from the Library's "+ New" this is a workspace: a conversation on
+     the left proposing what the package should be, the form on the right. The
+     SAME drawer, grown — opened from the chip input on /admin/tables (where
+     you are mid-sentence assigning a table) it stays the compact in-place
+     panel it has always been. One implementation, two sizes; a second
+     authoring surface for one thing is how two of them drift apart.
+
+     The form is MOVED into the shell's configuration slot rather than
+     re-authored, so every cached node in `els` and every handler bound to it
+     keeps working untouched. */
+  var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [];
+
+  function enterBuilderLayout() {
+    if (!els || els.root.classList.contains('is-builder-built')) return;
+    els.root.classList.add('is-builder-built');
+    var body = els.root.querySelector('.ds-drawer__body');
+    var panes = Array.prototype.slice.call(body.children);
+    var work = document.createElement('div');
+    work.innerHTML = BuilderShell.workspace({
+      left: '<div class="pdw-conv" id="pdw-conv"></div>',
+      cfgTitle: 'Package',
+      cfgSub: 'what it carries and who gets it, editable by hand',
+      cfgBodyId: 'pdw-cfg',
+    });
+    body.appendChild(work.firstChild);
+    var slot = body.querySelector('#pdw-cfg');
+    panes.forEach(function (node) { slot.appendChild(node); });
+    els.convHost = body.querySelector('#pdw-conv');
+  }
+
+  function renderConv() {
+    if (!els || !els.convHost) return;
+    els.convHost.innerHTML =
+      BuilderShell.conversation({
+        id: 'pdw-conv-scroll',
+        rows: [{ role: 'assistant', text: OPENING }].concat(conv),
+        busy: convBusy,
+        err: convErr,
+      }) +
+      BuilderShell.composer({
+        kind: 'create', value: convDraft, busy: convBusy,
+        placeholder: 'Describe the package you need…',
+        chips: convBusy ? [] : (convChips.length ? convChips : STARTERS),
+      });
+    var el = els.convHost.querySelector('#pdw-conv-scroll');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  var OPENING = 'Tell me what this package should carry and who it is for. ' +
+    'I will propose the tables and the groups — you review the access before anything is written.';
+  var STARTERS = ['Our sales pipeline tables', 'Everything finance needs for invoicing', 'Which tables are not in a package yet?'];
+
+  /* One turn. Proposes into the drawer; writes nothing. The reply is inserted
+     as TEXT (BuilderShell.message) — model output, no sanitizer here. */
+  function sendTurn(text) {
+    if (convBusy) return;
+    conv = conv.concat([{ role: 'user', text: text }]);
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderConv();
+    api(PKG_API + '/builder/turn', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: text,
+        history: conv.slice(0, -1),
+        draft: {
+          name: els.name.value || '',
+          description: els.desc.value || '',
+          tables: Array.from(st.tablesSelected),
+          groups: Array.from(st.grantsOriginal.keys()),
+        },
+      }),
+    }).then(function (body) {
+      conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      applyPatch(body.patch || {});
+    }).catch(function (err) {
+      console.error('package drawer: turn failed', err);
+      convErr = (err && err.message) || 'The assistant could not answer.';
+    }).finally(function () {
+      convBusy = false;
+      renderConv();
+    });
+  }
+
+  /* Merge a proposal into the form. Nothing is saved — Create still writes,
+     and the admin sees the tables and the access matrix first. */
+  function applyPatch(patch) {
+    if (typeof patch.name === 'string' && patch.name) {
+      els.name.value = patch.name;
+      if (!st.slugTouched) els.slug.value = slugify(patch.name);
+    }
+    if (typeof patch.description === 'string') els.desc.value = patch.description;
+    if (Array.isArray(patch.tables)) {
+      patch.tables.forEach(function (id) { st.tablesSelected.add(id); });
+      renderTables();
+    }
+    if (Array.isArray(patch.groups)) {
+      patch.groups.forEach(function (id) {
+        var box = els.root.querySelector('[data-pdw-group="' + id + '"]');
+        if (box && !box.checked) { box.checked = true; }
+      });
+    }
+  }
+
   function open(opts) {
     opts = opts || {};
     build();
     var mode = opts.mode === 'edit' ? 'edit' : 'create';
     st = {
       mode: mode,
+      builder: !!opts.builder,
       pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
@@ -557,6 +664,17 @@
       tablesSelected: new Set(),
       restoreFocus: document.activeElement,
     };
+    // Grow into a workspace, or stay the compact in-place drawer.
+    els.root.classList.toggle('ds-drawer--builder', st.builder);
+    // Reset either way: a transcript from a previous open must not be sitting
+    // there when the drawer is next used, in either size.
+    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = [];
+    if (st.builder) {
+      enterBuilderLayout();
+      renderConv();
+    } else if (els.convHost) {
+      els.convHost.innerHTML = '';
+    }
     var typed = opts.typed || '';
     els.name.value = typed;
     els.slug.value = slugify(typed);
@@ -622,6 +740,29 @@
       els.submit.disabled = false;
     }).catch(function (e) {
       fail('Could not load the package: ' + e.message);
+    });
+  }
+
+  /* The conversation's controls. Scoped to this drawer's root so they cannot
+     collide with a builder page underneath. */
+  function bindConversation(root) {
+    root.addEventListener('click', function (e) {
+      var t = e.target.closest('[data-ag-send],[data-ag-chip]');
+      if (!t) return;
+      if (t.hasAttribute('data-ag-chip')) { sendTurn(t.getAttribute('data-ag-chip')); return; }
+      var box = root.querySelector('[data-ag-comp]');
+      var text = box ? box.value.trim() : '';
+      if (text) sendTurn(text);
+    });
+    root.addEventListener('input', function (e) {
+      if (e.target.getAttribute && e.target.getAttribute('data-ag-comp')) convDraft = e.target.value;
+    });
+    root.addEventListener('keydown', function (e) {
+      if (!e.target.getAttribute || !e.target.getAttribute('data-ag-comp')) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      e.preventDefault();
+      var text = e.target.value.trim();
+      if (text) sendTurn(text);
     });
   }
 

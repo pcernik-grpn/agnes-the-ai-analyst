@@ -258,3 +258,40 @@ body.ag-building .idx > footer { display: none; }
 .ag-live-note { font-size: 12px; color: var(--ds-text-muted); text-align: center; padding: 0 22px 10px; }
 .ag-live-note a { color: var(--ds-primary); font-weight: 600; text-decoration: none; }
 .ag-live-note a:hover { text-decoration: underline; }
+
+/* ── The drawer, grown into a workspace ──
+   The data-package builder is the same drawer /admin/tables opens from a chip
+   input; from the Library's "+ New" it grows to host these two panes instead.
+   One implementation, two sizes — see package_drawer.js.
+
+   The panel is wider than --wide and the body stops scrolling: the workspace
+   owns the height and each pane scrolls inside it, exactly as on the builder
+   pages. Without this the whole drawer scrolls and the conversation's
+   composer walks off the bottom. */
+.ds-drawer--builder .ds-drawer__panel { width: min(1360px, 100vw); }
+.ds-drawer--builder .ds-drawer__body { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.ds-drawer--builder .ag-work { flex: 1; height: auto; min-height: 0; }
+/* The moved-in form is the configuration pane's content; it keeps the
+   drawer's own field styling and only needs the gutter back. */
+.ds-drawer--builder .ds-drawer__pane { padding: 18px 22px; }
+.pdw-conv { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+@media (max-width: 900px) {
+  .ds-drawer--builder .ds-drawer__body { overflow-y: auto; }
+  .ds-drawer--builder .ag-work { height: auto; }
+}
+
+/* ...and stands back down when it is not the builder.
+   `enterBuilderLayout` restructures the drawer ONCE and leaves the scaffold
+   in place (it now holds the moved-in form), so a later compact open — the
+   chip-input path on /admin/tables — would otherwise inherit a two-column
+   grid squeezed into 600px with a stale conversation beside it. The class is
+   the switch; without it the workspace is a plain block and the form is the
+   only thing in it. */
+.ds-drawer:not(.ds-drawer--builder) .ag-work {
+  display: block; height: auto; min-height: 0; border-top: none; background: none;
+}
+.ds-drawer:not(.ds-drawer--builder) .ag-pane { display: block; }
+.ds-drawer:not(.ds-drawer--builder) .pdw-conv,
+.ds-drawer:not(.ds-drawer--builder) .ag-cfg-head { display: none; }
+.ds-drawer:not(.ds-drawer--builder) .ag-pane--cfg { border-left: none; background: none; }
+.ds-drawer:not(.ds-drawer--builder) .ds-drawer__pane { padding: 0; }

@@ -12,6 +12,9 @@
 {# The shared create/edit drawer, for the rail's "Edit details". Admin-only:
    a reader who cannot manage the package never downloads the component or
    its sheet. #}
+{# The builder workspace's rules — package_drawer grows into it when
+   opened from "+ New". Without the sheet the two panes stack. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
@@ -474,6 +477,9 @@
 {{ detail.cols_close() }}
 
 {% if user.is_admin %}
+{# package_drawer builds the shared builder workspace when opened
+   from "+ New", so the shell has to be defined before it runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 {% endif %}
 <script>

@@ -445,6 +445,7 @@ from app.api.collections import router as collections_router  # Slice 2: file co
 from app.api.agents import router as agents_router  # v103: agent registry (Library items)
 from app.api.agent_builder import router as agent_builder_router  # builder assistant turns
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
+from app.api.package_builder import router as package_builder_router  # data-package builder turns
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
 from app.api.knowledge_search import router as knowledge_search_router  # K2: unified search
 from app.api.stack import router as stack_router
@@ -2795,6 +2796,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_router)
     app.include_router(agent_builder_router)
     app.include_router(entity_builder_router)
+    app.include_router(package_builder_router)
     app.include_router(sharing_router)
     app.include_router(knowledge_search_router)
     app.include_router(stack_router)

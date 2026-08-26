@@ -558,6 +558,16 @@ _AGENTS_REGISTRY_REASON = (
     "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
+_PACKAGE_BUILDER_TURN_REASON = (
+    "one turn of the data-package drawer's CONVERSATION — web-UI-only, same "
+    "shape as the two builder-turn endpoints above. It writes NOTHING and has "
+    "no `apply` flag at all: creating a package writes GRANTS, so a turn only "
+    "ever proposes into the open drawer and the admin presses Create having "
+    "seen the access matrix. Its inputs are the drawer's transient state; its "
+    "output is a proposal, not a resource. The package itself is created "
+    "through POST /api/admin/data-packages, which is grandfathered above."
+)
+
 _ENTITY_PREVIEW_AGENT_REASON = (
     "points the caller's single scratch agent at the agent TEMPLATE they are "
     "drafting on /skills and returns its slug, so the builder's Preview tab "
@@ -706,6 +716,7 @@ _EXEMPT: dict[str, str] = {
     "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
     "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
     "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
+    "/api/admin/data-packages/builder/turn": _PACKAGE_BUILDER_TURN_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (

@@ -6354,6 +6354,70 @@
         "title": "OwnerOption",
         "type": "object"
       },
+      "PackageDraft": {
+        "description": "The drawer's unsaved state. Used only to build the prompt.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "title": "PackageDraft",
+        "type": "object"
+      },
+      "PackageTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PackageDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "PackageTurnRequest",
+        "type": "object"
+      },
       "PassthroughToolDTO": {
         "description": "Slimmed-down tool_registry row for the stdio client's tool list.",
         "properties": {
@@ -16801,6 +16865,70 @@
         "summary": "Create Data Package",
         "tags": [
           "data-packages"
+        ]
+      }
+    },
+    "/api/admin/data-packages/builder/turn": {
+      "post": {
+        "description": "Run one turn of the data-package builder. Proposes; never writes.\n\nReturns ``{reply, patch, suggestions}``. Nothing here creates a package\nor writes a grant \u2014 see the module docstring for why that is a rule\nrather than a default.",
+        "operationId": "package_builder_turn_api_admin_data_packages_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Package Builder Turn",
+        "tags": [
+          "admin"
         ]
       }
     },
