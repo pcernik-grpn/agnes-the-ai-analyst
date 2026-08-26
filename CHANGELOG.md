@@ -12,6 +12,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
+  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
+  collection an admin creates via the Library/API is granted to the `Everyone`
+  group at creation, so admin uploads are workspace-visible — in the Library,
+  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
+  without a manual share step. The grant is an ordinary revocable Everyone
+  grant; non-admin uploads and chat file drops stay private. The
+  `POST /api/collections` response now reports the resulting `visibility`
+  (`workspace`/`private`).
 - **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
   (remediation-program Track C1.1, additive — the builder router is
   unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept

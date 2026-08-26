@@ -32472,7 +32472,7 @@
         ]
       },
       "post": {
-        "description": "Create a new file corpus (any authenticated user).\n\nThe corpus is owned by the creator (``created_by``) and is private to\nthem \u2014 reachable via ownership without a ``resource_grants`` row (see\n``can_access_collection``). Admins may additionally grant a corpus to\ngroups to share it.\n\nReturns the created collection object (id, slug, name, \u2026).\n``slug`` is auto-generated from ``name`` when omitted, and an explicit\n``slug`` is normalised to a URL-safe form (``[a-z0-9-]``) so it always\nresolves via ``/library/{slug}``; a collision on the unique slug index\nreturns **409**.",
+        "description": "Create a new file corpus (any authenticated user).\n\nThe corpus is owned by the creator (``created_by``) and is private to\nthem \u2014 reachable via ownership without a ``resource_grants`` row (see\n``can_access_collection``). Admins may additionally grant a corpus to\ngroups to share it. When the instance opts into\n``library.auto_share_admin_uploads``, a corpus created by an admin is\ngranted to the Everyone group at creation (workspace-visible, still\nrevocable in the share dialog).\n\nReturns the created collection object (id, slug, name, \u2026) plus\n``visibility`` (``\"workspace\"`` when auto-shared, else ``\"private\"``).\n``slug`` is auto-generated from ``name`` when omitted, and an explicit\n``slug`` is normalised to a URL-safe form (``[a-z0-9-]``) so it always\nresolves via ``/library/{slug}``; a collision on the unique slug index\nreturns **409**.",
         "operationId": "create_collection_api_collections_post",
         "parameters": [
           {

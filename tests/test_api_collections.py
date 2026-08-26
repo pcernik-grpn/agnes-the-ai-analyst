@@ -1576,3 +1576,135 @@ class TestListingPastTheRepoCap:
         items = resp.json()["items"]
         assert len(items) == self._FILLER + 1
         assert target in {item["id"] for item in items}
+
+
+class TestAutoShareAdminUploads:
+    """`library.auto_share_admin_uploads` — admin Library uploads land already
+    shared to Everyone (opt-in per instance, default off).
+
+    Scope is deliberately narrow: only the `POST /api/collections` path and
+    only admin creators. Analyst uploads stay private-by-default, and an
+    admin's casual chat drop (`create_single_file_artefact`) must never
+    auto-publish.
+    """
+
+    def _everyone_grant_exists(self, corpus_id: str) -> bool:
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_groups import UserGroupsRepository
+
+        conn = get_system_db()
+        try:
+            grp = UserGroupsRepository(conn).get_by_name("Everyone")
+            assert grp, "Everyone group must be seeded"
+            return ResourceGrantsRepository(conn).has_grant([grp["id"]], "collection", corpus_id)
+        finally:
+            conn.close()
+
+    def test_flag_on_admin_upload_is_shared_to_everyone(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/collections",
+            json={"name": "Company Docs"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["visibility"] == "workspace"
+        assert self._everyone_grant_exists(body["id"])
+        # The point of the flag: an analyst in Everyone sees the upload with
+        # no manual share step.
+        _seed_everyone_membership("analyst1")
+        listed = c.get("/api/collections", headers=_auth(seeded_app["analyst_token"]))
+        assert listed.status_code == 200, listed.text
+        assert body["id"] in {r["id"] for r in listed.json()["items"]}
+
+    def test_flag_on_non_admin_upload_stays_private(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/collections",
+            json={"name": "Analyst Notes"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["visibility"] == "private"
+        assert not self._everyone_grant_exists(body["id"])
+
+    def test_flag_off_admin_upload_stays_private(self, seeded_app):
+        # Default off: a routine upgrade must not change what admin uploads
+        # are visible to anyone.
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/collections",
+            json={"name": "Still Private"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["visibility"] == "private"
+        assert not self._everyone_grant_exists(body["id"])
+
+    def test_flag_on_chat_drop_by_admin_stays_private(self, seeded_app, monkeypatch):
+        # Guard: the chat-upload path creates artefacts through
+        # create_single_file_artefact, which the auto-share hook must not
+        # touch — an admin's ad-hoc chat file is not a publication.
+        monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")
+        from app.corpus_ingest import create_single_file_artefact
+
+        created = create_single_file_artefact(owner_id="admin1", filename="note.txt", data=b"hello")
+        assert created is not None
+        assert not self._everyone_grant_exists(created["collection"]["id"])
+
+    def test_flag_on_restricted_principal_stays_private(self, seeded_app, monkeypatch):
+        # A restricted principal (co-session / agent-session) is never an
+        # admin — the helper must refuse via the explicit PRINCIPAL_TYPES
+        # seam (app/auth/session_principal.py), not via an accidental
+        # TypeError on `user["id"]`.
+        monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")
+        from app.api.collections import _maybe_auto_share_admin_upload
+        from app.auth.session_principal import AgentPrincipal, SessionPrincipal
+
+        principals = [
+            SessionPrincipal(
+                session_id="s1",
+                participant_user_ids=["admin1"],
+                participant_emails=["admin@test.com"],
+                intersection={},
+            ),
+            AgentPrincipal(
+                session_id="s2",
+                agent_id="agent1",
+                owner_user_id="admin1",
+                owner_email="admin@test.com",
+                intersection={},
+            ),
+        ]
+        for principal in principals:
+            assert _maybe_auto_share_admin_upload("col_whatever", principal) == "private"
+
+    def test_flag_on_grant_write_failure_leaves_create_ok_and_private(self, seeded_app, monkeypatch):
+        # Fail-closed branch must actually execute: a broken grant write may
+        # not fail the create — the collection lands private and the
+        # response says so.
+        monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")
+
+        def _boom():
+            raise RuntimeError("grants backend down")
+
+        import src.repositories as repos
+
+        monkeypatch.setattr(repos, "resource_grants_repo", _boom)
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/collections",
+            json={"name": "Grant Write Down"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["visibility"] == "private"
+        # _everyone_grant_exists reads through the repository classes
+        # directly, so the factory monkeypatch does not blind this assert.
+        assert not self._everyone_grant_exists(body["id"])
