@@ -474,7 +474,12 @@
            orphans; the merge (spec 2026-08-12) is the durable answer. #}
     </div>
 
-    {% if session.user.is_admin %}
+    {# `dev_preview != 'member'` is the local-dev audience switch: previewing
+       as a member has to take the Admin destination away, or the preview shows
+       an admin rail beside a member page and answers the wrong question. It
+       changes the RENDER only — the caller keeps every permission they had,
+       and /admin still answers if they type it. See _dev_preview.html. #}
+    {% if session.user.is_admin and dev_preview != 'member' %}
     {# Admin — the last thing in the bottom zone, behind the nav's only divider
        (rail.css): a different KIND of destination from Library/Agents
        (operating the instance vs. using it).
@@ -645,7 +650,7 @@
                 {% endif %}
                 <span class="rail-user-txt">
                     <b>{{ session.user.name or session.user.email }}</b>
-                    {% if session.user.is_admin %}<span class="rail-user-role">Admin</span>{% endif %}
+                    {% if session.user.is_admin and dev_preview != 'member' %}<span class="rail-user-role">Admin</span>{% endif %}
                 </span>
             </button>
             <div class="app-user-menu-panel" id="userMenuPanel" role="menu" hidden>

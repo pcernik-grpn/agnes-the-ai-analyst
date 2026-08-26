@@ -4744,6 +4744,36 @@ async def memory_domain_detail(
     return templates.TemplateResponse(request, "memory_domain_detail.html", ctx)
 
 
+#: The three audiences the local-dev switch can render as. `None` is the
+#: caller's real one — an admin looking at their own instance.
+DEV_PREVIEW_MODES = ("member", "admin", "empty")
+
+
+def _dev_preview_enabled() -> bool:
+    """Whether the audience switch may render at all.
+
+    Gated on LOCAL_DEV_MODE, under which the whole auth layer is already
+    bypassed — so this adds no reachable surface to a real deployment, and on
+    any instance without it the parameter is inert rather than half-honoured.
+    """
+    from app.auth.dependencies import is_local_dev_mode
+
+    return is_local_dev_mode()
+
+
+def _resolve_dev_preview(request: Request) -> Optional[str]:
+    """Which audience this render is pretending to be for, or None.
+
+    Changes only what is RENDERED. No authority, no grant and no repo read is
+    faked, which is why it must never be read as a role-switcher: an admin
+    previewing `member` still has every permission they had.
+    """
+    if not _dev_preview_enabled():
+        return None
+    value = request.query_params.get("preview")
+    return value if value in DEV_PREVIEW_MODES else None
+
+
 def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
     """Single owner of every chrome-level template-context key (#996).
 
@@ -4762,9 +4792,19 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
     (``/admin/studio/{domain}``) sets it explicitly, the same way
     ``_build_context`` callers do.
     """
+    # Local-dev audience preview, resolved ONCE for every page that renders
+    # chrome. It used to live in the /chat route, which is why the switch only
+    # worked there — the parameter was inert everywhere else, so following a
+    # link out of /chat silently dropped you back to the admin view.
+    _preview = _resolve_dev_preview(request)
     return {
         "request": request,
         "user": _flex(user) if user else _FlexDict(),
+        "dev_preview": _preview,
+        # The switch is chrome, so whether to render it is chrome's business.
+        # Admin-only AND local-dev-only: it must not appear on a real
+        # deployment, and it must not offer a member a view they cannot have.
+        "dev_preview_available": bool(_preview is not None or _dev_preview_enabled()),
         "now": datetime.now,
         "get_flashed_messages": lambda **kw: [],
         "url_for": lambda endpoint, **kw: _url_for_shim(endpoint, **kw),
@@ -9020,9 +9060,11 @@ async def chat_page(
     # so the state can be reviewed without registering or deleting real tables
     # to reach it. It fakes only the RENDER — no repo read is bypassed, nothing
     # is written, and the instance keeps whatever data it has.
-    _dev_preview = request.query_params.get("preview") if is_local_dev_mode() else None
-    if _dev_preview not in ("member", "admin", "empty"):
-        _dev_preview = None
+    #
+    # Resolved by the shared helper, not re-derived here: this used to be the
+    # only page that understood `?preview=`, which is exactly why the switch
+    # worked nowhere else.
+    _dev_preview = _resolve_dev_preview(request)
 
     admin_notice = None
     if _dev_preview != "member" and is_user_admin(user["id"], conn):
@@ -9056,10 +9098,13 @@ async def chat_page(
         knowledge_source_count=knowledge_source_count,
         capability_count=capability_count,
         admin_notice=admin_notice,
-        dev_preview=_dev_preview,
+        dev_preview=_dev_preview,  # same value chrome resolved; kept explicit for this page's own branches
         # The toggle renders only where the switch is honoured, and only for
         # someone who has an admin view to switch away from — a member seeing
         # "Admin | Member" would be offered a view they can never get.
+        # Narrowed to an admin here, where a connection is already open —
+        # `_chrome_ctx` deliberately does not do an `is_user_admin()` lookup of
+        # its own for every page (see its docstring on `is_admin`).
         dev_preview_available=is_local_dev_mode() and is_user_admin(user["id"], conn),
     )
     ctx["chat_capabilities"] = _chat_capability_snapshot(conn, user)

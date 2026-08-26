@@ -105,10 +105,35 @@ def _enable_rail_chat(seeded_app, monkeypatch) -> None:
     these tests pin the redesign experience, where the stack mode is enabled
     together with the chrome (spec 2026-08-07-default-chrome-ux-parity) —
     the seeded ``available`` grants below only count into the context line
-    under that mode."""
+    under that mode.
+
+    Also reports the instance as having REGISTERED TABLES. These tests call
+    ``/chat`` with the admin token against a seeded instance that has none, and
+    in that state the page carries the "no data is registered yet" admin notice
+    (see ``admin_notice`` in chat.html) — correct product behaviour, but not the
+    state any test in this file is about. Pinning it here keeps every assertion
+    in the file talking about the ordinary landing page; the notice's own
+    behaviour is covered by ``TestRailDashboard`` in
+    tests/test_ui_layout_theme.py."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
     monkeypatch.setenv("AGNES_STACK_AUTO_MEMBERSHIP", "1")
     seeded_app["client"].app.state.chat_config = SimpleNamespace(enabled=True)
+
+    import app.services.admin_dashboard as admin_dashboard
+
+    monkeypatch.setattr(
+        admin_dashboard,
+        "resolve_journey",
+        lambda: {
+            "setup": {
+                "steps": [{"key": "tables", "done": True, "failed": False, "cta": "x", "href": "/x"}],
+                "complete": False,
+                "done_count": 1,
+                "total": 6,
+                "summary": "",
+            }
+        },
+    )
 
 
 class TestChatEmptyStatePill:
@@ -124,19 +149,27 @@ class TestChatEmptyStatePill:
         resp = c.get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        # The Knowledge Layer hero — a single premium banner: text lead + CTA
-        # on the left, orb in the centre, floating integration chips on the
-        # right (no inner "Ask Agnes" / tools cards).
-        assert '<div class="klb-lead">' in body
-        assert "Agnes is your knowledge layer." in body
-        assert "Use it here or connect your tools." in body
-        assert "Connect your tools" in body  # the green CTA
-        # Floating integration chips (no surrounding card).
-        assert 'class="klb-chips"' in body
-        assert "Claude Code" in body and "CLI and more" in body
-        # Below the banner: the trust caption + the "Ask Agnes anything" heading.
-        assert "Secure. Private. Always in sync." in body
+        # The page introduces itself in TEXT, not in a banner: greeting, the
+        # "Ask Agnes anything" heading, then one factual sentence about what it
+        # answers. The Knowledge Layer hero that used to lead here is retired —
+        # it asserted a category rather than a capability, and its "Connect your
+        # tools" CTA read as sending data INTO Agnes.
+        assert 'class="cld-greet"' in body
         assert "Ask Agnes anything" in body
+        assert 'class="cld-lede"' in body
+        assert "shows you where each answer came from" in body
+        # The three doors at the foot carry the routes the hero carried, with
+        # the middle one naming the DIRECTION rather than "Connect your tools".
+        assert 'class="cld-doors"' in body
+        assert "Take Agnes to your own tools" in body
+        # The tool NAMES stay (they are the useful half of the retired hero, and
+        # the door names them in its description); the floating chip markup that
+        # carried them is what went with the banner.
+        assert "Claude Code" in body
+        assert 'class="klb-chips"' not in body
+        assert "Secure. Private. Always in sync." in body
+        for retired in ('class="klb"', "Agnes is your knowledge layer.", "Connect your tools"):
+            assert retired not in body, f"the retired hero is back: {retired}"
         assert 'id="rdb-actions"' in body
         assert "Using" in _context_line(body) and "from your" in _context_line(body)
         # The retired hero copy must be gone.
@@ -183,35 +216,48 @@ class TestChatEmptyStatePill:
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
+        # The region is composer → suggested actions, NOT composer → the hero
+        # slot. The rule protects the INTENT ZONE: the span a reader crosses
+        # between having a question and the suggestions that help them phrase
+        # it, where a navigate-away control is a detour. It was written when a
+        # hero above the composer carried the orientation routes; that hero is
+        # retired, so those routes now sit at the FOOT of the empty state
+        # (`.cld-doors`, after the suggestions) — past the intent zone, not
+        # inside it. Widening the region to the hero slot would forbid the page
+        # from offering any route at all, which is not what the rule was for.
         below = body[body.index('id="chat-input"') :]
-        below = below[: below.index('id="chat-empty-banner"')]
+        below = below[: below.index('id="rdb-actions"')]
         assert 'class="rdb-context"' in below
         assert 'id="chat-agent-btn"' in below
         for retired in ("rdb-orient", "New here?", 'href="/how-it-works"'):
             assert retired not in below, f"below-input area is not context-only: {retired}"
 
-    def test_hero_carries_the_first_run_orientation_link(self, seeded_app, monkeypatch):
-        """ "See how Agnes works" — the first-run path to /how-it-works, which
-        the rail otherwise carries only as a quiet `.rail-meta` row in its foot
-        (_app_rail.html). It sits directly under the hero's "Connect your tools"
-        CTA as a plain text link with an info glyph: an optional onboarding
-        action, deliberately NOT a second button (the retired outline secondary
-        is guarded in tests/test_ui_layout_theme.py).
+    def test_orientation_routes_live_in_the_doors_row(self, seeded_app, monkeypatch):
+        """The first-run path to /how-it-works, which the rail otherwise carries
+        only as a quiet ``.rail-meta`` row in its foot (_app_rail.html).
+
+        It used to be a text link under the hero's "Connect your tools" CTA.
+        With that hero retired it is one of three labelled doors at the foot of
+        the empty state — still a plain link, still not a button, and now beside
+        the two other routes off this page instead of competing with a banner
+        CTA above the composer.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        lead = body[body.index('<div class="klb-lead">') :]
-        lead = lead[: lead.index("</div>")]
-        assert 'class="klb-orient"' in lead
-        assert 'href="/how-it-works"' in lead
-        assert "See how Agnes works" in lead  # brand-templated, seeded default
-        # Under the CTA, not above it — the green CTA stays the hero's lead action.
-        assert lead.index('class="klb-cta"') < lead.index('class="klb-orient"')
-        # Still not a button: no CTA row, no outline secondary.
-        assert 'class="klb-ctas"' not in body
-        assert "klb-cta-secondary" not in body
+        doors = body[body.index('class="cld-doors"') :]
+        doors = doors[: doors.index("</nav>")]
+        # All three routes, and each says where it goes.
+        assert 'href="/library"' in doors
+        assert 'href="/how-it-works#connect"' in doors
+        assert 'href="/how-it-works"' in doors
+        assert "See what Agnes knows" in doors
+        assert "Take Agnes to your own tools" in doors
+        assert "How Agnes works" in doors
+        # Links, not buttons — the composer above is the page's only action.
+        for retired in ("btn btn-primary", 'class="klb-cta"', 'class="klb-ctas"', "klb-cta-secondary"):
+            assert retired not in doors, f"a door rendered as a button: {retired}"
 
     def test_context_line_hidden_at_zero(self, seeded_app, monkeypatch):
         """analyst1 has no data/plugin grants → both counts are 0 and the

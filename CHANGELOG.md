@@ -91,6 +91,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **The `/chat` landing page introduces itself in text instead of a banner.**
+  The Knowledge Layer hero that led the page is retired: it asserted a category
+  ("Agnes is your knowledge layer") rather than saying what Agnes answers,
+  spent the page's best space on a CTA pointing away from the composer, and its
+  "Connect your tools" button was read as sending data *into* Agnes when the
+  direction is the opposite. In its place: a greeting, the "Ask Agnes
+  anything" heading, and one factual sentence about what it answers and that it
+  cites sources — then three labelled doors at the foot of the empty state
+  ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
+  works"), the middle one naming the direction the old CTA got backwards. Same
+  page for admins and members.
+- **An admin on an instance with no registered data gets one line saying so.**
+  Nobody can ask about the company until a source is connected and its tables
+  are shared, so the landing page says that, with the next action beside it and
+  a link to the full checklist on `/admin`. Gated on the fact (nothing
+  registered), not on a completion count — it is silent as soon as there is
+  data and never implies setup is finished, because adding another source is
+  always legitimate.
+
 - **The `/agents` builder is now a conversation next to the configuration.**
   Opening an agent gives two panes: a **Create** conversation on the left that
   describes the agent in plain language, and the **Configuration** on the
@@ -140,6 +159,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   builder's own delete.
 
 ### Internal
+
+- **Local-dev audience switch on the chat landing page.** Under
+  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
+  Admin | Admin, empty instance | Member" toggle for reviewing each landing
+  state without keeping a second account or mutating data — `?preview=member`
+  hides the admin notice, `?preview=empty` forces it on an instance that has
+  data. It fakes the render only: no repo read is bypassed, nothing is
+  written, and no authority or grant changes. Off the dev gate every value is
+  ignored outright and the toggle is not rendered, so it adds no surface to a
+  real deployment.
 
 - **PG-first development rule (remediation-program Track A3): the DuckDB
   app-state backend is frozen.** No user-visible change. Development-rule

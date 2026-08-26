@@ -1465,68 +1465,158 @@ class TestRailDashboard:
             "sub-pixel scrollbar on the caption/heading block is back"
         )
 
-    def test_rail_chat_renders_dashboard_empty_state(self, web_client, admin_cookie, monkeypatch):
+    @staticmethod
+    def _tables_registered(monkeypatch):
+        """Report the instance as having registered tables.
+
+        This class signs in with `admin_cookie` against a `tmp_path` instance,
+        which has none — the state in which /chat shows the "no data is
+        registered yet" notice. Tests about the ordinary landing page say so
+        with this; the notice has its own tests below.
+        """
+        import app.services.admin_dashboard as admin_dashboard
+
+        monkeypatch.setattr(
+            admin_dashboard,
+            "resolve_journey",
+            lambda: {
+                "setup": {
+                    "steps": [{"key": "tables", "done": True, "failed": False, "cta": "x", "href": "/x"}],
+                    "complete": False,
+                    "done_count": 1,
+                    "total": 6,
+                    "summary": "",
+                }
+            },
+        )
+
+    @staticmethod
+    def _dev_mode(monkeypatch):
+        """Turn the local-dev preview gate on.
+
+        Patches the FUNCTION rather than setting LOCAL_DEV_MODE=1: the env var
+        also switches the whole auth layer to auto-login as a seeded dev user
+        that does not exist in this fixture's DB, which would change who is
+        making the request — the one thing these tests must hold still.
+        """
+        import app.auth.dependencies as deps
+
+        monkeypatch.setattr(deps, "is_local_dev_mode", lambda: True)
+
+    def test_admin_notice_states_the_instance_has_no_data(self, web_client, admin_cookie, monkeypatch):
+        """One line, not a checklist.
+
+        A six-step panel with a "0 of 6 done" meter lived in the hero slot and
+        was removed as misleading: it read as onboarding, existed only before
+        the first message, and disappeared for good at 6 of 6 — exactly when an
+        admin might still want another source. What survives is the single
+        claim that is a FACT rather than a milestone: with nothing registered,
+        nobody can ask about the company at all.
+        """
         self._enable_chat(web_client, monkeypatch)
-        resp = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False)
-        assert resp.status_code == 200
-        text = resp.text
-        assert 'data-ui-layout="rail"' in text
-        for anchor in (
-            # The Knowledge Layer hero — one premium banner: text lead + green
-            # CTA on the left, orb in the centre, floating integration chips on
-            # the right (no inner "Ask Agnes" / tools cards).
-            'class="klb"',  # self-contained hero banner
-            '<div class="klb-lead">',  # left text lead block
-            "Agnes is your knowledge layer.",  # hero headline line 1
-            "Use it here or connect your tools.",  # hero headline line 2 (gradient)
-            '<p class="klb-sub">',  # the supporting sentence renders
-            'href="/how-it-works#connect"',  # the green "Connect your tools" CTA target
-            'class="klb-chips"',  # floating integration chips (no card)
-            "Claude Code",  # a chip label
-            "CLI and more",  # a chip label
-            # Below the banner: the trust caption + "Ask Agnes anything" heading.
-            "klb-hub-label--lead",  # the trust-caption wrapper
-            "Secure. Private. Always in sync.",  # caption text, below the banner
-            'class="rdb-ask-heading"',  # the usage heading above the composer
-            "Ask Agnes anything",
-            'id="rdb-actions"',  # the one personalized section
-            'id="rdb-actions-list"',  # suggested-actions list
-            "css/chat_dashboard.css",  # dashboard styles
-            'id="chat-input"',  # the REAL composer serves the dashboard
-        ):
-            assert anchor in text, f"rail chat dashboard is missing {anchor}"
-        # The retired three-panel layout is gone (one actions list instead).
-        # `rdb-semantic-links` joins it: the dashboard carried a "Browse metrics
-        # & glossary" button (#1108) directly above the composer, and this is
-        # the moment of INTENT — the reader came here to ask something. A
-        # control whose only function is to navigate away from the composer,
-        # offered before they have an answer to check, is a detour.
-        #
-        # Asserted on the BUTTON'S wrapper class, not on the bare
-        # `/catalog/semantics` URL: the rail chrome now carries a Definitions
-        # nav row, so that URL is legitimately present on every rail page
-        # including this one. What must not come back is the in-page button.
-        for retired in (
-            'id="rdb-continue-list"',
-            'id="rdb-tasks"',
-            "Recent updates",
-            "rdb-semantic-links",
-        ):
-            assert retired not in text, f"retired dashboard panel leaked back: {retired}"
-        # The banner's old two-button CTA row is retired: "Connect your tools"
-        # moved into the tools card (klb-card-cta), "Learn how it works" into
-        # the user menu. Neither the CTA row nor the outline secondary remain.
-        assert 'class="klb-ctas"' not in text
-        assert "klb-cta-secondary" not in text
-        # One composer only — the retired standalone dashboard's look-alike
-        # input and its prompt-handoff module must be gone.
-        assert 'id="rdb-composer"' not in text
-        assert "dashboard_rail" not in text
-        # The retired ask-hero brand block is gone too.
-        assert "Ask anything." not in text
-        # The "Agnes Knowledge Layer" hub title was dropped as redundant with the
-        # "Agnes is your knowledge layer." headline — it must not render anywhere.
-        assert "Agnes Knowledge Layer" not in text
+        # NOT patched: the tmp_path instance genuinely has no registered table.
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+
+        assert 'class="cld-notice"' in text, "admin notice missing on an instance with no data"
+        assert "No data is registered yet" in text
+        assert 'href="/admin"' in text  # the full chain stays one click away
+        # The retired panel's framing must not come back with it.
+        for retired in ('class="cset"', "of 6 done", "Do this next", 'class="cset-steps"'):
+            assert retired not in text, f"the retired setup-panel framing is back: {retired}"
+        # The composer is still the page's point.
+        assert 'id="chat-input"' in text
+
+    def test_admin_notice_is_silent_once_tables_are_registered(self, web_client, admin_cookie, monkeypatch):
+        """Gated on the FACT, not on chain completion — so it goes quiet as soon
+        as there is data, without ever implying setup is finished."""
+        self._enable_chat(web_client, monkeypatch)
+        self._tables_registered(monkeypatch)
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+        assert 'class="cld-notice"' not in text
+        # …and the page itself is unchanged: it is the same landing page for
+        # everyone, which is the point of retiring the two-hero split.
+        assert 'class="cld-doors"' in text
+        assert 'class="rdb-ask-heading"' in text
+
+    def test_non_admin_never_sees_the_admin_notice(self, web_client, monkeypatch):
+        """A member cannot act on it, so it would be a dead end."""
+        from argon2 import PasswordHasher
+
+        from src.db import get_system_db
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        UserRepository(conn).create(
+            id="member1",
+            email="member@test.com",
+            name="Member",
+            password_hash=PasswordHasher().hash("MemberPass1!"),
+        )
+        conn.close()
+        self._enable_chat(web_client, monkeypatch)
+        # A member has no CHAT grant in this fixture, so /chat would 302 to home
+        # and every "not in text" assertion below would pass against an empty
+        # body — proving nothing. Let them through the gate so the test actually
+        # exercises the render.
+        import app.auth.access as access
+
+        monkeypatch.setattr(access, "can_access", lambda *a, **k: True)
+
+        resp = web_client.post("/auth/token", json={"email": "member@test.com", "password": "MemberPass1!"})
+        assert resp.status_code == 200, f"member login failed: {resp.text}"
+        cookie = {"access_token": resp.json()["access_token"]}
+        page = web_client.get("/chat", cookies=cookie, follow_redirects=False)
+        assert page.status_code == 200, f"member did not reach /chat: {page.status_code}"
+        text = page.text
+        assert 'class="cld-notice"' not in text, "a non-admin was shown the admin notice"
+        assert "cset-devsw" not in text, "a non-admin was shown the dev audience switch"
+        # They get the same landing page as everyone else.
+        assert 'class="cld-doors"' in text
+
+    def test_dev_preview_member_hides_the_admin_notice(self, web_client, admin_cookie, monkeypatch):
+        """`?preview=member` under LOCAL_DEV_MODE lets one account look at the
+        other audience's landing page — the reason the switch exists."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        text = web_client.get("/chat?preview=member", cookies=admin_cookie, follow_redirects=False).text
+        assert 'class="cld-notice"' not in text, "?preview=member did not suppress the admin notice"
+        # The switch stays on screen so the view is escapable and labelled. It
+        # moved out of this page's markup and into the base layout — inline it
+        # read as product chrome, and its links could only point back at /chat.
+        assert "data-devsw" in text
+        assert "your data and permissions are unchanged" in text
+
+    def test_dev_preview_empty_forces_the_notice_without_touching_data(self, web_client, admin_cookie, monkeypatch):
+        """`?preview=empty` renders the no-data notice on an instance that has
+        data, so the state can be reviewed without registering or deleting real
+        tables to reach it. It fakes the RENDER only."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        self._tables_registered(monkeypatch)  # …so the notice would normally be silent
+        text = web_client.get("/chat?preview=empty", cookies=admin_cookie, follow_redirects=False).text
+        assert 'class="cld-notice"' in text
+        assert "No data is registered yet" in text
+
+    def test_dev_preview_is_inert_without_local_dev_mode(self, web_client, admin_cookie, monkeypatch):
+        """The switch must not be a production surface. Off the dev gate every
+        value is ignored outright — not half-honoured — and the toggle is not
+        rendered at all, so nothing advertises a view it won't give."""
+        self._enable_chat(web_client, monkeypatch)
+        self._tables_registered(monkeypatch)
+        # No _dev_mode() call: this is the default, production-shaped path.
+        for value in ("member", "empty"):
+            text = web_client.get(f"/chat?preview={value}", cookies=admin_cookie, follow_redirects=False).text
+            assert "cset-devsw" not in text, f"the dev switch rendered outside LOCAL_DEV_MODE (?preview={value})"
+            assert 'class="cld-notice"' not in text, f"?preview={value} was honoured outside LOCAL_DEV_MODE"
+
+    def test_dev_preview_rejects_an_unknown_value(self, web_client, admin_cookie, monkeypatch):
+        """Anything but the known values falls back to the real view rather than
+        to an arbitrary branch."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        self._tables_registered(monkeypatch)
+        text = web_client.get("/chat?preview=wat", cookies=admin_cookie, follow_redirects=False).text
+        assert 'class="cld-notice"' not in text
 
     def test_rail_dashboard_actions_section(self, web_client, admin_cookie, monkeypatch):
         """One Suggested-next-actions section below the composer: list +

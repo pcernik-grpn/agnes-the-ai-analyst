@@ -147,11 +147,24 @@
        Blocks share the one --rdb-col column (see the "HERO" section of
        chat.css). #}
     <aside id="chat-capabilities" class="cloud-chat-capabilities">
-      {# The hero banner (order 0) has already said what Agnes is; this block
-         is the transition into usage: the trust caption, then a plain "Ask
-         Agnes anything" heading directly above the composer. #}
-      <div class="klb-hub-label klb-hub-label--lead">{{ knowledge_hub_label(show_title=False) }}</div>
+      {# The page's own introduction, because there is no banner above it any
+         more. The retired hero asserted a category ("{brand} is your knowledge
+         layer") and spent the page's best real estate on a CTA that navigated
+         AWAY from the composer; the feedback was that a first-time reader still
+         could not tell what {brand} was FOR, and that its "Connect your tools"
+         button read as sending data INTO {brand}.
+
+         What replaces it is one factual sentence about what this thing answers
+         and what it does with sources — a capability statement a newcomer can
+         check against the answer they get, rather than a claim they have to
+         take on faith. The greeting above it is small on purpose: it locates
+         the reader, it is not the message. #}
+      <p class="cld-greet">{{ greeting }}{% if user.name %}, {{ user.name.split(' ')[0] }}{% endif %}</p>
       <h2 class="rdb-ask-heading">Ask {{ instance_brand_short or 'Agnes' }} anything</h2>
+      <p class="cld-lede">
+        {{ instance_brand_short or 'Agnes' }} answers from your company's own data, documents and
+        shared memory &mdash; and shows you where each answer came from.
+      </p>
       {# A "Browse metrics & glossary" button used to sit here (#1108), the only
          in-page path to /catalog/semantics in the rail chrome. Retired: this is
          the moment of INTENT — the reader came to ask something and the
@@ -486,24 +499,90 @@
             </p>
           </div>
         </section>
+
+        {# The three real doors off this page, as labelled links rather than a
+           banner. This is what the retired hero was actually for — and the
+           middle one is the label that feedback killed: "Connect your tools"
+           read as sending your tools' data INTO {brand}, when the direction is
+           the opposite. Naming the direction ("take {brand} to…") is the fix;
+           the tool marks stay because "which tools" is the genuinely useful
+           part of that hero, and they cost one row here instead of a banner.
+
+           Order is by how many readers need them: what {brand} knows, then how
+           to use it elsewhere, then the explanation for whoever wants it. #}
+        <nav class="cld-doors" aria-label="Where to go next">
+          <a class="cld-door" href="/library">
+            <span class="cld-door-t">See what {{ instance_brand_short or 'Agnes' }} knows</span>
+            <span class="cld-door-d">Data packages, skills, memory and agents you can reach</span>
+          </a>
+          <a class="cld-door" href="/how-it-works#connect">
+            <span class="cld-door-t">Take {{ instance_brand_short or 'Agnes' }} to your own tools</span>
+            <span class="cld-door-d">Same knowledge inside Claude Code, Cursor, VS Code or your terminal</span>
+            <span class="cld-door-tools" aria-hidden="true">
+              <img src="{{ static_url('img/tools/claude-code.ico') }}" alt="" width="15" height="15">
+              <img src="{{ static_url('img/tools/cursor.ico') }}" alt="" width="15" height="15">
+              <img src="{{ static_url('img/tools/vscode.ico') }}" alt="" width="15" height="15">
+            </span>
+          </a>
+          <a class="cld-door" href="/how-it-works">
+            <span class="cld-door-t">How {{ instance_brand_short or 'Agnes' }} works</span>
+            <span class="cld-door-d">Where your data goes, and what stays private</span>
+          </a>
+        </nav>
+
+        {# The trust caption the retired hero carried. Kept — it is a claim the
+           reader cares about — but demoted to one quiet line at the foot
+           instead of riding above the composer. #}
+        <p class="cld-trust">{{ knowledge_hub_label(show_title=False) }}</p>
       </div>
     </div>
 
-    {# Knowledge Layer hero — floated to the VERY TOP via flex order (chat.css);
-       the trust caption + "Ask Agnes anything" heading + composer + suggestions
-       follow below it, and the Keboola credit pins to the very bottom. The hero
-       is self-contained (its own gradient banner). Both it and the credit are
-       placed after #chat-capabilities in the DOM so the empty-state hide rule
-       (#chat-capabilities[hidden] ~ …) still catches them. #}
+    {# The hero slot. Empty for almost everyone now, by design.
+
+       It used to hold the Knowledge Layer banner: a gradient hero with the
+       orb, four tool chips and a green "Connect your tools" CTA. Two pieces of
+       feedback retired it. It answered "what category of product is this"
+       rather than "what can I ask", so a first-time reader still did not know
+       what {brand} was for; and its CTA read as connecting a tool INTO
+       {brand} — the opposite of what it did, which is to carry {brand} OUT to
+       the tools you already use. The page now introduces itself in one factual
+       sentence above the composer (#chat-capabilities) and offers the routes
+       as plain labelled doors under it (.cld-doors), so nothing here has to
+       carry a slogan.
+
+       A setup CARD lived here too, briefly, for admins: the six-step chain
+       with a "0 of 6 done" meter. Removed as misleading rather than moved.
+       Three reasons, all of which are about the frame rather than the pixels —
+       it lived only in the pre-conversation state, so it vanished the moment
+       anyone typed; it presented recurring work as a ladder that finishes,
+       when connecting a second source is always legitimate; and being gated on
+       "chain incomplete" it disappeared permanently at 6 of 6, exactly when an
+       admin might still want to add a source. The chain's real home is
+       /admin, where it is one collapsible card among many and reads correctly.
+
+       What survives is the one thing that is a FACT rather than a milestone:
+       on an instance with nothing registered, nobody can ask about the company
+       at all. That is worth saying once, in a line, with the action next to it
+       — and it is true whenever it is true, so it neither graduates nor
+       returns misleadingly. #}
     <div id="chat-empty-banner" class="cloud-chat-empty-banner">
-      {# The first-run orientation link rides UNDER the hero's CTA (macro
-         param), not below the composer: under the input is where the reader's
-         context lives, and the hero is already the "what is this" block. It
-         stays a quiet text link so "Connect your tools" remains the one
-         action up there. The macro's own defaults (headline_1, orient_label)
-         already read instance_brand off this template's context (imported
-         `with context`), so no explicit args are needed here. #}
-      {{ knowledge_layer_banner() }}
+      {# The audience switch used to live here. It is chrome now — a corner
+         affordance rendered from base_ds.html on EVERY page — because inline
+         it read as part of the product, and its links could only point back
+         at /chat, so following any link off this page silently dropped the
+         preview. See templates/_dev_preview.html. #}
+      {% if admin_notice %}
+      <div class="cld-notice" role="note">
+        <span class="cld-notice-dot" aria-hidden="true"></span>
+        <span class="cld-notice-txt">
+          <strong>No data is registered yet.</strong>
+          Nobody can ask {{ instance_brand_short or 'Agnes' }} about your company until a source is
+          connected and its tables are shared.
+        </span>
+        <a class="cld-notice-cta" href="{{ admin_notice.href }}">{{ admin_notice.cta }} &rarr;</a>
+        <a class="cld-notice-more" href="/admin">Full checklist &rarr;</a>
+      </div>
+      {% endif %}
     </div>
 
     {# Shared footer partial, pinned to the very bottom of the empty state.
