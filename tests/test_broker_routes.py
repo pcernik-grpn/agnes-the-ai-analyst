@@ -795,6 +795,125 @@ def test_dispatcher_optin_empty_key_logs_warning(broker_app, monkeypatch, caplog
 
 
 # ---------------------------------------------------------------------------
+# Guard/destination-mismatch fixes: the value used to CLASSIFY the upstream
+# subpath (model allowlist / budget / dispatcher selection) and the value used
+# to BUILD the outbound URL must be one and the same canonical path. httpx
+# collapses dot-segments and duplicate slashes at send time, so any divergence
+# lets a bound agent slip past its pinned-model allowlist + monthly budget.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_upstream_path_rejects_dot_segments_and_backslash():
+    """Unit (Finding A): a literal ``.``/``..`` dot-segment or backslash in the
+    Anthropic subpath is REFUSED (400), not silently canonicalized. httpx
+    collapses ``/v1/./messages`` -> ``/v1/messages`` at send time, so accepting
+    the dot-segment form (which the old strip-empty-only normalizer classified
+    as NON-message) would reach the real messages operation while skipping the
+    per-agent model allowlist and monthly budget."""
+    from fastapi import HTTPException
+
+    from app.api.broker import _normalize_upstream_path
+
+    # legitimate slash normalization still works (unchanged behavior)
+    assert _normalize_upstream_path("/v1/messages") == "/v1/messages"
+    assert _normalize_upstream_path("/v1/messages/") == "/v1/messages"
+    assert _normalize_upstream_path("//v1//messages") == "/v1/messages"
+    assert _normalize_upstream_path("/") == "/"
+
+    for bad in (
+        "/v1/./messages",
+        "/v1/../messages",
+        "/./v1/messages",
+        "/v1/messages/..",
+        "/v1/messages/.",
+        "/v1/%2e/messages",
+        "/v1/%2e%2e/messages",
+        "/v1\\messages",
+    ):
+        with pytest.raises(HTTPException) as ei:
+            _normalize_upstream_path(bad)
+        assert ei.value.status_code == 400, bad
+        assert ei.value.detail == "broker_upstream_path_invalid", bad
+
+
+def test_anthropic_proxy_dot_segment_path_refused_before_forward(broker_app, monkeypatch):
+    """Finding A end-to-end: a dot-segment subpath reaching the handler (which
+    httpx would canonicalize to /v1/messages at send time) is REFUSED with 400
+    before any upstream call — it can never classify as non-message and slip
+    past the model allowlist / budget / dispatcher gate.
+
+    Built with a hand-crafted ASGI scope because httpx's ASGITransport collapses
+    the dot-segment client-side, so a normal TestClient request would never let
+    the raw form reach the handler."""
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    import app.api.broker as broker_mod
+
+    def _must_not_construct(*a, **k):  # pragma: no cover - must never run
+        raise AssertionError("outbound client must not be built for a dot-segment path")
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _must_not_construct)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/broker/anthropic/v1/./messages",
+        "raw_path": b"/api/broker/anthropic/v1/./messages",
+        "query_string": b"",
+        "headers": [],
+        "app": broker_app,
+    }
+
+    async def _receive():
+        return {"type": "http.request", "body": b'{"model":"x"}', "more_body": False}
+
+    request = Request(scope, _receive)
+    row = {"scope": "main", "session_id": "dot-seg-session"}
+
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(broker_mod.anthropic_proxy(request, row))
+    assert ei.value.status_code == 400
+    assert ei.value.detail == "broker_upstream_path_invalid"
+
+
+def test_dispatcher_trailing_slash_classification_and_url_agree(broker_app, monkeypatch):
+    """Finding B: a trailing-slash message path (``/v1/messages/``) classifies
+    as the dispatcher route AND the built outbound URL is the SAME canonical
+    ``/v1/messages`` (no trailing slash). Before the fix the outbound URL was
+    built from the un-normalized subpath, so authorization/dispatcher selection
+    and the final destination disagreed in shape."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setenv("LLM_DISPATCHER_URL", "http://127.0.0.1:8600")
+    monkeypatch.setenv("LLM_DISPATCHER_API_KEY", "agnes-team-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static-KEY")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_broker_anthropic(broker_app, "/v1/messages/", "chat_disp_slash")
+    assert r.status_code == 200
+    # classified as the dispatcher route (trailing slash collapsed for the gate)
+    h = _lower_keys(_UrlCapturingClient._captured)
+    assert h.get("x-api-key") == "agnes-team-key"
+    # ...and the destination matches that classification, canonicalized
+    assert _UrlCapturingClient._captured_url == "http://127.0.0.1:8600/v1/messages"
+
+
+def test_duplicate_slash_message_url_canonical(broker_app, monkeypatch):
+    """Finding B: a duplicate-slash message path forwards to the canonical
+    ``/v1/messages`` destination, not the raw ``//v1//messages`` string."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static-KEY")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_broker_anthropic(broker_app, "//v1//messages", "chat_dup_slash")
+    assert r.status_code == 200
+    assert _UrlCapturingClient._captured_url == "https://api.anthropic.com/v1/messages"
+
+
+# ---------------------------------------------------------------------------
 # Task 8 wiring: per-agent model policy / usage ledger / budget, exercised
 # end-to-end through anthropic_proxy (not just the pure-logic unit tests in
 # tests/test_broker_agent_policy.py).

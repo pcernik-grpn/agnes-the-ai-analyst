@@ -2217,8 +2217,18 @@ function enhanceTables(root) {
       const label = th.textContent;
       // Wrap the text + indicator so the indicator stays anchored
       // right while the label can ellipsis if a column is narrow.
-      th.innerHTML = `<span class="cloud-chat-th-label">${label}</span>
-        <span class="cloud-chat-th-arrow" aria-hidden="true"></span>`;
+      // `label` is untrusted (agent- or peer-authored markdown table
+      // header) — build the label span via textContent, never
+      // interpolate it into an innerHTML template (F3, security.md).
+      th.textContent = "";
+      const labelSpan = document.createElement("span");
+      labelSpan.className = "cloud-chat-th-label";
+      labelSpan.textContent = label;
+      const arrowSpan = document.createElement("span");
+      arrowSpan.className = "cloud-chat-th-arrow";
+      arrowSpan.setAttribute("aria-hidden", "true");
+      th.appendChild(labelSpan);
+      th.appendChild(arrowSpan);
       const sortRows = () => _sortTableByColumn(table, headers, idx);
       th.addEventListener("click", sortRows);
       th.addEventListener("keydown", (e) => {
