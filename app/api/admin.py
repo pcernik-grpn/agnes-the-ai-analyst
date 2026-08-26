@@ -1733,6 +1733,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "absence of a marker. Organization and Verified are unaffected."
             ),
         },
+        "auto_share_admin_uploads": {
+            "kind": "bool",
+            "default": False,
+            "hint": (
+                "Share a collection an admin creates in the Library with the "
+                "Everyone group at creation, so admin uploads are visible to "
+                "the whole workspace with no manual share step. The grant is "
+                "an ordinary Everyone grant — revocable per collection in the "
+                "Share dialog. Off by default: turning it on changes only "
+                "collections created afterwards. Non-admin uploads and chat "
+                "file drops stay private."
+            ),
+        },
     },
     "marketplace": {
         "curators_url": {
