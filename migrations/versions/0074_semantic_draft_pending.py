@@ -1,14 +1,16 @@
 """table_registry.semantic_draft_pending_at
 
-Mirrors DuckDB ``_v124_to_v125``. Dedup bookkeeping for wave 2's headless
+PG-only (A3 PG-first ratchet — the DuckDB app-state ladder is frozen at
+``FROZEN_DUCKDB_SCHEMA_VERSION``, so there is no matching ``_vN_to_v(N+1)``
+step in ``src/db.py``). Dedup bookkeeping for wave 2's headless
 semantic-model auto-drafting session (semantic-phase5): when set, a draft
 has already been queued for this table and a fresh sweep should not queue a
 second one. Plain additive column, no backfill — NULL on every existing row
 means "no draft pending", the correct reading for a table nothing has swept
 yet.
 
-Revision ID: 0073_semantic_draft_pending_v125
-Revises: 0072_sync_state_id_v124
+Revision ID: 0074_semantic_draft_pending
+Revises: 0073_agent_scope_granted_by
 Create Date: 2026-08-26
 """
 
@@ -19,8 +21,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0073_semantic_draft_pending_v125"
-down_revision: Union[str, None] = "0072_sync_state_id_v124"
+revision: str = "0074_semantic_draft_pending"
+down_revision: Union[str, None] = "0073_agent_scope_granted_by"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

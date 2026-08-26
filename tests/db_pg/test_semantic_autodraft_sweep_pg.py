@@ -227,6 +227,43 @@ class TestConcurrencyCapDegradation:
         assert body["triggered"] == 1
         assert body["no_apply_call"] == 1
 
+    def test_cap_hit_table_stays_eligible_for_a_later_tick(
+        self, state_backend, seeded_app_both, fake_chat_manager, monkeypatch
+    ):
+        """A capped table's dedup stamp must be cleared again on the way out.
+
+        The cap is enforced inside ``ChatManager.create_session``, before the
+        prompt is ever sent, so a capped table's session never started and no
+        ``authoring_suggestions`` row will ever exist to clear its flag on
+        resolution. Left stamped, the table is filtered out of every later
+        tick's candidates and is never drafted again without an admin
+        clearing it by hand (Devin review).
+        """
+        _skip_unless_pg(state_backend)
+        from src.repositories import table_registry_repo
+
+        _register_uncovered("capped")
+        _register_uncovered("fine")
+        _patch_run_one_shot(monkeypatch, raise_cap_for=("capped",))
+
+        c = seeded_app_both["client"]
+        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["skipped_cap"] == 1
+
+        registry = table_registry_repo()
+        assert registry.get("capped")["semantic_draft_pending_at"] is None
+        # The table that DID get a session keeps its stamp — that one has a
+        # suggestion resolution coming to clear it.
+        assert registry.get("fine")["semantic_draft_pending_at"] is not None
+
+        # And it really is picked up again: a second tick re-triggers it.
+        calls = _patch_run_one_shot(monkeypatch)
+        r2 = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app_both["admin_token"]))
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["triggered"] == 1
+        assert len(calls) == 1 and "capped" in calls[0]["prompt"]
+
 
 class TestAppliedDetection:
     def test_a_session_that_applies_counts_as_applied(

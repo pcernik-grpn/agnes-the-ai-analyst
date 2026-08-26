@@ -342,9 +342,12 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
 
     A session hitting the chat manager's per-user concurrency cap
     (``ConcurrencyCapHit``) is counted and skipped, never raised as a
-    500 — the table stays marked pending and is picked up once the cap
-    clears and the flag is cleared by that suggestion's resolution, or
-    (if the session never actually started) by an admin manually.
+    500 — and its dedup flag is cleared again on the way out, so the
+    table stays eligible for a later tick. That un-stamping matters: the
+    cap is enforced inside ``ChatManager.create_session``, before the
+    prompt is ever sent, so a capped table's session never started and no
+    suggestion will ever exist to clear the flag on resolution. Left set,
+    the flag would exclude the table from every future sweep permanently.
 
     Returns ``{"triggered": N, "applied": A, "no_apply_call": X,
     "skipped_cap": M, "remaining": R}`` — ``applied`` counts a table whose
@@ -427,6 +430,16 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
                 profile="semantic-model-builder",
             )
         except ConcurrencyCapHit:
+            # The cap is checked inside ``manager.create_session``, which
+            # ``run_one_shot`` calls before the prompt is ever sent — so
+            # this table's session never started and no suggestion will
+            # EVER be created for it, meaning nothing would ever clear the
+            # stamp we just wrote. Left set, the table is excluded from
+            # every future tick's candidates and is never drafted again
+            # without an admin clearing the flag by hand. Clear it here so
+            # the table simply falls back into the pool for a later tick
+            # once the cap has room.
+            registry.clear_semantic_draft_pending(table["id"])
             skipped_cap += 1
             continue
         triggered += 1

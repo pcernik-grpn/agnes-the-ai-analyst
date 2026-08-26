@@ -36,6 +36,19 @@ def build_trigger_prompt(table: dict[str, Any]) -> str:
     2. Tell the agent it is fine — preferred, even — to submit a minimal,
        explicitly-flagged-for-review model rather than invent structure or
        meaning the data does not actually support.
+
+    It also pins the ``dataset.source`` contract explicitly. The dedup flag
+    is stamped on the Agnes ``table_registry.id``, but
+    :func:`clear_pending_for_document` can only clear the ids the drafted
+    document's datasets actually resolve to — under ``source='manual'``
+    that is a literal ``id``-then-``name`` match (see
+    :func:`src.semantic.projection.resolve_dataset_table`). An agent that
+    wrote the upstream native identifier there instead (a raw Keboola
+    tableId, a ``dataset.table`` BQ path) would resolve to nothing, leaving
+    the flag set forever and the table excluded from every later sweep —
+    and it would not be credited as covered either, since coverage runs
+    through the same resolver. Stating the field contract outright is what
+    keeps that from hinging on the agent inferring it.
     """
     table_id = table.get("id") or ""
     name = table.get("name") or table_id
@@ -49,6 +62,15 @@ def build_trigger_prompt(table: dict[str, Any]) -> str:
         "to see its real columns and sample values before writing any "
         "structure. Never invent a dataset, field, relationship or metric "
         "you have not actually seen in the data.\n\n"
+        "IMPORTANT — dataset identity: set each dataset's `source` field to "
+        f"exactly `{table_id}`, the Agnes table id given above, verbatim. Do "
+        "NOT put the upstream/native identifier there (a Keboola tableId, a "
+        "BigQuery `dataset.table` path, a Snowflake fully-qualified name), "
+        "and do not reformat, prefix or shorten the id. That field is how "
+        "the document is resolved back to the registered table — both for "
+        "coverage reporting and for clearing this table's auto-draft "
+        "bookkeeping — and an identifier that does not match the Agnes id "
+        "(or its display name) resolves to nothing at all.\n\n"
         "IMPORTANT — this is a headless, unattended run: there is no human "
         "reading this conversation. Do NOT end your turn by asking a "
         "question or waiting for a go-ahead, and do not stop once you have "

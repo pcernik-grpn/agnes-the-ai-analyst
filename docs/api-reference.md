@@ -1211,7 +1211,7 @@ CLI: `agnes semantic-model coverage [--limit N] [--json]`. MCP:
 - /api/admin/semantic-auto-draft-sweep
 
 `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
-30 minutes) drafts a semantic model for up to a handful of uncovered tables
+55 minutes) drafts a semantic model for up to a handful of uncovered tables
 (`tables_without_semantic_coverage`, filtered on `table_registry.
 semantic_draft_pending_at IS NULL`) per tick via a headless
 `semantic-model-builder` chat session, authenticated as the non-admin
@@ -1222,7 +1222,10 @@ proposal — never applied directly. Each selected table's
 after), so a table can never be double-picked by an overlapping tick; the
 flag clears when an admin resolves the resulting suggestion, approve or
 reject alike. A session hitting the chat manager's concurrency cap is
-counted and skipped, never a 500.
+counted and skipped, never a 500 — and its stamp is cleared again on the
+way out, since the cap is enforced before the session starts, so no
+suggestion would ever exist to clear it and the table would otherwise be
+excluded from every future sweep permanently.
 
 Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
 "remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,

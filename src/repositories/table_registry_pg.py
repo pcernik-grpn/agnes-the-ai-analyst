@@ -340,8 +340,9 @@ class TableRegistryPgRepository:
         """Stamp ``semantic_draft_pending_at`` to now.
 
         Postgres-only (A3 PG-first ratchet): ``semantic_draft_pending_at``
-        is a PG-only column (``migrations/versions/0073_semantic_draft_pending_
-        v125.py``), so this method has no DuckDB sibling — the DuckDB
+        is a PG-only column
+        (``migrations/versions/0074_semantic_draft_pending.py``), so this
+        method has no DuckDB sibling — the DuckDB
         app-state backend simply does not gain this capability. Set BEFORE a
         headless auto-draft session is invoked for this table
         (semantic-phase5 wave 2's auto-draft sweep) — never after — so a

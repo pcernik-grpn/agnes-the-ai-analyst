@@ -657,9 +657,9 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # Semantic-layer auto-draft sweep (semantic-phase5 wave 2): drafts a
         # semantic model for a handful of uncovered tables per tick via a
         # headless chat session, landing each result in the
-        # authoring_suggestions moderation queue. `every 30m` matches the
-        # design doc's V0 cadence; no env override — one more scheduler knob
-        # is unwarranted before this has run in production. 60s timeout is
+        # authoring_suggestions moderation queue. `every 55m` is the V0
+        # cadence; no env override — one more scheduler knob is unwarranted
+        # before this has run in production. 60s timeout is
         # this HTTP call's own client-side budget only: the endpoint stamps
         # each table's dedup flag before invoking its session, so a call
         # that outruns this timeout server-side is never re-triggered for
