@@ -54,6 +54,23 @@ measures:
 
 _DOC_ID = "databricks_metrics/dbc-test.cloud.databricks.com/main.sales.orders_metrics"
 
+# A second metric view over the SAME underlying table (`source:` matches
+# `_YAML`'s) but declaring a dimension `_YAML` does not — `region` — used to
+# exercise `column_metadata` pruning when two metric views share a table_id.
+_YAML_V2 = """
+version: 1.1
+source: SELECT * FROM main.sales.orders
+dimensions:
+  - name: order_date
+    expr: o_orderdate
+  - name: region
+    expr: c_region
+measures:
+  - name: Order Count
+    expr: COUNT(o_orderkey)
+"""
+_DOC_ID_V2 = "databricks_metrics/dbc-test.cloud.databricks.com/main.sales.orders_metrics_v2"
+
 
 class FakeStatementClient:
     """Routes the two query shapes the sync issues: metric-view discovery
@@ -175,6 +192,56 @@ class TestSyncSemanticLayer:
         assert result["status"] == "ok"
         assert result["pruned"] == 0
         assert semantic_model_repo().get(_DOC_ID) is not None
+
+    def test_partial_composition_does_not_prune_the_dropped_views_column_metadata(self, e2e_env):
+        """A single composed document failing `validate_document` is
+        logged-and-dropped before reaching `project_document` — so the
+        merged model list handed to it that pass is a PARTIAL view of what
+        `extract_documents` actually composed. Two metric views sharing an
+        underlying table (`dataset.source`, `column_metadata`'s `table_id`)
+        make this observable: dropping one must not prune the OTHER's
+        already-projected columns, which upstream never asked to have
+        removed. Mirrors
+        tests/test_keboola_semantic_layer_sync.py
+        ::test_partial_composition_does_not_prune_the_dropped_models_rows."""
+        from src.repositories import column_metadata_repo, semantic_model_repo
+        from src.semantic import document_validation
+
+        table_id = "SELECT * FROM main.sales.orders"
+        two_views = [
+            ("main", "sales", "orders_metrics", "Sales KPIs"),
+            ("main", "sales", "orders_metrics_v2", "Sales KPIs v2"),
+        ]
+        client = FakeStatementClient(
+            views=two_views,
+            yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2},
+        )
+
+        _sync(client)
+        assert semantic_model_repo().get(_DOC_ID) is not None
+        assert semantic_model_repo().get(_DOC_ID_V2) is not None
+        # `region` is declared only by the v2 view — its presence confirms
+        # both views' fields were projected onto the shared table_id.
+        assert column_metadata_repo().get(table_id, "country") is not None
+        assert column_metadata_repo().get(table_id, "region") is not None
+
+        real_validate = document_validation.validate_document
+
+        def _fail_v2(text):
+            if "name: main.sales.orders_metrics_v2" in text:
+                return document_validation.ValidationResult(ok=False, errors=["forced failure for test"])
+            return real_validate(text)
+
+        with patch("src.semantic.document_validation.validate_document", side_effect=_fail_v2):
+            result = _sync(FakeStatementClient(views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2}))
+
+        assert result["status"] == "ok"
+        # "orders_metrics" still composes and projects fine.
+        assert column_metadata_repo().get(table_id, "country") is not None
+        # v2's document failed validation and was dropped — its
+        # PREVIOUSLY-WRITTEN column rows must survive this pass, not be
+        # pruned as if upstream had genuinely removed the field.
+        assert column_metadata_repo().get(table_id, "region") is not None
 
     def test_unparseable_view_is_counted_not_fatal(self, e2e_env):
         result = _sync(FakeStatementClient(yaml_by_view={"orders_metrics": None}))

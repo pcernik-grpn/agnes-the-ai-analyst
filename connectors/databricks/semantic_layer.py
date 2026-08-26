@@ -378,6 +378,50 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
         )
         counters["created_or_updated"] += 1
 
+    # `validate_document` above logs-and-drops any single composed document
+    # that fails schema validation. When that happens the merged model list
+    # below is a PARTIAL view of what `extract_documents` actually composed
+    # — projecting it with pruning at full scope would delete the dropped
+    # view's own previously-written rows (in particular its `column_metadata`
+    # rows, if it shares an underlying table with a view that DID survive),
+    # which upstream never asked to have removed. `partial=True` NARROWS the
+    # projector's prune to the views this call actually carried rather than
+    # skipping it wholesale — mirrors `connectors/keboola/semantic_layer.py`'s
+    # own `partial_composition` handling for exactly this scenario.
+    #
+    # This projection call MUST run before the `semantic_models`
+    # `delete_missing` below: `partial=True` makes the projector protect a
+    # dropped view's already-projected `column_metadata` rows by reading the
+    # OTHER currently-stored valid models' claims for the same table from
+    # `semantic_models` (`_sibling_column_claims`) — if the dropped view's
+    # own `semantic_models` row were already deleted first, there would be
+    # no sibling row left to find its claimed columns in, and the
+    # protection could never work regardless of `partial`.
+    partial_composition = len(parsed_documents) < len(documents)
+    if partial_composition:
+        logger.warning(
+            "Databricks semantic layer: %d of %d composed metric-view document(s) failed validation "
+            "and were dropped this pass (source_ref=%s); narrowing the prune to the views that "
+            "survived, so the dropped view(s)' previously-written rows are left intact.",
+            len(documents) - len(parsed_documents),
+            len(documents),
+            source_ref,
+        )
+
+    merged: dict[str, list] = {"semantic_model": []}
+    for doc in parsed_documents:
+        merged["semantic_model"].extend(doc.get("semantic_model") or [])
+    # safe_prune=True: an upstream fetch that returns zero usable measures
+    # while rows exist must not wipe the registry — same full-wipe guard the
+    # retired flat sync carried (see project_document's own docstring).
+    # `report.metrics_written`/`metrics_pruned` are not read here — see the
+    # module/function docstring: every Databricks measure is DATABRICKS-only
+    # dialect, so the projector never writes a metric_definitions row for it.
+    report = project_document(
+        merged, source=SOURCE_LABEL, source_ref=source_ref, safe_prune=True, partial=partial_composition
+    )
+    counters["skipped_conflict"] = report.name_collisions
+
     # A `documents == []` pass — zero metric views found, or every view's
     # `SHOW CREATE TABLE` call failing transiently and being swallowed into
     # `skipped_unparseable` by `extract_documents` (neither raises
@@ -390,6 +434,11 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     # `if not models: return empty_result` guard — skip only the prune (the
     # rest of this pass, e.g. discovery counters, still runs) and log loudly
     # instead of silently deleting good data.
+    #
+    # Runs AFTER `project_document` above (see that call's comment for why):
+    # this document-level prune only removes the now-stale `semantic_models`
+    # row itself, once the projector has already read it to protect the
+    # dropped view's `column_metadata` rows.
     if not documents and existing_by_slug:
         logger.warning(
             "Databricks semantic layer: upstream returned zero metric-view documents for "
@@ -403,18 +452,6 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     else:
         pruned_slugs = repo.delete_missing(source=SOURCE_LABEL, source_ref=source_ref, keep_slugs=keep_slugs)
     counters["pruned"] = len(pruned_slugs)
-
-    merged: dict[str, list] = {"semantic_model": []}
-    for doc in parsed_documents:
-        merged["semantic_model"].extend(doc.get("semantic_model") or [])
-    # safe_prune=True: an upstream fetch that returns zero usable measures
-    # while rows exist must not wipe the registry — same full-wipe guard the
-    # retired flat sync carried (see project_document's own docstring).
-    # `report.metrics_written`/`metrics_pruned` are not read here — see the
-    # module/function docstring: every Databricks measure is DATABRICKS-only
-    # dialect, so the projector never writes a metric_definitions row for it.
-    report = project_document(merged, source=SOURCE_LABEL, source_ref=source_ref, safe_prune=True)
-    counters["skipped_conflict"] = report.name_collisions
 
     # One-time retirement of the pre-cutover source, scoped to this
     # workspace. Gated on this pass having actually stored at least one
