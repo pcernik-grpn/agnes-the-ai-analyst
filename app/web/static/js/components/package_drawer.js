@@ -147,19 +147,11 @@
       '          <p class="ds-drawer__hint">The eyebrow line above the card title in the Library.</p>' +
       '        </div>' +
       '      </div>' +
-      '      <div class="ds-drawer__row">' +
-      '        <div class="ds-drawer__field">' +
-      '          <label for="pdw-icon">Icon <span class="ds-drawer__opt">(optional)</span></label>' +
-      '          <input type="text" id="pdw-icon" autocomplete="off" maxlength="4" placeholder="📦">' +
-      '        </div>' +
-      '        <div class="ds-drawer__field">' +
-      '          <label for="pdw-color">Colour</label>' +
-      '          <div class="pdw-color">' +
-      '            <div class="cf-palette-row" data-target="pdw-color"></div>' +
-      '            <input type="color" id="pdw-color" value="#0EA5B5" class="ds-drawer__color">' +
-      '          </div>' +
-      '        </div>' +
-      '      </div>' +
+      // Icon and Colour are GONE. Under the paper/rail redesign the resource
+      // hero draws a kind glyph (`cards.kind_glyph`), and macros/_detail.html
+      // takes `icon` and `color` as parameters but never emits either — so
+      // these were two fields whose only effect was to be stored. The cover
+      // image below is different: it IS still painted, overlaying the glyph.
       '      <div class="ds-drawer__field">' +
       '        <label for="pdw-cover-file">Cover image <span class="ds-drawer__opt">(optional)</span></label>' +
       '        <div class="pdw-cover">' +
@@ -222,8 +214,6 @@
       desc: root.querySelector('#pdw-desc'),
       status: root.querySelector('#pdw-status'),
       category: root.querySelector('#pdw-category'),
-      icon: root.querySelector('#pdw-icon'),
-      color: root.querySelector('#pdw-color'),
       coverFile: root.querySelector('#pdw-cover-file'),
       coverUrl: root.querySelector('#pdw-cover-url'),
       coverPreview: root.querySelector('#pdw-cover-preview'),
@@ -722,9 +712,6 @@
     els.desc.value = '';
     els.status.value = 'prod';
     els.category.value = '';
-    els.icon.value = '';
-    els.color.value = '#0EA5B5';
-    els.color.dispatchEvent(new Event('change', { bubbles: true }));
     // Reset the cover on every open so a picked-then-cancelled image can
     // never ride along into the next package.
     els.coverFile.value = '';
@@ -791,11 +778,6 @@
       els.desc.value = pkg.description || '';
       els.status.value = pkg.status || 'prod';
       els.category.value = pkg.category || '';
-      els.icon.value = pkg.icon || '';
-      if (pkg.color) {
-        els.color.value = pkg.color;
-        els.color.dispatchEvent(new Event('change', { bubbles: true }));
-      }
       els.coverUrl.value = pkg.cover_image_url || '';
       renderCover(pkg.cover_image_url || '');
       els.submit.disabled = false;
@@ -1038,8 +1020,6 @@
         body: JSON.stringify({
           name: name,
           description: els.desc.value.trim() || null,
-          icon: els.icon.value.trim() || null,
-          color: els.color.value.trim() || null,
           cover_image_url: els.coverUrl.value || '',
           status: els.status.value || 'prod',
           category: els.category.value.trim(),
@@ -1127,8 +1107,6 @@
         name: name,
         slug: slug,
         description: els.desc.value.trim() || null,
-        icon: els.icon.value.trim() || null,
-        color: els.color.value.trim() || null,
         cover_image_url: els.coverUrl.value || null,
         status: els.status.value || 'prod',
         category: els.category.value.trim() || null,

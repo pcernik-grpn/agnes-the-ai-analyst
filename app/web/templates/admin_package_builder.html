@@ -17,6 +17,14 @@
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+{# The drawer's OWN controls — the table tree, the group grant rows and their
+   Optional/Automatic toggles. Without this they render as native checkboxes
+   and unstyled buttons: the markup is package_drawer.js's, so its sheet has
+   to come with it wherever it is mounted. #}
+<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
+{# The category picker is a ds-dropdown; unstyled it falls back to a bare
+   <select> beside its own chevron. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {# The builder workspace: two panes, the shell header, the full-bleed
    breakout. Shared with the other builders — see builder.css. #}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
@@ -37,6 +45,9 @@
 {# Not deferred: the builder mounts on boot, so BuilderShell has to exist
    before the script below runs. #}
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+{# The category picker initialises itself from this; without it the drawer
+   renders the branded dropdown's markup with nothing driving it. #}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script>
   (function () {

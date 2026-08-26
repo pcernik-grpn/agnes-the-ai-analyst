@@ -97,7 +97,7 @@
 
   /* Step 1 once answered: a one-line summary that keeps the choice visible
      and revisable without spending the room the three cards need. */
-  .sk-sec--done .sk-sec-head { padding: 12px 18px; }
+  .sk-sec--done .sk-sec-head { padding: 13px 4px; }
   .sk-sec-no--done { background: var(--ds-accent-success-bg); border-color: var(--ds-accent-success-line); color: var(--ds-accent-success-ink); }
   .sk-sec-collapsed { display: flex; align-items: center; gap: 11px; }
   .sk-sec-collapsed .sk-ava { width: 30px; height: 30px; border-radius: 9px; }
@@ -163,8 +163,12 @@
   .sk-access-hint { font-size: 12.5px; line-height: 1.45; color: var(--ds-text-secondary); }
 
   /* Numbered sections. */
-  .sk-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
-  .sk-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
+  /* Step 1 keeps its own markup (it is a decision already made, not an
+     editable section) but must not keep its own LOOK: on the grey panel the
+     shared sections are hairline-separated rows, so a white card here would
+     be the only floating thing in the column. */
+  .sk-sec { border-bottom: 1px solid var(--ds-border); }
+  .sk-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 4px; }
   .sk-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
   .sk-sec-head h3 { font-size: 15px; margin: 0; }
   .sk-sec-head h3 .sk-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }

@@ -198,3 +198,84 @@ class TestThePageBuilderDoesNotPaintOverTheRail:
         body = rule.group(1)
         assert "z-index: auto" in body, "page mode is keeping the overlay stacking order"
         assert "position: static" in body
+
+
+class TestTheConfigurationPanelIsOneSurface:
+    """Sections sit ON the grey panel, not as white cards floating on it.
+
+    Six stacked cards inside a panel that is itself a distinct surface was two
+    levels of container for one list: the eye reads the card edges before the
+    headings, and it got busier the more of the form you filled in.
+    """
+
+    def test_sections_have_no_card_of_their_own(self, css):
+        rule = re.search(r"\n\.ag-sec \{([^}]*)\}", css)
+        assert rule, ".ag-sec rule not found"
+        body = rule.group(1)
+        assert "background:" not in body, "the section is painting its own surface again"
+        assert "border-radius" not in body, "the section is a card again"
+        assert "border-bottom" in body, "sections need a hairline to separate them"
+
+    def test_the_body_has_no_rule_above_it(self, css):
+        """A line between a heading and the thing it names separates the wrong
+        two things. The rule that matters is BETWEEN sections."""
+        rule = re.search(r"\.ag-sec-body \{([^}]*)\}", css)
+        assert rule and "border-top" not in rule.group(1)
+
+    def test_the_last_section_does_not_end_in_a_stray_line(self, css):
+        assert ".ag-sec:last-child { border-bottom: none; }" in css
+
+    def test_the_skills_type_step_matches(self):
+        """Step 1 keeps its own markup but must not keep its own look — a lone
+        white card in a column of hairline rows."""
+        skills = (ROOT / "app" / "web" / "templates" / "skills.html").read_text(encoding="utf-8")
+        rule = re.search(r"\n  \.sk-sec \{([^}]*)\}", skills)
+        assert rule, ".sk-sec rule not found"
+        assert "background:" not in rule.group(1) and "border-radius" not in rule.group(1)
+
+
+class TestThePackageBuilderShipsItsOwnControls:
+    """The page mounts package_drawer.js, so it has to carry that component's
+    stylesheet too — the table tree, the grant rows and their Optional /
+    Automatic toggles are its markup. Without it they render as native
+    checkboxes and unstyled buttons.
+    """
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return (ROOT / "app" / "web" / "templates" / "admin_package_builder.html").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("asset", ["css/package_drawer.css", "css/drawer.css", "css/ds_dropdown.css"])
+    def test_the_drawers_own_sheets_are_loaded(self, page, asset):
+        assert asset in page, f"{asset} missing — the drawer's controls will render unstyled"
+
+    def test_the_dropdown_script_is_loaded(self, page):
+        """The category picker initialises from it; without it the branded
+        markup renders with nothing driving it."""
+        assert "js/components/ds_dropdown.js" in page
+
+
+class TestDeadPresentationFieldsAreGone:
+    """Icon and Colour were two fields whose only effect was to be stored.
+
+    Under the paper/rail redesign the resource hero draws a kind glyph
+    (`cards.kind_glyph`); macros/_detail.html accepts `icon` and `color` as
+    parameters and emits neither. The cover image is deliberately KEPT — it is
+    still painted, overlaying that glyph — so this is not "remove the
+    presentation fields", it is "remove the two that do nothing".
+    """
+
+    def test_icon_and_colour_are_not_offered(self, drawer):
+        for dead in ("pdw-icon", "pdw-color", "els.icon", "els.color"):
+            assert dead not in drawer, f"{dead} is back — it has no effect on any surface"
+
+    def test_the_cover_image_is_still_offered(self, drawer):
+        assert "pdw-cover-file" in drawer, "the cover image still renders on the package detail page"
+
+    def test_the_hero_still_ignores_icon_and_colour(self):
+        """If this fails the fields may be worth having again — the macro
+        started using them, and the builder can no longer set them."""
+        macro = (ROOT / "app" / "web" / "templates" / "macros" / "_detail.html").read_text(encoding="utf-8")
+        body = macro[macro.index("{% macro hero("):]
+        assert not re.search(r"\{\{ *icon *\}\}", body), "the hero now emits `icon` — the builder cannot set it"
+        assert "cover_image_url" in body, "the hero stopped using the cover image — then it can go too"
