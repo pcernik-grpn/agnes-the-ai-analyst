@@ -24,6 +24,34 @@ external source at all.
 
 Table definitions are stored in the DuckDB `table_registry` table (not in config files). Register tables via the admin API, CLI, or web UI.
 
+## Connection ownership: `source_connections` vs `instance.yaml`
+
+Keboola, BigQuery, Snowflake and Databricks each get one managed row in the
+`source_connections` table, reachable via `POST/GET/PUT/DELETE
+/api/admin/source-connections` (`agnes admin connection …`). A row's `config`
+is validated and normalized at write time by `src/connection_specs.py` — an
+unknown `source_type` or a malformed config (e.g. a non-`https://`
+`stack_url`) is rejected with a 400 naming the field. On first boot,
+`app/connections_seed.py` seeds a row for each type from whatever
+`instance.yaml` / env vars are already configured — a one-time, no-op-if-a-row-
+already-exists copy, not a live sync; editing `instance.yaml` afterwards logs a
+deprecation warning and is otherwise ignored.
+
+The row is meant to become the single live source of truth per source type,
+but that migration is happening in stages:
+
+| Source | Config actually used at query time TODAY | Row seeded on first boot |
+|---|---|---|
+| `keboola` | the `source_connections` row (multi-project, #1530) | yes |
+| `bigquery` | still `instance.yaml` (`data_source.bigquery`) / `/admin/server-config` | yes |
+| `snowflake` | still `instance.yaml` (`data_source.snowflake`) / `/admin/server-config` | yes |
+| `databricks` | still `instance.yaml` (`data_source.databricks`) / `/admin/server-config` | yes |
+
+Until BigQuery/Snowflake/Databricks resolution reads the row live (a
+follow-up), a `source_connections` row for those three types exists but is
+**not yet load-bearing** — the actual settings an in-flight sync or query uses
+still come from `instance.yaml`. Only Keboola's row is consulted today.
+
 ## Query Modes
 
 Each table has a `query_mode` that determines how data is accessed:

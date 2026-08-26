@@ -12,6 +12,37 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
+  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
+  collection an admin creates via the Library/API is granted to the `Everyone`
+  group at creation, so admin uploads are workspace-visible — in the Library,
+  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
+  without a manual share step. The grant is an ordinary revocable Everyone
+  grant; non-admin uploads and chat file drops stay private. The
+  `POST /api/collections` response now reports the resulting `visibility`
+  (`workspace`/`private`).
+- **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
+  (remediation-program Track C1.1, additive — the builder router is
+  unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
+  the builder's wire fields (`role`, `instructions` as an alias for the
+  existing `system_prompt`, `tone`, `greeting`, `knowledge`, `plugins`,
+  `surfaces`, `status`, `template_entity_id`); `slug` is now optional on
+  create and auto-derived from `name` when omitted. A `knowledge`/`plugins`
+  write goes through the SAME `_sync_builder_scope` mapping the builder
+  uses and forces any of the four `*_mode` columns the caller left unset to
+  `'selected'` on that same write — exactly like the builder's own PATCH —
+  so `agent_scope` enforcement is identical through either surface and an
+  agent sitting at `mode='all'` (e.g. the seeded default) cannot keep
+  passing its owner's whole stack through on an axis a `knowledge`/`plugins`
+  edit didn't mention. A draft agent's slug follows a rename exactly like
+  the builder's own PATCH does. `GET /api/v1/agents{,/{id}}` decode
+  `knowledge`/`plugins`/`surfaces` into structured JSON (previously opaque
+  text) and now include
+  agents shared into one of the caller's groups, not just owned ones — the
+  same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
+  also cleans up sharing grants on delete, closing a gap versus the
+  builder's own delete.
+
 - **`data_apps.subdomain_base` can now be set from the deployment, not only by
   hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
   env override plus a per-VM `data_apps_subdomain_base` field on the
@@ -68,6 +99,108 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   is not a general open redirect, since the target is always this deployment's
   own infrastructure behind the same RBAC.
 
+### Internal
+
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
+### Added
+
+- **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
+  the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
+  `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
+  of its own, so an enabled provider with no allowed domain means any Google
+  account can sign in and self-provision, and nothing said so at boot. Found
+  during RBAC review of the `config/loader.py` required-fields demotion above:
+  that loader check used to be an accidental loud signal for exactly this gap
+  (a missing `auth.allowed_domain` discarded the whole static config with an
+  ERROR log) and is now a passive warning, so the gap needed its own explicit
+  check.
+- Snowflake connection spec in `src/connection_specs.py` (config keys
+  `account`/`user`/`database`/`warehouse`/`role`/`auth_type`, mirroring
+  `resolve_snowflake_settings`'s read set), and first-boot seeding
+  (`app/connections_seed.py`) of default Snowflake and Databricks
+  `source_connections` rows from `instance.yaml`, matching the existing
+  Keboola/BigQuery seeding. These rows are not yet consulted at query time —
+  Snowflake/Databricks/BigQuery still resolve from `instance.yaml` until a
+  follow-up makes the row live — see the connection-ownership table in
+  `docs/DATA_SOURCES.md`.
+
+### Changed
+
+- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
+  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
+  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
+  `instance.theme` / `instance.experience` / `instance.home_route` /
+  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
+  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
+  UI (`/admin/server-config`) owns them from day 2 onward instead of having
+  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
+  value and permanently shadow the operator's own change. **Existing VMs**:
+  on their next boot the old always-wins `.env` lines disappear; the value
+  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
+  relied on Terraform re-asserting one of these four knobs every boot must
+  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
+  by hand). No app-side precedence change — a hand-set env var still wins
+  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
+  is unaffected (it pins deployment-provisioned backing, not a presentation
+  choice, so it is out of scope). See the new "Config ownership map" in
+  `docs/CONFIGURATION.md`.
+
+### Removed
+
+- **BREAKING: the `/api/agents` builder-CRUD router is deleted**
+  (remediation-program Track C1.2 — "one agent model"). `/api/v1/agents*`
+  is now the ONLY agent API; it absorbed every operation the router served
+  in the previous release (Track C1.1). The Agent builder page (`/agents`)
+  is re-pointed at v1 and behaves the same, with two intentional
+  deviations: `POST /api/v1/agents` requires a non-blank `name` (v1's
+  pre-existing rule), so the builder's "New agent" now sends a placeholder
+  (`"Untitled"`) instead of minting a fully blank draft; and a client
+  supplying an explicit `slug` on `PUT /api/v1/agents/{id}` gets a flat 400
+  `slug_immutable` rather than having it silently dropped, closing that gap
+  a notch tighter than the deleted router's own PATCH did. New agent ids
+  are plain UUIDs — the deleted router's `agt_`-prefixed convention (used
+  only to distinguish builder-created rows in one now-completed one-time
+  migration) is retired; existing `agt_`-prefixed rows are unaffected.
+  `POST /api/v1/agents` now also marks the "Create your first agent"
+  onboarding step, closing a gap versus a plain (non-builder-shape) v1
+  create that never did. Direct callers of `/api/agents*` (there were none
+  outside this repo's own web UI) must move to `/api/v1/agents*`; see
+  `docs/api-reference.md`.
+- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
+  `jira:` section is gone from both the `/admin/server-config` UI (it never
+  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
+  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
+  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
+  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
+  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
+  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
+  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
+  (zero readers — found during a sweep for other dead keys in the same
+  section). `deployment.role` is unaffected.
+
 ### Fixed
 
 - **A signed-out visitor opening a data-app URL on an app subdomain no longer
@@ -84,6 +217,46 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   deliberately not carried across: `safe_next_path` refuses non-same-origin
   targets by design, so post-login return to the app is a separate change to
   that guard rather than a side effect of this one.
+
+- **The GCP Cloud Logging overlay can no longer take an instance down**
+  (#1557, #1558; observed live as a 9-minute full outage on a routine
+  auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
+  service account, but the `customer-instance` Terraform module granted it
+  no logging role while defaulting `enable_gcp_logging = true` — and Docker
+  refuses to START a container whose log driver cannot initialize, so the
+  first container recreate with the overlay armed turned into 502s. Two
+  halves: (1) the module now grants `roles/logging.logWriter` on the
+  project to the VM service account, gated on the same `enable_gcp_logging`
+  variable (the deploying identity must be able to modify project IAM
+  policy — documented on the variable; grant the role out-of-band or
+  disable the flag otherwise); (2) defense in depth — the overlay is
+  engaged only when the overlay file is present AND a driver probe
+  (`agnes_gcp_logging_probe`: a no-op container on `--log-driver=gcplogs`)
+  has armed the `/opt/agnes/.gcp-logging-ok` marker. The probe runs at boot
+  and on any auto-upgrade tick that finds the overlay marker-less, and the
+  single shared gate (`agnes_gcp_logging_active` in
+  `scripts/ops/agnes-compose-file.sh`) is used by the boot startup script,
+  the auto-upgrade tick, and the state applier alike — so the boot-time
+  `COMPOSE_FILE` and the recurring resolver can never disagree about the
+  overlay again, and a missing IAM role now degrades to "Cloud Logging off
+  + loud warning" instead of an outage.
+- **`config/loader.py` no longer raises on a static `instance.yaml` missing
+  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
+  `auth.webapp_secret_key`.** The check never actually gated anything: a
+  provisioned VM ships no static `instance.yaml` at all (the loader raises
+  `FileNotFoundError` first), and `app.instance_config` already caught the
+  `ValueError` and served built-in defaults regardless. It now logs a
+  warning naming the missing field(s) instead of raising, so a direct caller
+  of `config.loader.load_instance_config()` (e.g. a connector script) no
+  longer gets an exception on an otherwise-bootable config.
+- `POST`/`PUT /api/admin/source-connections` now validate `source_type` +
+  `config` via `src.connection_specs.validate_connection_config`: an unknown
+  `source_type` or a malformed config (e.g. a non-`https://` `stack_url`, a
+  BigQuery config missing `project`) is rejected with `400` naming the
+  offending field, instead of being stored unchecked and only surfacing
+  later as a confusing sync failure. An empty config at create/update still
+  succeeds — the "Add data source" wizard creates a connection row before
+  its config is complete.
 
 ## [0.89.1] - 2026-08-26
 
@@ -200,6 +373,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sibling parts of the same table, and the same table on a later rebuild once
   the source part is repaired, are unaffected. (#1364)
 
+### Internal
+
+- **The release-cut moves out of feature PRs and into one daily cut PR.**
+  The old rule — whichever PR happened to land last with content under
+  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
+  section — raced two PRs against the same version number and produced a
+  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
+  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
+  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
+  the new `.github/workflows/daily-cut.yml` (minor bump by default,
+  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
+  labeled `release-cut` that a human reviews and merges — the workflow
+  never merges or tags anything itself. The cut arithmetic is pure
+  functions in `scripts/release_cut.py` (unit-tested in
+  `tests/test_release_cut.py`, including a guard against the known
+  3-way-merge duplicate-heading failure class), reused for the emergency
+  manual path when Actions dispatch isn't available. See
+  `docs/RELEASING.md` for the full ritual and the train-driver operating
+  rule.
 
 ## [0.88.0] - 2026-08-25
 

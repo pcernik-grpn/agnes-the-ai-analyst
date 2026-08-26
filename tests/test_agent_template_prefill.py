@@ -3,7 +3,9 @@
 The relationship between the two entities was invisible from the creation
 flow: a template is what you build an agent OUT OF, and the only way to act on
 that was to open the template, copy its prompt, and paste it into a blank
-agent. ``POST /api/agents`` now takes ``template_entity_id``.
+agent. ``POST /api/v1/agents`` now takes ``template_entity_id`` (originally
+added to the builder's own ``/api/agents`` router, folded in by Task C1.1
+and the router deleted by Task C1.2).
 
 The load-bearing rule is what the template does NOT bring. It carries
 behaviour — role, instructions — and never knowledge, tables or connections,
@@ -70,7 +72,7 @@ class TestPrefill:
     def test_the_template_body_becomes_the_agents_instructions(self, seeded_app, template):
         entity_id, body = template
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={"name": "From Template", "template_entity_id": entity_id},
             headers=_auth(seeded_app["analyst_token"]),
         )
@@ -84,7 +86,7 @@ class TestPrefill:
         """A template is a starting point, not an override."""
         entity_id, _ = template
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={
                 "name": "Mine",
                 "template_entity_id": entity_id,
@@ -102,7 +104,7 @@ class TestTemplateNeverCarriesData:
     def test_knowledge_stays_empty(self, seeded_app, template):
         entity_id, _ = template
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={"name": "No Data", "template_entity_id": entity_id},
             headers=_auth(seeded_app["analyst_token"]),
         )
@@ -115,7 +117,7 @@ class TestTemplateNeverCarriesData:
     def test_starting_blank_is_still_supported(self, seeded_app):
         """No template is the ordinary path and must not have regressed."""
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={"name": "Blank"},
             headers=_auth(seeded_app["analyst_token"]),
         )
@@ -126,7 +128,7 @@ class TestTemplateNeverCarriesData:
 class TestAccess:
     def test_an_unknown_template_404s(self, seeded_app):
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={"name": "X", "template_entity_id": "does-not-exist"},
             headers=_auth(seeded_app["analyst_token"]),
         )
@@ -153,7 +155,7 @@ class TestAccess:
         )
         assert created.status_code == 201, created.text
         resp = seeded_app["client"].post(
-            "/api/agents",
+            "/api/v1/agents",
             json={"name": "X", "template_entity_id": created.json()["id"]},
             headers=_auth(seeded_app["analyst_token"]),
         )

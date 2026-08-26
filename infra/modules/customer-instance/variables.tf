@@ -60,9 +60,12 @@ variable "prod_instance" {
     # Chrome the web UI renders in. Per-VM (not module-wide) for the same
     # reason as dispatcher_enabled / data_apps_enabled below: a look is
     # rolled out dev-first, previewed on a dev VM, and promoted to prod only
-    # once it looks right. Empty (the default) writes NO env line, so the
-    # instance keeps whatever `instance.theme` says in instance.yaml — or the
-    # app's own default when that is unset too.
+    # once it looks right. First-boot seed only (D1, 2026-08): a non-empty
+    # value is written into instance.yaml's `instance.theme` the FIRST time
+    # this VM boots (never on a later apply/recreate) — the admin UI
+    # (`/admin/server-config`) owns it from day 2 onward. Empty (the default)
+    # seeds nothing, so the instance keeps whatever `instance.theme` already
+    # says in instance.yaml — or the app's own default when that is unset too.
     #   theme: "" | "blue" | "navy" | "dark" | "auto" | "paper" (app default)
     #
     # ui_layout is RETIRED (app >= the Wave 0 legacy retirement, 2026-08): the
@@ -77,17 +80,18 @@ variable "prod_instance" {
     # to the VM from it any more — drop the line from your root when convenient.
     ui_layout = optional(string, "")
     theme     = optional(string, "")
-    # Experience preset (app >= 0.83.1), written as AGNES_INSTANCE_EXPERIENCE.
-    # `redesign` flips the app-side DEFAULTS of the coupled knobs (theme ->
-    # paper, features.stack_auto_membership -> on); any per-knob setting — the
-    # `theme` field above, or instance.yaml — still wins, so don't set both
-    # this and `theme` unless you mean to pin a divergence. Chrome layout is
-    # NO LONGER part of the coupling: the rail is unconditional.
-    # Empty (the default) writes NO env line: the instance keeps whatever
-    # `instance.experience` says in instance.yaml, or the app's `redesign`
-    # default. NOTE: like every startup-script value, this reaches a VM on
-    # creation/recreate only (`ignore_changes = [metadata_startup_script]`);
-    # a live instance is switched at runtime via /admin/server-config.
+    # Experience preset (app >= 0.83.1). `redesign` flips the app-side
+    # DEFAULTS of the coupled knobs (theme -> paper, features.
+    # stack_auto_membership -> on); any per-knob setting — the `theme` field
+    # above, or instance.yaml — still wins, so don't set both this and
+    # `theme` unless you mean to pin a divergence. Chrome layout is NO LONGER
+    # part of the coupling: the rail is unconditional.
+    # First-boot seed only (D1, 2026-08): a non-empty value is written into
+    # instance.yaml's `instance.experience` the FIRST time this VM boots
+    # (never on a later apply/recreate) — the admin UI
+    # (`/admin/server-config`) owns it from day 2 onward. Empty (the default)
+    # seeds nothing, so the instance keeps whatever `instance.experience`
+    # already says in instance.yaml, or the app's `redesign` default.
     #   experience: "" | "redesign" (app default)
     # `classic` is RETIRED and rejected below — same reasoning as ui_layout.
     experience = optional(string, "")
@@ -603,7 +607,7 @@ variable "acme_email" {
 }
 
 variable "home_route" {
-  description = "Landing page after auth, applied instance-wide by writing AGNES_HOME_ROUTE into /opt/agnes/.env. One of /home (state-aware onboarding), /dashboard (legacy table inventory), /setup, /catalog. Empty (default) omits the env line entirely so the app falls through to instance.home_route in instance.yaml and then its built-in /dashboard default — keeping the route operator-settable at runtime via /admin/server-config. Set a non-empty value to pin it at deploy time (the env var overrides the YAML, so don't do both). Per-VM divergence isn't exposed yet; it applies to prod + all dev VMs in the instance."
+  description = "Landing page after auth. One of /home (state-aware onboarding), /dashboard (legacy table inventory), /setup, /catalog. First-boot seed only (D1, 2026-08): a non-empty value is written into instance.yaml's `instance.home_route` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. Empty (default) seeds nothing, so the app falls through to its built-in /dashboard default. Applies to prod + all dev VMs in the instance (module-wide, not per-VM)."
   type        = string
   default     = ""
   validation {
@@ -613,7 +617,7 @@ variable "home_route" {
 }
 
 variable "studio_enabled" {
-  description = "Expose the authoring Studio (/admin/studio). Set false to hide it and close its routes for this instance (plumbed to the app as AGNES_STUDIO_ENABLED)."
+  description = "Expose the authoring Studio (/admin/studio). First-boot seed only (D1, 2026-08): `false` is written into instance.yaml's `studio.enabled` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. `true` (default) seeds nothing, matching the app's own default."
   type        = bool
   default     = true
 }
@@ -625,7 +629,31 @@ variable "enable_watchdog" {
 }
 
 variable "enable_gcp_logging" {
-  description = "Ship every container's stdout/stderr to Google Cloud Logging via Docker's built-in gcplogs driver, in addition to the local dual-logging cache `docker logs` reads from. On: the startup script extracts docker-compose.gcp-logging.yml (baked into the image) into the app directory, which the COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) then includes on every `docker compose` invocation — so logs survive the routine container recreates the auto-upgrade cron performs every 5 minutes, which otherwise destroy the Docker json-file log history. Off: the script removes the file instead, keeping the instance on the default json-file driver (rotated by /etc/docker/daemon.json) — the only supported choice for a non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server credentials."
+  description = <<-EOT
+    Ship every container's stdout/stderr to Google Cloud Logging via Docker's
+    built-in gcplogs driver, in addition to the local dual-logging cache
+    `docker logs` reads from. On: the module grants roles/logging.logWriter
+    on the project to the VM service account (the gcplogs driver
+    authenticates as that account, and Docker refuses to START a container
+    whose log driver cannot initialize — without the role, any container
+    recreate takes the instance down), and the startup script extracts
+    docker-compose.gcp-logging.yml (baked into the image) into the app
+    directory, probes that the driver actually initializes, and only then
+    arms the overlay for the COMPOSE_FILE resolver
+    (scripts/ops/agnes-compose-file.sh) to include on every `docker compose`
+    invocation — so logs survive the routine container recreates the
+    auto-upgrade cron performs every 5 minutes, which otherwise destroy the
+    Docker json-file log history. The IAM grant means the identity running
+    `terraform apply` must be allowed to modify project IAM policy (e.g.
+    roles/resourcemanager.projectIamAdmin); if yours cannot, grant
+    roles/logging.logWriter to the VM service account out-of-band or set
+    this to false — a VM without the role stays up either way (the probe
+    disables the overlay with a warning) but ships no logs. Off: the script
+    removes the file instead, keeping the instance on the default json-file
+    driver (rotated by /etc/docker/daemon.json) — the only supported choice
+    for a non-GCE / non-GCP deployment, since gcplogs needs GCE
+    metadata-server credentials.
+  EOT
   type        = bool
   default     = true
 }

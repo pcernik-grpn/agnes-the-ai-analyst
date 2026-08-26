@@ -484,7 +484,7 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
 # --- Server-config (instance.yaml) editor -----------------------------------
 #
 # The /admin/server-config UI POSTs a partial dict here keyed by section
-# (instance, data_source, email, telegram, jira, theme, server, auth) with
+# (instance, data_source, email, telegram, theme, server, auth) with
 # the field values to merge into instance.yaml. Each save:
 #   1. Loads the current instance.yaml (writable overlay first, then static).
 #   2. Deep-merges the patch on top.
@@ -512,7 +512,6 @@ _STATIC_EDITABLE_SECTIONS: tuple[str, ...] = (
     "data_source",
     "email",
     "telegram",
-    "jira",
     "theme",
     "server",
     "auth",
@@ -578,7 +577,6 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "email": "restart",  # conservative: the actual SMTP send path (app/auth/providers/email.py, password.py) reads SMTP_HOST/SMTP_USER/SMTP_PASSWORD straight from os.environ, never from get_value("email", ...) — a save here was not observed to change behavior at all, live or restart; "restart" is the non-overclaiming answer
     "telegram": "restart",  # services/telegram_bot/bot.py reads instance.yaml ONCE at module import, in a separate process — restarting the API alone does not refresh it
     "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above
-    "jira": "restart",  # connectors/jira/service.py's _JiraConfig snapshots JIRA_* env vars at class-body eval (import time); no instance.yaml wiring was found for this section at all
     "corporate_memory": "restart",  # partial: most keys (distribution_mode/approval_mode/sources.*) are read fresh via get_corporate_memory_config() per page render, but corporate_memory.confidence is applied ONCE at startup via services/corporate_memory/confidence.configure() (app/main.py) — conservative for the whole section, same reasoning as auth
     "openmetadata": "live",  # src/catalog_export.py reads instance config fresh at each invocation (a standalone job, not a long-lived cached client)
 }
@@ -1243,9 +1241,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
     "telegram": {
         # Rarely missing; leave empty.
     },
-    "jira": {
-        # Webhook + REST credentials always present when Jira is configured.
-    },
     "theme": {
         # Cosmetic only; rarely missing.
     },
@@ -1731,6 +1726,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Organization, Verified, or Community. Turn it off to restore "
                 "the older look, where an unverified item is marked only by the "
                 "absence of a marker. Organization and Verified are unaffected."
+            ),
+        },
+        "auto_share_admin_uploads": {
+            "kind": "bool",
+            "default": False,
+            "hint": (
+                "Share a collection an admin creates in the Library with the "
+                "Everyone group at creation, so admin uploads are visible to "
+                "the whole workspace with no manual share step. The grant is "
+                "an ordinary Everyone grant — revocable per collection in the "
+                "Share dialog. Off by default: turning it on changes only "
+                "collections created afterwards. Non-admin uploads and chat "
+                "file drops stay private."
             ),
         },
     },

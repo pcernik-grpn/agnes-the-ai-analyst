@@ -155,13 +155,20 @@ database:
   backend: side_car
 YAML
     # Vendor-neutral per-instance branding (logo_svg / brand / subtitle /
-    # copyright / favicon / theme colours / custom_scripts) from the Terraform variables,
-    # pre-rendered to a base64'd top-level `instance:` + `theme:` YAML fragment.
-    # Appended ONLY here, inside the "file absent" branch, so it seeds a fresh
-    # instance without ever clobbering an operator's later edits or a migrated
-    # database.backend. The app reads these keys back from this same file (see
-    # app/instance_config.py; theme colours recolor the design-system --ds-*
-    # tokens). Empty when the caller set no branding -> the block is skipped
+    # copyright / favicon / theme colours / custom_scripts) PLUS — since D1,
+    # 2026-08 — the presentation knobs that used to be always-wins `.env`
+    # lines: `instance.theme` (palette name), `instance.experience`,
+    # `instance.home_route` and `studio.enabled`. All of it comes from the
+    # Terraform variables, pre-rendered to a base64'd top-level
+    # `instance:` + `theme:` + `studio:` YAML fragment. Appended ONLY here,
+    # inside the "file absent" branch, so it seeds a fresh instance without
+    # ever clobbering an operator's later edits or a migrated
+    # database.backend — from day 2 onward, `/admin/server-config` (or a
+    # hand-edit of this file) is the only way to change any of these, exactly
+    # like the branding fields. The app reads these keys back from this same
+    # file (see app/instance_config.py; theme colours recolor the
+    # design-system --ds-* tokens). Empty when the caller set no branding and
+    # left every presentation knob at its default -> the block is skipped
     # entirely and instance.yaml is byte-for-byte the database-only file above.
     # base64 carries the multi-line SVG / script HTML across the metadata
     # boundary without any heredoc-delimiter or shell-expansion hazard.
@@ -201,18 +208,55 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 
 # docker-compose.gcp-logging.yml (see its own header comment) ships baked
 # into the image and was just extracted into $APP_DIR unconditionally by the
-# recursive docker cp above. Its mere PRESENCE is what activates it — the
-# COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) appends it to
-# every recurring `docker compose` invocation whenever the file exists on
-# disk, and section 4 below inlines the same presence check into
-# COMPOSE_FILE_VALUE so this script's own first `up -d` engages it too. On a
-# non-GCE / non-GCP deployment (or an operator who wants the default
-# json-file driver instead), remove it right back out so that presence check
-# stays false. Runs on every boot, so it also self-heals a VM whose
-# enable_gcp_logging flipped since the last provisioning.
+# recursive docker cp above. Its presence PLUS the probe marker written
+# below is what activates it — the COMPOSE_FILE resolver
+# (scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active) appends it
+# to every recurring `docker compose` invocation when both are on disk, and
+# section 4 below applies the same gate to COMPOSE_FILE_VALUE so this
+# script's own first `up -d` engages it too. On a non-GCE / non-GCP
+# deployment (or an operator who wants the default json-file driver
+# instead), remove it right back out so that gate stays false. Runs on
+# every boot, so it also self-heals a VM whose enable_gcp_logging flipped
+# since the last provisioning.
 %{ if !enable_gcp_logging ~}
 rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 %{ endif ~}
+
+# Boot-time gcplogs driver probe — defense in depth for #1557. Docker
+# refuses to START a container whose log driver cannot initialize, so an
+# armed overlay on a VM whose service account cannot write to Cloud Logging
+# turns the next container recreate into a full outage (observed live:
+# app/scheduler stuck in `created`, 9 minutes of 502). The Terraform module
+# grants roles/logging.logWriter alongside enable_gcp_logging=true, but an
+# out-of-band deployment — or a caller whose deploying identity could not
+# create project-IAM bindings — may still lack it. Probe the driver once
+# per boot with a no-op container; only success arms the shared marker
+# ($APP_DIR/.gcp-logging-ok) that EVERY COMPOSE_FILE builder requires
+# (section 4 below, agnes-auto-upgrade.sh, agnes-state-applier.sh — all
+# through agnes_gcp_logging_active), so boot and the recurring ticks can
+# never disagree about the overlay (#1558). A failed probe degrades to
+# "Cloud Logging off + loud warning" instead of refusing to start the
+# stack; the auto-upgrade tick re-probes a marker-less overlay every 5
+# minutes, so granting the missing role re-arms it without a reboot.
+# The source is presence-guarded because an operator may pin AGNES_TAG to
+# an image predating the shared resolver: probing is then impossible, so
+# the marker is cleared and the overlay stays off (fail-safe) — the append
+# in section 4 degrades the same way, since its gate function is undefined
+# without this file. Never a hard boot failure over a logging add-on.
+if [ -f "$APP_DIR/scripts/ops/agnes-compose-file.sh" ]; then
+    . "$APP_DIR/scripts/ops/agnes-compose-file.sh"
+    if agnes_gcp_logging_probe "$APP_DIR" "$${IMAGE_REPO}:$${IMAGE_TAG}"; then
+        echo "gcplogs driver probe OK — Cloud Logging overlay armed"
+    elif [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
+        echo "WARNING: docker-compose.gcp-logging.yml is present but the gcplogs log driver failed its probe (is roles/logging.logWriter granted to the VM service account?) — DISABLING the Cloud Logging overlay for this boot instead of letting container starts fail; grant the role and the next auto-upgrade tick re-arms it" >&2
+    fi
+else
+    rm -f "$APP_DIR/.gcp-logging-ok"
+    # Stub the gate so section 4's append below stays a clean "no" instead
+    # of a command-not-found.
+    agnes_gcp_logging_active() { false; }
+    echo "WARNING: $APP_DIR/scripts/ops/agnes-compose-file.sh missing from this image (AGNES_TAG predates the shared resolver?) — Cloud Logging overlay disabled" >&2
+fi
 
 # Install agnes-state-applier (DB backend state machine — applies compose
 # lifecycle changes when /data/state/db-state-target.flag changes). The
@@ -669,20 +713,23 @@ else
     COMPOSE_FILE_VALUE="docker-compose.yml:docker-compose.prod.yml:docker-compose.host-mount.yml"
 fi
 
-# GCP Cloud Logging overlay — same presence gate as the canonical resolver
-# (scripts/ops/agnes-compose-file.sh::agnes_resolve_compose_file), inlined
-# because only the recurring drivers (agnes-auto-upgrade.sh,
-# agnes-state-applier.sh) source that file; this script's first
+# GCP Cloud Logging overlay — the canonical resolver's own gate
+# (scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active, sourced in
+# section 3 next to the boot-time driver probe), reused here because only
+# the recurring drivers (agnes-auto-upgrade.sh, agnes-state-applier.sh)
+# call agnes_resolve_compose_file; this script's first
 # `docker compose up -d` builds COMPOSE_FILE_VALUE itself. Without this
 # append the very first boot ran the stack on the json-file driver, and the
 # first auto-upgrade tick lazily initializes its config marker to the status
 # quo (no drift detected) — so logs didn't reach Cloud Logging until some
-# unrelated recreate. Section 2 above removed the extracted file when
-# enable_gcp_logging=false, so presence is the single switch, exactly as the
-# resolver sees it. Appended before the deploy-layer overlays
-# (dispatcher/kai-agent) to match the resolver's managed-first ordering and
-# keep kai-agent last for the strict-boot strip below.
-if [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
+# unrelated recreate. Section 3 above removed the extracted file when
+# enable_gcp_logging=false and armed $APP_DIR/.gcp-logging-ok only when the
+# gcplogs driver passed its probe, so file presence + marker is the single
+# switch, exactly as the resolver sees it (#1557, #1558). Appended before
+# the deploy-layer overlays (dispatcher/kai-agent) to match the resolver's
+# managed-first ordering and keep kai-agent last for the strict-boot strip
+# below.
+if agnes_gcp_logging_active "$APP_DIR"; then
     COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.gcp-logging.yml"
 fi
 
@@ -1063,20 +1110,15 @@ AGNES_APP_MEM_LIMIT=${app_mem_limit}
 AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
-%{ if home_route != "" ~}
-AGNES_HOME_ROUTE=${home_route}
-%{ endif ~}
-%{ if !studio_enabled ~}
-AGNES_STUDIO_ENABLED=false
-%{ endif ~}
-%{ if experience != "" ~}
-AGNES_INSTANCE_EXPERIENCE=${experience}
-%{ endif ~}
+# home_route / studio_enabled / theme / experience do NOT write env lines
+# here (D1, 2026-08): an always-wins line rewritten into this file on EVERY
+# boot permanently shadowed the admin UI's `/admin/server-config` control of
+# the same knob. They ride the instance_branding_b64 first-boot-only seed
+# instead — see section 2's INSTANCE_YAML block above. chat_provider is the
+# one exception: it pins deployment-provisioned backing (the kai-agent
+# sidecar / apps-runner), not a pure presentation choice.
 %{ if chat_provider != "" ~}
 AGNES_CHAT_PROVIDER=${chat_provider}
-%{ endif ~}
-%{ if theme != "" ~}
-AGNES_INSTANCE_THEME=${theme}
 %{ endif ~}
 ACME_EMAIL=$ACME_EMAIL
 GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID

@@ -94,13 +94,12 @@ class TestServerConfigPageRendersSections:
             c.cookies.clear()
         assert resp.status_code == 200
         body = resp.text
-        # The eight editable sections appear in the JS SECTION_META map.
+        # The seven editable sections appear in the JS SECTION_META map.
         for section in (
             "instance",
             "data_source",
             "email",
             "telegram",
-            "jira",
             "theme",
             "server",
             "auth",

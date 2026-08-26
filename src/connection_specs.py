@@ -48,10 +48,41 @@ def _validate_databricks(config: Dict[str, Any]) -> Dict[str, Any]:
     return {**config, "host": host, "warehouse_id": warehouse_id}
 
 
+def _validate_snowflake(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Mirrors ``connectors.snowflake.settings.resolve_snowflake_settings``'s
+    read set exactly: ``account``, ``user``, ``database``, ``warehouse`` are
+    the coordinates required to open a session; ``role``/``auth_type`` get
+    the resolver's own defaults when omitted. The secret refs
+    (``token_env``/``private_key_env``/``private_key_passphrase_env``) are
+    already optional there (each falls back to a well-known default env var
+    name), so they pass through unvalidated here too.
+    """
+    account = str(config.get("account") or "").strip()
+    if not account:
+        raise ValueError("snowflake connection requires config.account")
+    user = str(config.get("user") or "").strip()
+    if not user:
+        raise ValueError("snowflake connection requires config.user")
+    database = str(config.get("database") or "").strip()
+    if not database:
+        raise ValueError("snowflake connection requires config.database")
+    warehouse = str(config.get("warehouse") or "").strip()
+    if not warehouse:
+        raise ValueError("snowflake connection requires config.warehouse")
+    auth_type = str(config.get("auth_type") or "password").strip() or "password"
+    if auth_type not in ("password", "key_pair"):
+        raise ValueError(f"auth_type must be 'password' or 'key_pair', got: {auth_type!r}")
+    out = {**config, "account": account, "user": user, "database": database, "warehouse": warehouse}
+    out.setdefault("role", "")
+    out["auth_type"] = auth_type
+    return out
+
+
 _SPECS: Dict[str, ConnectionSpec] = {
     "keboola": ConnectionSpec("keboola", _validate_keboola),
     "bigquery": ConnectionSpec("bigquery", _validate_bigquery),
     "databricks": ConnectionSpec("databricks", _validate_databricks),
+    "snowflake": ConnectionSpec("snowflake", _validate_snowflake),
 }
 
 

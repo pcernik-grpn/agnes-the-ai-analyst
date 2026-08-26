@@ -243,10 +243,14 @@ def test_no_user_is_a_no_op():
 
 
 def test_creating_an_agent_marks_the_agent_step(seeded_app):
-    """The sixth step is earned where the agent is made, like every other one."""
+    """The sixth step is earned where the agent is made, like every other one.
+
+    `/api/v1/agents` (Task C1.2 — absorbed from the builder's own now-deleted
+    `/api/agents` router in Task C1.1) marks it too, not just the builder
+    route this test originally pinned."""
     assert _journey()["agent_created"] is False
     resp = seeded_app["client"].post(
-        "/api/agents",
+        "/api/v1/agents",
         json={"name": "Journey Agent"},
         headers=_auth(seeded_app["analyst_token"]),
     )
@@ -282,12 +286,8 @@ def test_the_v118_backfill_leaves_a_finished_checklist_finished():
     # part under test, so drive it directly.
     conn.execute("UPDATE user_journey_state SET agent_created = TRUE WHERE onboarded = TRUE")
 
-    done = conn.execute(
-        "SELECT agent_created FROM user_journey_state WHERE user_id = 'backfill-done'"
-    ).fetchone()
-    midway = conn.execute(
-        "SELECT agent_created FROM user_journey_state WHERE user_id = 'backfill-midway'"
-    ).fetchone()
+    done = conn.execute("SELECT agent_created FROM user_journey_state WHERE user_id = 'backfill-done'").fetchone()
+    midway = conn.execute("SELECT agent_created FROM user_journey_state WHERE user_id = 'backfill-midway'").fetchone()
     conn.close()
 
     assert done[0] is True, "an already-onboarded user's card must stay retired"

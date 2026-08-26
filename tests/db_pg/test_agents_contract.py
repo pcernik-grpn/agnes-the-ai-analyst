@@ -192,7 +192,7 @@ def test_update_whitelists_are_identical_across_backends():
 
 
 def test_slug_is_updatable_on_both_backends(repo):
-    """Renaming a draft re-derives its slug (app/api/agents.py).
+    """Renaming a draft re-derives its slug (app/api/agents_admin.py).
 
     That write goes through ``update``, so ``slug`` must be whitelisted —
     and the row must remain addressable under the NEW slug and gone from
