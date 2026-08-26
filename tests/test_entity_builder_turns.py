@@ -177,3 +177,70 @@ class TestDegradingWithoutAModel:
         r = _turn(client)
         assert r.status_code == 200
         assert r.json() == {"reply": "Tell me more.", "patch": {}, "suggestions": []}
+
+
+class TestTheTemplatePreviewAgent:
+    """Previewing an agent template runs a real agent with the draft as its
+    prompt. That needs a row — and the row must not become clutter."""
+
+    def _preview(self, client, **kw):
+        c, token = client
+        body = {"name": "Finance reviewer", "body": "You review numbers carefully."}
+        body.update(kw)
+        return c.post("/api/store/entities/builder/preview-agent", json=body, headers=_auth(token))
+
+    def test_it_returns_a_slug_a_session_can_run_as(self, client):
+        r = self._preview(client)
+        assert r.status_code == 200, r.text
+        assert r.json()["slug"] == "template-preview"
+
+    def test_the_scratch_agent_never_shows_in_the_owners_list(self, client):
+        """It is machinery, not something they made. Showing it would be
+        showing them a thing they cannot explain and did not create."""
+        c, token = client
+        self._preview(client)
+        listed = c.get("/api/agents", headers=_auth(token)).json()
+        rows = listed.get("agents", listed) if isinstance(listed, dict) else listed
+        assert all(row.get("slug") != "template-preview" for row in rows), (
+            "the scratch preview agent is showing up in /agents"
+        )
+
+    def test_previewing_twice_reuses_one_row(self, client):
+        """A fixed slug bounds what a browser dying mid-preview can leave
+        behind to a single invisible row — which is why there is no delete
+        endpoint to race the next preview."""
+        first = self._preview(client).json()["id"]
+        second = self._preview(client, body="Different prompt entirely.").json()["id"]
+        assert first == second
+
+    def test_the_latest_draft_is_what_gets_previewed(self, client):
+        c, token = client
+        self._preview(client, body="First prompt.")
+        self._preview(client, body="Second prompt.")
+        from src.repositories import agents_repo
+
+        row = agents_repo().get_by_slug("author1", "template-preview")
+        assert row["system_prompt"] == "Second prompt."
+
+    def test_an_empty_body_is_refused(self, client):
+        """There is nothing to preview, and a scratch agent with no prompt
+        would answer as a bare assistant and flatter the template."""
+        r = self._preview(client, body="   ")
+        assert r.status_code == 400
+        assert r.json()["detail"]["kind"] == "empty_body"
+
+    def test_it_inherits_none_of_the_authors_own_access(self, client):
+        """A template carries no data access. A preview that quietly ran with
+        the author's would flatter it — someone would install a template that
+        worked in the preview and does nothing for them."""
+        self._preview(client)
+        from src.repositories import agents_repo
+
+        row = agents_repo().get_by_slug("author1", "template-preview")
+        assert (row.get("knowledge") or "[]") in ("[]", None)
+        assert (row.get("plugins") or "[]") in ("[]", None)
+
+    def test_it_needs_a_caller(self, shared_app):
+        assert TestClient(shared_app).post(
+            "/api/store/entities/builder/preview-agent", json={"body": "x"}
+        ).status_code in (401, 403)

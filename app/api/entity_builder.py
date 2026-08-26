@@ -340,3 +340,70 @@ async def entity_builder_turn(
         "patch": patch,
         "suggestions": [s for s in (suggestions or []) if isinstance(s, str)][:3],
     }
+
+
+#: The one scratch agent a user's template previews run as. A fixed slug, so
+#: there is at most ONE per user however many templates they try: each preview
+#: overwrites it. That bounds what a browser that dies mid-preview can leave
+#: behind to a single invisible row, which is why there is no delete endpoint
+#: to race against the next preview.
+PREVIEW_SLUG = "template-preview"
+
+#: Not a lifecycle value the builder offers — see `list_for_user` in
+#: src/repositories/agents.py for why these rows are filtered out of every
+#: list. Fetch-by-slug still finds it; that is how the session resolves.
+SCRATCH_STATUS = "scratch"
+
+
+class PreviewAgentRequest(BaseModel):
+    """The draft template to try out. Body only — a template carries no data
+    access of its own, and the preview must not invent any."""
+
+    name: str = Field(default="", max_length=MAX_NAME_CHARS)
+    body: str = Field(default="", max_length=MAX_BODY_CHARS)
+
+
+@router.post("/entities/builder/preview-agent")
+async def preview_agent(
+    payload: PreviewAgentRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Point the caller's scratch agent at this draft template and return its
+    slug, so the page can open a normal chat session against it.
+
+    An agent template IS a system prompt, so previewing one means running an
+    agent with that prompt. That needs a row, because a session runs as an
+    agent id — hence a scratch agent rather than some parallel un-agent path
+    that would drift from how templates actually behave once installed.
+
+    Deliberately inherits NOTHING from the author's own agents: default
+    scope modes, no knowledge, no plugins. A template carries no data access,
+    so a preview that quietly ran with the author's would flatter it —
+    someone would install a template that worked in the preview and does
+    nothing for them.
+    """
+    body = (payload.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail={"kind": "empty_body"})
+
+    from src.repositories import agents_repo
+
+    repo = agents_repo()
+    name = (payload.name or "").strip() or "Template preview"
+    row = repo.get_by_slug(user["id"], PREVIEW_SLUG)
+    if row:
+        repo.update(str(row["id"]), name=name, system_prompt=body, status=SCRATCH_STATUS)
+        agent_id = str(row["id"])
+    else:
+        import uuid
+
+        agent_id = f"agt_{uuid.uuid4().hex}"
+        repo.create(
+            id=agent_id,
+            owner_user_id=user["id"],
+            name=name,
+            slug=PREVIEW_SLUG,
+            system_prompt=body,
+            status=SCRATCH_STATUS,
+        )
+    return {"slug": PREVIEW_SLUG, "id": agent_id}

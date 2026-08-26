@@ -198,3 +198,47 @@ class TestTheCreateConversation:
         same way."""
         for key in ("convOpening", "convPlaceholder", "convStarters"):
             assert markup.count(key + ":") == 3, f"{key} is not declared for all three types"
+
+
+class TestTheLivePreview:
+    """Preview means a real session with the thing you are building — for the
+    one type where that is possible."""
+
+    def test_the_preview_service_is_shared_not_forked(self, markup):
+        """A session, a socket and a stream of tokens is genuinely stateful,
+        so it is a service beside the (pure) shell rather than part of it —
+        but it is still ONE implementation. Both builders load it."""
+        agents = AGENTS.read_text(encoding="utf-8")
+        for page, text in (("agents.html", agents), ("skills.html", markup)):
+            assert "js/components/builder_preview.js" in text, f"{page} does not load the shared service"
+            assert "BuilderPreview({" in text, f"{page} does not use it"
+
+    def test_neither_page_keeps_its_own_socket_plumbing(self, markup):
+        """The point of extracting it. A page re-growing its own WebSocket
+        handling is the fork this guards against."""
+        agents = AGENTS.read_text(encoding="utf-8")
+        for page, text in (("agents.html", agents), ("skills.html", markup)):
+            assert "new WebSocket(" not in text, f"{page} has grown its own socket again"
+
+    def test_only_an_agent_template_can_be_tried_live(self, markup):
+        """A skill or a plugin has no equivalent: making one invokable means
+        materializing it into a session workspace, which is its own phase."""
+        assert re.search(r"function canPreviewLive\(\) \{ return type === 'agent'; \}", markup)
+
+    def test_a_bodyless_template_says_what_to_do_rather_than_failing(self, markup):
+        """There is nothing to run yet; the composer is disabled with the
+        reason as its placeholder rather than accepting a message that would
+        go nowhere."""
+        assert "Write the role on the right, then talk to it here." in markup
+
+    def test_switching_type_drops_the_session(self, markup):
+        """Carrying the socket across would leave the author talking to the
+        previous template under the new one's name."""
+        block = re.search(r"function chooseType\(k\) \{(.*?)\n  \}", markup, re.S)
+        assert block and "preview.reset()" in block.group(1)
+
+    def test_the_pane_says_the_template_has_no_data_access(self, markup):
+        """The most important thing to know about a template preview: it runs
+        with nothing, and so will whoever installs it. A preview that implied
+        otherwise would flatter the template."""
+        assert "no data access of its own" in markup

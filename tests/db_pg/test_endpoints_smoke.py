@@ -2733,6 +2733,11 @@ KNOWN_UNTESTED = {
     # tests/test_entity_builder_turns.py. Stateless and writes nothing — no
     # persistence of its own for a PG smoke test to exercise.
     "POST /api/store/entities/builder/turn",
+    # The template-preview scratch agent. Behaviourally covered by
+    # tests/test_entity_builder_turns.py; the repo-level invisibility it
+    # depends on is pinned across BOTH backends by
+    # tests/db_pg/test_agents_contract.py.
+    "POST /api/store/entities/builder/preview-agent",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",

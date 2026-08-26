@@ -276,3 +276,24 @@ def test_agent_for_scope_item_skips_deleted_agents(repo):
     repo.set_scope("a-gone", [("slack_channel", "C777")])
     repo.soft_delete("a-gone")
     assert repo.agent_for_scope_item("slack_channel", "C777") is None
+
+
+def test_scratch_agents_are_hidden_from_the_owners_list(repo):
+    """`status='scratch'` is the throwaway identity an agent-TEMPLATE preview
+    runs as (app/api/entity_builder.py). It has to be a real row because a
+    chat session runs as an agent id, but it is machinery: listing it would
+    show the owner a thing they did not create and cannot explain.
+
+    Both backends, because the filter is in SQL in each — a fix applied to one
+    is exactly the kind of drift this file exists to catch.
+    """
+    repo.create(id="a-real", owner_user_id="u1", name="Real", slug="real")
+    repo.create(id="a-scratch", owner_user_id="u1", name="Preview", slug="template-preview", status="scratch")
+
+    slugs = {row["slug"] for row in repo.list_for_user("u1")}
+    assert slugs == {"real"}, "a scratch agent leaked into the owner's list"
+
+    # ...but it is still reachable by slug — that is how the preview session
+    # resolves the agent it runs as.
+    found = repo.get_by_slug("u1", "template-preview")
+    assert found is not None and found["id"] == "a-scratch"

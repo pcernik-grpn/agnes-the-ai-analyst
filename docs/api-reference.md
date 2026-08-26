@@ -1829,10 +1829,24 @@ server actually offers, and everything is length-capped. With no AI credential
 configured it answers `503 builder_llm_unavailable` and the form stays fully
 usable by hand.
 
+`POST /api/store/entities/builder/preview-agent` backs that builder's Preview
+tab for agent TEMPLATES. A template is a system prompt, so trying one means
+running an agent with it — which needs a row, because a chat session runs as
+an agent id. This points the caller's single scratch agent (fixed slug
+`template-preview`, `status='scratch'`) at the draft and returns its slug.
+Those rows are filtered out of every agent listing, so the author never sees
+machinery they did not create; fetch-by-slug still resolves, which is how the
+session binds. Idempotent per user — one row however many templates they try
+— so a browser that dies mid-preview leaves at most one invisible row behind.
+The scratch agent inherits none of the author's own knowledge or plugins: a
+template carries no data access, and a preview that quietly ran with theirs
+would flatter it.
+
 - /api/store/bundle.zip
 - /api/store/categories
 - /api/store/entities
 - /api/store/entities/builder/turn
+- /api/store/entities/builder/preview-agent
 - /api/store/entities/dryrun
 - /api/store/entities/from-markdown
 - /api/store/entities/preview

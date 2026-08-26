@@ -558,6 +558,18 @@ _AGENTS_REGISTRY_REASON = (
     "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
+_ENTITY_PREVIEW_AGENT_REASON = (
+    "points the caller's single scratch agent at the agent TEMPLATE they are "
+    "drafting on /skills and returns its slug, so the builder's Preview tab "
+    "can open a normal chat session against it. Web-UI-only: it exists to "
+    "back an in-page tab, it creates no resource anyone can address (the row "
+    "is `status='scratch'` and filtered out of every list — see "
+    "src/repositories/agents.py::list_for_user), and it is idempotent per "
+    "user rather than a thing you can have many of. The CLI/MCP way to try a "
+    "template is to install it and run the resulting agent, which "
+    "/api/v1/agents/{slug}/responses already covers."
+)
+
 _ENTITY_BUILDER_TURN_REASON = (
     "one turn of the /skills builder's CONVERSATION — web-UI-only for the "
     "same reason as its /agents sibling above. It is not an operation on a "
@@ -693,6 +705,7 @@ _EXEMPT: dict[str, str] = {
     "/api/agents/{agent_id}": _AGENTS_REGISTRY_REASON,
     "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
     "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
+    "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (

@@ -139,6 +139,7 @@
 {# NOT deferred: the builder renders on boot, so BuilderShell has to exist
    before the page script below runs. Same reason modal.js loads eagerly. #}
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/builder_preview.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -1081,21 +1082,30 @@
      slug, then its WebSocket), not a mock of one. The socket lives in a
      variable rather than the DOM so a re-render of either pane cannot drop
      the connection mid-turn. */
-  var pv = { session: null, socket: null, msgs: [], busy: false, err: null, stream: '', draft: '', slug: null };
+  /* Preview is a session, a socket and a stream of tokens — genuinely
+     stateful, which is why it is a service rather than part of the (pure)
+     shell. `resolveSlug` is the only thing that differs between the two
+     builders: here it is the agent being edited, saved first because the
+     agent runs SERVER-SIDE and can only answer as a configuration the server
+     has. That commit is the same write Save does, baseline included, so the
+     header stops claiming unsaved changes for edits that were just saved. */
+  var preview = BuilderPreview({
+    label: 'agents',
+    resolveSlug: function () {
+      var a = current(); if (!a) return null;
+      return saveAgent().then(function () { return a.slug; });
+    },
+    onUpdate: function () { renderConvPane(); },
+  });
+  var pv = preview.state;
 
   function resetBuilderPanes() {
     conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = DEFAULT_CHIPS.slice();
     builderTab = 'create'; touched = {};
-    closePreviewSocket();
-    pv = { session: null, socket: null, msgs: [], busy: false, err: null, stream: '', draft: '', slug: null };
+    preview.reset();
+    pv = preview.state;
   }
 
-  function closePreviewSocket() {
-    if (pv.socket) {
-      try { pv.socket.close(); } catch (e) { /* already closing */ }
-      pv.socket = null;
-    }
-  }
 
   var msgHtml = BuilderShell.message;
 
@@ -1371,90 +1381,13 @@
      Opened lazily on the first message so switching to the tab costs nothing.
      Bound by slug to the agent being edited, which is why the draft is saved
      server-side before the socket opens — see the note in the body. */
-  function openPreviewSession(then) {
-    var a = current(); if (!a) return;
-    if (pv.session && pv.socket && pv.slug === a.slug) { then(); return; }
-    closePreviewSocket();
-    pv.err = null; pv.busy = true; renderConvPane();
-    /* Preview is the one place editing stops being private: the agent runs
-       SERVER-SIDE, so it can only answer as a configuration the server has.
-       Previewing therefore commits the working copy — the same write Save
-       does, baseline included, so the header stops claiming unsaved changes
-       for edits that have in fact just been saved. */
-    saveAgent().then(function () {
-      return fetch('/api/chat/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ surface: 'web', agent_slug: a.slug })
-      });
-    }).then(function (r) {
-      if (!r.ok) {
-        return r.json().catch(function () { return {}; }).then(function (b) {
-          var d = (b && b.detail) || {};
-          throw new Error(d.hint || (r.status === 403 || r.status === 401
-            ? 'Chat is not enabled on your account — an admin grants it to your group.'
-            : 'Could not start a preview session (HTTP ' + r.status + ').'));
-        });
-      }
-      return r.json();
-    }).then(function (session) {
-      pv.session = session; pv.slug = a.slug;
-      var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-      var ws = new WebSocket(proto + location.host + session.ws_url);
-      pv.socket = ws;
-      ws.onmessage = function (ev) {
-        var frame;
-        try { frame = JSON.parse(ev.data); } catch (e) { return; }
-        if (frame.type === 'token') { pv.stream += (frame.text || ''); renderConvPane(); }
-        else if (frame.type === 'assistant_message') {
-          pv.msgs.push({ role: 'assistant', text: frame.content || pv.stream || '' });
-          pv.stream = ''; pv.busy = false; renderConvPane();
-        } else if (frame.type === 'error') {
-          pv.err = previewErrorCopy(frame.message);
-          pv.stream = ''; pv.busy = false; renderConvPane();
-        }
-      };
-      ws.onerror = function () { pv.err = 'The preview connection dropped.'; pv.busy = false; renderConvPane(); };
-      ws.onopen = function () { pv.busy = false; then(); };
-    }).catch(function (err) {
-      console.error('agents: preview session failed', err);
-      pv.err = err.message; pv.busy = false; renderConvPane();
-    });
-  }
 
   /* Engine errors arrive as internal kinds (`kai_integration_not_configured`,
      `concurrency_cap`). Pasted verbatim they read as a broken page, and send
      the owner looking for a mistake in a configuration that is in fact fine —
      what is missing is instance-level plumbing only an admin can supply. Say
      which of the two it is; keep the kind in the console. */
-  function previewErrorCopy(raw) {
-    var msg = String(raw || '');
-    if (/not_configured|no_provider|provider_unavailable|integration/i.test(msg)) {
-      return 'Preview needs a chat engine, and none is configured on this instance — ' +
-        'an admin sets one up. Your configuration on the right is saved either way.';
-    }
-    if (/concurrency_cap/i.test(msg)) {
-      return 'Too many sessions are running right now. Try the preview again in a moment.';
-    }
-    if (/budget|429/i.test(msg)) {
-      return 'This agent has spent its token budget for the month.';
-    }
-    return msg || 'The agent could not answer.';
-  }
 
-  function sendPreviewMessage(text) {
-    var send = function () {
-      if (!pv.socket || pv.socket.readyState !== WebSocket.OPEN) {
-        pv.err = 'The preview is not connected.'; pv.busy = false; renderConvPane(); return;
-      }
-      pv.socket.send(JSON.stringify({ type: 'user_msg', text: text }));
-      pv.msgs.push({ role: 'user', text: text });
-      pv.draft = ''; pv.busy = true; pv.err = null; pv.stream = '';
-      renderConvPane();
-    };
-    openPreviewSession(send);
-  }
 
 
   /* Light-touch header sync while typing (no re-render → keeps focus). */
@@ -1581,7 +1514,7 @@
       var box = builderView.querySelector('[data-ag-comp="' + kind + '"]');
       var text = box ? box.value.trim() : '';
       if (!text) return;
-      if (kind === 'create') sendBuilderTurn(text); else sendPreviewMessage(text);
+      if (kind === 'create') sendBuilderTurn(text); else preview.send(text);
       return;
     }
     if (t.hasAttribute('data-ag-new')) {
@@ -1877,7 +1810,7 @@
     e.preventDefault();
     var text = (e.target.value || '').trim();
     if (!text) return;
-    if (kind === 'create') sendBuilderTurn(text); else sendPreviewMessage(text);
+    if (kind === 'create') sendBuilderTurn(text); else preview.send(text);
   });
 
   /* Keyboard access for the div-based cards/section headers. The Chat link is

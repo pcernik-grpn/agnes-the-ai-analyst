@@ -7175,6 +7175,25 @@
         "title": "PolicyPreviewRequest",
         "type": "object"
       },
+      "PreviewAgentRequest": {
+        "description": "The draft template to try out. Body only \u2014 a template carries no data\naccess of its own, and the preview must not invent any.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "PreviewAgentRequest",
+        "type": "object"
+      },
       "PreviewComponent": {
         "properties": {
           "description": {
@@ -45006,6 +45025,70 @@
           }
         },
         "summary": "Create Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/builder/preview-agent": {
+      "post": {
+        "description": "Point the caller's scratch agent at this draft template and return its\nslug, so the page can open a normal chat session against it.\n\nAn agent template IS a system prompt, so previewing one means running an\nagent with that prompt. That needs a row, because a session runs as an\nagent id \u2014 hence a scratch agent rather than some parallel un-agent path\nthat would drift from how templates actually behave once installed.\n\nDeliberately inherits NOTHING from the author's own agents: default\nscope modes, no knowledge, no plugins. A template carries no data access,\nso a preview that quietly ran with the author's would flatter it \u2014\nsomeone would install a template that worked in the preview and does\nnothing for them.",
+        "operationId": "preview_agent_api_store_entities_builder_preview_agent_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Agent",
         "tags": [
           "store"
         ]

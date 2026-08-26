@@ -41,6 +41,17 @@ def markup() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
 
 @pytest.fixture(scope="module")
+def preview_js() -> str:
+    """The preview SERVICE. A session, a socket and a stream of tokens is
+    genuinely stateful, so it sits beside the pure shell rather than in it —
+    but it is one implementation, shared by both builders."""
+    return (
+        Path(__file__).resolve().parents[1]
+        / "app" / "web" / "static" / "js" / "components" / "builder_preview.js"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
 def shell_js() -> str:
     """The builder shell's markup, extracted so a second builder page renders
     the same thing. Assertions about what the SHELL emits read this; the
@@ -58,15 +69,25 @@ class TestPreviewRunsARealTurn:
         assert "<textarea" in shell_js
         assert 'data-ag-send="' in shell_js
 
-    def test_it_opens_a_session_bound_to_this_agent(self, markup):
+    def test_it_opens_a_session_bound_to_this_agent(self, markup, preview_js):
         """Bound by slug — a preview against the default agent would answer as
-        something other than the thing on screen."""
-        assert "/api/chat/sessions" in markup
-        assert "agent_slug: a.slug" in markup
+        something other than the thing on screen. The session plumbing moved
+        into the shared service; WHICH slug is still this page's decision, and
+        that is the half worth pinning here."""
+        assert "/api/chat/sessions" in preview_js
+        assert "agent_slug: slug" in preview_js
+        block = re.search(r"resolveSlug: function \(\) \{(.*?)\n    \},", markup, re.S)
+        assert block, "agents.html does not tell the preview which agent to run"
+        assert "a.slug" in block.group(1)
 
-    def test_it_streams_over_the_websocket_contract(self, markup):
+    def test_it_streams_over_the_websocket_contract(self, preview_js):
         for frame in ("'token'", "'assistant_message'", "'error'"):
-            assert frame in markup, f"preview does not handle the {frame} frame"
+            assert frame in preview_js, f"preview does not handle the {frame} frame"
+
+    def test_the_frame_it_sends_is_the_web_chat_protocols(self, preview_js):
+        """Not this module's invention. Getting this wrong sends a message the
+        engine silently ignores, which looks exactly like a hung preview."""
+        assert "'user_msg'" in preview_js and "text: text" in preview_js
 
     def test_the_draft_is_saved_before_the_session_spawns(self, markup):
         """The agent runs SERVER-SIDE, so it can only answer as a configuration
@@ -91,11 +112,14 @@ class TestPreviewDoesNotPromiseWhatItCannotDo:
         # the textarea and the send button in composerHtml.
         assert re.search(r"composerHtml\('preview', '', 'Start by defining your agent\.', true\)", body)
 
-    def test_an_engine_error_is_translated_not_pasted(self, markup):
-        assert "function previewErrorCopy(" in markup
-        assert "not_configured" in markup
-        # The owner is told whose problem it is; the raw kind stays in console.
-        assert "an admin sets one up" in markup
+    def test_an_engine_error_is_translated_not_pasted(self, preview_js):
+        """Internal kinds pasted verbatim read as a broken page and send the
+        author hunting for a mistake in a configuration that is fine."""
+        assert "function errorCopy(" in preview_js
+        assert "not_configured" in preview_js
+        # The author is told whose problem it is; the raw kind stays in console.
+        assert "an admin sets one up" in preview_js
+        assert "console.error" in preview_js
 
     def test_model_output_is_escaped_into_the_dom(self, shell_js):
         """Assistant text goes through `esc()`, never raw innerHTML — neither

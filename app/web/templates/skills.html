@@ -411,6 +411,7 @@
 {# NOT deferred: this page renders on boot, so BuilderShell has to exist
    before the script below runs. #}
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/builder_preview.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -556,6 +557,36 @@
   var convs = { skill: [], plugin: [], agent: [] };
   var convBusy = false, convErr = null, convDraft = '', convChips = [];
   function conv() { return convs[type] || []; }
+
+  /* Live preview, for agent templates only. A template IS a system prompt, so
+     trying one means running an agent with that prompt — which needs a row,
+     because a session runs as an agent id. The server points a single
+     invisible scratch agent at the draft and hands back its slug; see
+     app/api/entity_builder.py for why there is exactly one per user and no
+     delete endpoint racing the next preview.
+
+     A skill or a plugin has no equivalent: making one invokable means
+     materializing it into a session workspace, which is its own phase. Their
+     Preview stays the card. */
+  var preview = BuilderPreview({
+    label: 'skills',
+    resolveSlug: function () {
+      var body = (draft && draft.body || '').trim();
+      if (!body) return null;
+      return fetch('/api/store/entities/builder/preview-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ name: draft.name || '', body: body }),
+      }).then(function (r) {
+        if (!r.ok) throw new Error('Could not start a preview (HTTP ' + r.status + ').');
+        return r.json();
+      }).then(function (d) { return d.slug; });
+    },
+    onUpdate: function () { renderLeftPane(); },
+  });
+  /* Only an agent template can be tried live. */
+  function canPreviewLive() { return type === 'agent'; }
   var bundle = null;      // plugin only: the attached File (never persisted)
   var check = null;       // last Check result, or null
   var inFlight = false;
@@ -1045,7 +1076,39 @@
      workspace, which is its own phase of the builder spec. */
   function leftPaneHtml(c) {
     if (builderTab === 'preview') {
-      return '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>';
+      if (!canPreviewLive()) {
+        return '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>';
+      }
+      var pv = preview.state;
+      if (!(draft.body || '').trim()) {
+        return BuilderShell.conversationEmpty({
+            id: 'sk-pv-conv', icon: ICONS.agent,
+            text: 'Write the role on the right, then talk to it here.',
+          }) + BuilderShell.composer({
+            kind: 'preview', value: '', placeholder: 'Write the role first…', busy: true,
+          });
+      }
+      var rows = pv.msgs.slice();
+      if (pv.stream) rows.push({ role: 'assistant', text: pv.stream });
+      var body = rows.length || pv.err || pv.busy
+        ? BuilderShell.conversation({ id: 'sk-pv-conv', rows: rows, busy: pv.busy, err: pv.err })
+        : BuilderShell.conversationEmpty({
+            id: 'sk-pv-conv', icon: ICONS.agent,
+            text: 'Talk to it the way someone who installs it would.',
+          });
+      /* Answers render as plain text — this page has no HTML sanitizer and an
+         engine answer is model output. The full chat page has the real
+         renderer, so link to the same session rather than reimplementing it. */
+      var full = pv.session
+        ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
+        : '';
+      return body +
+        '<p class="ag-live-note">A real session running this template as its brief. ' +
+        'It has no data access of its own — neither will anyone who installs it.' + full + '</p>' +
+        BuilderShell.composer({
+          kind: 'preview', value: pv.draft,
+          placeholder: 'Ask it something…', busy: pv.busy,
+        });
     }
     return BuilderShell.conversation({
         id: 'sk-conv',
@@ -1294,6 +1357,12 @@
     var incoming = drafts[k] || null;
 
     type = k;
+    /* The live preview belongs to ONE draft. Carrying its socket across a
+       type switch would leave the author talking to the previous template
+       under the new one's name — the same reason /agents resets its panes
+       when the open agent changes. */
+    preview.reset();
+    builderTab = 'create';
     // Clone rather than reuse the stored reference, so editing a resumed
     // draft doesn't mutate the persisted copy in place.
     draft = incoming ? JSON.parse(JSON.stringify(incoming)) : makeDraft();
@@ -2112,7 +2181,7 @@
         // Carry the half-typed line across the switch — losing it is the
         // cheapest possible way to make a tab feel destructive.
         var live = view.querySelector('[data-ag-comp]');
-        if (live) convDraft = live.value;
+        if (live) { if (builderTab === 'preview') preview.setDraft(live.value); else convDraft = live.value; }
         builderTab = tab;
         renderLeftPane();
       }
@@ -2120,7 +2189,8 @@
     else if (t.hasAttribute('data-ag-send')) {
       var box = view.querySelector('[data-ag-comp]');
       var text = box ? box.value.trim() : '';
-      if (text) sendBuilderTurn(text);
+      if (!text) return;
+      if (builderTab === 'preview') preview.send(text); else sendBuilderTurn(text);
     }
     else if (t.hasAttribute('data-ag-chip')) {
       sendBuilderTurn(t.getAttribute('data-ag-chip'));
@@ -2207,7 +2277,7 @@
        would vanish under the author mid-sentence. */
     var comp = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
     if (comp) {
-      convDraft = e.target.value;
+      if (comp === 'preview') preview.setDraft(e.target.value); else convDraft = e.target.value;
       e.target.style.height = 'auto';
       e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
       return;
@@ -2246,7 +2316,8 @@
     if (e.key !== 'Enter' || e.shiftKey) return;
     e.preventDefault();
     var text = e.target.value.trim();
-    if (text) sendBuilderTurn(text);
+    if (!text) return;
+    if (builderTab === 'preview') preview.send(text); else sendBuilderTurn(text);
   });
   // ds_dropdown.js only dispatches "change" on the paired native <select>
   // when a branded item is picked (never "input", unlike a real <select>'s
