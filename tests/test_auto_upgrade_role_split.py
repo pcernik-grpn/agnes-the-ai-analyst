@@ -4,12 +4,11 @@ The actual test logic lives in ``tests/test_auto_upgrade_role_split.sh``
 (same pattern as ``tests/test_db_backup_pg_canary.sh`` /
 ``tests/test_state_applier_host_script.sh``): it fakes `docker`, `curl`,
 `logger`, and `flock` on PATH, sandboxes the paths
-``scripts/ops/agnes-auto-upgrade.sh`` reads/writes, and drives seven
-scenarios (single-container one-shot, healthy role-split rolling recreate,
-an aborted rollout that leaves untouched replicas alone, the pre-existing
-sync/status defer, the new data-refresh-job defer with its
-``SCHEDULER_API_TOKEN`` auth, the fail-open path when the token is
-absent, and a hard failure of the initial worker+gateway recreate itself)
+``scripts/ops/agnes-auto-upgrade.sh`` reads/writes, and drives the
+scenarios listed in that file's header (single-container one-shot,
+role-split rolling recreates healthy/aborting, the sync-defer probes and
+their fail-open path, the every-tick docker GC, and the host-artifact
+refresh + self-update from the pinned image's ``/opt/agnes-host/``)
 asserting the exact `docker`/`curl` command lines the topology
 detection + rolling-recreate + defer logic produces. This wrapper just
 makes it part of the ``pytest tests/`` run so CI enforces it automatically

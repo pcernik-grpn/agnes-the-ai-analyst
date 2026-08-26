@@ -33,6 +33,14 @@
 #      (`docker compose up -d --no-deps worker gateway` exits non-zero) —
 #      the rollout must ABORT (non-zero exit + webhook alert) WITHOUT ever
 #      recreating any api replica.
+#   I. Host-artifact refresh from the pinned image: config files + the
+#      script itself come out of the image's /opt/agnes-host/ via
+#      docker create/cp — no network fetch of the source repo — and an
+#      extracted config change alone (equal image ids) triggers the
+#      recreate and the self-update.
+#   J. Extract container cannot be created (image not pullable, not in
+#      the local store) — the tick degrades to WARN-and-keep-existing:
+#      no file touched, no recreate, exit 0, still no network fetch.
 #
 # Run with: bash tests/test_auto_upgrade_role_split.sh
 set -euo pipefail
@@ -140,6 +148,35 @@ else
             fi
             exit 0
             ;;
+        create)
+            # Extract container for the /opt/agnes-host artifact refresh.
+            # Without FAKE_EXTRACT_CID the create fails — simulating "image
+            # not pullable and not in the local store", the analogue of the
+            # old network-failure simulation for the raw-GitHub fetch.
+            if [ -n "${FAKE_EXTRACT_CID:-}" ]; then
+                echo "$FAKE_EXTRACT_CID"
+                exit 0
+            fi
+            exit 1
+            ;;
+        cp)
+            # docker cp <cid>:<path-under-/opt/agnes-host/> <dest> — serve
+            # the file from the FAKE_HOST_ARTIFACTS_DIR fixture tree. Parse
+            # after "agnes-host/" (not a fixed prefix) because the sandbox
+            # sed rewrites /opt/agnes* paths wholesale.
+            src="${2:-}"
+            dest="${3:-}"
+            path_in_image="${src#*agnes-host/}"
+            if [ -n "${FAKE_HOST_ARTIFACTS_DIR:-}" ] \
+               && [ -f "$FAKE_HOST_ARTIFACTS_DIR/$path_in_image" ]; then
+                cp "$FAKE_HOST_ARTIFACTS_DIR/$path_in_image" "$dest"
+                exit 0
+            fi
+            exit 1
+            ;;
+        rm|pull)
+            exit 0
+            ;;
         *)
             exit 0
             ;;
@@ -182,10 +219,10 @@ case "$url" in
         exit 0
         ;;
     *)
-        # RAW_BASE config-file / self-update fetches: simulate a network
-        # failure — the script's existing WARN-and-keep-existing-file
-        # fallback handles this gracefully (verified by test_ops_env_extraction.py
-        # and pre-existing behavior; not re-asserted here).
+        # No other URL is expected: config-file refresh + self-update come
+        # from the pinned image via `docker create`/`docker cp`, never from
+        # a network fetch (scenarios I/J assert this). Fail loudly so an
+        # unexpected fetch shows up as a scenario failure.
         exit 7
         ;;
 esac
@@ -220,15 +257,21 @@ make_sandboxed_script() {
     mkdir -p "$tmp/opt/agnes"
 
     # The script sources the shared compose-overlay resolver from
-    # /opt/agnes/scripts/ops (delivered by the same config fetch) and skips
-    # the tick when it is absent, so the sandbox has to provide it or every
-    # scenario below exits early without exercising anything.
+    # /opt/agnes/scripts/ops (delivered by the same artifact refresh) and
+    # skips the tick when it is absent, so the sandbox has to provide it or
+    # every scenario below exits early without exercising anything.
     mkdir -p "$tmp/opt/agnes/scripts/ops"
     cp "$(dirname "$script")/agnes-compose-file.sh" "$tmp/opt/agnes/scripts/ops/agnes-compose-file.sh"
+
+    # Self-update target dir (the sed below relocates /usr/local/bin here);
+    # seed it with the current script so `cmp -s` has a real comparand.
+    mkdir -p "$tmp/usr-local-bin"
+    cp "$script" "$tmp/usr-local-bin/agnes-auto-upgrade.sh"
 
     local sandboxed=$tmp/agnes-auto-upgrade.sh
     sed \
         -e "s|/opt/agnes|$tmp/opt/agnes|g" \
+        -e "s|/usr/local/bin|$tmp/usr-local-bin|g" \
         -e "s|/var/lock/agnes-auto-upgrade.lock|$tmp/agnes-auto-upgrade.lock|g" \
         -e "s|/etc/agnes-watchdog.env|$tmp/nonexistent-agnes-watchdog.env|g" \
         "$script" > "$sandboxed"
@@ -517,6 +560,95 @@ grep -qF -- "--filter until=" "$transcript" \
 grep -qE "docker image prune( -f)? -a| --all" "$transcript" \
     && fail "H: image prune must stay dangling-only — -a would drop tagged images a data app still needs"
 echo "OK: H — both prunes run on a no-drift tick, before the pull, dangling-only"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario I: host-artifact refresh from the pinned image. The config
+# files and the script's self-update must come from /opt/agnes-host/ in
+# the image (docker create + docker cp), never from a network fetch of
+# the source repo — and an extracted config change ALONE (image ids
+# equal) must count as drift and trigger the recreate.
+# =====================================================================
+run_scenario I
+
+# Fixture "image": /opt/agnes-host/ artifact tree the fake docker cp
+# serves from.
+host_artifacts=$tmp/host-artifacts
+mkdir -p "$host_artifacts/scripts/ops" "$host_artifacts/static"
+printf '# compose fresh-from-image\n' > "$host_artifacts/docker-compose.yml"
+printf '# caddyfile fresh-from-image\n' > "$host_artifacts/Caddyfile"
+cp "$(dirname "$script")/agnes-compose-file.sh" "$host_artifacts/scripts/ops/agnes-compose-file.sh"
+printf '#!/bin/bash\n# self-update fresh-from-image\n' > "$host_artifacts/agnes-auto-upgrade.sh"
+
+# Stale on-disk state the extraction must overwrite, plus a config marker
+# that disagrees with whatever hash the refreshed tree produces — so the
+# recreate below rides on CONFIG drift alone (image ids are forced equal).
+printf '# compose stale-on-disk\n' > "$tmp/opt/agnes/docker-compose.yml"
+printf 'bogus-marker-hash\n' > "$tmp/opt/agnes/.agnes-config-applied"
+
+rc=0
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    READYZ_STATE_DIR="$readyz_state_dir" \
+    FAKE_TOPOLOGY=single \
+    FAKE_TAG_ID=sha256:sameimage000 \
+    FAKE_RUNNING_IMAGE_ID=sha256:sameimage000 \
+    FAKE_EXTRACT_CID=extractcid123 \
+    FAKE_HOST_ARTIFACTS_DIR="$host_artifacts" \
+    WEBHOOK_URL="" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" || rc=$?
+[ "$rc" -eq 0 ] || fail "I: a healthy artifact-refresh tick must exit 0 (got $rc)"
+
+grep -qF "docker create" "$transcript" \
+    || fail "I: the refresh must create an extract container from the pinned image"
+grep -q "raw.githubusercontent.com" "$transcript" \
+    && fail "I: no network fetch of the source repo may remain — artifacts come from the image"
+grep -qF "curl -fsSL" "$transcript" \
+    && fail "I: the old curl-based artifact/self-update fetch must be gone entirely"
+grep -qF "# compose fresh-from-image" "$tmp/opt/agnes/docker-compose.yml" \
+    || fail "I: docker-compose.yml must be refreshed from the image's /opt/agnes-host/"
+grep -qF "# caddyfile fresh-from-image" "$tmp/opt/agnes/Caddyfile" \
+    || fail "I: Caddyfile must be extracted from the image too"
+grep -qF "docker compose up -d" "$transcript" \
+    || fail "I: an extracted config change alone (equal image ids) must trigger the recreate"
+grep -qF "bogus-marker-hash" "$tmp/opt/agnes/.agnes-config-applied" \
+    && fail "I: the config marker must be rewritten after the recreate"
+grep -qF "# self-update fresh-from-image" "$tmp/usr-local-bin/agnes-auto-upgrade.sh" \
+    || fail "I: the self-update must install the script shipped in the image"
+grep -q "self-update: replaced" "$transcript" \
+    || fail "I: the self-update replacement must be logged"
+echo "OK: I — config files + self-update extract from the pinned image, config drift alone recreates"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario J: the extract container cannot be created at all (image not
+# pullable and absent from the local store). The tick must degrade to
+# WARN-and-keep-existing: no config file touched, no recreate (image ids
+# equal, marker lazily initialized), exit 0 — and still no network fetch.
+# =====================================================================
+run_scenario J
+printf '# compose pre-existing\n' > "$tmp/opt/agnes/docker-compose.yml"
+
+rc=0
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    READYZ_STATE_DIR="$readyz_state_dir" \
+    FAKE_TOPOLOGY=single \
+    FAKE_TAG_ID=sha256:sameimage000 \
+    FAKE_RUNNING_IMAGE_ID=sha256:sameimage000 \
+    WEBHOOK_URL="" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" || rc=$?
+[ "$rc" -eq 0 ] || fail "J: a tick without an extract container must still exit 0 (got $rc)"
+
+grep -qF "# compose pre-existing" "$tmp/opt/agnes/docker-compose.yml" \
+    || fail "J: existing config files must be kept untouched when extraction is unavailable"
+grep -q "cannot create an extract container" "$transcript" \
+    || fail "J: the unavailable extract container must be WARN-logged"
+grep -qF "docker compose up -d" "$transcript" \
+    && fail "J: nothing may be recreated on a no-drift tick without an extract container"
+grep -q "raw.githubusercontent.com" "$transcript" \
+    && fail "J: extraction failure must NOT fall back to a network fetch of the source repo"
+echo "OK: J — no extract container degrades to WARN-and-keep-existing, no recreate, no network fetch"
 rm -rf "$tmp"
 
 echo "OK"

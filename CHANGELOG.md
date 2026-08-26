@@ -75,6 +75,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   uses `granted_by` to let an admin-shared agent reach items its owner
   personally does not hold.
 
+### Changed
+
+- **VM auto-upgrade refreshes host artifacts from the release image, not
+  the repo's raw `main` branch.** The 5-minute tick
+  (`scripts/ops/agnes-auto-upgrade.sh`) now extracts the bind-mounted
+  config files (compose overlays, Caddyfile, maintenance page, the
+  compose-file resolver) and its own self-update from `/opt/agnes-host/`
+  inside the pinned image — the same artifact contract the boot startup
+  script already uses — instead of curling the public
+  `raw.githubusercontent.com/.../main` URLs. Host config now stays in
+  lockstep with the image tag the VM actually runs (a config change rides
+  the release that ships it, instead of racing ahead of — or outliving —
+  the image), and the tick keeps working when the source repository is
+  private or the host's egress is restricted to the container registry.
+  Failure posture is unchanged: a failed pull/extract keeps the existing
+  file and WARNs to syslog. Rollout note: a VM still running the previous
+  curl-based script picks this up on its next reboot/recreate (the boot
+  path extracts the script from the image); the old script's raw-fetch
+  self-update cannot deliver it while the repo is private.
+
 ### Internal
 
 - **`agent_scope.granted_by` (remediation-program Track C2.1) is the first

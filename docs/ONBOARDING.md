@@ -20,10 +20,12 @@ Every Agnes instance lives in **one GCP project per customer**, driven by a **pr
 
 ## 1. Bootstrap GCP
 
+Run the bootstrap script from a clone of this repository (a raw-URL fetch
+only works while the repository is public — the clone works either way):
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keboola/agnes-the-ai-analyst/main/scripts/bootstrap-gcp.sh -o bootstrap-gcp.sh
-chmod +x bootstrap-gcp.sh
-./bootstrap-gcp.sh <GCP_PROJECT_ID>
+git clone https://github.com/keboola/agnes-the-ai-analyst.git
+./agnes-the-ai-analyst/scripts/bootstrap-gcp.sh <GCP_PROJECT_ID>
 ```
 
 Outputs:
