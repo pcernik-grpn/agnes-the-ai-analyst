@@ -558,6 +558,18 @@ _AGENTS_REGISTRY_REASON = (
     "that point this exemption is removed, not converted into a CLI/MCP mirror."
 )
 
+_ENTITY_BUILDER_TURN_REASON = (
+    "one turn of the /skills builder's CONVERSATION — web-UI-only for the "
+    "same reason as its /agents sibling above. It is not an operation on a "
+    "Library entity: it writes NOTHING (there is no row yet — the draft lives "
+    "in the author's browser until Save to Library), and it returns a patch "
+    "the page merges into that draft for the author to review. Its inputs are "
+    "the page's own transient state — the transcript so far and the unsaved "
+    "draft — which a CLI invocation would have to invent, and its output is "
+    "not a resource. The thing it helps produce is created through "
+    "POST /api/store/entities, which has its own coverage."
+)
+
 _AGENTS_BUILDER_TURN_REASON = (
     "one turn of the /agents builder's CONVERSATION — web-UI-only by nature. "
     "It is not an operation on an agent; it is the page asking a model to "
@@ -680,6 +692,7 @@ _EXEMPT: dict[str, str] = {
     "/api/agents": _AGENTS_REGISTRY_REASON,
     "/api/agents/{agent_id}": _AGENTS_REGISTRY_REASON,
     "/api/agents/{agent_id}/builder/turn": _AGENTS_BUILDER_TURN_REASON,
+    "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (

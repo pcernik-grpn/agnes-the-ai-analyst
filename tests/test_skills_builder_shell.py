@@ -131,3 +131,70 @@ class TestTheTwoBuildersStayOneProduct:
             called |= set(re.findall(r"BuilderShell\.(\w+)\b", text))
         missing = called - exported
         assert not missing, f"called but not exported by BuilderShell: {sorted(missing)}"
+
+
+class TestTheCreateConversation:
+    """The Create tab writes the form beside it — and never replaces it."""
+
+    def test_a_turn_posts_to_the_entity_endpoint(self, markup):
+        assert "/api/store/entities/builder/turn" in markup
+
+    def test_a_turn_writes_nothing_server_side(self, markup):
+        """A Library entity has no row until Save to Library. The patch is
+        merged into the local draft; there is no apply flag because there is
+        nothing to apply to."""
+        block = re.search(r"function sendBuilderTurn\(text\) \{(.*?)\n  \}\n", markup, re.S)
+        assert block, "sendBuilderTurn not found"
+        body = block.group(1)
+        assert "draft[k] = patch[k]" in body, "the patch is not merged into the local draft"
+        assert "persist()" in body, "a merged patch is not written to the draft store"
+
+    def test_the_turn_sees_the_draft_on_screen(self, markup):
+        block = re.search(r"function sendBuilderTurn\(text\) \{(.*?)\n  \}\n", markup, re.S)
+        assert "draft: {" in block.group(1)
+
+    def test_the_history_sent_excludes_the_message_being_answered(self, markup):
+        """`conv()` already has the new turn pushed onto it; sending it whole
+        would show the model the same message twice."""
+        assert "history: conv().slice(0, -1)" in markup
+
+    def test_the_transcript_is_per_type(self, markup):
+        """Switching type must not carry a skill's conversation into a
+        plugin — the drafts are already per-type for the same reason."""
+        assert re.search(r"var convs = \{ skill: \[\], plugin: \[\], agent: \[\] \}", markup)
+
+    def test_the_form_stays_hand_editable_while_the_assistant_talks(self, markup):
+        """The conversation is an accelerator, not a gate."""
+        block = re.search(r"function stepsHtml\(c, ns\) \{(.*?)\n  \}\n", markup, re.S)
+        assert block, "stepsHtml not found"
+        assert "disabled" not in block.group(1)
+
+    def test_only_the_changed_pane_rerenders(self, markup):
+        """A full render() per turn would pull the caret out of whichever
+        field or composer the author is typing in."""
+        assert "function renderLeftPane(" in markup
+        assert "function renderConfigPane(" in markup
+
+    def test_a_half_typed_message_survives_a_tab_switch(self, markup):
+        assert "convDraft = live.value" in markup
+
+    def test_the_composer_is_state_not_just_dom(self, markup):
+        """The left pane re-renders when a turn lands; a draft that only lived
+        in the textarea would vanish mid-sentence."""
+        block = re.search(r"function handleFieldInput\(e\) \{(.*?)\n    var f =", markup, re.S)
+        assert block and "convDraft = e.target.value" in block.group(1)
+
+    def test_every_conversation_hook_is_wired_to_the_delegated_handler(self, markup):
+        """A branch the selector never matches is dead code — how Save shipped
+        broken on /agents."""
+        sel = re.search(r"var t = e\.target\.closest\((.*?)\);", markup, re.S)
+        assert sel
+        for hook in ("[data-ag-tab]", "[data-ag-send]", "[data-ag-chip]"):
+            assert hook in sel.group(1), f"{hook} is not matched by the click handler"
+
+    def test_each_type_brings_its_own_opening_and_starters(self, markup):
+        """The sentence that tells a first-time author what this box wants
+        differs per type — a skill, a bundle and a role are not described the
+        same way."""
+        for key in ("convOpening", "convPlaceholder", "convStarters"):
+            assert markup.count(key + ":") == 3, f"{key} is not declared for all three types"

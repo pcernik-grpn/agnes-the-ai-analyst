@@ -4074,6 +4074,37 @@
         "title": "EnqueueJobRequest",
         "type": "object"
       },
+      "EntityDraft": {
+        "description": "The unsaved draft, as the page currently has it.\n\nUntrusted, and used only to build the prompt \u2014 nothing here is written\nanywhere, and the fields that come back are re-validated on the way out.",
+        "properties": {
+          "body": {
+            "default": "",
+            "maxLength": 40000,
+            "title": "Body",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "EntityDraft",
+        "type": "object"
+      },
       "EntityRating": {
         "description": "#398: per-user thumbs up/down tally for a store entity.\n\n``up`` / ``down`` are global counts; ``my_vote`` is the caller's own\nvote (``1`` up, ``-1`` down, ``0`` = not voted).",
         "properties": {
@@ -4094,6 +4125,43 @@
           }
         },
         "title": "EntityRating",
+        "type": "object"
+      },
+      "EntityTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntityDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 16,
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "message"
+        ],
+        "title": "EntityTurnRequest",
         "type": "object"
       },
       "FileEntry": {
@@ -44938,6 +45006,70 @@
           }
         },
         "summary": "Create Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/builder/turn": {
+      "post": {
+        "description": "Run one builder turn for a Library entity draft.\n\nReturns ``{reply, patch, suggestions}``. Writes nothing: the draft is the\ncaller's, and only *Save to Library* creates anything.",
+        "operationId": "entity_builder_turn_api_store_entities_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EntityTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Entity Builder Turn",
         "tags": [
           "store"
         ]

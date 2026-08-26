@@ -2729,6 +2729,10 @@ KNOWN_UNTESTED = {
     # degradation. It writes only through the PATCH row above, so it adds no
     # PG-specific persistence of its own to smoke.
     "POST /api/agents/{agent_id}/builder/turn",
+    # One /skills builder turn. Behaviourally covered by
+    # tests/test_entity_builder_turns.py. Stateless and writes nothing — no
+    # persistence of its own for a PG smoke test to exercise.
+    "POST /api/store/entities/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",

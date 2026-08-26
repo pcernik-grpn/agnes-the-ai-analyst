@@ -461,6 +461,9 @@
   var TYPES = {
     skill: {
       key: 'skill',
+      convOpening: 'Hi! Tell me what this skill should do and I will draft it — the recipe, when an agent should reach for it, and a name. For example, “how to pull last quarter’s revenue by region”.',
+      convPlaceholder: 'Tell me what this skill should do…',
+      convStarters: ['A recipe for our weekly revenue report', 'How to check a pipeline is healthy', 'Our house rules for writing SQL'],
       label: 'Skill',
       kicker: 'Authoring skill',
       newTitle: 'New skill',
@@ -485,6 +488,9 @@
     },
     plugin: {
       key: 'plugin',
+      convOpening: 'Hi! Upload your bundle on the right, and I will help you describe it — the name, the description someone reads before installing, and a category. I cannot write the bundle itself.',
+      convPlaceholder: 'Tell me what this plugin does…',
+      convStarters: ['It adds Jira commands', 'Describe it for someone who has not used it', 'Suggest a category'],
       label: 'Plugin',
       kicker: 'Authoring plugin',
       newTitle: 'New plugin',
@@ -505,6 +511,9 @@
     },
     agent: {
       key: 'agent',
+      convOpening: 'Hi! Describe the role this template should give an agent — who it is, what it does, what it should refuse — and I will draft the brief. Remember it carries no data access of its own.',
+      convPlaceholder: 'Describe the role this template gives…',
+      convStarters: ['A careful finance analyst', 'Someone who triages support tickets', 'A reviewer that never guesses a number'],
       label: 'Agent Template',
       kicker: 'Authoring agent template',
       newTitle: 'New agent template',
@@ -537,6 +546,16 @@
      Access is a pre-answered publishing choice and Type is already decided by
      the time this renders, so both start shut. */
   var collapsed = { type: true, identity: false, content: false, access: true };
+
+  /* ── The Create conversation ──
+     Per-type, like the drafts themselves: switching type must not carry a
+     skill's transcript into a plugin. In memory only — a reload starts the
+     conversation over while the DRAFT survives, which is the honest split
+     (the draft is the work; the conversation is how you got there). */
+  var builderTab = 'create';
+  var convs = { skill: [], plugin: [], agent: [] };
+  var convBusy = false, convErr = null, convDraft = '', convChips = [];
+  function conv() { return convs[type] || []; }
   var bundle = null;      // plugin only: the attached File (never persisted)
   var check = null;       // last Check result, or null
   var inFlight = false;
@@ -1009,14 +1028,118 @@
            spec). Until then it carries the one thing that already belongs
            there — what you are making, as it will read — behind the same tab
            strip, so adding Create later moves nothing. */
-        left: BuilderShell.tabs({ active: 'preview', tabs: [{ id: 'preview', label: 'Preview' }] }) +
-          '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>',
+        left: BuilderShell.tabs({
+            active: builderTab,
+            tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
+          }) + leftPaneHtml(c),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
         cfgBodyId: 'sk-steps',
         cfg: stepsHtml(c, ns),
       });
     afterRender();
+  }
+
+  /* Describe it, or look at it. Preview is still the card — a real
+     "try it with this applied" needs the draft materialized into a session
+     workspace, which is its own phase of the builder spec. */
+  function leftPaneHtml(c) {
+    if (builderTab === 'preview') {
+      return '<div class="sk-pvpane" id="sk-preview">' + previewHtml() + '</div>';
+    }
+    return BuilderShell.conversation({
+        id: 'sk-conv',
+        rows: [{ role: 'assistant', text: openingMessage(c) }].concat(conv()),
+        busy: convBusy,
+        err: convErr,
+      }) +
+      BuilderShell.composer({
+        kind: 'create',
+        value: convDraft,
+        placeholder: c.convPlaceholder,
+        busy: convBusy,
+        chips: convBusy ? [] : (convChips.length ? convChips : c.convStarters),
+      });
+  }
+
+  /* Written by the page, not the model: it costs nothing, it never fails, and
+     it is what tells a first-time author what kind of sentence this box
+     wants. Per type, because the answer differs. */
+  function openingMessage(c) { return c.convOpening; }
+
+  /* Re-render ONLY the left pane. A full render() would rebuild the form and
+     pull the caret out of whatever field is focused. */
+  function renderLeftPane() {
+    var pane = view.querySelector('.ag-work > .ag-pane');
+    if (!pane) { render(); return; }
+    var tabs = pane.querySelector('.ag-tabs');
+    if (!tabs) { render(); return; }
+    while (tabs.nextSibling) pane.removeChild(tabs.nextSibling);
+    pane.insertAdjacentHTML('beforeend', leftPaneHtml(cfg()));
+    var el = document.getElementById('sk-conv');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  /* One builder turn. The reply is inserted as TEXT (BuilderShell.message) —
+     the model's output is untrusted and neither builder page has a
+     sanitizer. Nothing is written server-side: the patch is merged into the
+     local draft and Save to Library stays the only thing that creates. */
+  function sendBuilderTurn(text) {
+    if (!type || !draft || convBusy) return;
+    convs[type] = conv().concat([{ role: 'user', text: text }]);
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderLeftPane();
+    fetch('/api/store/entities/builder/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        type: type,
+        message: text,
+        history: conv().slice(0, -1),
+        // The panel as it stands, so the turn reasons about what is on screen.
+        draft: {
+          name: draft.name || '', description: draft.description || '',
+          category: draft.category || '', body: draft.body || '',
+        },
+      }),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) {
+          var d = (body && body.detail) || {};
+          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
+        }
+        return body;
+      });
+    }).then(function (body) {
+      convs[type] = conv().concat([{ role: 'assistant', text: body.reply || '' }]);
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      var patch = body.patch || {};
+      var keys = Object.keys(patch);
+      if (keys.length) {
+        keys.forEach(function (k) { draft[k] = patch[k]; });
+        persist();
+        // The form is the source of truth and stays hand-editable; re-render
+        // it so the fields show what the turn wrote.
+        renderConfigPane();
+      }
+    }).catch(function (err) {
+      console.error('skills: builder turn failed', err);
+      convErr = err.message;
+    }).finally(function () {
+      convBusy = false;
+      renderLeftPane();
+    });
+  }
+
+  /* Re-render ONLY the configuration. Keeps the conversation pane — and any
+     half-typed message in its composer — untouched. */
+  function renderConfigPane() {
+    var body = document.getElementById('sk-steps');
+    if (!body) { render(); return; }
+    body.innerHTML = stepsHtml(cfg(), nameState());
+    syncProblems();
+    if (window.dsDropdownInit) body.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
   }
 
   /* The header verbs. Split out of render() for the same reason /agents did
@@ -1980,9 +2103,29 @@
     var t = e.target.closest('[data-sk-type],[data-sk-change],[data-sk-mode],[data-sk-browse],' +
                              '[data-sk-removefile],[data-sk-jump],[data-sk-dismiss],' +
                              '[data-ag-back],[data-ag-toggle-sec],' +
+                             '[data-ag-tab],[data-ag-send],[data-ag-chip],' +
                              '#sk-check,#sk-save,#sk-draft,#sk-discard');
     if (!t) return;
-    if (t.hasAttribute('data-ag-back')) {
+    if (t.hasAttribute('data-ag-tab')) {
+      var tab = t.getAttribute('data-ag-tab');
+      if (tab !== builderTab) {
+        // Carry the half-typed line across the switch — losing it is the
+        // cheapest possible way to make a tab feel destructive.
+        var live = view.querySelector('[data-ag-comp]');
+        if (live) convDraft = live.value;
+        builderTab = tab;
+        renderLeftPane();
+      }
+    }
+    else if (t.hasAttribute('data-ag-send')) {
+      var box = view.querySelector('[data-ag-comp]');
+      var text = box ? box.value.trim() : '';
+      if (text) sendBuilderTurn(text);
+    }
+    else if (t.hasAttribute('data-ag-chip')) {
+      sendBuilderTurn(t.getAttribute('data-ag-chip'));
+    }
+    else if (t.hasAttribute('data-ag-back')) {
       /* Straight out, no confirmation — and that is NOT an oversight.
          /agents asks before you leave because it holds the only copy of your
          edits; this page has written every keystroke to localStorage
@@ -2059,6 +2202,16 @@
   });
 
   function handleFieldInput(e) {
+    /* The composer is state, not just DOM: the left pane re-renders whenever
+       a turn lands, and a half-typed message that only lived in the textarea
+       would vanish under the author mid-sentence. */
+    var comp = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (comp) {
+      convDraft = e.target.value;
+      e.target.style.height = 'auto';
+      e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
+      return;
+    }
     var f = e.target.getAttribute && e.target.getAttribute('data-sk-field');
     if (!f || !draft) return;
     draft[f] = e.target.value;
@@ -2084,6 +2237,17 @@
     syncPreview();
   }
   document.addEventListener('input', handleFieldInput);
+
+  /* Enter sends, Shift+Enter opens a line — the convention every chat box on
+     this site follows, so a composer that behaved otherwise would be the
+     surprising one. */
+  document.addEventListener('keydown', function (e) {
+    if (!e.target.getAttribute || !e.target.getAttribute('data-ag-comp')) return;
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    var text = e.target.value.trim();
+    if (text) sendBuilderTurn(text);
+  });
   // ds_dropdown.js only dispatches "change" on the paired native <select>
   // when a branded item is picked (never "input", unlike a real <select>'s
   // own direct-interaction firing of both) — without this, picking a

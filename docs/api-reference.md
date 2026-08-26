@@ -1818,9 +1818,21 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 
 ### `/api/store` — Marketplace flea-market store
 
+`POST /api/store/entities/builder/turn` runs one turn of the `/skills`
+builder's conversation. It takes `{type, message, history, draft}` and returns
+`{reply, patch, suggestions}` — and it writes **nothing**: a Library entity has
+no row until the author saves it, so the draft lives in their browser and the
+patch is merged there for them to review. The model's output is untrusted:
+only the fields that type allows survive (a `plugin` patch can never carry a
+`body` — its contents are an uploaded archive), a category must be one the
+server actually offers, and everything is length-capped. With no AI credential
+configured it answers `503 builder_llm_unavailable` and the form stays fully
+usable by hand.
+
 - /api/store/bundle.zip
 - /api/store/categories
 - /api/store/entities
+- /api/store/entities/builder/turn
 - /api/store/entities/dryrun
 - /api/store/entities/from-markdown
 - /api/store/entities/preview
