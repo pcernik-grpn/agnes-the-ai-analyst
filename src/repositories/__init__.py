@@ -2,8 +2,15 @@
 
 Each ``<name>_repo()`` function returns a ready-to-use repository instance:
 
-* ``DATABASE_URL`` (or legacy ``AGNES_DB_URL``) unset  → DuckDB ``system.duckdb`` repos (legacy, default)
+* ``DATABASE_URL`` (or legacy ``AGNES_DB_URL``) unset  → DuckDB ``system.duckdb`` repos
 * ``DATABASE_URL`` (or legacy ``AGNES_DB_URL``) set    → Postgres-backed ``*_pg`` repos
+
+Postgres is the canonical, only-growing app-state backend. The DuckDB
+backend is frozen (PG-first ratchet, A3 — see ``CLAUDE.md`` -> "Dual-backend
+discipline"): existing pairs below stay registered on both backends, but a
+NEW repo key registers Postgres-only. Resolving a Postgres-only repo while
+the active backend is DuckDB raises :class:`RequiresPostgresBackend` instead
+of constructing anything.
 
 Callsites import factory functions instead of repository classes:
 
@@ -43,7 +50,9 @@ Adding a new backend (e.g. ``duckdb_quack``, see
 
 The dispatch logic in :func:`_build` is backend-count-agnostic — no
 per-repo function changes — and ``tests/test_repository_registry.py``
-verifies the table stays complete and symmetric across backends.
+verifies each entry is either fully symmetric or Postgres-only (see
+:class:`RequiresPostgresBackend`, below — the DuckDB app-state backend is
+frozen post-A3, so a NEW entry never carries a DuckDB backend without one).
 """
 
 from __future__ import annotations
@@ -61,6 +70,7 @@ __all__ = [
     "get_system_db",
     "get_analytics_db",
     "use_pg",
+    "RequiresPostgresBackend",
     # Core user / RBAC cluster
     "users_repo",
     "user_groups_repo",
@@ -196,6 +206,29 @@ def _pg_engine() -> Any:
     from src.db_pg import get_engine
 
     return get_engine()
+
+
+class RequiresPostgresBackend(RuntimeError):
+    """Raised when a Postgres-only repository is resolved on an instance
+    still running the frozen DuckDB app-state backend.
+
+    A3 PG-first ratchet (see CLAUDE.md -> "Dual-backend discipline"): new
+    app-state repos registered after the ratchet flipped carry only a ``PG``
+    entry in :data:`_REGISTRY` — there is no DuckDB implementation to fall
+    back to. Route handlers that can reach such a repo must let this
+    exception surface rather than catching it and improvising; the app-wide
+    handler in ``app/main.py`` translates it to a clean ``501`` instead of an
+    unhandled ``500``.
+    """
+
+    def __init__(self, feature: str):
+        self.feature = feature
+        super().__init__(
+            f"{feature!r} requires the Postgres app-state backend. This feature "
+            "was added after the PG-first ratchet (DuckDB app-state is frozen — "
+            "see CLAUDE.md -> 'Dual-backend discipline'); migrate this instance "
+            "to Postgres to use it — see docs/migrations.md."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -558,12 +591,16 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
 def _build(key: str) -> Any:
     """Resolve + construct the repo for ``key`` on the active backend."""
     backend = _active_backend()
-    try:
-        module_path, class_name = _REGISTRY[key][backend]
-    except KeyError as exc:
-        raise KeyError(
-            f"no '{backend}' repository registered for '{key}' (known: {sorted(_REGISTRY.get(key, {}))})"
-        ) from exc
+    entry = _REGISTRY.get(key, {})
+    if backend not in entry:
+        if backend == DUCKDB and PG in entry:
+            # PG-only repo (post-A3): no DuckDB fallback exists by design —
+            # raise the typed error instead of a bare KeyError so callers (and
+            # the app-wide exception handler) can translate it into a clean
+            # 4xx/501 instead of an unhandled crash.
+            raise RequiresPostgresBackend(key)
+        raise KeyError(f"no '{backend}' repository registered for '{key}' (known: {sorted(entry)})")
+    module_path, class_name = entry[backend]
     klass = getattr(import_module(module_path), class_name)
     return klass(_ARG_PROVIDERS[backend]())
 
