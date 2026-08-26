@@ -126,10 +126,15 @@ say so if the diff touches none of these surfaces.
 
 ### 7. Release-cut implication
 
-Invoke `Skill(agnes-release-process)`. Then: would this PR land the only
-`[Unreleased]` content since the last tag? If yes, the release-cut commit
-must be the last commit on this PR (version bump + CHANGELOG rename + new
-empty `[Unreleased]`). Report as Done if present, Missing if not.
+Invoke `Skill(agnes-release-process)`. The version bump + CHANGELOG rename
+are no longer a feature PR's job — they are cut once a day by
+`.github/workflows/daily-cut.yml` into a dedicated PR labeled `release-cut`.
+Check: does this diff touch `pyproject.toml`'s `version`, `server.json`'s
+`version`, or rename `## [Unreleased]` to a version heading? If yes AND this
+PR is not itself the `release-cut` PR, that is Missing — the bullet under
+`[Unreleased]` is enough; drop the version-bump/rename hunks and let the
+daily cut PR pick them up. If the PR IS the `release-cut` PR (or an
+explicit emergency/milestone cut a human asked for), Done.
 
 ## Output format
 
