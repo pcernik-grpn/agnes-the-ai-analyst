@@ -210,3 +210,18 @@
 .badge--warn    { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
 .badge--success { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
 .badge--danger  { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+
+/* Sprite icons — the design system's one icon seam (#1503). An icon is
+   `<svg class="ds-icon"><use href=".../vendor/lucide-sprite.svg#<name>"/></svg>`,
+   built by the `ds.icon(name)` macro (_components.html) server-side or
+   `iconEl(name)` (static/js/chat_icons.js) client-side. Lucide bodies draw
+   with `stroke="currentColor"`, so an icon takes the surrounding text color;
+   1em sizing + the -0.125em shift make it sit on the text baseline like a
+   glyph would. */
+.ds-icon {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  flex: none;
+  vertical-align: -0.125em;
+}

@@ -1,3 +1,8 @@
+    <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
+         so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">
+         references (external-document <use> only works in Safari 17.1+).
+         See app/web/static/js/icon_sprite.js. -->
+    <script src="{{ static_url('js/icon_sprite.js') }}" defer></script>
     <!-- window.AgnesTime — local-tz timestamp hydrator for <time datetime> tags.
          See app/web/static/js/datetime.js and the design spec at
          docs/superpowers/specs/2026-05-26-frontend-timezone-fix-design.md. -->

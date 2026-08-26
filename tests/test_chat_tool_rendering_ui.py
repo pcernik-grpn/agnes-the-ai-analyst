@@ -689,7 +689,7 @@ def test_no_bare_details_box_rule_can_flatten_a_tool_card():
     that needed such a rule is gone — both paths build the same card. Only
     the code-block rules may stay broad: they paint the highlighted JSON
     INSIDE the cards."""
-    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
     for rule in re.finditer(r"\.(?:cloud-chat-messages|msg-bubble)\s+(?:\.msg-bubble\s+)?details([^{]*)\{", css):
         rest = rule.group(1)
         assert "code" in rest or "pre.code-block-wrap" in rest, (
@@ -725,14 +725,15 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
         "the persisted state maps onto the same is-error / is-done classes a live result produces"
     )
-    assert 'icon.textContent = "✓"' in fn and 'icon.textContent = "⚠"' in fn
+    # Sprite icons since #1503 — check for done, triangle-alert for error.
+    assert 'iconEl("check")' in fn and 'iconEl("triangle-alert")' in fn
     # Neutral only when there is genuinely nothing to report: the fallback
     # class, and an icon appended only when it has content.
     assert 'let statusClass = "is-replayed"' in fn
-    assert "if (icon.textContent) head.appendChild(icon)" in fn, (
+    assert "if (icon.firstChild) head.appendChild(icon)" in fn, (
         "a stateless (pre-v123) part must not get an empty icon slot"
     )
-    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.S)
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
     replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
     replayed = replayed[: replayed.index("}")]
     assert "accent-success" not in replayed and "accent-info" not in replayed, (
