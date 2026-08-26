@@ -116,6 +116,14 @@ class LlmUsage(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Remediation Track C, task C2.4: WHICH caller incurred this row — PG-only
+    # under the A3 ratchet (migrations/versions/
+    # 0074_llm_usage_caller_user_id.py), no DuckDB counterpart / no
+    # SCHEMA_VERSION bump. Distinct from `user_id` above (unchanged: the
+    # agent's owner) — a shared agent (C2.3) can be run by many callers, and
+    # this is what lets `GET /api/v1/agents/{slug}/usage` report a per-caller
+    # breakdown while budget enforcement stays keyed on `agent_id` alone.
+    caller_user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(BigInteger, server_default=text("0"), nullable=True)

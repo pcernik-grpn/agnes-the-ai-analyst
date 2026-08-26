@@ -22,6 +22,12 @@ class LlmUsageRepository:
         return [dict(zip(columns, r)) for r in rows]
 
     def insert_batch(self, rows: List[Dict[str, Any]]) -> None:
+        """``caller_user_id`` (C2.4, per-caller attribution) is accepted in
+        each row for call-site symmetry with the PG sibling but silently
+        dropped — DuckDB has no column to persist it into (PG-only under
+        the A3 ratchet, ``migrations/versions/
+        0074_llm_usage_caller_user_id.py``), same no-op pattern as
+        ``agents.py``'s ``set_scope(granted_by=...)``."""
         if not rows:
             return
         self.conn.executemany(
@@ -89,6 +95,58 @@ class LlmUsageRepository:
             "cache_creation_tokens": cache_creation_tokens,
             "total_tokens": input_tokens + output_tokens + cache_creation_tokens,
         }
+
+    def usage_breakdown_by_caller_for_month(self, agent_id: str, year_month: str) -> List[Dict[str, Any]]:
+        """Per-caller token sums for one agent/month (C2.4, per-caller usage
+        attribution) — one row per distinct `caller_user_id` that incurred
+        usage against this agent, same field shape as
+        `usage_breakdown_for_month`.
+
+        DuckDB has no `caller_user_id` column (PG-only under the A3
+        ratchet — see `insert_batch`'s docstring), so every row this
+        backend ever wrote is honestly unattributed: this groups under a
+        single literal `NULL` bucket covering the agent's WHOLE month
+        total, rather than pretending to distinguish callers it never
+        recorded. Postgres's sibling groups by the real column and returns
+        one row per caller (`None` for any row written before this
+        feature, or by a caller who no longer resolves). Empty list when
+        the agent has no usage rows that month, on either backend.
+        """
+        row = self.conn.execute(
+            """SELECT
+                NULL AS caller_user_id,
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+            FROM llm_usage
+            WHERE agent_id = ? AND strftime(created_at, '%Y-%m') = ?
+            HAVING COUNT(*) > 0""",
+            [agent_id, year_month],
+        ).fetchall()
+        return self._breakdown_rows_to_dicts(row)
+
+    @staticmethod
+    def _breakdown_rows_to_dicts(rows) -> List[Dict[str, Any]]:
+        result = []
+        for caller_user_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens in rows:
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens = (
+                int(input_tokens),
+                int(output_tokens),
+                int(cache_read_tokens),
+                int(cache_creation_tokens),
+            )
+            result.append(
+                {
+                    "caller_user_id": caller_user_id,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "total_tokens": input_tokens + output_tokens + cache_creation_tokens,
+                }
+            )
+        return result
 
     def list_for_agent(self, agent_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         rows = self.conn.execute(

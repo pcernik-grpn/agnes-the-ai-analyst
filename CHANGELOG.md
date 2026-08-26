@@ -29,7 +29,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   config/delete) remain owner-only — a runnable grant is run+read, never
   manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
   source for a future runtime agent picker).
+- **`agnes admin add-user --invite`** — inviting a user is now reachable from
+  the CLI, not just the `/admin/users` page. The flag propagates `send_invite`
+  to `POST /api/users`, emails the setup link when mail transport is
+  configured, and prints the link either way so an instance without SMTP stays
+  workable. Without the flag behavior is unchanged, except that the command
+  now names the next step (`agnes admin reset-password <email>`) rather than
+  leaving a fresh account with no way in; an invite the server did not issue
+  exits non-zero instead of reading as one that went out. Deliberately not
+  MCP-exposed — issuing a setup token is credential provisioning, covered by
+  the standing exemption in `CONTRIBUTING.md`.
 
+
+- **Per-caller usage attribution for shared agents** (remediation program
+  Track C, C2.4). A shared agent (C2.3) run by multiple callers now
+  records WHICH caller incurred each `llm_usage` row (`caller_user_id`,
+  Postgres-only column — see Internal below) rather than attributing every
+  call to the agent alone; the pre-existing `user_id` column keeps its old
+  meaning (the agent's owner). `GET /api/v1/agents/{slug}/usage` gains a
+  `by_caller` field — a per-caller token breakdown — visible to the
+  agent's owner or an admin only; a plain runnable grantee (C2.3) still
+  sees the aggregate total but never other callers' usage
+  (`by_caller: null`). Token-budget enforcement (`token_budget_monthly`)
+  is unchanged — still summed across the whole agent regardless of caller.
 - **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
   subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
   ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
@@ -189,6 +211,75 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   whenever `config.token_env`/`config.private_key_env` is unset (the shape
   a legacy-seeded row carries), so it is an identity leaf too, and
   `_guard_row_repoint` now compares it alongside `config`.
+
+- **`data_apps.subdomain_base` can now be set from the deployment, not only by
+  hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
+  env override plus a per-VM `data_apps_subdomain_base` field on the
+  `customer-instance` module (both instance object types, `optional(string,
+  "")`, written into that VM's `.env` only when non-empty). Serving apps from
+  their own origin is the supported answer to the 0.89.0 same-origin refusal,
+  but the key had no env override and its section is locked in the
+  server-config overlay — so the only way to set it on a deployed instance was
+  editing the yaml on disk, the same Terraform-says-one-thing-the-box-says-
+  another drift that already bit `data_apps.enabled`. Unlike the sibling
+  `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
+  `enabled` state rather than on the env-enable path, because
+  `session_cookie_domain()` reads it on every login and the value must not
+  depend on whether the operator switched data apps on via env or yaml. While
+  the feature resolves OFF, `subdomain_base` is now dropped entirely — from
+  instance.yaml as much as from `.env`, which also fixes the pre-existing case
+  where `AGNES_DATA_APPS_ENABLED=false` left a yaml base widening the session
+  cookie and routing `<slug>.<base>` hosts for a feature serving nothing. Both
+  readers (`session_cookie_domain()` and `DataAppSubdomainMiddleware`) take the
+  key unconditionally, so this single accessor is where "off" is made to mean
+  "no base". `instance.yaml.example`
+  and the module variable now both carry the base-selection warning: the value
+  widens the session cookie to the base's PARENT domain, so
+  `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
+  session cookie to every unrelated host under it.
+
+- **Hosted data apps can be served from their own origin without a wildcard
+  certificate.** The shipped `Caddyfile.apps-subdomain` vhost now issues ONE
+  certificate per app hostname on first request (Caddy on-demand TLS, HTTP-01)
+  and is wired up automatically: the Dockerfile bakes it into the host
+  artifacts, and the `customer-instance` startup script prepends the required
+  global `on_demand_tls` block and appends the vhost whenever
+  `data_apps_subdomain_base` is set (guarded on its own marker, since the
+  script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
+  parse). `agnes-auto-upgrade.sh` re-applies the identical block on every
+  5-minute tick, right after it re-fetches the pristine `Caddyfile` from main
+  and before it hashes for config drift — without that, a VM lost its vhost and
+  its `on_demand_tls` block on the first tick after boot and hosted apps became
+  unreachable altogether, since same-origin serving is refused by default. The
+  two copies are asserted byte-identical, so the Caddy-parser test that runs one
+  of them covers both; the tick also refreshes the vhost fragment itself, so a
+  VM whose last boot predates it converges without a reboot. A wildcard
+  certificate was the obvious alternative and was rejected
+  on purpose: it can only be validated over DNS-01, which would put a DNS-zone
+  write credential on the very host that runs user-authored app code. Issuance
+  is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
+  (Caddy's `ask` contract — 2xx allows, anything else cancels), which answers
+  2xx for exactly one shape: a registered, non-hidden slug directly under the
+  configured base. It leaks nothing new — `proxy_app` already resolves the row
+  before authenticating, so a real slug is already distinguishable from a
+  made-up one. Compose hands Caddy the base with an inert `apps.invalid`
+  default, mirroring the `DOMAIN_ALIAS` fix: an empty-but-set value would
+  render the site address `*.` and take the primary site down at config parse.
+
+- **Signing in from an app subdomain returns you to the app.** `safe_next_path`
+  now accepts one new shape besides a same-origin absolute path: an absolute
+  http(s) URL on `<single-label>.<data_apps.subdomain_base>`, and only while
+  data apps are enabled and a base is configured. The 401 redirect carries the
+  path the visitor actually asked for (the subdomain middleware now records it
+  before rewriting), so login lands them back where they started instead of on
+  the dashboard. Every classic open-redirect shape is still refused, plus the
+  near-misses that merely look like an app origin — userinfo (`https://evil.com@
+  s.apps.example.com/` and its inverse), backslashes (browsers normalize them,
+  `urlsplit` does not), suffix extension, multi-label names, and non-web
+  schemes. Not verified, deliberately: that the slug is a REAL app — that would
+  put a database lookup in a helper every login calls, to close something that
+  is not a general open redirect, since the target is always this deployment's
+  own infrastructure behind the same RBAC.
 
 ### Changed
 
@@ -385,6 +476,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   succeeds — the "Add data source" wizard creates a connection row before
   its config is complete.
 
+- **A signed-out visitor opening a data-app URL on an app subdomain no longer
+  hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
+  path on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the app-wide
+  401→`/login` redirect — relative, and therefore resolved by the browser
+  against the app's own host — came back as `/apps/<slug>/login`, 401'd again,
+  and looped until the browser gave up (`ERR_TOO_MANY_REDIRECTS`). The handler
+  now sends a subdomain-origin caller to the MAIN host's login absolutely
+  (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
+  order). Anyone already signed in was unaffected — the session cookie is
+  scoped to cover both origins — which is why every existing subdomain test,
+  all of which drive an already-authenticated client, stayed green. The return
+  URL is carried across in `next` — see the `safe_next_path` entry under
+  **Added**, which is the separate, deliberate edit to that open-redirect guard
+  that makes carrying it safe.
+
 ### Security
 
 - Knowledge-digest generation now frames corpus source chunks as untrusted
@@ -496,6 +602,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   0073_agent_scope_granted_by.py` backfills every pre-existing row to its
   agent's `owner_user_id`.
 
+
+- **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
+  second genuine schema change on an existing DuckDB↔Postgres pair under
+  the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
+  "Adding a PG-only feature".** No DuckDB `_vN_to_v(N+1)` step, no
+  `SCHEMA_VERSION` bump; `LlmUsageRepository.insert_batch` (DuckDB) accepts
+  the same `caller_user_id` row key for call-site symmetry but has no
+  column to persist it into, and its new
+  `usage_breakdown_by_caller_for_month` degrades to a single, honestly
+  unattributed (`caller_user_id=None`) bucket there, while the Postgres
+  sibling groups by the real column. `migrations/versions/
+  0074_llm_usage_caller_user_id.py` adds the column with NO backfill — a
+  pre-existing row's actual caller is genuinely unknown, unlike
+  `granted_by`'s owner backfill (every pre-C2.1 write path was
+  ownership-gated; no equivalent fact exists for who was driving a past
+  turn).
 - **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
 - **PG-first development rule (remediation-program Track A3): the DuckDB

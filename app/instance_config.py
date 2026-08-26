@@ -1448,6 +1448,13 @@ def get_data_apps_config() -> dict:
     example-config defaults are backfilled for any key instance.yaml omits so
     the spec-builders have a complete block, and ``runtime_image`` can be
     further pinned with ``AGNES_DATA_APPS_RUNTIME_IMAGE``.
+
+    ``subdomain_base`` has its own override, ``AGNES_DATA_APPS_SUBDOMAIN_BASE``,
+    applied whenever the feature resolves enabled — by either source — because
+    it drives :func:`session_cookie_domain`. While the feature resolves
+    DISABLED the key is dropped entirely, from yaml as well as env: it widens
+    the session cookie and switches on host-based routing, and neither reader
+    checks ``enabled`` for itself. See the inline note at the bottom of the body.
     """
     cfg = dict(get_value("data_apps", default={}) or {})
     raw = os.environ.get("AGNES_DATA_APPS_ENABLED")
@@ -1459,6 +1466,39 @@ def get_data_apps_config() -> dict:
                 cfg["runtime_image"] = env_image
         else:
             cfg["enabled"] = False
+    # ``subdomain_base`` is resolved LAST, and resolved here rather than at its
+    # readers, because both of them read it unconditionally:
+    # :func:`session_cookie_domain` on every login and
+    # ``DataAppSubdomainMiddleware`` (``app/data_apps_subdomain.py``) on every
+    # request. Neither re-checks ``enabled``, so this accessor is the single
+    # place where "the feature is off" can be made to mean "there is no base".
+    #
+    # Off ⇒ no base, whatever the SOURCE of the base. Widening the session
+    # cookie to the base's parent domain, and routing ``<slug>.<base>`` hosts,
+    # are both things a deployment that is serving no apps must not be doing —
+    # and the config that asks for them outlives the switch that turned the
+    # feature on, in both directions: a stale ``.env`` line, or (the case an
+    # earlier cut of this change missed — Devin Review on #1588) a
+    # ``subdomain_base`` still sitting in instance.yaml under
+    # ``AGNES_DATA_APPS_ENABLED=false``.
+    if not cfg.get("enabled"):
+        # ``pop``, not ``= ""``: an absent/null ``data_apps:`` block must keep
+        # resolving to exactly ``{}`` (three tests pin that hardening).
+        cfg.pop("subdomain_base", None)
+        return cfg
+    # ``AGNES_DATA_APPS_SUBDOMAIN_BASE`` — deliberately keyed on the RESOLVED
+    # ``enabled`` above, not on the env-enable path the ``runtime_image`` pin
+    # sits inside, so the value does not depend on WHETHER the operator
+    # switched data apps on via env or yaml.
+    # (TODO: ``AGNES_DATA_APPS_RUNTIME_IMAGE`` above still no-ops silently on a
+    # yaml-enabled instance — same treatment, separate change.)
+    #
+    # An empty value wins too (env decides in both directions, per the #1022
+    # convention) — it forces path-prefix mode even when instance.yaml names a
+    # base.
+    env_base = os.environ.get("AGNES_DATA_APPS_SUBDOMAIN_BASE")
+    if env_base is not None:
+        cfg["subdomain_base"] = env_base.strip()
     return cfg
 
 

@@ -276,6 +276,77 @@ if [ -n "$EXTRACT_CID" ]; then
   done
 fi
 
+# Data-app subdomains: re-apply the wiring the BOOT script does, because the
+# Caddyfile it wired was just re-fetched pristine by the loop above. Without
+# this, a VM with a data-app subdomain base lost its `*.<base>` vhost and its
+# `on_demand_tls` block on the first tick after boot, and the recreate below
+# then served a Caddy that could reach no hosted app at all — hosted apps are
+# refused on the main origin by default, so their own origin is the only
+# supported way to reach them. Boot script and upgrade tick must both do this,
+# exactly as both already mirror `--profile apps`.
+#
+# The block between the markers is byte-identical to the one in
+# `startup-script.sh.tpl` — `tests/test_startup_data_apps_toggle.py` asserts
+# that, and `tests/test_caddyfile_apps_subdomain_docker.py` runs it through
+# Caddy's own parser. Keep them in sync by editing both.
+#
+# Placed BEFORE `hash_config_files` so the drift hash describes the file Caddy
+# will actually load. That is also what makes the base converge in both
+# directions without a reboot: adding or clearing APPS_SUBDOMAIN_BASE in .env
+# changes the hash, and the resulting recreate is what puts it into effect.
+APP_DIR=/opt/agnes
+APPS_SUBDOMAIN_BASE="$(_env_get APPS_SUBDOMAIN_BASE)"
+# The vhost fragment normally arrives with the boot-time image extract. Refresh
+# it here too, so a VM whose last boot predates the fragment picks it up within
+# a tick instead of waiting for a reboot (the block below warns and no-ops
+# while it is absent, leaving the pristine Caddyfile untouched).
+if [ -n "$APPS_SUBDOMAIN_BASE" ]; then
+  if curl -fsSL "$RAW_BASE/deploy/caddy/Caddyfile.apps-subdomain" \
+     -o "$APP_DIR/Caddyfile.apps-subdomain.new" 2>/dev/null; then
+    mv -f "$APP_DIR/Caddyfile.apps-subdomain.new" "$APP_DIR/Caddyfile.apps-subdomain"
+  else
+    rm -f "$APP_DIR/Caddyfile.apps-subdomain.new"
+    logger -t agnes-auto-upgrade "WARN: failed to fetch Caddyfile.apps-subdomain from $RAW_BASE — keeping existing"
+  fi
+fi
+# --- apps-subdomain-caddy begin (extracted + executed by tests/test_caddyfile_apps_subdomain_docker.py) ---
+# Data-app subdomains: Caddy vhost + per-app certificates
+# Hosted apps are refused on the main origin (they run user-authored JS that
+# would otherwise be same-origin with /api), so they are only reachable once
+# Caddy terminates TLS for *.$APPS_SUBDOMAIN_BASE.
+#
+# Certificates are issued PER HOSTNAME on first request (on-demand, HTTP-01),
+# not as one wildcard: a wildcard can only be validated over DNS-01, which
+# would put a DNS-zone write credential on this very host — the host that runs
+# user-authored app code. Issuance is gated by the `ask` endpoint below, so a
+# stranger cannot drive ACME by requesting made-up names.
+#
+# Only when a base is configured: `*.` with an empty value is a site address
+# Caddy refuses to parse, taking the PRIMARY site down with it — the same way
+# an empty DOMAIN_ALIAS once did.
+#
+# The global options block must be FIRST in a Caddyfile, so it is prepended,
+# not appended. Guarded on its own marker because this script runs on EVERY
+# boot and a second copy is a file Caddy cannot parse. (The boot-time image
+# extract normally restores a pristine Caddyfile first; the guard covers the
+# paths that do not.)
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -f "$APP_DIR/Caddyfile" ]; then
+    if [ ! -f "$APP_DIR/Caddyfile.apps-subdomain" ]; then
+        echo "WARN: Caddyfile.apps-subdomain missing from the image — data apps will not be reachable on *.$APPS_SUBDOMAIN_BASE" >&2
+    elif grep -q on_demand_tls "$APP_DIR/Caddyfile"; then
+        :  # already wired this boot — idempotent
+    else
+        {
+            printf '{\n\ton_demand_tls {\n\t\task http://app:8000/api/data-apps-tls-check\n\t}\n}\n\n'
+            cat "$APP_DIR/Caddyfile"
+            printf '\n'
+            cat "$APP_DIR/Caddyfile.apps-subdomain"
+        } > "$APP_DIR/.Caddyfile.new" && mv "$APP_DIR/.Caddyfile.new" "$APP_DIR/Caddyfile"
+        echo "INFO: data-app subdomains wired for *.$APPS_SUBDOMAIN_BASE (per-app certs via on-demand TLS)"
+    fi
+fi
+# --- apps-subdomain-caddy end ---
+
 # docker-compose.gcp-logging.yml is placement-driven: deliberately NOT in
 # CONFIG_FILES (those are refreshed unconditionally). It must exist ONLY
 # where the deploy layer placed it -- the overlay-append further down gates

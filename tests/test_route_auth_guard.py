@@ -28,6 +28,16 @@ import os
 # get_optional_user + explicit 401/redirect check).
 _EXEMPT: dict[str, str] = {
     "/api/health": "liveness probe — no secrets, must be reachable pre-auth",
+    "/api/data-apps-tls-check": (
+        "Caddy's on-demand-TLS `ask` probe — Caddy sends a plain GET carrying no "
+        "credential and reads ANY non-2xx as 'cancel issuance', so a Depends() auth "
+        "chain would refuse every certificate and leave hosted apps unreachable. "
+        "Leaks nothing new: it answers 2xx only for a registered, non-hidden slug "
+        "under the configured data_apps.subdomain_base, and proxy_app already "
+        "resolves _get_row_or_404 BEFORE authenticating — so a real slug is already "
+        "distinguishable from a made-up one on the proxy itself. Rate-limited. "
+        "See app/api/data_apps_proxy.py::tls_check"
+    ),
     "/api/version": "build/version info — public, no secrets (app/api/health.py)",
     "/api/sync/status": (
         "public sync-in-flight probe used by the host auto-upgrade cron to avoid "

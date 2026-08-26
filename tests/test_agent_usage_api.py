@@ -37,22 +37,34 @@ def env(tmp_path, monkeypatch, shared_app):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
 
-    from src.db import SYSTEM_EVERYONE_GROUP, get_system_db
+    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP, get_system_db
     from src.repositories import agents_repo, resource_grants_repo, user_group_members_repo, user_groups_repo
     from src.repositories.users import UserRepository
 
     conn = get_system_db()
     UserRepository(conn).create(id="owner1", email="owner@test.com", name="Owner")
     UserRepository(conn).create(id="other1", email="other@test.com", name="Other")
+    UserRepository(conn).create(id="admin1", email="admin@test.com", name="Admin")
+    UserRepository(conn).create(id="grantee1", email="grantee@test.com", name="Grantee")
     conn.close()
 
     everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-    user_group_members_repo().add_member("owner1", everyone["id"], source="system_seed")
-    user_group_members_repo().add_member("other1", everyone["id"], source="system_seed")
+    for uid in ("owner1", "other1", "admin1", "grantee1"):
+        user_group_members_repo().add_member(uid, everyone["id"], source="system_seed")
     resource_grants_repo().create(everyone["id"], "chat", "chat")
+
+    admin_group = user_groups_repo().get_by_name(SYSTEM_ADMIN_GROUP)
+    user_group_members_repo().add_member("admin1", admin_group["id"], source="system_seed")
 
     agent_id = str(uuid.uuid4())
     agents_repo().create(id=agent_id, owner_user_id="owner1", name="Support Bot", slug="support-bot")
+
+    # C2.4 (shared-agent, C2.3): `grantee1` is neither owner nor admin, but
+    # was shared this agent via a `ResourceType.AGENT` grant, same as
+    # `tests/test_agent_sessions_api.py::_grant_agent_to_group`.
+    grantee_group = user_groups_repo().create(name="c24-usage-grantee-group", created_by="owner1")
+    user_group_members_repo().add_member("grantee1", grantee_group["id"], source="admin", added_by="owner1")
+    resource_grants_repo().create(grantee_group["id"], "agent", agent_id, assigned_by="owner1")
 
     budgeted_id = str(uuid.uuid4())
     agents_repo().create(
@@ -71,13 +83,23 @@ def env(tmp_path, monkeypatch, shared_app):
         "client": client,
         "owner_token": create_access_token("owner1", "owner@test.com"),
         "other_token": create_access_token("other1", "other@test.com"),
+        "admin_token": create_access_token("admin1", "admin@test.com"),
+        "grantee_token": create_access_token("grantee1", "grantee@test.com"),
         "agent_id": agent_id,
         "budgeted_agent_id": budgeted_id,
         "other_agent_id": other_agent_id,
     }
 
 
-def _seed_usage(agent_id: str, *, input_tokens: int, output_tokens: int, cache_read: int, cache_creation: int) -> None:
+def _seed_usage(
+    agent_id: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_creation: int,
+    caller_user_id: str | None = None,
+) -> None:
     from src.repositories import llm_usage_repo
 
     llm_usage_repo().insert_batch(
@@ -86,6 +108,7 @@ def _seed_usage(agent_id: str, *, input_tokens: int, output_tokens: int, cache_r
                 "id": uuid.uuid4().hex,
                 "agent_id": agent_id,
                 "user_id": "owner1",
+                "caller_user_id": caller_user_id,
                 "session_id": "sess-1",
                 "model": "claude-sonnet-5",
                 "input_tokens": input_tokens,
@@ -297,3 +320,116 @@ def test_usage_agent_pat_wrong_agent_returns_403(env):
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "agent_pat_wrong_agent"
+
+
+# ---------------------------------------------------------------------------
+# C2.4 — per-caller usage attribution: `by_caller` breakdown, owner-or-admin
+# only (`env`'s `grantee1` was shared `support-bot` via a `ResourceType.
+# AGENT` grant, C2.3 — a plain runnable grantee must never see other
+# callers' usage).
+#
+# The RBAC gating below is exercised through a fake `llm_usage_repo()`
+# rather than real seeded rows: the real per-caller breakdown is a
+# genuinely Postgres-only capability (`caller_user_id` is a PG-only column,
+# `tests/db_pg/test_llm_usage_contract.py` pins the exact per-backend
+# content), and this test suite's default backend is DuckDB, which would
+# silently degrade every row to a single `caller_user_id=None` bucket —
+# hiding a broken RBAC gate behind a backend limitation. The fake isolates
+# "does THIS endpoint show/hide `by_caller` for THIS caller" from "does
+# THIS backend persist enough to compute it".
+# ---------------------------------------------------------------------------
+
+
+class _FakeBreakdownRepo:
+    def __init__(self):
+        self.by_caller_calls = 0
+
+    def usage_breakdown_for_month(self, agent_id, year_month):
+        return {
+            "input_tokens": 30,
+            "output_tokens": 15,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "total_tokens": 45,
+        }
+
+    def usage_breakdown_by_caller_for_month(self, agent_id, year_month):
+        self.by_caller_calls += 1
+        return [
+            {
+                "caller_user_id": "owner1",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 15,
+            },
+            {
+                "caller_user_id": "grantee1",
+                "input_tokens": 20,
+                "output_tokens": 10,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 30,
+            },
+        ]
+
+
+def test_usage_by_caller_breakdown_visible_to_owner(env, monkeypatch):
+    fake = _FakeBreakdownRepo()
+    monkeypatch.setattr("app.api.agent_runtime.llm_usage_repo", lambda: fake)
+
+    resp = env["client"].get("/api/v1/agents/support-bot/usage", headers=_auth(env["owner_token"]))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Aggregate is unaffected by attribution -- still the SUM across callers.
+    assert body["total_tokens"] == 45
+    by_caller = {row["caller_user_id"]: row for row in body["by_caller"]}
+    assert set(by_caller) == {"owner1", "grantee1"}
+    assert by_caller["owner1"]["total_tokens"] == 15
+    assert by_caller["grantee1"]["total_tokens"] == 30
+    assert fake.by_caller_calls == 1
+
+
+def test_usage_by_caller_breakdown_visible_to_admin_with_no_grant(env, monkeypatch):
+    """An admin who is neither the owner nor a grantee still sees the
+    breakdown -- inspection, not run authority (see
+    `require_agent_usage_principal`'s docstring). Addressed by id, since
+    `support-bot` is only unique within OWNER1's own slug namespace."""
+    fake = _FakeBreakdownRepo()
+    monkeypatch.setattr("app.api.agent_runtime.llm_usage_repo", lambda: fake)
+
+    resp = env["client"].get(f"/api/v1/agents/{env['agent_id']}/usage", headers=_auth(env["admin_token"]))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    by_caller = {row["caller_user_id"]: row for row in body["by_caller"]}
+    assert set(by_caller) == {"owner1", "grantee1"}
+
+
+def test_usage_by_caller_breakdown_hidden_from_a_plain_grantee(env, monkeypatch):
+    """`grantee1` was shared `support-bot` (runs it, C2.3) but is not its
+    owner and not an admin -- it can see the AGGREGATE total, never the
+    per-caller split (that would leak the owner's own usage). The
+    breakdown repo method is never even CALLED for this caller."""
+    fake = _FakeBreakdownRepo()
+    monkeypatch.setattr("app.api.agent_runtime.llm_usage_repo", lambda: fake)
+
+    resp = env["client"].get(f"/api/v1/agents/{env['agent_id']}/usage", headers=_auth(env["grantee_token"]))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_tokens"] == 45
+    assert body["by_caller"] is None
+    assert fake.by_caller_calls == 0
+
+
+def test_usage_unrelated_user_by_id_still_404s(env):
+    """The admin inspection fallback in `require_agent_usage_principal`
+    must not accidentally widen access for a NON-admin -- `other1` has no
+    relationship to `support-bot` (not owner, not a grantee, not admin)."""
+    resp = env["client"].get(f"/api/v1/agents/{env['agent_id']}/usage", headers=_auth(env["other_token"]))
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "agent_not_found"
