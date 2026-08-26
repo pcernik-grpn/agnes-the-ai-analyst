@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.89.1] - 2026-08-26
+
 ### Fixed
 
 - **The in-chat data-app preview works again for logged-in users in the
