@@ -802,8 +802,13 @@ DISPYAML
 
 COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.dispatcher.yml"
 %{ endif ~}
-%{ if data_apps_enabled ~}
-# --- Data apps (apps-runner sidecar) ---
+%{ if data_apps_enabled || chat_provider == "docker" ~}
+# --- apps-runner sidecar (data apps AND/OR chat.provider=docker) ---
+# Two features ride the same sidecar: hosted data apps, and web chat with
+# `chat_provider = "docker"`, whose sandboxes it creates (it is the only
+# process holding the Docker socket). The token + gid below are therefore
+# minted whenever EITHER is on; only the runtime-image lines further down are
+# data-apps-specific.
 # APPS_RUNNER_TOKEN — shared secret between the app and the apps-runner sidecar
 # (both source the same .env). Preserve across reboots like SCHEDULER_API_TOKEN:
 # read back from an existing .env, mint fresh only on first boot.
@@ -819,10 +824,12 @@ fi
 # a supplementary group. Resolve the host socket's gid so uid 999 can talk to
 # the daemon (else every up()/stop() 502s with PermissionError(13)).
 DOCKER_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)
+%{ if data_apps_enabled ~}
 # The runner only pulls images under this prefix (everything before the last
 # ':' of the full runtime image); the app reads the full image via the env var.
 DATA_APPS_RUNTIME_IMAGE="${data_apps_runtime_image}"
 APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
+%{ endif ~}
 %{ endif ~}
 %{ if kai_agent_enabled ~}
 # --- 4c. Opt-in embedded kai-agent turn engine ---
@@ -1114,6 +1121,15 @@ APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN
 APPS_RUNNER_IMAGE_PREFIX=$APPS_RUNNER_IMAGE_PREFIX
 DOCKER_GID=$DOCKER_GID
 %{ endif ~}
+%{ if chat_provider == "docker" && !data_apps_enabled ~}
+# chat.provider=docker needs the same sidecar as data apps, but NOT the
+# data-apps feature itself: no AGNES_DATA_APPS_ENABLED here, so the app keeps
+# hosted apps off while the sandbox half of the sidecar's API stays reachable.
+# The negated guard exists only to keep these two keys from being written
+# twice when both features are on.
+APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN
+DOCKER_GID=$DOCKER_GID
+%{ endif ~}
 $CADDY_TLS_LINE
 $DOMAIN_ALIAS_LINE
 $AGNES_TEMP_DIR_LINE
@@ -1143,15 +1159,16 @@ COMPOSE_PROFILES_ARG=""
 if [ "$TLS_MODE" = "caddy" ] && [ -n "$DOMAIN" ]; then
     COMPOSE_PROFILES_ARG="--profile tls"
 fi
-%{ if data_apps_enabled ~}
+%{ if data_apps_enabled || chat_provider == "docker" ~}
 # The `apps` profile MUST be a command-line --profile flag, not COMPOSE_PROFILES
 # in .env: docker compose does not merge the two — the moment ANY --profile flag
 # is passed (e.g. `--profile tls` on the default caddy/TLS instance) the
 # COMPOSE_PROFILES env var is ignored entirely, so an apps profile carried
 # through .env would be silently dropped and the apps-runner sidecar never start
-# (data-app deploys then 502). Multiple --profile flags DO union, so appending
-# here activates apps alongside tls. agnes-auto-upgrade.sh mirrors this so the
-# recurring upgrade tick keeps the sidecar running.
+# (data-app deploys then 502; with chat_provider=docker every chat session
+# 503s instead). Multiple --profile flags DO union, so appending here activates
+# apps alongside tls. agnes-auto-upgrade.sh mirrors this so the recurring
+# upgrade tick keeps the sidecar running.
 COMPOSE_PROFILES_ARG="$COMPOSE_PROFILES_ARG --profile apps"
 %{ endif ~}
 
@@ -1196,6 +1213,16 @@ docker compose $COMPOSE_PROFILES_ARG pull
 # Best-effort (`|| true`) — a registry hiccup must not fail the whole boot;
 # the deploy path still works, just slowly, on the cold-pull backstop.
 docker pull "$AGNES_DATA_APPS_RUNTIME_IMAGE" || echo "WARN: could not pre-pull data-app runtime image $AGNES_DATA_APPS_RUNTIME_IMAGE"
+%{ endif ~}
+%{ if chat_provider == "docker" ~}
+# Build the chat sandbox image BEFORE `up -d`: the app probes it through the
+# apps-runner during its own lifespan and refuses the ChatManager when it is
+# absent, so a VM that built it afterwards would boot with chat 503ing until
+# something restarted the app. Best-effort by the same rule as the pre-pull
+# above — a build failure must not strand the boot before cron and the
+# watchdog are installed; the app's gate then says why chat is off.
+"$APP_DIR/scripts/ops/agnes-chat-sandbox-image.sh" "$${IMAGE_REPO}:$${IMAGE_TAG}" \
+    || echo "WARN: chat sandbox image unavailable — chat.provider=docker will refuse to start"
 %{ endif ~}
 # Retry `up`: on a first boot the app can exceed its healthcheck start window
 # (fresh image, DuckDB->PG data migration, keboola table attach), which makes

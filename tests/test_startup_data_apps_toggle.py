@@ -66,14 +66,21 @@ def test_tpl_env_block_guarded_by_toggle():
 
 def test_tpl_data_apps_blocks_are_toggle_gated():
     body = (MODULE / "startup-script.sh.tpl").read_text()
-    # Five positive `if data_apps_enabled` blocks (token/DOCKER_GID prep, the
-    # .env keys, the --profile apps flag, the runtime-image pre-pull, and the
-    # container-metadata-hardening firewall rule), only positive guards (no
-    # `!data_apps_enabled`), so a default instance renders none of it — in
-    # particular it never spends boot time, bandwidth or disk pulling a ~1.3 GB
+    # Four data-apps-only blocks (the runtime-image half of the sidecar prep,
+    # the .env keys, the runtime-image pre-pull, and the container-metadata-
+    # hardening firewall rule) — so a default instance renders none of it, and
+    # in particular never spends boot time, bandwidth or disk pulling a ~1.3 GB
     # image, nor touches iptables, for a feature it does not run.
-    assert body.count("%{ if data_apps_enabled ~}") == 5
-    assert "!data_apps_enabled" not in body
+    assert body.count("%{ if data_apps_enabled ~}") == 4
+    # Two blocks are SHARED with chat.provider=docker, which spawns its
+    # sandboxes through the same apps-runner: the token/DOCKER_GID prep and the
+    # --profile apps flag. Either feature alone must render them.
+    assert body.count('%{ if data_apps_enabled || chat_provider == "docker" ~}') == 2
+    # The one negated guard exists solely to keep APPS_RUNNER_TOKEN/DOCKER_GID
+    # from being written to .env twice when BOTH features are on — never to
+    # gate data-apps behavior itself.
+    assert body.count("!data_apps_enabled") == 1
+    assert '%{ if chat_provider == "docker" && !data_apps_enabled ~}' in body
     # The APPS_RUNNER_TOKEN prep must precede its use in the .env heredoc.
     assert body.index("APPS_RUNNER_TOKEN=$(openssl") < body.index("APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN")
 

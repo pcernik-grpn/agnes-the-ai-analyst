@@ -385,6 +385,15 @@ is unchanged.
 
 ### Prerequisites
 
+On a VM built by the `customer-instance` Terraform module, setting
+`chat_provider = "docker"` on that instance does all of this for you: it mints
+`APPS_RUNNER_TOKEN`, resolves `DOCKER_GID`, activates the `apps` compose
+profile, and builds the sandbox image at boot from the context inside the app
+image (`scripts/ops/agnes-chat-sandbox-image.sh`, re-run by the upgrade tick
+whenever that context changes). It does **not** enable hosted data apps —
+`data_apps_enabled` stays a separate choice. The list below is what that
+automation does, and what to do by hand anywhere else.
+
 1. **A Docker daemon on the host** that runs the Agnes gateway.
 2. **The apps-runner sidecar.** It is the only process that touches
    `/var/run/docker.sock`; the gateway reaches it over a token-gated HTTP API.

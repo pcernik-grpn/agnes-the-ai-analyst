@@ -74,6 +74,12 @@ COMPOSE_PROFILES="$(_env_get COMPOSE_PROFILES)"
 # flag below (NOT via COMPOSE_PROFILES: compose ignores that env var whenever any
 # --profile flag — e.g. `--profile tls` — is present; the two are not merged).
 DATA_APPS_ENABLED="$(_env_get AGNES_DATA_APPS_ENABLED)"
+# Web chat with chat.provider=docker spawns its sessions through that SAME
+# apps-runner sidecar, so it needs the `apps` profile below even on a VM that
+# runs no data apps. Env pin > instance.yaml (app/chat/config.py), and only
+# the pin is visible from a host script — an instance.yaml-only `docker`
+# provider keeps the sidecar through COMPOSE_PROFILES=apps in .env instead.
+CHAT_PROVIDER="$(_env_get AGNES_CHAT_PROVIDER)"
 # The runtime image data apps actually run. Pre-pulled below so the first
 # deploy on this host isn't a 1.3 GB fetch inside the runner's request.
 DATA_APPS_RUNTIME_IMAGE="$(_env_get AGNES_DATA_APPS_RUNTIME_IMAGE)"
@@ -319,9 +325,19 @@ fi
 # across upgrade ticks. Must be a flag (mirrors the startup script): once
 # `--profile tls` is in PROFILE_ARGS the COMPOSE_PROFILES env var is ignored, so
 # relying on it would silently drop the sidecar on the default TLS instance.
+APPS_PROFILE_WANTED=0
 case "$DATA_APPS_ENABLED" in
-  1|true|TRUE|yes|on) PROFILE_ARGS+=( --profile apps ) ;;
+  1|true|TRUE|yes|on) APPS_PROFILE_WANTED=1 ;;
 esac
+# Same sidecar, second consumer: chat.provider=docker. Dropping the profile
+# here would stop the sandbox runner on the next tick and 503 every chat
+# session on a VM whose chat was fine a moment earlier.
+[ "$CHAT_PROVIDER" = "docker" ] && APPS_PROFILE_WANTED=1
+# Guard the append: COMPOSE_PROFILES in .env is already folded into flags
+# above, so a VM carrying `apps` there would otherwise get it twice.
+if [ "$APPS_PROFILE_WANTED" = "1" ] && [[ " ${PROFILE_ARGS[*]-} " != *" apps "* ]]; then
+    PROFILE_ARGS+=( --profile apps )
+fi
 
 # gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging.
 # Gated on file presence (the file is baked into the image but PLACED only
@@ -641,6 +657,16 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
                 done
             fi
         fi
+    fi
+    # chat.provider=docker: refresh the sandbox image BEFORE the recreate.
+    # Its build context ships inside the app image, so an app upgrade can
+    # change it — and the app probes the image during boot, refusing the
+    # ChatManager when it is missing or unbuildable. The helper is a no-op
+    # unless the context hash actually moved, and best-effort: a failed
+    # build must not abort the tick and leave the config marker unwritten.
+    if [ "$CHAT_PROVIDER" = "docker" ] && [ -x /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh ]; then
+        /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE" \
+            || logger -t agnes-auto-upgrade "WARN: chat sandbox image refresh failed — chat may refuse to start after this recreate"
     fi
     # ${arr[@]+"${arr[@]}"} pattern: expands to nothing when array is
     # empty (vs. plain "${arr[@]}" which trips `set -u` on bash <4.4).
