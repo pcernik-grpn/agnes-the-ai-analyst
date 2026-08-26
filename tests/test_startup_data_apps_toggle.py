@@ -66,12 +66,13 @@ def test_tpl_env_block_guarded_by_toggle():
 
 def test_tpl_data_apps_blocks_are_toggle_gated():
     body = (MODULE / "startup-script.sh.tpl").read_text()
-    # Four positive `if data_apps_enabled` blocks (token/DOCKER_GID prep, the
-    # .env keys, the --profile apps flag, and the runtime-image pre-pull), only
-    # positive guards (no `!data_apps_enabled`), so a default instance renders
-    # none of it — in particular it never spends boot time, bandwidth or disk
-    # pulling a ~1.3 GB image for a feature it does not run.
-    assert body.count("%{ if data_apps_enabled ~}") == 4
+    # Five positive `if data_apps_enabled` blocks (token/DOCKER_GID prep, the
+    # .env keys, the --profile apps flag, the runtime-image pre-pull, and the
+    # container-metadata-hardening firewall rule), only positive guards (no
+    # `!data_apps_enabled`), so a default instance renders none of it — in
+    # particular it never spends boot time, bandwidth or disk pulling a ~1.3 GB
+    # image, nor touches iptables, for a feature it does not run.
+    assert body.count("%{ if data_apps_enabled ~}") == 5
     assert "!data_apps_enabled" not in body
     # The APPS_RUNNER_TOKEN prep must precede its use in the .env heredoc.
     assert body.index("APPS_RUNNER_TOKEN=$(openssl") < body.index("APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN")
