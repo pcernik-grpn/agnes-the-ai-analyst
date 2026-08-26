@@ -183,18 +183,20 @@ Set the env var in `.env`/Terraform, or the YAML path in `instance.yaml`.
 
 ### Connection ownership (`source_connections` vs `instance.yaml`)
 
-The `data_source.{bigquery,snowflake,databricks}` blocks above are read
-straight from the resolved `instance.yaml` tier — but each of those source
-types (plus `keboola`) also has a row in the `source_connections` table
-(`/api/admin/source-connections`, `agnes admin connection …`), the intended
-long-term source of truth. `app/connections_seed.py` seeds one such row per
-type from whatever `instance.yaml` / env vars are already configured on
-first boot — a one-time copy, not a live sync — after which further edits to
+Each of `keboola`/`bigquery`/`snowflake`/`databricks` has a row in the
+`source_connections` table (`/api/admin/source-connections`, `agnes admin
+connection …`) that is the live source of truth, resolved fresh on every
+call — the `data_source.{bigquery,snowflake,databricks}` blocks above are
+only consulted as a fallback on an un-migrated instance with no row yet.
+`app/connections_seed.py` seeds one such row per type from whatever
+`instance.yaml` / env vars are already configured on first boot — a
+one-time copy, not a live sync — after which further edits to
 `instance.yaml` for a *seeded* type log a deprecation warning and are
-otherwise ignored. See [`DATA_SOURCES.md`](DATA_SOURCES.md#connection-ownership-source_connections-vs-instanceyaml)
-for the per-source table of which side is actually load-bearing today (only
-`keboola` reads its row live; `bigquery`/`snowflake`/`databricks` still
-resolve from `instance.yaml` until that migration lands).
+otherwise ignored (the row wins). The "Add data source" wizard's Snowflake/
+Databricks panes write the row directly, so a saved connection is visible to
+every process on the very next call — no restart. See
+[`DATA_SOURCES.md`](DATA_SOURCES.md#connection-ownership-source_connections-vs-instanceyaml)
+for the per-source table.
 
 ### Flea-market upload guardrails
 
