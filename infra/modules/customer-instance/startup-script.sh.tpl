@@ -485,7 +485,8 @@ if [ "$TLS_MODE" = "caddy" ] && [ -n "$DOMAIN" ]; then
     fi
 fi
 
-# --- Data-app subdomains: Caddy vhost + per-app certificates ---------------
+# --- apps-subdomain-caddy begin (extracted + executed by tests/test_caddyfile_apps_subdomain_docker.py) ---
+# Data-app subdomains: Caddy vhost + per-app certificates
 # Hosted apps are refused on the main origin (they run user-authored JS that
 # would otherwise be same-origin with /api), so they are only reachable once
 # Caddy terminates TLS for *.$APPS_SUBDOMAIN_BASE.
@@ -520,6 +521,7 @@ if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -f "$APP_DIR/Caddyfile" ]; then
         echo "INFO: data-app subdomains wired for *.$APPS_SUBDOMAIN_BASE (per-app certs via on-demand TLS)"
     fi
 fi
+# --- apps-subdomain-caddy end ---
 
 # DOMAIN_ALIAS — a legacy hostname Caddy serves alongside DOMAIN and 308s onto
 # it, so a domain cutover doesn't break old bookmarks / CLI configs / MCP
