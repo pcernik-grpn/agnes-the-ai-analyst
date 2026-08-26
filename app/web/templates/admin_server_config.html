@@ -390,29 +390,26 @@
   </section>
 
   <!-- Cloud chat — bespoke panel (not part of instance.yaml).
-       ANTHROPIC_API_KEY / E2B_API_KEY via /admin/chat/secrets. -->
+       ANTHROPIC_API_KEY via /admin/chat/secrets. -->
   <section class="cfg-section" id="chat-section">
     <header>
       <div>
         <h3>Cloud chat</h3>
         <div class="section-help">
-          The cloud-hosted chat needs <code>ANTHROPIC_API_KEY</code> and
-          (for the E2B sandbox provider) <code>E2B_API_KEY</code> in the
-          server environment, plus a strong <code>JWT_SECRET_KEY</code>.
-          Missing or invalid keys leave chat disabled. Set the keys here
-          (stored in the server's env-overlay, never echoed back) and use
-          <strong>Test keys</strong> to confirm they actually work. A server
-          restart is required after setting keys for chat to start.
+          The cloud-hosted chat needs <code>ANTHROPIC_API_KEY</code> in the
+          server environment, plus a strong <code>JWT_SECRET_KEY</code> and
+          the active provider's backing (<code>KAI_HOST_JWT_SECRET</code> for
+          <code>kai-agent</code>, <code>APPS_RUNNER_TOKEN</code> for
+          <code>docker</code>). Missing or invalid keys leave chat disabled.
+          Set the key here (stored in the server's env-overlay, never echoed
+          back) and use <strong>Test keys</strong> to confirm it actually
+          works. A server restart is required after setting keys for chat to
+          start.
         </div>
       </div>
     </header>
     <div class="section-body">
       <div id="chat-readiness-status" class="cfg-loading">Loading…</div>
-      <div class="iw-form-field">
-        <label for="chat-e2b-key">E2B_API_KEY</label>
-        <input type="password" id="chat-e2b-key"
-               placeholder="e2b_••• (leave blank to keep existing)" autocomplete="off">
-      </div>
       <div class="iw-form-field">
         <label for="chat-anthropic-key">ANTHROPIC_API_KEY</label>
         <input type="password" id="chat-anthropic-key"
@@ -438,6 +435,15 @@
           precedence — a token shown as <code>env</code> can't be changed
           here. Storing a token requires <code>AGNES_VAULT_KEY</code> on the
           server.
+          <br>
+          Create the Slack app from the shipped manifest —
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-http.md"
+             target="_blank" rel="noopener">docs/slack-manifest-http.md</a>
+          (or the
+          <a href="https://github.com/keboola/agnes-the-ai-analyst/blob/main/docs/slack-manifest-socket.md"
+             target="_blank" rel="noopener">Socket&nbsp;Mode variant</a>)
+          — never by hand-picking scopes. The manifest is the minimal
+          bot-token scope set; the bot needs no user scopes at all.
         </div>
       </div>
     </header>
@@ -545,7 +551,6 @@ const SECTION_META = {
   data_source: { title: "Data source", help: "Switch source type or update connection details. Optional BQ + Keboola knobs render below as structured fields with hints; expand each to edit." },
   email: { title: "Email (SMTP)", help: "SMTP relay for magic-link login. Leave blank to disable." },
   telegram: { title: "Telegram", help: "Bot credentials for notifications." },
-  jira: { title: "Jira", help: "Jira webhook + REST credentials." },
   theme: { title: "Theme", help: "Brand colors and typography." },
   server: { title: "Server", help: "Hostname and host. Changing these can break OAuth callbacks." },
   auth: { title: "Authentication", help: "Allowed sign-in domain and Google OAuth keys. Misconfiguration can lock everyone out." },
@@ -1151,7 +1156,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "jira", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in
@@ -1940,9 +1945,7 @@ async function chatReadinessLoad() {
     // to its raw name rather than being dropped.
     const CHAT_SECRET_LABELS = {
       anthropic_api_key: "ANTHROPIC_API_KEY",
-      e2b_api_key: "E2B_API_KEY",
       jwt_secret_key: "JWT_SECRET_KEY",
-      e2b_template_id: "e2b_template_id",
       apps_runner_token: "APPS_RUNNER_TOKEN",
       chat_docker_image: "chat.docker_image",
       kai_host_jwt_secret: "KAI_HOST_JWT_SECRET",
@@ -1950,10 +1953,10 @@ async function chatReadinessLoad() {
     // Rows that echo plain config rather than secrets: they always carry a
     // value (built-in defaults), so "set" is meaningless for them — show them
     // only when the active provider actually requires them. Secret rows stay
-    // visible whenever set, so "you still have an E2B key configured" reads
-    // on a docker instance and vice versa. With chat disabled nothing is
+    // visible whenever set, so a configured-but-unused credential still reads
+    // on the other provider's instance. With chat disabled nothing is
     // "required", so everything renders as setup guidance.
-    const CHAT_CONFIG_ROWS = new Set(["e2b_template_id", "chat_docker_image"]);
+    const CHAT_CONFIG_ROWS = new Set(["chat_docker_image"]);
     const rows = Object.entries(s.secrets || {})
       .filter(([key, v]) => !s.enabled || v.required || (v.set && !CHAT_CONFIG_ROWS.has(key)))
       .map(([key, v]) => [CHAT_SECRET_LABELS[key] || key, v]);
@@ -1995,15 +1998,12 @@ async function chatReadinessLoad() {
 }
 
 async function chatSaveSecrets(btn) {
-  const e2b = document.getElementById("chat-e2b-key").value.trim();
   const anth = document.getElementById("chat-anthropic-key").value.trim();
-  if (!e2b && !anth) {
-    showBanner("Enter at least one key to save.", "error");
+  if (!anth) {
+    showBanner("Enter a key to save.", "error");
     return;
   }
-  const payload = {};
-  if (e2b) payload.e2b_api_key = e2b;
-  if (anth) payload.anthropic_api_key = anth;
+  const payload = { anthropic_api_key: anth };
   btn.disabled = true;
   try {
     const r = await fetch(CHAT_API + "/secrets", {
@@ -2014,8 +2014,7 @@ async function chatSaveSecrets(btn) {
     });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const body = await r.json();
-    // Clear the inputs so the secret doesn't linger in the DOM.
-    document.getElementById("chat-e2b-key").value = "";
+    // Clear the input so the secret doesn't linger in the DOM.
     document.getElementById("chat-anthropic-key").value = "";
     showBanner("Saved " + body.changed.join(", ") + ". Restart the server to activate chat.", "success");
     chatReadinessLoad();
@@ -2037,10 +2036,9 @@ async function chatTestSecrets(btn) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const b = await r.json();
     const fmt = (label, x) => `${x.ok ? "✓" : "✗"} ${label}: ${x.detail}`;
-    // The sandbox row is provider-aware: e2b_api_key on an E2B deployment,
-    // docker_sandbox on a self-hosted one. Render whichever came back.
+    // The sandbox row is provider-aware: docker_sandbox on a docker
+    // deployment, nothing extra on kai-agent. Render whichever came back.
     const rows = [
-      ["E2B", b.e2b_api_key],
       ["Docker sandbox", b.docker_sandbox],
       ["Anthropic", b.anthropic_api_key],
     ].filter(([, x]) => x);

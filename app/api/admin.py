@@ -484,7 +484,7 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
 # --- Server-config (instance.yaml) editor -----------------------------------
 #
 # The /admin/server-config UI POSTs a partial dict here keyed by section
-# (instance, data_source, email, telegram, jira, theme, server, auth) with
+# (instance, data_source, email, telegram, theme, server, auth) with
 # the field values to merge into instance.yaml. Each save:
 #   1. Loads the current instance.yaml (writable overlay first, then static).
 #   2. Deep-merges the patch on top.
@@ -512,7 +512,6 @@ _STATIC_EDITABLE_SECTIONS: tuple[str, ...] = (
     "data_source",
     "email",
     "telegram",
-    "jira",
     "theme",
     "server",
     "auth",
@@ -578,7 +577,6 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "email": "restart",  # conservative: the actual SMTP send path (app/auth/providers/email.py, password.py) reads SMTP_HOST/SMTP_USER/SMTP_PASSWORD straight from os.environ, never from get_value("email", ...) — a save here was not observed to change behavior at all, live or restart; "restart" is the non-overclaiming answer
     "telegram": "restart",  # services/telegram_bot/bot.py reads instance.yaml ONCE at module import, in a separate process — restarting the API alone does not refresh it
     "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above
-    "jira": "restart",  # connectors/jira/service.py's _JiraConfig snapshots JIRA_* env vars at class-body eval (import time); no instance.yaml wiring was found for this section at all
     "corporate_memory": "restart",  # partial: most keys (distribution_mode/approval_mode/sources.*) are read fresh via get_corporate_memory_config() per page render, but corporate_memory.confidence is applied ONCE at startup via services/corporate_memory/confidence.configure() (app/main.py) — conservative for the whole section, same reasoning as auth
     "openmetadata": "live",  # src/catalog_export.py reads instance config fresh at each invocation (a standalone job, not a long-lived cached client)
 }
@@ -711,6 +709,17 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "hint": (
                 "ON by default: a tool call the agent asks about is routed to an "
                 "approval card. Turning it OFF auto-allows those calls instead. "
+                "Resolved from the same overlay-only source as chat.enabled."
+            ),
+        },
+        "bootstrap_marketplace": {
+            "kind": "bool",
+            "default": _flag_default("chat", "bootstrap_marketplace", True),
+            "hint": (
+                "ON by default: the skills in a user's stack are materialized into "
+                "their chat session, so the composer's /<skill-name> menu entries "
+                "actually resolve. Turning it OFF removes marketplace skills from "
+                "that menu too — the menu never offers what nothing delivers. "
                 "Resolved from the same overlay-only source as chat.enabled."
             ),
         },
@@ -1231,9 +1240,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
     },
     "telegram": {
         # Rarely missing; leave empty.
-    },
-    "jira": {
-        # Webhook + REST credentials always present when Jira is configured.
     },
     "theme": {
         # Cosmetic only; rarely missing.
@@ -4012,14 +4018,12 @@ async def discover_tables(
             from app.instance_config import get_value
             from connectors.keboola.client import KeboolaClient
 
+            from app.datasource_secrets import keboola_instance_token
+
             url = get_value("data_source", "keboola", "stack_url", default="")
             token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-            token = os.environ.get(token_env, "") if token_env else ""
-            if not token:
-                from app.datasource_secrets import datasource_secret
-
-                token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-            client = KeboolaClient(token=token, url=url)
+            token, _provenance = keboola_instance_token(token_env)
+            client = KeboolaClient(token=token or "", url=url)
             tables = client.discover_all_tables()
             return {"tables": tables, "count": len(tables), "source": "keboola"}
 
@@ -7006,17 +7010,14 @@ def _discover_and_register_tables(
         }
 
     from connectors.keboola.client import KeboolaClient
+    from app.datasource_secrets import keboola_instance_token
 
     # Read from data_source.keboola (matches what /api/admin/configure writes)
     url = get_value("data_source", "keboola", "stack_url", default="")
     token_env = get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN")
-    token = os.environ.get(token_env, "") if token_env else ""
-    if not token:
-        from app.datasource_secrets import datasource_secret
+    token, _provenance = keboola_instance_token(token_env)
 
-        token = datasource_secret("KEBOOLA_STORAGE_TOKEN") or ""
-
-    client = KeboolaClient(token=token, url=url)
+    client = KeboolaClient(token=token or "", url=url)
     discovered = client.discover_all_tables()
 
     plan = _build_keboola_discovery_plan(conn, discovered)

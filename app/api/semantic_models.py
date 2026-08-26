@@ -37,7 +37,7 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.instance_config import get_studio_enabled
 from app.resource_types import ResourceType
 from src.audit_helpers import client_kind_from_user
-from src.repositories import audit_repo, semantic_model_repo, semantic_source_repo
+from src.repositories import RequiresPostgresBackend, audit_repo, semantic_model_repo, semantic_source_repo, use_pg
 from src.semantic.document_validation import validate_document
 from src.semantic.projection import project_document, prune_model
 from src.semantic_context import get_semantic_context as _get_semantic_context
@@ -49,7 +49,7 @@ router = APIRouter(tags=["semantic-models"])
 # Auto-draft sweep (semantic-phase5 wave 2) — how many uncovered tables one
 # sweep tick drafts, and how long it waits for each headless session before
 # moving on. Tuning knobs, not magic numbers: a batch of 3 keeps one sweep
-# tick's LLM spend bounded, and the scheduler re-fires every 30 minutes
+# tick's LLM spend bounded, and the scheduler re-fires every 55 minutes
 # (services/scheduler/__main__.py) so a large backlog drains gradually
 # rather than in one expensive tick.
 _SWEEP_BATCH_SIZE = 3
@@ -324,7 +324,7 @@ async def get_semantic_coverage(user: dict = Depends(require_admin)):
 async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     """Draft a semantic model for tables with zero semantic-layer coverage.
 
-    Scheduler-triggered every 30 minutes (``services/scheduler/__main__.py``)
+    Scheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)
     — admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``
     uncovered, not-already-pending tables (``tables_without_semantic_
     coverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a
@@ -355,7 +355,19 @@ async def semantic_auto_draft_sweep(user: dict = Depends(require_admin)):
     by another table's suggestion); ``no_apply_call`` is everything else
     the session actually ran for. ``remaining`` is how many eligible
     tables were left over after this tick's batch.
+
+    A3 PG-first ratchet: the dedup flag this sweep relies on
+    (``table_registry.mark_semantic_draft_pending`` /
+    ``clear_semantic_draft_pending``) is a Postgres-only capability — the
+    DuckDB app-state ladder is frozen at v124 and never gained the backing
+    column. On a DuckDB-backend instance this raises
+    :class:`~src.repositories.RequiresPostgresBackend`, translated by the
+    app-wide handler in ``app/main.py`` into a clean ``501`` naming the
+    feature, before any real work (no chat session, no table scan) runs.
     """
+    if not use_pg():
+        raise RequiresPostgresBackend("semantic-auto-draft-sweep")
+
     from app.auth.system_users import SEMANTIC_DRAFTER_USER_EMAIL, ensure_semantic_drafter_user
     from app.chat.headless import run_one_shot
     from app.chat.manager import ConcurrencyCapHit, get_current_chat_manager

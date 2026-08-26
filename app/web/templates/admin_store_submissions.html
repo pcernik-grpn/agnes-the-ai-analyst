@@ -93,7 +93,7 @@
   .badge.blocked_llm,
   .badge.review_error  { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
   .badge.archived      { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
-  .badge.deleted       { background: #4b5563; color: #f3f4f6; }
+  .badge.deleted       { background: var(--ds-text-primary); color: var(--ds-text-inverse); }
 
   .findings {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
@@ -280,7 +280,12 @@
           </td>
           <td>
             <span style="color: var(--text-secondary, #6b7280); font-size: 11px;">{{ s.type }}</span>
-            <strong>{{ s.name | store_display_name }}</strong>
+            {# Real link, not just the row's JS click handler — a keyboard user
+               had no way to reach a submission's detail page at all otherwise.
+               data-noprop matches the submitter-email link above so a real
+               click uses plain anchor navigation instead of also firing the
+               row handler for the same URL. #}
+            <a href="/admin/store/submissions/{{ s.id }}" data-noprop="1"><strong>{{ s.name | store_display_name }}</strong></a>
           </td>
           <td style="white-space: nowrap; font-variant-numeric: tabular-nums;">
             {%- if s.version_no -%}

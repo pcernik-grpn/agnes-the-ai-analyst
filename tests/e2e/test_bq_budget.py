@@ -81,30 +81,30 @@ def _bq_table_id() -> str:
 @pytest.fixture(scope="module")
 def admin_client(docker_e2e_agnes: str):
     return bootstrap_admin(
-        docker_e2e_agnes, email=E2E_USER_EMAIL, password=E2E_USER_PASSWORD,
+        docker_e2e_agnes,
+        email=E2E_USER_EMAIL,
+        password=E2E_USER_PASSWORD,
     )
 
 
 def _read_session_bq_bytes(admin_client, session_id: str) -> int:
     """Read the per-session BQ-bytes counter via the admin debug endpoint.
 
-    Pre-E2B this test used ``docker exec`` to read
-    ``app.api.query._per_session_bq_bytes`` from inside the running
-    container, but under the E2B-provider model the runner lives in a
-    remote E2B microVM and there is no host-side subprocess to exec
-    into. ``GET /admin/chat/{id}/debug`` (admin-only) returns the same
-    process-local counter without coupling the test to docker-exec
-    machinery. Returns 0 when the session has not yet been charged.
+    The counter lives in the gateway process
+    (``app.api.query._per_session_bq_bytes``), not in the sandbox, so the
+    right read path is the server's own API: ``GET /admin/chat/{id}/debug``
+    (admin-only) returns the process-local counter without coupling the
+    test to docker-exec machinery or the container layout. Returns 0 when
+    the session has not yet been charged.
     """
     status, payload = admin_client.get(f"/admin/chat/{session_id}/debug")
-    assert status == 200, (
-        f"admin debug endpoint should return 200; got {status} {payload!r}"
-    )
+    assert status == 200, f"admin debug endpoint should return 200; got {status} {payload!r}"
     return int(payload.get("bq_bytes", 0))
 
 
 def test_f6_remote_bq_count_increments_per_session_budget(
-    docker_e2e_agnes: str, admin_client,
+    docker_e2e_agnes: str,
+    admin_client,
 ) -> None:
     """End-to-end: chat → remote BQ COUNT(*) → budget accumulator ticks up."""
     if not _WS_AVAILABLE:
@@ -115,9 +115,7 @@ def test_f6_remote_bq_count_increments_per_session_budget(
     session = admin_client.create_chat_session(surface="web")
 
     before = _read_session_bq_bytes(admin_client, session["id"])
-    assert before == 0, (
-        f"fresh session {session['id']} should have zero BQ bytes; got {before}"
-    )
+    assert before == 0, f"fresh session {session['id']} should have zero BQ bytes; got {before}"
 
     ws_url = admin_client.ws_url_for(session)
     asst_texts: list[str] = []
@@ -144,7 +142,7 @@ def test_f6_remote_bq_count_increments_per_session_budget(
                 continue
             if frame.get("type") == "tool_call":
                 args = frame.get("args") or {}
-                cmd = (args.get("command") or "")
+                cmd = args.get("command") or ""
                 if "agnes query --remote" in cmd or "--remote" in cmd:
                     saw_remote_call = True
             elif frame.get("type") == "assistant_message":
@@ -153,10 +151,7 @@ def test_f6_remote_bq_count_increments_per_session_budget(
                     asst_texts.append(content)
                     break
 
-    assert saw_remote_call, (
-        "expected the assistant to invoke `agnes query --remote` for a "
-        "remote-mode table"
-    )
+    assert saw_remote_call, "expected the assistant to invoke `agnes query --remote` for a remote-mode table"
     assert asst_texts, "never saw an assistant_message before the WS closed"
 
     after = _read_session_bq_bytes(admin_client, session["id"])

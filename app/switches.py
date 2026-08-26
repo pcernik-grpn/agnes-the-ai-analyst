@@ -149,28 +149,48 @@ SWITCHES: tuple[Switch, ...] = (
         category="product",
         editable=True,
         runtime_view="enabled",
-        description="Cloud-hosted chat (E2B sandbox agent sessions). New feature — off by default.",
+        description="Cloud-hosted chat (sandboxed agent sessions). New feature — off by default.",
+    ),
+    Switch(
+        name="chat_bootstrap_marketplace",
+        config_keys=("chat", "bootstrap_marketplace"),
+        env_var="AGNES_CHAT_BOOTSTRAP_MARKETPLACE",
+        kind="bool",
+        default=True,
+        effect="restart",
+        category="product",
+        editable=True,
+        runtime_view="bootstrap_marketplace",
+        description=(
+            "Deliver the caller's RBAC-filtered marketplace skills into chat sessions so a "
+            "stack skill is invokable as `/<skill-name>`. On `docker` the runner installs "
+            "them as Claude Code plugins in the sandbox (~10-15 s per spawn); on `kai-agent` "
+            "they ride the workspace tarball the engine materializes. Off makes the composer's "
+            "slash menu stop offering marketplace skills rather than advertise ones the agent "
+            "was never given. Resolved by `load_chat_config` (env > instance.yaml > default) at "
+            "boot, not through `switch_value` — hence `runtime_view`."
+        ),
     ),
     Switch(
         name="chat_provider",
         config_keys=("chat", "provider"),
         env_var="AGNES_CHAT_PROVIDER",
         kind="select",
-        options=("e2b", "docker", "kai-agent"),
-        default="e2b",
+        options=("docker", "kai-agent"),
+        default="kai-agent",
         effect="restart",
         category="product",
         editable=True,
         runtime_view="provider",
         description=(
-            "Which engine runs web/Slack chat sessions: `e2b` (cloud microVM per session, the "
-            "default), `docker` (self-hosted container per session) or `kai-agent` (the embedded "
-            "kai-agent turn engine — see docs/cloud-chat.md). Resolved by `load_chat_config` "
+            "Which engine runs web/Slack chat sessions: `kai-agent` (the embedded kai-agent "
+            "turn engine, the default — see docs/cloud-chat.md) or `docker` (self-hosted "
+            "container per session). Resolved by `load_chat_config` "
             "(env > instance.yaml > default) at boot, not through `switch_value` — hence "
             "`runtime_view`. Editable because the whole `chat` section is (a raw section edit "
             "could always write it); the real guards sit elsewhere: every provider rides "
-            "deployment-provisioned backing (E2B key/template, apps-runner sidecar, kai-agent "
-            "sidecar + KAI_HOST_JWT_SECRET), and app/main.py's boot gates refuse a provider "
+            "deployment-provisioned backing (kai-agent sidecar + KAI_HOST_JWT_SECRET, or the "
+            "apps-runner sidecar), and app/main.py's boot gates refuse a provider "
             "whose backing is absent, loudly, at the restart the save already requires. Pin "
             "it in infrastructure via the customer-instance module's per-VM `chat_provider` "
             "(AGNES_CHAT_PROVIDER) so a fresh data disk boots into the right engine."
@@ -191,6 +211,34 @@ SWITCHES: tuple[Switch, ...] = (
             "backend is absent. Enable the profile and set AGNES_DATA_APPS_ENABLED together."
         ),
         description="Hosted user web apps (data apps). New feature — off by default.",
+    ),
+    Switch(
+        name="data_apps_allow_same_origin",
+        config_keys=("data_apps", "allow_same_origin"),
+        env_var="AGNES_DATA_APPS_ALLOW_SAME_ORIGIN",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="operations",
+        editable=False,
+        lock_reason=(
+            "Deliberate security lock: serving hosted apps on the main origin hands every "
+            "app's user-authored JS the viewer's own session (a same-origin read of /api "
+            "that no response header can close). Accepting that is a deployment decision — "
+            "set it in instance.yaml or AGNES_DATA_APPS_ALLOW_SAME_ORIGIN, next to the "
+            "subdomain_base alternative that avoids it — not a live panel toggle. Its "
+            "section is locked regardless (see data_apps)."
+        ),
+        description=(
+            "Serve hosted data apps on the MAIN origin (same origin as the Agnes /api) for "
+            "ALL apps and callers. Off by default: a hosted app's JS then shares the "
+            "viewer's session and can read /api, so the supported isolation is "
+            "data_apps.subdomain_base (per-app origins); requests arriving on a data-app "
+            "subdomain are always served, and the in-chat preview works without this flag "
+            "via its per-app data-app-preview:<slug> token. Turn on only when every app "
+            "author is trusted with every viewer's session — see "
+            "docs/architecture.md#hosted-data-apps."
+        ),
     ),
     Switch(
         name="library_show_unverified_trust",

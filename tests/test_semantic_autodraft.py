@@ -62,6 +62,16 @@ class TestBuildTriggerPrompt:
 
 
 class TestClearPendingForDocument:
+    """A3 PG-first ratchet: ``table_registry.semantic_draft_pending_at`` is a
+    Postgres-only column, so ``clear_pending_for_document`` no-ops on a
+    DuckDB-backend instance rather than touching a column that doesn't
+    exist there. These tests pin the no-op — no raise, no crash — for every
+    ORDINARY (non-auto-drafted) semantic-layer suggestion's approve/reject,
+    which is exactly what calls this function on every instance regardless
+    of backend. The actual clearing behavior can only be exercised on
+    Postgres — see ``tests/db_pg/test_semantic_autodraft_pg.py``.
+    """
+
     @pytest.fixture
     def system_db(self, e2e_env):
         return e2e_env
@@ -71,13 +81,13 @@ class TestClearPendingForDocument:
 
         table_registry_repo().register(id=id_, name=name or id_, source_type="local", query_mode="local")
 
-    def test_clears_the_flag_for_every_resolved_table(self, system_db):
-        from src.repositories import table_registry_repo
-
+    def test_noop_on_duckdb_backend_does_not_raise(self, system_db):
+        """No mark_semantic_draft_pending call here at all — that method
+        doesn't exist on the DuckDB repo either. The claim under test is
+        only that clearing never crashes an approve/reject on this
+        backend."""
         self._register("orders")
         self._register("customers")
-        table_registry_repo().mark_semantic_draft_pending("orders")
-        table_registry_repo().mark_semantic_draft_pending("customers")
 
         document = {
             "semantic_model": [
@@ -90,10 +100,7 @@ class TestClearPendingForDocument:
                 }
             ]
         }
-        clear_pending_for_document(document)
-
-        assert table_registry_repo().get("orders")["semantic_draft_pending_at"] is None
-        assert table_registry_repo().get("customers")["semantic_draft_pending_at"] is None
+        clear_pending_for_document(document)  # must not raise
 
     def test_unresolvable_dataset_is_a_noop_not_an_error(self, system_db):
         # No table_registry row matches "ghost" — must not raise.
@@ -101,17 +108,5 @@ class TestClearPendingForDocument:
             {"semantic_model": [{"name": "m", "datasets": [{"name": "ghost", "source": "ghost"}]}]}
         )
 
-    def test_leaves_other_tables_pending_flag_untouched(self, system_db):
-        from src.repositories import table_registry_repo
-
-        self._register("orders")
-        self._register("untouched")
-        table_registry_repo().mark_semantic_draft_pending("orders")
-        table_registry_repo().mark_semantic_draft_pending("untouched")
-
-        clear_pending_for_document(
-            {"semantic_model": [{"name": "m", "datasets": [{"name": "orders", "source": "orders"}]}]}
-        )
-
-        assert table_registry_repo().get("orders")["semantic_draft_pending_at"] is None
-        assert table_registry_repo().get("untouched")["semantic_draft_pending_at"] is not None
+    def test_empty_document_is_a_noop_not_an_error(self, system_db):
+        clear_pending_for_document({})

@@ -66,9 +66,9 @@
 <div class="adopt-bar">
   <a class="adopt-back" href="/admin/adoption">← Adoption</a>
   <div class="adopt-window" id="adoptWindow" role="tablist" aria-label="Time window">
-    <button type="button" data-win="24h">24h</button>
-    <button type="button" data-win="7d" class="is-active">7d</button>
-    <button type="button" data-win="30d">30d</button>
+    <button type="button" role="tab" aria-selected="false" data-win="24h">24h</button>
+    <button type="button" role="tab" aria-selected="true" class="is-active" data-win="7d">7d</button>
+    <button type="button" role="tab" aria-selected="false" data-win="30d">30d</button>
   </div>
 </div>
 {% endblock %}
@@ -198,7 +198,11 @@
   function refreshWindowed(){ loadKpis().catch(()=>{}); loadSkills().catch(()=>{}); loadTools().catch(()=>{}); }
   $('adoptWindow').addEventListener('click', e=>{
     const btn=e.target.closest('button'); if(!btn) return;
-    [...e.currentTarget.children].forEach(x=>x.classList.toggle('is-active', x===btn));
+    [...e.currentTarget.children].forEach(x=>{
+      const selected = x===btn;
+      x.classList.toggle('is-active', selected);
+      x.setAttribute('aria-selected', selected ? 'true' : 'false');
+    });
     state.window=btn.dataset.win; refreshWindowed();
   });
 

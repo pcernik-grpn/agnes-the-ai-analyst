@@ -85,9 +85,20 @@ def clear_pending_for_document(document_json: dict, *, source: str = "manual") -
     (``app/api/semantic_models.py``), which always stores the resulting
     document under ``source='manual'``; :func:`resolve_dataset_table`
     needs that provenance to pick the right resolution strategy.
+
+    No-op on a DuckDB-backend instance (A3 PG-first ratchet):
+    ``table_registry.semantic_draft_pending_at`` is a Postgres-only column,
+    so there is nothing to clear there — this is not an error, just a
+    capability the frozen DuckDB app-state backend does not have. Every
+    OTHER semantic-layer suggestion this function is called for on approve
+    AND reject (``app/api/authoring_suggestions.py``) — human-submitted,
+    unrelated to auto-drafting — must still resolve normally regardless.
     """
-    from src.repositories import table_registry_repo
+    from src.repositories import table_registry_repo, use_pg
     from src.semantic.projection import resolve_dataset_table
+
+    if not use_pg():
+        return
 
     registry = table_registry_repo()
     for model in document_json.get("semantic_model") or []:

@@ -616,6 +616,63 @@ runtime image, whose nginx + supervisord write outside the `/tmp` + `/app`
 tmpfs the spec builder currently supplies, so turning it on unverified would
 crash-loop every hosted app.
 
+**Origin isolation** (`data_apps.allow_same_origin`, default **off**): a hosted
+app runs user-authored JS, so *where* it is served decides what that JS can
+reach. Served on the **main origin** (`/apps/<slug>/…`) it is same-origin with
+the Agnes `/api`, so its JS can `fetch('/api/…', {credentials:'include'})` with
+the viewer's own session cookie and read the response — mint a PAT, read admin
+config — because same-origin reads need no CORS and the `CsrfOriginMiddleware`
+only refuses *cross*-origin state changes. No response header closes this (a
+same-origin `window.open`/`<iframe>` to `/api` is DOM-readable and ungoverned by
+CSP). The only fix is origin isolation: configure `data_apps.subdomain_base` so
+apps are served from their own origin (`<slug>.<subdomain_base>`), where the
+existing CORS policy blocks the credentialed read and `CsrfOriginMiddleware`
+blocks the write. The ingress proxy therefore **refuses** to serve an app on the
+main origin unless one of: the request carries a per-app `data-app-preview:<slug>`
+token (the in-chat preview — served same-origin only to a caller who already
+holds a short-TTL token for *that* app, so a plain drive-by navigation to
+`/apps/<other-slug>/` stays refused), or the operator opts into
+`data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (serve ALL
+apps same-origin — trusted authors only). Requests that arrive on a data-app
+subdomain are always served. A startup log flags an enabled-but-unservable
+posture (no isolated origin, no opt-in).
+
+The isolated-origin signal is the request's `Host` (rewritten by
+`app/data_apps_subdomain.py`), so the TLS-terminating reverse proxy in front of
+Agnes **must route by Host** — a `<slug>.<subdomain_base>` request should reach
+Agnes only when the client genuinely connected to that subdomain, and a
+client-supplied `Host` that doesn't match the terminating certificate should be
+rejected or normalized. A browser cannot forge `Host` for a cross-origin request,
+so this is a deployment-correctness requirement rather than a browser-reachable
+bypass; when `subdomain_base` is unset the marker is never set regardless of
+`Host`.
+
+**Network egress** (GCP metadata): a data-app container sits on the `agnes-apps`
+bridge with normal egress (its runtime image installs dependencies from PyPI/npm
+at boot). On a cloud VM that reach includes the instance **metadata server**
+(`169.254.169.254`), from which a compromised app could read the VM's
+service-account token and pivot to the whole cloud project. The
+`customer-instance` Terraform module blocks this at the host firewall — an
+idempotent `DOCKER-USER` iptables DROP from the `agnes-apps` source subnet to
+`169.254.169.254/32`, installed at boot (see the `container-metadata-hardening`
+block in `infra/modules/customer-instance/startup-script.sh.tpl`). It is
+source-scoped, not a blanket block, so the Agnes app container's own metadata
+use (e.g. BigQuery GCE-metadata auth) is unaffected — the `app` service pins
+`default` as its gateway network (`docker-compose.yml` sets BOTH
+`networks.default.gw_priority` — the field that actually selects the gateway
+on Docker Engine ≥ 28, where `priority` deliberately does not — and the older
+`priority`, which pre-28 engines derive the default route from via connection
+order) so its egress routes via `default`, keeping its source IP out of the
+`agnes-apps` subnet the rule matches. `gw_priority` requires Compose CLI ≥
+v2.33.1 — older Compose rejects the key at validation. The rule resolves the
+subnet at boot; re-run the block (or reboot) after any manual `agnes-apps`
+network recreation. For a non-Terraform host
+(plain docker-compose), install the equivalent rule yourself:
+`iptables -I DOCKER-USER -s <agnes-apps-subnet> -d 169.254.169.254/32 -j DROP`
+(resolve the subnet with `docker network inspect agnes-apps`). Least-privilege
+the VM service account regardless — the firewall rule is defense-in-depth, not a
+substitute for a narrowly-scoped SA.
+
 ---
 
 ## Background Jobs

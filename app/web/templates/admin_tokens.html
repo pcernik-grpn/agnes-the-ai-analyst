@@ -7,6 +7,7 @@
    the active-refinement chips row. Styles only; filtering is page-local JS
    over an already-loaded list. #}
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   /* ─────────────────────────────────────────────────────────────────────────
      /admin/tokens — ALL tokens across users for incident response + offboarding.
@@ -550,7 +551,7 @@
         <input id="flt-user" type="search" placeholder="Search by owner email&hellip;" autocomplete="off" aria-label="Filter by user email">
       </div>
       <div class="fbar-select">
-        <select id="tok-sort" aria-label="Sort tokens">
+        <select id="tok-sort" class="ds-dropdown-native" aria-label="Sort tokens">
           <option value="created_at:desc" selected>Newest first</option>
           <option value="created_at:asc">Oldest first</option>
           <option value="last_used_at:desc">Recently used</option>
@@ -562,6 +563,20 @@
           <option value="user_email:asc" data-sort-key="user_email">Owner A–Z</option>
           <option value="user_email:desc" data-sort-key="user_email">Owner Z–A</option>
         </select>
+        {{ ds.dropdown(
+          id='tok-sort-dd', target='tok-sort',
+          aria_label='Sort tokens', selected='created_at:desc',
+          options=[
+            {'value': 'created_at:desc', 'label': 'Newest first'},
+            {'value': 'created_at:asc', 'label': 'Oldest first'},
+            {'value': 'last_used_at:desc', 'label': 'Recently used'},
+            {'value': 'last_used_at:asc', 'label': 'Least recently used'},
+            {'value': 'expires_at:asc', 'label': 'Expiring soonest'},
+            {'value': 'expires_at:desc', 'label': 'Expiring latest'},
+            {'value': 'user_email:asc', 'label': 'Owner A–Z'},
+            {'value': 'user_email:desc', 'label': 'Owner Z–A'},
+          ],
+        ) }}
       </div>
       <!-- Hidden legacy selects — kept so the id contract the tests pin
            (flt-status, flt-last-used) stays valid, and so the status filter
@@ -639,6 +654,7 @@
 
 <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 // Admin tokens — list of ALL tokens for incident response / offboarding.
 const API_LIST   = "/auth/admin/tokens";
@@ -1030,11 +1046,28 @@ document.querySelectorAll("#tokens-counts .count-chip").forEach(btn => {
 document.getElementById("flt-status").addEventListener("change", e => setStatusFilter(e.target.value));
 
 // ── Sort — one select carrying `key:dir` ───────────────────────────────────
+// ds_dropdown.js only pushes a selection FROM the custom button+menu ONTO
+// the paired native <select> — setting `.value` straight from code (below)
+// needs an explicit re-sync or the paper-theme dropdown keeps showing
+// whatever was picked last.
+function syncSortDropdown(sel) {
+  const dd = document.querySelector('.ds-dropdown[data-ds-dropdown-target="' + sel.id + '"]');
+  if (!dd) return;
+  const label = dd.querySelector(".ds-dropdown-btn-label");
+  const opt = sel.options[sel.selectedIndex];
+  dd.querySelectorAll('.ds-dropdown-menu [role="menuitemradio"]').forEach(item => {
+    const isSelected = item.dataset.value === sel.value;
+    item.classList.toggle("is-selected", isSelected);
+    item.setAttribute("aria-checked", isSelected ? "true" : "false");
+  });
+  if (label && opt) label.textContent = opt.textContent.trim();
+}
+
 function setSort(key, dir) {
   sort.key = key;
   sort.dir = dir;
   const sel = document.getElementById("tok-sort");
-  if (sel) sel.value = `${key}:${dir}`;
+  if (sel) { sel.value = `${key}:${dir}`; syncSortDropdown(sel); }
   renderList();
 }
 document.getElementById("tok-sort").addEventListener("change", e => {

@@ -1,7 +1,7 @@
 """DockerSandboxProvider unit tests — mock the sidecar client at the import
 boundary.
 
-Same pattern as `tests/test_chat_e2b_provider.py`: there is no mock provider
+There is no mock provider
 class. These tests patch `app.chat.docker_provider.SandboxRunnerClient` so the
 real provider code runs against a fake sidecar. Daemon-backed coverage is
 `@pytest.mark.docker`-gated in `tests/test_chat_docker_provider_daemon.py`
@@ -214,7 +214,7 @@ def test_profile_session_mounts_symlink_targets_not_the_workspace(tmp_path: Path
     """A profile session's `.claude`/`CLAUDE.md` are COPIES (WorkdirManager
     materializes them precisely so the profiled agent cannot write the shared
     originals). Mounting the whole workspace would hand those originals back
-    read-write — E2B kept this isolation structurally by uploading only the
+    read-write — the session dir is the isolation boundary, mirroring the
     session dir. Only the data symlink targets may be mounted: snapshots
     writable (`agnes snapshot create` lands there), the rest read-only."""
 
@@ -345,7 +345,7 @@ def test_spawn_refuses_without_a_session_id(tmp_path: Path):
 
 
 def test_spawn_refuses_past_the_global_sandbox_cap(tmp_path: Path):
-    """Docker sandboxes contend with the gateway host (E2B offloads compute),
+    """Docker sandboxes contend with the gateway host (remote engines offload compute),
     so there is a host-wide ceiling on top of concurrency_per_user."""
 
     async def _run():

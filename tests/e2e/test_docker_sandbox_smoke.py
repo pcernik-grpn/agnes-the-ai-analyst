@@ -1,9 +1,9 @@
 """Docker chat-sandbox smoke test — real image + real sidecar, opt-in via
 AGNES_E2E_DOCKER=1.
 
-Sibling of `tests/e2e/test_e2b_smoke.py`. Where that one is the canary for
-"E2B SDK + our template + our provider", this is the canary for "the built
-`agnes-chat-sandbox` image + a running apps-runner + our provider". It talks to
+The canary for "the built `agnes-chat-sandbox` image + a running
+apps-runner + our provider" (its E2B sibling, tests/e2e/test_e2b_smoke.py,
+was deleted with the e2b provider, 2026-08). It talks to
 a *deployed* sidecar (`APPS_RUNNER_URL` / `APPS_RUNNER_TOKEN`), so it also
 proves the token, the image allowlist, and the bind-mount host-path translation
 in the operator's real topology.

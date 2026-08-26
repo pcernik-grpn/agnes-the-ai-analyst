@@ -551,7 +551,7 @@ def figure_poster() -> str:
     p.row(
         [
             (
-                "sandbox   E2B | Docker",
+                "sandbox   Docker | kai-agent",
                 [
                     "one per chat or agent session",
                     "workspace = the caller's stack:",

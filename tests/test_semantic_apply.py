@@ -249,13 +249,16 @@ def test_approve_refuses_a_since_shadowed_slug(seeded_app):
     assert authoring_suggestions_repo().get(sid)["status"] == "pending"
 
 
-def test_approve_clears_semantic_draft_pending_flag(seeded_app):
-    """semantic-phase5 wave 2: an approved suggestion clears the dedup flag
-    for every table its document covers — approve or reject alike."""
+def test_approve_succeeds_despite_pg_only_dedup_column(seeded_app):
+    """A3 PG-first ratchet: ``table_registry.semantic_draft_pending_at`` is a
+    Postgres-only column, so ``clear_pending_for_document`` no-ops on this
+    DuckDB-backend instance. An ORDINARY (non-auto-drafted) suggestion's
+    approve must still resolve normally — no crash, no 500 — regardless of
+    that capability gap. See ``tests/db_pg/test_semantic_autodraft_pg.py``
+    for the PG-backend round trip that actually exercises the dedup flag."""
     from src.repositories import table_registry_repo
 
     table_registry_repo().register(id="db.public.tickets", name="db.public.tickets", source_type="local")
-    table_registry_repo().mark_semantic_draft_pending("db.public.tickets")
 
     c = seeded_app["client"]
     sid = _apply(c, seeded_app["analyst_token"]).json()["suggestion_id"]
@@ -266,17 +269,14 @@ def test_approve_clears_semantic_draft_pending_flag(seeded_app):
     )
     assert r.status_code == 200, r.text
 
-    row = table_registry_repo().get("db.public.tickets")
-    assert row["semantic_draft_pending_at"] is None
 
-
-def test_reject_also_clears_semantic_draft_pending_flag(seeded_app):
-    """The reject path must clear the flag too — a rejected draft is just as
-    eligible for a fresh sweep as an approved one."""
+def test_reject_succeeds_despite_pg_only_dedup_column(seeded_app):
+    """Reject-path counterpart to ``test_approve_succeeds_despite_pg_only_
+    dedup_column`` — the reject flow must be just as unaffected by the
+    DuckDB-side no-op."""
     from src.repositories import table_registry_repo
 
     table_registry_repo().register(id="db.public.tickets", name="db.public.tickets", source_type="local")
-    table_registry_repo().mark_semantic_draft_pending("db.public.tickets")
 
     c = seeded_app["client"]
     sid = _apply(c, seeded_app["analyst_token"]).json()["suggestion_id"]
@@ -286,9 +286,6 @@ def test_reject_also_clears_semantic_draft_pending_flag(seeded_app):
         json={"note": "not good enough"},
     )
     assert r.status_code == 200, r.text
-
-    row = table_registry_repo().get("db.public.tickets")
-    assert row["semantic_draft_pending_at"] is None
 
 
 def test_non_admin_branch_respects_studio_toggle(seeded_app, monkeypatch):

@@ -4,8 +4,8 @@ chat-sandbox-secret-broker plan, spec §7.4).
 Maps each incident-closure / guarantee acceptance-criteria (AC) id from the
 design spec to the real ``path::test_name`` node that satisfies it, and
 asserts that node actually exists and is not disabled via a bare
-``@pytest.mark.skip`` (the e2b-tier tests are legitimately
-``@pytest.mark.skipif(not AGNES_E2E_E2B, ...)``-gated — that's a manual
+``@pytest.mark.skip`` (the sandbox-tier tests are legitimately
+``@pytest.mark.skipif(not AGNES_E2E_DOCKER, ...)``-gated — that's a manual
 operator gate, not a disabled test, so skipif is fine).
 
 This is a ratchet, not a full spec sweep: if a future edit renames or
@@ -22,10 +22,14 @@ from pathlib import Path
 # were confirmed against the committed test files (grep -n "def test_"), not
 # copied from the plan's illustrative names.
 REQUIRED: dict[str, str] = {
-    # e2b-tier adversarial suite (Task 11) — manual AGNES_E2E_E2B gate.
+    # Sandbox-tier adversarial suite (Task 11) — manual AGNES_E2E_DOCKER
+    # gate (docker-provider sandboxes; ported from the e2b tier).
+    # AC-F3 and AC-F4c were removed here 2026-08: they proved the E2B
+    # VM-level ``network.allow_out`` egress firewall specifically, and that
+    # mechanism was deleted with the e2b provider. The docker analogue
+    # (chat.docker_egress_mode none/allowlist) is covered by
+    # tests/test_chat_docker_provider.py + the services/egress_proxy tests.
     "AC-F-nosecret": "tests/e2e/test_adversarial.py::test_no_secret_anywhere",
-    "AC-F3": "tests/e2e/test_adversarial.py::test_hook_disabled_egress_blocked",
-    "AC-F4c": "tests/e2e/test_adversarial.py::test_non_bash_egress_blocked",
     "AC-F-allowed-sink": "tests/e2e/test_adversarial.py::test_no_exfil_via_allowlisted_host",
     # PreToolUse hook hardening (Task 3) — unit-tier, per-PR.
     "AC-G-schemeless": "tests/test_pre_tool_use_hook.py::test_schemeless_curl_denied",
@@ -75,7 +79,7 @@ def _decorator_dotted_name(dec: ast.expr) -> str:
 def _is_bare_skip(fn: ast.FunctionDef) -> bool:
     """True if decorated with an unconditional ``@pytest.mark.skip`` (as
     opposed to ``@pytest.mark.skipif``, which is a legitimate manual-gate
-    marker used by the e2b-tier tests)."""
+    marker used by the sandbox-tier tests)."""
     return any(_decorator_dotted_name(dec) == "pytest.mark.skip" for dec in fn.decorator_list)
 
 

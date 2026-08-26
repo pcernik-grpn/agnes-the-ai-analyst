@@ -24,7 +24,7 @@ throughout — substitute your own hosts, ids, and channel.
   credential in that server, expose only draft-creating tools). Same for any
   Slack read/write tools you want the agent to have beyond the surface's
   own reply path.
-- `chat.bootstrap_marketplace: true` in `instance.yaml` if the agent should
+- `chat.bootstrap_marketplace` left ON (the default) if the agent should
   load marketplace skills (e.g. a house style guide) in its sandbox.
 
 ## 1. Register the tool servers

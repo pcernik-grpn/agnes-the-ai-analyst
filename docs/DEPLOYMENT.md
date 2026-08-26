@@ -1155,39 +1155,29 @@ unit/contract tests:
 
 ## Cloud-chat host requirements
 
-Agnes can serve a zero-install web chat and Slack DM bot at `/chat`. The
-sandboxed runner lives in an E2B ephemeral microVM; the Agnes host only
-needs RAM/CPU for the FastAPI app, ChatManager state, DuckDB, and any
-open WebSockets.
+Agnes can serve a zero-install web chat and Slack DM bot at `/chat`.
+Sessions run on one of two providers: the embedded **kai-agent** turn
+engine (the default — the engine owns the agent loop and its own
+execution sandbox, so Agnes spawns nothing per session) or **docker**
+(a self-hosted container per session on the host's own Docker daemon).
 
-**Full operator guide:** [`cloud-chat.md`](cloud-chat.md)
+**Full operator guide** — provider setup, prerequisites, and how to
+choose between them: [`cloud-chat.md`](cloud-chat.md)
 
 ### Agnes server floor
 
-Per-sandbox compute is billed by E2B (not by the Agnes host). The Agnes
-server itself needs only:
+Under the default kai-agent provider the Agnes server itself needs only:
 
 - 2 GB RAM (FastAPI + ChatManager + chat_repo + WS connections)
 - 1 vCPU for small teams; bump if you regularly host 50+ concurrent WS
   clients
 
-There is no per-session RAM/CPU floor for the host any more — that
-moved to the E2B template (`e2b.toml`).
-
-### E2B account
-
-1. Create an E2B account at https://e2b.dev and copy the API key from
-   the dashboard.
-2. Build the chat sandbox template: `e2b auth login` followed by
-   `e2b template build` inside
-   `app/initial_workspace_default/e2b-template/` (see that directory's
-   README for the full walkthrough).
-3. Set `E2B_API_KEY` in the Agnes server environment.
-4. Put the returned template id into `chat.e2b_template_id` in
-   `instance.yaml`.
-
-Sandbox billing is visible in the operator's E2B dashboard. Agnes does
-not yet surface per-session E2B cost in its own admin UI.
+The engine sidecar (and whatever sandbox infrastructure it manages) is
+sized by the deployment, not by the Agnes app. Under the docker provider,
+sandboxes run on the Agnes host itself — budget the per-sandbox bounds
+(`chat.docker_mem_limit` × `chat.docker_max_total_sandboxes`) on top of
+the floor above; see [`cloud-chat.md`](cloud-chat.md) → *Docker provider
+(self-hosted)*.
 
 ### Multi-replica chat HA (wave-2F)
 

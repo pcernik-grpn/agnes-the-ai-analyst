@@ -735,7 +735,15 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
     ResourceType.TABLE: ResourceTypeSpec(
         key=ResourceType.TABLE,
         display_name="Tables",
-        description="A registered data table.",
+        description=(
+            "Does NOT grant analyst visibility — the unified-stack design routes "
+            "all analyst table access through Data Packages instead (grant the "
+            "package, not the table). This grant only sets the ceiling agent "
+            "scoping (`tables_mode='selected'`) and co-session grant intersection "
+            "narrow against; a table absent here can never appear in a scoped "
+            "agent's or co-session's effective table set, regardless of package "
+            "membership."
+        ),
         id_format="<table_id>",
         list_blocks=_table_blocks,
     ),

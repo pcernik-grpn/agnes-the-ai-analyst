@@ -2,7 +2,7 @@
 
 Bug B — ``SessionNotFound`` race: ``_handle_dm`` / ``_handle_mention`` / the
 ``/agnes`` slash command schedule ``ChatManager.attach`` fire-and-forget (it
-spawns the E2B sandbox, takes seconds, and never returns) and then used a fixed
+spawns the sandbox, takes seconds, and never returns) and then used a fixed
 ``asyncio.sleep(0.1)`` before calling ``send_user_message``. The sleep raced
 attach() registering the live session, so the user's first message after
 binding was dropped with ``SessionNotFound``. Fix: ``mgr.wait_until_live`` polls

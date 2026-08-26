@@ -44,7 +44,6 @@ import pytest
 WORKSPACE_CLAUDE_MD = Path("app/initial_workspace_default/CLAUDE.md")
 SERVER_DEFAULT_TEMPLATE = Path("config/claude_md_template.txt")
 DOCKER_SANDBOX = Path("app/initial_workspace_default/docker-sandbox/Dockerfile")
-E2B_TEMPLATE = Path("app/initial_workspace_default/e2b-template/Dockerfile")
 CLOUD_CHAT_DOC = Path("docs/cloud-chat.md")
 TOUR_JS = Path("app/web/static/js/tour.js")
 CHAT_JS = Path("app/web/static/js/chat.js")
@@ -270,13 +269,11 @@ def test_the_charts_sandbox_wording_does_not_drift():
     )
 
 
-@pytest.mark.parametrize("dockerfile", [DOCKER_SANDBOX, E2B_TEMPLATE], ids=["docker", "e2b"])
-def test_both_sandbox_images_carry_matplotlib(dockerfile: Path):
+def test_the_sandbox_image_carries_matplotlib():
     """`pip install matplotlib` inside the sandbox cannot reach PyPI, so the
-    prompt rule above is unfulfillable unless the image ships it. The two images
-    are siblings and drift between them is a per-provider bug."""
-    body = _read(dockerfile)
-    assert "matplotlib>=" in body, f"{dockerfile} must bake matplotlib in"
+    prompt rule above is unfulfillable unless the image ships it."""
+    body = _read(DOCKER_SANDBOX)
+    assert "matplotlib>=" in body, f"{DOCKER_SANDBOX} must bake matplotlib in"
 
 
 def test_the_contract_label_matches_what_the_docs_tell_operators_to_expect():

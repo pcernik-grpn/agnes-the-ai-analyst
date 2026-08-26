@@ -4,6 +4,7 @@
 {% block head_extra %}
 {# Design-system component macros — toolbar "+ New digest" + modal buttons
    render via `ds.button`. Table/modal/toast CSS mirrors admin_mcp_sources.html. #}
+<link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
 <style>
   .kd-toolbar {
     display: flex; justify-content: space-between; align-items: center;
@@ -44,17 +45,7 @@
   }
 
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
-  .icon-btn {
-    background: transparent; border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
-    padding: 5px 10px; font-size: 12px; cursor: pointer;
-    color: var(--text-secondary, #6b7280); transition: all 0.15s;
-    text-decoration: none; line-height: 1.4; white-space: nowrap;
-  }
-  .icon-btn:hover { color: var(--text-primary, #111827); border-color: var(--ds-border); background: var(--ds-surface-dim); }
-  .icon-btn.primary { color: var(--ds-primary); border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent); }
-  .icon-btn.primary:hover { background: var(--ds-primary-light); }
-  .icon-btn.danger:hover { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
-  .icon-btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* .icon-btn now shared — see css/icon_btn.css */
 
   .kd-empty, .kd-loading {
     text-align: center; padding: 48px 16px;
@@ -120,7 +111,7 @@
   </p>
 
   <div class="kd-toolbar">
-    <input id="kd-search" type="search" class="kd-search" placeholder="Filter by slug or title…" autocomplete="off">
+    <input id="kd-search" type="search" class="kd-search" placeholder="Filter by slug or title…" aria-label="Filter by slug or title" autocomplete="off">
     {{ ds.button('+ New digest', variant='primary', id='open-create-btn') }}
   </div>
 

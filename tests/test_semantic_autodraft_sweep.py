@@ -4,95 +4,24 @@ bounded batch of them via a headless ``semantic-model-builder`` chat
 session, landing each result in the ``authoring_suggestions`` moderation
 queue like any human-submitted proposal.
 
-Two mocking strategies, by design:
-
-- Most tests here mock ``app.chat.headless.run_one_shot`` itself (the same
-  seam ``tests/test_agent_responses_api.py`` uses) — they exercise the
-  sweep's OWN logic: dedup, batch limiting, concurrency-cap degradation,
-  applied/no_apply_call detection.
-- ``TestSystemIdentityAndSurface`` instead installs a minimal fake
-  ``ChatManager`` and lets the REAL ``run_one_shot`` run against it, so the
-  user_email/surface/profile wiring is exercised through production code
-  rather than re-asserted against a mock's captured kwargs.
+A3 PG-first ratchet: the sweep's dedup flag
+(``table_registry.mark_semantic_draft_pending`` / ``clear_semantic_draft_
+pending``) is a Postgres-only column, so the endpoint itself is gated
+PG-only (``if not use_pg(): raise RequiresPostgresBackend(...)`` — see
+``app/api/semantic_models.py``). This file covers the two backend-agnostic
+edges: the admin-only gate (``require_admin`` runs before the backend
+check, so it 403s identically on either backend) and the clean-501 fail
+mode on a DuckDB-backend instance. Every other behavior (dedup, batch
+limiting, concurrency-cap degradation, applied/no_apply_call detection,
+system-identity/surface wiring) can only run against Postgres and lives in
+``tests/db_pg/test_semantic_autodraft_sweep_pg.py``.
 """
 
 from __future__ import annotations
 
-import pytest
-
-from app.auth.system_users import SEMANTIC_DRAFTER_USER_EMAIL
-from app.chat.manager import ConcurrencyCapHit, set_current_chat_manager
-from app.chat.types import Surface
-
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
-
-
-def _register_uncovered(id_: str) -> None:
-    from src.repositories import table_registry_repo
-
-    table_registry_repo().register(id=id_, name=id_, source_type="local", query_mode="local")
-
-
-@pytest.fixture
-def no_chat_manager():
-    """Ensure no manager is installed — the sweep's chat-disabled path."""
-    set_current_chat_manager(None)
-    yield
-    set_current_chat_manager(None)
-
-
-@pytest.fixture
-def fake_chat_manager():
-    """A non-None sentinel manager — enough to pass the ``manager is None``
-    gate when ``run_one_shot`` itself is mocked and never touches it."""
-    manager = object()
-    set_current_chat_manager(manager)
-    yield manager
-    set_current_chat_manager(None)
-
-
-def _patch_run_one_shot(monkeypatch, *, raise_cap_for=(), apply_for=(), calls=None):
-    """Mock ``app.chat.headless.run_one_shot`` — the sweep endpoint imports
-    it locally per-request, so patching the module attribute (not any
-    importer's copy) is the correct seam, mirroring
-    ``tests/test_agent_responses_api.py``.
-
-    ``raise_cap_for`` / ``apply_for`` are iterables of substrings matched
-    against the rendered prompt (which always embeds the table id) to
-    decide, per call, whether to raise ``ConcurrencyCapHit`` or simulate an
-    ``apply_semantic_model`` call by writing a real ``authoring_suggestions``
-    row.
-    """
-    from app.chat import headless
-
-    calls = calls if calls is not None else []
-
-    async def _fake(manager, *, user_email, agent_id, prompt, timeout_s, owner_user_id=None, profile=None):
-        calls.append(
-            {
-                "user_email": user_email,
-                "agent_id": agent_id,
-                "prompt": prompt,
-                "timeout_s": timeout_s,
-                "profile": profile,
-            }
-        )
-        if any(marker in prompt for marker in raise_cap_for):
-            raise ConcurrencyCapHit("cap")
-        if any(marker in prompt for marker in apply_for):
-            from src.repositories import authoring_suggestions_repo
-
-            authoring_suggestions_repo().create(
-                domain="semantic-layer",
-                payload={"slug": "x", "document": "irrelevant"},
-                created_by=user_email,
-            )
-        return {"chat_id": "chat-fake", "answer": "ok", "timed_out": False}
-
-    monkeypatch.setattr(headless, "run_one_shot", _fake)
-    return calls
 
 
 class TestRequiresAdmin:
@@ -102,195 +31,17 @@ class TestRequiresAdmin:
         assert r.status_code == 403
 
 
-class TestNoChatManager:
-    def test_chat_disabled_triggers_nothing(self, seeded_app, no_chat_manager):
-        _register_uncovered("t1")
+class TestRequiresPostgresBackend:
+    def test_duckdb_backend_fails_clean_with_a_typed_501(self, seeded_app):
+        """A3 PG-first ratchet: on a DuckDB-backend instance the dedup
+        column this sweep depends on doesn't exist, so the endpoint must
+        never attempt any real work — it raises ``RequiresPostgresBackend``
+        before touching the coverage read or the chat manager, and
+        ``app/main.py``'s app-wide handler translates that into a clean
+        501 naming the feature."""
         c = seeded_app["client"]
         r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
+        assert r.status_code == 501, r.text
         body = r.json()
-        assert body == {"triggered": 0, "applied": 0, "no_apply_call": 0, "skipped_cap": 0, "remaining": 1}
-
-        from src.repositories import table_registry_repo
-
-        assert table_registry_repo().get("t1")["semantic_draft_pending_at"] is None
-
-
-class TestDedup:
-    def test_covered_table_is_never_triggered(self, seeded_app, fake_chat_manager, monkeypatch):
-        from datetime import datetime, timezone
-
-        from src.repositories import semantic_model_repo, table_registry_repo
-
-        table_registry_repo().register(id="hidden", name="hidden", source_type="local")
-        _register_uncovered("visible")
-        semantic_model_repo().upsert(
-            id="manual/_/m",
-            slug="m",
-            name="m",
-            description=None,
-            document="",
-            document_json={"semantic_model": [{"name": "m", "datasets": [{"name": "hidden", "source": "hidden"}]}]},
-            spec_version="0.2.0.dev0",
-            content_hash="h",
-            source="manual",
-            source_ref=None,
-            status="valid",
-            validation_errors=None,
-            validated_at=datetime.now(timezone.utc),
-        )
-        calls = _patch_run_one_shot(monkeypatch)
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        assert r.json()["triggered"] == 1
-        assert len(calls) == 1
-        assert "visible" in calls[0]["prompt"]
-        assert "hidden" not in calls[0]["prompt"]
-
-    def test_already_pending_table_is_skipped(self, seeded_app, fake_chat_manager, monkeypatch):
-        from src.repositories import table_registry_repo
-
-        _register_uncovered("t1")
-        table_registry_repo().mark_semantic_draft_pending("t1")
-        calls = _patch_run_one_shot(monkeypatch)
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["triggered"] == 0
-        assert body["remaining"] == 0
-        assert calls == []
-
-    def test_selected_table_is_stamped_pending_before_the_session_runs(
-        self, seeded_app, fake_chat_manager, monkeypatch
-    ):
-        from src.repositories import table_registry_repo
-
-        _register_uncovered("t1")
-        _patch_run_one_shot(monkeypatch)
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        assert table_registry_repo().get("t1")["semantic_draft_pending_at"] is not None
-
-
-class TestBatchLimit:
-    def test_only_first_n_are_triggered_rest_are_remaining(self, seeded_app, fake_chat_manager, monkeypatch):
-        import app.api.semantic_models as sm
-
-        for i in range(sm._SWEEP_BATCH_SIZE + 2):
-            _register_uncovered(f"t{i}")
-        calls = _patch_run_one_shot(monkeypatch)
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["triggered"] == sm._SWEEP_BATCH_SIZE
-        assert body["remaining"] == 2
-        assert len(calls) == sm._SWEEP_BATCH_SIZE
-
-
-class TestConcurrencyCapDegradation:
-    def test_cap_hit_is_counted_not_raised(self, seeded_app, fake_chat_manager, monkeypatch):
-        _register_uncovered("capped")
-        _register_uncovered("fine")
-        _patch_run_one_shot(monkeypatch, raise_cap_for=("capped",))
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["skipped_cap"] == 1
-        assert body["triggered"] == 1
-        assert body["no_apply_call"] == 1
-
-
-class TestAppliedDetection:
-    def test_a_session_that_applies_counts_as_applied(self, seeded_app, fake_chat_manager, monkeypatch):
-        _register_uncovered("drafts_ok")
-        _register_uncovered("asks_a_question")
-        _patch_run_one_shot(monkeypatch, apply_for=("drafts_ok",))
-
-        c = seeded_app["client"]
-        r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["triggered"] == 2
-        assert body["applied"] == 1
-        assert body["no_apply_call"] == 1
-
-
-class _FakeSession:
-    def __init__(self, id_: str) -> None:
-        self.id = id_
-
-
-class _FakeManager:
-    """Minimal ChatManager double driving the REAL
-    app.chat.headless.run_one_shot end to end, so the sweep's system-
-    identity/surface wiring is exercised through production code rather
-    than re-implemented in the test."""
-
-    def __init__(self) -> None:
-        self.create_session_calls: list[dict] = []
-        self._sinks: dict[str, object] = {}
-        self._next_id = 0
-
-    async def create_session(self, *, user_email, surface, agent_id=None, profile=None):
-        self.create_session_calls.append(
-            {"user_email": user_email, "surface": surface, "agent_id": agent_id, "profile": profile}
-        )
-        self._next_id += 1
-        return _FakeSession(f"chat-{self._next_id}")
-
-    async def attach(self, chat_id, sink, is_primary=True):
-        self._sinks[chat_id] = sink
-
-    async def send_user_message(self, chat_id, prompt, sender_email=None):
-        sink = self._sinks[chat_id]
-        await sink.send_json({"type": "assistant_message", "content": "drafted"})
-        await sink.send_json({"type": "done"})
-
-    async def detach_sink(self, chat_id, sink):
-        self._sinks.pop(chat_id, None)
-
-
-class TestSystemIdentityAndSurface:
-    def test_run_one_shot_is_invoked_with_the_drafter_identity_and_api_surface(self, seeded_app):
-        _register_uncovered("t1")
-        manager = _FakeManager()
-        set_current_chat_manager(manager)
-        try:
-            c = seeded_app["client"]
-            r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-            assert r.status_code == 200, r.text
-        finally:
-            set_current_chat_manager(None)
-
-        assert len(manager.create_session_calls) == 1
-        call = manager.create_session_calls[0]
-        assert call["user_email"] == SEMANTIC_DRAFTER_USER_EMAIL
-        assert call["surface"] == Surface.API
-        assert call["profile"] == "semantic-model-builder"
-        # No named agent — this is a raw profile session, not an agent-as-API run.
-        assert call["agent_id"] is None
-
-    def test_ensures_the_drafter_user_row_exists(self, seeded_app):
-        _register_uncovered("t1")
-        manager = _FakeManager()
-        set_current_chat_manager(manager)
-        try:
-            c = seeded_app["client"]
-            r = c.post("/api/admin/semantic-auto-draft-sweep", headers=_auth(seeded_app["admin_token"]))
-            assert r.status_code == 200, r.text
-        finally:
-            set_current_chat_manager(None)
-
-        from src.repositories import users_repo
-
-        assert users_repo().get_by_email(SEMANTIC_DRAFTER_USER_EMAIL) is not None
+        assert body["error"] == "requires_postgres_backend"
+        assert body["feature"] == "semantic-auto-draft-sweep"

@@ -664,7 +664,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # each table's dedup flag before invoking its session, so a call
         # that outruns this timeout server-side is never re-triggered for
         # the same table on the next tick.
-        ("semantic-auto-draft-sweep", "every 30m", "/api/admin/semantic-auto-draft-sweep", "POST", 60),
+        ("semantic-auto-draft-sweep", "every 55m", "/api/admin/semantic-auto-draft-sweep", "POST", 60),
         # Weekly skill-lint retro-audit (#687). Re-lints published skills,
         # skipping entities whose content is unchanged since their last lint
         # (zero LLM cost on a static store). The endpoint self-guards against

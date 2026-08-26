@@ -21,13 +21,17 @@
 
 ### Setup (Adam, 5 min)
 
-- [ ] Confirm `chat.enabled: true`, `chat.provider: e2b`, `chat.e2b_template_id: agnes-chat:latest`
-      in `instance.yaml`. Restart server if not already loaded.
+- [ ] Confirm `chat.enabled: true`, `chat.provider: docker`, `chat.docker_image: agnes-chat-sandbox:latest`
+      in `instance.yaml`, the apps-runner sidecar is running
+      (`docker compose --profile apps up -d apps-runner`), and the sandbox
+      image is built (`docker build -t agnes-chat-sandbox:latest
+      app/initial_workspace_default/docker-sandbox`). Restart server if not
+      already loaded.
 - [ ] Confirm all required env vars are set:
       ```bash
-      env | grep -E 'ANTHROPIC_API_KEY|E2B_API_KEY|JWT_SECRET_KEY|SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET'
+      env | grep -E 'ANTHROPIC_API_KEY|APPS_RUNNER_URL|APPS_RUNNER_TOKEN|JWT_SECRET_KEY|SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET'
       ```
-      All 5 should be non-empty.
+      All 6 should be non-empty.
 - [ ] Visit `/admin/chat` as admin. Page should render an empty sessions table.
       (Verifies Assertion 1 from the admin side.)
 - [ ] In the DB, set the per-user daily-spend cap temporarily low for Sarah:
@@ -136,10 +140,13 @@
       Look for entries where the agent attempted the curl. The agent's
       subsequent assistant_message should explain the deny (search for
       "egress allowlist" or similar phrasing).
-- [ ] *(Optional defense-in-depth check)* If you can monitor outbound network
-      from the E2B sandbox (E2B dashboard or VPC flow logs if running
-      hybrid), confirm zero traffic to `evil.example.com`. Per Q4, this
-      is the only network-layer check available — the sandbox is fail-open.
+- [ ] *(Optional defense-in-depth check)* If the deployment sets
+      `chat.docker_egress_mode: none` or `allowlist`, the sandbox's only
+      network is an internal bridge with no route out — `docker exec` into
+      the sandbox container (`agnes-chatsbx-...`) and confirm a direct
+      `curl https://evil.example.com/` fails at the network layer too. On
+      the default `open` mode the PreToolUse hook is the only egress layer,
+      so this hook assertion is the whole check.
 
 ### Act 4 — RBAC denial (3 min)
 
@@ -163,8 +170,12 @@
       Sarah sends one more message in her active chat. Expected: WS frame
       `{"type": "error", "kind": "daily_budget", "message": "..."}`. Visible to
       Sarah as a red banner.
-- [ ] **(5.2) Crash + respawn:** Adam terminates the active E2B sandbox via the
-      E2B dashboard. In Sarah's open chat, WS receives `{"type":"error","kind":"subprocess_crashed","auto_respawn":true}` then `{"type":"ready"}`. Sarah's next message proceeds normally.
+- [ ] **(5.2) Crash + respawn:** Adam force-removes the active sandbox container:
+      ```bash
+      docker rm -f $(docker ps -q --filter "label=agnes.chat-sandbox")
+      ```
+      (or by name — sandbox containers are named `agnes-chatsbx-<session>-<digest>`).
+      In Sarah's open chat, WS receives `{"type":"error","kind":"subprocess_crashed","auto_respawn":true}` then `{"type":"ready"}`. Sarah's next message proceeds normally.
 - [ ] **(5.3) Idle TTL pauses (not kills):** Sarah leaves her tab open but inactive for
       65 seconds (the test-config TTL). Adam refreshes `/admin/chat` — the session row
       shows `sandbox_paused_at` non-null (paused, not gone). He queries:
@@ -211,9 +222,9 @@
 | Assertion 2 fails (no workspace files) | Initial workspace bundle not installed; check `app/initial_workspace_default/` |
 | Assertion 3 fails (RBAC leak) | `resource_grants` not respected by catalog endpoint; regression in `app/api/catalog.py` |
 | Assertion 5 fails (wrong number) | Real-LLM path broken — likely missing `ANTHROPIC_API_KEY` forwarding (Task A.1) or runner not loading agnes CLI correctly |
-| Assertion 6 fails (no snapshot file) | Workspace sync download-on-end not working; check `e2b_workspace_sync.download_workspace` |
+| Assertion 6 fails (no snapshot file) | The docker provider bind-mounts the workspace (no sync step) — check the session dir's `snapshots` symlink and the mounts built in `app/chat/docker_provider.py::_mounts` |
 | Assertion 7 fails (session killed on disconnect) | `chat.on_detach: kill` in config, or `detach_sink` not wired in `ws_stream` finally block |
-| Assertion 7b fails (no context recall after resume) | Provider resume failed — check `chat.e2b_template_id` and `E2B_API_KEY`; session may have fallen back to fresh spawn |
+| Assertion 7b fails (no context recall after resume) | Provider resume failed — check `chat.docker_image` and the apps-runner sidecar (`APPS_RUNNER_URL`/`APPS_RUNNER_TOKEN`); note a paused container does not survive a Docker daemon restart, so the session may have fallen back to a fresh spawn |
 | Assertion 9 fails (Slack reply doesn't see snapshot) | Workspace sync race; user_email lookup bug in Slack handler |
 | Assertion 10 or 11 fail (hook didn't fire) | PreToolUse hook not registered in workspace `.claude/settings.json`, or initial workspace override removed it without replacement |
 | Assertion 12 fails (data leak in refusal) | LLM ignored the typed error and synthesized data — needs system-prompt tightening |

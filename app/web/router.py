@@ -7164,8 +7164,13 @@ def _source_inventory() -> dict:
         if conns_per_type.get(stype):
             continue  # a real connection of this type owns the card
         own_tables = unlinked_by_type.pop(stype, [])
+        # Computed once per iteration (and only actually calls the probe when
+        # `stype == "keboola"`, via short-circuit) so the keboola branch below
+        # can reuse the same boolean instead of calling `_keboola_credentialed()`
+        # a second time to decide whether the "Import" button gets to render.
+        keboola_credentialed = stype == "keboola" and _keboola_credentialed()
         if not own_tables and not (
-            (stype == "keboola" and _keboola_credentialed())
+            keboola_credentialed
             or (stype == "bigquery" and _bigquery_credentialed())
             or (stype == "snowflake" and _snowflake_credentialed())
             or (stype == "databricks" and _databricks_credentialed())
@@ -7173,7 +7178,29 @@ def _source_inventory() -> dict:
             continue
         did = f"derived:{stype}"
         by_conn[did] = own_tables
-        derived.append({"id": did, "source_type": stype, "derived": True, **meta})
+        row = {"id": did, "source_type": stype, "derived": True, **meta}
+        if stype == "keboola":
+            # The "Import as managed connection" button on this card needs
+            # these two values to POST straight to
+            # `/api/admin/source-connections` without a second round trip —
+            # see `_keboola_instance_config()`. `credentialed` gates the
+            # button itself: a stack_url with no working token anywhere has
+            # nothing to import, and rendering the button in that state
+            # created a connection with no credential and a badge that
+            # claimed otherwise.
+            row["stack_url"], row["token_env"] = _keboola_instance_config()
+            row["credentialed"] = keboola_credentialed
+            # `create_connection` rejects an unallowlisted `token_env` before
+            # anything else (`_reject_disallowed_token_env`) — a card can be
+            # credentialed via the generic env var or the instance vault
+            # while `data_source.keboola.token_env` is still some custom,
+            # unallowlisted name, in which case Import would 400 even though
+            # the card looks ready. Gate the button on this too rather than
+            # advertise a one-click path that dead-ends for that config.
+            from src.orchestrator_security import is_token_env_allowed
+
+            row["token_env_allowlisted"] = is_token_env_allowed(row["token_env"])
+        derived.append(row)
 
     try:
         states = {s["table_id"]: s for s in sync_state_repo().get_all_states()}
@@ -7413,6 +7440,24 @@ def _db_cap(key: str, default: int) -> int:
         return default
 
 
+def _keboola_instance_config() -> tuple[str, str]:
+    """The instance-level Keboola `stack_url` + `token_env`, however they got
+    there (`instance.yaml` or `/admin/server-config`).
+
+    Shared by `_keboola_credentialed()` (which only needs the boolean half)
+    and the derived Keboola card's "Import as managed connection" button
+    (`_source_inventory()`), which needs the actual values to POST to
+    `POST /api/admin/source-connections` without a second round trip.
+    """
+    from app.instance_config import get_value
+
+    stack_url = (get_value("data_source", "keboola", "stack_url", default="") or "").strip()
+    token_env = (
+        get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN") or "KEBOOLA_STORAGE_TOKEN"
+    ).strip()
+    return stack_url, token_env
+
+
 def _keboola_credentialed() -> bool:
     """Whether this instance has an instance-level Keboola stack URL + token
     — the pre-flight half of the same check
@@ -7427,26 +7472,21 @@ def _keboola_credentialed() -> bool:
     `_DERIVED_SOURCES` without a Keboola entry despite
     `app/connections_seed.py` seeding one on first boot only when both are
     already present.
-    """
-    from app.instance_config import get_value
 
-    stack_url = (get_value("data_source", "keboola", "stack_url", default="") or "").strip()
+    The 3-step fallback itself lives in
+    `app.datasource_secrets.keboola_instance_token` — shared with the
+    derived Keboola card's "Import as managed connection" vault-seeding
+    step (`app/api/admin_source_connections.py`), which also needs to know
+    WHICH of the three actually holds the value, not just whether one does.
+    """
+    stack_url, token_env = _keboola_instance_config()
     if not stack_url:
         return False
 
-    token_env = (
-        get_value("data_source", "keboola", "token_env", default="KEBOOLA_STORAGE_TOKEN") or "KEBOOLA_STORAGE_TOKEN"
-    ).strip()
-    if os.environ.get(token_env, "").strip():
-        return True
-    if os.environ.get("KEBOOLA_STORAGE_TOKEN", "").strip():
-        return True
-    try:
-        from app.datasource_secrets import datasource_secret
+    from app.datasource_secrets import keboola_instance_token
 
-        return bool((datasource_secret("KEBOOLA_STORAGE_TOKEN") or "").strip())
-    except Exception:
-        return False
+    value, _provenance = keboola_instance_token(token_env)
+    return value is not None
 
 
 def _orphan_reason(connection_id: str) -> str:

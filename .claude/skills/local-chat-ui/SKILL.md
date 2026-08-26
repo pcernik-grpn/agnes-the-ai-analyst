@@ -1,6 +1,6 @@
 ---
 name: Local Agnes Chat UI testing
-description: How to run the Agnes FastAPI server locally so the chat UI and onboarding rail render without real auth or LLM/E2B credentials.
+description: How to run the Agnes FastAPI server locally so the chat UI and onboarding rail render without real auth or LLM credentials.
 ---
 
 # Local Agnes Chat UI testing
@@ -15,13 +15,13 @@ LOCAL_DEV_MODE=1 TESTING=1 AGNES_CHAT_ENABLED=true .venv/bin/uvicorn app.main:ap
 ```
 
 - `LOCAL_DEV_MODE=1` auto-authenticates every request as `dev@localhost` (admin).
-- `TESTING=1` bypasses the `JWT_SECRET_KEY`, `ANTHROPIC_API_KEY`, and `E2B_API_KEY` startup checks.
+- `TESTING=1` bypasses the `JWT_SECRET_KEY` and `ANTHROPIC_API_KEY` startup checks (and the chat provider-backing boot gates).
 - `AGNES_CHAT_ENABLED=true` enables chat; without it the rail panel is never rendered.
 - No `instance.yaml` is required; the app falls back to built-in defaults.
 
-This server has **no working turn engine**: with no LLM/E2B credentials a real
-message cannot be answered, so it is only good for rendering, layout and
-onboarding work.
+This server has **no working turn engine**: with no LLM credentials and no
+provider backing a real message cannot be answered, so it is only good for
+rendering, layout and onboarding work.
 
 ## Testing an actual conversation (tool cards, streaming, frame order)
 

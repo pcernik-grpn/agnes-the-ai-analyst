@@ -160,32 +160,9 @@ class TestDeleteInternalExcept:
         assert repos["registry"].get("agnes_telemetry") is not None
 
 
-class TestSemanticDraftPending:
-    """Pins ``mark_semantic_draft_pending`` / ``clear_semantic_draft_pending``
-    (semantic-phase5 wave 2) — the auto-draft sweep's dedup flag. Set before
-    a headless drafting session is invoked, cleared once the resulting
-    ``authoring_suggestions`` row is resolved (approve or reject)."""
-
-    def test_starts_unset(self, repos):
-        _seed(repos, "t1", "Table One")
-        row = repos["registry"].get("t1")
-        assert row["semantic_draft_pending_at"] is None
-
-    def test_mark_sets_a_timestamp(self, repos):
-        _seed(repos, "t1", "Table One")
-        repos["registry"].mark_semantic_draft_pending("t1")
-        row = repos["registry"].get("t1")
-        assert row["semantic_draft_pending_at"] is not None
-
-    def test_clear_unsets_it(self, repos):
-        _seed(repos, "t1", "Table One")
-        repos["registry"].mark_semantic_draft_pending("t1")
-        repos["registry"].clear_semantic_draft_pending("t1")
-        row = repos["registry"].get("t1")
-        assert row["semantic_draft_pending_at"] is None
-
-    def test_mark_and_clear_are_scoped_to_one_row(self, repos):
-        _seed(repos, "t1", "Table One")
-        _seed(repos, "t2", "Table Two")
-        repos["registry"].mark_semantic_draft_pending("t1")
-        assert repos["registry"].get("t2")["semantic_draft_pending_at"] is None
+# NOTE: mark_semantic_draft_pending / clear_semantic_draft_pending
+# (semantic-phase5 wave 2's auto-draft sweep dedup flag) are PG-only (A3
+# PG-first ratchet — table_registry.semantic_draft_pending_at is a
+# Postgres-only column with no DuckDB sibling), so they are not part of
+# this dual-backend contract. See tests/db_pg/test_table_registry_pg.py
+# for their PG-only-shaped coverage.

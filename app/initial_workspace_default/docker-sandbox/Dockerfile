@@ -1,18 +1,16 @@
-# Agnes chat sandbox image — the self-hosted sibling of the E2B template
-# (../e2b-template/Dockerfile). Runs claude-agent-sdk + the agnes CLI inside a
-# local Docker container instead of a cloud microVM.
+# Agnes chat sandbox image. Runs claude-agent-sdk + the agnes CLI inside a
+# local Docker container.
 #
 # Build (from the repo root):
 #   docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
 # then set `chat.docker_image` in instance.yaml. See README.md here and
 # docs/cloud-chat.md → "Docker provider (self-hosted)".
 #
-# Base: `python:3.13-slim` rather than a copy of `e2bdev/base`. What the runner
-# actually depends on is a Debian userland with python3 + pip installing into
-# /usr/local, which this gives directly; mirroring the E2B base image would add
-# a whole VM-oriented toolchain nothing here uses.
+# Base: `python:3.13-slim`. What the runner actually depends on is a Debian
+# userland with python3 + pip installing into /usr/local, which this gives
+# directly.
 #
-# NOT baked in (same trade-offs as the E2B template):
+# NOT baked in (deliberate trade-offs):
 #   - `app/chat/runner.py` — staged per spawn (as a plain host write into the
 #     bind-mounted session dir, so runner changes need no image rebuild).
 #   - the `agnes` CLI wheel — staged per spawn from the server's own build so
@@ -45,12 +43,12 @@ RUN npm install -g @anthropic-ai/claude-code
 # claude-agent-sdk + the agnes CLI's *runtime dependency closure* — NOT the
 # agnes package itself (staged per spawn, see above). cli/main.py imports every
 # command module eagerly, so a missing dep breaks the whole `agnes` binary, not
-# one subcommand. Keep in sync with ../e2b-template/Dockerfile and the
-# CLI-relevant entries of [project.dependencies] in pyproject.toml.
+# one subcommand. Keep in sync with the CLI-relevant entries of
+# [project.dependencies] in pyproject.toml.
 #
 # `matplotlib` is the one entry here that the CLI never imports. It is baked in
 # because the agent is asked to draw charts and had no way to obtain it: under
-# `chat.docker_egress_mode: none` (and behind E2B's per-hostname allowlist)
+# `chat.docker_egress_mode: none`
 # an in-sandbox `pip install matplotlib` cannot reach PyPI at all, and even on
 # an open egress it is a slow download inside every session that wants a plot.
 # Without it the agent improvises — the reported failure was an SVG written to
@@ -84,8 +82,7 @@ RUN pip install --no-cache-dir \
 # The world-writable modes are what make that work for ANY uid: the provider
 # runs the container as the uid owning the bind-mounted session dir on the host
 # (docker's standard answer to bind-mount ownership), which is almost never
-# 1000. The E2B base image solves the same problem the same way (a 777
-# /usr/local). Everything here is a single-process, cap-dropped,
+# 1000. Everything here is a single-process, cap-dropped,
 # no-new-privileges container with no setuid binaries and no root process to
 # escalate to, so a writable /usr/local buys an attacker nothing they don't
 # already have as the agent user.

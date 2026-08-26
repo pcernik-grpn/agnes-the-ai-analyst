@@ -9,10 +9,9 @@ two is a CSS theme decision, not a template one (see `paper-skin.css`).
 
 The other three (`#f-user`, `#f-action`, `#f-source`) populate their
 `<option>`s entirely at runtime from `/api/admin/observability/facets` and
-stay plain native selects — `ds_dropdown.js` snapshots its menu items once
-at load with no public re-init API, so mirroring a runtime-rebuilt option
-list into the custom menu would mean duplicating its selection/keyboard-nav
-logic in page-local JS.
+also get a paired `ds.dropdown()` (initially just the `{'', 'Any'}` option),
+kept in sync with the fetched facet options by `syncObsFacetDropdown()` using
+`ds_dropdown.js`'s exported re-init hook (#1473).
 """
 
 from __future__ import annotations
@@ -80,17 +79,21 @@ class TestActivityCenterDropdowns:
         ):
             assert f'data-value="{value}"' in text
 
-    def test_dynamic_facet_selects_are_not_converted(self, seeded_app):
-        """#f-user / #f-action / #f-source keep their runtime-populated options
-        and stay plain — no paired ds-dropdown wrapper for these three."""
+    def test_dynamic_facet_selects_are_converted(self, seeded_app):
+        """#f-user / #f-action / #f-source keep their runtime-populated native
+        <select> (existing fillSelect() JS wiring untouched) and are paired
+        with a ds.dropdown() kept in sync by syncObsFacetDropdown()."""
         resp = seeded_app["client"].get("/admin/activity", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
         text = resp.text
-        assert '<select id="f-user" class="obs-select"><option value="">Any</option></select>' in text
-        assert '<select id="f-action" class="obs-select"><option value="">Any</option></select>' in text
-        assert '<select id="f-source" class="obs-select"><option value="">Any</option></select>' in text
-        for target in ("f-user", "f-action", "f-source"):
-            assert f'data-ds-dropdown-target="{target}"' not in text
+        for select_id in ("f-user", "f-action", "f-source"):
+            assert (
+                f'<select id="{select_id}" class="obs-select ds-dropdown-native"><option value="">Any</option></select>'
+                in text
+            )
+            assert f'data-ds-dropdown-target="{select_id}"' in text
+            assert f'id="{select_id}-dd-btn"' in text
+            assert f'id="{select_id}-dd-menu"' in text
 
     def test_dropdown_js_module_is_loaded(self, seeded_app):
         resp = seeded_app["client"].get("/admin/activity", headers=_auth(seeded_app["admin_token"]))

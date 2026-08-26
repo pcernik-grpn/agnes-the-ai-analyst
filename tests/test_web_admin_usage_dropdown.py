@@ -8,9 +8,10 @@ is a CSS theme decision, not a template one — see
 `app/web/static/css/paper-skin.css`.
 
 The four facet selects (`#u-user`, `#u-tool`, `#u-source`, `#u-event-type`)
-are populated client-side from `/api/admin/telemetry/facets` and are NOT
-converted — `ds_dropdown.js` has no mechanism to re-populate a paired
-dropdown's menu when the target select's options change after load.
+are populated client-side from `/api/admin/telemetry/facets` and also get a
+paired `ds.dropdown()` (initially just the `{'', 'Any'}` option), kept in
+sync with the fetched facet options via `ds_dropdown.js`'s exported re-init
+hook (#1473).
 """
 
 from __future__ import annotations
@@ -30,13 +31,15 @@ class TestAdminUsageDropdown:
         assert '<option value="10080" selected>Last 7d</option>' in text
         assert '<option value="day" selected>Day</option>' in text
 
-    def test_facet_selects_are_not_converted(self, seeded_app):
+    def test_facet_selects_are_converted(self, seeded_app):
         resp = seeded_app["client"].get("/admin/telemetry", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
         text = resp.text
         for select_id in ("u-user", "u-tool", "u-source", "u-event-type"):
-            assert f'<select id="{select_id}" class="obs-select">' in text
-            assert f'data-ds-dropdown-target="{select_id}"' not in text
+            assert f'<select id="{select_id}" class="obs-select ds-dropdown-native">' in text
+            assert f'data-ds-dropdown-target="{select_id}"' in text
+            assert f'id="{select_id}-dd-btn"' in text
+            assert f'id="{select_id}-dd-menu"' in text
 
     def test_custom_dropdown_markup_present_for_window_and_groupby(self, seeded_app):
         resp = seeded_app["client"].get("/admin/telemetry", headers=_auth(seeded_app["admin_token"]))

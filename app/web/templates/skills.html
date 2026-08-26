@@ -53,6 +53,7 @@
    by the builder actions (same as /agents) — without it the buttons fall back
    to the unstyled browser default. #}
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   .sk-no-review {
     margin-bottom: var(--space-4);
@@ -398,6 +399,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
   'use strict';
@@ -662,6 +664,29 @@
     return '<option value="">— none —</option>' + CATEGORIES.map(function (c) {
       return '<option value="' + esc(c) + '"' + (draft.category === c ? ' selected' : '') + '>' + esc(c) + '</option>';
     }).join('');
+  }
+
+  // Paired `.ds-dropdown` (see _components.html's `dropdown` macro) for the
+  // category <select> above — hand-built since render() rebuilds the whole
+  // form via innerHTML on every state change, so there's no id yet for a
+  // Jinja macro to target at template-render time. Safe to always build
+  // fresh: render()'s full innerHTML replacement means this never persists
+  // across two dsDropdownInit calls the way a partial-refresh control would.
+  function catDropdownHtml() {
+    var current = draft.category && CATEGORIES.indexOf(draft.category) >= 0 ? draft.category : '';
+    var currentLabel = current || '— none —';
+    var items = '<li class="ds-dropdown-menu-item' + (current === '' ? ' is-selected' : '') + '" role="menuitemradio" aria-checked="' + (current === '') + '" tabindex="0" data-value="">— none —</li>' +
+      CATEGORIES.map(function (c) {
+        var selected = c === current;
+        return '<li class="ds-dropdown-menu-item' + (selected ? ' is-selected' : '') + '" role="menuitemradio" aria-checked="' + selected + '" tabindex="0" data-value="' + esc(c) + '">' + esc(c) + '</li>';
+      }).join('');
+    return '<div class="ds-dropdown" data-ds-dropdown-target="sk-category">' +
+      '<button type="button" class="ds-dropdown-btn" id="sk-category-dd-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="sk-category-dd-menu">' +
+        '<span class="ds-dropdown-btn-label" id="sk-category-dd-btn-label">' + esc(currentLabel) + '</span>' +
+        '<svg class="ds-dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>' +
+      '</button>' +
+      '<ul class="ds-dropdown-menu" id="sk-category-dd-menu" role="menu" aria-label="Category" hidden>' + items + '</ul>' +
+    '</div>';
   }
 
   /* ── Section 1 — Type.
@@ -991,7 +1016,7 @@
                 '<textarea rows="2" data-sk-field="description" placeholder="' + esc(c.descPlaceholder) + '">' + esc(draft.description) + '</textarea></label>' +
               fieldErrHtml('description') +
               '<label class="sk-field"><span>Category</span>' +
-                '<div class="sk-selectwrap"><select data-sk-field="category">' + catOptions() + '</select></div></label>' +
+                '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
               fieldErrHtml('category') +
             '</div>' +
           '</div>' +
@@ -1053,6 +1078,12 @@
     // The per-field slots render empty; this is what fills (or clears) them,
     // so a re-render never drops a live fault or keeps a dead one.
     syncProblems();
+    // view.innerHTML above just replaced the category .ds-dropdown with a
+    // brand-new node, so this is always a first init — never a second call
+    // on a persisting button (which would double-register its click
+    // handler; see ds_dropdown.js's own docstring on init() not being
+    // idempotent per element).
+    if (window.dsDropdownInit) view.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
   }
 
   /* Light-touch preview sync while typing (no re-render → keeps focus). */
@@ -1954,7 +1985,7 @@
     }
   });
 
-  document.addEventListener('input', function (e) {
+  function handleFieldInput(e) {
     var f = e.target.getAttribute && e.target.getAttribute('data-sk-field');
     if (!f || !draft) return;
     draft[f] = e.target.value;
@@ -1978,6 +2009,20 @@
     dropProblem(f);   // the field is being answered — stop faulting it
     persist();
     syncPreview();
+  }
+  document.addEventListener('input', handleFieldInput);
+  // ds_dropdown.js only dispatches "change" on the paired native <select>
+  // when a branded item is picked (never "input", unlike a real <select>'s
+  // own direct-interaction firing of both) — without this, picking a
+  // category via the paper-theme dropdown never reaches handleFieldInput,
+  // and Save would submit whatever category was selected before. Scoped to
+  // just this field: every other data-sk-field element is a text input/
+  // textarea, which already fires "input" nativel and needs no help here.
+  // Runs handleFieldInput a second time for a REAL <select> too (which
+  // fires both "input" and "change" natively) — harmless, since every
+  // branch here is idempotent for an unchanged value.
+  document.addEventListener('change', function (e) {
+    if (e.target && e.target.matches && e.target.matches('[data-sk-field="category"]')) handleFieldInput(e);
   });
 
   /* Drop zone — delegated at the document level (like every other handler

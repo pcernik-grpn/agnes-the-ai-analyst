@@ -153,28 +153,13 @@ instance:
 server:
   hostname: ""                    # DNS name (e.g., "data.acme.com")
   host: ""                        # IP address
-  app_dir: "/opt/data-analyst"    # Installation directory
   # public_url: ""                # Absolute base URL, e.g. "https://data.acme.com".
                                   # Used to build absolute links from request-less
                                   # surfaces — notably the Slack bot's /slack/bind
                                   # magic links. The PUBLIC_URL env var overrides this.
-  # --- Client setup (shown in "Get Started" on dashboard) ---
-  # ssh_alias: "data-analyst"     # SSH config Host alias for analysts (default: "data-analyst")
-  # ssh_key: "~/.ssh/data_analyst_server"  # SSH key path for analysts (default: "~/.ssh/data_analyst_server")
-  # project_dir: "data-analyst"   # Local project folder name (default: "data-analyst")
-
-# --- Admin users ---
-# Manage the server, own data files, get unlimited resource limits.
-# SSH keys are used by server/setup.sh during provisioning.
-admins:
-  - username: "admin"
-    ssh_public_key: "ssh-ed25519 AAAA..."
 
 # --- Deployment ---
 deployment:
-  method: "manual"                # manual | github_actions
-  repo_url: ""                    # e.g., "git@github.com:acme/ai-data-analyst.git"
-  branch: "main"
   # role: "all"                    # api | gateway | worker | all, comma-separable (e.g. "api,gateway").
                                    # AGNES_ROLE env var overrides this. Default "all" keeps the
                                    # single-process, zero-ops S-tier behavior. Splitting into
@@ -544,10 +529,6 @@ email:
   # Sender address. `SMTP_FROM` (or the legacy `EMAIL_FROM_ADDRESS`) wins if
   # set; this value is the fallback.
   from_address: "noreply@example.com"
-  # NOT IMPLEMENTED — the SMTP transport sends a bare address with no display
-  # name, so this key is inert. Left in place because removing it would silently
-  # drop it from existing instance.yaml files on the next template diff.
-  from_name: "AI Harness"
   smtp_host: "${SMTP_HOST}"          # e.g., "smtp.gmail.com"
   smtp_port: 587                     # 587 for STARTTLS, 465 for SSL
   smtp_user: "${SMTP_USER}"
@@ -571,16 +552,14 @@ notifications:
   alert_webhook_url: ""
 
 # --- Jira integration (optional) ---
-jira:
-  domain: ""
-  email: ""
-  api_token: "${JIRA_API_TOKEN}"
-  webhook_secret: "${JIRA_WEBHOOK_SECRET}"
-  # Custom fields to refresh onto tickets (generic; no defaults). field_id or
-  # field_id:column, comma-separated. Discover with:
-  #   python -m connectors.jira.scripts.verify_sla_access --list-fields
-  refresh_fields: "${JIRA_REFRESH_FIELDS}"
-  cloud_id: ""  # set only for a scoped API token (gateway URL)
+# NOT configured here. connectors/jira/service.py reads JIRA_* environment
+# variables directly (os.environ) — there is no instance.yaml wiring for this
+# connector at all. Set in .env: JIRA_DOMAIN, JIRA_EMAIL, JIRA_API_TOKEN,
+# JIRA_WEBHOOK_SECRET, JIRA_REFRESH_FIELDS (custom fields to refresh onto
+# tickets — field_id or field_id:column, comma-separated; discover with
+# `python -m connectors.jira.scripts.verify_sla_access --list-fields`),
+# JIRA_CLOUD_ID (only for a scoped API token / gateway URL). See
+# docs/CONFIGURATION.md's ".env infrastructure variables".
 
 # --- Corporate Memory AI (optional) ---
 # Extracts shared knowledge from team members' CLAUDE.local.md files.
@@ -904,25 +883,25 @@ materialize:
 
 # --- Cloud-hosted Claude Code (optional) ---
 # Cloud-hosted Claude Code (web /chat + Slack adapter). Off by default;
-# turn on per-instance once you've built the E2B sandbox template and
-# set ANTHROPIC_API_KEY + E2B_API_KEY in the Agnes server env. See
+# turn on per-instance once the chosen provider's backing exists and
+# ANTHROPIC_API_KEY is set in the Agnes server env. See
 # docs/cloud-chat.md for the operator walkthrough.
 chat:
   enabled: false
-  # Sandbox provider:
-  #   e2b       — cloud microVMs (needs an E2B account + a built template).
+  # Chat provider:
+  #   kai-agent — the default. Sessions run on the embedded kai-agent turn
+  #               engine (the /api/kai/* integration; requires
+  #               KAI_HOST_JWT_SECRET). The engine owns the agent loop,
+  #               transcript and sandbox; Agnes spawns nothing per session.
+  #               See docs/cloud-chat.md → "kai-agent provider (embedded
+  #               turn engine)".
   #   docker    — self-hosted containers on the local Docker daemon, created
   #               through the apps-runner sidecar (compose profile `apps`).
-  #               No E2B account; the workspace is bind-mounted instead of
-  #               uploaded, so there is no 100 MB cap. See docs/cloud-chat.md
-  #               → "Docker provider (self-hosted)".
-  #   kai-agent — sessions run on the embedded kai-agent turn engine (the
-  #               /api/kai/* integration; requires KAI_HOST_JWT_SECRET).
-  #               The engine owns the agent loop, transcript and sandbox;
-  #               Agnes spawns nothing per session. See docs/cloud-chat.md
-  #               → "kai-agent provider (embedded turn engine)".
-  # There is deliberately no mock provider.
-  provider: e2b
+  #               The workspace is bind-mounted, so there is no size cap.
+  #               See docs/cloud-chat.md → "Docker provider (self-hosted)".
+  # There is deliberately no mock provider. (The e2b provider was removed
+  # in 0.89.0 — a stale `provider: e2b` boots with chat disabled.)
+  provider: kai-agent
   # Where the embedded engine listens (provider=kai-agent only). Default is
   # the compose service the customer-instance module materializes.
   # Overridable from the environment as AGNES_CHAT_KAI_AGENT_URL (env > this
@@ -933,14 +912,6 @@ chat:
   # the local stub engine that lets you exercise this provider without the
   # real one.
   # kai_agent_url: "http://kai-agent:3000"
-  # E2B template id returned by `e2b template build` inside
-  # app/initial_workspace_default/e2b-template/. Required when
-  # provider=e2b and enabled=true; startup gate refuses otherwise.
-  # e2b_template_id: "agnes-chat"
-  # Per-spawn workspace push cap. Files past this cap → user-facing
-  # workspace_too_large error. 100 MB default keeps spawn latency in
-  # the 3-5 s range. (provider=e2b only — docker bind-mounts.)
-  e2b_workspace_max_bytes: 104857600
   # --- provider: docker -------------------------------------------------
   # Operator-built sandbox image (docker build -t agnes-chat-sandbox:latest
   # app/initial_workspace_default/docker-sandbox). The sidecar additionally
@@ -951,15 +922,14 @@ chat:
   # or AGNES_SERVER won't resolve from inside the container.
   # docker_network: "agnes-apps"
   # Per-sandbox resource bounds — always applied (a local sandbox competes
-  # with the gateway for host resources, unlike an E2B microVM).
+  # with the gateway for host resources).
   # docker_mem_limit: "2g"
   # docker_cpus: 1.0
   # docker_pids_limit: 512
   # open — normal bridge, internet reachable (in-sandbox `pip install` etc.
-  #        keep working; weaker than E2B's hostname allowlist).
+  #        keep working).
   # none — internal-only network: the sandbox reaches nothing but the
-  #        containers on that network (stronger than E2B; breaks in-sandbox
-  #        package installs).
+  #        containers on that network (breaks in-sandbox package installs).
   # allowlist — the internal network of `none` PLUS the egress-proxy sidecar
   #        (compose profile `chat-docker-egress`): sandboxes get HTTP(S)_PROXY
   #        pointed at it and may reach only docker_egress_allow_hosts, each
@@ -974,10 +944,10 @@ chat:
   # docker_egress_proxy_url: "http://agnes-egress-proxy:3128"
   # Host-wide ceiling on live sandboxes, on top of concurrency_per_user.
   # docker_max_total_sandboxes: 10
-  # Kill the sandbox the moment the WS disconnects rather than
-  # waiting for the idle reaper. Cuts billable sandbox-minutes on
-  # UI close.
-  e2b_kill_on_ws_disconnect: true
+  # What happens when the last WebSocket disconnects (after the linger
+  # window): pause (default) keeps the session resumable; kill tears the
+  # sandbox down immediately.
+  # on_detach: pause
   # Agent harness driving the in-sandbox session. "claude-code" is the
   # only approved engine today; the id exists as the extension seam
   # (app/chat/harness.py) so an alternative can plug in behind the same
@@ -1020,6 +990,16 @@ data_apps:
   enabled: false
   runtime_image: "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24"
   subdomain_base: ""            # e.g. "apps.example.com"; "" = path-prefix only
+  # Serve hosted apps on the MAIN origin (same origin as the Agnes /api)?
+  # OFF by default (SECURITY): a hosted app runs user-authored JS, and on the
+  # main origin that JS can call /api with the viewer's own session cookie and
+  # read the response (mint a PAT, read admin config) — no response header can
+  # stop same-origin reads. Configure `subdomain_base` above to serve apps from
+  # their own origin instead; requests arriving on a data-app subdomain are
+  # always served. Set this to true only if you accept same-origin serving
+  # (e.g. trusted authors only, or to keep the in-chat app preview working).
+  # Env override: AGNES_DATA_APPS_ALLOW_SAME_ORIGIN.
+  allow_same_origin: false
   default_idle_timeout_s: 1800
   default_sleep_mode: recreate  # recreate | pause
   default_mem_limit: 1g
