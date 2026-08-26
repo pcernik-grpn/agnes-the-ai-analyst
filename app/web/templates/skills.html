@@ -1077,10 +1077,7 @@
            spec). Until then it carries the one thing that already belongs
            there — what you are making, as it will read — behind the same tab
            strip, so adding Create later moves nothing. */
-        left: BuilderShell.tabs({
-            active: builderTab,
-            tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
-          }) + leftPaneHtml(c),
+        left: tabsHtml() + leftPaneHtml(c),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
         cfgBodyId: 'sk-steps',
@@ -1160,12 +1157,20 @@
   function renderLeftPane() {
     var pane = view.querySelector('.ag-work > .ag-pane');
     if (!pane) { render(); return; }
-    var tabs = pane.querySelector('.ag-tabs');
-    if (!tabs) { render(); return; }
-    while (tabs.nextSibling) pane.removeChild(tabs.nextSibling);
-    pane.insertAdjacentHTML('beforeend', leftPaneHtml(cfg()));
+    /* The TAB STRIP is part of this pane, not chrome above it. Keeping it and
+       replacing only what follows left `aria-selected` on whichever tab was
+       active at first paint — so Preview's pane rendered under a Create tab
+       still styled as the selected one. The strip is cheap; rebuild it. */
+    pane.innerHTML = tabsHtml() + leftPaneHtml(cfg());
     var el = document.getElementById('sk-conv');
     if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  function tabsHtml() {
+    return BuilderShell.tabs({
+      active: builderTab,
+      tabs: [{ id: 'create', label: 'Create' }, { id: 'preview', label: 'Preview' }],
+    });
   }
 
   /* One builder turn. The reply is inserted as TEXT (BuilderShell.message) —

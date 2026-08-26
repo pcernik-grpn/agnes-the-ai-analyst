@@ -236,6 +236,7 @@
       tables: root.querySelector('#pdw-tables'),
       err: root.querySelector('#pdw-err'),
       submit: root.querySelector('#pdw-submit'),
+      foot: root.querySelector('.ds-drawer__foot'),
     };
 
     root.addEventListener('click', function (e) {
@@ -343,6 +344,8 @@
   function applyMode(mode) {
     var editing = mode === 'edit';
     els.title.textContent = editing ? 'Edit data package' : 'New data package';
+    // The shell header carries the same title in builder mode.
+    if (els.shellTitle) els.shellTitle.textContent = els.title.textContent;
     els.sub.textContent = editing
       ? 'What analysts read before they add it.'
       : 'A package is the unit an analyst receives — tables reach them only through one.';
@@ -555,8 +558,26 @@
   function enterBuilderLayout() {
     if (!els || els.root.classList.contains('is-builder-built')) return;
     els.root.classList.add('is-builder-built');
+    var panel = els.root.querySelector('.ds-drawer__panel');
     var body = els.root.querySelector('.ds-drawer__body');
     var panes = Array.prototype.slice.call(body.children);
+
+    /* The same header every other builder has: leave on the left, the verb
+       that commits on the right. The drawer's own title bar and its footer
+       button row are the compact drawer's pattern, not this one — a workspace
+       whose primary action is parked in a footer below a scrolling form reads
+       as a dialog, and you lose it the moment the form is long enough to
+       scroll. The Create button is MOVED, not rebuilt, so `#pdw-submit` and
+       everything bound to it keeps working. */
+    var head = document.createElement('div');
+    head.innerHTML = BuilderShell.head({
+      backLabel: 'Library',
+      title: 'New data package',
+      titleId: 'pdw-shell-title',
+      actionsId: 'pdw-shell-actions',
+    });
+    panel.insertBefore(head.firstChild, body);
+
     var work = document.createElement('div');
     work.innerHTML = BuilderShell.workspace({
       left: '<div class="pdw-conv" id="pdw-conv"></div>',
@@ -568,6 +589,19 @@
     var slot = body.querySelector('#pdw-cfg');
     panes.forEach(function (node) { slot.appendChild(node); });
     els.convHost = body.querySelector('#pdw-conv');
+
+    els.shellTitle = els.root.querySelector('#pdw-shell-title');
+  }
+
+  /* Put the commit button where the CURRENT size wants it. It is one node in
+     one DOM, so this has to happen on every open, not once at build: after a
+     builder open the button was living in the shell header, and the next
+     compact open showed a footer with nothing in it but Cancel. */
+  function placeSubmit() {
+    if (!els || !els.submit) return;
+    var actions = els.root.querySelector('#pdw-shell-actions');
+    if (st && st.builder && actions) actions.appendChild(els.submit);
+    else if (els.foot) els.foot.appendChild(els.submit);
   }
 
   function renderConv() {
@@ -675,6 +709,7 @@
     } else if (els.convHost) {
       els.convHost.innerHTML = '';
     }
+    placeSubmit();
     var typed = opts.typed || '';
     els.name.value = typed;
     els.slug.value = slugify(typed);
@@ -747,6 +782,10 @@
      collide with a builder page underneath. */
   function bindConversation(root) {
     root.addEventListener('click', function (e) {
+      /* The shell's back button is this drawer's close. Nothing is lost by
+         leaving — the package does not exist until Create, and there is no
+         draft store here to preserve — so it does not confirm. */
+      if (e.target.closest('[data-ag-back]')) { close(); return; }
       var t = e.target.closest('[data-ag-send],[data-ag-chip]');
       if (!t) return;
       if (t.hasAttribute('data-ag-chip')) { sendTurn(t.getAttribute('data-ag-chip')); return; }

@@ -190,7 +190,7 @@ body.ag-building .idx > footer { display: none; }
    padding so the panes run edge to edge; one hairline divides them and the
    page border IS the window. Everything is undone on the list view, which
    is a document and wants its column back. */
-.ag-work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--ds-surface); border-top: 1px solid var(--ds-border); min-height: 520px; height: calc(100vh - var(--ag-chrome, 150px)); }
+.ag-work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--ds-surface); border-top: 1px solid var(--ds-border); min-height: 520px; flex: 1 1 auto; }
 .ag-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .ag-pane--cfg { border-left: 1px solid var(--ds-border); background: var(--ds-surface-sunken); }
 /* Prose does not want the full width of a wide monitor even when the pane
@@ -295,3 +295,39 @@ body.ag-building .idx > footer { display: none; }
 .ds-drawer:not(.ds-drawer--builder) .ag-cfg-head { display: none; }
 .ds-drawer:not(.ds-drawer--builder) .ag-pane--cfg { border-left: none; background: none; }
 .ds-drawer:not(.ds-drawer--builder) .ds-drawer__pane { padding: 0; }
+
+/* ── Filling the window, without guessing at the chrome ──
+   `.ag-work` used to be `height: calc(100vh - 150px)`, where 150px was the
+   height of ONE page's header. On the other builder the header is 70px, so
+   the workspace stopped 80px short and left a band of dead white under it.
+
+   A number tuned to one page's chrome is wrong on every other page and wrong
+   again the moment either header rewraps. So the whole column flexes instead:
+   the shell is pinned to the viewport and the workspace takes whatever the
+   header leaves, whatever that turns out to be. */
+body.ag-building .idx { height: 100vh; min-height: 0; overflow: hidden; }
+body.ag-building .idx-band { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+body.ag-building .idx-band-inner { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+body.ag-building #ag-builder-view,
+body.ag-building #sk-builder-view { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+@media (max-width: 900px) {
+  /* Stacked, so the page scrolls again and pinning it would trap the panes. */
+  body.ag-building .idx { height: auto; overflow: visible; }
+}
+
+/* In builder mode the drawer wears the shell's header instead of its own.
+   The title bar and the footer button row are the COMPACT drawer's pattern:
+   a workspace whose primary action sits in a footer under a scrolling form
+   reads as a dialog, and the action leaves the screen as soon as the form is
+   long enough to scroll. Hidden rather than not-built, because the compact
+   drawer still needs both and there is only one DOM. */
+.ds-drawer--builder .ds-drawer__head,
+.ds-drawer--builder .ds-drawer__foot { display: none; }
+.ds-drawer--builder .ag-build-head { padding: 14px 22px; border-bottom: 1px solid var(--ds-border); }
+/* ...and the shell head is chrome, so it must not scroll with the panes. */
+.ds-drawer--builder .ds-drawer__panel > .ag-build-head { flex: 0 0 auto; }
+
+/* ...and the shell header is builder-only, for the same reason the drawer's
+   own header is compact-only. Both exist in the DOM once the drawer has been
+   opened as a builder; the class decides which one is showing. */
+.ds-drawer:not(.ds-drawer--builder) .ag-build-head { display: none; }
