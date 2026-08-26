@@ -51,7 +51,7 @@ def _chat_granted():
 
 
 def _make_agent(seeded_app, token: str, name: str) -> dict:
-    resp = seeded_app["client"].post("/api/agents", json={"name": name}, headers=_auth(token))
+    resp = seeded_app["client"].post("/api/v1/agents", json={"name": name}, headers=_auth(token))
     assert resp.status_code == 201, resp.text
     return resp.json()
 
@@ -274,8 +274,7 @@ class TestEveryChatRouteRefusesARestrictedPrincipal:
         # And the baseline must shrink, not rot: a name that no longer has the
         # gap has to leave the set, or the set stops describing anything.
         assert self.UNRESOLVED <= missing, (
-            "UNRESOLVED names a handler that now carries the guard — remove it: "
-            f"{sorted(self.UNRESOLVED - missing)}"
+            f"UNRESOLVED names a handler that now carries the guard — remove it: {sorted(self.UNRESOLVED - missing)}"
         )
 
 
@@ -298,7 +297,7 @@ class TestTheSessionSaysWhichAgentItRunsAs:
     def test_the_default_path_reports_the_default_agent(self, seeded_app):
         """Never null: an unnamed web session is attributed to the default
         agent, so a client tells "named" from "default" by comparing against the
-        ``is_default`` row in ``GET /api/agents`` — not by null-checking here."""
+        ``is_default`` row in ``GET /api/v1/agents`` — not by null-checking here."""
         resp = _chat_or_skip(seeded_app, surface="web")
         assert resp.status_code == 201, resp.text
 
@@ -311,9 +310,7 @@ class TestTheSessionSaysWhichAgentItRunsAs:
         created = _chat_or_skip(seeded_app, surface="web", agent_slug=agent["slug"])
         assert created.status_code == 201, created.text
 
-        listed = seeded_app["client"].get(
-            "/api/chat/sessions", headers=_auth(seeded_app["analyst_token"])
-        )
+        listed = seeded_app["client"].get("/api/chat/sessions", headers=_auth(seeded_app["analyst_token"]))
         assert listed.status_code == 200, listed.text
         row = next((s for s in listed.json() if s["id"] == created.json()["id"]), None)
         assert row is not None, "the just-created session is missing from the list"
@@ -391,7 +388,7 @@ class TestTheComposerCanChooseAnAgent:
         assert "#chat-capabilities[hidden] ~ #chat-form .rdb-context" in css
 
     def test_the_picker_offers_only_agents_the_caller_owns(self):
-        """``GET /api/agents`` also returns agents merely SHARED with the caller,
+        """``GET /api/v1/agents`` also returns agents merely SHARED with the caller,
         but ``_resolve_agent_id`` resolves a slug against their OWN rows only —
         so offering a shared agent would 404 on click."""
         js = self._js()
@@ -452,7 +449,7 @@ class TestTheComposerCanChooseAnAgent:
 
     def test_the_greeting_waits_for_the_agent_list_instead_of_racing_it(self):
         """The `/chat?agent=` deep link and a picker click both open a session
-        within the same tick as the `/api/agents` fetch."""
+        within the same tick as the `/api/v1/agents` fetch."""
         js = self._js()
         idx_await = js.index("await _agentsLoaded;\n    const agent = _agentById(_currentAgentId);")
         assert idx_await > 0
