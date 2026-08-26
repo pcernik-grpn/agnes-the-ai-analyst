@@ -1346,8 +1346,23 @@ the registry that replaced the builder's browser-only draft store. Reads are
 grant-aware (owner ∪ shared into one of your groups); a grant conveys *use*, so
 only the owner or an admin may edit or delete.
 
+`POST /api/agents/{agent_id}/builder/turn` (owner-only) runs one turn of the
+builder's conversation: it sends the message, the transcript so far, and the
+caller's own plugin candidates to the configured LLM, and returns
+`{reply, patch, agent, suggestions}`. The model's output is untrusted — unknown
+fields, ids outside the caller's candidate lists, and invented tones are
+dropped before anything is written, and `status` / the four `*_mode` columns
+are not writable from a conversation at all. Two optional fields serve the
+builder page's unsaved working copy: `apply` (default `true`) writes the patch
+through the ordinary `PATCH /api/agents/{id}` path — pass `false` to get the
+sanitized patch back **without** writing, in which case `agent` is `null`; and
+`config`, the caller's unsaved copy, narrowed to the patchable keys and used
+only to build the prompt. With no AI credential configured the endpoint answers
+`503 builder_llm_unavailable` and the panel stays fully usable by hand.
+
 - /api/agents
 - /api/agents/{agent_id}
+- /api/agents/{agent_id}/builder/turn
 
 ### `/api/sharing` — Owner-initiated sharing of Library items
 

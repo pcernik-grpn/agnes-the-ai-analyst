@@ -10,6 +10,85 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
+  It used to debounce-PATCH every keystroke, which meant there was never a
+  moment at which the owner had *decided* the agent was right, and no honest
+  way to offer "leave without saving". Edits — typed or made by the
+  conversation — now accumulate in an unsaved working copy and reach the
+  server only on **Save**. The header says which state you are in ("Unsaved
+  changes", Save disabled when clean).
+  - A **new** agent's header offers *Save as draft* and *Mark ready*, and no
+    Delete: the row exists server-side only because the conversation and the
+    preview address the agent by id, so it is a placeholder until saved, and
+    leaving via *← All agents* discards it (confirmation first, then a real
+    `DELETE`). A failed discard restores the row rather than leaving the list
+    denying an agent the server still has.
+  - An **existing** agent's header offers *Save*, *Revert to draft* /
+    *Mark ready*, and *Delete*. Leaving with unsaved changes asks first and
+    rolls the working copy back to the last saved state.
+  - `beforeunload` covers the ways out our own dialog cannot intercept (a nav
+    click, a reload, a closed tab).
+  - **Preview still commits.** The agent runs server-side, so it can only
+    answer as a configuration the server has; opening Preview performs the
+    same write Save does, baseline included, rather than previewing a persona
+    the agent does not have.
+- **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
+  `apply=false` runs the turn and returns the sanitized patch **without**
+  writing, which is what lets the page hold an unsaved working copy;
+  `config` carries that copy so the turn reasons about the configuration on
+  screen rather than the last-saved row. `config` is narrowed to the
+  `PATCHABLE` keys and only ever reaches the prompt — ids in the returned
+  patch are still gated against the caller's own RBAC-scoped candidate lists.
+  Both default to the previous behaviour (`apply=true`, no override), so
+  every existing caller is unaffected. Note the consequence for the page: the
+  panel now merges the patch client-side instead of re-rendering from the
+  applied row, so the enforced scope is re-derived at Save rather than at
+  each turn — an unsaved patch grants nothing, so nothing is enforced later
+  than it is shown.
+
+- **The `/agents` index separates ready agents from drafts, and a card's click
+  follows its state.** Ready agents render in a titled band above Drafts.
+  Clicking a ready card opens a conversation with that agent (what you came to
+  the page to do) and its footer carries **Edit** into the builder; clicking a
+  draft opens the builder (what you came to *it* to do) and its footer keeps
+  **Chat**. Neither route was lost in either state — marking an agent ready is
+  not a one-way door out of the builder, and a draft is still talk-to-able.
+- **The builder's two panes are an even 50/50 split.** The configuration was
+  previously capped at a third of the width, which left it a cramped sidebar
+  while the conversation had room to spare.
+
+### Fixed
+
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
+
 ### Added
 
 - **The `/agents` builder is now a conversation next to the configuration.**

@@ -114,6 +114,19 @@ class BuilderTurnRequest(BaseModel):
     message: str = Field(max_length=MAX_MESSAGE_CHARS)
     history: List[BuilderMessage] = Field(default_factory=list)
     plugin_candidates: List[PluginCandidate] = Field(default_factory=list)
+    # The builder page holds an unsaved working copy and commits it on Save,
+    # so a turn must be able to run WITHOUT writing: `apply=False` returns the
+    # sanitized patch for the page to merge into that copy, and the write
+    # happens later through the ordinary PATCH. Default True — the persisting
+    # behaviour is the original contract and every other caller relies on it.
+    apply: bool = True
+    # ...and with an unsaved copy in play, the row is no longer what the owner
+    # is looking at. `config` carries that copy so the turn reasons about the
+    # configuration on screen rather than the last-saved one. Untrusted like
+    # any other request field: it is narrowed to PATCHABLE keys and only ever
+    # reaches the PROMPT — ids in the returned patch are still gated against
+    # the caller's own RBAC-scoped candidate lists by _sanitize_patch.
+    config: Optional[Dict[str, Any]] = None
 
 
 def _candidate_block(rows: List[Dict[str, Any]], empty: str) -> str:
@@ -201,7 +214,9 @@ def _prompt(
 ) -> str:
     lines: List[str] = []
     lines.append("## Knowledge sources this owner can ground the agent in")
-    lines.append(_candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artefact collections)"))
+    lines.append(
+        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artefact collections)")
+    )
     lines.append("")
     lines.append("## Capabilities this owner can give the agent")
     if plugins:
@@ -372,6 +387,11 @@ async def builder_turn(
     knowledge_ids = {str(k["id"]) for k in knowledge}
     plugin_ids = {p.id for p in payload.plugin_candidates}
     config = _current_config(row)
+    if payload.config is not None:
+        # Overlay the caller's unsaved working copy over the saved row, key by
+        # key, so a field the page did not send keeps the stored value rather
+        # than being blanked in the prompt.
+        config.update({k: v for k, v in payload.config.items() if k in PATCHABLE})
 
     if _stub_enabled():
         result: Dict[str, Any] = _stub_turn(message, config, knowledge)
@@ -410,7 +430,7 @@ async def builder_turn(
         plugin_ids=plugin_ids,
     )
     agent: Optional[Dict[str, Any]] = None
-    if patch:
+    if patch and payload.apply:
         agent = await update_agent(agent_id, AgentUpdate(**patch), user)
 
     reply = result.get("reply")

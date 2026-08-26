@@ -58,11 +58,14 @@ class TestPreviewRunsARealTurn:
         for frame in ("'token'", "'assistant_message'", "'error'"):
             assert frame in markup, f"preview does not handle the {frame} frame"
 
-    def test_the_draft_is_flushed_before_the_session_spawns(self, markup):
-        """`persist` is debounced by 400ms; spawning inside that window gives
-        the owner an agent running the previous edit's persona."""
-        assert "function flushSave(" in markup
-        assert re.search(r"flushSave\(a\)\.then", markup), "openPreviewSession does not await the flush"
+    def test_the_draft_is_saved_before_the_session_spawns(self, markup):
+        """The agent runs SERVER-SIDE, so it can only answer as a configuration
+        the server has. Previewing therefore commits the working copy — the
+        same write Save does — rather than spawning a session against the
+        previous edit's persona."""
+        assert re.search(r"saveAgent\(\)\.then", markup), (
+            "openPreviewSession does not commit the working copy first"
+        )
 
 
 class TestPreviewDoesNotPromiseWhatItCannotDo:

@@ -195,3 +195,65 @@ class TestDegradingWithoutAModel:
         assert r.status_code == 200
         assert r.json()["patch"] == {}
         assert r.json()["agent"] is None
+
+
+class TestATurnCanRunWithoutWriting:
+    """`apply=False` is what lets the builder page hold an unsaved working
+    copy: the turn returns its sanitized patch and the page merges it, so
+    "leave without saving" really discards what the conversation said. The
+    default stays True — the persisting behaviour is the original contract.
+    """
+
+    def test_apply_false_returns_the_patch_but_writes_nothing(self, builder):
+        before = builder["client"].get(
+            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+        ).json()
+        r = _turn(builder, "an agent that answers revenue questions", apply=False)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["patch"], "the caller gets nothing to merge"
+        # No row comes back, because none was written.
+        assert body["agent"] is None
+        after = builder["client"].get(
+            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+        ).json()
+        assert after["name"] == before["name"]
+        assert after["instructions"] == before["instructions"]
+
+    def test_the_default_still_applies(self, builder):
+        """Omitting the flag must behave exactly as it did before it existed."""
+        r = _turn(builder, "an agent for pipeline questions")
+        assert r.json()["agent"] is not None
+
+    def test_the_unsaved_working_copy_is_what_the_turn_reasons_about(self, builder):
+        """With edits held client-side the stored row is stale, so the page
+        sends the configuration actually on screen."""
+        r = _turn(
+            builder,
+            "keep going",
+            apply=False,
+            config={"name": "Working Copy Name", "role": "unsaved role"},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_the_config_override_is_not_a_way_to_write_unvetted_fields(self, builder):
+        """It only ever reaches the prompt. Anything outside PATCHABLE is
+        dropped, and it never becomes a write of its own."""
+        before = builder["client"].get(
+            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+        ).json()
+        r = _turn(
+            builder,
+            "hello",
+            apply=False,
+            config={"status": "ready", "is_default": True, "slug": "hijacked"},
+        )
+        assert r.status_code == 200, r.text
+        after = builder["client"].get(
+            f"/api/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
+        ).json()
+        # None of the three is in PATCHABLE, so none reached the prompt — and
+        # apply=False means nothing reached the row either way.
+        assert after["status"] == before["status"] == "draft"
+        assert after["is_default"] == before["is_default"]
+        assert after["slug"] == before["slug"]

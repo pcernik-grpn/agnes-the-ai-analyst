@@ -610,14 +610,24 @@ class TestRailOptIn:
         assert resp.status_code == 200
         text = resp.text
         assert 'class="cc-btn ag-del-btn" data-ag-del=' in text
-        # Left of the status button, inside the builder's action group.
-        actions = text.index('<div class="ag-build-actions">')
-        assert actions < text.index('class="cc-btn ag-del-btn"') < text.index("data-ag-status")
+        # Left of the status button, in the header branch that renders an
+        # EXISTING agent's actions. Scoped to that branch on purpose: the
+        # new-agent branch above it also mentions data-ag-status, so a
+        # whole-file index comparison measures source order, not screen order.
+        fn = re.search(r"function headActionsHtml\(a\) \{(.*?)\n  \}", text, re.S)
+        assert fn, "headActionsHtml not found"
+        existing = fn.group(1).rsplit("return statusPill(a) +", 1)[-1]
+        assert existing.index('class="cc-btn ag-del-btn"') < existing.index("data-ag-status")
         # Confirms only for the builder button; the list card is unchanged.
         assert "window.confirm(" in text
         assert "t.classList.contains('ag-del-btn')" in text
-        # A pending debounced PATCH must not outlive the row it would write to.
-        assert "clearTimeout(saveTimers[id]);" in text
+        # Delete is for an agent that EXISTS. A never-saved placeholder shows
+        # "Save as draft" instead and is discarded by leaving — offering both
+        # would be two buttons for one outcome.
+        assert "if (isNewAgent) {" in text
+        # Deleting the open agent must clear the builder's editing state, or
+        # the next open compares against a dead row's baseline.
+        assert "baseline = null; isNewAgent = false;" in text
 
     def test_agents_page_has_no_default_agent_card(self, web_client, admin_cookie, monkeypatch):
         """/agents lists the caller's OWN agents only — the always-on baseline
