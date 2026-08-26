@@ -243,6 +243,53 @@ class TestSyncSemanticLayer:
         # pruned as if upstream had genuinely removed the field.
         assert column_metadata_repo().get(table_id, "region") is not None
 
+    def test_extract_stage_drop_does_not_prune_the_dropped_views_rows(self, e2e_env):
+        """Unlike the validate_document-stage drop above, a view can also be
+        dropped earlier, inside `extract_documents` itself — a persistent
+        `SHOW CREATE TABLE` failure or unparseable YAML — before it ever
+        reaches `documents`. That never shows up as a gap between
+        `parsed_documents` and `documents` (both already exclude it), so the
+        `len(parsed_documents) < len(documents)` check alone can't see it;
+        `discovery_counters['skipped_unparseable']` is the only signal. Both
+        the previously-stored document AND its column_metadata rows must
+        survive this pass — a transient per-view failure, not a real
+        upstream removal."""
+        from src.repositories import column_metadata_repo, semantic_model_repo
+
+        table_id = "SELECT * FROM main.sales.orders"
+        two_views = [
+            ("main", "sales", "orders_metrics", "Sales KPIs"),
+            ("main", "sales", "orders_metrics_v2", "Sales KPIs v2"),
+        ]
+        client = FakeStatementClient(
+            views=two_views,
+            yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": _YAML_V2},
+        )
+        _sync(client)
+        assert semantic_model_repo().get(_DOC_ID) is not None
+        assert semantic_model_repo().get(_DOC_ID_V2) is not None
+        assert column_metadata_repo().get(table_id, "country") is not None
+        assert column_metadata_repo().get(table_id, "region") is not None
+
+        # Re-sync: orders_metrics_v2's SHOW CREATE TABLE now yields no
+        # parseable YAML body (persistent permission issue, say) —
+        # extract_documents drops it before `documents` is even returned;
+        # orders_metrics itself still discovers/composes/validates fine.
+        result = _sync(
+            FakeStatementClient(views=two_views, yaml_by_view={"orders_metrics": _YAML, "orders_metrics_v2": None})
+        )
+
+        assert result["status"] == "ok"
+        assert result["skipped_unparseable"] == 1
+        # orders_metrics is unaffected.
+        assert semantic_model_repo().get(_DOC_ID) is not None
+        assert column_metadata_repo().get(table_id, "country") is not None
+        # orders_metrics_v2's OWN previously-stored rows must survive a
+        # transient per-view failure, not be deleted as if upstream had
+        # genuinely removed the view.
+        assert semantic_model_repo().get(_DOC_ID_V2) is not None
+        assert column_metadata_repo().get(table_id, "region") is not None
+
     def test_unparseable_view_is_counted_not_fatal(self, e2e_env):
         result = _sync(FakeStatementClient(yaml_by_view={"orders_metrics": None}))
         assert result["status"] == "ok"

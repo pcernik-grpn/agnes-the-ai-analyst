@@ -397,14 +397,16 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     # own `semantic_models` row were already deleted first, there would be
     # no sibling row left to find its claimed columns in, and the
     # protection could never work regardless of `partial`.
-    partial_composition = len(parsed_documents) < len(documents)
+    partial_composition = discovery_counters["skipped_unparseable"] > 0 or len(parsed_documents) < len(documents)
     if partial_composition:
         logger.warning(
             "Databricks semantic layer: %d of %d composed metric-view document(s) failed validation "
-            "and were dropped this pass (source_ref=%s); narrowing the prune to the views that "
+            "and/or %d metric view(s) could not be composed at all this pass (SHOW CREATE TABLE "
+            "failure or unparseable YAML, source_ref=%s); narrowing the prune to the views that "
             "survived, so the dropped view(s)' previously-written rows are left intact.",
             len(documents) - len(parsed_documents),
             len(documents),
+            discovery_counters["skipped_unparseable"],
             source_ref,
         )
 
@@ -435,19 +437,44 @@ def sync_semantic_layer(client: DatabricksStatementClient | None = None) -> dict
     # rest of this pass, e.g. discovery counters, still runs) and log loudly
     # instead of silently deleting good data.
     #
+    # A `partial_composition` pass (SOME but not all views dropped, either
+    # here or earlier in `extract_documents`) gets the SAME skip: `keep_slugs`
+    # only lists the views that survived THIS pass, so a view missing from it
+    # is indistinguishable from "genuinely removed upstream" vs "still
+    # dropping transiently" — exactly the ambiguity `partial=True` already
+    # narrows `project_document`'s prune around, above. Without this, a
+    # transient per-view failure (e.g. a persistent `SHOW CREATE TABLE`
+    # permission issue on one view) would still delete that view's own
+    # `semantic_models` document outright, even though `project_document`
+    # was just told to spare its `column_metadata` rows — defeating the
+    # point of that protection.
+    #
     # Runs AFTER `project_document` above (see that call's comment for why):
     # this document-level prune only removes the now-stale `semantic_models`
     # row itself, once the projector has already read it to protect the
     # dropped view's `column_metadata` rows.
-    if not documents and existing_by_slug:
-        logger.warning(
-            "Databricks semantic layer: upstream returned zero metric-view documents for "
-            "workspace %s while %d document(s) were previously stored — skipping the "
-            "semantic_models prune this pass instead of risking a wipe on a transient fetch "
-            "failure (see connectors/databricks/semantic_ossie.py::extract_documents).",
-            source_ref,
-            len(existing_by_slug),
-        )
+    if (not documents or partial_composition) and existing_by_slug:
+        if not documents:
+            logger.warning(
+                "Databricks semantic layer: upstream returned zero metric-view documents for "
+                "workspace %s while %d document(s) were previously stored — skipping the "
+                "semantic_models prune this pass instead of risking a wipe on a transient fetch "
+                "failure (see connectors/databricks/semantic_ossie.py::extract_documents).",
+                source_ref,
+                len(existing_by_slug),
+            )
+        else:
+            logger.warning(
+                "Databricks semantic layer: one or more metric view(s) were dropped this pass — "
+                "%d failed validation, %d could not be composed at all (SHOW CREATE TABLE failure "
+                "or unparseable YAML) — for workspace %s while %d document(s) were previously "
+                "stored; skipping the semantic_models prune this pass instead of risking deletion "
+                "of a view that only failed transiently.",
+                len(documents) - len(parsed_documents),
+                discovery_counters["skipped_unparseable"],
+                source_ref,
+                len(existing_by_slug),
+            )
         pruned_slugs: list[str] = []
     else:
         pruned_slugs = repo.delete_missing(source=SOURCE_LABEL, source_ref=source_ref, keep_slugs=keep_slugs)
