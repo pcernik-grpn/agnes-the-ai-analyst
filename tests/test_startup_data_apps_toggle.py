@@ -184,3 +184,50 @@ def test_tpl_caddy_wiring_is_conditional_and_idempotent():
     assert "on_demand_tls" in tpl and re.search(r"grep -q .*on_demand_tls", tpl), (
         "the Caddyfile edit must be guarded so a second boot cannot duplicate it"
     )
+
+
+# ---------------------------------------------------------------------------
+# The wiring has to survive the 5-minute upgrade tick, not just the boot.
+# `agnes-auto-upgrade.sh` re-fetches a PRISTINE Caddyfile from main on every
+# tick (it is in CONFIG_FILES), so wiring it only at boot meant a VM lost its
+# `*.<base>` vhost within five minutes of coming up — and hosted apps, refused
+# on the main origin by default, became unreachable entirely.
+# ---------------------------------------------------------------------------
+
+UPGRADE = Path("scripts/ops/agnes-auto-upgrade.sh")
+_BLOCK_RE = r"^# --- apps-subdomain-caddy begin.*?$\n.*?^# --- apps-subdomain-caddy end ---$"
+
+
+def _block(path: Path) -> str:
+    m = re.search(_BLOCK_RE, path.read_text(), re.S | re.M)
+    assert m, f"apps-subdomain-caddy markers missing from {path}"
+    return m.group(0)
+
+
+def test_upgrade_tick_refetches_the_caddyfile():
+    """The premise of the two tests below. If the Caddyfile ever stops being
+    re-fetched every tick, the mirrored block becomes dead weight rather than a
+    fix, and this test should be the one that says so."""
+    body = UPGRADE.read_text()
+    files = re.search(r"CONFIG_FILES=\((.*?)\)", body, re.S)
+    assert files and "Caddyfile" in files.group(1)
+
+
+def test_caddy_wiring_block_is_mirrored_into_the_upgrade_tick():
+    """Byte-identical, deliberately: the docker test validates ONE copy through
+    Caddy's own parser, and this equality is what makes that verdict cover both.
+    Editing one copy without the other fails here."""
+    assert _block(MODULE / "startup-script.sh.tpl") == _block(UPGRADE)
+
+
+def test_upgrade_tick_wires_caddy_before_hashing_config():
+    """Order matters twice over. The drift hash must describe the file Caddy
+    will actually load, and adding/clearing APPS_SUBDOMAIN_BASE in .env must
+    move that hash — the recreate it triggers is what puts the vhost into
+    effect without a reboot."""
+    body = UPGRADE.read_text()
+    end = body.index("# --- apps-subdomain-caddy end ---")
+    assert end < body.index("CONFIG_AFTER=$(hash_config_files)")
+    # And the base comes from .env via the safe reader, not a bash `source`.
+    assert 'APPS_SUBDOMAIN_BASE="$(_env_get APPS_SUBDOMAIN_BASE)"' in body
+    assert body.index('_env_get() {') < body.index('_env_get APPS_SUBDOMAIN_BASE')

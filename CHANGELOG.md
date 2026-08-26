@@ -127,7 +127,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   global `on_demand_tls` block and appends the vhost whenever
   `data_apps_subdomain_base` is set (guarded on its own marker, since the
   script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
-  parse). A wildcard certificate was the obvious alternative and was rejected
+  parse). `agnes-auto-upgrade.sh` re-applies the identical block on every
+  5-minute tick, right after it re-fetches the pristine `Caddyfile` from main
+  and before it hashes for config drift — without that, a VM lost its vhost and
+  its `on_demand_tls` block on the first tick after boot and hosted apps became
+  unreachable altogether, since same-origin serving is refused by default. The
+  two copies are asserted byte-identical, so the Caddy-parser test that runs one
+  of them covers both; the tick also refreshes the vhost fragment itself, so a
+  VM whose last boot predates it converges without a reboot. A wildcard
+  certificate was the obvious alternative and was rejected
   on purpose: it can only be validated over DNS-01, which would put a DNS-zone
   write credential on the very host that runs user-authored app code. Issuance
   is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
