@@ -113,6 +113,25 @@ variable "prod_instance" {
     # dev-first rollout doesn't touch prod. Brings up the apps-runner sidecar +
     # the AGNES_DATA_APPS_ENABLED env override on that VM's .env only.
     data_apps_enabled = optional(bool, false)
+    # Serve each hosted app from its OWN origin, `<slug>.<base>`, instead of
+    # `<domain>/apps/<slug>/` (app >= the origin-isolation release). The app
+    # REFUSES main-origin serving by default, so a VM with data apps enabled
+    # and this unset serves no app at all — that is the intended posture, not
+    # a regression: main-origin serving hands an app's user-authored JS the
+    # viewer's own session (docs/architecture.md#hosted-data-apps).
+    #
+    # Setting this requires BOTH, or apps stay unreachable:
+    #   - a wildcard DNS record `*.<base>` pointed at this VM, and
+    #   - TLS covering those names on the terminating proxy.
+    #
+    # SECURITY — the value widens the session cookie to the base's PARENT
+    # domain (the app's `session_cookie_domain()`), so one login also covers
+    # the app subdomains:
+    #   "apps.agnes.example.com" -> cookie Domain=.agnes.example.com  (good)
+    #   "apps.example.com"       -> cookie Domain=.example.com        (BAD —
+    #      the session cookie then rides to every unrelated host under it)
+    # Use `apps.<this VM's domain>`, never `apps.<registrable domain>`.
+    data_apps_subdomain_base = optional(string, "")
     # Opt-in embedded kai-agent turn engine on this VM (app >= the /api/kai
     # host wiring, app/api/kai.py). Per-VM (like dispatcher_enabled) so a
     # dev-first rollout doesn't touch prod. Brings up the engine + its own
@@ -327,6 +346,9 @@ variable "dev_instances" {
     dispatcher_enabled  = optional(bool, false)
     # Per-VM hosted data apps — see prod_instance for the rationale.
     data_apps_enabled = optional(bool, false)
+    # Per-VM app origin base — see prod_instance for the DNS/TLS prerequisites
+    # and the session-cookie widening this value drives.
+    data_apps_subdomain_base = optional(string, "")
     # Per-VM embedded kai-agent turn engine — see prod_instance for the
     # rationale. Same "must be on the type" rule as the fields above.
     kai_agent_enabled = optional(bool, false)

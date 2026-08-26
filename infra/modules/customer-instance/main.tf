@@ -523,6 +523,7 @@ resource "google_compute_instance" "vm" {
     home_route                      = var.home_route
     studio_enabled                  = var.studio_enabled
     data_apps_enabled               = each.value.data_apps_enabled
+    data_apps_subdomain_base        = each.value.data_apps_subdomain_base
     data_apps_runtime_image         = var.data_apps_runtime_image
     enable_watchdog                 = var.enable_watchdog
     enable_gcp_logging              = var.enable_gcp_logging

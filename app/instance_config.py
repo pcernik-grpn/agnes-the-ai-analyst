@@ -1448,6 +1448,11 @@ def get_data_apps_config() -> dict:
     example-config defaults are backfilled for any key instance.yaml omits so
     the spec-builders have a complete block, and ``runtime_image`` can be
     further pinned with ``AGNES_DATA_APPS_RUNTIME_IMAGE``.
+
+    ``subdomain_base`` has its own override, ``AGNES_DATA_APPS_SUBDOMAIN_BASE``,
+    applied whenever the feature resolves enabled — by either source — because
+    it drives :func:`session_cookie_domain`. See the inline note at the bottom
+    of the body.
     """
     cfg = dict(get_value("data_apps", default={}) or {})
     raw = os.environ.get("AGNES_DATA_APPS_ENABLED")
@@ -1459,6 +1464,23 @@ def get_data_apps_config() -> dict:
                 cfg["runtime_image"] = env_image
         else:
             cfg["enabled"] = False
+    # ``AGNES_DATA_APPS_SUBDOMAIN_BASE`` — deliberately keyed on the RESOLVED
+    # ``enabled`` above, not on the env-enable path the ``runtime_image`` pin
+    # sits inside. :func:`session_cookie_domain` reads this on every login and
+    # ``DataAppSubdomainMiddleware`` on every request, so the value must not
+    # depend on WHETHER the operator switched data apps on via env or yaml.
+    # (TODO: ``AGNES_DATA_APPS_RUNTIME_IMAGE`` above still no-ops silently on a
+    # yaml-enabled instance — same treatment, separate change.)
+    #
+    # Ignored entirely while the feature is off: this key widens the session
+    # cookie to the base's parent domain, and a stale ``.env`` line must never
+    # do that for a feature that is serving nothing. Empty value wins too (env
+    # decides in both directions, per the #1022 convention) — it forces
+    # path-prefix mode even when instance.yaml names a base.
+    if cfg.get("enabled"):
+        env_base = os.environ.get("AGNES_DATA_APPS_SUBDOMAIN_BASE")
+        if env_base is not None:
+            cfg["subdomain_base"] = env_base.strip()
     return cfg
 
 

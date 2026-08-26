@@ -12,6 +12,7 @@ UPGRADE_MODE="${upgrade_mode}"
 UPGRADE_SCHEDULE="${upgrade_schedule}"
 TLS_MODE="${tls_mode}"
 DOMAIN="${domain}"
+APPS_SUBDOMAIN_BASE="${data_apps_subdomain_base}"
 DOMAIN_ALIAS="${domain_alias}"
 ACME_EMAIL="${acme_email}"
 DATA_SOURCE="${data_source}"
@@ -481,6 +482,42 @@ if [ "$TLS_MODE" = "caddy" ] && [ -n "$DOMAIN" ]; then
         CADDY_TLS_LINE="CADDY_TLS=\"tls $ACME_EMAIL\""
     else
         CADDY_TLS_LINE="CADDY_TLS=\"tls internal\""
+    fi
+fi
+
+# --- Data-app subdomains: Caddy vhost + per-app certificates ---------------
+# Hosted apps are refused on the main origin (they run user-authored JS that
+# would otherwise be same-origin with /api), so they are only reachable once
+# Caddy terminates TLS for *.$APPS_SUBDOMAIN_BASE.
+#
+# Certificates are issued PER HOSTNAME on first request (on-demand, HTTP-01),
+# not as one wildcard: a wildcard can only be validated over DNS-01, which
+# would put a DNS-zone write credential on this very host — the host that runs
+# user-authored app code. Issuance is gated by the `ask` endpoint below, so a
+# stranger cannot drive ACME by requesting made-up names.
+#
+# Only when a base is configured: `*.` with an empty value is a site address
+# Caddy refuses to parse, taking the PRIMARY site down with it — the same way
+# an empty DOMAIN_ALIAS once did.
+#
+# The global options block must be FIRST in a Caddyfile, so it is prepended,
+# not appended. Guarded on its own marker because this script runs on EVERY
+# boot and a second copy is a file Caddy cannot parse. (The boot-time image
+# extract normally restores a pristine Caddyfile first; the guard covers the
+# paths that do not.)
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -f "$APP_DIR/Caddyfile" ]; then
+    if [ ! -f "$APP_DIR/Caddyfile.apps-subdomain" ]; then
+        echo "WARN: Caddyfile.apps-subdomain missing from the image — data apps will not be reachable on *.$APPS_SUBDOMAIN_BASE" >&2
+    elif grep -q on_demand_tls "$APP_DIR/Caddyfile"; then
+        :  # already wired this boot — idempotent
+    else
+        {
+            printf '{\n\ton_demand_tls {\n\t\task http://app:8000/api/data-apps-tls-check\n\t}\n}\n\n'
+            cat "$APP_DIR/Caddyfile"
+            printf '\n'
+            cat "$APP_DIR/Caddyfile.apps-subdomain"
+        } > "$APP_DIR/.Caddyfile.new" && mv "$APP_DIR/.Caddyfile.new" "$APP_DIR/Caddyfile"
+        echo "INFO: data-app subdomains wired for *.$APPS_SUBDOMAIN_BASE (per-app certs via on-demand TLS)"
     fi
 fi
 
@@ -1068,6 +1105,13 @@ COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}
 AGNES_DATA_APPS_ENABLED=true
 AGNES_DATA_APPS_RUNTIME_IMAGE=${data_apps_runtime_image}
+%{ if data_apps_subdomain_base != "" ~}
+AGNES_DATA_APPS_SUBDOMAIN_BASE=${data_apps_subdomain_base}
+# Same value, second consumer: the app reads AGNES_DATA_APPS_SUBDOMAIN_BASE,
+# Caddy substitutes {$APPS_SUBDOMAIN_BASE} into the vhost address. The name is
+# baked into the shipped Caddyfile.apps-subdomain, hence two vars, one source.
+APPS_SUBDOMAIN_BASE=${data_apps_subdomain_base}
+%{ endif ~}
 APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN
 APPS_RUNNER_IMAGE_PREFIX=$APPS_RUNNER_IMAGE_PREFIX
 DOCKER_GID=$DOCKER_GID

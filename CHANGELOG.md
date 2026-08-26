@@ -10,6 +10,81 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Added
+
+- **`data_apps.subdomain_base` can now be set from the deployment, not only by
+  hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
+  env override plus a per-VM `data_apps_subdomain_base` field on the
+  `customer-instance` module (both instance object types, `optional(string,
+  "")`, written into that VM's `.env` only when non-empty). Serving apps from
+  their own origin is the supported answer to the 0.89.0 same-origin refusal,
+  but the key had no env override and its section is locked in the
+  server-config overlay — so the only way to set it on a deployed instance was
+  editing the yaml on disk, the same Terraform-says-one-thing-the-box-says-
+  another drift that already bit `data_apps.enabled`. Unlike the sibling
+  `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
+  `enabled` state rather than on the env-enable path, because
+  `session_cookie_domain()` reads it on every login and the value must not
+  depend on whether the operator switched data apps on via env or yaml; it is
+  ignored entirely while the feature is off, so a stale `.env` line can never
+  widen the session cookie for a feature serving nothing. `instance.yaml.example`
+  and the module variable now both carry the base-selection warning: the value
+  widens the session cookie to the base's PARENT domain, so
+  `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
+  session cookie to every unrelated host under it.
+
+- **Hosted data apps can be served from their own origin without a wildcard
+  certificate.** The shipped `Caddyfile.apps-subdomain` vhost now issues ONE
+  certificate per app hostname on first request (Caddy on-demand TLS, HTTP-01)
+  and is wired up automatically: the Dockerfile bakes it into the host
+  artifacts, and the `customer-instance` startup script prepends the required
+  global `on_demand_tls` block and appends the vhost whenever
+  `data_apps_subdomain_base` is set (guarded on its own marker, since the
+  script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
+  parse). A wildcard certificate was the obvious alternative and was rejected
+  on purpose: it can only be validated over DNS-01, which would put a DNS-zone
+  write credential on the very host that runs user-authored app code. Issuance
+  is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
+  (Caddy's `ask` contract — 2xx allows, anything else cancels), which answers
+  2xx for exactly one shape: a registered, non-hidden slug directly under the
+  configured base. It leaks nothing new — `proxy_app` already resolves the row
+  before authenticating, so a real slug is already distinguishable from a
+  made-up one. Compose hands Caddy the base with an inert `apps.invalid`
+  default, mirroring the `DOMAIN_ALIAS` fix: an empty-but-set value would
+  render the site address `*.` and take the primary site down at config parse.
+
+- **Signing in from an app subdomain returns you to the app.** `safe_next_path`
+  now accepts one new shape besides a same-origin absolute path: an absolute
+  http(s) URL on `<single-label>.<data_apps.subdomain_base>`, and only while
+  data apps are enabled and a base is configured. The 401 redirect carries the
+  path the visitor actually asked for (the subdomain middleware now records it
+  before rewriting), so login lands them back where they started instead of on
+  the dashboard. Every classic open-redirect shape is still refused, plus the
+  near-misses that merely look like an app origin — userinfo (`https://evil.com@
+  s.apps.example.com/` and its inverse), backslashes (browsers normalize them,
+  `urlsplit` does not), suffix extension, multi-label names, and non-web
+  schemes. Not verified, deliberately: that the slug is a REAL app — that would
+  put a database lookup in a helper every login calls, to close something that
+  is not a general open redirect, since the target is always this deployment's
+  own infrastructure behind the same RBAC.
+
+### Fixed
+
+- **A signed-out visitor opening a data-app URL on an app subdomain no longer
+  hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
+  path on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the app-wide
+  401→`/login` redirect — relative, and therefore resolved by the browser
+  against the app's own host — came back as `/apps/<slug>/login`, 401'd again,
+  and looped until the browser gave up (`ERR_TOO_MANY_REDIRECTS`). The handler
+  now sends a subdomain-origin caller to the MAIN host's login absolutely
+  (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
+  order). Anyone already signed in was unaffected — the session cookie is
+  scoped to cover both origins — which is why every existing subdomain test,
+  all of which drive an already-authenticated client, stayed green. `next` is
+  deliberately not carried across: `safe_next_path` refuses non-same-origin
+  targets by design, so post-login return to the app is a separate change to
+  that guard rather than a side effect of this one.
+
 ## [0.89.1] - 2026-08-26
 
 ### Fixed

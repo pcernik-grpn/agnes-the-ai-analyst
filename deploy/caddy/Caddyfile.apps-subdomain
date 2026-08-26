@@ -1,7 +1,27 @@
-# Optional: subdomain routing for data apps. Append to your Caddyfile and
-# provide a wildcard DNS record + wildcard TLS for *.{$APPS_SUBDOMAIN_BASE}.
+# Subdomain routing for hosted data apps. Appended to the Caddyfile at boot by
+# the customer-instance startup script when `data_apps_subdomain_base` is set;
+# a deployment running plain docker-compose appends it by hand.
+#
+# Requires a wildcard DNS record for *.{$APPS_SUBDOMAIN_BASE} pointed here.
+#
+# TLS: ONE CERTIFICATE PER APP HOSTNAME, issued on first request and validated
+# over HTTP-01. This deliberately avoids a wildcard certificate: a wildcard can
+# only be validated over DNS-01, which would put a DNS-zone write credential on
+# the very host that runs user-authored app code — the same host an attacker
+# lands on after RCE inside an app container.
+#
+# Issuance is gated by the `ask` endpoint declared in the global options block
+# (see the startup script): Caddy asks Agnes whether a hostname is a registered
+# app before requesting a certificate, so nobody can drive ACME by hitting
+# made-up names. Caddy's own docs point at `ask` for this rather than the
+# `interval`/`burst` knobs.
+#
+# A deployment that already holds a wildcard certificate can replace the `tls`
+# block below with its own directive; nothing else here changes.
 *.{$APPS_SUBDOMAIN_BASE} {
-	{$CADDY_TLS:tls internal}
+	tls {
+		on_demand
+	}
 	reverse_proxy app:8000 {
 		header_up X-Forwarded-Proto https
 		header_up X-Forwarded-Host {host}

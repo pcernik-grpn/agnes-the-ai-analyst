@@ -97,3 +97,90 @@ def test_auto_upgrade_folds_compose_profiles_into_flags():
     body = Path("scripts/ops/agnes-auto-upgrade.sh").read_text()
     assert "IFS=',' read -ra _cp_list <<< \"$COMPOSE_PROFILES\"" in body
     assert 'PROFILE_ARGS+=( --profile "$_cp" )' in body
+
+
+# --- subdomain base (origin isolation) -------------------------------------
+# `data_apps_subdomain_base` is what moves apps off the main origin. It rides
+# the SAME per-VM plumbing as `data_apps_enabled` above, and its env line must
+# stay nested inside the enabled block: the value widens the session cookie to
+# the base's parent domain, so it must never reach a VM whose data-apps feature
+# is off.
+
+
+def test_subdomain_base_is_per_vm_field():
+    body = (MODULE / "variables.tf").read_text()
+    decls = re.findall(r'data_apps_subdomain_base\s*=\s*optional\(string,\s*""\)', body)
+    assert len(decls) == 2, f"expected the base optional on prod+dev object types, got {len(decls)}"
+    # Not a module-global — one base for every VM would force a shared cookie
+    # parent across instances that may not share a domain.
+    assert not re.search(r'variable\s+"data_apps_subdomain_base"\s*\{', body)
+
+
+def test_main_tf_forwards_subdomain_base_per_vm():
+    body = (MODULE / "main.tf").read_text()
+    assert re.search(r"data_apps_subdomain_base\s*=\s*each\.value\.data_apps_subdomain_base", body)
+    assert not re.search(r"data_apps_subdomain_base\s*=\s*var\.data_apps_subdomain_base", body)
+
+
+def test_tpl_subdomain_base_env_line_is_conditional_and_nested():
+    body = (MODULE / "startup-script.sh.tpl").read_text()
+    assert "AGNES_DATA_APPS_SUBDOMAIN_BASE=${data_apps_subdomain_base}" in body
+    # Empty value writes NO env line: an empty-but-set var would hand the app
+    # an empty base, and `""` already means path-prefix mode there.
+    assert re.search(
+        r'%\{ if data_apps_subdomain_base != "" ~\}\s*\n'
+        r"AGNES_DATA_APPS_SUBDOMAIN_BASE=\$\{data_apps_subdomain_base\}",
+        body,
+    )
+    # Nested INSIDE the `if data_apps_enabled` block — slice from that opener to
+    # its matching close and assert the line lives in there.
+    start = body.index("%{ if data_apps_enabled ~}\nAGNES_DATA_APPS_ENABLED=true")
+    end = body.index("%{ endif ~}", body.index("DOCKER_GID=$DOCKER_GID", start))
+    assert "AGNES_DATA_APPS_SUBDOMAIN_BASE" in body[start:end], (
+        "the base env line must sit inside the data_apps_enabled block — it widens "
+        "the session cookie and must not reach a VM with the feature off"
+    )
+
+
+# --- Caddy: per-app certificates (on-demand TLS) ---------------------------
+# The app refuses main-origin serving, so apps are only reachable once Caddy
+# terminates TLS for `*.<base>`. We issue one cert per hostname rather than a
+# wildcard, because a wildcard needs DNS-01 — a DNS-zone credential on the host
+# that runs user-authored code.
+
+ASK_PATH = "/api/data-apps-tls-check"
+
+
+def test_apps_subdomain_vhost_ships_in_the_image():
+    """The VM extracts host artifacts from the image and downloads nothing at
+    boot, so a file the Dockerfile does not bake never reaches the box."""
+    dockerfile = Path("Dockerfile").read_text()
+    assert "Caddyfile.apps-subdomain" in dockerfile
+
+
+def test_vhost_uses_on_demand_not_a_wildcard_cert():
+    body = Path("deploy/caddy/Caddyfile.apps-subdomain").read_text()
+    assert "*.{$APPS_SUBDOMAIN_BASE}" in body
+    assert re.search(r"tls\s*\{\s*on_demand\s*\}", body), "per-app certs, not a wildcard"
+
+
+def test_tpl_declares_the_ask_endpoint_and_it_matches_the_route():
+    """The `ask` URL is a contract with a real FastAPI route — a rename on
+    either side silently turns every certificate request into a refusal."""
+    tpl = (MODULE / "startup-script.sh.tpl").read_text()
+    assert "on_demand_tls" in tpl
+    assert ASK_PATH in tpl
+    route = Path("app/api/data_apps_proxy.py").read_text()
+    assert f'@router.get("{ASK_PATH}"' in route, "ask URL and route path drifted apart"
+
+
+def test_tpl_caddy_wiring_is_conditional_and_idempotent():
+    tpl = (MODULE / "startup-script.sh.tpl").read_text()
+    # Only when a base is configured: an empty value would render the site
+    # address `*.` and Caddy refuses to start on it.
+    assert re.search(r'if \[ -n "\$APPS_SUBDOMAIN_BASE" \]', tpl)
+    # The startup script runs on EVERY boot. Prepending the global options
+    # block twice is a Caddyfile Caddy will not parse.
+    assert "on_demand_tls" in tpl and re.search(r"grep -q .*on_demand_tls", tpl), (
+        "the Caddyfile edit must be guarded so a second boot cannot duplicate it"
+    )
