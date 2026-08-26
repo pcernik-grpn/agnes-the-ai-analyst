@@ -129,3 +129,138 @@ def test_start_pgserver_stops_postmaster_on_cleanup(monkeypatch):
         time.sleep(0.1)
     assert not _pid_alive(postmaster_pid)
     assert not Path(captured["dir"]).exists()
+
+
+def _shared_pgdata_for(testrun_uid: str):
+    """Mirror of the data-dir path ``_start_pgserver`` derives, for assertions."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    checkout_token = hashlib.sha256(str(Path(__file__).resolve().parents[2]).encode()).hexdigest()[:8]
+    return Path(tempfile.gettempdir()) / f"agnes-pgserver-{checkout_token}-{testrun_uid}"
+
+
+# Stands in for a second xdist worker; see the test below for why it cannot
+# simply be a second in-process handle.
+_SECOND_WORKER = """
+import sys
+sys.path.insert(0, {repo!r})
+from tests.db_pg.conftest import _start_pgserver
+gen = _start_pgserver({uid!r}, "gw1")
+print(next(gen), flush=True)
+try:
+    next(gen)
+except StopIteration:
+    pass
+"""
+
+
+class TestWorkerDatabaseName:
+    """``_start_pgserver`` interpolates this straight into ``CREATE DATABASE``.
+
+    xdist owns the value, so this is not an untrusted-input path — but
+    ``CREATE DATABASE`` accepts no bind parameters, and the repo's security
+    playbook asks that an identifier reaching an f-string be one that has
+    been checked rather than one that merely happens to be safe.
+    """
+
+    def test_master_keeps_the_servers_default_database(self):
+        from tests.db_pg.conftest import _worker_database_name
+
+        assert _worker_database_name("master") is None
+
+    def test_each_xdist_worker_gets_a_distinct_database(self):
+        from tests.db_pg.conftest import _worker_database_name
+
+        assert _worker_database_name("gw0") == "agnes_gw0"
+        assert _worker_database_name("gw0") != _worker_database_name("gw1")
+
+    @pytest.mark.parametrize(
+        "hostile",
+        ['gw0"; DROP DATABASE postgres; --', "gw0 gw1", "", "gw-0", "GW0"],
+        ids=["sql-injection", "space", "empty", "dash", "uppercase"],
+    )
+    def test_rejects_anything_that_is_not_a_plain_worker_id(self, hostile):
+        from tests.db_pg.conftest import _worker_database_name
+
+        with pytest.raises(ValueError):
+            _worker_database_name(hostile)
+
+
+@pytest.mark.slow
+def test_shared_pgserver_serves_every_worker_from_one_postmaster(tmp_path):
+    """The contract that makes the shared server safe, across real processes.
+
+    ``_start_pgserver`` turns N workers into one postmaster, which is what
+    took a ``-n auto`` run from 11 postmasters (91-100 postgres processes,
+    load average 22 on an 11-core box) down to one. Nothing asserted the two
+    properties that make the sharing safe rather than merely cheap:
+
+      * a worker leaving must NOT stop the server its siblings still use;
+      * the last worker out must stop it, so a run leaves nothing behind.
+
+    The second worker has to be a real subprocess. pgserver refcounts holders
+    BY PID in ``<pgdata>/.handle_pids.json``, and ``get_server`` additionally
+    returns the same object from ``_instances`` for a repeated path in one
+    interpreter — so two in-process handles would be a single holder and the
+    first close would stop the server, modelling the fan-out backwards.
+
+    Boots a real pgserver, so marked ``slow``.
+    """
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    import sqlalchemy as sa
+
+    from tests.db_pg.conftest import _resolve_backend, _start_pgserver, _worker_database_name
+    from tests.db_pg.pgserver_reaper import OWNER_SENTINEL, _pid_alive
+
+    if _resolve_backend() != "pgserver":
+        pytest.skip("only meaningful on the pgserver backend")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    testrun_uid = f"pgshare{os.getpid()}"
+
+    gw0 = _start_pgserver(testrun_uid, "gw0")
+    try:
+        url0 = next(gw0)
+        pgdata = _shared_pgdata_for(testrun_uid)
+        assert (pgdata / "PG_VERSION").exists(), "initdb ran in the shared dir"
+        postmaster_pid = int((pgdata / "postmaster.pid").read_text().splitlines()[0])
+        assert _pid_alive(postmaster_pid)
+        assert sa.make_url(url0).database == _worker_database_name("gw0")
+
+        second = subprocess.run(
+            [sys.executable, "-c", _SECOND_WORKER.format(repo=str(repo_root), uid=testrun_uid)],
+            capture_output=True,
+            text=True,
+            check=False,  # the assertion below reports stderr on failure
+            timeout=180,
+            cwd=str(repo_root),
+        )
+        assert second.returncode == 0, second.stderr
+        url1 = second.stdout.strip().splitlines()[-1]
+
+        # Same postmaster, different databases — where isolation now lives.
+        assert sa.make_url(url1).database == _worker_database_name("gw1")
+        assert int((pgdata / "postmaster.pid").read_text().splitlines()[0]) == postmaster_pid
+
+        # gw1's PROCESS has exited by now. Its handle going away must not have
+        # taken the server with it.
+        assert _pid_alive(postmaster_pid), "a worker leaving stopped the shared postmaster"
+
+        # The sentinel must name something that outlives a single worker,
+        # otherwise a concurrent session's reaper reads the live server as an
+        # orphan and stops it mid-run.
+        assert _pid_alive(int((pgdata / OWNER_SENTINEL).read_text().strip()))
+    finally:
+        with pytest.raises(StopIteration):
+            next(gw0)  # last handle out
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _pid_alive(postmaster_pid):
+        time.sleep(0.1)
+    assert not _pid_alive(postmaster_pid), "last worker out must stop the postmaster"
