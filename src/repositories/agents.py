@@ -250,6 +250,33 @@ class AgentsRepository:
         duplicate on every cycle. ``is_default`` is only ever set here, so it
         identifies the seeded default on its own. Most-recent first, so
         repeated pre-fix cycles resolve deterministically to the newest.
+
+        The default is seeded ``status='ready'``, and an older one that
+        predates that is promoted here on first touch. It is the one agent
+        nobody builds — it exists so a new instance can be chatted with before
+        anyone opens the builder — so "draft" was never true of it, and every
+        surface that separates ready agents from unfinished ones (the
+        ``/agents`` index, the composer's agent picker) was filing the only
+        always-usable agent under drafts.
+
+        Promoting it is safe for the slug rule it used to be entangled with:
+        ``_draft_slug_rename`` returns early on ``is_default`` — BEFORE it
+        looks at ``status`` — because the default's slug is a reserved address
+        (``POST /api/v1/agents/default/responses``, ``_RESERVED_SLUGS``). So
+        that freeze never depended on the draft status, and dropping it moves
+        nothing. (``_v114_to_v115`` excludes ``is_default`` for the opposite
+        reason and its comment says the default is a PERMANENT draft; that
+        step is a one-time backfill of a different cohort and stays as it is —
+        it simply no longer describes the default.)
+
+        Healed here rather than in a migration step because the DuckDB ladder
+        is frozen (A3) and a PG-only Alembic revision would leave DuckDB
+        instances behind. Every web chat session resolves this method first,
+        so the repair lands on first touch on either backend, and it is
+        naturally idempotent — an already-ready row fails the ``if``.
+        ``updated_at`` is deliberately NOT bumped: this corrects a value that
+        was always meant to be ``'ready'``, and touching the timestamp would
+        reshuffle a recency-ordered list for an edit the owner never made.
         """
         row = self.conn.execute(
             "SELECT * FROM agents WHERE owner_user_id = ? AND is_default AND deleted_at IS NULL",
@@ -257,6 +284,11 @@ class AgentsRepository:
         ).fetchone()
         existing = self._row_to_dict(row)
         if existing is not None:
+            if (existing.get("status") or "") != "ready":
+                self.conn.execute(
+                    "UPDATE agents SET status = 'ready' WHERE id = ?", [existing["id"]]
+                )
+                existing["status"] = "ready"
             return existing
 
         stale = self.conn.execute(
@@ -267,7 +299,8 @@ class AgentsRepository:
         ).fetchone()
         if stale is not None:
             self.conn.execute(
-                "UPDATE agents SET deleted_at = NULL, is_default = TRUE, updated_at = ? WHERE id = ?",
+                "UPDATE agents SET deleted_at = NULL, is_default = TRUE, "
+                "status = 'ready', updated_at = ? WHERE id = ?",
                 [datetime.now(timezone.utc), stale[0]],
             )
             return self.get_by_id(stale[0])  # type: ignore[return-value]
@@ -284,6 +317,7 @@ class AgentsRepository:
             memory_mode="all",
             memory_write_mode="propose",
             is_default=True,
+            status="ready",
         )
         return self.get_by_id(agent_id)  # type: ignore[return-value]
 

@@ -246,7 +246,9 @@ class AgentsPgRepository:
 
         Parity sibling of ``src/repositories/agents.py`` — see that docstring
         for why the soft-deleted-default revive and the free-slug fallback
-        exist (a permanent 500 on every web chat session create).
+        exist (a permanent 500 on every web chat session create), and why the
+        default is seeded ``status='ready'`` with an older draft one promoted
+        on first touch instead of by a migration step.
         """
         with self._engine.connect() as conn:
             row = (
@@ -261,7 +263,15 @@ class AgentsPgRepository:
                 .first()
             )
         if row:
-            return dict(row)
+            existing = dict(row)
+            if (existing.get("status") or "") != "ready":
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        sa.text("UPDATE agents SET status = 'ready' WHERE id = :id"),
+                        {"id": existing["id"]},
+                    )
+                existing["status"] = "ready"
+            return existing
 
         with self._engine.begin() as conn:
             stale = conn.execute(
@@ -276,7 +286,7 @@ class AgentsPgRepository:
                 conn.execute(
                     sa.text(
                         "UPDATE agents SET deleted_at = NULL, is_default = TRUE, "
-                        "updated_at = :updated_at WHERE id = :id"
+                        "status = 'ready', updated_at = :updated_at WHERE id = :id"
                     ),
                     {"updated_at": datetime.now(timezone.utc), "id": stale[0]},
                 )
@@ -295,6 +305,7 @@ class AgentsPgRepository:
             memory_mode="all",
             memory_write_mode="propose",
             is_default=True,
+            status="ready",
         )
         result = self.get_by_id(agent_id)
         assert result is not None
