@@ -44,6 +44,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   config/delete) remain owner-only — a runnable grant is run+read, never
   manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
   source for a future runtime agent picker).
+- **`agnes admin add-user --invite`** — inviting a user is now reachable from
+  the CLI, not just the `/admin/users` page. The flag propagates `send_invite`
+  to `POST /api/users`, emails the setup link when mail transport is
+  configured, and prints the link either way so an instance without SMTP stays
+  workable. Without the flag behavior is unchanged, except that the command
+  now names the next step (`agnes admin reset-password <email>`) rather than
+  leaving a fresh account with no way in; an invite the server did not issue
+  exits non-zero instead of reading as one that went out. Deliberately not
+  MCP-exposed — issuing a setup token is credential provisioning, covered by
+  the standing exemption in `CONTRIBUTING.md`.
 
 - **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
   subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
