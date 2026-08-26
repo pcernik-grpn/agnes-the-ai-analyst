@@ -12,6 +12,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Shared-agent runtime: a user an agent was shared with can now run it**
+  (remediation program Track C, C2.3). Previously only an agent's OWNER
+  could open a session against it — a `ResourceType.AGENT` grant (the
+  Library's "Share" action) only conveyed builder-read. The runtime
+  resolution sites (`POST /api/v1/agents/{slug|id}/responses`,
+  `.../sessions`, the web chat route's `agent_slug`) now resolve
+  owned-OR-shared (`agents_repo().get_runnable_by_slug` — new dual-backend
+  repo method), addressed by the agent's id for a non-owner since a slug is
+  only unique per-owner. Row-level table access policies
+  (`src/access_policy.py`) now bind `$user_email`/`$user_id`/`$user_groups`
+  to the CALLER of an `AgentPrincipal` turn, not the agent's owner — a
+  shared agent's rows are filtered per grantee, threaded from the chat
+  session's own server-side `user_email` (never a client-suppliable JWT
+  claim). Memory notebooks, PAT issuance, and all agent mutation (scope/
+  config/delete) remain owner-only — a runnable grant is run+read, never
+  manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
+  source for a future runtime agent picker).
+
 - **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
   subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
   ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the

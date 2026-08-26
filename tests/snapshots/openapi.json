@@ -47426,9 +47426,21 @@
     },
     "/api/v1/agents": {
       "get": {
-        "description": "The caller's own agents plus any shared into a group they belong to\n(Task C1.1 \u2014 same reach as the /agents builder's `list_agents`, via the\nsame `ResourceType.AGENT` grant).",
+        "description": "The caller's own agents plus any shared into a group they belong to\n(Task C1.1 \u2014 same reach as the /agents builder's `list_agents`, via the\nsame `ResourceType.AGENT` grant).\n\n``runnable=true`` (C2.3) additionally filters to rows\n`agents_repo().get_runnable_by_slug` would actually resolve for this\ncaller \u2014 the same owned-or-granted check the runtime routes\n(`/api/v1/agents/{slug}/...`) enforce, so this list can never claim an\nagent is runnable that the runtime would then 404. Today that check\nhappens to accept every row this endpoint already returns, but it goes\nthrough the real resolver rather than re-deriving \"owned or granted\" a\nsecond time, so the two cannot drift apart later (e.g. a per-agent\nruntime precondition added down the line).",
         "operationId": "list_agents_api_v1_agents_get",
         "parameters": [
+          {
+            "description": "When true, the response is scoped to exactly the agents the caller may start a session against (owned, or shared via a ResourceType.AGENT grant) \u2014 the data source for a runtime agent picker (e.g. `agnes chat`).",
+            "in": "query",
+            "name": "runnable",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "When true, the response is scoped to exactly the agents the caller may start a session against (owned, or shared via a ResourceType.AGENT grant) \u2014 the data source for a runtime agent picker (e.g. `agnes chat`).",
+              "title": "Runnable",
+              "type": "boolean"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
