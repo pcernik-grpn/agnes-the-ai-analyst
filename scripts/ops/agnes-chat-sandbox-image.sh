@@ -27,6 +27,21 @@ CTX_PATH="/app/app/initial_workspace_default/docker-sandbox"
 # only adds a dependency. The context hash sees every edit.
 LABEL="agnes.chat-sandbox.source"
 
+# Fingerprint the WHOLE extracted context, not just its Dockerfile: `docker
+# build` reads every file in the context, so anything COPY'd in later is
+# build-affecting. Hashing one file would let such an edit slip past — the
+# helper would report "is current" and leave the sandbox stale across an
+# upgrade. Sorted under LC_ALL=C so the digest is order-independent.
+context_fingerprint() {
+    (
+        cd "$1" || return 1
+        find . -type f -exec sha256sum {} + </dev/null |
+            LC_ALL=C sort |
+            sha256sum |
+            awk '{print $1}'
+    )
+}
+
 if [ -z "$APP_IMAGE" ]; then
     echo "usage: agnes-chat-sandbox-image.sh <app-image-ref> [sandbox-tag]" >&2
     exit 2
@@ -51,7 +66,7 @@ if ! docker cp "$EXTRACT_CID:$CTX_PATH/." "$TMP_CTX/" 2>/dev/null || [ ! -f "$TM
     exit 1
 fi
 
-WANT=$(sha256sum "$TMP_CTX/Dockerfile" | awk '{print $1}')
+WANT=$(context_fingerprint "$TMP_CTX")
 HAVE=$(docker image inspect -f "{{ index .Config.Labels \"$LABEL\" }}" "$SANDBOX_TAG" 2>/dev/null) || HAVE=""
 if [ "$WANT" = "$HAVE" ]; then
     echo "chat sandbox image $SANDBOX_TAG is current ($WANT)"
