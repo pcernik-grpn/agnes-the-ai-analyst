@@ -229,6 +229,23 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="library_auto_share_admin_uploads",
+        config_keys=("library", "auto_share_admin_uploads"),
+        env_var="AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Auto-share collections an admin creates in the Library to the Everyone group, so "
+            "admin uploads are workspace-visible without a manual share step. Writes an ordinary "
+            "Everyone grant — revocable per collection in the share dialog. Off by default so an "
+            "upgrade never changes who sees data; scope is the Library/API creation path only "
+            "(analyst uploads and chat file drops stay private)."
+        ),
+    ),
+    Switch(
         name="experience",
         config_keys=("instance", "experience"),
         env_var="AGNES_INSTANCE_EXPERIENCE",
