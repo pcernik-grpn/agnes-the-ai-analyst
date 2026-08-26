@@ -345,6 +345,13 @@ body.ag-building #sk-builder-view { display: flex; flex-direction: column; min-h
 .ds-drawer.is-page {
   position: static; inset: auto; background: none;
   display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
+  /* An overlay needs to sit above everything (drawer.css: 1200). A PAGE does
+     not, and must not: the app rail is a fixed element at z-index 40, so a
+     page-mounted drawer keeping 1200 paints OVER the sidebar wherever the two
+     meet. `position: static` is not enough to neutralise it — this is a flex
+     item, and z-index applies to flex items whether or not they are
+     positioned. */
+  z-index: auto;
 }
 .ds-drawer.is-page .ds-drawer__backdrop { display: none; }
 .ds-drawer.is-page .ds-drawer__panel {

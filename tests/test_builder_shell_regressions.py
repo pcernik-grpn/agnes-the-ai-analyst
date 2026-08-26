@@ -179,3 +179,22 @@ class TestThePackageBuilderIsAPage:
         showed. A builder PAGE renders it empty, and its 32px top padding
         pushed the whole workspace down by exactly that much."""
         assert re.search(r"body\.ag-building \.idx-head \{ padding: 0; \}", css)
+
+
+class TestThePageBuilderDoesNotPaintOverTheRail:
+    def test_page_mode_gives_up_the_overlay_z_index(self, css):
+        """An overlay sits above everything (drawer.css: z-index 1200). A page
+        must not: the app rail is a fixed element at z-index 40, so a
+        page-mounted drawer that kept 1200 paints OVER the sidebar wherever the
+        two meet — during a rail expand/collapse transition, for instance,
+        when the content offset and the rail width are briefly inconsistent.
+
+        `position: static` does NOT neutralise this on its own: the root is a
+        flex item, and z-index applies to flex items whether or not they are
+        positioned. That is the trap this pins.
+        """
+        rule = re.search(r"\.ds-drawer\.is-page \{([^}]*)\}", css, re.S)
+        assert rule, ".ds-drawer.is-page rule not found"
+        body = rule.group(1)
+        assert "z-index: auto" in body, "page mode is keeping the overlay stacking order"
+        assert "position: static" in body
