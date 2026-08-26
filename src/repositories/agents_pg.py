@@ -286,7 +286,20 @@ class AgentsPgRepository:
         assert result is not None
         return result
 
-    def set_scope(self, agent_id: str, items: List[Tuple[str, str]]) -> None:
+    def set_scope(
+        self,
+        agent_id: str,
+        items: List[Tuple[str, str]],
+        granted_by: Optional[str] = None,
+    ) -> None:
+        """Replace the whole scope set for ``agent_id``.
+
+        ``granted_by`` is the writer's user id, recorded on every row this
+        call inserts (uniform per call — one write replaces the whole set,
+        so every row it produces has the same writer). Column added by
+        migration 0073 (remediation Track C, C2.1) — see the DuckDB
+        sibling's docstring for why it has no counterpart there.
+        """
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text("DELETE FROM agent_scope WHERE agent_id = :agent_id"),
@@ -295,10 +308,15 @@ class AgentsPgRepository:
             for item_type, item_id in items:
                 conn.execute(
                     sa.text(
-                        "INSERT INTO agent_scope (agent_id, item_type, item_id) "
-                        "VALUES (:agent_id, :item_type, :item_id)"
+                        "INSERT INTO agent_scope (agent_id, item_type, item_id, granted_by) "
+                        "VALUES (:agent_id, :item_type, :item_id, :granted_by)"
                     ),
-                    {"agent_id": agent_id, "item_type": item_type, "item_id": item_id},
+                    {
+                        "agent_id": agent_id,
+                        "item_type": item_type,
+                        "item_id": item_id,
+                        "granted_by": granted_by,
+                    },
                 )
 
     def get_scope(self, agent_id: str) -> List[Dict[str, Any]]:
@@ -306,7 +324,7 @@ class AgentsPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT item_type, item_id FROM agent_scope "
+                        "SELECT item_type, item_id, granted_by FROM agent_scope "
                         "WHERE agent_id = :agent_id ORDER BY item_type, item_id"
                     ),
                     {"agent_id": agent_id},
@@ -317,15 +335,16 @@ class AgentsPgRepository:
         return [dict(r) for r in rows]
 
     def get_scope_for_agents(self, agent_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-        """``{agent_id: [{item_type, item_id}, ...]}`` — see the DuckDB sibling
-        for why the list endpoint needs a batched read instead of an N+1."""
+        """``{agent_id: [{item_type, item_id, granted_by}, ...]}`` — see the
+        DuckDB sibling for why the list endpoint needs a batched read
+        instead of an N+1."""
         if not agent_ids:
             return {}
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT agent_id, item_type, item_id FROM agent_scope "
+                        "SELECT agent_id, item_type, item_id, granted_by FROM agent_scope "
                         "WHERE agent_id = ANY(:agent_ids) ORDER BY agent_id, item_type, item_id"
                     ),
                     {"agent_ids": list(agent_ids)},
@@ -336,7 +355,7 @@ class AgentsPgRepository:
         out: Dict[str, List[Dict[str, Any]]] = {}
         for r in rows:
             out.setdefault(r["agent_id"], []).append(
-                {"item_type": r["item_type"], "item_id": r["item_id"]}
+                {"item_type": r["item_type"], "item_id": r["item_id"], "granted_by": r["granted_by"]}
             )
         return out
 

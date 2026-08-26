@@ -140,7 +140,10 @@ def test_scope_replace_all(repo):
     repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
     repo.set_scope("a1", [("plugin", "p1"), ("table", "t1")])
     repo.set_scope("a1", [("plugin", "p2")])
-    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2"}]
+    # `granted_by` defaults to None on both backends when the caller doesn't
+    # pass one (C2.1) — see test_granted_by_* below for the PG-persists /
+    # DuckDB-drops split.
+    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2", "granted_by": None}]
 
 
 def test_get_scope_for_agents_batches_the_same_rows(repo):
@@ -276,3 +279,42 @@ def test_agent_for_scope_item_skips_deleted_agents(repo):
     repo.set_scope("a-gone", [("slack_channel", "C777")])
     repo.soft_delete("a-gone")
     assert repo.agent_for_scope_item("slack_channel", "C777") is None
+
+
+# ---------------------------------------------------------------------------
+# C2.1 — agent_scope.granted_by. A genuine schema change on an existing pair
+# is PG-only under the A3 ratchet
+# (`.claude/skills/agnes-conventions/references/migration.md` -> "Adding a
+# PG-only feature"; `docs/migrations.md` -> "Extending an EXISTING (frozen
+# pre-A3) pair"): the column lives on Postgres alone, so these two tests are
+# deliberately NOT parametrized over the shared `repo` fixture — each drives
+# its own backend directly to pin the intentional asymmetry (persists on PG,
+# silently dropped on DuckDB, same call shape either way).
+# ---------------------------------------------------------------------------
+
+
+def test_granted_by_persists_on_postgres(pg_engine, monkeypatch):
+    repo, _ = _make_pg_repo(pg_engine, monkeypatch)
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.set_scope("a1", [("table", "t1"), ("plugin", "p1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [
+        {"item_type": "plugin", "item_id": "p1", "granted_by": "admin1"},
+        {"item_type": "table", "item_id": "t1", "granted_by": "admin1"},
+    ]
+    # A later replace with a different writer re-attributes every row this
+    # call writes — one `set_scope` call always has exactly one writer.
+    repo.set_scope("a1", [("plugin", "p2")], granted_by="owner1")
+    assert repo.get_scope("a1") == [{"item_type": "plugin", "item_id": "p2", "granted_by": "owner1"}]
+
+
+def test_granted_by_is_dropped_on_duckdb(tmp_path):
+    """DuckDB has no `granted_by` column: `set_scope` accepts the kwarg so
+    both call sites (`app/api/agents_admin.py`,
+    `app/api/agents_builder_shared.py`) work unmodified regardless of the
+    active backend, but the write is a documented no-op here — the DuckDB
+    side of this pair gains no capability that depends on the column."""
+    repo, conn = _make_duckdb_repo(tmp_path)
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.set_scope("a1", [("table", "t1")], granted_by="admin1")
+    assert repo.get_scope("a1") == [{"item_type": "table", "item_id": "t1", "granted_by": None}]
+    conn.close()

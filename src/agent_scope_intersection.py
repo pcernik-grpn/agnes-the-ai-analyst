@@ -51,7 +51,7 @@ resource type here; the axis is enforced at its own seam via
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import duckdb
 
@@ -370,9 +370,7 @@ def compute_agent_intersection(
                 # with the owner's own reach, so neither a package edit nor a
                 # revoked owner grant can widen the agent.
                 declared_pkgs = _agent_scope_ids(agent_id, "data_package", conn)
-                agent_set = agent_set | _package_table_ids(
-                    declared_pkgs & owner_pkgs, conn
-                )
+                agent_set = agent_set | _package_table_ids(declared_pkgs & owner_pkgs, conn)
             narrowed = owner_set & agent_set
             if narrowed:
                 result[rt.value] = narrowed
@@ -384,3 +382,109 @@ def compute_agent_intersection(
             result[rt.value] = frozenset()
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# C2.1 — the D-C2 staged write-gate (docs/superpowers/plans/
+# 2026-08-26-one-agent-model.md, "Decision point D-C2"): a non-admin writer
+# may only grant a DATA-authority `agent_scope` item they currently hold
+# themselves; an admin writer is unconditioned (the "admin-granted" half of
+# D-C2 — task C2.2 later resolves such rows without re-checking the granter's
+# live access). `plugin`/`memory_domain`/`slack_channel` are not data
+# authority and keep today's rules — never checked here.
+# ---------------------------------------------------------------------------
+
+#: item_type values the write-gate governs. Mirrors `TABLES_MODE_EXTRA_TYPES`
+#: plus bare `table`, plus `connection` (authorized outside `resource_grants`
+#: entirely — see `writer_can_access_item`).
+DATA_AUTHORITY_ITEM_TYPES: frozenset[str] = frozenset({"table", "data_package", "collection", "connection"})
+
+
+def writer_can_access_item(
+    writer_user_id: str,
+    item_type: str,
+    item_id: str,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> bool:
+    """True when ``writer_user_id`` currently holds ``item_id`` of
+    ``item_type`` through their OWN access.
+
+    Deliberately the RAW reach check — ``_allowed_ids_for_user`` (plus the
+    same package/collection-ownership widening :func:`_owner_ids_for_type`
+    applies), NOT the full stack-narrowed set that function derives for the
+    live runtime intersection. An "available" (granted but never subscribed)
+    data package is a real grant the write-gate must accept — refusing it
+    here would 403 a builder save merely reorganizing scope, exactly the
+    hazard the pre-C2.1 ``_classify_knowledge`` docstring called out. The
+    stack-aware narrowing still applies downstream, at resolve time
+    (``compute_agent_intersection`` today, ``resolve_agent_authority`` from
+    task C2.2 on) — a grant that is not currently "in stack" makes the
+    declared item inert there, never a write-time rejection.
+
+    Parameterized by the WRITER rather than "the owner": every write path
+    that exists today is ownership-gated (``_load_agent(require_owner=
+    True)``, ``app/api/agents_admin.py``), so the two are the same person
+    for every currently reachable call; a future write path with a real
+    writer/owner split narrows correctly the moment one exists, with no
+    change here.
+
+    ``connection`` has no ``ResourceType`` of its own (per the module
+    docstring — per-user MCP connections are authorized via ``tool_registry``
+    grants, not ``resource_grants``); ``item_id`` is an ``mcp_sources.id``,
+    checked the same way ``app/api/mcp_user_secrets.py::_require_source_grant``
+    already gates a caller's own connection reach.
+
+    The final ``return True`` is a pass-through for item_types genuinely
+    OUTSIDE the DATA axis (``plugin``/``memory_domain``/``slack_channel``) —
+    those are not data authority and are never checked here, by design.
+    It is NOT a catch-all for a ``DATA_AUTHORITY_ITEM_TYPES`` member this
+    function has not (yet) grown a branch for: that shape fails CLOSED
+    instead, on purpose — the type is data-authority-shaped by the caller's
+    own contract (``DATA_AUTHORITY_ITEM_TYPES``), so silently passing it
+    would be a fail-open convention inversion for the one function this
+    whole module leans on to keep the write-gate fail-closed.
+    """
+    if item_type == "table":
+        base = _allowed_ids_for_user(writer_user_id, ResourceType.TABLE.value, conn)
+        pkgs = _allowed_ids_for_user(writer_user_id, ResourceType.DATA_PACKAGE.value, conn)
+        return item_id in (base | _package_table_ids(pkgs, conn))
+    if item_type == "data_package":
+        return item_id in _allowed_ids_for_user(writer_user_id, ResourceType.DATA_PACKAGE.value, conn)
+    if item_type == "collection":
+        base = _allowed_ids_for_user(writer_user_id, ResourceType.COLLECTION.value, conn)
+        return item_id in (base | _owned_collection_ids(writer_user_id))
+    if item_type == "connection":
+        from app.api.mcp_passthrough import _visible_passthrough_tools
+
+        granted_source_ids = {t["source_id"] for t in _visible_passthrough_tools(writer_user_id)}
+        return item_id in granted_source_ids
+    if item_type not in DATA_AUTHORITY_ITEM_TYPES:
+        return True
+    # A DATA_AUTHORITY_ITEM_TYPES member with no handled branch above — fail
+    # closed rather than silently pass (see docstring).
+    return False
+
+
+def first_inaccessible_data_item(
+    writer_user_id: str,
+    items: Iterable[Tuple[str, str]],
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> Optional[Tuple[str, str]]:
+    """The first ``(item_type, item_id)`` pair in ``items`` that the write-
+    gate refuses, or ``None`` when every one passes.
+
+    An admin writer short-circuits to ``None`` unconditionally — the
+    "admin-granted = unconditioned" half of D-C2 is exactly this: admins
+    skip the check, never merely widen it. Every non-``DATA_AUTHORITY_
+    ITEM_TYPES`` pair is untouched regardless of writer.
+    """
+    from app.auth.access import is_user_admin
+
+    if is_user_admin(writer_user_id, conn):
+        return None
+    for item_type, item_id in items:
+        if item_type not in DATA_AUTHORITY_ITEM_TYPES:
+            continue
+        if not writer_can_access_item(writer_user_id, item_type, item_id, conn):
+            return (item_type, item_id)
+    return None

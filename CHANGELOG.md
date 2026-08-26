@@ -12,6 +12,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
+  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
+  collection an admin creates via the Library/API is granted to the `Everyone`
+  group at creation, so admin uploads are workspace-visible — in the Library,
+  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
+  without a manual share step. The grant is an ordinary revocable Everyone
+  grant; non-admin uploads and chat file drops stay private. The
+  `POST /api/collections` response now reports the resulting `visibility`
+  (`workspace`/`private`).
 - **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
   (remediation-program Track C1.1, additive — the builder router is
   unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
@@ -33,8 +42,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
   also cleans up sharing grants on delete, closing a gap versus the
   builder's own delete.
+- **`agent_scope` rows now record who granted them, and a non-admin writer
+  can no longer declare a data item they cannot themselves reach**
+  (remediation-program Track C2.1, staged agent-owned authority — no
+  behavior change for existing agents, a backfill attributes every
+  pre-existing row to its agent's owner). Every write to `PUT
+  /api/v1/agents/{id}/scope` and the builder-shape `knowledge` write
+  (`POST`/`PUT /api/v1/agents`) now records the authenticated caller as
+  `granted_by` (Postgres-only column — see Internal below), and refuses a
+  non-admin caller's `table`/`data_package`/`collection`/`connection` item
+  with `403 scope_item_not_accessible` when they do not currently hold it
+  themselves; an admin caller is unconditioned. `plugin`/`memory_domain`/
+  `slack_channel` items are unaffected. Runtime scope resolution is
+  unchanged by this step (still today's owner intersection) — a later task
+  uses `granted_by` to let an admin-shared agent reach items its owner
+  personally does not hold.
 
 ### Internal
+
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
 
 - **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
