@@ -430,7 +430,7 @@ async def create_agent(
     # no existing `agent_scope` rows to replace.
     from app.api.agents_builder_shared import _sync_builder_scope
 
-    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [])
+    _sync_builder_scope(agent_id, payload.knowledge or [], payload.plugins or [], user["id"])
 
     row = repo.get_by_id(agent_id)
     _audit(user["id"], "agent.create", agent_id, {"slug": slug})
@@ -614,6 +614,7 @@ async def update_agent(
             agent_id,
             supplied.get("knowledge", held_knowledge),
             supplied.get("plugins", held_plugins),
+            user["id"],
         )
 
     return _serialize(agents_repo().get_by_id(agent_id), uid=user["id"])  # type: ignore[arg-type]
@@ -725,6 +726,22 @@ async def set_agent_scope(
         seen.add(key)
         items.append(key)
 
+    # D-C2 staged write-gate (task C2.1): a non-admin writer may only grant
+    # a DATA-authority item (table/data_package/collection/connection) they
+    # currently hold themselves — admins are unconditioned. See
+    # `src.agent_scope_intersection` module docstring for the full contract.
+    from src.agent_scope_intersection import first_inaccessible_data_item
+
+    offender = first_inaccessible_data_item(user["id"], items, conn)
+    if offender is not None:
+        item_type, item_id = offender
+        raise _err(
+            403,
+            "scope_item_not_accessible",
+            f"you do not currently have access to {item_type} '{item_id}' — "
+            "grant yourself access first, or ask an admin to grant it to this agent",
+        )
+
     has_binding = any(item_type == "slack_channel" for item_type, _ in items)
     if has_binding:
         from src.agent_scope_intersection import agent_is_passthrough
@@ -765,7 +782,7 @@ async def set_agent_scope(
                 f"slack channel '{item_id}' is already bound to {who} — unbind it there first (one agent per channel)",
             )
 
-    agents_repo().set_scope(agent_id, items)
+    agents_repo().set_scope(agent_id, items, granted_by=user["id"])
     _audit(user["id"], "agent.scope.set", agent_id, {"count": len(items)})
     return {"items": [{"item_type": t, "item_id": i} for t, i in items]}
 
