@@ -108,6 +108,50 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   uses `granted_by` to let an admin-shared agent reach items its owner
   personally does not hold.
 
+### Changed
+
+- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
+  `none` (internal-only network, no route to the internet) instead of `open`.
+  The chat agent runs with bypassed tool permissions over a read-write
+  workspace, so an open default was a file-exfiltration surface. Operators who
+  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
+  with `chat.docker_egress_mode: open`, or `allowlist` +
+  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
+  or blank value now fails closed to `none`.
+
+### Fixed
+
+- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
+  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
+  labels now render via `textContent`, keeping the static sort markup trusted.
+- Agent-session principals no longer crash (500) when reaching collection
+  authorization (`accessible_collection_ids`, `require_collection_access`);
+  an `AgentPrincipal` now resolves to its live scoped-collection intersection
+  or a clean 403, matching the existing co-session/agent-session seam and
+  never inheriting owner-owned collections.
+- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
+  the same canonical subpath used for policy and dispatcher classification, and
+  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
+  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
+  path like `/v1/./messages` that classified as a non-message call — skipping
+  its pinned-model allowlist and monthly token budget — while HTTPX
+  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
+  duplicate-slash message paths can likewise no longer route the destination
+  somewhere the authorization decision did not intend.
+- Token persistence refuses to write (instead of silently downgrading to
+  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
+  valid Fernet key; a genuinely unset key still uses the plaintext keyless
+  fallback as before. A previously-silent misconfigured production vault now
+  fails loudly on secret saves instead of writing the secret in cleartext.
+
+### Security
+
+- Knowledge-digest generation now frames corpus source chunks as untrusted
+  data — behind an explicit do-not-follow-instructions notice and a per-call
+  nonce-delimited fence — before they reach the LLM, so retrieved content can
+  no longer be elevated into persistent agent instructions through the
+  generated `.claude/rules/ka_<slug>.md` digest.
+
 ### Internal
 
 - **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
