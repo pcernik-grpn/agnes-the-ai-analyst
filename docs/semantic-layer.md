@@ -268,6 +268,45 @@ Three things about it are deliberate:
   feature"), so on the frozen DuckDB app-state backend these routes answer
   `501 requires_postgres_backend`.
 
+## Muting: turning a check off is a signature
+
+An admin who has read a finding, decided it is expected and put the work in a
+plan should be able to stop it shouting. What they must not be able to do is
+make it vanish without a trace — a check that simply stops appearing leaves the
+next reader unable to tell "fixed" from "hidden". So Agnes has no "dismiss"
+button; it has a mute that carries **who**, **when** and **why**, and hands all
+three back on every read (`/admin/semantic-layer` → **Mute**).
+
+A mute names a scope, in one of three widths:
+
+| Scope | Silences |
+|---|---|
+| `domain:<domain>` | that domain across every source |
+| `source:<source_id>` | that source, every domain |
+| `source:<source_id>:domain:<domain>` | one cell of the coverage grid |
+
+`__local__` is a valid source id — it is the report's synthetic bucket for
+registered tables with no connection. A scope that parses to neither form is
+refused (`400 invalid_scope`) rather than stored: a row that looks like a mute
+but matches nothing is worse than either outcome. So is a scope naming a source
+that does not exist (`404`), and re-muting something already muted (`409`, with
+the existing mute's id — read the reason somebody already gave before adding a
+second one).
+
+`expires_at` is the honest middle option: say when you expect to have fixed it
+and let the check come back on its own. Omit it and the mute stands until
+somebody unmutes it. Expired mutes drop out of the default list but stay
+readable with `?include_expired=true` / `--include-expired` — the silence ends
+at the expiry, the record of who chose it does not.
+
+Muting is admin-only on every surface (UI, `agnes semantic-model
+mute/unmute/mutes`, MCP `mute_semantic_check` / `unmute_semantic_check` /
+`semantic_mutes_list`, REST), and both mutations are audit-logged.
+`semantic_health_mutes` is **Postgres-only** (see `docs/migrations.md` →
+"Adding a PG-only feature") — on the frozen DuckDB app-state backend every one
+of these surfaces answers `501 requires_postgres_backend` rather than
+pretending the check was silenced.
+
 ## Feedback: "that answer looked wrong"
 
 Coverage says what is undocumented and health says what is broken. Neither can
@@ -314,6 +353,10 @@ agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
 agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
 agnes semantic-model coverage tag <type> <resource-id> <source-id>
 agnes semantic-model coverage untag <tag-id>
+
+agnes semantic-model mute <scope> [--reason "..."] [--expires <ISO8601>]  # admin
+agnes semantic-model unmute <mute-id>                                    # admin
+agnes semantic-model mutes [--include-expired] [--json]                  # admin
 
 agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
 agnes semantic-model feedback list [--status open] [--json]   # admin

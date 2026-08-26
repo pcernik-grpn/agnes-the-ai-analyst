@@ -53,6 +53,12 @@ _FEEDBACK_SUBMIT_PATH = "/api/semantic-feedback"
 _FEEDBACK_ADMIN_PATH = "/api/admin/semantic-feedback"
 _FEEDBACK_STATUSES = ("open", "acknowledged", "resolved")
 
+# Muting a health check (F4.3). Top-level verbs, not a `mute` sub-group: the
+# three commands are one action each (`mute` / `unmute` / `mutes`), and a group
+# whose every member is a bare verb reads as `mute mute`.
+_MUTES_PATH = "/api/admin/semantic-layer/mutes"
+_MUTE_SCOPE_FORMS = ("source:<source-id>", "domain:<domain>", "source:<source-id>:domain:<domain>")
+
 
 @semantic_model_app.command("apply")
 def apply(
@@ -621,3 +627,166 @@ def feedback_resolve(
         typer.echo(json.dumps(body, indent=2, default=str))
         return
     typer.echo(f"Resolved: {feedback_id} by {body.get('resolved_by')}")
+
+
+# ---------------------------------------------------------------------------
+# Mutes (F4.3) — `agnes semantic-model mute|unmute|mutes`
+# ---------------------------------------------------------------------------
+
+
+def _fail_mute_needs_postgres(resp, what: str) -> None:
+    """Turn the PG-only 501 into the one sentence that names the fix."""
+    if resp.status_code != 501:
+        return
+    typer.echo(
+        f"{what} needs the Postgres app-state backend — this instance still runs the frozen "
+        "DuckDB backend. Migrate it (see docs/migrations.md) to mute checks.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def _detail(resp) -> dict:
+    """The typed `detail` object, or `{}` — never an exception.
+
+    A non-JSON error body (a proxy's HTML 502, say) must not turn a refusal
+    into a traceback: the caller still needs to print SOMETHING actionable.
+    """
+    try:
+        detail = resp.json().get("detail")
+    except Exception:
+        return {}
+    return detail if isinstance(detail, dict) else {}
+
+
+@semantic_model_app.command("mute")
+def mute(
+    scope: str = typer.Argument(..., help=f"What to silence — one of: {', '.join(_MUTE_SCOPE_FORMS)}"),
+    reason: Optional[str] = typer.Option(
+        None, "--reason", help="Why it is expected — stored on the mute and shown wherever it appears"
+    ),
+    expires: Optional[str] = typer.Option(
+        None,
+        "--expires",
+        help="ISO-8601 instant to un-silence itself at (e.g. 2026-10-01T00:00:00Z); omit = until unmuted",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Silence one semantic-layer check you already know about (admin only).
+
+    Muting is legitimate — a gap you have read, judged expected and scheduled
+    should not shout on every page load. Muting ANONYMOUSLY is not: your
+    identity, the time and (if you give one) your reason are stored with it and
+    shown wherever the mute appears, so nobody later has to guess whether the
+    check was fixed or hidden. Pass `--reason` unless there is genuinely
+    nothing to say.
+
+    Scopes: `domain:<domain>` silences one domain across every source,
+    `source:<id>` silences one source entirely, and
+    `source:<id>:domain:<domain>` silences the single cell. The coverage
+    domains are semantic, metrics, glossary, skill, agent, knowledge_base
+    (`agnes semantic-model coverage` prints them as columns); `__local__` is
+    the source id of the bucket for tables with no connection.
+
+    Mirrors `POST /api/admin/semantic-layer/mutes` and the MCP
+    `mute_semantic_check` tool.
+    """
+    payload = {"scope": scope, "reason": reason, "expires_at": expires}
+    resp = api_post(_MUTES_PATH, json={k: v for k, v in payload.items() if v is not None})
+    _fail_mute_needs_postgres(resp, "Muting a check")
+
+    if resp.status_code == 400:
+        detail = _detail(resp)
+        typer.echo(detail.get("message") or f"Could not mute {scope!r}.", err=True)
+        if detail.get("error") == "invalid_scope":
+            typer.echo(f"  Expected one of: {', '.join(_MUTE_SCOPE_FORMS)}", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 404:
+        typer.echo(f"No such data source in scope {scope!r}.", err=True)
+        typer.echo("  List them: agnes admin connection list", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 409:
+        typer.echo(f"Already muted: {_detail(resp).get('message') or scope}", err=True)
+        typer.echo("  See it: agnes semantic-model mutes", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 422:
+        # The only field the server parses for us is `--expires`; a 422 here is
+        # almost always an unparseable instant, so name the format rather than
+        # dumping pydantic's field-path list at the reader.
+        typer.echo(f"Could not read --expires {expires!r} — expected ISO-8601, e.g. 2026-10-01T00:00:00Z.", err=True)
+        raise typer.Exit(1)
+    if resp.status_code not in (200, 201):
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    until = f" until {body.get('expires_at')}" if body.get("expires_at") else ""
+    typer.echo(f"Muted: {body.get('scope')}{until} (mute {body.get('id')})")
+    if not body.get("reason"):
+        # Not an error — the API allows it — but the whole point of the record
+        # is the next reader, and "muted by you, no reason given" is a thin
+        # thing to inherit.
+        typer.echo("  No reason recorded — add one with: agnes semantic-model unmute <id> then re-mute with --reason")
+
+
+@semantic_model_app.command("unmute")
+def unmute(
+    mute_id: str = typer.Argument(..., help="Mute id from `agnes semantic-model mutes`"),
+):
+    """Let one check report again (admin only).
+
+    Mirrors `DELETE /api/admin/semantic-layer/mutes/{mute_id}` and the MCP
+    `unmute_semantic_check` tool.
+    """
+    resp = api_delete(f"{_MUTES_PATH}/{mute_id}")
+    _fail_mute_needs_postgres(resp, "Unmuting a check")
+    if resp.status_code == 404:
+        typer.echo(f"No semantic-layer mute {mute_id!r}.", err=True)
+        typer.echo("  Find the id: agnes semantic-model mutes", err=True)
+        raise typer.Exit(1)
+    if resp.status_code not in (200, 204):
+        _fail(resp)
+    typer.echo(f"Unmuted: {mute_id}")
+
+
+@semantic_model_app.command("mutes")
+def mutes(
+    include_expired: bool = typer.Option(
+        False, "--include-expired", help="Also show mutes that have lapsed (the record outlives the silence)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """What is currently silenced, and who silenced it (admin only).
+
+    Server-side state, so there is no local/server scope to choose — mutes are
+    a fact about the instance's own health report.
+
+    Mirrors `GET /api/admin/semantic-layer/mutes` and the MCP
+    `semantic_mutes_list` tool.
+    """
+    resp = api_get(_MUTES_PATH, params={"include_expired": "true"} if include_expired else None)
+    _fail_mute_needs_postgres(resp, "The muted-check list")
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+
+    items = body.get("items") or []
+    if not items:
+        typer.echo("No muted checks." if include_expired else "No muted checks (nothing is being silenced).")
+        typer.echo('  Silence one you already know about: agnes semantic-model mute domain:<domain> --reason "…"')
+        return
+
+    for item in items:
+        expires = item.get("expires_at")
+        window = f"until {expires}" if expires else "no expiry"
+        typer.echo(f"{item.get('id')}  {(item.get('scope') or '?'):<44} {window}")
+        # Who and when on their own line, always printed: they are the record,
+        # not a detail the reader has to ask for with a flag.
+        typer.echo(f"    muted by {item.get('muted_by') or 'unknown'} at {item.get('muted_at')}")
+        typer.echo(f"    reason: {item.get('reason') or '(none given)'}")

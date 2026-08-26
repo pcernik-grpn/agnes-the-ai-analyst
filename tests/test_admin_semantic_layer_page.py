@@ -75,10 +75,10 @@ class TestTheTabStrip:
         assert "?tab=health" in body
 
     def test_another_tab_renders_its_own_placeholder_not_coverage(self, seeded_app):
-        """Health / Mute land in later waves. The tab exists so the page's
-        shape is settled, and says plainly that it is empty — an invisible tab
-        would be re-designed from scratch by whoever lands it. (Feedback is no
-        longer among them — see TestTheFeedbackTab.)"""
+        """Health lands in a later wave. The tab exists so the page's shape is
+        settled, and says plainly that it is empty — an invisible tab would be
+        re-designed from scratch by whoever lands it. (Feedback and Mute are no
+        longer among them — see TestTheFeedbackTab / TestTheMuteTab.)"""
         body = (
             seeded_app["client"].get("/admin/semantic-layer?tab=health", headers=_auth(seeded_app["admin_token"])).text
         )
@@ -197,9 +197,9 @@ class TestTheFeedbackTab:
     def test_it_replaced_its_placeholder(self, seeded_app):
         body = self._body(seeded_app)
         assert 'id="sl-feedback"' in body
-        # The class still EXISTS (Health and Mute still use it, and its rule
-        # lives in the shared head block) — what must be gone is any element
-        # on this tab wearing it.
+        # The class still EXISTS (Health still uses it, and its rule lives in
+        # the shared head block) — what must be gone is any element on this tab
+        # wearing it.
         assert 'class="sl-placeholder"' not in body
 
     def test_the_queue_is_filled_from_the_feedback_endpoint(self, seeded_app):
@@ -227,6 +227,59 @@ class TestTheFeedbackTab:
         the submit surfaces so an admin does not read it as admin-only."""
         body = self._body(seeded_app)
         assert "agnes semantic-model feedback submit" in body
+
+
+class TestTheMuteTab:
+    """F4.3 — silencing a check an admin already knows about, on the record."""
+
+    def _body(self, seeded_app) -> str:
+        return seeded_app["client"].get("/admin/semantic-layer?tab=mute", headers=_auth(seeded_app["admin_token"])).text
+
+    def test_it_replaced_its_placeholder(self, seeded_app):
+        body = self._body(seeded_app)
+        assert 'id="sl-mute"' in body
+        assert 'class="sl-placeholder"' not in body
+
+    def test_the_list_is_filled_from_the_mutes_endpoint(self, seeded_app):
+        """Fetched after paint, like the coverage grid and the feedback queue:
+        the table is Postgres-only, so server-rendering it would refuse to load
+        the whole page on a DuckDB instance."""
+        assert "/api/admin/semantic-layer/mutes" in self._body(seeded_app)
+
+    def test_a_duckdb_instance_is_told_why_the_list_is_empty(self, seeded_app):
+        """ "Nothing muted" would read as "nobody silenced anything" on an
+        instance that cannot store a mute at all."""
+        assert "requires_postgres_backend" in self._body(seeded_app)
+
+    def test_the_form_asks_for_a_reason(self, seeded_app):
+        """The whole point of the feature: a mute carries who/when/why. The
+        field is optional at the API, but the form must ASK — an empty reason
+        should be a decision, not an omission nobody was prompted about."""
+        body = self._body(seeded_app)
+        assert 'id="sl-mute-reason"' in body
+
+    def test_the_domain_picker_offers_the_reports_own_domains(self, seeded_app):
+        """Read from `src.semantic.coverage.DOMAINS`, not re-typed: a domain the
+        picker offers but the report never scores would mute nothing."""
+        from src.semantic.coverage import DOMAINS
+
+        body = self._body(seeded_app)
+        for domain in DOMAINS:
+            assert f'value="{domain}"' in body, f"{domain} missing from the mute picker"
+
+    def test_a_source_can_be_picked_even_though_a_domain_alone_is_valid(self, seeded_app):
+        """All three scope forms are reachable from one pair of selects —
+        source-only, domain-only, and both."""
+        _connection()
+        body = self._body(seeded_app)
+        assert 'value="conn-a"' in body
+        assert "Production Project" in body
+
+    def test_it_renders_with_no_source_connected(self, seeded_app):
+        """Unlike the tagging form, this one still works: `domain:<domain>`
+        mutes a check across every source and needs no connection at all."""
+        body = self._body(seeded_app)
+        assert 'id="sl-mute-form"' in body
 
     def test_the_coverage_grid_is_not_rendered_on_this_tab(self, seeded_app):
         assert 'id="sl-coverage"' not in self._body(seeded_app)

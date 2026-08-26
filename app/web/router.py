@@ -7489,9 +7489,9 @@ def _keboola_credentialed() -> bool:
     return value is not None
 
 
-# The in-page lenses of /admin/semantic-layer. "coverage" (F4.1) and
-# "feedback" (F4.5) are built; "health" and "mute" are the settled shape of the
-# sections that follow, rendered as named placeholders rather than left
+# The in-page lenses of /admin/semantic-layer. "coverage" (F4.1), "mute"
+# (F4.3) and "feedback" (F4.5) are built; "health" is the settled shape of the
+# section that follows, rendered as a named placeholder rather than left
 # invisible — a tab nobody can see is a tab the next author redesigns from
 # scratch.
 _SEMANTIC_LAYER_ADMIN_TABS = ("coverage", "health", "mute", "feedback")
@@ -7557,12 +7557,18 @@ async def admin_semantic_layer_page(
     vocabulary — read from the API's own ``FEEDBACK_STATUSES`` rather than
     re-typed, since a status the select offers but the endpoint rejects would
     400 on click.
+
+    The Mute tab (F4.3) follows the same rule once more: the list of silenced
+    checks is fetched after paint, and what this handler renders is the scope
+    vocabulary the form composes from — the report's own ``DOMAINS`` and the
+    connected sources, so a scope the picker offers is always a scope something
+    is actually scored on.
     """
     from app.api.keboola_semantic_layer_refresh import get_last_refresh_summary
     from app.resource_types import RESOURCE_TYPES, ResourceType
     from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
-    from src.semantic.coverage import DOMAINS, TAG_RESOURCE_TYPE_BY_DOMAIN
+    from src.semantic.coverage import DOMAINS, LOCAL_BUCKET_ID, LOCAL_BUCKET_NAME, TAG_RESOURCE_TYPE_BY_DOMAIN
 
     ctx = _build_context(request, user=user)
 
@@ -7620,6 +7626,19 @@ async def admin_semantic_layer_page(
     ]
     ctx["prefill_tag_source"] = request.query_params.get("tag_source") or ""
     ctx["prefill_tag_type"] = request.query_params.get("tag_type") or ""
+
+    # The Mute tab's scope picker. Two selects — source and domain, each with
+    # an "any" option — compose all three scope forms (`domain:<d>`,
+    # `source:<s>`, `source:<s>:domain:<d>`) without asking the admin to learn
+    # the string grammar. The domain list is the report's own, so the picker
+    # cannot offer a domain nothing is scored on; the source list adds the
+    # synthetic local bucket, which IS a row in the report even though it is
+    # not a connection.
+    ctx["mute_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    ctx["mute_sources"] = [{"id": LOCAL_BUCKET_ID, "label": LOCAL_BUCKET_NAME}] + [
+        {"id": source["id"], "label": source["name"] + (f" ({source['source_type']})" if source["source_type"] else "")}
+        for source in ctx["tag_sources"]
+    ]
 
     ctx["semantic_refresh_summary"] = get_last_refresh_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)

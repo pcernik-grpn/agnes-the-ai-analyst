@@ -6011,6 +6011,45 @@
         "title": "MoveFileBody",
         "type": "object"
       },
+      "MuteCreate": {
+        "description": "One mute. ``muted_by`` is deliberately NOT a field \u2014 it is taken from the\nauthenticated caller, because a signature you can address to somebody else\nis not a signature.\n\nThe caps matter for the same reason they do on feedback: the columns are\n``TEXT``/``VARCHAR`` and generous enough that no genuine mute hits them.",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "scope": {
+            "maxLength": 200,
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "title": "MuteCreate",
+        "type": "object"
+      },
       "MySecretBody": {
         "properties": {
           "value": {
@@ -13341,7 +13380,7 @@
     },
     "/admin/semantic-layer": {
       "get": {
-        "description": "Cross-source, cross-domain completeness for the semantic layer.\n\nREBUILT in F4.1. This was a Keboola sync-ops page \u2014 one row per\nmaster-token Keboola connection, with hand-computed \"connections without a\nmaster token\", \"orphaned rows\" and \"legacy / unattributed\" sections\nalongside. Every one of those is gone, replaced by ONE report that asks\nthe same questions of EVERY connected source\n(``src.semantic.coverage.compute_cross_domain_coverage``), which is why\nthis handler is now smaller than the page it replaces rather than larger:\n\n* a Keboola connection with no owner token is a ROW in that report (the\n  wrapper fills the hole K0.5 leaves) instead of a list underneath it;\n* the connection-scoped \"orphaned\" count measured stale flat\n  ``metric_definitions`` rows \u2014 projections of the canonical document, not\n  the truth \u2014 and its successor is F4.2's source-agnostic\n  \"disconnected models\" check over the document itself;\n* the \"legacy / unattributed\" bucket is the report's synthetic\n  ``__local__`` source.\n\nThe grid itself is fetched after paint, not rendered here: the report's\nKeboola provider makes upstream Metastore calls (the retired page already\nrefused to block on those), and the report is Postgres-only, so a DuckDB\ninstance gets an inline explanation instead of a page that will not load.\n\nWhat this handler still renders server-side is what the client cannot ask\nfor: the tab shell, the Keboola sync strip, and the tagging form's\noptions \u2014 the latter straight off ``app/resource_types.py``'s\n``list_blocks`` delegates, the same projection /admin/access renders, so\nthe two can never disagree about what is taggable.\n\nThe Feedback tab (F4.5) is the same shape one layer down: the report queue\nis fetched after paint (also Postgres-only, and its status filter re-queries\nwithout a reload), so all this handler renders for it is the filter's\nvocabulary \u2014 read from the API's own ``FEEDBACK_STATUSES`` rather than\nre-typed, since a status the select offers but the endpoint rejects would\n400 on click.",
+        "description": "Cross-source, cross-domain completeness for the semantic layer.\n\nREBUILT in F4.1. This was a Keboola sync-ops page \u2014 one row per\nmaster-token Keboola connection, with hand-computed \"connections without a\nmaster token\", \"orphaned rows\" and \"legacy / unattributed\" sections\nalongside. Every one of those is gone, replaced by ONE report that asks\nthe same questions of EVERY connected source\n(``src.semantic.coverage.compute_cross_domain_coverage``), which is why\nthis handler is now smaller than the page it replaces rather than larger:\n\n* a Keboola connection with no owner token is a ROW in that report (the\n  wrapper fills the hole K0.5 leaves) instead of a list underneath it;\n* the connection-scoped \"orphaned\" count measured stale flat\n  ``metric_definitions`` rows \u2014 projections of the canonical document, not\n  the truth \u2014 and its successor is F4.2's source-agnostic\n  \"disconnected models\" check over the document itself;\n* the \"legacy / unattributed\" bucket is the report's synthetic\n  ``__local__`` source.\n\nThe grid itself is fetched after paint, not rendered here: the report's\nKeboola provider makes upstream Metastore calls (the retired page already\nrefused to block on those), and the report is Postgres-only, so a DuckDB\ninstance gets an inline explanation instead of a page that will not load.\n\nWhat this handler still renders server-side is what the client cannot ask\nfor: the tab shell, the Keboola sync strip, and the tagging form's\noptions \u2014 the latter straight off ``app/resource_types.py``'s\n``list_blocks`` delegates, the same projection /admin/access renders, so\nthe two can never disagree about what is taggable.\n\nThe Feedback tab (F4.5) is the same shape one layer down: the report queue\nis fetched after paint (also Postgres-only, and its status filter re-queries\nwithout a reload), so all this handler renders for it is the filter's\nvocabulary \u2014 read from the API's own ``FEEDBACK_STATUSES`` rather than\nre-typed, since a status the select offers but the endpoint rejects would\n400 on click.\n\nThe Mute tab (F4.3) follows the same rule once more: the list of silenced\nchecks is fetched after paint, and what this handler renders is the scope\nvocabulary the form composes from \u2014 the report's own ``DOMAINS`` and the\nconnected sources, so a scope the picker offers is always a scope something\nis actually scored on.",
         "operationId": "admin_semantic_layer_page_admin_semantic_layer_get",
         "parameters": [
           {
@@ -25747,6 +25786,181 @@
           }
         },
         "summary": "Get Semantic Layer Coverage"
+      }
+    },
+    "/api/admin/semantic-layer/mutes": {
+      "get": {
+        "description": "Every check currently silenced, and by whom (admin only).\n\nIts own route rather than a corner of the health report: this is the answer\nto \"what are we not being told about\", and an admin auditing that should\nnot have to fetch (and re-compute) the whole health roll-up to read it.\nF4.2's health response includes the same rows \u2014 the list is deliberately\nreachable from both.\n\n``?include_expired=true`` adds the lapsed ones. The silence ends at the\nexpiry; the record of who chose it does not.",
+        "operationId": "list_mutes_api_admin_semantic_layer_mutes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_expired",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Expired",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Mutes"
+      },
+      "post": {
+        "description": "Silence one check, on the record (admin only).\n\nReturns the stored row \u2014 ``muted_by``, ``muted_at``, ``reason`` and all \u2014\nso the caller sees the signature it just left rather than a bare ``201``.\n\n409 when an ACTIVE mute already covers the scope: two rows for one check\nread as two independent judgements when it is one, and unmuting either\nwould leave the check silent with no visible reason why. 404 when the scope\nnames a source connection that does not exist \u2014 a mute pointing at nothing\nsilences nothing, forever, while looking like it works.",
+        "operationId": "create_mute_api_admin_semantic_layer_mutes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MuteCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Mute"
+      }
+    },
+    "/api/admin/semantic-layer/mutes/{mute_id}": {
+      "delete": {
+        "description": "Unmute \u2014 the check starts reporting again (admin only).\n\n404 when the mute does not exist, so an admin never reads a success for an\nunmute that unmuted nothing and then wonders why the warning is still\nquiet.",
+        "operationId": "delete_mute_api_admin_semantic_layer_mutes__mute_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mute_id",
+            "required": true,
+            "schema": {
+              "title": "Mute Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Mute"
       }
     },
     "/api/admin/semantic-model/coverage": {

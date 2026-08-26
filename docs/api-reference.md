@@ -1232,6 +1232,53 @@ CLI: `agnes semantic-model coverage [--source <id>] [--json]`,
 MCP: `semantic_model_coverage`, `semantic_model_coverage_tag`,
 `semantic_model_coverage_untag`.
 
+### `/api/admin/semantic-layer/mutes` — silencing a check, on the record
+
+- /api/admin/semantic-layer/mutes
+- /api/admin/semantic-layer/mutes/{mute_id}
+
+Turning a check off is legitimate — an admin who has read a finding, judged it
+expected and scheduled the work should not be shouted at on every page load.
+Turning it off **anonymously** is not: a check that simply stops appearing
+leaves the next reader unable to tell "fixed" from "hidden". So a mute is a
+signature. `muted_by` is taken from the authenticated caller (never from the
+body), `muted_at` is stamped by the database, and both come back out of every
+read alongside the optional `reason`.
+
+`POST /api/admin/semantic-layer/mutes` (admin) takes `{scope, reason?,
+expires_at?}`. `scope` is one of three forms — `domain:<domain>` (one domain
+across every source), `source:<source_id>` (one source entirely), or
+`source:<source_id>:domain:<domain>` (a single cell of the coverage grid).
+`__local__` is a valid source id: it is the report's synthetic bucket for
+registered tables with no connection. A scope that parses to neither is a `400
+invalid_scope` rather than a stored row that would sit in the list looking like
+a silenced check while the check carries on firing; a scope naming a source
+that does not exist is a `404 unknown_source`; a scope that already has an
+**active** mute is a `409 already_muted` carrying the existing `mute_id`.
+`expires_at` (ISO-8601, must be in the future — `400 expires_in_past`
+otherwise) makes the check come back on its own; omit it for "until somebody
+unmutes it".
+
+`GET /api/admin/semantic-layer/mutes[?include_expired=true]` (admin) lists what
+is currently silenced and by whom. Its own route rather than a corner of the
+health report: "what are we not being told about" is a question worth asking on
+its own, and F4.2's health response carries the same rows. Expired mutes are
+hidden by default and returned with `include_expired` — the silence ends at the
+expiry, the record of who chose it does not. `DELETE
+/api/admin/semantic-layer/mutes/{mute_id}` (admin) unmutes; `404 unknown_mute`
+when there was nothing to unmute.
+
+**Postgres-only.** All three routes read `semantic_health_mutes`, which exists
+on Postgres only (see `docs/migrations.md` → "Adding a PG-only feature"); on an
+instance still running the frozen DuckDB app-state backend they answer `501`
+with `error: "requires_postgres_backend"`.
+
+CLI: `agnes semantic-model mute <scope> [--reason …] [--expires <ISO8601>]`,
+`agnes semantic-model unmute <mute-id>`, `agnes semantic-model mutes
+[--include-expired] [--json]`. MCP: `mute_semantic_check`,
+`unmute_semantic_check`, `semantic_mutes_list`. UI:
+`/admin/semantic-layer?tab=mute`.
+
 ### `/api/semantic-feedback` — "that answer looked wrong"
 
 - /api/semantic-feedback

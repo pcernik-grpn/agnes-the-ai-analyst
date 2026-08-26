@@ -62,6 +62,7 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "coverage tagging writes `resource_source_tags`, a PG-only table (F4.1)"
     ),
     "POST /api/semantic-feedback": "filing feedback writes `semantic_feedback`, a PG-only table (F4.5)",
+    "POST /api/admin/semantic-layer/mutes": ("muting a check writes `semantic_health_mutes`, a PG-only table (F4.3)"),
 }
 
 

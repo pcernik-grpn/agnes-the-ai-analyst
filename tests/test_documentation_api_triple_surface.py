@@ -98,6 +98,16 @@ _COHORT: dict[str, tuple[str, str]] = {
         "semantic-model coverage untag",
         "semantic_model_coverage_untag",
     ),
+    # Muting a semantic-layer health check (F4.3) — "I know, it is deliberate".
+    # Same reasoning as the tag/untag pair above for why the mutations are in
+    # the cohort rather than _EXEMPT; and a mute an agent can create but not
+    # SEE would be the silent disappearance the feature exists to prevent, so
+    # the list is triple-surface too. One cohort row per PATH: the first row's
+    # MCP column names the GET's tool, and the POST's `mute_semantic_check` is
+    # asserted in FOUNDATION_TOOL_NAMES by tests/test_mcp_tool_parity.py (same
+    # shape as the /api/store/entities/{entity_id} row above).
+    "/api/admin/semantic-layer/mutes": ("semantic-model mutes", "semantic_mutes_list"),
+    "/api/admin/semantic-layer/mutes/{mute_id}": ("semantic-model unmute", "unmute_semantic_check"),
     # Semantic-layer feedback (F4.5) — "that answer looked wrong". Submit is
     # open to any signed-in caller (and is the tool the chat agent offers when
     # it cannot ground an answer); the queue and resolve are admin. All three

@@ -101,6 +101,7 @@ from src.models.oauth import OAuthAccessToken, OAuthAuthCode, OAuthClient, OAuth
 from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
 from src.models.semantic_coverage import ResourceSourceTag
 from src.models.semantic_feedback import SemanticFeedback
+from src.models.semantic_health_mutes import SemanticHealthMute
 from src.models.vault import SystemSecret
 
 
@@ -159,6 +160,7 @@ __all__ = [
     "SetupToken",
     "ScriptRegistry",
     "SemanticFeedback",
+    "SemanticHealthMute",
     "SemanticModel",
     "SemanticSource",
     "SessionProcessorState",

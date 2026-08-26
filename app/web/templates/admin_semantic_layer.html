@@ -247,10 +247,79 @@
     no declared relationship). Nothing to show here yet.
   </div>
   {% elif active_tab == 'mute' %}
-  <div class="sl-placeholder" id="sl-mute">
-    <strong>Mute</strong> lands with Health: silencing a check will record who did it and why, and a muted
-    item stays visible as muted rather than disappearing. Nothing to show here yet.
-  </div>
+  <section id="sl-mute">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Muted checks</h2>
+      <span class="apg-sechead__count" id="sl-mute-count"></span>
+    </div>
+    <p class="apg-sec-desc">
+      Silencing a check you have read and judged expected is a normal thing to do — silencing it
+      <em>anonymously</em> is not. Every mute below carries who made it, when, and the reason they gave, so a
+      check that stopped appearing can always be told apart from one that was fixed. Unmute puts it straight
+      back.
+    </p>
+
+    <table class="ds-table" id="sl-mute-table">
+      <thead>
+        <tr>
+          <th>Scope</th>
+          <th>Muted by</th>
+          <th>Reason</th>
+          <th>Until</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="sl-mute-body">
+        <tr><td colspan="5"><span class="sl-note">Loading muted checks…</span></td></tr>
+      </tbody>
+    </table>
+    <div class="sl-empty" id="sl-mute-empty" hidden></div>
+
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Mute a check</h2>
+    </div>
+    <p class="apg-sec-desc">
+      Pick what to silence: a domain on its own covers every source, a source on its own covers every domain,
+      and both together silence the single cell in the <a href="/admin/semantic-layer?tab=coverage">Coverage</a>
+      grid. The reason is what the next admin inherits — write the one sentence you would want to read.
+    </p>
+    <form class="sl-tagform" id="sl-mute-form">
+      <div class="sl-tagform-row">
+        <div>
+          <label for="sl-mute-source">Data source</label>
+          <select id="sl-mute-source">
+            <option value="">Any source</option>
+            {% for source in mute_sources %}
+            <option value="{{ source.id }}">{{ source.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="sl-mute-domain">Domain</label>
+          <select id="sl-mute-domain">
+            <option value="">Any domain</option>
+            {% for domain in mute_domains %}
+            <option value="{{ domain.key }}">{{ domain.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label for="sl-mute-reason">Reason</label>
+        <input id="sl-mute-reason" type="text" placeholder="e.g. tracked in the Q3 modelling epic — no metric until it lands">
+      </div>
+      <div>
+        <label for="sl-mute-expires">Un-silence itself on (optional)</label>
+        <input id="sl-mute-expires" type="date">
+        <p class="sl-note">
+          Leave empty to mute until somebody unmutes it. A date makes the check come back on its own — the
+          honest option when you expect to have fixed it by then.
+        </p>
+      </div>
+      <p class="sl-note" id="sl-mute-preview">Scope: <span class="sl-mono">(pick a source, a domain, or both)</span></p>
+      <div><button type="submit" class="btn btn-primary" id="sl-mute-submit">Mute</button></div>
+    </form>
+  </section>
   {% else %}
   <section id="sl-feedback">
     <div class="apg-sechead">
@@ -719,6 +788,227 @@ async function fbLoad() {
 
 document.getElementById("sl-fb-status").addEventListener("change", fbLoad);
 fbLoad();
+</script>
+{% endif %}
+
+{% if active_tab == 'mute' %}
+<script>
+// Fetched after paint for the same two reasons as the coverage grid and the
+// feedback queue: the table is Postgres-only (a DuckDB instance must still
+// render the page and say why the list is empty), and unmuting re-queries
+// without a reload.
+//
+// EVERY string below — scopes, reasons, emails — was typed by an admin. Nodes
+// are built and filled with textContent; nothing here goes near innerHTML.
+const MUTES_URL = "/api/admin/semantic-layer/mutes";
+
+function mtEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function mtWhen(value) {
+  if (!value) return "";
+  // Server timestamps are UTC-aware; render in the reader's zone rather than
+  // shifting a naive string by the local offset.
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function mtScope() {
+  const source = document.getElementById("sl-mute-source").value;
+  const domain = document.getElementById("sl-mute-domain").value;
+  if (source && domain) return `source:${source}:domain:${domain}`;
+  if (source) return `source:${source}`;
+  if (domain) return `domain:${domain}`;
+  return "";
+}
+
+function mtRefreshPreview() {
+  const scope = mtScope();
+  const preview = document.getElementById("sl-mute-preview");
+  preview.textContent = "";
+  preview.appendChild(document.createTextNode("Scope: "));
+  preview.appendChild(mtEl("span", "sl-mono", scope || "(pick a source, a domain, or both)"));
+  // "Any source and any domain" is not a mute of everything — it names
+  // nothing, and the server refuses it. Say so before the click, not after.
+  document.getElementById("sl-mute-submit").disabled = !scope;
+}
+
+function mtShowEmpty(message, linkHref, linkLabel) {
+  const table = document.getElementById("sl-mute-table");
+  const empty = document.getElementById("sl-mute-empty");
+  table.hidden = true;
+  empty.hidden = false;
+  empty.textContent = message;
+  if (linkHref) {
+    empty.appendChild(document.createTextNode(" "));
+    const link = mtEl("a", null, linkLabel);
+    link.href = linkHref;
+    empty.appendChild(link);
+  }
+  document.getElementById("sl-mute-count").textContent = "";
+}
+
+async function mtUnmute(mute) {
+  const r = await fetch(`${MUTES_URL}/${encodeURIComponent(mute.id)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (r.ok) {
+    showToast(`Unmuted ${mute.scope} — the check reports again.`, true);
+    mtLoad();
+    return;
+  }
+  const body = await r.json().catch(() => ({}));
+  const detail = body.detail || {};
+  showToast(detail.message || detail || r.statusText, false);
+}
+
+function mtRender(items) {
+  const table = document.getElementById("sl-mute-table");
+  const empty = document.getElementById("sl-mute-empty");
+  const body = document.getElementById("sl-mute-body");
+  table.hidden = false;
+  empty.hidden = true;
+  body.textContent = "";
+
+  for (const item of items) {
+    const row = mtEl("tr");
+    const scopeCell = mtEl("td");
+    scopeCell.appendChild(mtEl("span", "sl-mono", item.scope || ""));
+    row.appendChild(scopeCell);
+
+    // Who and when together: the signature is one fact, and splitting it
+    // across sortable columns invites reading the name without the date.
+    const whoCell = mtEl("td");
+    whoCell.appendChild(mtEl("div", "sl-fb-who", item.muted_by || "unknown"));
+    whoCell.appendChild(mtEl("div", "sl-fb-when", mtWhen(item.muted_at)));
+    row.appendChild(whoCell);
+
+    const reasonCell = mtEl("td");
+    // An unexplained mute is legal but conspicuous — it reads as an omission,
+    // which is exactly what it is.
+    reasonCell.appendChild(
+      item.reason ? mtEl("span", null, item.reason) : mtEl("span", "sl-note", "no reason given")
+    );
+    row.appendChild(reasonCell);
+
+    const untilCell = mtEl("td");
+    untilCell.appendChild(
+      item.expires_at ? mtEl("span", "sl-fb-when", mtWhen(item.expires_at)) : mtEl("span", "sl-note", "until unmuted")
+    );
+    row.appendChild(untilCell);
+
+    const actionCell = mtEl("td");
+    const button = mtEl("button", "btn btn-secondary", "Unmute");
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await mtUnmute(item);
+      } catch (err) {
+        showToast("Could not unmute: " + err.message, false);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    actionCell.appendChild(button);
+    row.appendChild(actionCell);
+    body.appendChild(row);
+  }
+
+  const noun = `check${items.length === 1 ? "" : "s"}`;
+  document.getElementById("sl-mute-count").textContent = `${items.length} muted ${noun}`;
+}
+
+async function mtLoad() {
+  try {
+    const r = await fetch(MUTES_URL, { credentials: "include" });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 501 && body.error === "requires_postgres_backend") {
+      // Named rather than hidden: this instance runs the frozen DuckDB
+      // app-state backend, so there is no table to store a mute in. "Nothing
+      // muted" here would read as "nobody silenced anything".
+      mtShowEmpty(
+        "Muting needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to mute checks:",
+        "/admin/database",
+        "Database backend"
+      );
+      document.getElementById("sl-mute-submit").disabled = true;
+      return;
+    }
+    if (!r.ok) {
+      mtShowEmpty("Could not load muted checks: " + (body.detail || r.statusText));
+      return;
+    }
+    const items = body.items || [];
+    if (!items.length) {
+      mtShowEmpty("Nothing is muted — every check reports.");
+      return;
+    }
+    mtRender(items);
+  } catch (e) {
+    mtShowEmpty("Could not load muted checks: " + e.message);
+  }
+}
+
+(function wireMuteForm() {
+  const form = document.getElementById("sl-mute-form");
+  const submit = document.getElementById("sl-mute-submit");
+  const expires = document.getElementById("sl-mute-expires");
+  // A date already past would be refused by the server; keep it unpickable.
+  expires.min = new Date().toISOString().slice(0, 10);
+
+  document.getElementById("sl-mute-source").addEventListener("change", mtRefreshPreview);
+  document.getElementById("sl-mute-domain").addEventListener("change", mtRefreshPreview);
+  mtRefreshPreview();
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const scope = mtScope();
+    if (!scope) {
+      showToast("Pick a source, a domain, or both — a mute has to name something.", false);
+      return;
+    }
+    const reason = document.getElementById("sl-mute-reason").value.trim();
+    const payload = { scope: scope };
+    if (reason) payload.reason = reason;
+    if (expires.value) {
+      // End of the chosen day in the reader's own zone: a bare date parsed as
+      // UTC midnight would already be in the past for anyone picking today.
+      const until = new Date(`${expires.value}T23:59:59`);
+      payload.expires_at = until.toISOString();
+    }
+
+    submit.disabled = true;
+    try {
+      const r = await fetch(MUTES_URL, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        showToast(`Muted ${scope}.`, true);
+        document.getElementById("sl-mute-reason").value = "";
+        mtLoad();
+        return;
+      }
+      const detail = body.detail || {};
+      showToast(detail.message || detail || r.statusText, false);
+    } catch (err) {
+      showToast("Could not mute: " + err.message, false);
+    } finally {
+      mtRefreshPreview();
+    }
+  });
+})();
+
+mtLoad();
 </script>
 {% endif %}
 {% endblock %}

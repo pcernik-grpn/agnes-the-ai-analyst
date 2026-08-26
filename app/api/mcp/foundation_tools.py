@@ -131,6 +131,14 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "semantic_model_coverage",
     "semantic_model_coverage_tag",
     "semantic_model_coverage_untag",
+    # Muting one of those checks (F4.3) — "I know, it is deliberate". The pair
+    # is NOT read_only and, like tag/untag above, is deliberately not
+    # MCP-exempt. The list rides along on purpose: a mute an agent can create
+    # but never SEE is the anonymous disappearance the feature exists to
+    # prevent.
+    "semantic_mutes_list",
+    "mute_semantic_check",
+    "unmute_semantic_check",
     # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
     # here an ORDINARY caller may use — the agent that cannot ground its own
     # answer is the intended reporter, which is why it is not admin-gated and
@@ -1689,6 +1697,98 @@ def register_foundation_tools(
             )
             r.raise_for_status()
             return {"deleted": tag_id}
+
+    @tool(read_only=True)
+    async def semantic_mutes_list(include_expired: bool = False) -> dict:
+        """List the semantic-layer checks an admin has deliberately silenced (admin only).
+
+        Read this before reporting a coverage or health gap as news: a scope
+        listed here is one somebody has already seen, judged expected, and
+        signed for. Each entry carries ``scope``, ``muted_by``, ``muted_at``
+        and (when given) ``reason`` — the reason is usually the answer to "why
+        is this still missing".
+
+        Args:
+            include_expired: Also return mutes whose expiry has passed. They no
+                longer silence anything, but the record of who chose it stands.
+
+        Mirrors ``GET /api/admin/semantic-layer/mutes`` and
+        ``agnes semantic-model mutes``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                params={"include_expired": "true"} if include_expired else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def mute_semantic_check(scope: str, reason: str = "", expires_at: str = "") -> dict:
+        """Silence one semantic-layer check that is known and expected (admin only).
+
+        OFFER this rather than reaching for it: muting is how a real gap stops
+        being reported, and the caller's identity, the time and the reason are
+        stored on the row and shown everywhere the mute appears. Say what you
+        would mute and why, and file it once the user agrees. Never as a way to
+        make a finding you could not explain go away.
+
+        409 if the scope is already muted — read ``semantic_mutes_list`` first;
+        somebody may have signed for it already.
+
+        Args:
+            scope: ``domain:<domain>`` (one domain across every source),
+                ``source:<source_id>`` (one source entirely), or
+                ``source:<source_id>:domain:<domain>`` (a single cell). The
+                domains are the ones ``semantic_model_coverage`` reports;
+                ``__local__`` is the source id of the no-connection bucket.
+            reason: Why the check is expected. Optional at the API and strongly
+                worth filling: it is what the next reader inherits.
+            expires_at: ISO-8601 instant at which the check starts reporting
+                again (e.g. ``2026-10-01T00:00:00Z``). Omit for "until somebody
+                unmutes it". Must be in the future.
+
+        Mirrors ``POST /api/admin/semantic-layer/mutes`` and
+        ``agnes semantic-model mute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        payload = {"scope": scope, "reason": reason or None, "expires_at": expires_at or None}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def unmute_semantic_check(mute_id: str) -> dict:
+        """Let a silenced semantic-layer check report again (admin only).
+
+        Args:
+            mute_id: The mute's id, from ``semantic_mutes_list``.
+
+        Mirrors ``DELETE /api/admin/semantic-layer/mutes/{mute_id}`` and
+        ``agnes semantic-model unmute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-layer/mutes/{mute_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return {"unmuted": mute_id}
 
     @tool(read_only=False, idempotent=False)
     async def flag_semantic_issue(

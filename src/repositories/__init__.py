@@ -179,6 +179,8 @@ __all__ = [
     "resource_source_tags_repo",
     # Semantic-layer feedback queue (F4.5) — Postgres-only
     "semantic_feedback_repo",
+    # Muted semantic-layer health checks (F4.3) — Postgres-only
+    "semantic_health_mutes_repo",
 ]
 
 
@@ -585,6 +587,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "semantic_feedback": {
         PG: ("src.repositories.semantic_feedback_pg", "SemanticFeedbackPgRepository"),
     },
+    # Muted semantic-layer health checks (F4.3) — POSTGRES-ONLY, same
+    # reasoning as the two entries above.
+    "semantic_health_mutes": {
+        PG: ("src.repositories.semantic_health_mutes_pg", "SemanticHealthMutesPgRepository"),
+    },
 }
 
 
@@ -938,3 +945,9 @@ def resource_source_tags_repo() -> Any:
 # RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
 def semantic_feedback_repo() -> Any:
     return _build("semantic_feedback")
+
+
+# Muted semantic-layer health checks (F4.3) — POSTGRES-ONLY. Raises
+# RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
+def semantic_health_mutes_repo() -> Any:
+    return _build("semantic_health_mutes")

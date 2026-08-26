@@ -39,6 +39,9 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
     ),
     "GET /api/admin/semantic-feedback": "the feedback queue reads `semantic_feedback`, a PG-only table (F4.5)",
+    "GET /api/admin/semantic-layer/mutes": (
+        "the muted-check list reads `semantic_health_mutes`, a PG-only table (F4.3)"
+    ),
 }
 
 

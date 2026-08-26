@@ -80,6 +80,12 @@ TAG_RESOURCE_TYPE_BY_DOMAIN: Dict[str, str] = {v: k for k, v in TAG_DOMAIN_BY_RE
 #: retired page's "legacy / unattributed" bucket existed to close.
 LOCAL_BUCKET_NAME = "Local / no connection"
 
+#: The id that synthetic row answers to. Named rather than spelled inline
+#: because it is not a ``source_connections.id``: anything validating a source
+#: id against that table (F4.3's mute scopes) has to special-case exactly this
+#: value, and a magic string copied into a second module is how the two drift.
+LOCAL_BUCKET_ID = "__local__"
+
 _BUILDER_HREF = "/admin/studio/semantic-layer"
 _DATA_SOURCES_HREF = "/admin/data-sources"
 
@@ -439,7 +445,7 @@ def _local_bucket(
             action={"label": "Author a model", "href": _BUILDER_HREF},
         )
     return {
-        "source_id": "__local__",
+        "source_id": LOCAL_BUCKET_ID,
         "source_type": "local",
         "name": LOCAL_BUCKET_NAME,
         "domains": {

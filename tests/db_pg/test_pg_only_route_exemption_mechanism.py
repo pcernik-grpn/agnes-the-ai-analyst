@@ -162,6 +162,100 @@ def test_assert_pg_only_exemptions_fail_clean_no_exemptions_is_a_noop():
 # ---------------------------------------------------------------------------
 
 
+def test_sweeps_run_fail_clean_check_before_pg_client_build():
+    """The fail-clean check must run while DuckDB is still the live backend.
+
+    ``build_seeded_client("pg", ...)`` sets ``AGNES_DB_URL``, and
+    ``src.repositories.use_pg`` reads it live on every ``*_repo()`` call — a
+    ``TestClient`` does not pin the backend it was built under. So once the pg
+    client exists, requests through the "DuckDB" client resolve repos on
+    Postgres and the typed-501-on-DuckDB check silently exercises the wrong
+    backend (the PG-only repo then EXISTS, no ``RequiresPostgresBackend`` is
+    raised, and the check fails for the wrong reason — or worse, a handler
+    that swallows the error passes). Pin the call order in both sweeps.
+    """
+    import inspect
+
+    import tests.db_pg.test_get_status_parity_sweep as get_sweep
+    import tests.db_pg.test_mutation_status_parity_sweep as mutation_sweep
+
+    for fn in (
+        get_sweep.test_get_status_is_identical_across_backends,
+        mutation_sweep.test_mutation_status_is_identical_across_backends,
+    ):
+        # Drop comment lines first — the sweeps carry an explanatory comment
+        # that itself names build_seeded_client("pg", ...), which would
+        # otherwise shadow the real call site.
+        source = "\n".join(line for line in inspect.getsource(fn).splitlines() if not line.lstrip().startswith("#"))
+        check_at = source.index("assert_pg_only_exemptions_fail_clean(")
+        pg_build_at = source.index('build_seeded_client("pg"')
+        assert check_at < pg_build_at, (
+            f"{fn.__module__}.{fn.__name__}: assert_pg_only_exemptions_fail_clean "
+            "must be called BEFORE build_seeded_client('pg', ...) — the pg build "
+            "sets AGNES_DB_URL and use_pg() reads it live per *_repo() call, so "
+            "afterwards the DuckDB client resolves repos on Postgres and the "
+            "typed-501-on-DuckDB check never exercises DuckDB"
+        )
+
+
+def test_post_reload_raise_still_translates_to_typed_501(tmp_path, monkeypatch):
+    """``build_seeded_client`` reloads ``src.repositories``, and ``app.main``
+    registered its 501 handler against the class it imported at its own import
+    time. Starlette resolves handlers via the raised exception's MRO, so if the
+    reload produced a NEW class object the raise would fall through to the
+    catch-all 500 — the original bug this test was written for.
+
+    Two things now stand between that bug and production, and this test pins
+    both. ``RequiresPostgresBackend`` lives in its own import-free module
+    (``src/repository_errors.py``), which ``importlib.reload(src.repositories)``
+    does not touch — so the identity is STABLE across any number of reloads, in
+    either order — and the harness re-registration
+    (``_reregister_requires_pg_handler``) remains as belt-and-braces. The
+    identity assertion below therefore reads the way it does deliberately: it
+    used to demand that the reload rebind the class (back when the class was
+    defined inside ``src/repositories/__init__.py``, which made rebinding
+    unavoidable), and it now demands the opposite, because the fix was to make
+    rebinding impossible. Flipping it back would silently reintroduce the
+    unhandled 500.
+
+    The end-to-end proof is unchanged: a route raising the current class on the
+    DuckDB-built client answers the exact typed 501 that
+    ``assert_pg_only_exemptions_fail_clean`` demands."""
+    import app.main  # bind app.main's class reference BEFORE the reload below  # noqa: F401
+
+    from ._parity_sweep_util import build_seeded_client
+
+    client, token = build_seeded_client("duckdb", tmp_path, monkeypatch, None)
+
+    import src.repositories
+
+    exc_cls = src.repositories.RequiresPostgresBackend  # the post-reload class
+    assert exc_cls is app.main.RequiresPostgresBackend, (
+        "the reload rebound RequiresPostgresBackend — it must be defined in an "
+        "import-free module of its own (src/repository_errors.py) so reloading "
+        "src.repositories cannot produce a second class object that app.main's "
+        "handler no longer matches"
+    )
+
+    from fastapi import APIRouter
+
+    probe_router = APIRouter()
+
+    @probe_router.get("/_test/pg-only-probe")
+    def _probe():
+        raise exc_cls("widgets")
+
+    # Insert FIRST, not append: the web router ends with a catch-all route, so
+    # an appended route would never match (404) and prove nothing.
+    client.app.router.routes.insert(0, probe_router.routes[0])
+
+    r = client.get("/_test/pg-only-probe", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 501, f"expected the typed 501 translation, got {r.status_code}"
+    body = r.json()
+    assert body["error"] == "requires_postgres_backend"
+    assert body["feature"] == "widgets"
+
+
 def test_production_pg_only_exemptions_all_have_reasons():
     """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` are ``dict[str, str]``,
     so an exemption can never be added without a stated reason a reviewer can
