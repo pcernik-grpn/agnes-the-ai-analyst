@@ -10,6 +10,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+## [0.89.0] - 2026-08-26
+
 ### Added
 
 - **Hosted data-app containers are blocked from the cloud metadata server at
