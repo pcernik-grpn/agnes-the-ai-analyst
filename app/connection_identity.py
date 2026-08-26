@@ -1,8 +1,8 @@
-"""Which ``data_source.<source>`` leaves decide *where* a registration points.
+"""Which leaves decide *where* a registration points.
 
 A registered table stores its upstream coordinates relative to the instance's
 one connection per source: a Snowflake row keeps ``bucket='GOLD'`` and resolves
-the *database* from ``data_source.snowflake.database`` at extract-build time,
+the *database* from the connection's own coordinates at extract-build time,
 baking the result into ``_remote_attach.url`` and into the remote view's
 ``sf."GOLD"."T"``. Repoint that connection and every existing row of the source
 keeps naming a database/schema pair the new upstream does not have: a
@@ -11,8 +11,18 @@ exist``), a materialized sync fails at COPY time, and ``last_sync_status`` goes
 on reporting the last *successful* run — so the instance looks healthy while
 its data is stale.
 
+The leaf NAMES are shared across two writers of the same shape (field names
+match 1:1): the legacy ``data_source.<source>`` server-config yaml overlay
+block (guarded by ``app.api.admin._guard_connection_repoint`` on `POST
+/api/admin/server-config` / `POST /api/admin/configure`), and — since D2.3,
+for Snowflake/Databricks — the connection row's own ``config`` dict (guarded
+by ``app.api.admin_source_connections._guard_row_repoint`` on `PUT
+/api/admin/source-connections/{id}`). Keboola's identity lived on the row
+from the start; BigQuery's row-edit path is not yet guarded (out of scope
+for D2 slice 2).
+
 The leaves listed here are the ones that change *which upstream* answers, as
-opposed to the tuning knobs that live in the same block (scan caps, timeouts,
+opposed to the tuning knobs that live alongside them (scan caps, timeouts,
 pool sizes) and break nothing. Changing a credential-pointer leaf
 (``token_env``, ``private_key_env``) counts: it swaps which secret is
 presented, and therefore which grants apply.
