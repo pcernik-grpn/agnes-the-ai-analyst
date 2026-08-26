@@ -144,10 +144,46 @@ def env(tmp_path, monkeypatch, shared_app):
     }
 
 
+def _grant_package(user_id: str, pkg_id: str) -> None:
+    """Direct `resource_grants(resource_type='data_package', ...)` row for
+    `user_id` — the write-gate (C2.1) requires a non-admin writer to
+    currently hold whatever data_package they declare in `knowledge`."""
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    groups = UserGroupsRepository(conn)
+    grp = groups.get_by_name("v1-parity-pkg-grants") or groups.create(
+        name="v1-parity-pkg-grants", description="test", created_by="test"
+    )
+    members = UserGroupMembersRepository(conn)
+    if not members.has_membership(user_id, grp["id"]):
+        members.add_member(user_id, grp["id"], source="admin", added_by="test")
+    grants = ResourceGrantsRepository(conn)
+    if not grants.has_grant([grp["id"]], "data_package", pkg_id):
+        grants.create(
+            group_id=grp["id"],
+            resource_type="data_package",
+            resource_id=pkg_id,
+            assigned_by="test",
+            requirement="required",
+        )
+    conn.close()
+
+
 def _make_pkg(name: str, slug: str) -> str:
+    """A data package, granted to `owner1` immediately — every test in this
+    file declares it via `owner1`'s `knowledge`, and the write-gate (C2.1)
+    requires that writer to already hold what they declare."""
     from src.repositories import data_packages_repo
 
-    return data_packages_repo().create(name=name, slug=slug, description=None, icon=None, color=None, created_by="test")
+    pkg_id = data_packages_repo().create(
+        name=name, slug=slug, description=None, icon=None, color=None, created_by="test"
+    )
+    _grant_package("owner1", pkg_id)
+    return pkg_id
 
 
 # ---------------------------------------------------------------------------
