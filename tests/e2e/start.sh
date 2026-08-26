@@ -7,8 +7,9 @@
 #   2. Seed the analytics DuckDB with the SQL fixtures under sample-data/.
 #   3. Boot uvicorn.
 #
-# Under the E2B-provider model there is no iptables / nsjail step — chat
-# sandboxes run in E2B microVMs, not on this host.
+# There is no iptables / nsjail step here — chat sandboxes are sibling
+# docker containers spawned (and hardened: cap_drop ALL, no-new-privileges,
+# pids/mem/cpu limits) by the apps-runner sidecar, not by this container.
 
 set -euo pipefail
 

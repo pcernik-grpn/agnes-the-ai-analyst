@@ -1,12 +1,12 @@
-"""Docker-backed SandboxProvider — the self-hosted alternative to E2B.
+"""Docker-backed SandboxProvider — self-hosted chat sandboxes.
 
-Each chat session runs in a local Docker container instead of an E2B microVM.
+Each chat session runs in a local Docker container.
 Every Docker call goes through the apps-runner sidecar
 (``app/chat/sandbox_runner_client.py`` → ``services/apps_runner/sandbox_api.py``)
 so the gateway process never touches ``/var/run/docker.sock`` — the socket
 confinement invariant this repo enforces everywhere else.
 
-Three things differ from :mod:`app.chat.e2b_provider`, all deliberate:
+Three defining traits of this provider, all deliberate:
 
 **The workspace is bind-mounted, not uploaded** (``syncs_workspace = True``).
 The per-session dir becomes ``/work`` and the user's workspace is mounted at the
@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 # Reused rather than re-implemented: the queue-backed reader is the exact
 # StreamReader shim ChatManager's pump expects, and its readline() buffering is
 # subtle enough that a second copy would drift.
-from app.chat.e2b_provider import SANDBOX_WORKDIR, _StreamReaderAdapter
+from app.chat.provider import SANDBOX_WORKDIR, _StreamReaderAdapter
 
 # Module-level so unit tests can ``patch("app.chat.docker_provider.SandboxRunnerClient")``.
 from app.chat.config import sandbox_can_reach_directly
@@ -106,7 +106,8 @@ def container_name(chat_id: str) -> str:
 
 @dataclass
 class EntryInfo:
-    """E2B-``EntryInfo``-shaped row for the ``files.list`` shim."""
+    """``EntryInfo``-shaped row for the ``files.list`` shim (the file-API
+    contract ``app.chat.artifact_harvest`` consumes)."""
 
     name: str
     path: str
@@ -114,7 +115,7 @@ class EntryInfo:
 
 
 class _SandboxFiles:
-    """The E2B file-API surface ``app.chat.artifact_harvest`` consumes
+    """The sandbox file-API surface ``app.chat.artifact_harvest`` consumes
     (``.list(path)`` / ``.read(path, format=...)`` / ``.write(path, data)``),
     backed by the sidecar's file endpoints so headless runs and the agent API
     work unchanged under this provider."""
@@ -147,8 +148,8 @@ class _SandboxFiles:
 class _StdinWriter:
     """``asyncio.StreamWriter``-shaped adapter over ``POST /sandboxes/*/stdin``.
 
-    Buffers on ``write`` and ships one sidecar call per ``drain`` — matching the
-    E2B adapter, and matching how ChatManager writes (one JSON line, then drain,
+    Buffers on ``write`` and ships one sidecar call per ``drain`` — matching
+    how ChatManager writes (one JSON line, then drain,
     under ``live._stdin_lock``).
     """
 
@@ -305,22 +306,22 @@ class DockerSandboxProvider:
     Constructor params mirror the ``chat.docker_*`` config block:
 
     image:
-        Sandbox image tag (``chat.docker_image``). Empty → ``spawn()`` raises,
-        mirroring the E2B provider's missing-template behavior.
+        Sandbox image tag (``chat.docker_image``). Empty → ``spawn()`` raises
+        at spawn time rather than failing deep inside a session.
     network:
         Docker network the sandbox joins; must be one the Agnes app is also
         attached to so ``AGNES_SERVER`` resolves.
     mem_limit / cpus / pids_limit:
         Always-set resource bounds (D7) — local sandboxes contend with the
-        gateway host, unlike E2B's offloaded compute.
+        gateway host, unlike offloaded remote compute.
     egress_mode:
         ``open`` (normal bridge, internet reachable), ``none`` (an
         ``internal`` bridge: only containers on that network are reachable),
         or ``allowlist`` (the ``none`` internal bridge PLUS the
         services/egress_proxy sidecar: HTTP(S)_PROXY env points sandboxes
         at the proxy, which enforces the hostname allowlist with a
-        post-resolution IP re-check — E2B ``allow_out`` parity, with
-        DNS-rebinding/metadata protection E2B doesn't have).
+        post-resolution IP re-check for DNS-rebinding/metadata
+        protection).
     egress_proxy_url:
         Where sandboxes find the proxy in ``allowlist`` mode; must resolve
         on the internal network (compose service name).
@@ -448,8 +449,8 @@ class DockerSandboxProvider:
             # Profile session: WorkdirManager COPIED `.claude`/`CLAUDE.md`
             # into the session dir precisely so the profiled agent works on
             # private settings — mounting the whole workspace would hand it
-            # the shared originals anyway (E2B kept this isolation
-            # structurally: only the session dir was uploaded). Mount just
+            # the shared originals anyway (the session dir is the isolation
+            # boundary). Mount just
             # the fixed data entries WorkdirManager itself links, so
             # `snapshots` (writable — `agnes snapshot create` lands there)
             # and the read-only extras resolve while the workspace's
@@ -491,7 +492,7 @@ class DockerSandboxProvider:
         A plain host write: ``/work`` *is* this directory, so no Docker round
         trip is needed and the file keeps the gateway's ownership (a
         ``put_archive`` copy would land root-owned and block later cleanup).
-        Same "not baked into the image" trade-off as E2B (Q2).
+        Kept out of the image so the runner version always matches the server (Q2).
         """
         try:
             src = Path(__file__).with_name("runner.py").read_text(encoding="utf-8")
@@ -585,7 +586,7 @@ class DockerSandboxProvider:
     async def pause(self, handle: DockerSandboxHandle) -> None:
         """Detach, then ``docker pause``.
 
-        Honest semantics vs E2B: the runner process and its memory survive only
+        Honest semantics: the runner process and its memory survive only
         as long as the daemon does — a daemon restart or host reboot loses them,
         and the next resume raises into ``_respawn_fresh``.
         """

@@ -198,12 +198,14 @@ echo "checking redis reachability..."
 
 # Real lease/ws-ticket keys (app/coordination/leases.py's
 # `paused-sandbox-sweep`; app/api/chat.py's `ws-ticket:<id>`) only ever
-# appear once chat is enabled (chat.enabled=true plus ANTHROPIC_API_KEY,
-# E2B_API_KEY and chat.e2b_template_id — see app/main.py's
-# `_chat_*_ok` startup guards), none of which this harness configures
-# (config/instance.mtier.yaml has no `chat:` section at all). Forcing
-# that on would pull in an E2B/Anthropic dependency this smoke doesn't
-# otherwise need just to get a key to scan for. Same reason: the
+# appear once chat is enabled (chat.enabled=true plus ANTHROPIC_API_KEY
+# and a provider whose backing is up — the kai-agent engine sidecar +
+# KAI_HOST_JWT_SECRET, or the apps-runner sidecar with a built sandbox
+# image; see app/main.py's `_chat_*_ok` startup guards), none of which
+# this harness configures (config/instance.mtier.yaml has no `chat:`
+# section at all). Forcing that on would pull in an engine/sidecar/
+# Anthropic dependency this smoke doesn't otherwise need just to get a
+# key to scan for. Same reason: the
 # gateway-kill→sweep-lease-reappears continuity check is intentionally
 # omitted (sweep lease only fires when chat.enabled=true).
 #
@@ -338,15 +340,18 @@ echo "post-FLUSHALL coordination write OK (redis repopulated within ${i}s; keys=
 # Full chat.enabled=true live-session coverage (spawn a runner, exchange
 # turns, observe the reconnect replay/full_refresh control frame — wave-2F
 # tasks 1-5, see docs/architecture.md and docs/DEPLOYMENT.md's chat HA
-# sections) needs a real ANTHROPIC_API_KEY + E2B_API_KEY + a built
-# e2b_template_id, plus an authenticated user with a chat-RBAC grant — none
-# of which this harness configures (config/instance.mtier.yaml has no
-# `chat:` section at all, same reason section 2's comment above gives for
-# omitting the sweep-lease check). Per Q7 (owner decision — see
-# tests/test_chat_e2b_provider.py's module docstring) there is no
-# MockE2BProvider / non-e2b test provider to substitute; `e2b` is the only
-# chat.provider app/main.py accepts in production. So rather than a live
-# session, this section drives the real running route handler
+# sections) needs a real ANTHROPIC_API_KEY plus a provider whose backing
+# is up (the kai-agent engine sidecar + KAI_HOST_JWT_SECRET, or the
+# apps-runner sidecar + a built agnes-chat-sandbox image), plus an
+# authenticated user with a chat-RBAC grant — none of which this harness
+# configures (config/instance.mtier.yaml has no `chat:` section at all,
+# same reason section 2's comment above gives for omitting the sweep-lease
+# check). There is deliberately no mock chat provider to substitute
+# (app/main.py refuses unknown providers outright; the closest stand-in,
+# the kai-agent stub engine of docs/kai-agent-local-dev.md, is another
+# sidecar this harness doesn't run — and the docker provider is
+# single-gateway, unsupported on this multi-gateway topology anyway). So
+# rather than a live session, this section drives the real running route handler
 # (app/api/chat.py::ws_stream) to prove the cross-replica INFRA a live
 # session rides on:
 #

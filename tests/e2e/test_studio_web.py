@@ -155,9 +155,11 @@ def test_skill_builder_shows_advisory_lint_then_publishes(video_ctx):
 @pytest.mark.real_llm
 @pytest.mark.timeout(300)
 def test_live_agent_assists_in_data_package_builder(video_ctx):
-    """LIVE: a real Claude agent (E2B sandbox, data-package-builder profile)
-    answers in the builder's assistant panel. Needs AGNES_E2E_ANTHROPIC=1 +
-    AGNES_E2E_E2B=1 + real ANTHROPIC_API_KEY/E2B_API_KEY (no fake agent)."""
+    """LIVE: a real Claude agent (docker chat sandbox, data-package-builder
+    profile) answers in the builder's assistant panel. Needs
+    AGNES_E2E_ANTHROPIC=1 + AGNES_E2E_DOCKER=1 (apps-runner sidecar up,
+    agnes-chat-sandbox image built) + a real ANTHROPIC_API_KEY (no fake
+    agent)."""
     browser, base = video_ctx
     ctx = browser.new_context(
         record_video_dir=str(_VIDEO_DIR),
@@ -168,7 +170,7 @@ def test_live_agent_assists_in_data_package_builder(video_ctx):
     try:
         page.goto(f"{base}/admin/studio/data-package", wait_until="domcontentloaded")
         page.wait_for_selector("#studio-msg", timeout=15_000)
-        # The assistant panel opens a profiled chat session on load; the E2B
+        # The assistant panel opens a profiled chat session on load; the
         # sandbox spawn takes a few seconds before it can receive a message.
         page.wait_for_timeout(6_000)
         page.fill("#studio-msg", "Suggest a data package for finance reporting and which tables it should include.")

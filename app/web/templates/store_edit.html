@@ -3,7 +3,15 @@
 {% block title %}Edit {{ entity.name | store_display_name }} — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
+  /* Mirrors the native <select>'s own `disabled` attribute — pending_sub
+     locks the whole form, and the branded dropdown has no disabled state of
+     its own (see _components.html's `dropdown` macro), so this page-local
+     rule fakes one for it: no clicks, muted like every other disabled
+     control here. */
+  .ds-dropdown[aria-disabled="true"] .ds-dropdown-btn { pointer-events: none; opacity: .5; }
+
   .lint-advice { border: 1px solid var(--ds-border); border-radius: var(--radius-lg); background: var(--ds-surface); padding: var(--space-4); margin: var(--space-3) 0; }
   .lint-advice-head { margin: 0 0 4px 0; font-size: var(--text-base); font-weight: var(--font-semibold); color: var(--ds-text-primary); }
   .lint-advice-sub { margin: 0 0 var(--space-3) 0; font-size: var(--text-xs); color: var(--ds-text-muted); }
@@ -182,13 +190,25 @@
 
     <div class="field">
       <label class="field-label" for="f-category">Category</label>
-      <select id="f-category" name="category"
+      {% set category_options = [{'value': '', 'label': '— none —'}] %}
+      {% for cat in categories %}
+      {% set _ = category_options.append({'value': cat, 'label': cat}) %}
+      {% endfor %}
+      {# The real <select> stays the control the JS below reads at submit time
+         — untouched. The custom dropdown alongside it is a visual
+         replacement only, same as store_upload.html's #category. #}
+      <select id="f-category" name="category" class="ds-dropdown-native"
               {% if pending_sub %}disabled{% endif %}>
-        <option value="">— none —</option>
-        {% for cat in categories %}
-        <option value="{{ cat }}" {% if cat == entity.category %}selected{% endif %}>{{ cat }}</option>
+        {% for opt in category_options %}
+        <option value="{{ opt.value }}" {% if opt.value == entity.category %}selected{% endif %}>{{ opt.label }}</option>
         {% endfor %}
       </select>
+      {{ ds.dropdown(
+        id='f-category-dd', target='f-category',
+        aria_label='Category', selected=entity.category or '',
+        options=category_options,
+        attrs=('aria-disabled="true"' if pending_sub else ''),
+      ) }}
     </div>
 
     <div class="field">
@@ -248,6 +268,7 @@
   </form>
 </div>
 
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 const ENTITY_ID = {{ entity.id|tojson }};
 const banner = document.getElementById('banner');

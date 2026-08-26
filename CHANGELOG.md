@@ -10,6 +10,383 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Internal
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
+### Added
+
+- **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
+  the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
+  `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
+  of its own, so an enabled provider with no allowed domain means any Google
+  account can sign in and self-provision, and nothing said so at boot. Found
+  during RBAC review of the `config/loader.py` required-fields demotion above:
+  that loader check used to be an accidental loud signal for exactly this gap
+  (a missing `auth.allowed_domain` discarded the whole static config with an
+  ERROR log) and is now a passive warning, so the gap needed its own explicit
+  check.
+
+### Changed
+
+- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
+  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
+  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
+  `instance.theme` / `instance.experience` / `instance.home_route` /
+  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
+  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
+  UI (`/admin/server-config`) owns them from day 2 onward instead of having
+  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
+  value and permanently shadow the operator's own change. **Existing VMs**:
+  on their next boot the old always-wins `.env` lines disappear; the value
+  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
+  relied on Terraform re-asserting one of these four knobs every boot must
+  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
+  by hand). No app-side precedence change — a hand-set env var still wins
+  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
+  is unaffected (it pins deployment-provisioned backing, not a presentation
+  choice, so it is out of scope). See the new "Config ownership map" in
+  `docs/CONFIGURATION.md`.
+
+### Removed
+
+- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
+  `jira:` section is gone from both the `/admin/server-config` UI (it never
+  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
+  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
+  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
+  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
+  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
+  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
+  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
+  (zero readers — found during a sweep for other dead keys in the same
+  section). `deployment.role` is unaffected.
+
+### Fixed
+
+- **`config/loader.py` no longer raises on a static `instance.yaml` missing
+  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
+  `auth.webapp_secret_key`.** The check never actually gated anything: a
+  provisioned VM ships no static `instance.yaml` at all (the loader raises
+  `FileNotFoundError` first), and `app.instance_config` already caught the
+  `ValueError` and served built-in defaults regardless. It now logs a
+  warning naming the missing field(s) instead of raising, so a direct caller
+  of `config.loader.load_instance_config()` (e.g. a connector script) no
+  longer gets an exception on an otherwise-bootable config.
+
+## [0.89.1] - 2026-08-26
+
+### Fixed
+
+- **The in-chat data-app preview works again for logged-in users in the
+  default posture.** The 0.89.0 same-origin gate resolved the caller
+  session-first: a preview iframe carries the viewer's `access_token` session
+  cookie ALONGSIDE its per-app `data-app-preview:<slug>` cookie (browsers
+  attach both), so it authenticated as a plain session and was refused (403)
+  unless the instance-global `data_apps.allow_same_origin` escape hatch was
+  on — breaking the exact flow the preview token exists for. The ingress
+  proxy now tries the preview credential first, trusting it only when its
+  verified scope pins THIS slug; an expired/revoked/wrong-slug preview token
+  grants nothing and falls back to normal session resolution, and the
+  control-plane API still rejects the preview scope. The WebSocket bridge
+  gained the same preview path (it had none), so a WS-based app
+  (Streamlit/Dash) can connect from the in-chat preview too.
+
+### Changed
+
+- The `app` service's compose gateway pin now sets `networks.default.gw_priority`
+  alongside `priority`: on Docker Engine ≥ 28 only `gw_priority` selects a
+  container's gateway network (`priority` deliberately does not), so the pin
+  that keeps the app's egress — including GCP-metadata traffic for BigQuery
+  auth — off the `agnes-apps` bridge and out of the metadata DROP rule's
+  source subnet was not guaranteed there. Sets the minimum Compose CLI at
+  v2.33.1 (older Compose rejects the key at validation; pre-28 engines still
+  honor `priority` via connection order).
+
+### Internal
+
+- `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` now
+  resolves through the switch registry (`app/switches.py`, entry
+  `data_apps_allow_same_origin`) instead of a hand-rolled env/config pair —
+  same resolution order, parsing and default, and the flag now appears
+  (locked, with its reason) in the `/admin/server-config` feature-flag
+  inventory and `docs/feature-flags.md`.
+
+## [0.89.0] - 2026-08-26
+
+### Added
+
+- **Hosted data-app containers are blocked from the cloud metadata server at
+  the host firewall.** A data app runs user-authored code (RCE inside its own
+  container is by design), and on the `agnes-apps` bridge it could otherwise
+  reach the instance metadata server (`169.254.169.254`), read the VM's
+  service-account token, and pivot to the whole cloud project. The
+  `customer-instance` Terraform module now installs an idempotent `DOCKER-USER`
+  iptables DROP at boot (`container-metadata-hardening` block in
+  `startup-script.sh.tpl`), source-scoped to the `agnes-apps` subnet so the
+  Agnes app container's own metadata use (e.g. BigQuery GCE-metadata auth) is
+  untouched — the `app` service now pins `default` as its highest-priority
+  network (`docker-compose.yml`), so its egress routes off `agnes-apps` and its
+  source IP never matches the rule. Non-Terraform hosts should install the
+  equivalent rule (see `docs/architecture.md#hosted-data-apps`) and
+  least-privilege the VM service account regardless. Fail-soft: a missing
+  `iptables` or an unresolvable subnet warns and never blocks the boot.
+
+### Changed
+
+- **BREAKING: hosted data apps are no longer served on the main Agnes origin by
+  default.** A hosted app's user-authored JS, served same-origin with the Agnes
+  `/api` (the `/apps/<slug>/…` path-prefix form), can call `/api` with the
+  viewer's own session and read the response (mint a PAT, read admin config) —
+  no response header can close a same-origin read. The ingress proxy now
+  refuses to serve an app on the main origin unless the operator either
+  configures `data_apps.subdomain_base` (serve apps from an isolated origin,
+  where the existing CORS + CSRF-origin defenses contain the attack) or
+  explicitly opts into same-origin serving with the new
+  `data_apps.allow_same_origin` / `AGNES_DATA_APPS_ALLOW_SAME_ORIGIN` (default
+  `false`). Requests that arrive on a data-app subdomain are always served, and
+  the in-chat preview keeps working without the flag — it is served same-origin
+  only to a caller holding a per-app `data-app-preview:<slug>` token, so
+  enabling the preview does not re-open drive-by same-origin serving for other
+  apps. A deployment that serves apps publicly in path-prefix mode (no
+  `subdomain_base`) must set `allow_same_origin: true` (trusted authors only) or
+  move to subdomain mode; a startup log flags an enabled-but-unservable posture.
+
+### Removed
+
+- **BREAKING: removed the `e2b` chat provider.** `chat.provider` now accepts
+  only `kai-agent` (the new default) and `docker`. A deployment still
+  configured with `provider: e2b` (instance.yaml or `AGNES_CHAT_PROVIDER`)
+  boots with chat disabled and an actionable error log — switch the provider
+  and restart; the `customer-instance` Terraform module refuses `e2b` at plan
+  time. The `chat.e2b_template_id`, `chat.egress_allow_out`,
+  `chat.e2b_workspace_max_bytes` and `chat.e2b_kill_on_ws_disconnect` config
+  keys, the `E2B_API_KEY` secret (admin UI field, readiness rows, live probe)
+  and the bundled `e2b-template/` sandbox image are gone
+  (`e2b_kill_on_ws_disconnect: true` no longer implies `on_detach: kill` — a
+  stale key warns and gets the `pause` default). The kai engine sidecar's own
+  E2B backing (`kai_agent_e2b_key_secret`) is unaffected. The E2E chat suites
+  now run on the docker provider (`AGNES_E2E_DOCKER=1` replaces
+  `AGNES_E2E_E2B`; `e2e-docker.yml` replaces `e2e-e2b.yml`).
+### Fixed
+- **A corrupt parquet part is no longer distributed, and no longer overwrites
+  an analyst's good local copy.** `_hash_table_parts` / `_update_sync_state`
+  (`src/orchestrator.py`) now check each part's leading + trailing `PAR1`
+  magic bytes (or a `PARE` encrypted-footer tail) before hashing it — reusing
+  the file handle already open for the MD5, not a second read. This is a
+  structural check only ("well-formed enough to admit", not "valid"): it
+  catches truncation/footerless writes (the failure mode behind #1354) but
+  not subtle internal corruption a footer-level check can't see. A part that
+  fails it is refused and logged at WARNING naming the exact path. Refusing a
+  part that was never previously published simply excludes it from this
+  sync's manifest — nothing local depends on it yet. Refusing a part that
+  *was* previously published good instead freezes its manifest entry at the
+  last known-good hash: `agnes pull`'s `_diff_parts` treats a part that is
+  locally present but absent from a fresh manifest as an intentional
+  server-side deletion and prunes it, so naive omission would have deleted
+  the analyst's good copy — the opposite of the fix's intent, and worse than
+  the original bug (which only overwrote it with corrupt bytes). Healthy
+  sibling parts of the same table, and the same table on a later rebuild once
+  the source part is repaired, are unaffected. (#1364)
+
+### Internal
+
+- **The release-cut moves out of feature PRs and into one daily cut PR.**
+  The old rule — whichever PR happened to land last with content under
+  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
+  section — raced two PRs against the same version number and produced a
+  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
+  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
+  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
+  the new `.github/workflows/daily-cut.yml` (minor bump by default,
+  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
+  labeled `release-cut` that a human reviews and merges — the workflow
+  never merges or tags anything itself. The cut arithmetic is pure
+  functions in `scripts/release_cut.py` (unit-tested in
+  `tests/test_release_cut.py`, including a guard against the known
+  3-way-merge duplicate-heading failure class), reused for the emergency
+  manual path when Actions dispatch isn't available. See
+  `docs/RELEASING.md` for the full ritual and the train-driver operating
+  rule.
+
+## [0.88.0] - 2026-08-25
+
+### Added
+
+- **New `/agnes-review` reviewer: `agnes-reviewer-adversarial`.** The existing reviewers (rules/architecture/rbac/parity) are pattern-matching checklists against a fixed rule list — none of them re-derive a PR's own claims, sweep for the same bug at a sibling call site the diff didn't touch, tell a test that proves behavior apart from one that only greps its own source for a string, or check that the CI behind a "green checks" claim actually ran the suite. The new reviewer does all four: verifies factual premises in the PR body/commit messages against the base ref instead of trusting the diff in isolation, greps the whole repo for structurally similar call sites left unfixed, traces whether a new guard's data is actually produced end-to-end rather than accepting a source-existence test as proof, and checks that the CI run behind a "green checks" claim actually ran the test suite (not just a build/release workflow) on a base ref current enough to mean anything. Opt-in via `/agnes-review --adversarial` — its checks are slow (real test runs, whole-repo greps, CI history), so it doesn't fire by default.
+
+### Changed
+
+- **`/admin/initial-workspace`'s "Link template repository" modal gets the richer form treatment (#722).** Icon-headed modal title, a required-field marker on Repository URL, a GitHub icon prefixed on the URL input, and a collapsible "Advanced settings" section (open by default) holding Auto-sync and the PAT field. Auto-sync moves from a single free-text schedule field (`daily HH:MM` grammar, easy to typo with no feedback until save) to a three-state picker — Daily/Disabled/Custom — with a branded `.ds-dropdown` mode select plus a native `<input type="time">` for the Daily case; anything not matching the plain `daily HH:MM` shape (the scheduler's richer `every Nm`/`every Nh`/comma-listed-times grammar) round-trips through Custom as raw text instead of being silently narrowed. The PAT field gains a show/hide eye toggle and a "Stored securely" note. The modal also widens to 520px (480px was cramped once Advanced settings landed — the Auto-sync row alone packs a dropdown, a time input and a "UTC" label onto one line) and gains proper focus management: opening remembers what had focus to restore on close, and Tab is trapped inside the topmost open modal.
+
+- **The `/admin/access` grant tree now explains what each resource type actually does.** Every `ResourceTypeSpec.description` renders as a header tooltip and an expanded-section caption — previously the field existed but nothing rendered it, so an admin had no way to learn, e.g., that a `TABLE` grant doesn't reach analyst visibility. `ResourceType.TABLE`'s description now says so explicitly: analyst table access flows entirely through Data Packages, and a direct table grant only sets the ceiling that agent scoping (`tables_mode='selected'`) and co-session grant intersection narrow against — a no-op unless one of those is in use. `docs/RBAC.md`'s stale v49 union formula for `TABLE`/`DATA_PACKAGE` is corrected to match, with a new section documenting the agent-scope/co-session ceiling behavior.
+
+- **Slack app manifests trimmed to the minimal bot-token scope set.** The
+  three shipped manifests (`services/slack_bot/manifest.yaml` + the two
+  transport variants in `docs/`) had drifted; they now carry the same five
+  bot scopes with a per-scope justification and no user scopes. Dropped the
+  dead `users:read` + `users:read.email` (identity binds via the `/setup`
+  code flow — the bot never reads Slack profiles), added the missing
+  `reactions:write` to the canonical manifest (the ack-emoji call silently
+  degraded to a log warning without it), and brought slash commands +
+  interactivity to the docs variants. `tests/test_slack_manifest_sync.py`
+  now pins all three copies together. The admin "Slack bot secrets" panel
+  links to the manifests so operators create the Slack app from a manifest
+  instead of hand-picking scopes (hand-picked scope lists are what trips
+  workspace-admin approval and customer security reviews).
+
+### Fixed
+
+- **`/admin/store/submissions`' rows were entirely unreachable by keyboard** — the whole table's "click a row to view the submission" affordance was a JS `click` listener on `<tr>`, with no real link anywhere in the row. A keyboard-only admin could not open a single submission's detail page. The type/name cell is now a real `<a href="/admin/store/submissions/{id}">`, `data-noprop`-guarded like the existing submitter-filter link so a real click gets plain anchor navigation instead of double-firing the row handler for the same URL.
+
+- **`admin_database.html`'s own header comment claimed the page already used `ds-card`/`ds.button` "for visual consistency" — false: `.db-actions-card` and its migration buttons were fully hand-rolled with hardcoded colors** (`background:#fff`, `border:#e5e7eb`, `color:#fff` on `var(--ds-primary)`), and the in-progress migration banner hardcoded its warn colors (`#fff7ed`/`#fdba74`/`#9a3412`) instead of `--ds-accent-warn-*` tokens. The card now carries the shared `.ds-card` class; `db_state.js`'s transition buttons (shared with the legacy embedded `/admin/server-config` view, which already had this right) now emit `class="btn btn-primary"` instead of a bare `.btn` styled by a page-local override; the banner uses the warn tokens. The header comment now says what's actually true.
+
+- **A handful of smaller design-system/accessibility gaps found in the same audit pass, batched together**: `.badge.deleted` on `admin_store_submissions.html`/`admin_store_submission_detail.html` hardcoded `#4b5563`/`#f3f4f6` instead of tokens (now `--ds-text-primary`/`--ds-text-inverse`, preserving the "more final than archived" visual distinction rather than collapsing onto `.badge.archived`'s tokens); `admin_mcp_tool_grants.html`'s origin chips and toast hardcoded colors with two exact 1:1 token matches found (`.gr-origin-google_sync` was pixel-identical to `--ds-accent-success-bg`/`-ink`, `.gr-origin-custom`'s ink was pixel-identical to `--ds-kind-agent`) plus a missing `aria-label` on its group-filter input; `admin_tables.html` had ~13 hardcoded hex colors scattered through JS-templated loading/error/warning strings, now tokens; `admin_adoption.html`/`admin_adoption_user.html`'s identical time-window widget had `role="tablist"` but no `role="tab"`/`aria-selected"` on its children (invalid ARIA — a tablist with no tab children); three toolbar search inputs (`admin_knowledge_digests.html`, `admin_marketplaces.html`, `admin_mcp_sources.html`) had no accessible name beyond their placeholder; `admin_marketplaces.html`'s "Format guide →" link opens in a new tab with only a `title` attribute noting it (not reliably announced); `admin_mcp_source_detail.html`'s per-row exposed-name/schedule inputs in the tool-import table had no `aria-label` to disambiguate rows for a screen reader navigating by form control; `admin_session_detail.html`'s per-event expand/collapse toggle had no `aria-expanded`/`aria-controls`, and its error-jump scroll highlight hardcoded `#ef4444` instead of `--ds-accent-danger-line`; `admin_studio_suggestions.html`'s status-filter tabs had `role="tab"`/`aria-selected` but no `aria-controls` linking to the list, which itself lacked `role="tabpanel"`. And a new shared `css/icon_btn.css` replaces four byte-for-byte-identical copies of the same small outline button component (`admin_knowledge_digests.html`, `admin_marketplaces.html`, `admin_mcp_source_detail.html`, `admin_mcp_sources.html`) that had drifted into existence as a copy-paste chain — `admin_mcp_sources.html`'s own prior comment said as much ("mirroring admin_marketplaces.html").
+
+- **`/admin/tables` had 14 unbranded selects across its register/edit modals and the access-policy builder — the largest remaining gap in this pass.** Static-option cases (`kbStrategy`, `kbPartitionGranularity` and their edit-modal mirrors, the legacy `editStrategy`, `apRowCombine`) use the `ds.dropdown()` macro directly with a shared lightweight `_syncDropdownFromSelect()` re-sync for their several modal-open/reset call sites that set `.value` straight from code. Fetched-once cases (`kbProjectSelect`/`editKbProjectSelect`, sharing one populate function; `bulk-assign-package`, including its "+ Create new package…" sentinel that appends an option and re-selects) use a new full-rebuild `_syncDropdownRebuild()` — the file's own version of the button-plus-menu rebuild pattern established for `/admin/linked-apps`, needed because their `<select>`s are static Jinja markup whose surrounding DOM persists across repeat modal opens. Three per-row dynamic cases (`ap-rr-col`/`ap-rr-op` in the row-rule builder, `ap-col-mask` in the column-mask list, `edp-rbac-req` in the package RBAC matrix) use a new page-local `_dropdownMarkupHtml()` helper (mirroring `admin_server_config.html`'s `dsDropdownMarkup()`) with per-row ids, safe to fully rebuild because their containing lists are always regenerated from scratch on every add/remove/edit. The row-rule and column-mask builders skip the branded pair entirely when disabled (no eligible table selected) — `select.ds-dropdown-native{display:none}` in paper-skin.css doesn't check the `disabled` attribute, so adding the class without a paired dropdown would have hidden the control with nothing to replace it, the exact bug this whole pass exists to fix elsewhere. Verified via Playwright against real and mocked backends: every case opens on first click, survives its own re-render (including the trickiest ones — a mask select whose own `onchange` handler triggers `_apRenderColList()` to fully rebuild the very dropdown that's mid-dispatch, and the package-create flow which does the same to `bulk-assign-package`), and per-row cases track independent state across multiple simultaneous rows.
+
+- **`/admin/data-sources`'s per-table live/materialized mode select (`ds-table-mode`, inside the Keboola bucket browser) was the one case left unbranded from the earlier data-sources pass — it renders once per table row (a bucket listing can hold hundreds) and stays hidden until that row's checkbox is checked.** Converted using the same `_dropdownMarkupHtml` helper as the other per-row cases, with a per-row id (`ds-tmode-{connId}-{bucketIndex}-{tableIndex}`, reusing the scheme the adjacent status span already had) and `dsDropdownInit` swept once per fresh bucket-picker render — critically, **not** inside `_syncPicker()`, which also runs on every checkbox click against the same still-mounted markup and would otherwise double-register each row's click handler. The show/hide-on-select CSS rule moves from `.ds-table-mode` (the select itself) to a new `.ds-table-mode-wrap` around both controls — giving the paired `.ds-dropdown` the select's own decorative classes would have also handed it the select's font/border/background rules, fighting `ds_dropdown.css`'s own layout. Verified with up to two simultaneously-checked rows (independent state, both open correctly) and a close/reopen cycle (simulating "Reload tables") to confirm the fresh-render-only init timing holds.
+
+- **`/agents`' schedule-creation Skill picker and `/skills`' Builder Category picker were unbranded** — an earlier audit pass wrongly read them as pages that predate the design system entirely (zero `ds.button()`/`.ds-card` macro calls), but both are visually on it already, just via the sibling `.cc-btn` class family (`catalog_card.css`, same `--ds-*` tokens) rather than the Jinja macro — normal for JS-templated content, which can't call macros. Both selects are single-instance JS-templated controls (not true per-row-multiplied), the same low-risk shape as `/admin/data-sources`' `ds-sf-picker-mode`. The Skill picker's `<optgroup>`s ("From this agent's plugins" / "Other skills you can access") are preserved as non-interactive `.ds-dropdown-menu-group` headers in the branded menu — a markup convention with no prior precedent in this codebase, added page-locally rather than to the shared component; `ds_dropdown.js`'s item-scan (`[role="menuitemradio"]`) already skips a `role="presentation"` row for free, so keyboard nav and click-to-select needed no changes. Caught two bugs while wiring these up: agents.html's `<script src=".../ds_dropdown.js">` tag was simply missing (added `link` for the CSS but forgot the JS — the dropdown silently never opened, since `window.dsDropdownInit` was undefined); and skills.html's category field is read by a delegated `input`-event listener, which a real `<select>` fires natively but `ds_dropdown.js` only ever dispatches `change` for — picking a category via the branded dropdown updated the visible label but never touched `draft.category`, so Save would have submitted whichever category was selected before. Fixed by adding a second, narrowly-scoped `change` listener for just that field rather than changing what event `ds_dropdown.js` dispatches everywhere.
+
+- **`/admin/chat` ("Chat runners") rendered with no admin sidebar at all**, unlike every other page under `/admin/*` — it's registered in the nav config (`admin_nav.py`, "Chat sessions" under Activity) and its markup already followed the hero+toolbar+page convention, but the template extended `base_page.html` directly instead of `base_admin_page.html`, so it never got wrapped in the `.admin-split` grid with `_admin_nav.html`. One-line `{% extends %}` swap — exactly the case `base_admin_page.html`'s own docstring documents as a drop-in migration.
+
+- **`/admin/linked-apps`'s six selects render as plain native `<select>` elements on the paper theme, unlike every other admin page.** Their options are fetched and the `<select>`s rebuilt entirely client-side (`loadSources`/`loadTools`/`loadGroups`/`renderMapping`), which is exactly the case `ds_dropdown.js`'s exported re-init hook (0.83.99, `window.dsDropdownInit`) was added for — the branded `.ds-dropdown` markup is now paired with each select and rebuilt via a `syncDropdown()` helper every time its select is repopulated.
+
+- **`/admin/data-sources`'s "grant this project's Keboola MCP tools to a group" picker had no branded dropdown paired to it at all, and it's worse than missing branding: the page never loads `ds_dropdown.css`/`.js` or imports the `_components.html` macro namespace, so on the paper theme `select.ds-dropdown-native{display:none}` still applies globally and the control disappears with nothing to replace it** — an admin who had just turned chat tools on for a project had no way to pick a group to grant them to. The select (built per-row in `_chatToolsFactHtml`, populated once via `_fillGrantPickers`) is now paired with hand-built `.ds-dropdown` markup and a `_syncGrantPickerDropdown()` helper that rebuilds it whenever the row's options are (re)filled, following `dsDropdownMarkup()`'s shape from `admin_server_config.html`; the page now loads the dropdown's CSS/JS like every other converted page.
+
+- **Five more `/admin/data-sources` selects were unbranded**: the Add-source wizard's Snowflake auth-type picker, its "already connected — go straight to its tables" project shortcut, the Bundle step's "add to an existing package" picker, the Snowflake table-browser's live/materialized mode, and the manual-entry rows' per-row live/materialized mode. The existing-package picker was the trickiest — the branded button intercepts all interaction, so the native `focus` event that lazily loaded and re-filtered its options (excluding packages already added to the board) never fires once branded; the fetch-and-filter logic is now a named function called from three places instead of one (the step becoming visible, right after a pick updates the board, and still on native `focus` for instances not running the paper theme). The manual-entry rows needed their own generic hand-built-markup helper (`_dropdownMarkupHtml`, mirroring `admin_server_config.html`'s `dsDropdownMarkup()`) since each row's `<select>` is built fresh in a JS template literal with no id to hang a Jinja macro off of; each row gets a unique id via a counter so a later row's dropdown never collides with an earlier one's. Left unconverted: the per-table live/materialized mode select inside the Keboola bucket browser (`ds-table-mode`) — it renders once per table row (potentially hundreds per bucket) and stays `display:none` until that row is checked, a different cost/visibility trade-off than the others here.
+
+- **Five more dynamic-options selects were plain native `<select>`s on the paper theme, unbranded like the ones above**: `/admin/sessions`'s User/Model filters, `/admin/usage`'s User/Tool/Source/Event-type filters, and `/admin/access`'s Simulate-lens Person picker. Each gets a `sync*Dropdown()` helper — the User/Model/Usage filters rebuild the whole button+menu on every facet refetch (same shape as the `/admin/linked-apps` fix, including rebuilding the `<button>` itself to dodge `ds_dropdown.js`'s non-idempotent per-element listeners); the Person picker splits into a heavy rebuild for when its person list is (re)fetched and a light in-place re-mark (existing items, no button churn) for when only the selection changes via a `?user=` deep link setting `.value` straight from code.
+
+- **The token-list sort dropdown was unbranded on both `/admin/tokens` (admin) and `/me/profile` (Access tokens section)**, and also missed a re-sync gap the analogous `create-ttl` dropdown next to it on the profile page already had a fix for: `setSort()` sets the native select's `.value` straight from code (the column-header-driven default-sort reset), which — same as this page's own `create-ttl` comment already explains — `ds_dropdown.js` only pushes a selection FROM the custom button+menu ONTO the native select, never the other way. Both pages' `setSort()` now call the same re-sync (a pre-existing helper reused as-is on the profile page).
+
+- **Three more dynamic-options selects still carried the pre-0.83.99 "no re-init hook" exclusion comment as their reason for staying plain `<select>`s on the paper theme**, now stale since `dsDropdownInit` was exported: the Git-file picker on `/admin/prompts` (per-card, `git-path-select-{install,workspace}`), the group picker on `/admin/people/{id}` (`add-group-select`), and the User/Action/Source facet filters on `/admin/activity` (`f-user`/`f-action`/`f-source` — the Result/Resource filters on the same page were already converted since their option lists are static). Each gets a `sync*Dropdown()` helper matching the `/admin/linked-apps` shape, called every time its select's options are rebuilt. One pitfall hit and fixed across all three: the helper must rebuild the dropdown's `<button>` element too, not just its `<ul>` menu — `ds_dropdown.js`'s `init()` isn't idempotent for the same button node, so leaving it in place across the page's own DOMContentLoaded bootstrap and a later sync call double-registers its click handler, and the second toggle silently cancels the first (the menu never visibly opens).
+
+- **The derived Keboola card on `/admin/data-sources` was a navigation dead end.** An instance whose Keboola connection was configured the old way (`data_source.keboola.*` + a token, no `source_connections` row) rendered a card whose only action opened server-config — which has no route back into table browsing or registration. The card now offers "Import as managed connection", a one-click POST of the existing `stack_url` + `token_env` to the connection registry; the card immediately flips to a real, fully-interactive connection with the inline browse-and-register panel, and existing tables registered against the legacy instance-level connection keep resolving exactly as before. The button only renders when the instance is actually credentialed (a `stack_url` alone has nothing to import), and when the working credential isn't independently resolvable by the new connection on its own — the instance-level vault, or the generic `KEBOOLA_STORAGE_TOKEN` env var behind some OTHER custom configured `token_env` — the import now seeds that same token into the new connection's own vault slot — preflighted against the Storage API — instead of creating a connection that badges "env" but cannot actually reach Keboola; a stale vault token reports `token_seeded: false` instead of a silent false-success toast.
+
+- **Bulk Keboola table registration 422ed on hyphenated names with no way to fix them.** Names like `inventory-items` (common in Shopify exports) fail the registry's identifier check — correct, intentional, unchanged — but the bulk table picker gave the operator no way to retype a name before submitting, so a whole batch failed with nothing to click. Rows whose raw name would fail now render an editable input pre-filled with a suggested valid identifier (`inventory-items` → `inventory_items`); the suggestion is shown, not silently applied, and the register call sends whatever the operator leaves in the field.
+
+- **`chat.provider: kai-agent` no longer fails every turn on a freshly booted
+  deployment.** The local-dev stand-in engine was named `kai-agent` — the same
+  name a deployment gives the real turn engine (the `customer-instance`
+  module's `docker-compose.kai-agent.yml` overlay). Compose merges same-named
+  services across the files in `COMPOSE_FILE` and the later file inherits every
+  key it does not itself restate, so the overlay's `image:` won while the
+  stub's `command: python -m services.kai_engine_stub` came along for the ride.
+  The real engine image was launched as the fixture, node died on `Cannot find
+  module '/app/python'`, and the crash loop took the service out of compose DNS
+  — surfacing to users as `engine_error — engine turn failed: [Errno -3]
+  Temporary failure in name resolution` on every message. The stub's
+  `profiles: ["kai-stub"]` gate did not help: naming a service on the `up`
+  command line auto-activates its profiles.
+
+  The stub is now `kai-agent-stub` and the real engine keeps `kai-agent`, so the
+  default `chat.kai_agent_url` (`http://kai-agent:3000`) resolves to the real
+  engine in every deployment with no configuration — the fixture is what needs
+  an override now, not production. Renaming the deployment's service instead
+  would have inverted that: the only chat engine running under a name chosen to
+  dodge a test fixture, `AGNES_CHAT_KAI_AGENT_URL` mandatory everywhere, and two
+  repos obliged to agree on the non-obvious name. Local dev's compose flow gains
+  `AGNES_CHAT_KAI_AGENT_URL=http://kai-agent-stub:3000` (one env var in a flow
+  that already sets `KAI_HOST_JWT_SECRET`); the host-process flow already set it.
+  `docker-compose.prod.yml`'s source-less-host `image:` pin follows the stub to
+  its new name.
+
+  Two paired tests keep the names apart from both sides, asserting DISJOINTNESS
+  rather than specific names:
+  `test_stub_does_not_squat_the_real_engine_service_name` (no
+  `docker-compose.yml` service may be called `kai-agent`, and the default
+  endpoint must still resolve to it) and
+  `test_overlay_service_names_are_disjoint_from_the_base_compose_file` (no
+  overlay service may collide with a base one) — so the next dev-only service
+  added under a colliding name fails in CI instead of in production.
+
+  Note why this hid: the stub landed in `docker-compose.yml` in 0.86.0, but an
+  engine container created before that keeps running across app upgrades (the
+  auto-upgrade tick does not recreate it unless the pinned engine image
+  changes). Only a VM recreate — or an engine image bump — exposed it, which is
+  why a deployment that had been serving engine turns for days broke the moment
+  it was replaced. No infra module change and no VM recreate are needed to pick
+  this up: `docker-compose.yml` and `docker-compose.prod.yml` are both in the
+  auto-upgrade tick's `CONFIG_FILES`, refetched every tick, and the content
+  drift triggers the recreate itself.
+
+### Removed
+
+- **`admin_scheduler_runs.html` was dead code — deleted.** `/admin/scheduler-runs` has 308-redirected to `/admin/activity?source=scheduler` since the platform-telemetry unification; no route has rendered this template since, confirmed by no remaining reference anywhere in `app/` or `tests/`.
+
+## [0.87.1] - 2026-08-25
+
+### Fixed
+
+- **A marketplace plugin in your stack now actually reaches your chat session —
+  whole.** The composer's slash menu offered `/<skill-name>` for every skill in
+  the caller's stack while nothing delivered those plugins into the session, so
+  picking one came back `Unknown command: /<skill>` on every provider. Three
+  causes, all fixed: (1) `chat.bootstrap_marketplace` was **off by default**, so
+  nothing was attempted; it is now **on**, with a new
+  `chat_bootstrap_marketplace` switch (`AGNES_CHAT_BOOTSTRAP_MARKETPLACE`,
+  editable in `/admin/server-config`). (2) The e2b/docker path it gated could
+  not have worked where it ran: the runner shelled out to `agnes
+  refresh-marketplace --bootstrap` *inside* the sandbox, where the marketplace
+  git endpoint is unreachable — it is PAT-gated, the sandbox deliberately holds
+  no PAT, and the in-sandbox relay routes no marketplace path — so the clone
+  401'd behind a `check=False` subprocess. Agnes now writes the caller's filtered
+  marketplace into the workspace as a directory and the sandbox's own CLI
+  installs from it **offline** (`claude plugin marketplace add` + `claude plugin
+  install --scope user`), which is a real plugin install: agents, slash commands,
+  hooks and MCP servers all arrive, `${CLAUDE_PLUGIN_ROOT}` keeps working, and
+  components keep the `<plugin>:<name>` namespace the usage-event attribution
+  reads. (3) The `kai-agent` provider was never wired at all — Agnes never enters
+  that sandbox, so a plugin install (which writes the CLI's HOME registry) is out
+  of reach; its plugins are now flattened into project-scope files in the
+  workspace tarball `GET /api/kai/workspace` serves, covering the same component
+  types. The marketplace content comes from the same builder as the served ZIP an
+  analyst's `agnes refresh-marketplace` downloads, so a sandbox and a laptop get
+  byte-identical plugins.
+
+  With delivery off, the slash menu omits marketplace entries instead of
+  advertising undelivered ones. `GET /api/chat/skills` now also returns the
+  plugins' slash **commands**, and reports each token as the running provider
+  actually exposes it — a plugin's skill is bare (`/keboola-cli`) but its command
+  is namespaced (`/kbl:kbl-ship`), while both are bare in the flattened shape.
+  Verified against the CLI's own init handshake rather than assumed. Two honest
+  costs of the flattened shape, both stated in `docs/cloud-chat.md`: a hook whose
+  command needs `${CLAUDE_PLUGIN_ROOT}` is dropped rather than shipped to fail
+  mid-turn, and the flattened MCP servers are added to `enabledMcpjsonServers`
+  because a project-scope server is never spawned without that allow-list entry
+  and nobody can approve one interactively in a headless sandbox. Reference:
+  `docs/cloud-chat.md` → *Marketplace plugins in a chat session*.
+
+### Removed
+
+- `AGNES_BOOTSTRAP_MARKETPLACE` (the chat sandbox's env var) and the runner's
+  in-sandbox marketplace *clone*. It could not clone from inside a sandbox (see
+  Fixed above); the sandbox now installs from a directory the server shipped.
+  The operator-facing `chat.bootstrap_marketplace` config key keeps its name and
+  gates the whole feature.
+
 ## [0.87.0] - 2026-08-25
 
 ### Added

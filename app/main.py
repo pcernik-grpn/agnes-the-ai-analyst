@@ -11,6 +11,7 @@
 # stdout clean without hiding warnings from any other package.
 import warnings as _warnings
 from src.repositories import (
+    RequiresPostgresBackend,
     memory_domains_repo,
     user_group_members_repo,
     user_groups_repo,
@@ -121,7 +122,7 @@ def _chat_jwt_secret_ok(chat_config) -> bool:
 def _chat_anthropic_key_ok(chat_config) -> bool:
     """Refuse ``chat.enabled=true`` deployments that lack ``ANTHROPIC_API_KEY``.
 
-    The chat runner inside the E2B sandbox calls the Anthropic API on
+    The chat runner inside the sandbox calls the Anthropic API on
     behalf of each user.  If the key is absent the runner silently fails
     on its first API call.  Refuse to enable chat and surface a fatal
     log so the operator finds the cause immediately rather than after
@@ -171,55 +172,6 @@ def _chat_anthropic_key_ok(chat_config) -> bool:
     return False
 
 
-def _chat_e2b_api_key_ok(chat_config) -> bool:
-    """Refuse ``chat.enabled=true`` deployments that lack ``E2B_API_KEY``.
-
-    Mirrors ``_chat_anthropic_key_ok``: the E2B SDK requires an API key
-    to spawn sandboxes; without it ``AsyncSandbox.create`` would 401 on
-    every session start. Refuse the manager rather than letting users
-    hit the failure.
-
-    Returns True when chat is disabled or provider is not ``e2b``, or
-    when the key is present; False otherwise.
-    """
-    if not chat_config.enabled:
-        return True
-    if chat_config.provider != "e2b":
-        return True
-    if os.environ.get("TESTING", "").lower() in ("1", "true"):
-        return True
-    if os.environ.get("E2B_API_KEY", ""):
-        return True
-    logging.getLogger("app.main").error(
-        "chat.enabled=true with provider=e2b requires E2B_API_KEY env; refusing to spawn ChatManager",
-    )
-    return False
-
-
-def _chat_e2b_template_id_ok(chat_config) -> bool:
-    """Refuse ``chat.enabled=true`` without a ``chat.e2b_template_id``.
-
-    The provider can't pick a default template — every operator builds
-    their own ``agnes-chat`` template against their E2B account. Without
-    the id, the provider would 404 at spawn time. Refuse at boot.
-    """
-    if not chat_config.enabled:
-        return True
-    if chat_config.provider != "e2b":
-        return True
-    if os.environ.get("TESTING", "").lower() in ("1", "true"):
-        return True
-    if getattr(chat_config, "e2b_template_id", None):
-        return True
-    logging.getLogger("app.main").error(
-        "chat.enabled=true with provider=e2b requires chat.e2b_template_id "
-        "to be set in instance.yaml; refusing to spawn ChatManager. "
-        "Run `e2b template build` against app/initial_workspace_default/e2b-template "
-        "and copy the returned id into instance.yaml.",
-    )
-    return False
-
-
 def _chat_kai_agent_ok(chat_config) -> bool:
     """Refuse ``chat.provider=kai-agent`` without the engine host wiring.
 
@@ -227,7 +179,7 @@ def _chat_kai_agent_ok(chat_config) -> bool:
     ``KAI_HOST_JWT_SECRET`` (the same shared secret that turns on the
     ``/api/kai/*`` host surface the engine itself depends on — tickets, LLM
     broker, workspace). Without it every spawn would 503 at mint time; refuse
-    the manager at boot instead, mirroring the e2b/docker gates.
+    the manager at boot instead, mirroring the docker gates.
     """
     if not chat_config.enabled:
         return True
@@ -345,7 +297,7 @@ async def _chat_docker_sandbox_ok(chat_config) -> bool:
     otherwise only surfaces at the first user's spawn.
 
     Never raises: a transport failure is a refusal with an actionable log line,
-    mirroring the e2b gates' behavior.
+    mirroring the other chat boot gates' behavior.
     """
     if not chat_config.enabled:
         return True
@@ -893,6 +845,15 @@ async def lifespan(app):
 
     validate_deployment()
 
+    # Surface an unsafe/no-op data-apps posture at startup: enabled, but
+    # same-origin serving off and no isolated origin configured, so no hosted
+    # app can actually be served (see data_apps_proxy._same_origin_serving_refused).
+    from app.api.data_apps import same_origin_serving_warning
+
+    _same_origin_msg = same_origin_serving_warning()
+    if _same_origin_msg:
+        logger.error("%s", _same_origin_msg)
+
     # Fail-closed: refuse to serve with a weak/absent JWT signing key in
     # production. Cheap, runs before any request is accepted.
     from app.auth.jwt import validate_jwt_secret_or_raise
@@ -1189,6 +1150,18 @@ async def lifespan(app):
             logger.warning("Microsoft auth check: %s", warning)
     except Exception:
         logger.exception("Microsoft auth startup check crashed (non-fatal)")
+
+    # Google: unlike Microsoft, there is no tenant to serve as even a partial
+    # identity boundary — an enabled provider without auth.allowed_domain
+    # means ANY Google account can sign in and self-provision. Same wiring as
+    # the Microsoft check above (RBAC review on PR #1569).
+    try:
+        from app.auth.providers.google import startup_warnings as google_startup_warnings
+
+        for warning in google_startup_warnings():
+            logger.warning("Google auth check: %s", warning)
+    except Exception:
+        logger.exception("Google auth startup check crashed (non-fatal)")
 
     # Bring the Postgres schema to the app's expected Alembic head. The
     # DuckDB ladder self-migrates on every connect (src/db.py); Postgres
@@ -1594,16 +1567,28 @@ async def lifespan(app):
             if not role_enabled(Role.GATEWAY):
                 logger.info("chat: disabled in this process (role split; gateway role owns chat)")
                 app.state.chat_manager = None
-            elif app.state.chat_config.provider not in ("e2b", "docker", "kai-agent"):
-                logger.error(
-                    "chat.provider=%r is not supported — the accepted values are "
-                    "'e2b' (cloud microVMs), 'docker' (self-hosted containers "
-                    "via the apps-runner sidecar) and 'kai-agent' (the embedded "
-                    "kai-agent turn engine; see docs/cloud-chat.md). There "
-                    "is deliberately no mock provider. Set chat.provider in "
-                    "instance.yaml to one of those, or flip chat.enabled: false.",
-                    app.state.chat_config.provider,
-                )
+            elif app.state.chat_config.provider not in ("docker", "kai-agent"):
+                if app.state.chat_config.provider == "e2b":
+                    logger.error(
+                        "chat.provider=e2b is no longer supported — the E2B "
+                        "provider was removed in 0.89.0. Set chat.provider in "
+                        "instance.yaml (or AGNES_CHAT_PROVIDER / the "
+                        "customer-instance module's chat_provider field) to "
+                        "'kai-agent' (the embedded turn engine) or 'docker' "
+                        "(self-hosted containers via the apps-runner sidecar; "
+                        "see docs/cloud-chat.md), then restart. Chat stays "
+                        "disabled until then.",
+                    )
+                else:
+                    logger.error(
+                        "chat.provider=%r is not supported — the accepted values are "
+                        "'docker' (self-hosted containers via the apps-runner "
+                        "sidecar) and 'kai-agent' (the embedded kai-agent turn "
+                        "engine; see docs/cloud-chat.md). There is deliberately "
+                        "no mock provider. Set chat.provider in instance.yaml "
+                        "to one of those, or flip chat.enabled: false.",
+                        app.state.chat_config.provider,
+                    )
                 app.state.chat_manager = None
             elif int(os.environ.get("UVICORN_WORKERS", "1")) > 1 and _chat_coordination_backend() != "redis":
                 # Multi-worker/multi-replica chat needs its state (tickets,
@@ -1633,12 +1618,6 @@ async def lifespan(app):
                 logger.error(
                     "ANTHROPIC_API_KEY missing; disabling chat",
                 )
-                app.state.chat_manager = None
-            elif not _chat_e2b_api_key_ok(app.state.chat_config):
-                # Fatal already logged inside the helper.
-                app.state.chat_manager = None
-            elif not _chat_e2b_template_id_ok(app.state.chat_config):
-                # Fatal already logged inside the helper.
                 app.state.chat_manager = None
             elif not _chat_kai_agent_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.
@@ -1691,6 +1670,51 @@ async def lifespan(app):
                         if conn is not None:
                             conn.close()
 
+                def _export_marketplace(user_email: str, dest: Path) -> "list[str]":
+                    """Write the user's RBAC-filtered marketplace tree at `dest`.
+
+                    Returns the plugin names written — the `<name>@agnes` refs
+                    the sandbox installs offline. The content comes from the same
+                    builder the served marketplace ZIP uses, so a chat sandbox
+                    and an analyst's laptop get byte-identical plugins.
+
+                    Returns [] when nothing installs from a tree: the operator
+                    has `chat.bootstrap_marketplace` off (the composer's menu
+                    omits the plugins too, so the two agree), the provider
+                    delivers flattened components instead (`kai-agent` — it gets
+                    them from the workspace tarball, so exporting a tree here
+                    would copy the whole marketplace per convergence for nothing),
+                    or the user row is gone. In those cases any tree a previous
+                    provider left behind is removed, and the [] return also
+                    prunes the `@agnes` enabledPlugins entries — there are no
+                    installed plugins to enable. Found by Devin Review on #1552.
+
+                    Conn resolution mirrors `_render_workspace_prompt` above:
+                    handed in under DuckDB, None on Postgres (where opening the
+                    system DuckDB is a forbidden invariant) — the resolver reads
+                    its state through the repo factory either way.
+                    """
+                    import shutil
+
+                    from app.chat.marketplace_payload import export_marketplace_tree
+                    from app.chat.skills_catalog import DELIVERY_PLUGIN, marketplace_delivery
+                    from src.db import get_system_db
+                    from src.repositories import use_pg, users_repo
+
+                    if marketplace_delivery(app.state.chat_config) != DELIVERY_PLUGIN:
+                        shutil.rmtree(dest, ignore_errors=True)
+                        return []
+                    user = users_repo().get_by_email(user_email)
+                    if user is None:
+                        shutil.rmtree(dest, ignore_errors=True)
+                        return []
+                    conn = None if use_pg() else get_system_db()
+                    try:
+                        return export_marketplace_tree(conn, dict(user), dest)
+                    finally:
+                        if conn is not None:
+                            conn.close()
+
                 workdir_mgr = WorkdirManager(
                     data_dir=_chat_data_dir,
                     repo=app.state.chat_repo,
@@ -1701,6 +1725,7 @@ async def lifespan(app):
                     get_template_status=_server_template_status,
                     fetch_template_zip=_fetch_local_template_zip,
                     render_workspace_prompt=_render_workspace_prompt,
+                    export_marketplace=_export_marketplace,
                     marketplace_sha_debounce_seconds=app.state.chat_config.marketplace_sha_debounce_seconds,
                 )
                 if app.state.chat_config.provider == "docker":
@@ -1743,7 +1768,7 @@ async def lifespan(app):
 
                     for _mismatch in egress_compose_mismatches(app.state.chat_config):
                         logger.warning("chat egress: %s", _mismatch)
-                elif app.state.chat_config.provider == "kai-agent":
+                else:  # kai-agent — the allowlist above guarantees membership
                     from app.chat.kai_engine_provider import KaiEngineProvider
 
                     # Sessions run on the embedded kai-agent turn engine: the
@@ -1768,24 +1793,6 @@ async def lifespan(app):
                                 "spend per agent with token_budget_monthly instead.",
                                 _cap,
                             )
-                else:
-                    from app.chat.e2b_provider import E2BProvider
-
-                    # E2B sandboxes are capped at 1 hour (3600 s) by the platform.
-                    # If chat.max_session_seconds is higher (default 4 h), clamp here
-                    # so AsyncSandbox.create() doesn't 400. The idle reaper / per-tool
-                    # caps still enforce shorter limits as configured; this just
-                    # prevents the spawn call from failing fast on the upper bound.
-                    E2B_SANDBOX_MAX_SECONDS = 3600
-                    provider = E2BProvider(
-                        api_key=os.environ.get("E2B_API_KEY", ""),
-                        template_id=app.state.chat_config.e2b_template_id or "",
-                        sandbox_timeout_seconds=min(
-                            app.state.chat_config.max_session_seconds,
-                            E2B_SANDBOX_MAX_SECONDS,
-                        ),
-                        egress_allow_out=app.state.chat_config.egress_allow_out,
-                    )
                 mgr = ChatManager(
                     provider=provider,
                     workdir_mgr=workdir_mgr,
@@ -1805,10 +1812,8 @@ async def lifespan(app):
                     _chat_sandbox_desc = (
                         f"image={app.state.chat_config.docker_image}, egress={app.state.chat_config.docker_egress_mode}"
                     )
-                elif app.state.chat_config.provider == "kai-agent":
-                    _chat_sandbox_desc = f"engine={app.state.chat_config.kai_agent_url}"
                 else:
-                    _chat_sandbox_desc = f"template={app.state.chat_config.e2b_template_id}"
+                    _chat_sandbox_desc = f"engine={app.state.chat_config.kai_agent_url}"
                 logger.info(
                     "chat.enabled: ChatManager started (provider=%s, "
                     "%s, idle_ttl=%ds, concurrency_per_user=%d, "
@@ -2527,7 +2532,7 @@ def create_app() -> FastAPI:
                 # Override, NOT setdefault: the overlay is the admin's
                 # persisted runtime configuration (secrets set via
                 # /api/admin/configure and the chat "configure secrets" UI,
-                # e.g. ANTHROPIC_API_KEY / E2B_API_KEY, marketplace PATs). It
+                # e.g. ANTHROPIC_API_KEY, marketplace PATs). It
                 # MUST win over an image-baked default of the same name.
                 # With setdefault, a stale baked key already occupying
                 # os.environ shadowed the overlay, so rotating a key via the
@@ -3129,6 +3134,21 @@ def create_app() -> FastAPI:
         keep = ("loc", "msg", "type", "url")
         redacted = [{k: error[k] for k in keep if k in error} for error in exc.errors()]
         return JSONResponse(status_code=422, content=jsonable_encoder({"detail": redacted}))
+
+    @app.exception_handler(RequiresPostgresBackend)
+    async def _requires_postgres_backend_handler(request, exc: RequiresPostgresBackend):
+        """A3 PG-first ratchet: a route resolved a Postgres-only repository on
+        an instance still running the frozen DuckDB app-state backend. Fail
+        clean with a 501 naming the feature — never an unhandled 500 — see
+        CLAUDE.md -> "Dual-backend discipline" and docs/migrations.md."""
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": str(exc),
+                "error": "requires_postgres_backend",
+                "feature": exc.feature,
+            },
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _html_auth_redirect_handler(request, exc: StarletteHTTPException):

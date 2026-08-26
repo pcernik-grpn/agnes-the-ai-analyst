@@ -338,7 +338,7 @@ def test_mcp_server_rides_mcp_scope_url(monkeypatch):
 
 
 def test_runner_has_no_module_level_app_import():
-    """The runner runs as a standalone script inside the E2B sandbox, where the
+    """The runner runs as a standalone script inside the sandbox, where the
     `app` package does not exist until _install_agnes_cli() pip-installs the
     uploaded wheel. A module-level `import app.*` (e.g. the broker relay import)
     crashes the interpreter at startup with ModuleNotFoundError — before the
@@ -921,7 +921,7 @@ def test_a_failed_tool_result_carries_the_sdk_verdict(monkeypatch):
     "error"/"traceback", so a real failure reading "Catalog Error: Table …
     does not exist" rendered with a success tick and folded itself shut.
 
-    This is the NATIVE (e2b/docker) path — the engine provider sets the same
+    This is the NATIVE (docker) path — the engine provider sets the same
     field from its own `tool-output-error` event, so both producers agree."""
     mod = _make_fake_sdk(monkeypatch, with_stream_event=False)
     script = [

@@ -392,8 +392,8 @@ def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     """Write this agent's active memories into the session workdir.
 
     Called from ``ChatManager._spawn_live`` at the same pre-spawn seam as
-    ``build_profile`` — before ``_spawn_runner`` uploads ``session_dir``
-    into the (remote, E2B microVM) sandbox. A file written after spawn
+    ``build_profile`` — before the provider delivers ``session_dir``
+    into the (remote) sandbox. A file written after spawn
     would never reach the agent; see the module docstring.
 
     Reads ``agent_memories_repo().list_active(agent_id)`` (newest-first),

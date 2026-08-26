@@ -1,14 +1,13 @@
 """Harvest agent-written output files from a session's REMOTE sandbox into
 the object store + ``agent_artifacts`` registry (V1b Task 5).
 
-**Where artifacts actually live.** The chat sandbox is an E2B microVM, not a
-host directory — there is no ``workdir/outputs`` on the Agnes host to scan.
-The session's local workdir only ever holds the per-user *workspace* that
-gets uploaded INTO the VM at spawn time (``app/chat/e2b_workspace_sync.py``
-``upload_workspace``, pushed under ``SANDBOX_WORKDIR`` = ``/work`` —
-``app/chat/e2b_provider.py``). So harvesting means reading files back OUT of
-the live sandbox over the E2B file API (``handle.files.list`` /
-``handle.files.read``), not walking a local ``Path``.
+**Where artifacts actually live.** The chat sandbox is a remote container,
+not a host directory — there is no ``workdir/outputs`` on the Agnes host to
+scan. The agent writes under ``SANDBOX_WORKDIR`` = ``/work``
+(``app/chat/provider.py``) inside the sandbox, so harvesting means reading
+files back OUT of the live sandbox over the provider's file API
+(``handle.files.list`` / ``handle.files.read``), not walking a local
+``Path``.
 
 **Why a dedicated ``outputs/`` subdir, not all of ``/work``.** ``/work``
 also contains the uploaded workspace tree (``CLAUDE.md``, ``.claude/``,
@@ -110,9 +109,8 @@ def sanitize_filename(raw: str) -> str:
 
 def _entry_type(entry: Any) -> str:
     """Normalize an EntryInfo-shaped object's `.type` — mirrors
-    `e2b_workspace_sync._entry_type` (kept local rather than imported so
-    this module has no dependency on the workspace-sync module, only on
-    the SANDBOX_WORKDIR constant)."""
+    the provider file-API shim's entry shape (str or enum across
+    implementations)."""
     t = getattr(entry, "type", None)
     if t is None:
         return "FILE"
@@ -123,7 +121,7 @@ async def _read_bytes(files_api: Any, remote_path: str) -> bytes:
     try:
         data = await files_api.read(remote_path, format="bytes")
     except TypeError:
-        # Older SDK without a format= kwarg (mirrors e2b_workspace_sync.download_workspace).
+        # Older file-API shape without a format= kwarg.
         data = await files_api.read(remote_path)
     if isinstance(data, str):
         data = data.encode("utf-8")
@@ -200,11 +198,7 @@ async def harvest_session_artifacts(
     /api/v1/sessions/{id}` teardown) and must not create duplicate rows
     for files it already harvested.
     """
-    # Local import: app.chat.e2b_provider pulls in the e2b SDK (~250ms) at
-    # its own module top for the `AsyncSandbox`/`ALL_TRAFFIC` patch points
-    # (see its module docstring) — needlessly heavy for the plain string
-    # constant this function actually needs.
-    from app.chat.e2b_provider import SANDBOX_WORKDIR
+    from app.chat.provider import SANDBOX_WORKDIR
 
     store = object_store()
     if store is None:

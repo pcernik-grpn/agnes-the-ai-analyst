@@ -6,11 +6,18 @@ existed on the module, the only way to set them on a provisioned VM was
 survives a VM recreate (it lives on the data disk) but is invisible to
 Terraform, so the deployment's own config could not state what chrome it runs.
 
+D1 (config-ownership remediation, 2026-08): `theme` no longer writes an
+always-wins `AGNES_INSTANCE_THEME` `.env` line — that permanently shadowed
+the admin UI's own control of the same knob on every boot. It now rides the
+first-boot-only `instance.yaml` seed instead (see
+`test_startup_ui_config_ownership.py` for the full seed-vs-env contract), so
+a fresh VM still gets the day-1 palette and `/admin/server-config` owns it
+from day 2 onward. `ui_layout` stays exactly as before — it was already
+retired to "declared but never plumbed", unaffected by this change.
+
 Same lightweight read-the-template pattern as `test_startup_studio_toggle.py`,
 with one difference that matters: these are **per-VM** fields, not module-wide,
-because the redesign is rolled out dev-first. The empty default must write NO
-env line at all — `AGNES_UI_LAYOUT=` would resolve to an empty string and, unlike
-an absent variable, shadow whatever instance.yaml says.
+because the redesign is rolled out dev-first.
 """
 
 import re
@@ -55,10 +62,12 @@ def test_both_object_types_declare_the_chrome_fields():
             )
 
 
-def test_main_tf_forwards_theme_per_vm():
+def test_main_tf_folds_theme_into_the_first_boot_seed_per_vm():
     body = (MODULE / "main.tf").read_text()
-    assert re.search(r"theme\s*=\s*each\.value\.theme", body), (
-        "main.tf must forward theme per-VM (each.value), not module-wide"
+    assert re.search(r'theme\s*=\s*try\(inst\.theme,\s*""\)', body), (
+        "main.tf must fold theme per-VM (inst.theme) into the "
+        "instance_brand_scalars first-boot seed map, not forward it as a "
+        "raw templatefile() var"
     )
 
 
@@ -80,16 +89,11 @@ def test_ui_layout_is_declared_but_not_plumbed():
     assert "${ui_layout}" not in tpl, "startup-script.sh.tpl must not reference the retired ui_layout template var"
 
 
-def test_tpl_emits_the_theme_env_line_only_when_set():
+def test_tpl_never_writes_the_theme_env_line():
     body = (MODULE / "startup-script.sh.tpl").read_text()
-    guard, env = "theme", "AGNES_INSTANCE_THEME"
-    assert re.search(
-        rf'%\{{\s*if\s+{guard}\s*!=\s*""\s*~?\}}\s*\n{env}=\$\{{{guard}\}}\s*\n%\{{\s*endif\s*~?\}}',
-        body,
-    ), f"tpl must emit {env} guarded by a non-empty {guard}"
-    assert body.count(f"\n{env}=") == 1, (
-        f"{env} must be emitted exactly once — a second, unguarded line "
-        "would write an empty value and shadow instance.yaml"
+    assert "AGNES_INSTANCE_THEME" not in body, (
+        "startup-script.sh.tpl must not write AGNES_INSTANCE_THEME — the "
+        "palette reaches the VM only through the first-boot instance.yaml seed"
     )
 
 

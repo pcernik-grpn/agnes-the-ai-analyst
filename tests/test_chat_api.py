@@ -39,7 +39,10 @@ def _make_mock_manager(repo: ChatRepository) -> ChatManager:
     workdir_mgr.ensure_user_workdir = MagicMock()
     workdir_mgr.prepare_session_dir = MagicMock(return_value="/tmp/fake")
 
-    config = ChatConfig(enabled=True, concurrency_per_user=3)
+    # Pin the native provider: these tests assert on chat_<hex> session ids,
+    # which `engine_session_id` replaces with UUIDs under the (default)
+    # kai-agent provider.
+    config = ChatConfig(enabled=True, concurrency_per_user=3, provider="docker")
     return ChatManager(
         provider=provider,
         workdir_mgr=workdir_mgr,
@@ -192,8 +195,7 @@ def test_get_messages_exposes_sender_email(api_client: TestClient, logged_in_use
     rows = api_client.get(f"/api/chat/sessions/{c['id']}/messages").json()
     assert len(rows) == 2, rows
     assert all("sender_email" in r for r in rows), (
-        "chat.js's recall filter and peer badge both read m.sender_email -- "
-        "omitting it makes both dead code"
+        "chat.js's recall filter and peer badge both read m.sender_email -- omitting it makes both dead code"
     )
     assert [r["sender_email"] for r in rows] == [None, "peer@example.com"]
 

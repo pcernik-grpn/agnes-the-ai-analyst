@@ -334,7 +334,7 @@ class ChatRepository:
     # chat-session cardinality.
 
     def set_sandbox_ref(self, session_id: str, *, sandbox_id: str, runner_pid: int) -> None:
-        """Record the E2B sandbox id and runner pid; clear paused_at (live).
+        """Record the provider sandbox id and runner pid; clear paused_at (live).
 
         Also stamps ``relay_protocol_version`` with the current
         ``RELAY_PROTOCOL_VERSION`` (Tier 1, restart-invariant reuse):

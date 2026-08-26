@@ -6,7 +6,18 @@
 {% set page_hero_subtitle = "Admin-managed git repos cloned nightly. Synced plugins surface in the Claude Code marketplace feed." %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
 <style>
+  /* No global `.sr-only` in this codebase — declared page-locally, same
+     convention as admin_tokens.html / admin_hub.html. */
+  .sr-only {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0);
+    white-space: nowrap; border: 0;
+  }
+
   .marketplaces-toolbar {
     display: flex; justify-content: space-between; align-items: center;
     gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
@@ -68,18 +79,7 @@
   .date-cell { color: var(--text-secondary, #6b7280); font-size: 12px; white-space: nowrap; }
 
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; white-space: nowrap; }
-  .icon-btn {
-    background: transparent; border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
-    padding: 5px 10px; font-size: 12px; cursor: pointer;
-    color: var(--text-secondary, #6b7280); transition: all 0.15s;
-    text-decoration: none; line-height: 1.4;
-    white-space: nowrap;
-  }
-  .icon-btn:hover { color: var(--text-primary, #111827); border-color: var(--ds-border); background: var(--ds-surface-dim); }
-  .icon-btn.primary { color: var(--ds-primary, #6366f1); border-color: color-mix(in srgb, var(--ds-primary) 30%, transparent); }
-  .icon-btn.primary:hover { background: var(--ds-primary-light); }
-  .icon-btn.danger:hover { color: var(--ds-accent-danger-ink); border-color: var(--ds-accent-danger-line); background: var(--ds-accent-danger-bg); }
-  .icon-btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* .icon-btn now shared — see css/icon_btn.css */
 
   .mp-empty, .mp-loading {
     text-align: center; padding: 48px 16px;
@@ -271,10 +271,10 @@
 <div class="marketplaces-page">
 
   <div class="marketplaces-toolbar">
-    <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" autocomplete="off">
+    <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" aria-label="Filter by slug, name, or URL" autocomplete="off">
     <a class="icon-btn" href="/marketplace/format-guide" target="_blank" rel="noopener"
        title="Open the marketplace-metadata.json format guide in a new tab">
-      Format guide →
+      Format guide → <span class="sr-only">(opens in a new tab)</span>
     </a>
     {{ ds.button('+ Add marketplace', variant='primary', id='open-create-btn') }}
   </div>

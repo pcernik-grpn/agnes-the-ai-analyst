@@ -213,15 +213,16 @@ async def access_overview(
 
     # Per-resource-type hierarchies. Driven by the registry in
     # app.resource_types — adding a new type there is the one place that
-    # surfaces here, no extra wiring. Disabled types (e.g. TABLE without
-    # AGNES_ENABLE_TABLE_GRANTS) are skipped so the admin UI does not
-    # render a chip for grants the runtime cannot enforce yet.
+    # surfaces here, no extra wiring. Disabled types (none as of v19 — see
+    # `is_resource_type_enabled`) are skipped so the admin UI does not render
+    # a chip for grants the runtime cannot enforce yet.
     from app.resource_types import enabled_resource_types
 
     resources = [
         {
             "type_key": spec.key.value,
             "type_display": spec.display_name,
+            "type_description": spec.description,
             "blocks": spec.list_blocks(),
         }
         for spec in enabled_resource_types()
@@ -682,20 +683,17 @@ async def create_grant(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     rt = _validate_resource_type(payload.resource_type)
-    # Feature gate: refuse to mint grants for resource types whose runtime
-    # enforcement is not wired up yet (e.g. ResourceType.TABLE without
-    # AGNES_ENABLE_TABLE_GRANTS). Listing + deleting existing rows still
-    # works so operators can clean up legacy data.
+    # Feature gate: refuse to mint grants for a resource type disabled by
+    # `is_resource_type_enabled` (all types are enabled unconditionally as of
+    # v19 — this exists for a future type whose runtime enforcement isn't
+    # wired up yet). Listing + deleting existing rows still works so
+    # operators can clean up legacy data.
     from app.resource_types import is_resource_type_enabled
 
     if not is_resource_type_enabled(rt):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"resource_type {rt.value!r} is not currently enabled. "
-                "Set AGNES_ENABLE_TABLE_GRANTS=1 to opt in once the runtime "
-                "enforcement is in place (see docs/TODO-rbac-data-enforcement.md)."
-            ),
+            detail=f"resource_type {rt.value!r} is not currently enabled.",
         )
     if not payload.resource_id.strip():
         raise HTTPException(status_code=400, detail="resource_id is required")

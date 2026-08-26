@@ -49,7 +49,8 @@ chat.enabled: ChatManager started (provider=kai-agent, engine=http://127.0.0.1:3
 `AGNES_CHAT_KAI_AGENT_URL` exists because the default `chat.kai_agent_url`
 names a compose service (`http://kai-agent:3000`) that does not resolve outside
 the compose network, and because the local-dev flow deliberately runs without
-an `instance.yaml`. It follows the same env > yaml > default precedence as
+an `instance.yaml`. It is also how you select the stub over the real engine's
+name inside compose (see below). It follows the same env > yaml > default precedence as
 `AGNES_CHAT_PROVIDER`.
 
 Both processes are also registered in `.claude/launch.json`
@@ -58,12 +59,20 @@ Claude Code browser preview.
 
 ## Docker Compose
 
-The stub answers to the hostname `kai-agent`, which is what the default
-`chat.kai_agent_url` already points at, so no URL override is needed:
+The stub answers to the hostname `kai-agent-stub`. The default
+`chat.kai_agent_url` (`http://kai-agent:3000`) names the REAL engine's
+service, so point the app at the stub explicitly:
 
 ```bash
-KAI_HOST_JWT_SECRET=local-dev-secret docker compose --profile kai-stub up
+KAI_HOST_JWT_SECRET=local-dev-secret \
+AGNES_CHAT_KAI_AGENT_URL=http://kai-agent-stub:3000 \
+  docker compose --profile kai-stub up
 ```
+
+The stub deliberately does not take the `kai-agent` name: compose merges
+same-named services across the files in `COMPOSE_FILE`, so a deployment
+overlay defining the real engine would inherit this stub's `command` and run
+the real image as the fixture.
 
 Set `chat.provider: kai-agent` in `config/instance.yaml`, or pass
 `AGNES_CHAT_PROVIDER=kai-agent` in the app's environment.

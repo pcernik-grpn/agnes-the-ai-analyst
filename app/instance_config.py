@@ -1403,6 +1403,13 @@ def get_corporate_memory_config() -> dict:
 _DATA_APPS_ENV_DEFAULTS = {
     "runtime_image": "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24",
     "subdomain_base": "",
+    # Serve hosted apps on the main origin (same origin as `/api`)? Off by
+    # default — see `app/api/data_apps.py::_CONFIG_DEFAULTS`. Resolution
+    # (env > merged config > default) lives in the switch registry
+    # (`app/switches.py`, entry `data_apps_allow_same_origin`) read by the
+    # call site (`same_origin_serving_allowed`), so this backfill only
+    # matters for an instance.yaml-configured value.
+    "allow_same_origin": False,
     "default_idle_timeout_s": 1800,
     "default_sleep_mode": "recreate",
     "default_mem_limit": "1g",

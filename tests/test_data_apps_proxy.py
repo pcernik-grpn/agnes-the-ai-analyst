@@ -79,7 +79,11 @@ def proxy_env(e2e_env, monkeypatch, shared_app):
 
     state = data_dir / "state"
     state.mkdir(parents=True, exist_ok=True)
-    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True}}))
+    # `allow_same_origin` on by default in tests: most proxy tests exercise the
+    # path-prefix serving mechanics, which the same-origin gate would otherwise
+    # refuse (see `_same_origin_serving_refused`). The gate itself is covered by
+    # the dedicated tests below, which flip it off explicitly.
+    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True, "allow_same_origin": True}}))
     import app.instance_config as instance_config
 
     instance_config._instance_config = None
@@ -111,7 +115,13 @@ def proxy_env(e2e_env, monkeypatch, shared_app):
     from fastapi.testclient import TestClient
 
     client = TestClient(app)
-    return {"client": client, "app": app, "owner_pat": pats["owner1"], "other_pat": pats["other1"], "data_dir": data_dir}
+    return {
+        "client": client,
+        "app": app,
+        "owner_pat": pats["owner1"],
+        "other_pat": pats["other1"],
+        "data_dir": data_dir,
+    }
 
 
 def _set_data_apps_config(data_dir, **overrides) -> None:
@@ -120,7 +130,10 @@ def _set_data_apps_config(data_dir, **overrides) -> None:
     import app.instance_config as instance_config
 
     state = data_dir / "state"
-    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {"enabled": True, **overrides}}))
+    # `allow_same_origin` defaults on (path-prefix mechanics); a test exercising
+    # the same-origin gate passes `allow_same_origin=False` to override it.
+    base = {"enabled": True, "allow_same_origin": True}
+    (state / "instance.yaml").write_text(yaml.dump({"data_apps": {**base, **overrides}}))
     instance_config._instance_config = None
 
 
@@ -648,6 +661,120 @@ def test_ws_sleeping_app_rejected_with_4404(client_granted, sleeping_app):
 
 
 # ---------------------------------------------------------------------------
+# Same-origin serving gate (security): a hosted app served on the MAIN origin
+# shares the viewer's session with app-authored JS, which can read /api. Refused
+# unless the request arrived on a data-app subdomain (isolated origin) or the
+# operator opted in via data_apps.allow_same_origin.
+# ---------------------------------------------------------------------------
+
+
+def test_same_origin_serving_refused_by_default(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 403
+    assert "isolated origin" in r.text  # the operator-facing HTML explains the fix
+    assert respx_upstream.calls == []  # hard stop — never proxied to the container
+
+
+def test_same_origin_serving_refused_json(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_granted.get("/apps/s/hello", headers={"accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
+
+
+def test_same_origin_serving_allowed_with_ack(client_granted, running_app, respx_upstream, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=True)
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200
+    assert r.text == "hello from app"
+
+
+def test_same_origin_gate_honors_env_override(client_granted, running_app, respx_upstream, proxy_env, monkeypatch):
+    """The env override wins over an instance.yaml `allow_same_origin: false`."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    monkeypatch.setenv("AGNES_DATA_APPS_ALLOW_SAME_ORIGIN", "1")
+    r = client_granted.get("/apps/s/hello")
+    assert r.status_code == 200
+    assert r.text == "hello from app"
+
+
+def test_subdomain_request_served_without_ack(client_granted, running_app, respx_upstream, proxy_env):
+    """A subdomain-origin request is already on an isolated origin, so it is
+    served even with same-origin serving off."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com", allow_same_origin=False)
+    r = client_granted.get("/", headers={"host": "s.apps.example.com"})
+    assert r.status_code == 200
+    assert respx_upstream.calls  # reached and proxied to the container
+
+
+def test_same_origin_gate_runs_after_rbac(client_stranger, running_app, respx_upstream, proxy_env):
+    """The gate runs AFTER RBAC: a stranger still gets a plain 403 `forbidden`,
+    so the refusal never reveals an app's existence to an unauthorized caller."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = client_stranger.get("/apps/s/hello", headers={"accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "forbidden"
+
+
+def test_ws_same_origin_refused_by_default(client_granted, running_app, proxy_env):
+    """The WS bridge mirrors the HTTP gate — owner passes RBAC, so the only
+    reason for the 4403 close here is the same-origin refusal."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with client_granted.websocket_connect("/apps/s/ws"):
+            pass
+    assert excinfo.value.code == 4403
+
+
+def test_ws_preview_token_passes_the_same_origin_gate(proxy_env, running_app, mint_preview):
+    """WS mirror of the HTTP gate's `via_preview` allowance: a logged-in
+    browser's in-chat preview of a WS-based app (Streamlit/Dash) opens the
+    handshake with session + preview cookies, and must pass auth, RBAC and
+    the same-origin gate on the preview credential in the default posture.
+    The bridge then fails to reach the nonexistent upstream container and
+    closes 1011 — which is the proof every gate passed: without the WS
+    preview path this handshake closed 4403 instead (Devin Review on this
+    PR)."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    with proxy_env["client"].websocket_connect(
+        "/apps/s/ws", headers={"cookie": f"{_session_cookie()}; {tok.cookie}"}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_text()
+    assert excinfo.value.code == 1011
+
+
+# ---------------------------------------------------------------------------
+# same_origin_serving_warning() — the startup log when apps are enabled but no
+# hosted app can be served (same-origin off, no isolated origin configured).
+# ---------------------------------------------------------------------------
+
+
+def test_same_origin_warning_fires_when_enabled_without_isolation(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    msg = same_origin_serving_warning()
+    assert msg is not None and "subdomain_base" in msg
+
+
+def test_same_origin_warning_silent_with_subdomain(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com", allow_same_origin=False)
+    assert same_origin_serving_warning() is None
+
+
+def test_same_origin_warning_silent_with_ack(proxy_env):
+    from app.api.data_apps import same_origin_serving_warning
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=True)
+    assert same_origin_serving_warning() is None
+
+
+# ---------------------------------------------------------------------------
 # Session-cookie domain — regression: no Domain= attribute when
 # data_apps.subdomain_base is unset (today's exact behavior).
 # ---------------------------------------------------------------------------
@@ -759,6 +886,82 @@ def test_preview_token_authorizes_iframe(proxy_client, fake_runner, respx_upstre
     # Body, not just status: a 401 here is redirected to `/login`, which also
     # answers 200, so status alone passes whether or not the token was read.
     assert r.text == "hello from app"
+
+
+def test_preview_token_serves_same_origin_without_global_ack(
+    proxy_client, fake_runner, respx_upstream, running_app, mint_preview, proxy_env
+):
+    """A per-app preview token serves same-origin even with
+    `allow_same_origin=False` — the in-chat preview works WITHOUT the global
+    flag. A plain navigation (no preview token) to the same origin is still
+    refused (see `test_same_origin_serving_refused_by_default`), so enabling the
+    preview does not re-open drive-by same-origin serving for every app.
+
+    NOTE: this sends ONLY the preview cookie — an anonymous caller. That shape
+    alone let the session-first resolution bug slip (Devin Review on this PR):
+    a real logged-in browser sends the session cookie TOO, which is the twin
+    `test_logged_in_browser_with_preview_cookie_serves_same_origin` below."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": tok.cookie})
+    assert r.status_code == 200, r.text
+    assert r.text == "hello from app"
+
+
+def _session_cookie(user_id: str = "owner1", email: str = "owner@test.local") -> str:
+    """The `access_token` session cookie a logged-in browser attaches — the
+    same JWT `_set_login_cookie` sets after OAuth/password login."""
+    from app.auth.jwt import create_access_token
+
+    return f"access_token={create_access_token(user_id, email)}"
+
+
+def test_logged_in_browser_with_preview_cookie_serves_same_origin(
+    proxy_client, fake_runner, respx_upstream, running_app, mint_preview, proxy_env
+):
+    """THE browser reality the anonymous test above misses: the in-chat
+    preview iframe of a logged-in user carries the viewer's `access_token`
+    session cookie ALONGSIDE the preview cookie. The preview credential must
+    win — the earlier session-first resolution returned `via_preview=False`
+    for this request, and the same-origin gate 403'd the preview in the
+    default posture (no subdomain_base, flag off): Devin Review on this PR."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    tok = mint_preview("s", ttl_s=1800)
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": f"{_session_cookie()}; {tok.cookie}"})
+    assert r.status_code == 200, r.text
+    assert r.text == "hello from app"
+
+
+def test_logged_in_browser_without_preview_token_still_refused(proxy_client, running_app, proxy_env):
+    """Default posture: a plain logged-in navigation (session cookie only, no
+    preview token) to `/apps/<slug>/` is still refused — the preview-first
+    ordering must not widen what a session alone can reach."""
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    r = proxy_client.get(
+        "/apps/s/hello",
+        headers={"cookie": _session_cookie(), "accept": "application/json"},
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
+
+
+def test_logged_in_browser_with_wrong_slug_preview_token_still_refused(
+    proxy_client, running_app, mint_preview, proxy_env
+):
+    """A preview token minted for ANOTHER app grants nothing on this slug:
+    the scope pin skips it, resolution falls back to the session (the caller
+    stays authenticated), and the same-origin gate refuses exactly as if no
+    preview token were present. Delivered via the legacy bare cookie name —
+    the per-app cookie name for this slug would not even be consulted."""
+    from app.api.data_apps import _PREVIEW_COOKIE_NAME
+
+    _set_data_apps_config(proxy_env["data_dir"], allow_same_origin=False)
+    _create_app_row(slug="other", state="running")
+    tok = mint_preview("other", ttl_s=1800)
+    cookies = f"{_session_cookie()}; {_PREVIEW_COOKIE_NAME}={tok.jwt}"
+    r = proxy_client.get("/apps/s/hello", headers={"cookie": cookies, "accept": "application/json"})
+    assert r.status_code == 403
+    assert r.json()["detail"] == "data_app_same_origin_disabled"
 
 
 def test_expired_preview_token_403(proxy_client, running_app, mint_preview):

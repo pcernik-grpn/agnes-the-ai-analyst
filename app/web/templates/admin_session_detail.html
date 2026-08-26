@@ -176,9 +176,13 @@
     toggle.className = 'td-toggle';
     toggle.type = 'button';
     toggle.textContent = 'Expand';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-controls', 'td-body-' + idx);
     toggle.addEventListener('click', () => {
       el.classList.toggle('expanded');
-      toggle.textContent = el.classList.contains('expanded') ? 'Collapse' : 'Expand';
+      const expanded = el.classList.contains('expanded');
+      toggle.textContent = expanded ? 'Collapse' : 'Expand';
+      toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     });
     body.appendChild(toggle);
 
@@ -206,8 +210,11 @@
           if (!errs.length) return;
           cursor = (cursor + 1) % errs.length;
           errs[cursor].scrollIntoView({ behavior: 'smooth', block: 'center' });
+          // Element.animate() keyframes don't resolve CSS custom properties the
+          // way inline styles do — resolve the token to its computed color first.
+          const dangerLine = getComputedStyle(errs[cursor]).getPropertyValue('--ds-accent-danger-line').trim();
           errs[cursor].animate(
-            [{ outline: '3px solid #ef4444' }, { outline: '3px solid transparent' }],
+            [{ outline: `3px solid ${dangerLine}` }, { outline: '3px solid transparent' }],
             { duration: 1500 }
           );
         });

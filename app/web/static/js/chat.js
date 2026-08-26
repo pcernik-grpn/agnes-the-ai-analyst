@@ -177,7 +177,7 @@ function _maybeOpenInitialSession() {
 // the server after we open a WebSocket. ``ws.readyState === 1`` (the TCP/HTTP
 // handshake) does NOT mean the server-side ``ChatManager.attach`` has finished
 // spawning the runner and populated ``live[chat_id]`` — that takes ~5 s for
-// E2B sandbox creation. If we send ``user_msg`` during that window the server
+// sandbox creation. If we send ``user_msg`` during that window the server
 // raises ``SessionNotFound``, closes the WS with 4404, and the user sees
 // "Disconnected — click the conversation again to resume." with no idea why.
 // All ``user_msg`` sends now ``await`` this promise first.
@@ -1436,7 +1436,7 @@ async function loadAndRenderHistory(chatId) {
     // the `greeting` its owner authored in the builder (agents.greeting, v110),
     // which until now was only ever shown in the builder's preview bubble.
     // Rendered client-side and never persisted: generating a hello through the
-    // model would force an E2B sandbox spawn and burn a turn before the user
+    // model would force a sandbox spawn and burn a turn before the user
     // has typed anything, and the whole point of an authored greeting is that
     // the words already exist. Re-rendered on every open of a still-empty
     // session, so a reload before the first message keeps it.

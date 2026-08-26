@@ -1,9 +1,10 @@
 # instance.yaml.e2e — config used inside the docker-compose E2E env.
 #
-# Mirrors instance.yaml.example but with cloud-chat enabled and pointed
-# at an E2B-backed sandbox. The real E2B smoke (which actually spawns
-# microVMs) is gated separately by AGNES_E2E_E2B=1 on the host so the
-# default e2e run doesn't burn billable sandbox minutes.
+# Mirrors instance.yaml.example but with cloud-chat enabled on the
+# self-hosted docker provider. The suites that actually spawn sandboxes
+# are gated separately by AGNES_E2E_DOCKER=1 on the host (they need the
+# apps-runner sidecar up and the agnes-chat-sandbox image built), so the
+# default e2e run doesn't require a local sandbox-image build.
 
 config_version: 1
 
@@ -18,12 +19,19 @@ data_source:
 
 chat:
   enabled: true
-  provider: e2b
-  # Operator builds this against their own E2B account via
-  # `e2b template build` in app/initial_workspace_default/e2b-template/.
-  e2b_template_id: "agnes-chat"
-  e2b_workspace_max_bytes: 104857600  # 100 MB
-  e2b_kill_on_ws_disconnect: true
+  provider: docker
+  # Built from the repo root (one-time, before the gated suites):
+  #   docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox
+  docker_image: "agnes-chat-sandbox:latest"
+  # Must match the fixed network name docker-compose.e2e.yml gives its
+  # default network — sandbox containers join it so the rails URL
+  # (AGNES_INTERNAL_URL=http://agnes:8000) resolves from inside a sandbox.
+  docker_network: "agnes-e2e"
+  # pause (the default) rather than the removed e2b_kill_on_ws_disconnect:
+  # that kill-on-disconnect behavior existed to stop E2B billable minutes,
+  # a paused local container is free — and pause is what lets
+  # test_adversarial.py::test_resume_uses_fresh_ticket exercise resume.
+  on_detach: pause
   concurrency_per_user: 3
   idle_ttl_seconds: 1800
   per_tool_call_seconds: 90

@@ -1602,7 +1602,7 @@ the engine exposes nothing.
   failed turn. The tree is the admin-registered Initial Workspace Template
   when one is synced, else the bundled default: `CLAUDE.md`, the org
   `PreToolUse` safety hook, and `.claude/skills/*`. Agnes's own sandbox-image
-  build assets (`e2b-template/`, `docker-sandbox/`) are excluded — they
+  build assets (`docker-sandbox/`) are excluded — they
   describe how to build a sandbox, not how to work in one.
 
   `CLAUDE.md` is the **rendered** Workspace Prompt, not the template's static
@@ -1956,7 +1956,7 @@ Multi-turn counterpart to the one-shot runtime above: create a session bound to 
 
 ### `/api/v1/sessions/{id}/artifacts` — sandbox artifact harvest + download (V1b Task 5)
 
-The chat sandbox is a remote E2B microVM; files an agent writes under `/work/outputs` inside it are harvested into the object store + `agent_artifacts` registry at two points: when a one-shot `/responses` (or `/jobs`) turn completes, and when `DELETE /api/v1/sessions/{id}` tears the sandbox down. Harvest is best-effort — a store that isn't configured, a missing `outputs/` dir, or a single file's read/write failure are all logged and skipped, never surfaced as an error on the run/delete path they piggyback on. Filenames are agent-chosen (an injection surface) and are sanitized to a flat, CR/LF-free basename before use — both as the object-store key (`agent-artifacts/{session_id}/{safe_filename}`) and in the download response's `Content-Disposition` header. Per-session caps (`agent_api_artifact_max_bytes`, default 25 MiB per file; `agent_api_artifact_max_files`, default 20 per harvest call) bound how much a single run can push into the store. Auth on both routes is the same `require_session_principal` every `/api/v1/sessions/{id}/*` route uses (owner or an agent PAT bound to this exact session's agent; any mismatch is `404`, never `403`).
+The chat sandbox is a separate per-session environment (a container under the docker provider); files an agent writes under `/work/outputs` inside it are harvested into the object store + `agent_artifacts` registry at two points: when a one-shot `/responses` (or `/jobs`) turn completes, and when `DELETE /api/v1/sessions/{id}` tears the sandbox down. Harvest is best-effort — a store that isn't configured, a missing `outputs/` dir, or a single file's read/write failure are all logged and skipped, never surfaced as an error on the run/delete path they piggyback on. Filenames are agent-chosen (an injection surface) and are sanitized to a flat, CR/LF-free basename before use — both as the object-store key (`agent-artifacts/{session_id}/{safe_filename}`) and in the download response's `Content-Disposition` header. Per-session caps (`agent_api_artifact_max_bytes`, default 25 MiB per file; `agent_api_artifact_max_files`, default 20 per harvest call) bound how much a single run can push into the store. Auth on both routes is the same `require_session_principal` every `/api/v1/sessions/{id}/*` route uses (owner or an agent PAT bound to this exact session's agent; any mismatch is `404`, never `403`).
 
 `GET /api/v1/sessions/{id}/artifacts` — `200 {data: [{id, filename, size_bytes, content_type, created_at}], has_more, next_cursor}` — every artifact harvested for this session so far.
 

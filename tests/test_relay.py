@@ -1,6 +1,6 @@
 """Sandbox-local loopback relay (`app/chat/relay.py`).
 
-The relay is the only thing inside the E2B sandbox that ever holds a broker
+The relay is the only thing inside the chat sandbox that ever holds a broker
 ticket, and it must hold it in memory only — never in `os.environ` (which
 subprocesses inherit and which can be dumped via `env`/`/proc/*/environ`)
 and never on disk. These tests pin that guarantee plus the fail-closed

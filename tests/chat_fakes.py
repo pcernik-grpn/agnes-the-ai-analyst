@@ -3,8 +3,8 @@
 FakeHandle and FakeWS were originally inline in tests/test_chat_manager.py;
 they live here so the pause/resume test suite can reuse them without circular
 imports. FakeProvider is new: a stateful in-memory SandboxProvider that
-mirrors E2B semantics (pause parks the handle; resume returns the same handle
-with its memory intact). ``_wait_until`` is the shared poll helper used by
+mirrors pause/resume snapshot semantics (pause parks the handle; resume
+returns the same handle with its memory intact). ``_wait_until`` is the shared poll helper used by
 tests/test_chat_manager.py, tests/test_chat_inbound.py,
 tests/test_chat_takeover.py and tests/test_chat_replay.py to de-flake
 fixed-``asyncio.sleep`` waits on async background setup (session attach,
@@ -114,10 +114,15 @@ class FakeHandle:
 class FakeProvider:
     """In-memory SandboxProvider: spawn/pause/resume with state retention.
 
-    pause() parks the handle; resume() returns the SAME handle (mirrors E2B
+    pause() parks the handle; resume() returns the SAME handle (snapshot
     semantics where the process and its memory survive). Set
     ``fail_resume=True`` to exercise the resume-failure fallback path.
     """
+
+    # Both real providers own workspace delivery (docker bind-mounts it,
+    # the kai engine fetches the tarball itself); the manager no longer has
+    # an upload path for providers that don't.
+    syncs_workspace = True
 
     def __init__(self) -> None:
         self.spawned: list[FakeHandle] = []
@@ -147,11 +152,11 @@ class FakeProvider:
     async def stage_file(self, handle, path, data) -> None:
         """Provider-mediated file staging (agnes CLI wheel, restore-context).
 
-        Mirrors ``E2BProvider.stage_file``: writes through the handle's fake
-        sandbox file API when a test attached one, and always records the write
-        on ``self.staged`` so tests can assert on staging without wiring a
-        sandbox. Real providers declare this as an ``async def``, which is what
-        ``ChatManager._file_stager`` keys off.
+        Mirrors the provider ``stage_file`` contract: writes through the
+        handle's fake sandbox file API when a test attached one, and always
+        records the write on ``self.staged`` so tests can assert on staging
+        without wiring a sandbox. Real providers declare this as an
+        ``async def``, which is what ``ChatManager._file_stager`` keys off.
         """
         self.staged.append((path, data))
         sandbox = getattr(handle, "_sandbox", None)
@@ -161,8 +166,8 @@ class FakeProvider:
     async def destroy(self, *, sandbox_id) -> None:
         self.paused.pop(sandbox_id, None)
         self.destroyed.append(sandbox_id)
-        # Test-fidelity fix: a real destroy() (E2B AsyncSandbox.kill) kills
-        # the underlying VM and its process, so ANY handle still bound to
+        # Test-fidelity fix: a real destroy() kills the underlying sandbox
+        # and its process, so ANY handle still bound to
         # this sandbox_id — paused OR actively running elsewhere (the
         # cross-gateway takeover race: gateway B destroys gateway A's still
         # ACTIVE sandbox by id) — must have its wait() unblock with a

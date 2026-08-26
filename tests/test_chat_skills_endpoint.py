@@ -179,3 +179,61 @@ def test_bundled_skill_shadowed_by_same_name_marketplace_skill(conn, tmp_path, m
     r = client.get("/api/chat/skills")
     assert r.status_code == 200
     assert r.json()["skills"] == [{"name": "shared", "description": "Marketplace wins.", "source": "marketplace"}]
+
+
+def test_the_menu_stops_offering_marketplace_skills_when_delivery_is_off(conn, tmp_path, monkeypatch):
+    """#1552: the menu must never advertise a skill nothing delivers into the
+    session — picking it inserted `/name` and the agent answered "Unknown
+    command". Bundled skills are unaffected (they ship in the workspace tree)."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_CHAT_BOOTSTRAP_MARKETPLACE", "0")
+
+    _make_user(conn, user_id=TEST_USER["id"], email=TEST_USER["email"])
+    _grant_chat_access(conn, user_id=TEST_USER["id"])
+    _register_marketplace(conn, id="mkt", plugins=[{"name": "p1", "version": "1.0"}])
+    _grant_and_subscribe_marketplace(conn, user_id=TEST_USER["id"], marketplace="mkt", plugin="p1")
+
+    from app.utils import get_marketplaces_dir
+
+    skill_md = get_marketplaces_dir() / "mkt" / "plugins" / "p1" / "skills" / "keboola-cli" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text("---\nname: keboola-cli\n---\n\nBody.\n", encoding="utf-8")
+
+    bundled_dir = tmp_path / "bundled-template"
+    bundled_skill = bundled_dir / ".claude" / "skills" / "bundled-one" / "SKILL.md"
+    bundled_skill.parent.mkdir(parents=True, exist_ok=True)
+    bundled_skill.write_text("---\nname: bundled-one\n---\n\nBody.\n", encoding="utf-8")
+
+    import app.api.chat as chat_module
+
+    monkeypatch.setattr(chat_module, "BUNDLED_TEMPLATE_DIR", bundled_dir)
+
+    r = _make_app(conn).get("/api/chat/skills")
+
+    assert r.status_code == 200
+    assert [s["name"] for s in r.json()["skills"]] == ["bundled-one"]
+
+
+def test_a_marketplace_skill_is_offered_under_its_bare_name(conn, tmp_path, monkeypatch):
+    """The composer inserts `/<name>` verbatim. Claude Code exposes a plugin's
+    skill as the bare `keboola-cli` (the plugin shows up in the DESCRIPTION),
+    so a `<plugin>:<skill>` name here would be an unknown command."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    import app.api.chat as chat_module
+
+    monkeypatch.setattr(chat_module, "BUNDLED_TEMPLATE_DIR", tmp_path / "empty-bundled-template")
+
+    _make_user(conn, user_id=TEST_USER["id"], email=TEST_USER["email"])
+    _grant_chat_access(conn, user_id=TEST_USER["id"])
+    _register_marketplace(conn, id="mkt", plugins=[{"name": "demo-plugin", "version": "1.0"}])
+    _grant_and_subscribe_marketplace(conn, user_id=TEST_USER["id"], marketplace="mkt", plugin="demo-plugin")
+
+    from app.utils import get_marketplaces_dir
+
+    skill_md = get_marketplaces_dir() / "mkt" / "plugins" / "demo-plugin" / "skills" / "keboola-cli" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text("---\nname: keboola-cli\n---\n\nBody.\n", encoding="utf-8")
+
+    r = _make_app(conn).get("/api/chat/skills")
+
+    assert [s["name"] for s in r.json()["skills"]] == ["keboola-cli"]

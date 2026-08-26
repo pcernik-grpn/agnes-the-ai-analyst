@@ -1,6 +1,6 @@
 """Contract tests against the *installed* docker SDK.
 
-Sibling of `tests/test_e2b_sdk_contract.py`, for the same reason: the chat
+Pins the docker SDK surface the chat stack depends on: the chat
 sandbox's Docker calls are mocked everywhere else in the suite, so a `docker`
 bump that renames a kwarg or changes a return shape would stay green here and
 fail only on a live spawn. These assertions run with no daemon and no network —

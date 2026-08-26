@@ -87,6 +87,16 @@ _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 # `_v123_to_v124`).
 SCHEMA_VERSION = 124
 
+#: A3 PG-first ratchet (see CLAUDE.md -> "Dual-backend discipline"): the
+#: DuckDB app-state migration ladder is frozen at this version. New schema
+#: work lands as an Alembic-only revision (``migrations/versions/``), with no
+#: matching ``_vN_to_v(N+1)`` step in this file — see ``docs/migrations.md``
+#: -> "Adding a PG-only feature". ``SCHEMA_VERSION`` must never move past
+#: this constant; ``tests/test_db_schema_version_frozen.py`` is the gate.
+#: A4 deletes this whole ladder (and this constant) once the fleet has
+#: migrated off the DuckDB app-state backend.
+FROZEN_DUCKDB_SCHEMA_VERSION = 124
+
 # v96: data_apps registry (hosted user web apps). Extracted as a shared
 # module-level constant so the fresh-install DDL (appended to
 # _SYSTEM_SCHEMA below) and the _v95_to_v96 upgrade step execute the
@@ -6322,7 +6332,7 @@ def _v71_to_v72(conn: duckdb.DuckDBPyConnection) -> None:
 def _v72_to_v73(conn: duckdb.DuckDBPyConnection) -> None:
     """v73: sandbox pause/resume refs on ``chat_sessions``.
 
-    Three nullable columns tracking the E2B sandbox ID, the runner PID,
+    Three nullable columns tracking the provider sandbox ID, the runner PID,
     and the time the session was paused. Must stay un-indexed — DuckDB 1.5.3
     raises a false FK violation when UPDATE-ing indexed columns of
     ``chat_sessions`` after any ``chat_messages`` INSERT (see comment at the

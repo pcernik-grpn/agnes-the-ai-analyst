@@ -2,6 +2,13 @@
 # when installing Agnes for their workspace.
 # Replace YOUR-AGNES-HOST with the public hostname of your Agnes instance
 # (e.g. agnes.example.com).
+#
+# This is the CANONICAL scope set — the minimum the bot code actually calls.
+# docs/slack-manifest-http.md and docs/slack-manifest-socket.md must carry the
+# same scopes and events (guarded by tests/test_slack_manifest_sync.py). Never
+# add a scope here without a code path that needs it; the whole set is
+# bot-token only, no user scopes, which is what keeps the app approvable by
+# workspace admins and customer security reviews.
 display_information:
   name: Agnes
   description: Ask Agnes data questions from Slack
@@ -17,12 +24,11 @@ features:
 oauth_config:
   scopes:
     bot:
-      - app_mentions:read
-      - chat:write
-      - im:history
-      - im:write
-      - users:read
-      - users:read.email
+      - app_mentions:read # event: app_mention
+      - chat:write # chat.postMessage / chat.postEphemeral / chat.update
+      - im:history # event: message.im (DMs with the bot)
+      - im:write # conversations.open (opening the DM channel)
+      - reactions:write # reactions.add (ack emoji; degrades to a log warning)
 # Slash commands. Under Socket Mode, omit each `url:` — commands arrive
 # over the socket and route through the same dispatch_command.
 slash_commands:

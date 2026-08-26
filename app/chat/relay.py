@@ -1,6 +1,6 @@
 """Sandbox-local loopback relay for the chat secret broker.
 
-Runs inside the E2B sandbox alongside the CLI subprocesses (``claude``,
+Runs inside the chat sandbox alongside the CLI subprocesses (``claude``,
 ``agnes``, ``agnes mcp``). It is the only thing in the sandbox that ever
 holds a broker ticket, and it holds it **in memory only** — never in
 ``os.environ`` (subprocess envs are inherited/inspectable) and never on
