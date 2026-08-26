@@ -3455,94 +3455,23 @@ async def agents_page(
 ):
     """Agents — build a focused assistant out of the caller's own stack.
 
-    Work-in-progress surface (rail item carries a WIP badge). The builder's
-    ingredient lists are REAL and RBAC-scoped: knowledge sources are the data
-    packages + memory domains resolved from the caller's stack (same
-    ``StackResolver`` reads as /stack), and capabilities hydrate client-side
-    from ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).
-    Agent definitions themselves persist in the browser for now — a server
-    registry is the next iteration, so the page states that plainly rather
-    than pretending drafts are shared."""
+    Two panes: a conversation that fills the configuration in
+    (``POST /api/agents/{id}/builder/turn``) and the configuration itself,
+    hand-editable throughout. Agents persist server-side in the ``agents``
+    registry behind ``/api/agents``.
+
+    The builder's ingredient lists are REAL and RBAC-scoped:
+    ``knowledge_sources_for`` resolves the caller's own data packages, memory
+    domains and artefact collections — the same list the builder assistant is
+    given as its candidate set, so it can never offer access the picker does
+    not — and capabilities hydrate client-side from
+    ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins)."""
     if not get_agent_profiles_enabled():
         return RedirectResponse("/", status_code=302)
 
-    from app.services.stack_resolver import StackResolver
-    from app.resource_types import ResourceType
+    from app.services.agent_ingredients import knowledge_sources_for
 
-    resolver = StackResolver()
-    knowledge_sources: list = []
-    try:
-        pkg_repo = data_packages_repo()
-        for e in resolver.stack(user["id"], ResourceType.DATA_PACKAGE):
-            tables = 0
-            try:
-                tables = len(pkg_repo.list_tables(e.id))
-            except Exception:
-                tables = 0
-            knowledge_sources.append(
-                {
-                    "id": e.id,
-                    "kind": "data",
-                    "name": e.name,
-                    "description": e.description or "",
-                    "meta": f"{tables} table{'' if tables == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve data stack: %s", e)
-    try:
-        domains_repo = memory_domains_repo()
-        for e in resolver.stack(user["id"], ResourceType.MEMORY_DOMAIN):
-            items_count = 0
-            try:
-                items_count = len(domains_repo.list_items_of_domain(e.id, limit=10000))
-            except Exception:
-                items_count = 0
-            knowledge_sources.append(
-                {
-                    "id": e.id,
-                    "kind": "memory",
-                    "name": e.name,
-                    "description": e.description or "",
-                    "meta": f"{items_count} item{'' if items_count == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve memory stack: %s", e)
-    # Artefacts (file collections) the caller can reach — owned ∪ shared with a
-    # group they belong to (admin → all). These are a third knowledge kind the
-    # agent can be grounded in, alongside governed data + memory. Same access
-    # resolution the /artefacts page uses, so the builder never offers a file
-    # the caller can't actually open.
-    try:
-        from app.auth.access import accessible_collection_ids
-
-        allowed = accessible_collection_ids(user)  # None => admin sees all
-        cf_repo = corpus_files_repo()
-        # TODO: the per-collection file count below is an N+1 (one query per
-        # reachable collection, so per *every* collection for an admin). It was
-        # incidentally bounded while this read the 200-capped list(); switching
-        # to list_all() to stop hiding reachable collections removes that
-        # ceiling. A bulk `counts_by_corpus()` on both corpus_files backends
-        # would collapse it into one query.
-        for col in file_corpora_repo().list_all():
-            if allowed is not None and col["id"] not in allowed:
-                continue
-            try:
-                fcount = len(cf_repo.list_for_corpus(col["id"]))
-            except Exception:
-                fcount = 0
-            knowledge_sources.append(
-                {
-                    "id": col["id"],
-                    "kind": "file",
-                    "name": col.get("name") or col.get("slug"),
-                    "description": col.get("description") or "",
-                    "meta": f"{fcount} file{'' if fcount == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve artefacts: %s", e)
+    knowledge_sources = knowledge_sources_for(user)
 
     ctx = _build_context(
         request,

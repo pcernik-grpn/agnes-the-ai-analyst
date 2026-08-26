@@ -1,0 +1,99 @@
+"""The agent builder's Preview is a real session, and says so honestly.
+
+This file replaces ``test_agents_preview_is_not_a_chat.py``, whose whole
+premise — "the builder page cannot run a turn" — this surface removed. That
+file existed because the old Preview rendered a pill styled exactly like the
+app's composer with no input behind it: people clicked it, typed, and watched
+the text vanish. Its fix was to stop the mock *claiming* to be interactive.
+
+The mock is gone. Preview now opens a chat session bound to the agent's own
+slug and streams the answer back, so the honest thing is the opposite of what
+that file asserted: it must be a REAL composer, and it must not promise a
+turn it cannot run.
+
+What is pinned here:
+
+- the composer is a real control, wired to a send path;
+- it is disabled, with an explanatory placeholder, while the agent has no
+  name — there is nothing to preview yet, and a live-looking box that
+  silently does nothing is the exact regression the old file was written for;
+- the draft is flushed to the server before the session spawns, or the agent
+  answers as the persona from before the owner's last edit;
+- an engine failure is translated, not pasted — ``kai_integration_not_
+  configured`` in a chat bubble reads as a broken page rather than as
+  "an admin has not set this up";
+- model output reaches the DOM as text, never as HTML (this page has no
+  sanitizer — see the security playbook on ``innerHTML``).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "agents.html"
+
+
+@pytest.fixture(scope="module")
+def markup() -> str:
+    return TEMPLATE.read_text(encoding="utf-8")
+
+
+class TestPreviewRunsARealTurn:
+    def test_the_preview_composer_is_a_real_control(self, markup):
+        """The inverse of the old assertion, and the reason this file exists."""
+        assert 'data-ag-comp="' in markup
+        assert "<textarea" in markup
+        assert 'data-ag-send="' in markup
+
+    def test_it_opens_a_session_bound_to_this_agent(self, markup):
+        """Bound by slug — a preview against the default agent would answer as
+        something other than the thing on screen."""
+        assert "/api/chat/sessions" in markup
+        assert "agent_slug: a.slug" in markup
+
+    def test_it_streams_over_the_websocket_contract(self, markup):
+        for frame in ("'token'", "'assistant_message'", "'error'"):
+            assert frame in markup, f"preview does not handle the {frame} frame"
+
+    def test_the_draft_is_flushed_before_the_session_spawns(self, markup):
+        """`persist` is debounced by 400ms; spawning inside that window gives
+        the owner an agent running the previous edit's persona."""
+        assert "function flushSave(" in markup
+        assert re.search(r"flushSave\(a\)\.then", markup), "openPreviewSession does not await the flush"
+
+
+class TestPreviewDoesNotPromiseWhatItCannotDo:
+    def test_the_composer_is_disabled_until_the_agent_has_a_name(self, markup):
+        """An un-named draft has no slug worth previewing. The composer is
+        rendered disabled with the reason as its placeholder rather than
+        accepting a message that would go nowhere."""
+        block = re.search(r"function previewPaneHtml\(a\) \{(.*?)\n  \}", markup, re.S)
+        assert block, "previewPaneHtml not found"
+        body = block.group(1)
+        assert "Start by defining your agent." in body
+        # The empty-state branch passes busy=true, which is what disables both
+        # the textarea and the send button in composerHtml.
+        assert re.search(r"composerHtml\('preview', '', 'Start by defining your agent\.', true\)", body)
+
+    def test_an_engine_error_is_translated_not_pasted(self, markup):
+        assert "function previewErrorCopy(" in markup
+        assert "not_configured" in markup
+        # The owner is told whose problem it is; the raw kind stays in console.
+        assert "an admin sets one up" in markup
+
+    def test_model_output_is_escaped_into_the_dom(self, markup):
+        """Assistant text goes through `esc()`, never raw innerHTML — this page
+        has no sanitizer and the answer is model output."""
+        block = re.search(r"function msgHtml\(m\) \{(.*?)\n  \}", markup, re.S)
+        assert block, "msgHtml not found"
+        body = block.group(1)
+        assert "esc(m.text)" in body
+        assert body.count("m.text") == body.count("esc(m.text)"), "an unescaped m.text reaches the DOM"
+
+    def test_the_pane_says_the_session_is_real(self, markup):
+        """The old card had to disclaim being a chat. This one has the opposite
+        duty: say that messages here are a real, billable session."""
+        assert "A real session with this agent" in markup

@@ -12,6 +12,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **The `/agents` builder is now a conversation next to the configuration.**
+  Opening an agent gives two panes: a **Create** conversation on the left that
+  describes the agent in plain language, and the **Configuration** on the
+  right that it fills in — name, role, instructions, tone, greeting, and which
+  data packages / memory domains / artefact collections it is grounded in.
+  Every field stays hand-editable while the assistant is talking; the panel,
+  not the conversation, remains the source of truth. New endpoint
+  `POST /api/agents/{agent_id}/builder/turn` (owner-only) runs one turn
+  through the existing `connectors.llm` structured extractor and applies the
+  result through the ordinary `PATCH /api/agents/{id}` path, so the
+  builder-declaration → enforced-scope derivation is unchanged. The model's
+  output is treated as untrusted: unknown fields, ids outside the caller's
+  own candidate lists, and invented tones are dropped before anything is
+  written, and `status` / the four `*_mode` columns are not writable from a
+  conversation at all. With no AI credential configured the endpoint answers
+  `503 builder_llm_unavailable` and the panel stays fully usable by hand.
+- **The builder's Preview is a live chat with the agent**, replacing the
+  static mock card. It opens a real session bound to the draft agent's own
+  slug (`POST /api/chat/sessions` with `agent_slug`) and streams the answer
+  over the existing WebSocket, after flushing the pending edit so the agent
+  answers as its current configuration rather than the previous one. Answers
+  render as plain text — the page has no HTML sanitizer — with an *Open in
+  full chat* link to the same session for the full renderer. Engine failures
+  are translated into what the reader can act on instead of surfacing the
+  internal kind.
+
 - **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
   (remediation-program Track C1.1, additive — the builder router is
   unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept

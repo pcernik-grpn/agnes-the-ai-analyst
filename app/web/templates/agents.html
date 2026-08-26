@@ -102,19 +102,18 @@
   .ag-status--ready { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); }
 
   /* ── Builder ── */
-  .ag-back { border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; padding: 4px 8px 4px 0; margin-bottom: 6px; }
+  .ag-back { border: none; background: none; color: var(--ds-text-secondary); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; padding: 4px 8px 4px 0; flex-shrink: 0; }
   .ag-back:hover { color: var(--ds-primary); }
-  .ag-build-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 2px 0 18px; }
-  .ag-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
-  .ag-build-head h2 { font-size: 24px; margin: 2px 0 0; }
+  /* One row: leave, identity, state, act. The builder is a workspace now, so
+     the header is chrome above it rather than a page title block. */
+  .ag-build-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 2px 0 14px; }
+  .ag-build-head h2 { font-size: 19px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ag-build-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-top: 4px; }
   /* Delete sits left of the status button — a real button so it reads as an
      action next to "Mark ready", but danger-tinted only on hover/focus so it
      never competes with the primary affordance. */
   .ag-build-actions .ag-del-btn:hover,
   .ag-build-actions .ag-del-btn:focus-visible { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
-  .ag-bgrid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 22px; align-items: start; }
-  @media (max-width: 980px) { .ag-bgrid { grid-template-columns: 1fr; } }
 
   /* Numbered collapsible sections. */
   .ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
@@ -202,31 +201,76 @@
   .ag-sch-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
   .ag-sch-fine { font-size: 12px; color: var(--ds-text-muted); margin: 0; }
 
-  /* Preview aside. */
-  .ag-preview { position: sticky; top: 18px; }
-  .ag-preview h3 { font-size: 14px; margin: 0 0 10px; }
-  .ag-pv-card { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; box-shadow: var(--ds-shadow-md); overflow: hidden; }
-  .ag-pv-hd { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--ds-border); }
-  .ag-pv-hd .ag-ava { width: 32px; height: 32px; border-radius: 9px; }
-  .ag-pv-name { font-size: 14px; font-weight: 650; color: var(--ds-text-primary); }
-  .ag-pv-role { font-size: 12px; color: var(--ds-text-muted); display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
-  .ag-pv-body { padding: 14px; }
-  /* Theme-aware tint (not the light-only --ds-agnes-soft) so the greeting
-     stays readable against the assistant bubble in dark mode too. */
-  .ag-pv-bubble { background: color-mix(in srgb, var(--ds-agnes) 9%, var(--ds-surface)); border: 1px solid var(--ds-agnes-line); color: var(--ds-text-primary); border-radius: 12px 12px 12px 4px; padding: 10px 13px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
-  /* A mock composer, not a control: it copies the real chat pill so the
-     preview reads as the app, which also made people click it and type into
-     nothing. `cursor: default` + `user-select: none` withdraw the two cues
-     that invite that; `aria-hidden` on the element keeps it out of the
-     accessibility tree, where a fake textbox is worse than useless. */
-  .ag-pv-input { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-pill); padding: 8px 8px 8px 14px; color: var(--ds-text-muted); font-size: 13px; cursor: default; user-select: none; }
-  .ag-pv-note { padding: 0 14px 12px; font-size: 11.5px; color: var(--ds-text-muted); }
-  .ag-pv-send { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-primary); color: var(--ds-text-inverse); display: grid; place-items: center; font-size: 14px; flex-shrink: 0; }
-  .ag-pv-meta { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
-  .ag-pv-row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 12px; font-size: 12.5px; border-bottom: 1px solid var(--ds-border); }
-  .ag-pv-row:last-child { border-bottom: none; }
-  .ag-pv-k { color: var(--ds-text-secondary); }
-  .ag-pv-v { color: var(--ds-text-primary); font-weight: 550; }
+  /* ── Builder workspace ──
+     Two panes: a conversation that writes the configuration (left) and the
+     configuration itself, editable by hand (right). The right pane is the
+     source of truth for what the agent IS; the left is one way to fill it in,
+     which is why the panel is never read-only while the assistant is talking.
+     Each pane scrolls independently so a long conversation never pushes the
+     fields off-screen. */
+  .ag-work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border: 1px solid var(--ds-border); border-radius: 16px; background: var(--ds-surface); overflow: hidden; min-height: 560px; height: calc(100vh - 210px); }
+  .ag-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .ag-pane--cfg { border-left: 1px solid var(--ds-border); background: var(--ds-surface-sunken); }
+  @media (max-width: 900px) {
+    /* Stacked, each pane its own scroll region rather than one long page —
+       the configuration must stay reachable while the conversation runs. */
+    .ag-work { grid-template-columns: 1fr; height: auto; }
+    .ag-pane { max-height: 70vh; }
+    .ag-pane--cfg { border-left: none; border-top: 1px solid var(--ds-border); }
+  }
+
+  /* Create | Preview switch. */
+  .ag-tabs { display: flex; justify-content: center; padding: 14px 16px 10px; }
+  .ag-tabs-in { display: inline-flex; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 10px; padding: 3px; gap: 3px; }
+  .ag-tab { border: none; background: none; font-family: inherit; font-size: 13.5px; font-weight: 600; color: var(--ds-text-secondary); padding: 6px 20px; border-radius: 8px; cursor: pointer; }
+  .ag-tab[aria-selected="true"] { background: var(--ds-surface); color: var(--ds-text-primary); box-shadow: var(--ds-shadow-sm); }
+
+  /* Conversation. */
+  .ag-conv { flex: 1; overflow-y: auto; padding: 8px 22px 4px; display: flex; flex-direction: column; gap: 16px; }
+  .ag-msg { display: flex; gap: 12px; font-size: 14.5px; line-height: 1.6; }
+  .ag-msg-dot { width: 20px; height: 20px; border-radius: 6px; background: var(--ds-agnes); flex-shrink: 0; margin-top: 2px; }
+  /* Assistant and owner turns are told apart by alignment + surface, never by
+     colour alone. `white-space: pre-wrap` and text-only insertion: replies are
+     rendered as plain text (the assistant is instructed to write prose, and
+     this page has no sanitizer — see the security playbook on innerHTML). */
+  .ag-msg-text { min-width: 0; white-space: pre-wrap; color: var(--ds-text-primary); }
+  .ag-msg--me { justify-content: flex-end; }
+  .ag-msg--me .ag-msg-text { background: var(--ds-primary-light); border: 1px solid var(--ds-primary-line, var(--ds-border)); border-radius: 12px 12px 4px 12px; padding: 9px 13px; max-width: 80%; }
+  .ag-msg--busy .ag-msg-text { color: var(--ds-text-muted); font-style: italic; }
+  .ag-conv-empty { margin: auto; text-align: center; color: var(--ds-text-muted); font-size: 14px; display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 20px; }
+  .ag-conv-empty svg { width: 26px; height: 26px; opacity: 0.55; }
+  .ag-conv-empty-ring { width: 62px; height: 62px; border-radius: 50%; border: 1px solid var(--ds-border); display: grid; place-items: center; }
+  .ag-conv-err { font-size: 13px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 9px; padding: 9px 12px; }
+
+  /* Composer + starter chips. */
+  .ag-comp { padding: 10px 22px 20px; }
+  .ag-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .ag-chip { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); border-radius: var(--ds-radius-pill); padding: 6px 14px; font-size: 13px; font-family: inherit; cursor: pointer; }
+  .ag-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
+  .ag-comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 12px; background: var(--ds-surface); padding: 7px 7px 7px 14px; }
+  .ag-comp-box:focus-within { box-shadow: 0 0 0 3px var(--ds-primary-light); }
+  .ag-comp-box textarea { flex: 1; border: none; background: none; resize: none; font-family: inherit; font-size: 14.5px; color: var(--ds-text-primary); padding: 6px 0; max-height: 140px; }
+  .ag-comp-box textarea:focus { outline: none; }
+  .ag-send { border: none; background: var(--ds-primary); color: var(--ds-text-inverse); font-family: inherit; font-size: 13.5px; font-weight: 600; border-radius: 9px; padding: 8px 16px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+  .ag-send[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+  /* Configuration pane. */
+  .ag-cfg-head { display: flex; align-items: baseline; justify-content: center; gap: 12px; padding: 18px 16px 16px; border-bottom: 1px solid var(--ds-border); }
+  .ag-cfg-head h3 { font-size: 15.5px; margin: 0; color: var(--ds-text-primary); }
+  .ag-cfg-head p { font-size: 13px; margin: 0; color: var(--ds-text-muted); }
+  .ag-cfg-body { flex: 1; overflow-y: auto; padding: 22px; }
+  .ag-cfg-ava { display: flex; justify-content: center; margin-bottom: 22px; }
+  .ag-cfg-ava span { width: 74px; height: 74px; border-radius: 50%; border: 1.5px dashed var(--ds-border); display: grid; place-items: center; color: var(--ds-text-muted); }
+  .ag-cfg-ava svg { width: 26px; height: 26px; }
+  /* A field the assistant just wrote, flagged for one beat so the owner can
+     see WHAT the conversation changed rather than re-reading the whole form. */
+  .ag-touched { animation: ag-touch 1.6s var(--ds-ease-standard); }
+  @keyframes ag-touch { 0%, 55% { border-color: var(--ds-agnes); box-shadow: 0 0 0 3px var(--ds-agnes-soft); } 100% { border-color: var(--ds-border); box-shadow: none; } }
+
+  /* Live preview — a real session with the agent, not a mock of one. */
+  .ag-live-note { font-size: 12px; color: var(--ds-text-muted); text-align: center; padding: 0 22px 10px; }
+  .ag-live-note a { color: var(--ds-primary); font-weight: 600; text-decoration: none; }
+  .ag-live-note a:hover { text-decoration: underline; }
 </style>
 {% endblock %}
 
@@ -468,6 +512,10 @@
   var SECTION_KEYS = ['identity', 'knowledge', 'capabilities', 'surfaces', 'schedules', 'boundaries'];
 
   function openBuilder(id) {
+    // The conversation and the live preview socket belong to ONE agent —
+    // carrying either into the next builder would show someone else's
+    // transcript and stream a previous agent's answers into this one's pane.
+    if (currentId !== id) resetBuilderPanes();
     currentId = id;
     collapsed = { identity: false, knowledge: true, capabilities: true, surfaces: true, schedules: true, boundaries: true };
     schedForm = blankSchedForm();
@@ -479,7 +527,7 @@
     renderBuilder();
     window.scrollTo(0, 0);
   }
-  function closeBuilder() { currentId = null; renderList(); window.scrollTo(0, 0); }
+  function closeBuilder() { resetBuilderPanes(); currentId = null; renderList(); window.scrollTo(0, 0); }
 
   function section(key, no, title, note, sub, summary, body) {
     var isC = !!collapsed[key];
@@ -859,28 +907,148 @@
     el.textContent = msg || '';
   }
 
-  function previewHtml(a) {
-    var kn = a.knowledge.length, cp = a.plugins.length;
+  /* ── Builder conversation ───────────────────────────────────────────────
+     The left pane is a conversation that WRITES the right pane. Each turn
+     POSTs to /api/agents/{id}/builder/turn, which applies the patch through
+     the ordinary PATCH path and returns the updated agent row — so the panel
+     always re-renders from the server's copy, never from a patch the page
+     hoped landed.
+
+     Transcript state is page-local (the endpoint is stateless and replays
+     `history` each turn). A reload therefore loses the conversation but never
+     the agent: the configuration is what was persisted. */
+  var conv = [];            // [{ role: 'user' | 'assistant', text }]
+  var convBusy = false;
+  var convErr = null;
+  var convDraft = '';       // survives re-renders triggered from the config panel
+  var builderTab = 'create';
+  var DEFAULT_CHIPS = [
+    'An agent for pipeline questions',
+    'Something that answers HR policy questions',
+    'A finance agent for margin and revenue'
+  ];
+  var convChips = DEFAULT_CHIPS.slice();
+  var touched = {};         // field -> true, cleared after one render
+
+  /* ── Live preview ──
+     A REAL session with the agent (POST /api/chat/sessions with the agent's
+     slug, then its WebSocket), not a mock of one. The socket lives in a
+     variable rather than the DOM so a re-render of either pane cannot drop
+     the connection mid-turn. */
+  var pv = { session: null, socket: null, msgs: [], busy: false, err: null, stream: '', draft: '', slug: null };
+
+  function resetBuilderPanes() {
+    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = DEFAULT_CHIPS.slice();
+    builderTab = 'create'; touched = {};
+    closePreviewSocket();
+    pv = { session: null, socket: null, msgs: [], busy: false, err: null, stream: '', draft: '', slug: null };
+  }
+
+  function closePreviewSocket() {
+    if (pv.socket) {
+      try { pv.socket.close(); } catch (e) { /* already closing */ }
+      pv.socket = null;
+    }
+  }
+
+  function msgHtml(m) {
+    if (m.role === 'user') {
+      return '<div class="ag-msg ag-msg--me"><div class="ag-msg-text">' + esc(m.text) + '</div></div>';
+    }
+    return '<div class="ag-msg' + (m.busy ? ' ag-msg--busy' : '') + '">' +
+      '<span class="ag-msg-dot" aria-hidden="true"></span>' +
+      '<div class="ag-msg-text">' + esc(m.text) + '</div></div>';
+  }
+
+  var CUBE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>';
+
+  /* The opening turn is written by the page, not the model: it costs nothing,
+     it never fails, and it is what tells a first-time owner what kind of
+     sentence this box wants. */
+  function openingMessage() {
+    return 'Hi! I will help you build an agent. You can say something like, ' +
+      '“an agent that answers pipeline questions for the sales team” or ' +
+      '“something that looks up policies from the handbook.”\n\nWhat would you like it to do?';
+  }
+
+  function convHtml() {
+    var rows = [{ role: 'assistant', text: openingMessage() }].concat(conv);
+    if (convBusy) rows.push({ role: 'assistant', text: 'Thinking…', busy: true });
+    var html = rows.map(msgHtml).join('');
+    if (convErr) html += '<div class="ag-conv-err">' + esc(convErr) + '</div>';
+    return html;
+  }
+
+  function composerHtml(kind, value, placeholder, busy) {
+    var chips = '';
+    if (kind === 'create' && convChips.length && !convBusy) {
+      chips = '<div class="ag-chips">' + convChips.map(function (c) {
+        return '<button type="button" class="ag-chip" data-ag-chip="' + esc(c) + '">' + esc(c) + '</button>';
+      }).join('') + '</div>';
+    }
+    return '<div class="ag-comp">' + chips +
+      '<div class="ag-comp-box">' +
+        '<textarea rows="1" data-ag-comp="' + kind + '" placeholder="' + esc(placeholder) + '"' +
+          (busy ? ' disabled' : '') + '>' + esc(value) + '</textarea>' +
+        '<button type="button" class="ag-send" data-ag-send="' + kind + '"' + (busy ? ' disabled' : '') + '>' +
+          'Send <span aria-hidden="true">→</span></button>' +
+      '</div></div>';
+  }
+
+  function createPaneHtml() {
+    return '<div class="ag-conv" id="ag-conv">' + convHtml() + '</div>' +
+      composerHtml('create', convDraft, 'Tell me what this agent should do…', convBusy);
+  }
+
+  function previewPaneHtml(a) {
+    var ready = (a.name || '').trim();
+    if (!ready) {
+      return '<div class="ag-conv" id="ag-pv-conv">' +
+          '<div class="ag-conv-empty"><span class="ag-conv-empty-ring">' + CUBE_SVG + '</span>' +
+          '<span>Start by defining your agent.</span></div></div>' +
+        composerHtml('preview', '', 'Start by defining your agent.', true);
+    }
+    var rows = pv.msgs.slice();
+    if (pv.stream) rows.push({ role: 'assistant', text: pv.stream });
+    else if (pv.busy) rows.push({ role: 'assistant', text: 'Thinking…', busy: true });
+    var body = rows.length
+      ? rows.map(msgHtml).join('')
+      : '<div class="ag-conv-empty"><span class="ag-conv-empty-ring">' + CUBE_SVG + '</span>' +
+        '<span>Talk to ' + esc(a.name) + ' the way your team will.</span></div>';
+    if (pv.err) body += '<div class="ag-conv-err">' + esc(pv.err) + '</div>';
+    // Answers render as plain text here (this page has no HTML sanitizer, and
+    // an unsanitized model answer is exactly the innerHTML the security
+    // playbook forbids). The full chat page has the real renderer — tables,
+    // code blocks, tool cards — so link to the same session rather than
+    // reimplementing it in the drawer.
+    var full = pv.session
+      ? ' <a href="/chat?session=' + encodeURIComponent(pv.session.id) + '">Open in full chat →</a>'
+      : '';
+    return '<div class="ag-conv" id="ag-pv-conv">' + body + '</div>' +
+      '<p class="ag-live-note">A real session with this agent, using the configuration on the right.' + full + '</p>' +
+      composerHtml('preview', pv.draft, 'Ask ' + (a.name || 'your agent') + '…', pv.busy);
+  }
+
+  function cfgBodyHtml(a) {
     var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
-    return '<h3>Preview</h3>' +
-      '<div class="ag-pv-card">' +
-        '<div class="ag-pv-hd">' +
-          '<span class="ag-ava">' + AVA_SVG + '</span>' +
-          '<div style="min-width:0"><div class="ag-pv-name" id="ag-pv-name">' + (esc(a.name) || 'Your agent') + '</div>' +
-          '<div class="ag-pv-role" id="ag-pv-role">' + (esc(a.role) || '—') + '</div></div>' +
-        '</div>' +
-        '<div class="ag-pv-body">' +
-          '<div class="ag-pv-bubble" id="ag-pv-greeting">' + (esc(a.greeting) || '…') + '</div>' +
-          '<div class="ag-pv-input" aria-hidden="true"><span id="ag-pv-ph">Ask ' + (esc(a.name) || 'your agent') + '…</span><span class="ag-pv-send">↑</span></div>' +
-        '</div>' +
-        '<div class="ag-pv-note">Preview only — not a live chat.</div>' +
-      '</div>' +
-      '<div class="ag-pv-meta">' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Grounded in</span><span class="ag-pv-v">' + kn + ' source' + (kn === 1 ? '' : 's') + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Can use</span><span class="ag-pv-v">' + cp + ' tool' + (cp === 1 ? '' : 's') + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Tone</span><span class="ag-pv-v" style="text-transform:capitalize">' + esc(a.tone) + '</span></div>' +
-        '<div class="ag-pv-row"><span class="ag-pv-k">Surfaces</span><span class="ag-pv-v">' + sn + '</span></div>' +
-      '</div>';
+    return '<div class="ag-cfg-ava"><span>' + AVA_SVG + '</span></div>' +
+      section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
+        (esc(a.name) || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
+      section('knowledge', 2, 'Data & resources', 'what it knows',
+        'Everything this agent is allowed to reach. Outside of this it says it cannot help, rather than guessing.',
+        a.knowledge.length + ' source' + (a.knowledge.length === 1 ? '' : 's'), knowledgeBody(a)) +
+      section('capabilities', 3, 'Capabilities', 'what it can do',
+        'Give it tools — any plugin or skill available to you, not only what’s in your stack.',
+        a.plugins.length + ' enabled', capabilitiesBody(a)) +
+      section('surfaces', 4, 'Surfaces', 'where it runs',
+        'The same agent, reachable where your team already works.',
+        'On ' + sn, surfacesBody(a)) +
+      section('schedules', 5, 'Schedules', 'when it runs on its own',
+        'Run this agent unattended on a cadence — each schedule sends its own prompt.',
+        scheduleSummary(), schedulesBody(a)) +
+      section('boundaries', 6, 'Boundaries', 'set by admin',
+        'Guardrails managed by your workspace admin — you build within them.',
+        'Admin-managed', boundariesBody());
   }
 
   function renderBuilder() {
@@ -889,13 +1057,11 @@
     setPageHead(false);
     listView.hidden = true;
     builderView.hidden = false;
-    var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
     builderView.innerHTML =
-      '<button type="button" class="ag-back" data-ag-back>← All agents</button>' +
       '<div class="ag-build-head">' +
-        '<div style="min-width:0">' +
-          '<div class="ag-build-kicker">Configuring agent</div>' +
-          '<h2 id="ag-build-title">' + (esc(a.name) || 'Untitled') + '</h2>' +
+        '<button type="button" class="ag-back" data-ag-back>← All agents</button>' +
+        '<div style="min-width:0;flex:1">' +
+          '<h2 id="ag-build-title">' + (esc(a.name) || 'New agent') + '</h2>' +
         '</div>' +
         '<div class="ag-build-actions">' + statusPill(a) +
           // Same reason as the list card: the default agent has no delete.
@@ -904,40 +1070,224 @@
             (a.status === 'ready' ? 'Back to draft' : 'Mark ready') + '</button>' +
         '</div>' +
       '</div>' +
-      '<div class="ag-bgrid">' +
-        '<div>' +
-          section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
-            (esc(a.name) || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
-          section('knowledge', 2, 'Knowledge', 'what it knows',
-            'Ground it in anything you can access — governed data, memory, and your files.',
-            a.knowledge.length + ' source' + (a.knowledge.length === 1 ? '' : 's'), knowledgeBody(a)) +
-          section('capabilities', 3, 'Capabilities', 'what it can do',
-            'Give it tools — any plugin or skill available to you, not only what’s in your stack.',
-            a.plugins.length + ' enabled', capabilitiesBody(a)) +
-          section('surfaces', 4, 'Surfaces', 'where it runs',
-            'The same agent, reachable where your team already works.',
-            'On ' + sn, surfacesBody(a)) +
-          section('schedules', 5, 'Schedules', 'when it runs on its own',
-            'Run this agent unattended on a cadence — each schedule sends its own prompt.',
-            scheduleSummary(), schedulesBody(a)) +
-          section('boundaries', 6, 'Boundaries', 'set by admin',
-            'Guardrails managed by your workspace admin — you build within them.',
-            'Admin-managed', boundariesBody()) +
+      '<div class="ag-work">' +
+        '<div class="ag-pane">' +
+          '<div class="ag-tabs"><div class="ag-tabs-in" role="tablist">' +
+            '<button type="button" class="ag-tab" role="tab" data-ag-tab="create" aria-selected="' + (builderTab === 'create') + '">Create</button>' +
+            '<button type="button" class="ag-tab" role="tab" data-ag-tab="preview" aria-selected="' + (builderTab === 'preview') + '">Preview</button>' +
+          '</div></div>' +
+          (builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a)) +
         '</div>' +
-        '<aside class="ag-preview" id="ag-preview">' + previewHtml(a) + '</aside>' +
+        '<div class="ag-pane ag-pane--cfg">' +
+          '<div class="ag-cfg-head"><h3>Configuration</h3><p>everything the assistant set, editable by hand</p></div>' +
+          '<div class="ag-cfg-body" id="ag-cfg-body">' + cfgBodyHtml(a) + '</div>' +
+        '</div>' +
       '</div>';
     syncSkillDropdown();
+    flagTouchedFields();
+    scrollConvToEnd();
   }
 
-  /* Light-touch preview sync while typing (no re-render → keeps focus). */
+  /* Re-render ONLY the pane that changed. A full renderBuilder on every
+     keystroke or streamed token would pull the caret out of whichever
+     composer the owner is typing in, and rebuild the other pane for nothing. */
+  function renderConvPane() {
+    var a = current(); if (!a) return;
+    var pane = builderView.querySelector('.ag-pane');
+    if (!pane) { renderBuilder(); return; }
+    var tabs = pane.querySelector('.ag-tabs');
+    if (!tabs) { renderBuilder(); return; }
+    // Keep the tab strip; replace everything after it.
+    while (tabs.nextSibling) pane.removeChild(tabs.nextSibling);
+    pane.insertAdjacentHTML('beforeend', builderTab === 'create' ? createPaneHtml() : previewPaneHtml(a));
+    scrollConvToEnd();
+  }
+
+  function renderCfgPane() {
+    var a = current(); if (!a) return;
+    var body = document.getElementById('ag-cfg-body');
+    if (!body) { renderBuilder(); return; }
+    body.innerHTML = cfgBodyHtml(a);
+    syncSkillDropdown();
+    flagTouchedFields();
+  }
+
+  function scrollConvToEnd() {
+    var el = document.getElementById('ag-conv') || document.getElementById('ag-pv-conv');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  /* Highlight the fields the last turn wrote, once. Without this a patch that
+     changes three fields deep in a collapsed section is invisible: the reply
+     says what changed, but the panel gives no clue where to look. */
+  function flagTouchedFields() {
+    var keys = Object.keys(touched);
+    if (!keys.length) return;
+    keys.forEach(function (k) {
+      var el = document.querySelector('[data-ag-field="' + k + '"]');
+      if (el) { el.classList.remove('ag-touched'); void el.offsetWidth; el.classList.add('ag-touched'); }
+    });
+    touched = {};
+  }
+
+  /* One builder turn. The reply is inserted as TEXT (see .ag-msg-text) — the
+     model's output is untrusted and this page has no HTML sanitizer. */
+  function sendBuilderTurn(text) {
+    var a = current(); if (!a || convBusy) return;
+    conv.push({ role: 'user', text: text });
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderConvPane();
+    fetch('/api/agents/' + encodeURIComponent(a.id) + '/builder/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        message: text,
+        history: conv.slice(0, -1),
+        // The picker's own ids, so the assistant can only choose capabilities
+        // this page is actually offering (the server validates against this
+        // same list before writing anything).
+        plugin_candidates: (plugins || []).slice(0, 60).map(function (p) {
+          return { id: String(p.id), name: String(p.name || ''), description: String(p.description || '').slice(0, 400) };
+        })
+      })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (body) {
+        if (!r.ok) {
+          var d = (body && body.detail) || {};
+          throw new Error(d.hint || d.kind || ('The assistant could not answer (HTTP ' + r.status + ').'));
+        }
+        return body;
+      });
+    }).then(function (body) {
+      conv.push({ role: 'assistant', text: body.reply || '' });
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      if (body.agent) {
+        // Replace the working copy wholesale: the server just applied the
+        // patch AND re-derived the enforced scope, so its row is the truth.
+        var idx = agents.findIndex(function (x) { return x.id === body.agent.id; });
+        if (idx >= 0) agents[idx] = body.agent;
+        touched = {};
+        Object.keys(body.patch || {}).forEach(function (k) { touched[k] = true; });
+        renderCfgPane();
+        syncPreview();
+      }
+    }).catch(function (err) {
+      console.error('agents: builder turn failed', err);
+      convErr = err.message;
+    }).finally(function () {
+      convBusy = false;
+      renderConvPane();
+    });
+  }
+
+  /* ── Live preview session ──
+     Opened lazily on the first message so switching to the tab costs nothing.
+     Bound by slug to the agent being edited, which is why the draft is saved
+     server-side before the socket opens (`persist` is debounced — flush it). */
+  function openPreviewSession(then) {
+    var a = current(); if (!a) return;
+    if (pv.session && pv.socket && pv.slug === a.slug) { then(); return; }
+    closePreviewSocket();
+    pv.err = null; pv.busy = true; renderConvPane();
+    flushSave(a).then(function () {
+      return fetch('/api/chat/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ surface: 'web', agent_slug: a.slug })
+      });
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (b) {
+          var d = (b && b.detail) || {};
+          throw new Error(d.hint || (r.status === 403 || r.status === 401
+            ? 'Chat is not enabled on your account — an admin grants it to your group.'
+            : 'Could not start a preview session (HTTP ' + r.status + ').'));
+        });
+      }
+      return r.json();
+    }).then(function (session) {
+      pv.session = session; pv.slug = a.slug;
+      var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      var ws = new WebSocket(proto + location.host + session.ws_url);
+      pv.socket = ws;
+      ws.onmessage = function (ev) {
+        var frame;
+        try { frame = JSON.parse(ev.data); } catch (e) { return; }
+        if (frame.type === 'token') { pv.stream += (frame.text || ''); renderConvPane(); }
+        else if (frame.type === 'assistant_message') {
+          pv.msgs.push({ role: 'assistant', text: frame.content || pv.stream || '' });
+          pv.stream = ''; pv.busy = false; renderConvPane();
+        } else if (frame.type === 'error') {
+          pv.err = previewErrorCopy(frame.message);
+          pv.stream = ''; pv.busy = false; renderConvPane();
+        }
+      };
+      ws.onerror = function () { pv.err = 'The preview connection dropped.'; pv.busy = false; renderConvPane(); };
+      ws.onopen = function () { pv.busy = false; then(); };
+    }).catch(function (err) {
+      console.error('agents: preview session failed', err);
+      pv.err = err.message; pv.busy = false; renderConvPane();
+    });
+  }
+
+  /* Engine errors arrive as internal kinds (`kai_integration_not_configured`,
+     `concurrency_cap`). Pasted verbatim they read as a broken page, and send
+     the owner looking for a mistake in a configuration that is in fact fine —
+     what is missing is instance-level plumbing only an admin can supply. Say
+     which of the two it is; keep the kind in the console. */
+  function previewErrorCopy(raw) {
+    var msg = String(raw || '');
+    if (/not_configured|no_provider|provider_unavailable|integration/i.test(msg)) {
+      return 'Preview needs a chat engine, and none is configured on this instance — ' +
+        'an admin sets one up. Your configuration on the right is saved either way.';
+    }
+    if (/concurrency_cap/i.test(msg)) {
+      return 'Too many sessions are running right now. Try the preview again in a moment.';
+    }
+    if (/budget|429/i.test(msg)) {
+      return 'This agent has spent its token budget for the month.';
+    }
+    return msg || 'The agent could not answer.';
+  }
+
+  function sendPreviewMessage(text) {
+    var send = function () {
+      if (!pv.socket || pv.socket.readyState !== WebSocket.OPEN) {
+        pv.err = 'The preview is not connected.'; pv.busy = false; renderConvPane(); return;
+      }
+      pv.socket.send(JSON.stringify({ type: 'user_msg', text: text }));
+      pv.msgs.push({ role: 'user', text: text });
+      pv.draft = ''; pv.busy = true; pv.err = null; pv.stream = '';
+      renderConvPane();
+    };
+    openPreviewSession(send);
+  }
+
+  /* The debounced PATCH must land before a preview session spawns, or the
+     agent answers with the persona from before the last edit. */
+  function flushSave(a) {
+    clearTimeout(saveTimers[a.id]);
+    return fetch('/api/agents/' + encodeURIComponent(a.id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        name: a.name, role: a.role, instructions: a.instructions,
+        tone: a.tone, greeting: a.greeting, knowledge: a.knowledge,
+        plugins: a.plugins, surfaces: a.surfaces, status: a.status
+      })
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (updated) { if (updated && updated.slug) a.slug = updated.slug; })
+      .catch(function (e) { console.error('agents: flush failed', e); });
+  }
+
+  /* Light-touch header sync while typing (no re-render → keeps focus). */
   function syncPreview() {
     var a = current(); if (!a) return;
     var el;
-    if ((el = document.getElementById('ag-pv-name'))) el.textContent = a.name || 'Your agent';
-    if ((el = document.getElementById('ag-pv-role'))) el.textContent = a.role || '—';
-    if ((el = document.getElementById('ag-pv-greeting'))) el.textContent = a.greeting || '…';
-    if ((el = document.getElementById('ag-pv-ph'))) el.textContent = 'Ask ' + (a.name || 'your agent') + '…';
-    if ((el = document.getElementById('ag-build-title'))) el.textContent = a.name || 'Untitled';
+    if ((el = document.getElementById('ag-build-title'))) el.textContent = a.name || 'New agent';
     if ((el = document.querySelector('[data-sec="identity"] .ag-sec-sum'))) el.textContent = (a.name || 'Unnamed') + ' · ' + a.tone;
   }
 
@@ -1026,9 +1376,33 @@
     // without this the click both navigated and swapped the view underneath it.
     // Let the anchor do what an anchor does.
     if (e.target.closest('.ag-chat')) return;
-    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-del],[data-ag-back],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create]');
+    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-del],[data-ag-back],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create],[data-ag-tab],[data-ag-chip],[data-ag-send]');
     if (!t) return;
     var a = current();
+    if (t.hasAttribute('data-ag-tab')) {
+      var tab = t.getAttribute('data-ag-tab');
+      if (tab !== builderTab) {
+        // Carry the half-typed line across the switch — losing it is the
+        // cheapest possible way to make a tab feel destructive.
+        var live = builderView.querySelector('[data-ag-comp]');
+        if (live) { if (builderTab === 'create') convDraft = live.value; else pv.draft = live.value; }
+        builderTab = tab;
+        renderBuilder();
+      }
+      return;
+    }
+    if (t.hasAttribute('data-ag-chip')) {
+      sendBuilderTurn(t.getAttribute('data-ag-chip'));
+      return;
+    }
+    if (t.hasAttribute('data-ag-send')) {
+      var kind = t.getAttribute('data-ag-send');
+      var box = builderView.querySelector('[data-ag-comp="' + kind + '"]');
+      var text = box ? box.value.trim() : '';
+      if (!text) return;
+      if (kind === 'create') sendBuilderTurn(text); else sendPreviewMessage(text);
+      return;
+    }
     if (t.hasAttribute('data-ag-new')) {
       // With templates installed, picking one is the leading path — that is the
       // relationship between the two entities made visible, instead of leaving
@@ -1261,12 +1635,34 @@
     // loses the caret; values survive re-renders triggered elsewhere.
     var sf = e.target.getAttribute && e.target.getAttribute('data-ag-sch-field');
     if (sf) { if (schedForm) schedForm[sf] = e.target.value; return; }
+    // Composer text is state, not just DOM: the config panel re-renders the
+    // whole conversation pane whenever a turn lands, and a draft that only
+    // lived in the textarea would vanish under the owner mid-sentence.
+    var comp = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (comp) {
+      if (comp === 'create') convDraft = e.target.value; else pv.draft = e.target.value;
+      e.target.style.height = 'auto';
+      e.target.style.height = Math.min(e.target.scrollHeight, 140) + 'px';
+      return;
+    }
     var f = e.target.getAttribute && e.target.getAttribute('data-ag-field');
     if (!f) return;
     var a = current(); if (!a) return;
     a[f] = e.target.value;
     a.updated = new Date().toISOString();
     save(); syncPreview();
+  });
+
+  /* Enter sends, Shift+Enter opens a line — the convention every chat box on
+     this site already follows, so a composer that behaved otherwise would be
+     the surprising one. */
+  document.addEventListener('keydown', function (e) {
+    var kind = e.target.getAttribute && e.target.getAttribute('data-ag-comp');
+    if (!kind || e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    var text = (e.target.value || '').trim();
+    if (!text) return;
+    if (kind === 'create') sendBuilderTurn(text); else sendPreviewMessage(text);
   });
 
   /* Keyboard access for the div-based cards/section headers. The Chat link is
