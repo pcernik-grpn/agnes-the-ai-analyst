@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
@@ -442,10 +442,31 @@ async def create_agent(
 
 
 @router.get("")
-async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True))):
+async def list_agents(
+    user: dict = Depends(require_session_or_user_pat(allow_stack_surface=True)),
+    runnable: bool = Query(
+        False,
+        description=(
+            "When true, the response is scoped to exactly the agents the caller may "
+            "start a session against (owned, or shared via a ResourceType.AGENT grant) "
+            "— the data source for a runtime agent picker (e.g. `agnes chat`)."
+        ),
+    ),
+):
     """The caller's own agents plus any shared into a group they belong to
     (Task C1.1 — same reach as the /agents builder's `list_agents`, via the
-    same `ResourceType.AGENT` grant)."""
+    same `ResourceType.AGENT` grant).
+
+    ``runnable=true`` (C2.3) additionally filters to rows
+    `agents_repo().get_runnable_by_slug` would actually resolve for this
+    caller — the same owned-or-granted check the runtime routes
+    (`/api/v1/agents/{slug}/...`) enforce, so this list can never claim an
+    agent is runnable that the runtime would then 404. Today that check
+    happens to accept every row this endpoint already returns, but it goes
+    through the real resolver rather than re-deriving "owned or granted" a
+    second time, so the two cannot drift apart later (e.g. a per-agent
+    runtime precondition added down the line).
+    """
     from app.api.agents_builder_shared import _granted_agent_ids
 
     repo = agents_repo()
@@ -459,6 +480,8 @@ async def list_agents(user: dict = Depends(require_session_or_user_pat(allow_sta
         if row and row.get("deleted_at") is None:
             rows.append(row)
             seen.add(agent_id)
+    if runnable:
+        rows = [r for r in rows if repo.get_runnable_by_slug(uid, r["id"]) is not None]
     # ONE scope read for the whole page — `_serialize` hydrates an empty
     # knowledge/plugins declaration from `agent_scope`, and per-agent reads
     # would turn this listing into an N+1 (mirrors the retired `/agents`

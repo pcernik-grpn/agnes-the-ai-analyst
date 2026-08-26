@@ -7,7 +7,7 @@ and ``build_profile`` are surface-agnostic and are exactly what
 wired to them, so every browser session ran as the caller's default agent
 whatever they had built.
 
-Two things worth pinning beyond "it works":
+Three things worth pinning beyond "it works":
 
 * **Ownership.** Naming another user's slug must not hand the caller a persona
   assembled from grants that are not theirs. 404, not 403 — a distinct status
@@ -15,6 +15,10 @@ Two things worth pinning beyond "it works":
 * **The default path is untouched.** No ``agent_slug`` still resolves to the
   caller's default, because every existing session and its attribution depend
   on that.
+* **Sharing (C2.3).** An agent shared to a group the caller belongs to
+  (``ResourceType.AGENT``) now DOES resolve for web chat — addressed by the
+  agent's id, since a slug is only meaningful in its owner's own namespace.
+  See ``docs/superpowers/plans/2026-08-26-one-agent-model.md`` §C2.3.
 """
 
 from __future__ import annotations
@@ -70,6 +74,11 @@ class TestResolverOwnership:
     Tested at the function rather than only through the endpoint because chat
     is RBAC-gated and not enabled for every environment, and a skipped test
     proves nothing about who may run whose agent.
+
+    C2.3 (shared-agent runtime) widened this from "owned only" to "owned or
+    shared via a ResourceType.AGENT grant" — see
+    ``test_a_shared_agents_id_resolves_for_a_grantee`` below for the new
+    half; the un-shared cases below are unchanged.
     """
 
     def test_my_own_slug_resolves_to_my_agent(self, seeded_app):
@@ -88,6 +97,28 @@ class TestResolverOwnership:
         with pytest.raises(HTTPException) as exc:
             _resolve_agent_id(theirs["slug"], {"id": "analyst1", "email": "a@example.com"})
         assert exc.value.status_code == 404, "a foreign slug resolved, or leaked its existence with a 403"
+
+    def test_a_shared_agents_id_resolves_for_a_grantee(self, seeded_app):
+        """A grantee cannot borrow the owner's SLUG (that namespace is the
+        owner's alone — see ``test_another_users_slug_does_not_resolve``
+        above), but resolves fine by the agent's id once shared to a group
+        they belong to."""
+        from app.api.chat import _resolve_agent_id
+        from src.db import get_system_db
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+
+        theirs = _make_agent(seeded_app, seeded_app["admin_token"], "Shared To Me")
+
+        conn = get_system_db()
+        grp = UserGroupsRepository(conn).create(name="chat-shared-agent-grp", created_by="admin1")
+        UserGroupMembersRepository(conn).add_member("analyst1", grp["id"], source="admin", added_by="admin1")
+        ResourceGrantsRepository(conn).create(grp["id"], "agent", theirs["id"], assigned_by="admin1")
+        conn.close()
+
+        got = _resolve_agent_id(theirs["id"], {"id": "analyst1", "email": "analyst@test.com"})
+        assert got == theirs["id"]
 
     def test_an_unknown_slug_does_not_resolve(self):
         from fastapi import HTTPException
@@ -138,12 +169,41 @@ class TestOwnership:
         assert resp.status_code == 404
 
     def test_another_users_agent_is_refused(self, seeded_app):
-        """Owner-scoped lookup: the admin's agent must not resolve for the analyst."""
+        """Owner-scoped lookup: the admin's agent must not resolve for the
+        analyst by SLUG — a slug is only meaningful in its owner's own
+        namespace (see ``test_a_shared_agent_is_accepted_by_id`` below for
+        the id-shaped, actually-shared case)."""
         theirs = _make_agent(seeded_app, seeded_app["admin_token"], "Admins Agent")
         resp = _chat_or_skip(seeded_app, surface="web", agent_slug=theirs["slug"])
         assert resp.status_code == 404, (
             "a foreign slug resolved — the caller would get a persona built on grants that are not theirs"
         )
+
+    def test_a_shared_agent_is_accepted_by_id(self, seeded_app):
+        """C2.3: once shared (a ``ResourceType.AGENT`` grant via a group the
+        caller belongs to), a non-owner CAN open a web-chat session against
+        the agent — addressed by its id, since its slug lives in the
+        owner's namespace."""
+        from src.db import get_system_db
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+
+        theirs = _make_agent(seeded_app, seeded_app["admin_token"], "Shared Via Chat")
+
+        conn = get_system_db()
+        grp = UserGroupsRepository(conn).create(name="chat-shared-agent-e2e-grp", created_by="admin1")
+        UserGroupMembersRepository(conn).add_member("analyst1", grp["id"], source="admin", added_by="admin1")
+        ResourceGrantsRepository(conn).create(grp["id"], "agent", theirs["id"], assigned_by="admin1")
+        conn.close()
+
+        resp = _chat_or_skip(seeded_app, surface="web", agent_slug=theirs["id"])
+        assert resp.status_code == 201, resp.text
+
+        from src.repositories import chat_sessions_repo
+
+        row = chat_sessions_repo().get(resp.json()["id"])
+        assert row.get("agent_id") == theirs["id"]
 
     def test_a_restricted_principal_is_refused_not_crashed(self):
         """An agent session may not open a chat session — 403, not 500.

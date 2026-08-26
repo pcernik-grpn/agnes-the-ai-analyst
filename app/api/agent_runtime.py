@@ -2,18 +2,22 @@
 `GET /api/v1/jobs/{id}` (Task 9, `docs/superpowers/specs/
 2026-07-21-agent-profiles-and-agent-api-design.md` §3).
 
-One-shot request/response over an owner's agent: creates a fresh headless
-chat session (`app/chat/headless.py`), sends the caller's `input`, and
-either returns the answer synchronously (bounded by `timeout_s`) or
-degrades to a background job (`background: true`, or a sync call whose
-wait outran `timeout_s` — the RUN itself is never killed, only the wait).
+One-shot request/response over an agent the caller owns OR the agent was
+shared to (C2.3, shared-agent runtime): creates a fresh headless chat
+session (`app/chat/headless.py`), sends the caller's `input`, and either
+returns the answer synchronously (bounded by `timeout_s`) or degrades to a
+background job (`background: true`, or a sync call whose wait outran
+`timeout_s` — the RUN itself is never killed, only the wait).
 
 Auth chain (`require_agent_runtime_principal`): `get_current_user` (never
 `get_optional_user` — this surface must 401, not silently downgrade to
-anonymous, on a missing/invalid credential) -> resolve the agent by slug
-for that owner (404 if none) -> if the credential is an agent PAT, 403
-unless its `agent_id` claim matches this agent -> the same `ResourceType.CHAT`
-grant check the chat WS route uses (`app/api/chat.py::require_chat_access`).
+anonymous, on a missing/invalid credential) -> resolve the agent
+owned-or-runnable for that caller (`agents_repo().get_runnable_by_slug`,
+404 if neither) -> if the credential is an agent PAT, 403 unless its
+`agent_id` claim matches this agent -> the same `ResourceType.CHAT` grant
+check the chat WS route uses (`app/api/chat.py::require_chat_access`).
+Row-level access policies (`src/access_policy.py`) bind to THIS caller, not
+the agent's owner — a shared agent's rows are filtered per grantee.
 
 Idempotency (`Idempotency-Key` header): scoped to `(key, owner, agent)` —
 see `src/repositories/idempotency.py`. A replay with an identical raw-body
@@ -156,16 +160,26 @@ def require_agent_runtime_principal(
 ) -> AgentRuntimePrincipal:
     """Auth dependency for every `/api/v1/agents/{slug}/...` runtime route.
 
-    Any restricted principal is hard-denied — this surface is owner-scoped
-    and needs a real owner credential. A `SessionPrincipal` carries no single
-    owner identity to resolve an agent against; an `AgentPrincipal` is the
-    sandbox's own narrowed credential, which must never be able to drive the
-    owner-facing agent API (nor read `user["id"]` off a frozen dataclass).
+    Any restricted principal is hard-denied — this surface needs a real
+    (interactive-session or user-PAT) credential naming a single caller. A
+    `SessionPrincipal` carries no single identity to resolve an agent
+    against; an `AgentPrincipal` is the sandbox's own narrowed credential,
+    which must never be able to drive the caller-facing agent API (nor
+    read `user["id"]` off a frozen dataclass).
+
+    The agent is resolved OWNED-OR-RUNNABLE (C2.3, shared-agent runtime):
+    `agents_repo().get_runnable_by_slug` returns it either when `slug` is
+    this caller's own slug, or — for an agent shared to them via a
+    `ResourceType.AGENT` grant — when `slug` is the agent's id (slugs are
+    only unique per-owner, so a grantee cannot name someone else's agent by
+    a borrowed slug string; see that method's docstring). 404 either way a
+    non-owner/non-grantee gets today — existence of another user's agent is
+    never leaked.
     """
     if isinstance(user, PRINCIPAL_TYPES):
         raise HTTPException(status_code=403, detail={"code": "agent_runtime_requires_owner_credential"})
 
-    agent = agents_repo().get_by_slug(user["id"], slug)
+    agent = agents_repo().get_runnable_by_slug(user["id"], slug)
     if agent is None or agent.get("deleted_at") is not None:
         raise HTTPException(status_code=404, detail={"code": "agent_not_found"})
 
