@@ -52,12 +52,13 @@ _SKIP_SUBSTR = (
 
 # A3 PG-first ratchet (CLAUDE.md -> "Dual-backend discipline"): mutation
 # routes backed by a Postgres-only repository are expected to diverge
-# (DuckDB has no implementation) — list them here instead of letting the
-# sweep flag them. `assert_pg_only_exemptions_fail_clean` below still
-# requires each one to fail CLEAN (4xx/501) on DuckDB, not crash. Empty
-# until the first PG-only route ships (Track C); the mechanism itself is
-# proven in `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
-_PG_ONLY_ROUTE_EXEMPTIONS: frozenset[str] = frozenset()
+# (DuckDB has no implementation) — list them here (route -> one-line reason)
+# instead of letting the sweep flag them. `assert_pg_only_exemptions_fail_clean`
+# below still requires each one to fail CLEAN (a typed 501) on DuckDB, not
+# crash or merely return some unrelated 4xx. Empty until the first PG-only
+# route ships (Track C); the mechanism itself is proven in
+# `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
+_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {}
 
 
 def test_mutation_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
@@ -67,7 +68,7 @@ def test_mutation_status_is_identical_across_backends(tmp_path, monkeypatch, pg_
     pg_client, pg_token = build_seeded_client("pg", tmp_path / "pg", monkeypatch, pg_engine)
     pg = collect_statuses(pg_client, pg_token, methods=_METHODS, skip_substr=_SKIP_SUBSTR)
 
-    assert_pg_only_exemptions_fail_clean(duck, _PG_ONLY_ROUTE_EXEMPTIONS)
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
     divergences = diff_statuses(duck, pg, exempt=_PG_ONLY_ROUTE_EXEMPTIONS)
     assert not divergences, "Mutation status diverges between DuckDB and Postgres (backend-split):\n" + "\n".join(
         f"  {k}: duck={d} pg={g}" for k, (d, g) in sorted(divergences.items())

@@ -72,10 +72,13 @@ functions, not repo classes. Two guards back the sync-map:
 - **Dynamic:** `tests/db_pg/_parity_sweep_util.py` drives both backends through a
   `TestClient` and diffs the HTTP status of every parameter-free route. A
   route backed by a Postgres-only repo (PG-first ratchet, A3) is legitimately
-  expected to diverge — it is listed in the sweep's `_PG_ONLY_ROUTE_EXEMPTIONS`
-  and excluded from the diff, but `assert_pg_only_exemptions_fail_clean` still
-  requires it to answer a clean 4xx/501 on DuckDB (the translated
-  `RequiresPostgresBackend`), never a raw 500.
+  expected to diverge — it is listed (route → one-line reason) in the sweep's
+  `_PG_ONLY_ROUTE_EXEMPTIONS` (`dict[str, str]`) and excluded from the diff,
+  but `assert_pg_only_exemptions_fail_clean` still requires it to answer a
+  TYPED `501` on DuckDB — status `501` AND `body["error"] ==
+  "requires_postgres_backend"` (the translated `RequiresPostgresBackend`) —
+  never a raw 500, and never an unrelated 4xx accepted just because it's
+  also an error status.
 
 The parity reviewer flags exactly what these guards cannot see.
 

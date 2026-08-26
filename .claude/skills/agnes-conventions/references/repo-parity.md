@@ -27,8 +27,9 @@ instantiate a repo class directly.
    factory does this for any PG-only entry) — the app-wide handler in
    `app/main.py` turns it into a `501`. If the route is swept by
    `tests/db_pg/test_get_status_parity_sweep.py` /
-   `test_mutation_status_parity_sweep.py`, add it to that file's
-   `_PG_ONLY_ROUTE_EXEMPTIONS`.
+   `test_mutation_status_parity_sweep.py`, add `"METHOD path": "<one-line
+   reason>"` to that file's `_PG_ONLY_ROUTE_EXEMPTIONS` (a `dict[str, str]`
+   — an empty/missing reason fails its own guard).
 
 Full recipe with worked examples: `docs/migrations.md` → "Adding a PG-only
 feature".

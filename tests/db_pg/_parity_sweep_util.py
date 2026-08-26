@@ -142,39 +142,71 @@ def collect_statuses(client, token, *, methods, skip_substr=()):
     return seen
 
 
-def diff_statuses(duck, pg, *, exempt=frozenset()):
+def diff_statuses(duck, pg, *, exempt: dict[str, str] | None = None):
     """Return ``{key: (duck_status, pg_status)}`` for keys that differ.
 
     ``exempt`` (A3 PG-first ratchet, see CLAUDE.md -> "Dual-backend
-    discipline") names routes backed by a Postgres-only repository — they
-    are EXPECTED to differ across backends (DuckDB has no implementation to
-    resolve), so they are excluded from the strict diff here. That
-    exclusion is only safe combined with :func:`assert_pg_only_exemptions_fail_clean`,
-    which proves the DuckDB side fails *clean* (4xx/501, the translated
-    ``RequiresPostgresBackend``) rather than hiding an actual crash.
+    discipline") maps a route key (``"METHOD path"``) to a one-line reason it
+    is backed by a Postgres-only repository — it is EXPECTED to differ across
+    backends (DuckDB has no implementation to resolve), so it is excluded
+    from the strict diff here. That exclusion is only safe combined with
+    :func:`assert_pg_only_exemptions_fail_clean`, which proves the DuckDB
+    side fails *clean* — a TYPED 501, the translated
+    ``RequiresPostgresBackend`` — rather than hiding an actual crash (or an
+    unrelated 4xx that happens to also be an error status).
     """
+    exempt = exempt or {}
     keys = set(duck) | set(pg)
     return {k: (duck.get(k), pg.get(k)) for k in keys if k not in exempt and duck.get(k) != pg.get(k)}
 
 
-def assert_pg_only_exemptions_fail_clean(duck_statuses, exempt):
-    """For every ``exempt`` route, the DuckDB-backend status must be a clean
-    4xx or 501 (a ``RequiresPostgresBackend`` translated to an HTTP error by
-    ``app/main.py``), never a raw 5xx crash.
+def assert_pg_only_exemptions_fail_clean(client, token, exempt: dict[str, str]):
+    """For every ``exempt`` route (``{"METHOD path": reason}``), calling it
+    against ``client`` (the DuckDB-backed ``TestClient``) must answer a
+    TYPED clean failure — status ``501`` AND a JSON body with
+    ``error == "requires_postgres_backend"`` (the exact
+    ``RequiresPostgresBackend`` translation ``app/main.py`` performs) —
+    never a raw crash, and never an unrelated 4xx (e.g. a 403/404 that fires
+    before the PG-only repo is ever reached) passing silently just because
+    it also happens to be an error status.
+
+    Every exemption must also carry a non-empty ``reason`` — an
+    undocumented exemption is itself a finding, since the whole point of the
+    mechanism is that a reviewer can tell at a glance *why* a route is
+    allowed to diverge.
 
     Call this alongside ``diff_statuses(..., exempt=exempt)`` in every sweep
-    that accepts an exemption set — the exemption itself does not verify
-    anything; this is what stops it from silently hiding a real 500. A route
-    missing from ``duck_statuses`` entirely (e.g. skipped by a ``skip_substr``
-    filter) is not checked here — it simply never ran.
+    that accepts an exemption dict — the exemption itself proves nothing;
+    this is what stops it from silently hiding a real bug.
     """
-    dirty = {
-        k: duck_statuses[k]
-        for k in exempt
-        if k in duck_statuses and not (400 <= duck_statuses[k] < 500 or duck_statuses[k] == 501)
-    }
-    assert not dirty, (
-        "PG-only route exemption(s) did not fail clean on DuckDB (expected a "
-        "4xx/501 -- a RequiresPostgresBackend translated to an HTTP error -- "
-        "got a raw crash instead):\n" + "\n".join(f"  {k}: {v}" for k, v in sorted(dirty.items()))
+    auth = {"Authorization": f"Bearer {token}"}
+    bad: dict[str, str] = {}
+    for key, reason in exempt.items():
+        if not reason or not reason.strip():
+            bad[key] = "exemption has no reason recorded"
+            continue
+        method, _, path = key.partition(" ")
+        try:
+            if method == "GET":
+                r = client.get(path, headers=auth, follow_redirects=False)
+            else:
+                r = client.request(method, path, json={}, headers=auth, follow_redirects=False)
+        except Exception as exc:  # noqa: BLE001 — record as a failure, not a test crash
+            bad[key] = f"transport error calling the route: {exc}"
+            continue
+        if r.status_code != 501:
+            bad[key] = f"expected a clean 501, got {r.status_code}"
+            continue
+        try:
+            body = r.json()
+        except ValueError:
+            bad[key] = f"501 but the body is not JSON: {r.text[:200]!r}"
+            continue
+        if body.get("error") != "requires_postgres_backend":
+            bad[key] = f"501 but body['error'] = {body.get('error')!r}, expected 'requires_postgres_backend'"
+    assert not bad, (
+        "PG-only route exemption(s) did not fail clean on DuckDB (expected "
+        "the typed RequiresPostgresBackend translation -- status 501 with "
+        "body['error'] == 'requires_postgres_backend' -- got something "
+        "else):\n" + "\n".join(f"  {k}: {v}" for k, v in sorted(bad.items()))
     )

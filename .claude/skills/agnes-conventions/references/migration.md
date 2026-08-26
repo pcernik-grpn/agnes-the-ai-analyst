@@ -39,6 +39,12 @@ write, and `SCHEMA_VERSION` must not move.
 - `tests/test_db_schema_version_frozen.py` — `SCHEMA_VERSION` must equal
   `FROZEN_DUCKDB_SCHEMA_VERSION`; fails if a new `_vN_to_v(N+1)` step (or a
   bare version bump) appears.
+- `tests/test_db_schema_version.py` — unaffected by the freeze and still the
+  integration gate for the frozen ladder's existing (pre-A3) steps: it drives
+  old DuckDB files up through them and asserts they land at `SCHEMA_VERSION`.
+  A bugfix to one of those existing `_vN_to_v(N+1)` functions still needs a
+  green run here; only a NEW step is disallowed (that's
+  `test_db_schema_version_frozen.py`'s job).
 - `tests/db_pg/test_alembic_roundtrip.py` — upgrade/downgrade roundtrips +
   `test_no_model_migration_drift` (autogenerate diff vs `Base.metadata` must be
   empty → this is why you update `src/db_pg.py`).
@@ -59,6 +65,8 @@ write, and `SCHEMA_VERSION` must not move.
 ## Anchors
 
 - `SCHEMA_VERSION` / `FROZEN_DUCKDB_SCHEMA_VERSION`: `src/db.py`
-- gates: `tests/test_db_schema_version_frozen.py`, `tests/db_pg/test_alembic_roundtrip.py`
+- gates: `tests/test_db_schema_version_frozen.py` (freeze ceiling),
+  `tests/test_db_schema_version.py` (existing pre-A3 ladder steps),
+  `tests/db_pg/test_alembic_roundtrip.py`
 - full developer recipe with worked examples: `docs/migrations.md` → "Adding
   a PG-only feature"

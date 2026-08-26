@@ -596,9 +596,12 @@ like BQ/FTS are untouched and stay DuckDB-only by design.)
   (`tests/db_pg/_parity_sweep_util.py`) drive both backends through a
   `TestClient` and diff the HTTP status of every parameter-free route. A
   route backed by a PG-only repo is legitimately expected to diverge; list
-  it in the sweep's `_PG_ONLY_ROUTE_EXEMPTIONS` and the mechanism still
-  requires `assert_pg_only_exemptions_fail_clean` to prove the DuckDB side
-  answers 4xx/501, never a raw 500.
+  it (route → one-line reason) in the sweep's `_PG_ONLY_ROUTE_EXEMPTIONS`
+  (`dict[str, str]`) and the mechanism still requires
+  `assert_pg_only_exemptions_fail_clean` to prove the DuckDB side answers a
+  TYPED `501` (`body["error"] == "requires_postgres_backend"`) — never a raw
+  500, and never an unrelated 4xx accepted just because it's also an error
+  status.
 - **No PG-only optimizations without a DuckDB fallback path** on an existing
   frozen pair — unchanged by the ratchet. If a query has a PG-native window
   function, the DuckDB sibling either uses the same syntax (DuckDB ⊇ PG in

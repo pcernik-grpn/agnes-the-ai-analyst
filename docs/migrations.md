@@ -219,10 +219,13 @@ repo module.
    `app/main.py` turns it into a `501` naming the feature. You do not need a
    bespoke try/except in the handler; just let the exception propagate.
 7. **If the route is swept by `tests/db_pg/test_get_status_parity_sweep.py`
-   / `test_mutation_status_parity_sweep.py`**, add its `"METHOD path"` key to
-   that file's `_PG_ONLY_ROUTE_EXEMPTIONS` — the sweep's
+   / `test_mutation_status_parity_sweep.py`**, add its `"METHOD path"` key
+   (with a one-line reason as the value — `_PG_ONLY_ROUTE_EXEMPTIONS` is a
+   `dict[str, str]`) to that file's `_PG_ONLY_ROUTE_EXEMPTIONS` — the sweep's
    `assert_pg_only_exemptions_fail_clean` still requires the DuckDB side to
-   answer 4xx/501, so a genuine crash is still caught.
+   answer a TYPED `501` (`body["error"] == "requires_postgres_backend"`),
+   not merely some 4xx, so a genuine crash — or an unrelated 403/404 that
+   fires before the repo is even reached — is still caught.
 8. **Write PG-side tests** under `tests/db_pg/test_<cluster>_pg.py` and a
    PG-only-shaped test in the style of `tests/db_pg/test_mcp_sources_contract.py`
    (there is no DuckDB half to parametrize against — just exercise the PG

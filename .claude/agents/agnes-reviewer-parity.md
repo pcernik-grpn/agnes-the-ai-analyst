@@ -49,9 +49,11 @@ Read `CONTRIBUTING.md` → "Sync-map" + "Parity enforcement reality" first.
    must stay at `FROZEN_DUCKDB_SCHEMA_VERSION`. Finding a new DuckDB ladder
    step added alongside a new Alembic revision is BLOCKING (that is the
    pre-A3 rule, now retired). A PG-only feature that a DuckDB-backed route
-   can reach must fail clean (4xx/501 via `RequiresPostgresBackend`), not a
-   raw 500 — check the route is in `_PG_ONLY_ROUTE_EXEMPTIONS` if it's swept
-   by `tests/db_pg/test_get_status_parity_sweep.py` /
+   can reach must fail clean — a TYPED 501 (`RequiresPostgresBackend`:
+   status 501 AND `body["error"] == "requires_postgres_backend"`), never a
+   raw 500 and never an unrelated 4xx — check the route is in
+   `_PG_ONLY_ROUTE_EXEMPTIONS` (`dict[str, str]`, route → non-empty reason)
+   if it's swept by `tests/db_pg/test_get_status_parity_sweep.py` /
    `test_mutation_status_parity_sweep.py`.
 
 ## Severity

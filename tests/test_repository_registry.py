@@ -6,10 +6,14 @@ These tests lock the table's integrity so the dispatch stays correct as repos
 and backends are added:
 
   - every public `<name>_repo` factory has a registry entry (and vice versa);
-  - every entry registers the SAME set of backends (no repo that exists on one
-    backend but silently not another) — the structural half of the dual-backend
-    discipline, complementing `tests/db_pg/test_repo_method_parity.py` (method
-    parity) and the `*_contract.py` suites (behavioural parity);
+  - every entry registers EITHER every backend (a frozen pre-A3 pair) OR
+    Postgres-only (a post-A3 PG-first repo) — never DuckDB alone (no repo
+    that exists on DuckDB but silently has no Postgres backend at all) —
+    the structural half of the dual-backend discipline, complementing
+    `tests/db_pg/test_repo_method_parity.py` (method parity on existing
+    pairs), the `*_contract.py` suites (behavioural parity), and
+    `tests/test_repository_registry_pg_first_ratchet.py` (the frozen-key
+    ratchet — no *new* entry may carry a DuckDB backend, full pair or not);
   - the registry's backends match the connection-arg providers;
   - every registered `(module, class)` is importable and is a class.
 
