@@ -1000,7 +1000,22 @@ chat:
 data_apps:
   enabled: false
   runtime_image: "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24"
-  subdomain_base: ""            # e.g. "apps.example.com"; "" = path-prefix only
+  # Serve each app from its OWN origin (`<slug>.<subdomain_base>`) instead of
+  # the main host. This is the SUPPORTED fix for the same-origin hazard
+  # described under `allow_same_origin` below: a separate origin means CORS
+  # blocks the credentialed read that no response header can close.
+  # Env override: AGNES_DATA_APPS_SUBDOMAIN_BASE (applied whenever data apps
+  # resolve enabled, whichever way they were switched on).
+  # Needs a wildcard DNS record for `*.<subdomain_base>` pointed at this
+  # deployment, and TLS covering those names.
+  # SECURITY — choose the base carefully. Setting it widens the session cookie
+  # to the base's PARENT domain (`session_cookie_domain()`), so one login also
+  # covers the app subdomains:
+  #   "apps.agnes.example.com"  -> cookie Domain=.agnes.example.com   (good)
+  #   "apps.example.com"        -> cookie Domain=.example.com         (BAD: the
+  #      session cookie is then sent to every unrelated host under example.com)
+  # Prefer `apps.<your-agnes-host>`, never `apps.<your-registrable-domain>`.
+  subdomain_base: ""            # e.g. "apps.agnes.example.com"; "" = path-prefix only
   # Serve hosted apps on the MAIN origin (same origin as the Agnes /api)?
   # OFF by default (SECURITY): a hosted app runs user-authored JS, and on the
   # main origin that JS can call /api with the viewer's own session cookie and

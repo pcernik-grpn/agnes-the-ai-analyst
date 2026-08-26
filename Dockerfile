@@ -81,7 +81,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
        /app/docker-compose.postgres.yml \
        /app/docker-compose.postgres-host-mount.yml \
        /app/docker-compose.gcp-logging.yml \
-       /app/Caddyfile /opt/agnes-host/ && \
+       /app/Caddyfile /app/deploy/caddy/Caddyfile.apps-subdomain /opt/agnes-host/ && \
     cp /app/static/maintenance.html /opt/agnes-host/static/ && \
     chmod 0755 /opt/agnes-host/agnes-auto-upgrade.sh \
               /opt/agnes-host/agnes-tls-rotate.sh \

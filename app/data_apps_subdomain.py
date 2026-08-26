@@ -51,5 +51,11 @@ class DataAppSubdomainMiddleware:
                         # prefix from the app's own point of view, unlike
                         # the path-prefix form of the same route.
                         scope["agnes_data_app_subdomain"] = slug
+                        # The path as the VISITOR asked for it. The rewrite below
+                        # is irreversible from downstream's point of view (a real
+                        # app path could itself start with `/apps/<slug>`), and
+                        # the 401->login redirect has to hand back a return URL
+                        # in the visitor's own terms, not ours.
+                        scope["agnes_data_app_original_path"] = scope["path"]
                         scope["path"] = f"/apps/{slug}" + scope["path"]
         await self.app(scope, receive, send)
