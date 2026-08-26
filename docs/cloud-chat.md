@@ -386,13 +386,29 @@ is unchanged.
 ### Prerequisites
 
 On a VM built by the `customer-instance` Terraform module, setting
-`chat_provider = "docker"` on that instance does all of this for you: it mints
-`APPS_RUNNER_TOKEN`, resolves `DOCKER_GID`, activates the `apps` compose
+`chat_provider = "docker"` on that instance does **items 1–3** for you: it
+mints `APPS_RUNNER_TOKEN`, resolves `DOCKER_GID`, activates the `apps` compose
 profile, and builds the sandbox image at boot from the context inside the app
 image (`scripts/ops/agnes-chat-sandbox-image.sh`, re-run by the upgrade tick
 whenever that context changes). It does **not** enable hosted data apps —
-`data_apps_enabled` stays a separate choice. The list below is what that
-automation does, and what to do by hand anywhere else.
+`data_apps_enabled` stays a separate choice. Anywhere else, do items 1–3 by
+hand as described below.
+
+**Item 4, the rails URL, is not module-provisioned — read it even on a
+module-built VM.** The module pins `SERVER_URL` to the instance's *public*
+origin (OAuth redirects, magic links and the MCP issuer resolve from it too)
+and writes no `AGNES_INTERNAL_URL`. `SERVER_URL` wins the rails resolution and
+the `.env` heredoc is rewritten whole on every boot, so adding
+`AGNES_INTERNAL_URL` by hand there neither takes effect nor survives a
+reboot. The sandbox consequently reaches Agnes at the public address — on a
+domain VM `https://<domain>`, which verifies fine against the public-CA
+certificate the bundled Caddy obtains but routes sandbox↔Agnes traffic out
+through the proxy and back; on a domain-less VM the pinned
+`http://<external-ip>:8000`. Both are refused outright by
+`docker_egress_mode: none`, which leaves the sandbox no route off-host. Boot
+logs a warning, not a refusal. Serving the rails from the in-network address
+on a module-built VM needs a split-horizon module variable that does not exist
+yet.
 
 1. **A Docker daemon on the host** that runs the Agnes gateway.
 2. **The apps-runner sidecar.** It is the only process that touches
