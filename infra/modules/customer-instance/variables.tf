@@ -607,7 +607,31 @@ variable "enable_watchdog" {
 }
 
 variable "enable_gcp_logging" {
-  description = "Ship every container's stdout/stderr to Google Cloud Logging via Docker's built-in gcplogs driver, in addition to the local dual-logging cache `docker logs` reads from. On: the startup script extracts docker-compose.gcp-logging.yml (baked into the image) into the app directory, which the COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) then includes on every `docker compose` invocation — so logs survive the routine container recreates the auto-upgrade cron performs every 5 minutes, which otherwise destroy the Docker json-file log history. Off: the script removes the file instead, keeping the instance on the default json-file driver (rotated by /etc/docker/daemon.json) — the only supported choice for a non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server credentials."
+  description = <<-EOT
+    Ship every container's stdout/stderr to Google Cloud Logging via Docker's
+    built-in gcplogs driver, in addition to the local dual-logging cache
+    `docker logs` reads from. On: the module grants roles/logging.logWriter
+    on the project to the VM service account (the gcplogs driver
+    authenticates as that account, and Docker refuses to START a container
+    whose log driver cannot initialize — without the role, any container
+    recreate takes the instance down), and the startup script extracts
+    docker-compose.gcp-logging.yml (baked into the image) into the app
+    directory, probes that the driver actually initializes, and only then
+    arms the overlay for the COMPOSE_FILE resolver
+    (scripts/ops/agnes-compose-file.sh) to include on every `docker compose`
+    invocation — so logs survive the routine container recreates the
+    auto-upgrade cron performs every 5 minutes, which otherwise destroy the
+    Docker json-file log history. The IAM grant means the identity running
+    `terraform apply` must be allowed to modify project IAM policy (e.g.
+    roles/resourcemanager.projectIamAdmin); if yours cannot, grant
+    roles/logging.logWriter to the VM service account out-of-band or set
+    this to false — a VM without the role stays up either way (the probe
+    disables the overlay with a warning) but ships no logs. Off: the script
+    removes the file instead, keeping the instance on the default json-file
+    driver (rotated by /etc/docker/daemon.json) — the only supported choice
+    for a non-GCE / non-GCP deployment, since gcplogs needs GCE
+    metadata-server credentials.
+  EOT
   type        = bool
   default     = true
 }

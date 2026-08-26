@@ -188,8 +188,13 @@ hash_config_files() {
   # in CONFIG_FILES, which are fetched unconditionally) so an overlay-only
   # refresh triggers a recreate and actually lands on running containers.
   # Absent on non-GCE hosts it contributes a stable "missing" line, so it
-  # never causes spurious drift there.
-  ( cd /opt/agnes && for f in "${CONFIG_FILES[@]}" docker-compose.gcp-logging.yml; do
+  # never causes spurious drift there. The .gcp-logging-ok probe marker is
+  # hashed for the same reason: arming or disarming the overlay (see the
+  # probe below) must count as config drift, or the recreate that actually
+  # moves containers between log drivers would wait for some unrelated
+  # change. The marker only transitions when a probe runs, and a probe only
+  # runs when the marker is absent — so this cannot flap.
+  ( cd /opt/agnes && for f in "${CONFIG_FILES[@]}" docker-compose.gcp-logging.yml .gcp-logging-ok; do
       sha256sum "$f" 2>/dev/null || printf 'missing %s\n' "$f"
     done ) | sort | sha256sum | awk '{print $1}'
 }
@@ -206,8 +211,9 @@ done
 # docker-compose.gcp-logging.yml is placement-driven: deliberately NOT in
 # CONFIG_FILES (those are fetched unconditionally). It must exist ONLY where
 # the deploy layer placed it -- the overlay-append further down gates on its
-# presence, and its gcplogs driver needs the GCE metadata server, so a
-# non-GCE host must never acquire it. But once present it still has to track
+# presence plus the driver-probe marker (see below), and its gcplogs driver
+# needs the GCE metadata server, so a non-GCE host must never acquire it.
+# But once present it still has to track
 # @main: if a service is dropped from the base compose (e.g. ws-gateway) while
 # a stale gcp-logging.yml keeps referencing it, the merged project becomes
 # invalid and every `docker compose` below fails (pull, config, up) -- which
@@ -221,13 +227,13 @@ if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
     logger -t agnes-auto-upgrade "WARN: failed to refresh docker-compose.gcp-logging.yml from $RAW_BASE -- keeping existing"
   fi
 fi
-CONFIG_AFTER=$(hash_config_files)
 
-# Resolve the authoritative COMPOSE_FILE via the single shared resolver
-# (scripts/ops/agnes-compose-file.sh — just re-fetched above as part of
-# CONFIG_FILES). Evaluated AFTER the config re-fetch so a Caddyfile or
-# gcp-logging overlay that just landed THIS tick is reflected immediately,
-# not on the next one.
+# Source the single shared resolver (scripts/ops/agnes-compose-file.sh —
+# just re-fetched above as part of CONFIG_FILES) here, AFTER the config
+# re-fetch so a Caddyfile or gcp-logging overlay that just landed THIS tick
+# is reflected immediately, not on the next one, and BEFORE
+# hash_config_files so the gcplogs probe below can arm its marker inside
+# this tick's drift window.
 #
 # Sourced by absolute path, and its absence ends the tick rather than
 # being worked around. Two situations produce an absent resolver: the
@@ -244,6 +250,33 @@ if [ ! -f "$RESOLVER" ]; then
 fi
 # shellcheck source=./agnes-compose-file.sh
 . "$RESOLVER"
+
+# Defense in depth for #1557: the overlay is engaged only after the gcplogs
+# driver has proven it can initialize. Docker refuses to START a container
+# whose log driver cannot authenticate, so a recreate with an unauthorized
+# gcplogs driver takes the whole instance down (observed live:
+# app/scheduler stuck in `created`, 9 minutes of 502). The resolver's
+# agnes_gcp_logging_active gate requires the shared probe marker
+# (/opt/agnes/.gcp-logging-ok) next to the overlay file; the boot startup
+# script writes it after its own probe, and this tick re-probes whenever
+# the overlay sits there marker-less (fresh IAM grant, an overlay that
+# materialized mid-life, a boot from a build predating the marker) so the
+# VM converges within 5 minutes and without a reboot. An existing marker is
+# trusted for the life of the boot disk — re-probing every tick would let a
+# single metadata-server blip disarm the overlay and churn two recreates.
+# Runs BEFORE hash_config_files below so a marker transition counts as
+# config drift on THIS tick and the recreate that actually switches log
+# drivers happens now, not after some unrelated change.
+if [ -f /opt/agnes/docker-compose.gcp-logging.yml ] && [ ! -f /opt/agnes/.gcp-logging-ok ]; then
+  if agnes_gcp_logging_probe /opt/agnes "$IMAGE"; then
+    logger -t agnes-auto-upgrade "gcplogs driver probe OK — arming the Cloud Logging overlay"
+  else
+    logger -t agnes-auto-upgrade "WARN: docker-compose.gcp-logging.yml is present but the gcplogs driver failed its probe (is roles/logging.logWriter granted to the VM service account?) — leaving the Cloud Logging overlay disabled"
+  fi
+fi
+
+CONFIG_AFTER=$(hash_config_files)
+
 RESOLVED_COMPOSE_FILE=$(agnes_resolve_compose_file /opt/agnes "$STATE_DIR")
 
 # Reconcile the .env candidate against the authoritative state, rather
@@ -290,15 +323,17 @@ case "$DATA_APPS_ENABLED" in
   1|true|TRUE|yes|on) PROFILE_ARGS+=( --profile apps ) ;;
 esac
 
-# gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging. Gated
-# purely on file presence: the file is NOT baked into the image and is NOT
-# in CONFIG_FILES, so it lands ONLY when the GCE deploy layer (Terraform
-# startup-script / infra startup.sh) placed it. On non-GCP hosts the file
-# is absent → the overlay is never appended → containers stay on the
-# default json-file driver (gcplogs would otherwise fail without a GCE
-# metadata server). Folded into RESOLVED_COMPOSE_FILE above (same file-
-# presence check, done once in agnes_resolve_compose_file) — nothing left
-# to do here.
+# gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging.
+# Gated on file presence (the file is baked into the image but PLACED only
+# by the GCE deploy layer's startup script, and it is NOT in CONFIG_FILES)
+# plus the .gcp-logging-ok driver-probe marker (see the probe above). On
+# non-GCP hosts the file is absent → the overlay is never appended →
+# containers stay on the default json-file driver (gcplogs would otherwise
+# fail without a GCE metadata server); on GCP hosts whose service account
+# lacks roles/logging.logWriter the probe never arms the marker, so a
+# recreate cannot detonate on an unauthorized driver (#1557). Folded into
+# RESOLVED_COMPOSE_FILE above (the same agnes_gcp_logging_active gate, done
+# once in agnes_resolve_compose_file) — nothing left to do here.
 
 # Docker GC. Deliberately OUTSIDE the drift block below, and ahead of the
 # pull: `docker image prune -f` used to be the last statement inside that
