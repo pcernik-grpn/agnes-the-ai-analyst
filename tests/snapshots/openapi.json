@@ -2067,6 +2067,42 @@
             ],
             "title": "Description"
           },
+          "greeting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Greeting"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge"
+          },
           "model": {
             "anyOf": [
               {
@@ -2082,9 +2118,66 @@
             "title": "Name",
             "type": "string"
           },
+          "plugins": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugins"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "slug": {
-            "title": "Slug",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "surfaces": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaces"
           },
           "system_prompt": {
             "anyOf": [
@@ -2097,6 +2190,17 @@
             ],
             "title": "System Prompt"
           },
+          "template_entity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Template Entity Id"
+          },
           "token_budget_monthly": {
             "anyOf": [
               {
@@ -2107,11 +2211,21 @@
               }
             ],
             "title": "Token Budget Monthly"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tone"
           }
         },
         "required": [
-          "name",
-          "slug"
+          "name"
         ],
         "title": "CreateAgentRequest",
         "type": "object"
@@ -9372,6 +9486,42 @@
             ],
             "title": "Description"
           },
+          "greeting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Greeting"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge"
+          },
           "memory_mode": {
             "anyOf": [
               {
@@ -9416,6 +9566,20 @@
             ],
             "title": "Name"
           },
+          "plugins": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugins"
+          },
           "plugins_mode": {
             "anyOf": [
               {
@@ -9427,6 +9591,17 @@
             ],
             "title": "Plugins Mode"
           },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "slug": {
             "anyOf": [
               {
@@ -9437,6 +9612,31 @@
               }
             ],
             "title": "Slug"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "surfaces": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaces"
           },
           "system_prompt": {
             "anyOf": [
@@ -9470,6 +9670,17 @@
               }
             ],
             "title": "Token Budget Monthly"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tone"
           }
         },
         "title": "UpdateAgentRequest",
@@ -47706,6 +47917,7 @@
     },
     "/api/v1/agents": {
       "get": {
+        "description": "The caller's own agents plus any shared into a group they belong to\n(Task C1.1 \u2014 same reach as the /agents builder's `list_agents`, via the\nsame `ResourceType.AGENT` grant).",
         "operationId": "list_agents_api_v1_agents_get",
         "parameters": [
           {
