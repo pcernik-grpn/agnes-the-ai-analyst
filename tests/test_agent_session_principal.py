@@ -14,6 +14,11 @@ intersection-agent-scope actually reach the authorization seams. Covers:
   ``resolve_agent_authority`` computed independently.
 - Every fail-closed path, individually: missing session, session with no
   agent_id, missing agent row, soft-deleted agent, missing owner.
+- C2.3 (shared-agent runtime): the SAME branch also resolves
+  ``caller_user_id``/``caller_email`` from the session's own stored
+  ``user_email`` — the owner when they run their own agent, a DIFFERENT
+  user for a session a grantee created against a shared agent — and fails
+  closed the same way when that lookup comes up empty.
 """
 
 from __future__ import annotations
@@ -198,10 +203,60 @@ def test_resolver_returns_agent_principal_matching_intersection(e2e_env, monkeyp
     assert principal.agent_id == agent_id
     assert principal.owner_user_id == owner_id
     assert principal.owner_email == owner_email
+    # C2.3: the owner running their OWN agent is also the caller.
+    assert principal.caller_user_id == owner_id
+    assert principal.caller_email == owner_email
 
     expected = intersection_mod.resolve_agent_authority(agent_id)
     assert principal.intersection == expected
     assert principal.intersection["table"] == frozenset({"t1"})
+
+
+def test_resolver_agent_session_binds_a_distinct_caller_for_a_shared_agent(e2e_env):
+    """C2.3, shared-agent runtime: a session created under a DIFFERENT
+    user's identity than the agent's owner (the shape a grantee's session
+    takes) must resolve an ``AgentPrincipal`` whose ``caller_*`` fields
+    name THAT user, while ``owner_*`` still names the agent's real owner —
+    authority (``intersection``) keeps deriving from the owner/granter side
+    (C2.2), only the caller identity is new."""
+    from app.auth.access import mint_agent_session_jwt
+    from app.auth.pat_resolver import resolve_token_to_user
+    from app.auth.session_principal import AgentPrincipal
+
+    owner_id, owner_email = _make_user()
+    agent_id = _make_agent(owner_id)  # 'all'-mode: no scope narrowing needed for this test
+    caller_id, caller_email = _make_user()
+    session_id = _make_session(caller_email, agent_id=agent_id)
+
+    token = mint_agent_session_jwt(session_id)
+    principal, reason = resolve_token_to_user(None, token)
+
+    assert reason is None
+    assert isinstance(principal, AgentPrincipal)
+    assert principal.owner_user_id == owner_id
+    assert principal.owner_email == owner_email
+    assert principal.caller_user_id == caller_id
+    assert principal.caller_email == caller_email
+    assert principal.caller_user_id != principal.owner_user_id
+
+
+def test_resolver_agent_session_missing_caller_user_fails_closed(e2e_env):
+    """The owner and agent both resolve fine, but the session's stored
+    ``user_email`` (C2.3's caller-lookup key) names no real user — must
+    fail closed exactly like every other missing link, never silently
+    fall back to the owner identity."""
+    from app.auth.access import mint_agent_session_jwt
+    from app.auth.pat_resolver import resolve_token_to_user
+
+    owner_id, owner_email = _make_user()
+    agent_id = _make_agent(owner_id)
+    session_id = _make_session("ghost-caller@example.com", agent_id=agent_id)
+
+    token = mint_agent_session_jwt(session_id)
+    principal, reason = resolve_token_to_user(None, token)
+
+    assert principal is None
+    assert reason == "invalid_token"
 
 
 def test_resolver_agent_session_stashes_payload(e2e_env):
