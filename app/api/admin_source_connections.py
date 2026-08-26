@@ -13,15 +13,29 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        ``app.datasource_secrets.keboola_instance_token``.
                                                        Response gains ``token_seeded``/``token_seed_error``
                                                        when this ran and something was actually seeded.
-  GET    /api/admin/source-connections/{id}         — detail; 404 if missing
-  PUT    /api/admin/source-connections/{id}         — update config / token_env; 404 if missing.
                                                        Snowflake/Databricks: 409
+                                                       ``connection_change_affects_registrations`` if
+                                                       ``is_default: true`` would demote another connection
+                                                       of the same source_type that already has
+                                                       registrations — resend with
+                                                       ``confirm_connection_change: true`` to apply (RBAC
+                                                       review Finding 1, 2026-08-26; see
+                                                       ``_guard_default_repoint``).
+  GET    /api/admin/source-connections/{id}         — detail; 404 if missing
+  PUT    /api/admin/source-connections/{id}         — update config / token_env / is_default; 404 if
+                                                       missing. Snowflake/Databricks: 409
                                                        ``connection_change_affects_registrations`` if the new
                                                        config changes a connection-identity leaf
-                                                       (``app.connection_identity``) and the source already has
-                                                       registrations — resend with
-                                                       ``confirm_connection_change: true`` to apply (D2.3; see
-                                                       ``_guard_row_repoint``).
+                                                       (``app.connection_identity`` — an identity leaf present
+                                                       in the stored config but omitted from an empty/partial
+                                                       replacement config counts as a change, since this
+                                                       endpoint REPLACES ``config`` wholesale) or if
+                                                       ``is_default: true`` would demote a different
+                                                       connection of the same source_type, and the source
+                                                       already has registrations — resend with
+                                                       ``confirm_connection_change: true`` to apply (D2.3 +
+                                                       RBAC review Findings 1/2, 2026-08-26; see
+                                                       ``_guard_row_repoint`` / ``_guard_default_repoint``).
   DELETE /api/admin/source-connections/{id}         — delete; 404 if missing
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
@@ -137,6 +151,13 @@ class CreateConnectionBody(BaseModel):
     # data source" wizard, the CLI, third-party API clients) leaves this
     # False and gets exactly today's behavior.
     seed_from_instance_credentials: bool = False
+    # RBAC review Finding 1 (2026-08-26): creating a new row with
+    # `is_default: true` for a source_type that already has a default
+    # connection WITH registrations demotes that connection just as surely
+    # as a `PUT` repoint does — same 409 `connection_change_affects_
+    # registrations` override contract as `UpdateConnectionBody`'s field of
+    # the same name. See `_guard_default_repoint`.
+    confirm_connection_change: bool = False
 
 
 class UpdateConnectionBody(BaseModel):
@@ -358,7 +379,13 @@ def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirme
 
     from app.connection_identity import identity_changes
 
-    changes = identity_changes(source_type, row.get("config") or {}, new_config)
+    # replace_semantics=True: this endpoint REPLACES `config` wholesale (see
+    # the module docstring), so an identity leaf present in the stored config
+    # but absent from `new_config` was not "untouched", it was wiped — an
+    # empty `config: {}` PUT on a registrations-backed row must trip this
+    # guard rather than silently dropping account/user/token_env (RBAC
+    # review Finding 2, 2026-08-26).
+    changes = identity_changes(source_type, row.get("config") or {}, new_config, replace_semantics=True)
     if not changes:
         return
     try:
@@ -396,6 +423,76 @@ def _guard_row_repoint(row: Dict[str, Any], new_config: Dict[str, Any], confirme
                 f"{source_type} connection and will stop resolving after this change; "
                 "they need re-registering (or a matching schema on the new "
                 "upstream). Resend with confirm_connection_change=true to apply."
+            ),
+        },
+    )
+
+
+def _guard_default_repoint(source_type: str, demoted_id: Optional[str], confirmed: bool) -> None:
+    """Refuse an unconfirmed change of WHICH row is the ``source_type``
+    default, on a source that already has registrations (RBAC review
+    Finding 1, 2026-08-26).
+
+    ``is_default`` — not any one row's ``config`` — is what
+    ``resolve_source_connection(source_type)`` actually reads
+    (``src.connection_resolver``), so promoting a DIFFERENT row to default
+    repoints every registration of that source_type just as surely as
+    editing the current default's identity does, and neither of the two ways
+    to do that go through :func:`_guard_row_repoint` at all:
+
+    - ``create_connection`` with ``is_default=true`` — the repo's
+      ``create()`` unconditionally ``UPDATE ... SET is_default=FALSE WHERE
+      source_type=?`` before inserting the new (already-default) row, with
+      no guard call anywhere in the create path.
+    - ``update_connection`` promoting a DIFFERENT row — ``PUT
+      /{other_id} {is_default: true}`` with no ``config`` key skips the
+      ``if config is not None`` block :func:`_guard_row_repoint` lives in
+      entirely, yet ``other_id`` becomes the default, demoting the current
+      one.
+
+    Same 409 ``connection_change_affects_registrations`` contract as
+    :func:`_guard_row_repoint`, and the same notion of "affected
+    registrations" (``table_registry_repo().list_by_source(source_type)`` —
+    legacy rows resolve via the type's default, not a specific
+    connection_id, so every row of that source_type counts).
+
+    ``demoted_id`` is the id of the row that WOULD stop being the default —
+    ``None`` when there is nothing to demote (no current default, or the
+    promoted row already IS the current default), in which case this is a
+    no-op call. Scoped to :data:`_ROW_REPOINT_GUARDED_SOURCE_TYPES`, same as
+    the config guard — Keboola/BigQuery identity relocation is out of scope
+    for this slice.
+    """
+    if confirmed:
+        return
+    if source_type not in _ROW_REPOINT_GUARDED_SOURCE_TYPES:
+        return
+    if demoted_id is None:
+        return
+
+    try:
+        affected = table_registry_repo().list_by_source(source_type)
+    except Exception:
+        logger.exception("default-repoint guard: registry lookup failed for %s", source_type)
+        return
+    if not affected:
+        return
+
+    from app.api.admin import _REPOINT_SAMPLE_SIZE
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "connection_change_affects_registrations",
+            "source": source_type,
+            "changes": [{"field": "is_default", "before": demoted_id, "after": None}],
+            "affected_tables": len(affected),
+            "sample_tables": [str(r.get("id")) for r in affected[:_REPOINT_SAMPLE_SIZE]],
+            "hint": (
+                f"{len(affected)} registered table(s) resolve against the current "
+                f"{source_type} default connection ({demoted_id}); making a different "
+                "connection the default will repoint them to it. Resend with "
+                "confirm_connection_change=true to apply."
             ),
         },
     )
@@ -588,7 +685,14 @@ async def create_connection(
     body: CreateConnectionBody,
     _user: dict = Depends(require_admin),
 ):
-    """Create a named source connection. 409 if the name is already taken."""
+    """Create a named source connection. 409 if the name is already taken.
+
+    Snowflake/Databricks: 409 ``connection_change_affects_registrations`` if
+    ``is_default: true`` would demote the source_type's current default
+    connection and that source already has registrations — resend with
+    ``confirm_connection_change: true`` to apply. See
+    :func:`_guard_default_repoint`.
+    """
     repo = source_connections_repo()
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
@@ -604,6 +708,17 @@ async def create_connection(
     _validate_stack_url(body.config, required=False, resolve=False)
     config = _validate_config_for_source_type(body.source_type, body.config)
     _reject_disallowed_config_token_envs(body.source_type, config)
+    if body.is_default:
+        # RBAC review Finding 1: promoting a NEW row to default demotes
+        # whichever row currently answers `resolve_source_connection`, via
+        # the repo's own unconditional demotion UPDATE — a repoint just as
+        # real as a config change, so it needs the same guard.
+        current_default = repo.get_default(body.source_type)
+        _guard_default_repoint(
+            body.source_type,
+            current_default["id"] if current_default else None,
+            body.confirm_connection_change,
+        )
     conn_id = str(uuid4())
     repo.create(
         id=conn_id,
@@ -655,7 +770,15 @@ async def update_connection(
     a connection-identity leaf (``app.connection_identity``) on a connection
     that already has registrations is refused with 409
     ``connection_change_affects_registrations`` unless
-    ``confirm_connection_change: true`` — see :func:`_guard_row_repoint`.
+    ``confirm_connection_change: true`` — see :func:`_guard_row_repoint`. Since
+    ``config`` here REPLACES the stored dict wholesale, an identity leaf
+    present in the stored config but omitted from the new one (including an
+    empty ``config: {}``) counts as a change too, not as "untouched" (RBAC
+    review Finding 2, 2026-08-26). The same 409/confirm contract also covers
+    ``is_default: true`` demoting a DIFFERENT connection of the same
+    source_type that has registrations, even with no ``config`` key in the
+    request body at all (RBAC review Finding 1; see
+    :func:`_guard_default_repoint`).
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -706,6 +829,15 @@ async def update_connection(
                     **{k: v for k, v in old_config.items() if k in ("project_id", "project_name")},
                     **config,
                 }
+    if body.is_default:
+        # RBAC review Finding 1: this must run regardless of whether `config`
+        # was sent — `PUT /{other_id} {is_default: true}` with no `config`
+        # key skips the block above entirely, yet still demotes whichever
+        # row is currently the default.
+        source_type = existing_row.get("source_type")
+        current_default = repo.get_default(source_type)
+        demoted_id = current_default["id"] if current_default and current_default["id"] != connection_id else None
+        _guard_default_repoint(source_type, demoted_id, body.confirm_connection_change)
     repo.update(
         connection_id,
         name=body.name,

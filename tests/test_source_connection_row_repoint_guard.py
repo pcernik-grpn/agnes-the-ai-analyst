@@ -156,6 +156,239 @@ class TestRowRepointGuard:
         )
         assert resp.status_code == 200, resp.text
 
+    def test_create_with_is_default_repointing_the_default_is_refused(self, seeded_app):
+        """RBAC review Finding 1 (CREATE bypass): ``POST`` a new connection
+        with ``is_default: true`` for a source_type that already has a
+        default connection WITH registrations must trip the same 409 the
+        config-repoint guard applies — the repo's create() unconditionally
+        demotes the current default, so this is a repoint, only via
+        ``is_default`` instead of ``config``."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-current-default",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+            },
+            headers=_auth(token),
+        )
+        assert first.status_code == 201, first.text
+        first_id = first.json()["id"]
+        _register_snowflake_table("create_bypass_orders")
+
+        resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-new-default",
+                "source_type": "snowflake",
+                "config": {"account": "different-acct", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "connection_change_affects_registrations"
+        assert detail["source"] == "snowflake"
+
+        # The demoted-by-bypass connection must still be the default.
+        row = c.get(f"/api/admin/source-connections/{first_id}", headers=_auth(token)).json()
+        assert row["is_default"] is True
+
+    def test_create_with_is_default_repoint_applies_when_confirmed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-current-default-2",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+            },
+            headers=_auth(token),
+        )
+        first_id = first.json()["id"]
+        _register_snowflake_table("create_bypass_confirmed_orders")
+
+        resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-new-default-2",
+                "source_type": "snowflake",
+                "config": {"account": "different-acct", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+                "confirm_connection_change": True,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        second_id = resp.json()["id"]
+        assert resp.json()["is_default"] is True
+
+        row = c.get(f"/api/admin/source-connections/{first_id}", headers=_auth(token)).json()
+        assert row["is_default"] is False
+        row2 = c.get(f"/api/admin/source-connections/{second_id}", headers=_auth(token)).json()
+        assert row2["is_default"] is True
+
+    def test_update_is_default_repoint_without_config_is_refused(self, seeded_app):
+        """RBAC review Finding 1 (UPDATE bypass): ``PUT /{other_id}
+        {is_default: true}`` with NO ``config`` key never reached
+        ``_guard_row_repoint`` (gated on ``config is not None``), yet
+        ``other_id`` silently becomes the default, demoting the current one."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-first-default",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+            },
+            headers=_auth(token),
+        )
+        first_id = first.json()["id"]
+        second = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-second-not-default",
+                "source_type": "snowflake",
+                "config": {"account": "other-acct", "user": "svc", "database": "PROD", "warehouse": "WH"},
+            },
+            headers=_auth(token),
+        )
+        second_id = second.json()["id"]
+        assert second.json()["is_default"] is False
+        _register_snowflake_table("update_bypass_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{second_id}",
+            json={"is_default": True},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "connection_change_affects_registrations"
+
+        row = c.get(f"/api/admin/source-connections/{first_id}", headers=_auth(token)).json()
+        assert row["is_default"] is True
+
+    def test_update_is_default_repoint_applies_when_confirmed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        first = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-first-default-2",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+                "is_default": True,
+            },
+            headers=_auth(token),
+        )
+        first_id = first.json()["id"]
+        second = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-second-not-default-2",
+                "source_type": "snowflake",
+                "config": {"account": "other-acct", "user": "svc", "database": "PROD", "warehouse": "WH"},
+            },
+            headers=_auth(token),
+        )
+        second_id = second.json()["id"]
+        _register_snowflake_table("update_bypass_confirmed_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{second_id}",
+            json={"is_default": True, "confirm_connection_change": True},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["is_default"] is True
+
+        row = c.get(f"/api/admin/source-connections/{first_id}", headers=_auth(token)).json()
+        assert row["is_default"] is False
+
+    def test_empty_config_put_on_registrations_backed_row_is_refused(self, seeded_app):
+        """RBAC review Finding 2: ``PUT`` REPLACES ``config`` wholesale, and
+        ``identity_changes`` treated an absent leaf as "untouched" — correct
+        for the yaml-overlay PATCH caller, wrong here. ``{config: {}}`` on a
+        registrations-backed row must trip the guard instead of silently
+        wiping account/user/token_env."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-wipe",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+        _register_snowflake_table("wipe_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"config": {}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "connection_change_affects_registrations"
+
+        row = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert row["config"]["account"] == "acme-prod"
+
+    def test_empty_config_put_applies_when_confirmed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "sf-wipe-confirmed",
+                "source_type": "snowflake",
+                "config": {"account": "acme-prod", "user": "svc", "database": "PROD", "warehouse": "WH"},
+            },
+            headers=_auth(token),
+        )
+        conn_id = create_resp.json()["id"]
+        _register_snowflake_table("wipe_confirmed_orders")
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"config": {}, "confirm_connection_change": True},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["config"] == {}
+
+    def test_empty_config_put_on_fresh_row_still_works(self, seeded_app):
+        """The wizard's bootstrap flow — an empty config on a brand-new row
+        with no registrations — must keep working unconfirmed."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        create_resp = c.post(
+            "/api/admin/source-connections",
+            json={"name": "sf-bootstrap", "source_type": "snowflake", "config": {}},
+            headers=_auth(token),
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        conn_id = create_resp.json()["id"]
+
+        resp = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"config": {}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
     def test_bigquery_row_is_not_guarded_by_this_slice(self, seeded_app):
         """Keboola/BigQuery identity relocation is out of scope for D2.3 —
         their row edits are unaffected by this guard."""

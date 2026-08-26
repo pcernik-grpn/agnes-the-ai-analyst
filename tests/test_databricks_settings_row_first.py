@@ -108,10 +108,16 @@ class TestRowFromLegacySeed:
     def test_row_seeded_with_only_top_level_token_env_still_resolves(self, dbx_env, monkeypatch):
         """A row seeded by app.connections_seed (D2.1) carries the secret-ref
         name on the row's top-level `token_env` column, not embedded in
-        config. The row-first path must still find the right env var."""
+        config. The row-first path must still find the right env var —
+        provided the name is on the remote-attach allowlist (RBAC review
+        Finding 3, 2026-08-26: `_resolve_row_token` refuses an
+        off-allowlist name regardless of where it's stored), same as an
+        operator who wants a non-default token_env name has to opt it in via
+        AGNES_REMOTE_ATTACH_TOKEN_ENVS."""
         from src.repositories import source_connections_repo
 
         monkeypatch.setenv("MY_CUSTOM_DBX_TOKEN", "custom-secret")
+        monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "MY_CUSTOM_DBX_TOKEN")
         source_connections_repo().create(
             id="dbx-legacy",
             name="databricks",

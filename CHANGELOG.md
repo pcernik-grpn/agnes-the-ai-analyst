@@ -152,7 +152,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   Databricks credential on the first attach, now that the row is
   load-bearing. `connectors/snowflake/extract_init.py`'s own allowlist check
   now runs BEFORE the ATTACH (defense in depth), refusing instead of merely
-  warning after the credential had already been sent.
+  warning after the credential had already been sent — and, closing the same
+  gap for the other connector, `connectors/databricks/semantic_layer.py`'s
+  `resolve_databricks_settings()` (the single choke point every Databricks
+  consumer resolves through: the live Unity Catalog ATTACH, `agnes query
+  --remote`, schema/scan discovery, the semantic-layer sync) now applies the
+  identical allowlist check at credential-resolve time, for both a
+  connection row's `token_env` and the legacy `data_source.databricks.*` yaml
+  path — Databricks previously had no such check at all.
+- **Security: the `source_connections` row-repoint guard now also fires on
+  an `is_default` change and on an identity-wiping empty-config replace.**
+  Two more ways to silently repoint a Snowflake/Databricks connection with
+  existing table registrations, past the write-time 409
+  `connection_change_affects_registrations` guard added in the previous
+  bullet: (1) `POST /api/admin/source-connections` (and `PUT .../{id}`) with
+  `is_default: true` demotes whichever connection currently answers
+  `resolve_source_connection(source_type)` without ever touching that
+  connection's own `config` — the guard now checks every `is_default`
+  transition, not just a `config` change on the demoted row itself, and
+  `CreateConnectionBody` gains the same `confirm_connection_change` override
+  `PUT` already had; (2) `PUT .../{id}` REPLACES `config` wholesale, and an
+  empty `{"config": {}}` used to slip past the guard because an identity
+  leaf simply absent from the new config read as "untouched" rather than
+  "wiped" — `app.connection_identity.identity_changes` gains a
+  `replace_semantics` flag the row endpoint opts into, so a leaf present
+  before and missing after now counts as a change (the yaml-overlay PATCH
+  caller is unaffected — an absent leaf there still means untouched, which
+  is correct for its merge semantics).
 
 ### Changed
 

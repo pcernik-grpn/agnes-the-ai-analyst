@@ -108,6 +108,8 @@ def identity_changes(
     source: str,
     before: Dict[str, Any] | None,
     after: Dict[str, Any] | None,
+    *,
+    replace_semantics: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return the identity leaves whose value differs between two config blocks.
 
@@ -119,6 +121,21 @@ def identity_changes(
     A leaf that is genuinely unset before and set after counts as a change:
     going from "no role" to a role decides which grants apply, exactly the class
     of edit this guard exists to surface.
+
+    ``replace_semantics`` distinguishes the two writers sharing this leaf
+    shape (module docstring). Default ``False`` is the PATCH-merge caller
+    (``app.api.admin._guard_connection_repoint``): ``after`` is a partial
+    patch merged onto the stored block by the caller, so a leaf ABSENT from
+    ``after`` means the operator did not touch it — nothing to warn about.
+    ``True`` is the ROW endpoint (``app.api.admin_source_connections.
+    _guard_row_repoint``), whose ``config`` REPLACES the stored dict
+    wholesale: there, a leaf present in ``before`` but missing from ``after``
+    was not skipped, it was WIPED — silently dropping to that leaf's default
+    (e.g. an empty ``config: {}`` clearing ``account``/``token_env``), which
+    is exactly the class of repoint this guard exists to catch (RBAC review
+    Finding 2, 2026-08-26: an empty-config REPLACE PUT used to satisfy this
+    function's old "skip if absent" rule regardless of caller and slip the
+    409).
     """
     leaves = CONNECTION_IDENTITY_LEAVES.get(source)
     if not leaves:
@@ -128,7 +145,7 @@ def identity_changes(
     after = after or {}
     changes: List[Dict[str, Any]] = []
     for field in sorted(leaves):
-        if field not in after:
+        if field not in after and not replace_semantics:
             # Absent from the patch-merged block means the operator did not
             # touch it, so there is nothing to warn about.
             continue

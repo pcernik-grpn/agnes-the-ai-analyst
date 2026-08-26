@@ -2101,6 +2101,11 @@
             "title": "Config",
             "type": "object"
           },
+          "confirm_connection_change": {
+            "default": false,
+            "title": "Confirm Connection Change",
+            "type": "boolean"
+          },
           "is_default": {
             "default": false,
             "title": "Is Default",
@@ -27095,7 +27100,7 @@
         ]
       },
       "post": {
-        "description": "Create a named source connection. 409 if the name is already taken.",
+        "description": "Create a named source connection. 409 if the name is already taken.\n\nSnowflake/Databricks: 409 ``connection_change_affects_registrations`` if\n``is_default: true`` would demote the source_type's current default\nconnection and that source already has registrations \u2014 resend with\n``confirm_connection_change: true`` to apply. See\n:func:`_guard_default_repoint`.",
         "operationId": "create_connection_api_admin_source_connections_post",
         "parameters": [
           {
@@ -27276,7 +27281,7 @@
         ]
       },
       "put": {
-        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`.",
+        "description": "Update name/config/token_env/is_default of an existing connection.\n\n404 if missing; 409 if renaming to a name already taken by a different\nconnection.\n\nMoving the connection to a different ``stack_url`` drops any recorded\nproject identity: a project id is only meaningful on the stack it came\nfrom, and keeping the old binding would make every token from the new\nstack fail ``project_mismatch`` with no way to clear it from the UI. This\nis also the supported way to re-point a bound connection \u2014 see the note\non :func:`project_mismatch_message`.\n\nSnowflake/Databricks connections (D2.3 \u2014 identity relocated here off the\n``data_source.<type>`` server-config yaml overlay): a ``config`` change to\na connection-identity leaf (``app.connection_identity``) on a connection\nthat already has registrations is refused with 409\n``connection_change_affects_registrations`` unless\n``confirm_connection_change: true`` \u2014 see :func:`_guard_row_repoint`. Since\n``config`` here REPLACES the stored dict wholesale, an identity leaf\npresent in the stored config but omitted from the new one (including an\nempty ``config: {}``) counts as a change too, not as \"untouched\" (RBAC\nreview Finding 2, 2026-08-26). The same 409/confirm contract also covers\n``is_default: true`` demoting a DIFFERENT connection of the same\nsource_type that has registrations, even with no ``config`` key in the\nrequest body at all (RBAC review Finding 1; see\n:func:`_guard_default_repoint`).",
         "operationId": "update_connection_api_admin_source_connections__connection_id__put",
         "parameters": [
           {

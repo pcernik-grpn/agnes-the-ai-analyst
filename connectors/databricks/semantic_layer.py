@@ -88,7 +88,21 @@ def _resolve_row_token(connection: dict[str, Any], token_env: str) -> str:
     """Vault-first (this connection's own vault slot), then the named env
     var / remote-attach vault fallback — same order the legacy
     instance-config path used, just with the connection's own vault slot
-    checked first."""
+    checked first.
+
+    SECURITY: only the env/vault-by-name fallback is allowlist-checked
+    (RBAC review Finding 3, 2026-08-26) — mirroring the guard Snowflake's
+    ``connectors.snowflake.extract_init.init_extract`` applies BEFORE its own
+    ATTACH, and the write-time guard
+    ``app.api.admin_source_connections._reject_disallowed_config_token_envs``
+    already applies to a connection's ``config.token_env``. Without this, an
+    admin-set (or yaml-seeded, ``app.connections_seed``) ``token_env`` naming
+    an unrelated secret (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``, ...) would
+    resolve here and ship out as the Databricks credential on the very next
+    ATTACH/query — this connector had no such check at all. The connection's
+    OWN vault slot is unaffected: it is not selected by name, so there is
+    nothing for an attacker-controlled ``token_env`` to redirect.
+    """
     try:
         from src.repositories import connection_secrets_repo
 
@@ -97,6 +111,22 @@ def _resolve_row_token(connection: dict[str, Any], token_env: str) -> str:
         vault_value = None
     if vault_value:
         return vault_value
+
+    if not token_env:
+        return ""
+
+    from src.orchestrator_security import is_token_env_allowed
+
+    if not is_token_env_allowed(token_env):
+        logger.warning(
+            "databricks connection %s: token_env %r is not on the remote-attach "
+            "allowlist; refusing to read it (add it to "
+            "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+            connection.get("id"),
+            token_env,
+        )
+        return ""
+
     token = os.environ.get(token_env, "")
     if token:
         return token
@@ -146,7 +176,11 @@ def _resolve_databricks_from_instance_config() -> dict[str, Any] | None:
     """Legacy path: ``data_source.databricks.*`` (instance.yaml / /admin/server-config).
 
     Kept byte-for-byte so an un-migrated instance (no databricks row yet)
-    keeps resolving exactly as before D2.2.
+    keeps resolving exactly as before D2.2 — EXCEPT for the ``token_env``
+    allowlist check added by RBAC review Finding 3 (2026-08-26), for parity
+    with :func:`_resolve_row_token`: a ``data_source.databricks.token_env``
+    naming a secret outside the remote-attach allowlist must not resolve
+    here either, same as the row path.
     """
     from app.instance_config import get_value
 
@@ -154,14 +188,26 @@ def _resolve_databricks_from_instance_config() -> dict[str, Any] | None:
     warehouse_id = get_value("data_source", "databricks", "warehouse_id", default="") or ""
     catalog = get_value("data_source", "databricks", "catalog", default="") or ""
     token_env = get_value("data_source", "databricks", "token_env", default="DATABRICKS_TOKEN") or "DATABRICKS_TOKEN"
-    token = os.environ.get(token_env, "")
-    if not token:
-        try:
-            from src.orchestrator_security import resolve_remote_attach_token
 
-            token = resolve_remote_attach_token(token_env) or ""
-        except Exception:  # pragma: no cover - vault optional in dev contexts  # noqa: BLE001
-            token = ""
+    from src.orchestrator_security import is_token_env_allowed
+
+    if not is_token_env_allowed(token_env):
+        logger.warning(
+            "databricks: token_env %r is not on the remote-attach allowlist; "
+            "refusing to read it (add it to AGNES_REMOTE_ATTACH_TOKEN_ENVS or "
+            "use a vault secret)",
+            token_env,
+        )
+        token = ""
+    else:
+        token = os.environ.get(token_env, "")
+        if not token:
+            try:
+                from src.orchestrator_security import resolve_remote_attach_token
+
+                token = resolve_remote_attach_token(token_env) or ""
+            except Exception:  # pragma: no cover - vault optional in dev contexts  # noqa: BLE001
+                token = ""
     if not (host and warehouse_id and token):
         return None
     catalogs = get_value("data_source", "databricks", "semantic_layer_catalogs", default=None)
