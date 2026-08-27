@@ -48,7 +48,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.auth.access import require_resource_access
-from app.chat.workdir import _safe_email_dir
+from app.chat.workdir import WORKSPACE_LINK_ENTRIES, _safe_email_dir
 from app.resource_types import ResourceType
 from app.utils import get_data_dir
 
@@ -64,11 +64,30 @@ require_chat_access = require_resource_access(ResourceType.CHAT, "chat")
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Directory names never descended into during the listing walk. The
-#: ``.claude`` tree is deliberately NOT excluded — the #1611 repro wrote its
-#: deliverables into ``.claude/skills/<name>/`` — so the walk only skips
-#: unambiguous machine noise.
+#: Directory names never descended into during the listing walk — unambiguous
+#: machine noise, at any depth.
 _SKIP_DIR_NAMES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+
+#: Top-level entries that are the WORKSPACE TEMPLATE, not session output.
+#: ``WorkdirManager.prepare_session_dir`` symlinks these into every session
+#: dir for every provider, so walking them listed the operator's bundled
+#: skills, hooks and scaffolds as if the agent had just produced them — on a
+#: real conversation the deliverable was buried under dozens of
+#: ``scaffolds/nodejs-dashboard/...`` rows. Excluded at the TOP LEVEL only:
+#: the exclusion is about "this tree came from the template", not about the
+#: name, so a directory the agent itself creates deeper in the session dir is
+#: unaffected.
+#:
+#: This also aligns the two sources: the engine's own sandbox browser filters
+#: dot-directories for the same reason, so a deliverable under ``.claude/``
+#: was never going to be reachable there either. The workspace prompt now
+#: tells the agent to write deliverables to ``outputs/`` instead.
+_TEMPLATE_ENTRIES = frozenset(WORKSPACE_LINK_ENTRIES)
+
+#: Deliverables live here by convention (the workspace prompt says so, and the
+#: agent-API harvest scans the same directory). Sorted ahead of everything
+#: else so the thing the user asked for is never below incidental scratch.
+_OUTPUTS_PREFIX = "outputs/"
 
 #: Hard ceiling on files examined per listing — a runaway tree (a vendored
 #: dependency, an extracted archive) stops here instead of stat-ing forever.
@@ -192,7 +211,14 @@ def _resolve_file_or_404(email: str, chat_id: str, rel_path: str) -> Path:
 
 def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
     """Collect files reachable from the session dir (symlinks followed while
-    they stay inside the containment bases), newest-first, capped."""
+    they stay inside the containment bases), deliverables first, capped.
+
+    The workspace-template trees (``_TEMPLATE_ENTRIES``) are excluded at the
+    top level — they are the operator's bundled skills/scaffolds, present in
+    every session for every provider, and listing them buried the actual
+    deliverable. Within what remains, ``outputs/`` sorts ahead of everything
+    else and the rest is newest-first.
+    """
     sdir = _session_dir(email, chat_id)
     if not sdir.is_dir():
         return [], False
@@ -207,9 +233,10 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
         root_path = Path(root)
         # Prune in-place: skip noise dirs, dirs escaping containment, and
         # already-visited real dirs (symlink cycle guard).
+        at_top = root_path == sdir
         kept_dirs = []
         for d in sorted(dirs):
-            if d in _SKIP_DIR_NAMES:
+            if d in _SKIP_DIR_NAMES or (at_top and d in _TEMPLATE_ENTRIES):
                 continue
             try:
                 real = (root_path / d).resolve()
@@ -225,6 +252,8 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
             if scanned >= _MAX_SCAN_FILES:
                 truncated = True
                 break
+            if at_top and fname in _TEMPLATE_ENTRIES:
+                continue
             scanned += 1
             fpath = root_path / fname
             try:
@@ -249,7 +278,8 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
         if truncated:
             break
 
-    collected.sort(key=lambda item: item[0], reverse=True)
+    # Deliverables first, then newest-first within each group.
+    collected.sort(key=lambda item: (not item[1]["path"].startswith(_OUTPUTS_PREFIX), -item[0]))
     if len(collected) > _MAX_LIST_FILES:
         truncated = True
     return [entry for _, entry in collected[:_MAX_LIST_FILES]], truncated

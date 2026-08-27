@@ -1782,6 +1782,12 @@ function handleFrame(frame) {
       $("cancel-btn").hidden = true;
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
+      // The session-files block listens for this to refresh its count and to
+      // surface a deliverable the turn just wrote (see §6). A CustomEvent
+      // rather than a direct call: that block is a separate IIFE with no
+      // exported handle, and the frame switch should not grow a dependency
+      // on it.
+      document.dispatchEvent(new CustomEvent("agnes:turn-end"));
       break;
     case "session_participants":
       // §5.3 Co-presence: full re-render of the participant roster.
@@ -5387,7 +5393,6 @@ function renderCoPresence(host, participants) {
   // (POST .../files/save-artefact). Rows are built with createElement +
   // textContent — file names/paths are agent-chosen strings, never innerHTML.
 
-  const FILES_OVERLAY = "chat-files-overlay";
   const filesListEl = $("chat-files-list");
   const filesStatusEl = $("chat-files-status");
   const filesErrorEl = $("chat-files-error");
@@ -5482,13 +5487,10 @@ function renderCoPresence(host, participants) {
     return li;
   }
 
-  async function loadSessionFiles() {
-    if (!filesListEl) return;
-    const chatId = currentChatId;
-    if (!chatId) return;
-    clearDialogError(filesErrorEl);
-    setFilesStatus("Loading…");
-    filesListEl.replaceChildren();
+  /** Fetch the listing. Returns the file array (empty on failure — callers
+   *  that run unattended, like the turn-end check, must not surface an error
+   *  banner for a background poll). */
+  async function fetchSessionFiles(chatId, { quiet = false } = {}) {
     try {
       const res = await fetch(
         "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files",
@@ -5496,19 +5498,67 @@ function renderCoPresence(host, participants) {
       );
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      const files = data.files || [];
-      if (!files.length) {
-        setFilesStatus(
-          "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
-        );
-        return;
-      }
-      setFilesStatus(data.truncated ? "Showing the most recent files only." : "");
-      files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+      return { files: data.files || [], truncated: !!data.truncated, ok: true };
     } catch (err) {
-      setFilesStatus("");
-      showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      if (!quiet) showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+      return { files: [], truncated: false, ok: false };
     }
+  }
+
+  function renderFileList(chatId, files, truncated) {
+    if (!filesListEl) return;
+    filesListEl.replaceChildren();
+    if (!files.length) {
+      setFilesStatus(
+        "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
+      );
+      return;
+    }
+    setFilesStatus(truncated ? "Showing the most recent files only." : "");
+    files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+  }
+
+  function updateFilesBadge(count) {
+    const badge = $("chat-files-count");
+    if (!badge) return;
+    badge.textContent = String(count);
+    badge.hidden = count === 0;
+  }
+
+  async function loadSessionFiles() {
+    if (!filesListEl) return;
+    const chatId = currentChatId;
+    if (!chatId) return;
+    clearDialogError(filesErrorEl);
+    setFilesStatus("Loading…");
+    filesListEl.replaceChildren();
+    const { files, truncated } = await fetchSessionFiles(chatId);
+    renderFileList(chatId, files, truncated);
+    updateFilesBadge(files.length);
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+  }
+
+  // ── drawer open/close ─────────────────────────────────────────────────────
+
+  const drawer = $("chat-files-drawer");
+
+  function drawerOpen() {
+    return drawer && !drawer.hidden;
+  }
+
+  function openFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = false;
+    document.body.classList.add("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "true");
+    loadSessionFiles();
+  }
+
+  function closeFilesDrawer() {
+    if (!drawer) return;
+    drawer.hidden = true;
+    document.body.classList.remove("chat-files-open");
+    if (filesBtn) filesBtn.setAttribute("aria-expanded", "false");
   }
 
   const filesBtn = $("chat-session-files");
@@ -5518,13 +5568,61 @@ function renderCoPresence(host, participants) {
         showToast("Open a conversation first", "error");
         return;
       }
-      openOverlay(FILES_OVERLAY);
-      loadSessionFiles();
+      if (drawerOpen()) { closeFilesDrawer(); return; }
+      openFilesDrawer();
     });
   }
+  const filesCloseBtn = $("chat-files-close");
+  if (filesCloseBtn) filesCloseBtn.addEventListener("click", closeFilesDrawer);
   const filesRefreshBtn = $("chat-files-refresh");
   if (filesRefreshBtn) filesRefreshBtn.addEventListener("click", loadSessionFiles);
-  wireCloseButtons(FILES_OVERLAY);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drawerOpen()) {
+      closeFilesDrawer();
+      if (filesBtn) filesBtn.focus();
+    }
+  });
+
+  // ── open by itself when a turn lands a deliverable ────────────────────────
+  // Only for files under `outputs/` — the directory the workspace prompt
+  // reserves for things meant FOR the user. An agent touches plenty of other
+  // files mid-task (scratch, a script it wrote to run once); popping a panel
+  // for those would interrupt the read for something nobody asked to see.
+  // Anything else only moves the count on the button.
+
+  const OUTPUTS_PREFIX = "outputs/";
+  let _knownOutputs = new Set();
+  let _filesSessionId = null;
+
+  function isDeliverable(f) {
+    return typeof f.path === "string" && f.path.startsWith(OUTPUTS_PREFIX);
+  }
+
+  document.addEventListener("agnes:turn-end", async () => {
+    const chatId = currentChatId;
+    if (!chatId) return;
+    // A conversation switch invalidates the previous baseline — otherwise the
+    // first turn in the new session reads every pre-existing file as "new".
+    if (_filesSessionId !== chatId) {
+      _filesSessionId = chatId;
+      _knownOutputs = new Set();
+      const seed = await fetchSessionFiles(chatId, { quiet: true });
+      _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
+      updateFilesBadge(seed.files.length);
+      return;
+    }
+    const { files, truncated, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    if (!ok) return;
+    updateFilesBadge(files.length);
+    const fresh = files.filter(isDeliverable).filter((f) => !_knownOutputs.has(f.path));
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    if (!fresh.length) return;
+    if (drawerOpen()) {
+      renderFileList(chatId, files, truncated);
+      return;
+    }
+    openFilesDrawer();
+  });
 
 })();
 

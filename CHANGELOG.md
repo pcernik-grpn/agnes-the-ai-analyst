@@ -44,8 +44,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **Session files are a side drawer that opens itself when a deliverable
+  lands.** The Files panel was a modal, which covered the very sentence
+  ("I saved it as …") the reader was checking the list against. It now docks
+  to the trailing edge with no backdrop, the conversation stays readable and
+  scrollable beside it, and where there is room (≥1100px) the composer makes
+  way instead of sitting underneath. The header button carries a count, and a
+  turn that writes a new file under `outputs/` opens the drawer on its own —
+  `outputs/` only, so the scratch files an agent touches mid-task do not
+  interrupt the read.
+
 ### Fixed
 
+- **The session-files list no longer presents the workspace template as
+  session output.** `WorkdirManager.prepare_session_dir` symlinks `.claude`,
+  `scaffolds`, `snapshots`, `scripts` and `CLAUDE.md` into every session dir
+  for every provider, and the listing walked them: on a real conversation the
+  document the user asked for sat below dozens of
+  `scaffolds/nodejs-dashboard/...` rows, and on some turns never made the
+  page at all. Those trees are now excluded at the top level, and `outputs/`
+  — where the workspace prompt tells the agent to leave deliverables — sorts
+  ahead of everything else. This also aligns the two sources: the engine's
+  own sandbox browser filters dot-directories for the same reason.
+- **The chat header's action buttons no longer drift apart.** `margin-left:
+  auto` was written when Copy transcript was the header's only action; with
+  Files beside it, each button claimed the slack and the free space was split
+  between them, stranding Files mid-header. Only the first action claims it
+  now, so the pair reads as one group at the trailing edge.
 - The "Add data source" wizard's Snowflake table picker no longer renders a
   raw, three-layer-wrapped driver exception when the connection itself can't
   authenticate (e.g. an expired temporary password) — a routine first-connect
