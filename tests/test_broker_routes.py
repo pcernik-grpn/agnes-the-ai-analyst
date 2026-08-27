@@ -363,7 +363,7 @@ def test_anthropic_proxy_workload_identity_injects_bearer_not_key(broker_app, mo
     import types
 
     import app.api.broker as broker_mod
-    import app.auth.wif as wif
+    from app.auth import wif
 
     # Flip the app into workload_identity mode (ChatConfig is frozen; a duck-typed
     # stand-in with the one attribute the broker reads is enough).
@@ -399,7 +399,7 @@ def test_anthropic_proxy_wif_failure_returns_generic_detail(broker_app, monkeypa
     gets a generic 502, the detail is only in the server-side audit trail."""
     import types
 
-    import app.auth.wif as wif
+    from app.auth import wif
 
     broker_app.state.chat_config = types.SimpleNamespace(llm_auth="workload_identity")
 
@@ -754,7 +754,7 @@ def test_dispatcher_optin_takes_precedence_over_wif(broker_app, monkeypatch):
     import types
 
     import app.api.broker as broker_mod
-    import app.auth.wif as wif
+    from app.auth import wif
 
     broker_app.state.chat_config = types.SimpleNamespace(llm_auth="workload_identity")
 
@@ -1224,7 +1224,7 @@ def broker_env(e2e_env, shared_app):
     import yaml
     from fastapi.testclient import TestClient
 
-    import app.instance_config as instance_config
+    from app import instance_config
 
     data_dir = e2e_env["data_dir"]
     state = data_dir / "state"
@@ -1251,7 +1251,7 @@ def broker_env_main_scope(e2e_env, shared_app):
     import yaml
     from fastapi.testclient import TestClient
 
-    import app.instance_config as instance_config
+    from app import instance_config
 
     data_dir = e2e_env["data_dir"]
     state = data_dir / "state"
@@ -1554,3 +1554,324 @@ def test_anthropic_sse_stream_records_agent_usage(broker_app, broker_agent_sessi
     assert len(rows) == 1
     assert rows[0]["input_tokens"] == 11
     assert rows[0]["output_tokens"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Vertex mode (chat.llm.provider: vertex)
+# ---------------------------------------------------------------------------
+
+_VERTEX_NATIVE_PATH = (
+    "/v1/projects/proj-1/locations/europe-west1/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"
+)
+
+
+class _BodyCapturingClient(_UrlCapturingClient):
+    """_UrlCapturingClient that additionally records the outbound body, so the
+    vertex Messages-compat tests can assert the rewrite."""
+
+    _captured_body: bytes = b""
+
+    async def request(self, method, url, *a, **k):
+        if not self._real:
+            _BodyCapturingClient._captured_body = k.get("content") or b""
+        return await super().request(method, url, *a, **k)
+
+
+@pytest.fixture
+def vertex_chat_config(broker_app, monkeypatch):
+    """Flip the shared app into vertex mode (restored afterwards) and stub the
+    Google token mint — no ADC anywhere in tests."""
+    import types
+
+    from app.auth import vertex_gcp
+
+    prev = getattr(broker_app.state, "chat_config", None)
+    broker_app.state.chat_config = types.SimpleNamespace(
+        llm_auth="api_key",
+        llm_provider="vertex",
+        vertex_project_id="proj-1",
+        vertex_region="europe-west1",
+        agent_api_utility_models=[],
+        agent_api_budget_cache_ttl_s=60,
+    )
+    monkeypatch.setattr(vertex_gcp, "get_vertex_access_token", lambda: "gcp-tok-1")
+    yield broker_app.state.chat_config
+    broker_app.state.chat_config = prev
+
+
+def _post_vertex(broker_app, subpath, ticket_label, body: bytes = b'{"model":"x"}'):
+    _HeaderCapturingClient._captured = {}
+    _UrlCapturingClient._captured_url = ""
+    _BodyCapturingClient._captured_body = b""
+    tok = ticket_repo().mint(ticket_label, "main", ttl_seconds=60)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                f"/api/broker/anthropic{subpath}",
+                headers={"Authorization": f"Bearer {tok}"},
+                content=body,
+            )
+
+    return asyncio.run(_run())
+
+
+def test_vertex_native_path_forwards_with_google_bearer(broker_app, monkeypatch, vertex_chat_config):
+    """A native Vertex model path forwards to the regional Vertex host with a
+    Google Bearer token — no x-api-key, no oauth beta header, no Anthropic
+    credential involved at all."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static-KEY")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH, "chat_vx1")
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url == ("https://europe-west1-aiplatform.googleapis.com" + _VERTEX_NATIVE_PATH)
+    h = _lower_keys(_UrlCapturingClient._captured)
+    assert h.get("authorization") == "Bearer gcp-tok-1"
+    assert "x-api-key" not in h
+    assert "oauth-2025-04-20" not in h.get("anthropic-beta", "")
+
+
+def test_vertex_native_path_without_v1_prefix_is_canonicalized(broker_app, monkeypatch, vertex_chat_config):
+    """The Anthropic SDK's Vertex client emits /projects/... against a /v1
+    base; the broker rebuilds the canonical /v1 form."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH.removeprefix("/v1"), "chat_vx2")
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url == ("https://europe-west1-aiplatform.googleapis.com" + _VERTEX_NATIVE_PATH)
+
+
+def test_vertex_global_region_host(broker_app, monkeypatch, vertex_chat_config):
+    import app.api.broker as broker_mod
+
+    vertex_chat_config.vertex_region = "global"
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    path = _VERTEX_NATIVE_PATH.replace("europe-west1", "global")
+    r = _post_vertex(broker_app, path, "chat_vx3")
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url == "https://aiplatform.googleapis.com" + path
+
+
+def test_vertex_foreign_project_rejected_403(broker_app, monkeypatch, vertex_chat_config):
+    """The sandbox can never point spend at another project/region — the
+    broker pins them by equality against instance config."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH.replace("proj-1", "attacker-proj"), "chat_vx4")
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "vertex_target_not_allowed"
+    assert _UrlCapturingClient._captured_url == ""  # nothing forwarded
+
+
+def test_vertex_unsupported_subpath_404(broker_app, monkeypatch, vertex_chat_config):
+    """Vertex mode is fail-closed on subpaths, unlike anthropic mode's open
+    forward."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, "/v1/models", "chat_vx5")
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "vertex_path_not_supported"
+    assert _UrlCapturingClient._captured_url == ""
+
+
+def test_vertex_messages_compat_rewrite_streaming(broker_app, monkeypatch, vertex_chat_config):
+    """A plain Messages-format POST (the kai-agent engine) is rewritten into
+    the Vertex shape: model moves body→URL in the @-form, anthropic_version
+    is injected, stream:true selects :streamRawPredict."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-sonnet-4-5-20250929", "stream": True, "max_tokens": 4}).encode()
+    r = _post_vertex(broker_app, "/v1/messages", "chat_vx6", body=body)
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url == ("https://europe-west1-aiplatform.googleapis.com" + _VERTEX_NATIVE_PATH)
+    sent = _json.loads(_BodyCapturingClient._captured_body)
+    assert "model" not in sent
+    assert sent["anthropic_version"] == "vertex-2023-10-16"
+    assert sent["max_tokens"] == 4
+
+
+def test_vertex_messages_compat_non_streaming_rawpredict(broker_app, monkeypatch, vertex_chat_config):
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-sonnet-4-6"}).encode()
+    r = _post_vertex(broker_app, "/v1/messages", "chat_vx7", body=body)
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url.endswith("/models/claude-sonnet-4-6:rawPredict")
+
+
+def test_vertex_messages_compat_invalid_body_400(broker_app, monkeypatch, vertex_chat_config):
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    r = _post_vertex(broker_app, "/v1/messages", "chat_vx8", body=b'{"no_model": true}')
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "vertex_body_invalid"
+
+
+def test_vertex_count_tokens_rewrite(broker_app, monkeypatch, vertex_chat_config):
+    """count_tokens keeps the model IN the body (translated) and targets the
+    count-tokens:rawPredict pseudo-model path."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-haiku-4-5-20251001", "messages": []}).encode()
+    r = _post_vertex(broker_app, "/v1/messages/count_tokens", "chat_vx9", body=body)
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url == (
+        "https://europe-west1-aiplatform.googleapis.com/v1/projects/proj-1/locations/europe-west1"
+        "/publishers/anthropic/models/count-tokens:rawPredict"
+    )
+    sent = _json.loads(_BodyCapturingClient._captured_body)
+    assert sent["model"] == "claude-haiku-4-5@20251001"
+
+
+def test_vertex_dispatcher_env_is_ignored(broker_app, monkeypatch, vertex_chat_config, caplog):
+    """LLM_DISPATCHER_URL must never divert vertex traffic — the dispatcher
+    speaks the first-party Messages API only."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setenv("LLM_DISPATCHER_URL", "http://127.0.0.1:8600")
+    monkeypatch.setenv("LLM_DISPATCHER_API_KEY", "agnes-team-key")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH, "chat_vx10")
+    assert r.status_code == 200, r.text
+    assert _UrlCapturingClient._captured_url.startswith("https://europe-west1-aiplatform.googleapis.com")
+    h = _lower_keys(_UrlCapturingClient._captured)
+    assert h.get("authorization") == "Bearer gcp-tok-1"
+    assert h.get("x-api-key") is None
+
+
+def test_vertex_token_failure_is_502_with_generic_detail(broker_app, monkeypatch, vertex_chat_config):
+    import app.api.broker as broker_mod
+    from app.auth import vertex_gcp
+
+    def _boom():
+        raise vertex_gcp.VertexAuthError("ADC chain detail that must not leak")
+
+    monkeypatch.setattr(vertex_gcp, "get_vertex_access_token", _boom)
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH, "chat_vx11")
+    assert r.status_code == 502
+    assert "ADC chain detail" not in r.text
+    assert _UrlCapturingClient._captured_url == ""
+
+
+def test_vertex_401_clears_google_token_cache(broker_app, monkeypatch, vertex_chat_config):
+    import app.api.broker as broker_mod
+    from app.auth import vertex_gcp
+
+    class _Unauthorized(_UrlCapturingClient):
+        async def request(self, method, url, *a, **k):
+            if self._real:
+                return await self._real.request(method, url, *a, **k)
+            _UrlCapturingClient._captured_url = str(url)
+
+            class _R:
+                status_code = 401
+                headers = {"content-type": "application/json"}
+                content = b'{"error": {"message": "expired"}}'
+
+            return _R()
+
+    cleared = {"n": 0}
+    monkeypatch.setattr(vertex_gcp, "clear_token_cache", lambda: cleared.__setitem__("n", cleared["n"] + 1))
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _Unauthorized)
+
+    r = _post_vertex(broker_app, _VERTEX_NATIVE_PATH, "chat_vx12")
+    assert r.status_code == 401
+    assert cleared["n"] == 1
+
+
+def test_vertex_model_policy_from_url(broker_app, monkeypatch, vertex_chat_config, broker_agent_session):
+    """On a native Vertex path the pinned-model gate reads the model from the
+    URL — and both id spellings compare equal."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+    ctx = broker_agent_session(model="claude-sonnet-4-5-20250929")
+
+    async def _run(path):
+        _UrlCapturingClient._captured_url = ""
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                f"/api/broker/anthropic{path}",
+                headers={"Authorization": f"Bearer {ctx['tok']}"},
+                content=b"{}",
+            )
+
+    r = asyncio.run(_run(_VERTEX_NATIVE_PATH))  # @-form of the pinned dash-form
+    assert r.status_code == 200, r.text
+
+    foreign = _VERTEX_NATIVE_PATH.replace("claude-sonnet-4-5@20250929", "claude-opus-4-7")
+    r = asyncio.run(_run(foreign))
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "model_not_allowed"
+    assert _UrlCapturingClient._captured_url == ""
+
+
+def test_vertex_budget_exhausted_429_on_native_path(broker_app, monkeypatch, vertex_chat_config, broker_agent_session):
+    """A native Vertex completion is a token-spending call — the monthly
+    budget gate fires before anything is forwarded."""
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _UrlCapturingClient)
+    ctx = broker_agent_session(model="claude-sonnet-4-5-20250929", token_budget_monthly=0)
+    _UrlCapturingClient._captured_url = ""
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                f"/api/broker/anthropic{_VERTEX_NATIVE_PATH}",
+                headers={"Authorization": f"Bearer {ctx['tok']}"},
+                content=b"{}",
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 429
+    assert r.json()["detail"]["code"] == "budget_exhausted"
+    assert _UrlCapturingClient._captured_url == ""
+
+
+def test_vertex_messages_compat_traversal_model_rejected_400(broker_app, monkeypatch, vertex_chat_config):
+    """A body model crafted to escape publishers/anthropic via dot-segments
+    (httpx collapses '../' in the outbound URL) is refused before anything is
+    forwarded — the broker's signed Google credential must never ride a
+    caller-chosen path."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-x/../../../../publishers/google/models/gemini-pro", "stream": True}).encode()
+    r = _post_vertex(broker_app, "/v1/messages", "chat_vx13", body=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "vertex_body_invalid"
+    assert _UrlCapturingClient._captured_url == ""  # nothing forwarded

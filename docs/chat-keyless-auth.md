@@ -112,3 +112,10 @@ key.
   the sandbox, and is short-lived (default ~1 h, capped by the rule's
   `token_lifetime_seconds`). The chat sandbox secret-broker isolation is
   preserved and strengthened — there is no durable key anywhere.
+- **On GCP, `chat.llm.provider: vertex` is the other keyless option:** instead
+  of federating to the first-party Anthropic API, the broker signs requests
+  with the workload's ambient Google identity (ADC) and forwards to Claude on
+  Vertex AI — see `docs/cloud-chat.md` → "LLM provider: Google Vertex AI".
+  The two modes are mutually exclusive (boot refuses
+  `provider: vertex` + `auth: workload_identity`); pick the one matching where
+  your Claude capacity is provisioned.
