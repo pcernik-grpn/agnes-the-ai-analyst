@@ -289,6 +289,179 @@ class TestFreeFormSectionFailClosed:
         assert resp.json()["omitted_keys"] == []
 
 
+class TestListItemsAreScrubbed:
+    """Regression: a scalar list item has no key to name-match, so the old
+    scrub's dict-only decision skipped it entirely — a literal secret
+    hidden in an array bypassed BOTH the free-form gate and the
+    value-shape backstop, untracked (closure re-review finding on PR
+    #1607)."""
+
+    def test_literal_in_list_inside_free_form_section_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "connectors": {
+                        "connector-x": {
+                            "tokens": ["${VAR}", "totally-fake-literal-token-not-a-real-secret"],
+                        }
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        tokens = data["sections"]["connectors"]["connector-x"]["tokens"]
+        assert tokens == ["${VAR}"]
+        assert "totally-fake-literal-token-not-a-real-secret" not in resp.text
+        assert "connectors.connector-x.tokens[1]" in data["omitted_keys"]
+
+    def test_secret_shaped_literal_in_list_in_structured_section_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dGhpc2lzYWZha2Vqd3RzaWduYXR1cmU"
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump({"instance": {"name": "Acme", "backup_refs": ["normal-value", jwt]}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["instance"]["backup_refs"] == ["normal-value"]
+        assert jwt not in resp.text
+        assert "instance.backup_refs[1]" in data["omitted_keys"]
+
+    def test_env_ref_in_list_survives(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump({"connectors": {"connector-x": {"tokens": ["${ONE}", "${TWO}"]}}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["connectors"]["connector-x"]["tokens"] == ["${ONE}", "${TWO}"]
+        assert data["omitted_keys"] == []
+
+
+class TestEnvNameKeyValueValidated:
+    """Regression: `_is_env_name_key` used to trust ANY string under a
+    `*_env`-suffixed key without checking it actually looks like an
+    env-var NAME — an admin mis-suffixing a pasted literal (plausible in
+    the free-form `connectors` section, where field names are admin-typed)
+    exported the literal byte-for-byte (closure re-review finding on PR
+    #1607)."""
+
+    def test_env_key_with_literal_non_name_value_is_scrubbed(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "connectors": {
+                        "connector-y": {
+                            "token_env": "totally-fake-literal-not-an-env-name-EXAMPLE",
+                        }
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "token_env" not in data["sections"]["connectors"]["connector-y"]
+        assert "totally-fake-literal-not-an-env-name-EXAMPLE" not in resp.text
+        assert "connectors.connector-y.token_env" in data["omitted_keys"]
+
+    def test_env_key_with_valid_env_name_value_survives(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(yaml.dump({"connectors": {"connector-y": {"token_env": "FOO_TOKEN"}}}))
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["connectors"]["connector-y"]["token_env"] == "FOO_TOKEN"
+        assert data["omitted_keys"] == []
+
+    def test_env_key_with_var_ref_value_survives(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump({"data_source": {"snowflake": {"token_env": "${SNOWFLAKE_PASSWORD}"}}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["data_source"]["snowflake"]["token_env"] == "${SNOWFLAKE_PASSWORD}"
+        assert data["omitted_keys"] == []
+
+    def test_legitimate_token_env_in_structured_section_still_works(self, seeded_app, tmp_path, monkeypatch):
+        """Non-regression for the original `test_env_name_reference_keys_
+        pass_through` scenario in a NON-free-form section."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "data_source": {
+                        "snowflake": {
+                            "account": "acme-xy12345",
+                            "token_env": "SNOWFLAKE_PASSWORD",
+                        }
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        sf = resp.json()["sections"]["data_source"]["snowflake"]
+        assert sf["account"] == "acme-xy12345"
+        assert sf["token_env"] == "SNOWFLAKE_PASSWORD"
+
+
 class TestValueShapeBackstop:
     """Defense-in-depth: a literal that is unambiguously credential-shaped
     is omitted regardless of section or key name — catches a secret pasted

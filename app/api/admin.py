@@ -2031,6 +2031,22 @@ def _is_env_name_key(key: str) -> bool:
     return key.lower().endswith("_env")
 
 
+# Env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*` (POSIX shell rules — the
+# same charset every `os.environ` lookup in this codebase assumes). A
+# `*_env`-suffixed key is only a safe pass-through when its VALUE actually
+# has this shape — an admin who mis-suffixes a pasted literal (a plausible
+# mistake in the free-form `connectors` section, where field names are
+# admin-chosen) must not get free rein over `_is_env_name_key`'s allowlist.
+_ENV_NAME_VALUE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_valid_env_name_value(value: Any) -> bool:
+    """True if `value` looks like an env-var NAME rather than a pasted
+    literal — the shape a `*_env`-suffixed key's value must have to be
+    trusted as a name reference instead of scrubbed as an ordinary leaf."""
+    return isinstance(value, str) and bool(_ENV_NAME_VALUE_RE.match(value))
+
+
 def _looks_like_env_ref(value: Any) -> bool:
     """True if `value` is an unresolved `${VAR}` placeholder — a pointer to
     an env var, not a cleartext secret."""
@@ -2105,25 +2121,32 @@ def _export_scrub(
     path: str = "",
     omitted: Optional[List[str]] = None,
 ) -> Any:
-    """Recursively drop secret-shaped values from an overlay subtree.
+    """Recursively drop secret-shaped values from an overlay subtree —
+    dict VALUES keyed on their key name, list ITEMS on their shape alone
+    (a list element has no key to name-match).
 
-    Three independent gates, any one omits a leaf (a `*_env`-named key or a
-    `${VAR}` reference always wins over all three and is kept verbatim):
+    A `${VAR}` reference always wins and is kept verbatim, checked first
+    and unconditionally on every leaf regardless of key or position. Next,
+    for a dict leaf only, a `*_env`-suffixed key whose value actually looks
+    like an env-var NAME (`_is_valid_env_name_value` — not a pasted
+    literal) is kept verbatim too. Past those two carve-outs, three
+    independent gates, any one omits a leaf:
 
-    1. Key-name gate (`_is_secret_key`) — as before.
+    1. Key-name gate (`_is_secret_key`) — dict leaves only, as before.
     2. Free-form-section gate (`free_form=True`, set by the caller for every
        section in `_FREE_FORM_EXPORT_SECTIONS`, and propagated to every
-       descendant once set) — a positive allowlist: every literal is
-       omitted regardless of key name or shape.
+       descendant — dict AND list — once set) — a positive allowlist:
+       every literal is omitted regardless of key name, list position, or
+       shape.
     3. Value-shape gate (`_looks_like_secret_value`) — fires everywhere,
-       free-form or not.
+       free-form or not, dict value or list item alike.
 
     A dict/list value caught by gate 1 or 2 is not blanket-dropped — it is
     recursed into (forcing `free_form=True` for the subtree) so a nested
     `${VAR}` reference or `*_env` key inside it still survives; only an
-    actual literal leaf is omitted. `omitted` collects the dotted path of
-    every leaf actually dropped, so the caller can surface a transparency
-    note instead of a silent drop.
+    actual literal leaf is omitted. `omitted` collects the dotted/indexed
+    path (`a.b[2].c`) of every leaf actually dropped, so the caller can
+    surface a transparency note instead of a silent drop.
     """
     if omitted is None:
         omitted = []
@@ -2131,10 +2154,10 @@ def _export_scrub(
         out: Dict[str, Any] = {}
         for k, v in value.items():
             child_path = f"{path}.{k}" if path else k
-            if _is_env_name_key(k) and isinstance(v, str):
+            if _looks_like_env_ref(v):
                 out[k] = v
                 continue
-            if _looks_like_env_ref(v):
+            if _is_env_name_key(k) and _is_valid_env_name_value(v):
                 out[k] = v
                 continue
             if _is_secret_key(k) or free_form or _looks_like_secret_value(v):
@@ -2146,7 +2169,20 @@ def _export_scrub(
             out[k] = _export_scrub(v, free_form=free_form, path=child_path, omitted=omitted)
         return out
     if isinstance(value, list):
-        return [_export_scrub(item, free_form=free_form, path=path, omitted=omitted) for item in value]
+        out_list: List[Any] = []
+        for i, item in enumerate(value):
+            item_path = f"{path}[{i}]"
+            if isinstance(item, (dict, list)):
+                out_list.append(_export_scrub(item, free_form=free_form, path=item_path, omitted=omitted))
+                continue
+            if _looks_like_env_ref(item):
+                out_list.append(item)
+                continue
+            if free_form or _looks_like_secret_value(item):
+                omitted.append(item_path)
+                continue
+            out_list.append(item)
+        return out_list
     return value
 
 
@@ -2643,19 +2679,23 @@ async def get_server_config_overlay(
       their exported YAML); every returned section is still one of
       ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.
     - Secret-shaped LITERAL values are omitted, not masked — an env-var
-      NAME (``token_env``) or a ``${VAR}`` reference passes through
-      unchanged, but a real cleartext credential never leaves the server
-      (see ``_export_scrub``). This applies two ways: (a) any section in
-      ``_FREE_FORM_EXPORT_SECTIONS`` (``connectors`` today — an admin-typed
-      dict whose key names no registry enumerates, e.g.
-      ``connectors."connector-slack".SLACK_WEBHOOK_URL``) has EVERY literal
-      leaf omitted, not just secret-*named* ones, because a key-name
-      blocklist cannot police a key it has never seen; (b) a value that is
-      unambiguously credential-shaped (a PEM block, a JWT, a URL with
-      userinfo or a long opaque path segment, a long opaque alphanumeric
-      run) is omitted everywhere else too, regardless of its key's name.
-      There is no DB config table — the overlay IS the writable state
-      POST /server-config maintains.
+      NAME (``token_env``, itself validated to actually look like a name
+      rather than a mis-suffixed pasted literal) or a ``${VAR}`` reference
+      passes through unchanged, but a real cleartext credential never
+      leaves the server (see ``_export_scrub``). This applies two ways:
+      (a) any section in ``_FREE_FORM_EXPORT_SECTIONS`` (``connectors``
+      today — an admin-typed dict whose key names no registry enumerates,
+      e.g. ``connectors."connector-slack".SLACK_WEBHOOK_URL``) has EVERY
+      literal leaf omitted, not just secret-*named* ones, because a
+      key-name blocklist cannot police a key it has never seen; (b) a
+      value that is unambiguously credential-shaped (a PEM block, a JWT, a
+      URL with userinfo or a long opaque path segment, a long opaque
+      alphanumeric run) is omitted everywhere else too, regardless of its
+      key's name. Both apply equally to a LIST item, which has no key to
+      name-match at all — a scalar array entry gets the same free-form and
+      value-shape checks as a dict value, indexed in ``omitted_keys`` as
+      ``a.b[2]``. There is no DB config table — the overlay IS the
+      writable state POST /server-config maintains.
     - ``omitted_keys`` lists the dotted path of every leaf this endpoint
       dropped, so the operator knows what to set via env/``${VAR}`` on the
       target instead of silently losing it — `agnes admin config export`
