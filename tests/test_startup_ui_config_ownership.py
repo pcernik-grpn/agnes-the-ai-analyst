@@ -29,6 +29,8 @@ app/instance_config.py::get_data_source_type() and tests/test_instance_config.py
 """
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 MODULE = Path("infra/modules/customer-instance")
@@ -83,6 +85,79 @@ class TestEnvLinesRemoved:
         assert "DATA_SOURCE=" not in heredoc
         # The gating use further up the script is unaffected.
         assert 'if [ "$DATA_SOURCE" = "keboola" ]' in TPL_TEXT
+
+
+def _first_boot_guard_span() -> tuple[int, int]:
+    """Start/end character offsets of the `[ ! -f "$INSTANCE_YAML" ]`
+    first-boot guard's `if ... fi` body in the template — the ONE branch
+    that only ever runs on a brand-new VM."""
+    m = re.search(r'if \[ ! -f "\$INSTANCE_YAML" \]; then\n.*?\nfi\n', TPL_TEXT, re.DOTALL)
+    assert m, "first-boot instance.yaml guard not found in startup-script.sh.tpl"
+    return m.start(), m.end()
+
+
+def _data_source_backfill_block() -> str:
+    """The unconditional, idempotent boot-time backfill that migrates an
+    EXISTING instance.yaml (one predating the first-boot seed) — bounded by
+    its own heading comment and the next numbered section's heading, so the
+    extraction does not depend on counting nested `if`/`fi` pairs."""
+    m = re.search(r"# --- 2b\. Backfill .*?(?=\n# --- 3\.)", TPL_TEXT, re.DOTALL)
+    assert m, "data_source.type backfill block (section 2b) not found in startup-script.sh.tpl"
+    return m.group(0)
+
+
+class TestExistingVmDataSourceBackfill:
+    """Regression for the BLOCKING gap the precedence flip alone left open:
+    a VM provisioned BEFORE this change already has an instance.yaml, so the
+    first-boot seed (section 2) is skipped forever on it — and since the
+    `.env` heredoc (section 4) no longer writes `DATA_SOURCE=...` on ANY
+    boot, that VM's overlay AND `.env` both go empty the moment `.env` is
+    next rewritten (recreate/apply/auto-upgrade tick), and
+    get_data_source_type() silently falls back to `"local"`. Section 2b is
+    the fix: an unconditional, idempotent backfill that reaches already-
+    deployed VMs too."""
+
+    def test_backfill_block_exists(self):
+        block = _data_source_backfill_block()
+        assert "data_source" in block
+        assert "import yaml" in block
+
+    def test_backfill_is_outside_the_first_boot_guard(self):
+        """Nesting the backfill inside `if [ ! -f "$INSTANCE_YAML" ]` would
+        defeat its entire purpose — that guard is exactly what makes the
+        seed skip an existing VM. Assert both that the guard's own body does
+        not contain the backfill's heading (the guard's prose legitimately
+        MENTIONS `data_source.type` as part of what the seed blob carries,
+        so that substring alone is not a safe marker), and that the
+        backfill starts strictly after the guard closes."""
+        guard_start, guard_end = _first_boot_guard_span()
+        guard_body = TPL_TEXT[guard_start:guard_end]
+        assert "# --- 2b. Backfill" not in guard_body
+
+        backfill_start = TPL_TEXT.index("# --- 2b. Backfill")
+        assert backfill_start > guard_end, (
+            "the data_source.type backfill must be placed AFTER (and outside) the first-boot instance.yaml guard closes"
+        )
+
+    def test_backfill_guards_empty_data_source(self):
+        """No `var.data_source` configured must write nothing — not an
+        implicit 'local' clobbering an intentional absence."""
+        block = _data_source_backfill_block()
+        assert '[ -n "$DATA_SOURCE" ]' in block
+
+    def test_backfill_only_fires_when_key_absent(self):
+        """Permanent no-op once `data_source.type` exists — from this
+        backfill, the first-boot seed, or a later admin edit."""
+        block = _data_source_backfill_block()
+        assert 'data_source.get("type")' in block
+
+    def test_backfill_uses_atomic_tmp_rename(self):
+        """Same non-destructive write shape as write_instance_yaml in
+        scripts/ops/agnes-state-applier.sh — never a truncating in-place
+        write that could lose the file mid-write."""
+        block = _data_source_backfill_block()
+        assert 'tmp = path + ".tmp"' in block
+        assert "os.replace(tmp, path)" in block
 
 
 def _templatefile_call_block() -> str:
@@ -188,3 +263,57 @@ class TestVariableDescriptionsNameTheOwnershipHandoff:
         description = m.group(1).lower()
         assert "first-boot seed" in description
         assert "breaking" in description
+
+
+def _extract_backfill_python_snippet() -> str:
+    """The PyYAML script embedded in section 2b's `python3 - ... <<'PY'`
+    heredoc, pulled out so it can be executed directly (as
+    `python3 -c <snippet> <path> <value>`, matching the heredoc's own
+    `sys.argv[1]`/`sys.argv[2]` positions) against real fixture files
+    instead of re-implementing a bash interpreter for this test."""
+    block = _data_source_backfill_block()
+    m = re.search(r"<<'PY'\n(.*?)\nPY\n", block, re.DOTALL)
+    assert m, "PyYAML heredoc not found inside the data_source.type backfill block"
+    return m.group(1)
+
+
+class TestExistingVmDataSourceBackfillBehavior:
+    """Executes the ACTUAL embedded PyYAML snippet (not a re-implementation)
+    against real fixture instance.yaml files, so a future edit to the
+    heredoc that breaks its logic fails here even if the static assertions
+    above still pass."""
+
+    def _run(self, tmp_path, initial_yaml: str, value: str = "keboola") -> str:
+        instance_yaml = tmp_path / "instance.yaml"
+        instance_yaml.write_text(initial_yaml)
+        snippet = _extract_backfill_python_snippet()
+        result = subprocess.run(
+            [sys.executable, "-c", snippet, str(instance_yaml), value],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"backfill snippet failed: {result.stderr}"
+        return instance_yaml.read_text()
+
+    def test_writes_data_source_type_when_absent(self, tmp_path):
+        after = self._run(tmp_path, "database:\n  backend: side_car\n", value="bigquery")
+        assert "data_source" in after
+        assert "type: bigquery" in after
+        # The unrelated key the overlay already carried must survive —
+        # this is a key-scoped merge, never a from-scratch rewrite.
+        assert "backend: side_car" in after
+
+    def test_no_change_when_already_present(self, tmp_path):
+        before = "database:\n  backend: side_car\ndata_source:\n  type: keboola\n"
+        after = self._run(tmp_path, before, value="bigquery")
+        # Permanent no-op: an already-set value is never overwritten, even
+        # by a DIFFERENT $DATA_SOURCE — this is what stops the backfill
+        # from ever re-shadowing a deliberate later UI edit.
+        assert "type: keboola" in after
+        assert "type: bigquery" not in after
+
+    def test_preserves_unrelated_top_level_keys(self, tmp_path):
+        before = "database:\n  backend: side_car\nlogging:\n  level: debug\n"
+        after = self._run(tmp_path, before, value="keboola")
+        assert "level: debug" in after
+        assert "type: keboola" in after

@@ -323,7 +323,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   clobbered this way after the theme/experience/home_route/studio_enabled
   handoff). It now seeds `instance.yaml`'s `data_source.type` on a VM's
   FIRST boot only, the same first-boot-seed pattern those four knobs already
-  use, so `/admin/server-config` owns it from day 2 onward. `get_data_source_type()`
+  use, so `/admin/server-config` owns it from day 2 onward. An
+  already-deployed VM (one that already has an `instance.yaml` and so never
+  sees that first-boot seed) is auto-migrated instead by a new unconditional,
+  idempotent boot-time backfill: on its first boot with the new startup
+  script, it writes `data_source.type` from the still-available `$DATA_SOURCE`
+  into the existing overlay if — and only if — the key is not already
+  present, so it can never overwrite a later admin edit. `get_data_source_type()`
   also flips its own resolution order — `data_source.type` (the overlay) now
   wins over the `DATA_SOURCE` env var, the one exception to this module's
   usual env-wins rule — so a UI edit takes effect even on a VM whose
@@ -331,7 +337,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   from before this change. `DATA_SOURCE` remains a fallback when the overlay
   has no value (local-dev convenience unaffected). `data_source.{keboola,
   bigquery,snowflake,databricks}.*` connection settings (credentials, stack
-  URL) are unaffected — that consolidation is D2. See the updated "Config
+  URL) are unaffected — that consolidation is D2. The only VMs that still
+  need a manual `/admin/server-config` fix are downstream forks pinned to an
+  `infra-vX.Y.Z` tag predating this change — the backfill above only ships
+  once a VM's module version is bumped past it. See the updated "Config
   ownership map" in `docs/CONFIGURATION.md`.
 
 - **VM auto-upgrade refreshes host artifacts from the release image, not

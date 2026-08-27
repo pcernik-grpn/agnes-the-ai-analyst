@@ -183,6 +183,66 @@ fi
 # exists — the mode is only safe once the ownership it depends on is
 # established, and that user is what finally owns this file.
 
+# --- 2b. Backfill `data_source.type` into an EXISTING instance.yaml ---
+# The first-boot seed above only fires when instance.yaml is ABSENT — a VM
+# provisioned BEFORE this seed existed already has one, so it is skipped
+# forever on that VM. Combined with the `.env` heredoc (section 4 below) no
+# longer writing a `DATA_SOURCE=...` line on ANY boot (see its own comment),
+# such a VM's overlay AND `.env` both go empty the moment `.env` is next
+# rewritten (recreate / apply / auto-upgrade tick) — get_data_source_type()
+# then falls through to its `"local"` default and the instance silently
+# loses its real connector. Deliberately OUTSIDE the `[ ! -f "$INSTANCE_YAML" ]`
+# guard above and unconditional (runs on EVERY boot, not just first) so it
+# also reaches every already-deployed keboola/bigquery VM, not just new ones.
+#
+# Idempotent by construction: fires only when `data_source.type` is ABSENT
+# from the on-disk file. Once present — from this backfill, the first-boot
+# seed above, OR a later `/admin/server-config` edit — every subsequent boot
+# is a permanent no-op, so this can never re-shadow a deliberate UI change.
+# `$DATA_SOURCE` empty means no `var.data_source` was configured; write
+# nothing rather than backfill an implicit "local" over that intentional
+# absence.
+#
+# Same key-scoped, non-destructive PyYAML merge as
+# scripts/ops/agnes-state-applier.sh's write_instance_yaml (read the file →
+# set exactly one key → atomic tmp+rename) so no other top-level or nested
+# key in the overlay is ever touched. python3-yaml is installed
+# unconditionally in section 1 above; if it is somehow still missing (or the
+# existing file fails to parse), this degrades to a loud warning instead of
+# aborting the boot — the backfill simply retries on the next boot.
+if [ -n "$DATA_SOURCE" ] && [ -f "$INSTANCE_YAML" ]; then
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+        echo "WARN: python3-yaml unavailable — cannot backfill data_source.type into $INSTANCE_YAML this boot; will retry next boot" >&2
+    else
+        IY_OWNER=$(stat -c '%u:%g' "$INSTANCE_YAML")
+        IY_MODE=$(stat -c '%a' "$INSTANCE_YAML")
+        if python3 - "$INSTANCE_YAML" "$DATA_SOURCE" <<'PY'
+import sys, os, yaml
+path, value = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        existing = yaml.safe_load(f.read()) or {}
+except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
+    print(f"cannot read {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+data_source = dict(existing.get("data_source") or {})
+if not data_source.get("type"):
+    data_source["type"] = value
+    existing["data_source"] = data_source
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(existing, f, default_flow_style=False, sort_keys=True)
+    os.replace(tmp, path)
+PY
+        then
+            chown "$IY_OWNER" "$INSTANCE_YAML"
+            chmod "$IY_MODE" "$INSTANCE_YAML"
+        else
+            echo "WARN: data_source.type backfill into $INSTANCE_YAML failed — will retry next boot" >&2
+        fi
+    fi
+fi
+
 # --- 3. App directory + extract host artifacts from the pinned image ---
 APP_DIR="/opt/agnes"
 mkdir -p "$APP_DIR"

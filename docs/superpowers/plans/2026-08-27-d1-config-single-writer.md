@@ -42,33 +42,69 @@ moot, not re-executed):
    `tests/test_admin_server_config.py`) was added anyway, since no test
    previously pinned this deletion — the assertion is cheap insurance
    against the dict silently regaining the key.
+4. **(Found in architecture review, after the above three landed)
+   Items 1+2 alone still lose the connector on every already-deployed VM.**
+   The first-boot seed in item 1 only fires when `instance.yaml` is ABSENT —
+   a VM provisioned before this slice already has one, so the seed never
+   runs on it. The precedence flip in item 2 does not help either: the
+   `.env` heredoc drops `DATA_SOURCE=...` unconditionally, on every boot,
+   so the very next recreate/apply/auto-upgrade tick after this slice ships
+   leaves that VM with NEITHER an overlay value NOR an env value —
+   `get_data_source_type()` then returns its `"local"` default, silently
+   dropping keboola/bigquery. **BLOCKING — fixed in this slice** by an
+   unconditional, idempotent boot-time backfill (`startup-script.sh.tpl`
+   section 2b) that migrates an existing overlay the first time it boots
+   with this script. See "The three real changes" below for the mechanism.
 
-## The two real changes
+## The three real changes
 
-**Infra (`infra/modules/customer-instance/`):** the `.env` heredoc drops the
-`DATA_SOURCE=$DATA_SOURCE` line. `var.data_source` still flows into the
-startup script template (it gates the one boot-time decision of whether to
-fetch the `keboola-storage-token` Secret Manager secret — an operational
-concern, not a presentation choice) but no longer writes an env line. A new
-`instance_data_source_map` local folds `{ type = var.data_source }` into the
-same `instance_branding_b64` first-boot-only seed blob that
+**Infra, first-boot seed (`infra/modules/customer-instance/`):** the `.env`
+heredoc drops the `DATA_SOURCE=$DATA_SOURCE` line. `var.data_source` still
+flows into the startup script template (it gates the one boot-time decision
+of whether to fetch the `keboola-storage-token` Secret Manager secret — an
+operational concern, not a presentation choice) but no longer writes an env
+line. A new `instance_data_source_map` local folds `{ type = var.data_source }`
+into the same `instance_branding_b64` first-boot-only seed blob that
 `theme`/`experience`/`home_route`/`studio_enabled` already ride — exact same
 mechanism, no new plumbing. `variables.tf`'s `data_source` description now
 says "first-boot seed" instead of implying an always-wins env line.
 
+**Infra, existing-VM backfill (`startup-script.sh.tpl`, section 2b):** the
+first-boot seed above is a no-op on any VM that already has an
+`instance.yaml` — which is every VM provisioned before this change shipped.
+Left at that, those VMs would silently regress: the `.env` heredoc no longer
+writes `DATA_SOURCE=...` on ANY boot (not just after this change — every
+boot, including the very next recreate/apply/auto-upgrade tick), so such a
+VM's on-disk overlay AND its `.env` both end up with no value for the
+connector type, and `get_data_source_type()` falls through to `"local"`.
+Section 2b closes this: an unconditional (runs on every boot, not gated by
+`[ ! -f "$INSTANCE_YAML" ]`), idempotent backfill that writes
+`data_source.type` from `$DATA_SOURCE` into the existing overlay exactly
+once — the first boot with this script — and is a permanent no-op the
+instant the key exists (from the backfill itself, the first-boot seed, or a
+later `/admin/server-config` edit), so it can never re-shadow a deliberate
+UI change. Uses the same key-scoped, non-destructive PyYAML merge as
+`scripts/ops/agnes-state-applier.sh`'s `write_instance_yaml` (read → set one
+key → atomic tmp+rename) so no other overlay key is ever touched, and writes
+nothing when `$DATA_SOURCE` is empty (an unset `var.data_source` must stay
+unset, not become an implicit `"local"`).
+
 **App (`app/instance_config.py::get_data_source_type()`):** resolution order
 flips from `DATA_SOURCE env > data_source.type overlay > "local"` to
 `data_source.type overlay > DATA_SOURCE env > "local"` — the one deliberate
-exception to this module's usual env-wins-everything rule. Without this
-flip, fixing only the infra side would still leave a gap: an existing VM's
-`.env` (written before this change shipped, or a container that hasn't been
-recreated yet) keeps a `DATA_SOURCE` line the new startup script no longer
-writes but also doesn't remove from an already-materialized file, and the
-env-wins rule would let that stale value keep shadowing a UI edit
-indefinitely. Flipping precedence closes that gap without needing every
-customer VM to be recreated. `DATA_SOURCE` remains a fallback when the
-overlay has no value at all, so local-dev (`DATA_SOURCE=keboola` in a laptop
-`.env`, no `instance.yaml` overlay) is unaffected.
+exception to this module's usual env-wins-everything rule. This flip is
+**not** what migrates an existing VM — once `.env` is rewritten with no
+`DATA_SOURCE` line (the very next boot after this change ships), there is no
+env value left for the overlay to out-rank on that VM, so the precedence
+flip alone would have been irrelevant to the regression described above. Its
+job is narrower: once a value for `data_source.type` DOES exist in the
+overlay — seeded on a new VM, or backfilled on an existing one by section
+2b — the flip ensures that value, rather than a stale already-baked
+`DATA_SOURCE` env var in a running container, is what an admin's later
+`/admin/server-config` edit actually changes. `DATA_SOURCE` remains a
+fallback when the overlay has no value at all, so local-dev
+(`DATA_SOURCE=keboola` in a laptop `.env`, no `instance.yaml` overlay) is
+unaffected.
 
 ## BREAKING note (infra pins)
 

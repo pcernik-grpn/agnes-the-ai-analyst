@@ -71,7 +71,15 @@ changed. `data_source.type` additionally flips its own app-side precedence
 (overlay wins over the `DATA_SOURCE` env var, not the reverse) — belt and
 braces so a stale `.env` left over from before this change, or an
 already-running container's baked-in environment, can't shadow a UI edit
-either.
+either. Because a VM provisioned *before* this seed existed already has an
+`instance.yaml` (so the "only when absent" seed above never fires on it),
+`data_source.type` also carries a one-time, idempotent boot-time **backfill**:
+on the first boot with the new startup script, it writes `data_source.type`
+into the existing overlay from the still-available `$DATA_SOURCE` Terraform
+variable — but only if the key is not already present, so it can never
+overwrite a later admin edit. This is what actually migrates an
+already-deployed VM; the precedence flip above only decides which value wins
+once one exists.
 
 ---
 
