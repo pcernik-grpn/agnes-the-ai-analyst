@@ -517,7 +517,6 @@ _STATIC_EDITABLE_SECTIONS: tuple[str, ...] = (
     "server",
     "auth",
     "ai",
-    "openmetadata",
     "corporate_memory",
     "materialize",
     "marketplace",
@@ -579,7 +578,6 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "telegram": "restart",  # services/telegram_bot/bot.py reads instance.yaml ONCE at module import, in a separate process — restarting the API alone does not refresh it
     "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above. NARROWED scope since D2.2/D2.3: this classification covers writes to THIS yaml overlay only — the Add-data wizard's Snowflake/Databricks panes (and every Keboola/BigQuery connection edit) now write the `source_connections` ROW instead (PUT/POST /api/admin/source-connections*), which every process reads live straight off the DB with no cache to bounce, so those saves carry no restart notice at all. A hand-edited `data_source.snowflake.*`/`data_source.databricks.*` yaml block is IGNORED (not merely stale) once a row of that type exists — connections_seed.py's own deprecation-warning pattern, not this restart flag — but still reachable (and still genuinely restart-classified) on an un-migrated instance with no row yet, or for a source this section still owns end-to-end (keboola's stack_url predates the registry too, though its own CRUD long since moved to source_connections as well).
     "corporate_memory": "restart",  # partial: most keys (distribution_mode/approval_mode/sources.*) are read fresh via get_corporate_memory_config() per page render, but corporate_memory.confidence is applied ONCE at startup via services/corporate_memory/confidence.configure() (app/main.py) — conservative for the whole section, same reasoning as auth
-    "openmetadata": "live",  # src/catalog_export.py reads instance config fresh at each invocation (a standalone job, not a long-lived cached client)
 }
 
 #: Rank used to pick the "strongest" effect among a section's baseline and
@@ -1369,29 +1367,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "(Anthropic/OpenAI native, fail otherwise). json=Layer 1 + Layer 2 "
                 "fallback. auto=all three layers including prompt-based JSON (most "
                 "compatible, least strict)."
-            ),
-        },
-    },
-    "openmetadata": {
-        "url": {
-            "kind": "string",
-            "hint": "Base URL of your OpenMetadata server (e.g. https://catalog.example.com).",
-        },
-        "token": {
-            "kind": "secret",
-            "hint": ("JWT bearer token. Use ${OPENMETADATA_TOKEN} env-var reference (don't paste secret directly)."),
-        },
-        "cache_ttl_seconds": {
-            "kind": "int",
-            "default": 3600,
-            "hint": "How long to cache catalog responses in-process. Default 3600s (1h).",
-        },
-        "verify_ssl": {
-            "kind": "bool",
-            "default": True,
-            "hint": (
-                "TLS verification. Default true. Set false ONLY for internal CAs / "
-                "self-signed certs — sends the JWT over an unverified channel."
             ),
         },
     },
