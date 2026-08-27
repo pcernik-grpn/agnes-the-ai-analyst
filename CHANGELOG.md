@@ -539,6 +539,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- The "Add data source" wizard's Snowflake table picker no longer renders a
+  raw, three-layer-wrapped driver exception when the connection itself can't
+  authenticate (e.g. an expired temporary password) — a routine first-connect
+  case, not an edge case. `GET /api/admin/data-sources/{source_type}/tables`
+  now classifies the failure into one short, human sentence (the full
+  exception still goes to the server log at WARNING for diagnosis); the
+  wizard renders it in a proper error banner with a "Fix connection" action
+  that jumps back to step 1, and disables Reload tables, the manual
+  schema/table entry, and "Continue with selected tables" while the
+  connection is in this state, since nothing past step 1 can succeed until
+  it's fixed.
+
 - `use_pg()` no longer reverts a Postgres instance running purely on the
   `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`
   declaration) to an empty DuckDB backend the first time an admin saves an
