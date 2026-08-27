@@ -849,6 +849,280 @@ def test_statement_timeout_mechanism_actually_cancels(pg_env, repo):
             conn.execute(sa.text("SELECT pg_sleep(1)"))
 
 
+# ---------------------------------------------------------------------------
+# collection-scoped summaries (spec §13.2 "Surfaces") — Library card count +
+# collection-detail facts section.
+# ---------------------------------------------------------------------------
+
+
+def test_count_visible_facts_for_collection_is_caller_scoped(pg_env, repo):
+    """Two users, different grants on the SAME collection under
+    `all_evidence` mode -> different M: alice can reach every collection a
+    fact is evidenced from and sees it counted, bob can reach only CORPUS_A
+    and does not."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    # Fully-in-A fact: both callers should count it once they can read A.
+    fact_solo = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_solo, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Solo.")
+    # Spans A and B: only a caller who can read BOTH sees it under all_evidence.
+    fact_spans = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_spans, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Part A.")
+    repo.add_claim(fact_id=fact_spans, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="Part B.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    _make_group_with_grant(pg_env, group_name="group-alice", collection_id=CORPUS_A, member_user_id="alice")
+    _make_group_with_grant(pg_env, group_name="group-alice-b", collection_id=CORPUS_B, member_user_id="alice")
+    _make_group_with_grant(pg_env, group_name="group-bob", collection_id=CORPUS_A, member_user_id="bob")
+
+    import pytest as _pytest  # local import keeps the monkeypatch fixture explicit
+
+    def _force_all_evidence(mp):
+        mp.setenv("AGNES_FACTS_VISIBILITY_MODE", "all_evidence")
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        _force_all_evidence(mp)
+        alice_count = repo.count_visible_facts_for_collection(_dict_user("alice"), CORPUS_A)
+        bob_count = repo.count_visible_facts_for_collection(_dict_user("bob"), CORPUS_A)
+    finally:
+        mp.undo()
+
+    assert alice_count == 2  # fact_solo + fact_spans (alice can read both A and B)
+    assert bob_count == 1  # fact_solo only (fact_spans has an unreadable claim in B)
+
+
+def test_count_visible_facts_for_collection_zero_when_no_facts(pg_env, repo):
+    _seed_full_fixture()
+    from src.repositories import users_repo
+
+    users_repo().create(id="zoe", email="zoe@test.com", name="Zoe")
+    _make_group_with_grant(pg_env, group_name="group-zoe", collection_id=CORPUS_A, member_user_id="zoe")
+    assert repo.count_visible_facts_for_collection(_dict_user("zoe"), CORPUS_A) == 0
+
+
+def test_collection_facts_summary_type_counts_and_paged_facts(pg_env, repo):
+    """type_counts + a paged fact row list (type, display name from natural
+    key, claim_count, quote_count)."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-renewal")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Renewal signed."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="carla", email="carla@test.com", name="Carla")
+    _make_group_with_grant(pg_env, group_name="group-carla", collection_id=CORPUS_A, member_user_id="carla")
+
+    summary = repo.collection_facts_summary(_dict_user("carla"), CORPUS_A)
+    assert summary["total"] == 1
+    assert summary["type_counts"] == {"engagement": 1}
+    assert len(summary["facts"]) == 1
+    row = summary["facts"][0]
+    assert row["id"] == fact_id
+    assert row["type"] == "engagement"
+    assert row["display_name"] == "engagement:acme-renewal"
+    assert row["claim_count"] == 1
+    assert row["quote_count"] == 1
+    assert row["conflicts"] == []
+    assert summary["limit_applied"] is False
+
+
+def test_collection_facts_summary_hides_facts_the_caller_cannot_read(pg_env, repo):
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Hidden.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="dave", email="dave@test.com", name="Dave")
+    # Dave has NO grant on CORPUS_A at all.
+    summary = repo.collection_facts_summary(_dict_user("dave"), CORPUS_A)
+    assert summary["total"] == 0
+    assert summary["facts"] == []
+    assert summary["type_counts"] == {}
+
+
+def test_collection_facts_summary_conflict_rendered_inline(pg_env, repo):
+    """Two readable claims on one fact with differing values for the same
+    attr key -> a conflict entry carrying BOTH values and their document
+    names/dates (spec §13.2: "the conflict row inline ... both values +
+    their document names/dates")."""
+    import datetime as dt
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Status is active per doc 1.",
+        attrs={"status": "active"},
+        document_date=dt.date(2026, 1, 1),
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a2",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Status is closed per doc 2.",
+        attrs={"status": "closed"},
+        document_date=dt.date(2026, 2, 1),
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="erin2", email="erin2@test.com", name="Erin2")
+    _make_group_with_grant(pg_env, group_name="group-erin2", collection_id=CORPUS_A, member_user_id="erin2")
+
+    summary = repo.collection_facts_summary(_dict_user("erin2"), CORPUS_A)
+    row = summary["facts"][0]
+    assert row["claim_count"] == 2
+    assert len(row["conflicts"]) == 1
+    conflict = row["conflicts"][0]
+    assert conflict["key"] == "status"
+    values = {e["value"] for e in conflict["entries"]}
+    assert values == {"active", "closed"}
+    docs = {e["document_name"] for e in conflict["entries"]}
+    assert docs == {"cf_a1.md", "cf_a2.md"}
+
+
+def test_collection_facts_summary_revealed_hides_conflict_quotes_not_attrs(pg_env, repo):
+    """A revealed subject: quote_count is 0 (quotes suppressed at the
+    `claims()` endpoint), but attrs/conflicts still surface — matching
+    `claims()`'s own "quote blanked, everything else stays" contract."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Sensitive.",
+        attrs={"role": "exec"},
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="finn", email="finn@test.com", name="Finn")
+    # Finn has NO grants at all — revealed serves him regardless.
+    summary = repo.collection_facts_summary(_dict_user("finn"), CORPUS_A)
+    assert summary["total"] == 1
+    row = summary["facts"][0]
+    assert row["revealed"] is True
+    assert row["claim_count"] == 1
+    assert row["quote_count"] == 0
+
+
+def test_collection_facts_summary_review_items_possible_duplicate_of(pg_env, repo):
+    """`possible_duplicate_of` edges surfaced as review-item rows naming
+    both subjects — spec §7.2's entity-resolution review, §13.2's rendering."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_a = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:jane-doe")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Jane Doe.")
+    fact_b = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_b, type="person", natural_key="person:j-doe")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="J. Doe.")
+    edge_id = repo.create_edge(src=fact_a, type="possible_duplicate_of", dst=fact_b)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Possibly the same."
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="gale", email="gale@test.com", name="Gale")
+    _make_group_with_grant(pg_env, group_name="group-gale", collection_id=CORPUS_A, member_user_id="gale")
+
+    summary = repo.collection_facts_summary(_dict_user("gale"), CORPUS_A)
+    assert len(summary["review_items"]) == 1
+    item = summary["review_items"][0]
+    assert item["edge_id"] == edge_id
+    names = {item["a"]["display_name"], item["b"]["display_name"]}
+    assert names == {"person:jane-doe", "person:j-doe"}
+
+
+def test_collection_facts_summary_review_item_hidden_when_edge_claim_unreadable(pg_env, repo):
+    """S3-equivalent for review items: the edge's ONLY claim lives in an
+    unreadable collection -> not surfaced, even though both endpoints are
+    independently visible."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A.")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B.")
+    edge_id = repo.create_edge(src=fact_a, type="possible_duplicate_of", dst=fact_b)
+    repo.add_claim(edge_id=edge_id, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="Maybe.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="hana", email="hana@test.com", name="Hana")
+    _make_group_with_grant(pg_env, group_name="group-hana", collection_id=CORPUS_A, member_user_id="hana")
+
+    summary = repo.collection_facts_summary(_dict_user("hana"), CORPUS_A)
+    assert summary["review_items"] == []
+
+
+def test_collection_facts_summary_pagination(pg_env, repo):
+    _seed_full_fixture()
+    for i in range(5):
+        fid = repo.create_fact(type="engagement")
+        repo.add_claim(fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"claim {i}")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="ivy", email="ivy@test.com", name="Ivy")
+    _make_group_with_grant(pg_env, group_name="group-ivy", collection_id=CORPUS_A, member_user_id="ivy")
+
+    page1 = repo.collection_facts_summary(_dict_user("ivy"), CORPUS_A, limit=2, offset=0)
+    assert len(page1["facts"]) == 2
+    assert page1["limit_applied"] is True
+    assert page1["total"] == 5
+
+    page2 = repo.collection_facts_summary(_dict_user("ivy"), CORPUS_A, limit=2, offset=2)
+    assert len(page2["facts"]) == 2
+    ids_page1 = {f["id"] for f in page1["facts"]}
+    ids_page2 = {f["id"] for f in page2["facts"]}
+    assert ids_page1.isdisjoint(ids_page2)
+
+
 def test_neighbors_applies_a_statement_timeout(pg_env, repo):
     """`neighbors()` runs cleanly under its real, non-degenerate timeout —
     the companion positive case to the cancellation test above, so the
