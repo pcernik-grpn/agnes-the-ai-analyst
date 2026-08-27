@@ -171,6 +171,16 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
    are not standing guidance: a step that failed, and a degraded engine. Both
    stay the same box — a different SHAPE for an error would read as a different
    kind of thing, and it is the same sentence slot. */
+/* The interview's progress line. Lived in skills.html's inline <style>, which
+   made it invisible on every other builder that rendered the same markup —
+   "0 of 4still to settle" with no gap and no box was exactly that. */
+.ag-prog {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 14px; padding: 8px 12px;
+  background: var(--ds-surface-sunken); border: 1px solid var(--ds-border);
+  border-radius: 9px; font-size: 12.5px; color: var(--ds-text-secondary);
+}
+.ag-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
 .ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 .ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }
 
@@ -373,6 +383,14 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 body.ag-building .idx { height: 100vh; min-height: 0; overflow: hidden; }
 body.ag-building .idx-band { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
 body.ag-building .idx-band-inner { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+/* The chain that makes the workspace fill the viewport ends here, at the
+   page's own mount. It used to name the two mounts that existed by ID, which
+   meant a new builder page silently got no flex column: its panes never became
+   scroll containers, and the composer fell off the bottom of the page. That is
+   not a bug a third builder should have to rediscover, so the hook is a class
+   every builder mount carries. The two IDs stay as an alias — they are in
+   markup and in assertions, and dropping them buys nothing. */
+body.ag-building .ag-builder-mount,
 body.ag-building #ag-builder-view,
 body.ag-building #sk-builder-view { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
 @media (max-width: 900px) {

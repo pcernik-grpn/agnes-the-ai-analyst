@@ -167,15 +167,9 @@
   .sk-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-kind-skill); }
   .sk-build-kicker--skill { color: var(--ds-kind-skill); }
   .sk-build-kicker--plugin { color: var(--ds-kind-plugin); }
-  /* The interview's progress. Sits above the sections because it is a
-     property of the whole panel, not of any one field. */
-  .sk-prog {
-    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
-    margin: 0 0 14px; padding: 8px 12px;
-    background: var(--ds-surface-sunken); border: 1px solid var(--ds-border);
-    border-radius: 9px; font-size: 12.5px; color: var(--ds-text-secondary);
-  }
-  .sk-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
+  /* The interview's progress line lives in builder.css now (.ag-prog) — it is
+     the shell's, and keeping it here made it invisible on every other builder
+     that rendered the same markup. */
   .sk-note--engine { border-color: var(--ds-accent-warn-line); background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sk-build-kicker--agent { color: var(--ds-kind-agent); }
   .sk-build-head h2 { font-size: 24px; margin: 2px 0 0; word-break: break-word; }
@@ -1337,9 +1331,9 @@
     if (!slots || !slots.length) return '';
     var known = slots.filter(function (s) { return s.known; }).length;
     var open = slots.filter(function (s) { return !s.known; });
-    return '<div class="sk-prog">' +
-      '<span class="sk-prog-n">' + known + ' of ' + slots.length + '</span>' +
-      '<span class="sk-prog-t">' + (open.length
+    return '<div class="ag-prog">' +
+      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
+      '<span class="ag-prog-t">' + (open.length
         ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
         : 'nothing missing — ready to save') + '</span>' +
     '</div>';

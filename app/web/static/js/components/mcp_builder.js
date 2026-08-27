@@ -412,9 +412,9 @@
     if (!convSlots || !convSlots.length) return '';
     var known = convSlots.filter(function (s) { return s.known; }).length;
     var open = convSlots.filter(function (s) { return !s.known; });
-    return '<div class="sk-prog">' +
-      '<span class="sk-prog-n">' + known + ' of ' + convSlots.length + '</span>' +
-      '<span class="sk-prog-t">' + (open.length
+    return '<div class="ag-prog">' +
+      '<span class="ag-prog-n">' + known + ' of ' + convSlots.length + '</span>' +
+      '<span class="ag-prog-t">' + (open.length
         ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
         : 'nothing missing — ready to save') + '</span>' +
     '</div>';

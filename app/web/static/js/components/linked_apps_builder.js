@@ -389,6 +389,53 @@
       });
   }
 
+  /* The left pane, where the other builders put a conversation.
+
+     This one deliberately does not have one. Every decision here is a pick
+     from a list the SERVER supplies — which source, which apps, which groups —
+     so there is no intent for a model to turn into configuration, and a
+     conversation would be a costume over three clicks. (Same judgement the
+     conversational-entity-builder spec reaches about "Upload a file".)
+
+     What it carries instead is the procedure with live state on it, so the
+     pane still answers "where am I and what is next" — which is the job the
+     conversation does next door. */
+  function stepsPaneHtml() {
+    var src = (sources || []).filter(function (s) { return s.id === picked.sourceId; })[0];
+    var steps = [
+      { done: !!src, head: 'Where they come from',
+        body: src ? 'Reading from ' + src.name + '.'
+                  : (sources && !sources.length ? 'No tool server to read apps from yet.'
+                                                : 'Picking the server that lists your apps.') },
+      { done: fetched, head: 'Fetch the catalogue',
+        body: fetched ? apps.length + ' app' + (apps.length === 1 ? '' : 's') + ' found; ' +
+                        chosenApps().length + ' selected to publish.'
+                      : 'Agnes asks the server what exists. This step writes — it ingests the catalogue.' },
+      { done: grantGroups.length > 0, head: 'Decide who sees them',
+        body: grantGroups.length
+          ? 'Visible to ' + grantGroups.map(function (g) { return g.name; }).join(', ') + ' once published.'
+          : 'A fetched app is catalogued and invisible until a group is granted it.' },
+    ];
+    return '<div class="ag-conv-in" style="padding:24px 20px">' +
+      '<div class="ag-slot" style="padding-top:0">' +
+        '<p class="ag-slot-head">Apps you already run, in one place.</p>' +
+        '<p class="ag-slot-body">Agnes does not host these — it catalogues them and links to them, so ' +
+        'people find them beside everything else instead of in a bookmark.</p>' +
+      '</div>' +
+      '<div class="ag-rows">' + steps.map(function (st, i) {
+        return '<div class="ag-row">' +
+          '<span class="ag-sec-no">' + (st.done ? '✓' : String(i + 1)) + '</span>' +
+          '<div class="ag-row-body">' +
+            '<div class="ag-row-name">' + esc(st.head) + '</div>' +
+            '<div class="ag-row-desc">' + esc(st.body) + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('') + '</div>' +
+    '</div>';
+  }
+
+  function leftHtml() { return stepsPaneHtml(); }
+
   function render() {
     if (!mount) return;
     mount.innerHTML =
@@ -401,12 +448,7 @@
           (saving ? 'Publishing…' : 'Publish to Library') + '</button>',
       }) +
       window.BuilderShell.workspace({
-        left: '<div class="ag-slot" style="padding:24px">' +
-            '<p class="ag-slot-head">Apps you already run, in one place.</p>' +
-            '<p class="ag-slot-body">Agnes does not host these — it catalogues them and links to them, ' +
-            'so people find them beside everything else instead of in a bookmark. Work down the panel: ' +
-            'where they come from, which ones to publish, and who sees them.</p>' +
-          '</div>',
+        left: leftHtml(),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this link is, editable by hand',
         cfgBodyId: 'la-steps',
