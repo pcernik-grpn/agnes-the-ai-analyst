@@ -54,7 +54,8 @@
   /* ── List view ── */
   /* The list is two bands — ready first, drafts under — because a card's
      click does a different thing in each, and the heading is what says so. */
-  .ag-listbar { display: flex; justify-content: flex-end; margin-bottom: 18px; }
+  /* No `.ag-listbar`: the "+ New agent" button it held is a card in the grid
+     now (`.ag-new`), so there is no toolbar row above the collection. */
   .ag-group + .ag-group { margin-top: 30px; }
   .ag-group-h { margin-bottom: 12px; }
   .ag-group-h h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
@@ -88,6 +89,10 @@
   .ag-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
   .ag-new { border: 1.5px dashed var(--ds-border); background: var(--ds-surface-sunken); color: var(--ds-text-secondary); border-radius: 14px; padding: 16px 18px; display: flex; align-items: center; justify-content: center; gap: 9px; font-size: 14px; font-weight: 600; cursor: pointer; min-height: 158px; font-family: inherit; transition: color var(--ds-motion-fast) var(--ds-ease-standard), border-color var(--ds-motion-fast) var(--ds-ease-standard); }
   .ag-new:hover { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+  .ag-new:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  /* The plus at the weight of the cards' avatar tile, so the first cell has a
+     mark where its neighbours have one and the row's rhythm survives. */
+  .ag-new-plus { font-size: 19px; font-weight: 500; line-height: 1; }
   /* Template picker — the first step of "New agent" once the caller has any
      Agent Template installed. */
   /* No --ds-* scrim token exists (every modal in the codebase hard-codes its
@@ -382,22 +387,45 @@
     var ready = agents.filter(function (a) { return a.status === 'ready'; });
     var drafts = agents.filter(function (a) { return a.status !== 'ready'; });
 
-    listView.innerHTML =
-      '<div class="ag-listbar">' +
-        '<button type="button" class="cc-btn cc-btn--primary" data-ag-new>+ New agent</button>' +
-      '</div>' +
-      group('Ready', 'Click one to start a conversation with it.', ready) +
-      group('Drafts', 'Still being built — click one to keep going.', drafts);
+    /* "New agent" is the FIRST CARD, not a button above the grid. Making a new
+       agent is the same kind of act as opening an existing one — you land in the
+       same builder — so it belongs in the same row, in the position the eye
+       reaches first, rather than floating over the collection as a toolbar.
+
+       It leads whichever group actually renders: Ready when there is one, else
+       Drafts. `group()` drops an empty group entirely, so handing the card to
+       Ready unconditionally would lose it on an instance whose every agent is
+       still a draft. */
+    var readyHtml = group('Ready', 'Click one to start a conversation with it.', ready, newCard());
+    listView.innerHTML = readyHtml +
+      group('Drafts', 'Still being built — click one to keep going.', drafts,
+            readyHtml ? '' : newCard());
+  }
+
+  /* The dashed "add one here" affordance — a peer of the cards beside it in
+     size and radius, and deliberately NOT one in fill: a solid card would read
+     as an agent that exists. */
+  function newCard() {
+    return '<button type="button" class="ag-new" data-ag-new>' +
+      '<span class="ag-new-plus" aria-hidden="true">+</span>' +
+      '<span>New agent</span>' +
+    '</button>';
   }
 
   /* One titled band of cards. An empty group renders nothing rather than an
-     empty heading — a "Drafts" header over no drafts reads like a bug. */
-  function group(title, sub, list) {
+     empty heading — a "Drafts" header over no drafts reads like a bug.
+
+     `lead` is optional markup for a first cell that is not an agent (the
+     "New agent" card). It rides INSIDE the grid so it shares the row's track
+     sizing and gap; placed outside it would need its own width rules and would
+     drift from the cards the moment the grid's columns changed. It does not
+     count toward the group's badge, which counts agents. */
+  function group(title, sub, list, lead) {
     if (!list.length) return '';
     return '<section class="ag-group">' +
       '<div class="ag-group-h"><h2>' + title + '<span class="ag-group-n">' + list.length + '</span></h2>' +
         '<p>' + sub + '</p></div>' +
-      '<div class="ag-grid">' + list.map(agentCard).join('') + '</div>' +
+      '<div class="ag-grid">' + (lead || '') + list.map(agentCard).join('') + '</div>' +
     '</section>';
   }
 

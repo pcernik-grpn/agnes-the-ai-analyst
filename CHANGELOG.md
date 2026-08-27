@@ -12,6 +12,253 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **Fixed: the empty-instance chat landing told the reader something untrue.**
+  Its lede read "It knows nothing about your company yet, so it can answer
+  nothing", and that second clause is false — with no data registered {brand}
+  answers perfectly well from general knowledge. The same page proved it two
+  elements lower: the composer's placeholder is "Ask how to get {brand} set up…"
+  and the suggested questions are "How do I connect our data?" and "What will
+  people be able to ask?", all of which get real answers, so a reader who typed
+  one caught the page contradicting itself on their first attempt. What is
+  missing is the GROUNDING, not the answering, so the copy draws that line
+  instead: *"Nothing is connected yet, so {brand} answers from general knowledge
+  rather than your company's data. Connect where your data lives and it can
+  answer from your own numbers."* The setup card made the same overclaim
+  ("Nothing is registered yet, so nobody can ask anything") and now reads "No
+  data connected yet, so answers can't use your numbers". The guards assert the
+  scoped claim and refuse either old form.
+
+- **The admin zero state greets the reader like every other chat landing.** It
+  opened with an "{instance} · Admin" eyebrow where every other state opens with
+  "Good morning, {name}" — two different openers for no benefit to the reader,
+  since an admin arriving at an unconfigured instance is still a person arriving
+  at their tool. The greeting is now defined once and emitted in both intro
+  branches, so the only thing that differs between them is the heading and lede
+  that genuinely differ. The retired eyebrow's information is not lost: the
+  deployment is identified by the rail's wordmark and the footer's build stamp.
+
+- **The chat empty state has a vertical rhythm you can read.** Its spacing was
+  inverted: the gap between the composer block and the suggestions (18px) was
+  *smaller* than the gaps inside the intro above it (25px, 28px), so eight
+  elements sat at roughly one distance apart and the page read as a list of
+  unrelated rows rather than three sections. Spacing is now a named four-step
+  scale declared once on the empty state (`--cld-gap-tight` · `-inner` ·
+  `-block` · `-section`), with `section` the largest step by construction:
+  5px inside one line, 10px from a label to what it labels, 26px between the
+  parts of a region, 40px for the page's one real boundary. The page is TWO
+  regions rather than three sections — everything down to the suggested
+  questions is "ask" (the intro says what you can ask, the composer is where you
+  ask it, the chips are ways to fill it), then one break, then the ways out. The
+  measured result for an admin is 5 · 10 · 26 · 10 · **40** · 26 · 10, reading
+  greeting → heading → lede → cards → privacy line → *break* → composer → label →
+  chips; for a member the same steps run greeting → heading → lede → *break* →
+  composer → label → chips → **40** → cards → privacy line.
+  Three alignment faults went with it, all of the same kind — near-agreement,
+  which reads as error where either agreement or a clear difference would not:
+  - **The composer's footer row was the one left-aligned block** on a page whose
+    every other element shares one centre axis, and it sat at the midpoint with
+    540px of empty row after it. Centred.
+  - **Three near-equal measures** (composer 830px, cards 660px, chips 640px) are
+    now two. The chips and the cards share `--cld-measure`, so their left and
+    right edges land on the same pixels instead of 10px apart.
+  - **The two cards' text columns started at different insets** — one after a
+    46px progress ring, the other at its own padding — so their titles never sat
+    on a shared line and the ringed card read as the heavier of the pair. The
+    icon slot is the ring's exact size now (46px, was 40px), and the tools card
+    carries a leading mark of its own.
+
+- **`/agents` opens with a "New agent" card instead of a button above the
+  grid.** Making an agent lands in the same builder as opening one, so it is the
+  same kind of act and belongs in the same row — in the position the eye reaches
+  first — rather than floating over the collection as a toolbar. The dashed cell
+  is a peer of the cards beside it in size and radius and deliberately not in
+  fill, since a solid card would read as an agent that already exists. It leads
+  whichever band actually renders: Ready when there is one, Drafts otherwise, so
+  an instance whose every agent is still a draft does not lose it (an empty band
+  renders nothing at all). The zero state keeps its own "Build an agent" panel —
+  with no grid, there is no first cell for a card to be.
+
+- **The chat empty state is reordered, and says different things to admins and
+  members.** The three door-cards between the heading and the input are now two,
+  and the page reads as orientation-then-action: greeting, heading, lede, the two
+  cards, the privacy line — then the composer, then the suggestions. Everything
+  above the input tells you what this is and what it answers from; everything
+  below is the act of asking. The page's single `section` break lands immediately
+  before the composer, which is the boundary the reader crosses.
+
+  The cards sit by AUDIENCE. An **admin** gets them above the composer — their
+  lead card is a job (set the instance up, with its progress on it) and a job does
+  not belong below four suggested questions. A **member** gets them after the
+  suggestions — theirs is "see what {brand} knows", genuinely secondary to
+  asking, so the ways to go browsing sit past the thing they came for. The trust
+  line travels with the cards either way. Gated on the same flag that decides
+  which lead card renders, so audience and position cannot disagree — and
+  deliberately not on whether the instance is empty, which was tried and meant
+  the layout reflowed the moment a first table landed.
+
+  The "Using N knowledge sources and M capabilities from your Stack" line that
+  sat under the composer is **removed** — it reported a count with no action
+  attached, in the one row between the input and its suggestions. Nothing else
+  consumed those counts, and they were not free: two `StackResolver` reads plus
+  an RBAC plugin resolve on every `/chat` render, so the helpers
+  (`_stack_knowledge_source_count` / `_stack_capability_count`) and their tests
+  went with them. Git history holds the "actual Stack, not the whole catalog"
+  reasoning if the line ever returns.
+  - **The suggestions are a row of chips**, not a four-item column: a stack of
+    full-width rows under a text field reads as results, where a wrapping row of
+    pills reads as things you could ask — and takes one line instead of four. The
+    group is held to a measure so it wraps into balanced rows. Its label reads
+    **"Suggested for you"**, which is the claim worth a line: they are derived
+    from what this caller can actually reach, not four static examples. (An
+    interim "Suggested to ask" was dropped for saying only what the chips already
+    looked like — the word that earns the line is "for you".)
+  - **An admin's setup card carries a progress ring** (`3/6`) instead of
+    reporting "3 of 6 steps done" in the text of its own link — the same fact,
+    read at a glance, with the number where the eye lands first. It is rendered
+    server-side from `admin_setup`, so unlike the rail's ring it cannot flash a
+    wrong count. On an instance with nothing registered there is no ring at all:
+    a meter reading 0/6 measures the wrong thing when the point is that there is
+    no data yet, so that state keeps its "Add your first data" button.
+  - **The member's card carries the brand orb**, not a `brain` line glyph — that
+    was a generic abstraction which at 17px read as an unrecognisable pair of
+    shapes, on the one card that speaks for {brand} itself. It renders the same
+    shared macro as the rail logo and the connect banner, so the mark still lives
+    in exactly one place, and drops the tinted chip and halo behind it: those
+    give a monochrome glyph a surface to sit on, and around a full-colour mark
+    they are a badge around a badge.
+  - **A member never sees a setup card** — they cannot set the instance up, so
+    offering them the ring would be a chore they are not allowed to finish. Their
+    slot holds the one move they do have ("See what {brand} knows" → the
+    Library), with the same anatomy rather than the admin's card with its
+    controls greyed out.
+  - **"How {brand} works" is a link beside the trust caption, not a card** — it
+    is reference reading, and a card of equal size said it was a choice
+    comparable to setting the instance up. The pair closes the page under the two
+    cards, which is what everything-consulted-rather-than-acted-on is for; the
+    gap above the cards stays the page's one section break. It is also centred at
+    last — it was a `<p>` wrapping a `<div>`,
+    so the parser closed the paragraph early, its children became block siblings
+    of the row around it, and the `justify-content: center` applied to an empty
+    element. The greeting
+    grows a time-of-day glyph, corrected from the browser clock alongside the
+    salutation so the sun and the words can never disagree.
+  - **Both cards are clickable end to end.** The setup card was the one card
+    that was not a link — a `<div>` holding an `<a>` — so it had to suppress the
+    hover its neighbours offer and left the reader a 13px line of text to aim
+    at. It is a whole-card link now, its action a `<span>`, with hover and
+    `:active` driven from the card.
+  - **Only the audience card carries the tinted surface.** That fill means "this
+    is {brand} itself"; on the tools card as well, the pair read as a band of
+    two panels with nothing distinguishing the card about your own instance from
+    the one pointing at your editor. The marker-column layout and type moved to
+    their own `.cld-door--split`, so the two stay peers in shape while differing
+    in surface.
+  - **The agent picker moved INSIDE the composer, into the trailing cluster with
+    Send**, with the Stack sentence on the row below it. Choosing an agent is
+    part of composing — the agent is bound at session creation, so the control
+    sets a property of the message about to be sent, not of the page — and the
+    trailing position is what makes that work: ahead of the "+" a longer agent
+    name moved where the placeholder began (a measured 58px jump between "Agnes"
+    and "Finance Proposals", reflowing any draft already typed), while after the
+    textarea a wider pill takes its width off the end of the field and the text
+    origin does not move at all. It matches Send's 44px height so the two read as
+    one pair, keeps its fill on hover only, and the footer row collapses entirely
+    in a live conversation now that the sentence is its only occupant.
+  - **The default agent is called "Default"**, not the brand. "Agnes" read more
+    naturally alone but was the odd one out beside the caller's own named agents,
+    and it disagreed with `/agents`, where the same row is Default. One name per
+    agent, everywhere.
+  - **A long agent name shows as initials in the pill** ("Finance Proposals" →
+    "FP") so its width is stable across agents. The full name stays reachable
+    without opening anything — the title attribute carries it, the menu spells it
+    out, and the in-conversation label is never abbreviated. A single long word
+    has no initials to take and falls back to an ellipsis.
+  - **The picker's menu offers "Create new agent"**, ruled off below the agents
+    (they switch this conversation; it leaves the page). This is where a caller
+    discovers their agents are not enough, so the next move belongs in reach
+    rather than back through the rail. It points at `/agents?new=1` — the SAME
+    create path the Agents page's own card uses, a second door to one flow rather
+    than a second flow. The menu already listed ready agents only.
+  - The Stack sentence is *about* the agent, so **its counts follow the
+    selection**: an agent whose
+    knowledge or plugins are `'selected'` is counted from the ids it actually
+    lists rather than from the owner's whole Stack, and an agent scoped to
+    nothing hides the line instead of claiming a capability it cannot reach.
+    Mixed scope modes fall to the explicit list, since overstating an agent's
+    reach is the worse error. The server still renders the owner's totals for
+    first paint, so a failed `/api/v1/agents` degrades to the old behaviour.
+    The pill also takes a **resting fill** — a light tint of the accent — since
+    at `background: transparent` with muted ink it read as a label that happened
+    to carry a caret, which is the opposite of what a control that changes the
+    answer should look like. The fill is its only device — no border, since an
+    outline around a tinted 30px pill is two devices saying one thing and closed
+    the shape into a tag. The decorative glyph before the sentence is
+    gone, because a second mark 8px from the pill made a two-item row look like
+    a toolbar of unrelated readouts. The **agent menu anchors to the picker's
+    left edge** to match, and the row **sits on the composer's own text inset**
+    rather than the page's centre axis — it describes the input, so it lines up
+    with the input's content. Its sentence starts lower case, so pill and phrase
+    read as one line ("Agnes · using 1 capability from your Stack") instead of
+    two statements side by side: it grew
+    leftward from a `right: 0` anchor, which was correct while the picker
+    trailed the row and clipped the agent names behind the sidebar the moment it
+    led it.
+  - **Hover is a lift, and only the card that needs an edge keeps one.** The
+    outline is replaced by a shadow that appears on hover — one channel, so both
+    cards answer the pointer identically whatever surface each has — and the
+    tinted card drops both its resting border and the resting shadow it had. The
+    plain card keeps a subtle border, because that is the actual rule rather than
+    a per-card choice: the tinted card is held off the page by its own fill, so
+    an outline there frames something already separated, while the plain card's
+    fill is nearly the page and without an edge it stops reading as a card. The
+    1px stays in the box as `transparent` on the tinted one, so nothing shifts
+    when either lifts. Fixes with it: the quiet
+    "Continue setup" link took the PRIMARY fill on card hover, because the
+    card-level rule outranked its own `background: none` by one class and painted
+    the text link as a dark blue blob.
+
+- **The chat list has one view, and the rail's conversation zone has one door.**
+  Three changes to the same surface, all rail-layout instances:
+  - **`/chats` drops the list ⇄ grid switch.** A conversation is a title you
+    read plus two facts you glance at (which agent, how long ago); a card spent
+    a whole tile saying that much, so the list is now the only projection. The
+    `.fbar-view` control, the `#ch-grid` container, the card builder in
+    `chats_page.js` and the card CSS are gone — the Library keeps its own
+    switch, where an asset has a thumbnail worth a tile.
+  - **The rail's conversation zone is ONE unlabelled list.** "Pinned" and
+    "Recent" are gone, along with the per-section disclosure — its caret, its
+    persisted open/closed flag (`agnes.rail.chatsec.*` in localStorage) and its
+    `is-collapsed` state. Two labels and three moving parts were chrome over a
+    list a handful of rows tall that already scrolls in its own box; a pinned
+    row is marked by its pin glyph, and that the feed is a slice is said by the
+    row that closes it. Pinned rows still lead, and a section still hides when
+    it is empty, which is the only conditional left in the region. The zone's
+    tab order is now New chat → the titles → View all chats. The list also moves
+    up under **New chat** (8px of air above it became 3px, the same step the nav
+    rows use between themselves): the 8px was there to let a "PINNED" label read
+    as a heading, and with no label it only detached the list from the row it
+    belongs to. The folded Chats row now cancels the flex `gap` it was still
+    charged for, in both the persisted-open and peeked states, so the two ways
+    of reaching an open rail no longer disagree by 3px.
+  - **"View all chats" is the last ROW of that list, and the Chats row is now
+    the COLLAPSED form of the zone.** The link takes the conversation row's own
+    box — same height, left edge and hover — because it is the end of the list
+    rather than a footer under it; only its ink and weight mark it apart. It
+    sits outside both `<ul>`s, since every renderer clears its list with
+    `innerHTML = ""` and would delete an `<li>` on the first fetch. The row was introduced because the
+    conversation region is text end to end and cannot survive the rail's 56px
+    glyph strip, which left an admin page with no path to `/chats` at all; but
+    at full width it sat above the very lists it led to. Both widths are now
+    served by one zone: expanded, the lists render and a quiet link closes them;
+    collapsed, `#nav-chats` stands in for the whole region and folds away again
+    (`.rail-i--collapsed-only` — height and opacity, timed off the same
+    `--rail-peek-text-*` tokens as the peek reveal, with a `prefers-reduced-motion`
+    swap) the moment the rail opens or is peeked, so the two are never on screen
+    together. The link is static markup rather than revealed by a render, which
+    is what left `/chats` unreachable on a first run last time. On an admin page
+    the fold is not applied at all: the lists are not rendered there, so the row
+    keeps its place at every width.
+
 - **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
   It used to debounce-PATCH every keystroke, which meant there was never a
   moment at which the owner had *decided* the agent was right, and no honest

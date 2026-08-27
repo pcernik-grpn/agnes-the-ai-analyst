@@ -27,35 +27,6 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _context_line(body: str) -> str:
-    """The ``<p class="rdb-context">`` paragraph's inner markup, whitespace
-    collapsed. Scoped so a count or a /library link elsewhere on the page can
-    never stand in for the status line itself."""
-    import re
-
-    line = body[body.index('<p class="rdb-context">') :]
-    line = line[: line.index("</p>")]
-    return re.sub(r"\s+", " ", line).strip()
-
-
-def _make_pkg(slug: str, name: str) -> str:
-    from src.db import get_system_db
-    from src.repositories.data_packages import DataPackagesRepository
-
-    conn = get_system_db()
-    try:
-        return DataPackagesRepository(conn).create(
-            name=name,
-            slug=slug,
-            description=f"{name} desc",
-            icon="\U0001f4e6",
-            color="#fce7f3",
-            created_by="test",
-        )
-    finally:
-        conn.close()
-
-
 def _grant(
     group_name: str,
     resource_type: str,
@@ -137,14 +108,14 @@ def _enable_rail_chat(seeded_app, monkeypatch) -> None:
 
 
 class TestChatEmptyStatePill:
-    def test_renders_dashboard_and_context_line(self, seeded_app, monkeypatch):
-        """Rail ``/chat`` empty state renders the Dashboard — the Knowledge
-        Layer lead as the page hero, activity panels, guided task starters —
-        and the Stack context line (a package granted to the admin's group
-        puts it in their Stack, so the knowledge-source count is non-zero)."""
+    def test_renders_the_dashboard(self, seeded_app, monkeypatch):
+        """Rail ``/chat`` empty state renders the Dashboard — greeting, heading,
+        lede, the guided task starters and the two doors.
+
+        It used to assert a "Using N … from your Stack" line here too. That line
+        is retired: it reported a count the reader could not act on, in the one
+        row between the composer and its suggestions."""
         _enable_rail_chat(seeded_app, monkeypatch)
-        pkg_id = _make_pkg("dash-ctx-pkg", "Dash ctx pkg")
-        _grant("Admin", "data_package", pkg_id)
         c = seeded_app["client"]
         resp = c.get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
@@ -158,10 +129,10 @@ class TestChatEmptyStatePill:
         assert "Ask Agnes anything" in body
         assert 'class="cld-lede"' in body
         assert "shows you where each answer came from" in body
-        # The three doors at the foot carry the routes the hero carried, with
-        # the middle one naming the DIRECTION rather than "Connect your tools".
+        # The doors at the foot carry the routes the hero carried, with the tools
+        # one naming the DIRECTION rather than "Connect your tools".
         assert 'class="cld-doors"' in body
-        assert "Take Agnes to your own tools" in body
+        assert "Take Agnes to your tools" in body
         # The tool NAMES stay (they are the useful half of the retired hero, and
         # the door names them in its description); the floating chip markup that
         # carried them is what went with the banner.
@@ -171,76 +142,95 @@ class TestChatEmptyStatePill:
         for retired in ('class="klb"', "Agnes is your knowledge layer.", "Connect your tools"):
             assert retired not in body, f"the retired hero is back: {retired}"
         assert 'id="rdb-actions"' in body
-        assert "Using" in _context_line(body) and "from your" in _context_line(body)
+        # The suggestions carry a label again, and it names the one thing the
+        # chips cannot say about themselves — that they are derived from what
+        # this caller can reach.
+        assert "Suggested for you" in body
+        # No Stack count line, and no row under the composer to hold one.
+        assert 'class="rdb-context"' not in body
+        assert "cloud-chat-composer-foot" not in body
         # The retired hero copy must be gone.
         assert "Ask anything." not in body
         assert "Operated by" not in body
         assert "Suggested questions" not in body
 
-    def test_context_line_links_the_word_stack_only(self, seeded_app, monkeypatch):
-        """ONE link in the line, on the word "Stack" — pointing at the Library
-        with "In stack only" pre-applied, NOT at /stack: My Stack is not a rail
-        destination any more (#1088), so the old href landed the caller on a page
-        with no nav entry. /library renders every kind that page did and the
-        filter narrows it to what the line counts.
+    def test_below_the_input_is_the_suggestions_and_nothing_else(self, seeded_app, monkeypatch):
+        """Below the composer carries the suggested questions and nothing else —
+        no onboarding, no marketing, no documentation link.
 
-        The counts themselves are plain text. Linking each of them made a status
-        line read as a row of controls and put three targets in one 13px
-        sentence; "Stack" is the thing the reader would go look at.
-        """
-        _enable_rail_chat(seeded_app, monkeypatch)
-        pkg_id = _make_pkg("ctx-link-pkg", "Ctx link pkg")
-        _grant("Admin", "data_package", pkg_id)
-        resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
-        assert resp.status_code == 200, resp.text
-        line = _context_line(resp.text)
-        assert line.count('href="/library?stack=in_stack"') == 1
-        assert '<a href="/library?stack=in_stack">Stack</a>' in line
-        assert 'href="/stack"' not in line
-        # The counts are not links.
-        assert "knowledge source</a>" not in line and "knowledge sources</a>" not in line
-
-    def test_below_the_input_is_context_only(self, seeded_app, monkeypatch):
-        """Below the composer carries what this conversation RUNS WITH and
-        nothing else — no onboarding, no marketing, no documentation link. The
-        first-run "See how Agnes works" path moved INTO the hero, under its CTA.
-
-        Two things qualify, sharing one line: the Stack status line (what the
-        agent can reach) and the agent picker (who it is). Both live in the
-        composer's own footer row rather than in ``#chat-empty-extras``,
-        because the picker has to survive the start of a conversation and
-        extras do not — so the region checked here spans from the composer to
-        the suggested-actions block, not one container.
+        The rule protects the INTENT ZONE: the span a reader crosses between
+        having a question and the suggestions that help them phrase it, where a
+        navigate-away control is a detour. It used to also allow two readouts
+        here (the Stack count line and the agent picker); the picker moved into
+        the composer pill and the count line is retired, so the zone is now
+        strictly empty of everything but the chips.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200, resp.text
         body = resp.text
-        # The region is composer → suggested actions, NOT composer → the hero
-        # slot. The rule protects the INTENT ZONE: the span a reader crosses
-        # between having a question and the suggestions that help them phrase
-        # it, where a navigate-away control is a detour. It was written when a
-        # hero above the composer carried the orientation routes; that hero is
-        # retired, so those routes now sit at the FOOT of the empty state
-        # (`.cld-doors`, after the suggestions) — past the intent zone, not
-        # inside it. Widening the region to the hero slot would forbid the page
-        # from offering any route at all, which is not what the rule was for.
-        below = body[body.index('id="chat-input"') :]
-        below = below[: below.index('id="rdb-actions"')]
-        assert 'class="rdb-context"' in below
-        assert 'id="chat-agent-btn"' in below
-        for retired in ("rdb-orient", "New here?", 'href="/how-it-works"'):
-            assert retired not in below, f"below-input area is not context-only: {retired}"
+        below = body[body.index("</form>") :]
+        below = below[: below.index('id="rdb-actions-list"')]
+        for retired in ("rdb-orient", "New here?", 'href="/how-it-works"', 'class="rdb-context"'):
+            assert retired not in below, f"below-input area is not suggestions-only: {retired}"
+        # The picker is in the composer, not under it.
+        composer = body[body.index('class="cloud-chat-composer"') : body.index("</form>")]
+        assert 'id="chat-agent-btn"' in composer
+
+    def test_the_cards_sit_by_AUDIENCE_not_by_instance_state(self, seeded_app, monkeypatch):
+        """An ADMIN gets the two cards above the composer; a MEMBER gets them
+        after the suggestions.
+
+        The difference is what the lead card IS. An admin's is a job — set the
+        instance up, with its progress on it — and a job does not belong below
+        four suggested questions. A member's is "see what {brand} knows", which is
+        genuinely secondary to asking: they came to ask something, and the ways to
+        go browsing belong past the thing they came for.
+
+        Gated on `admin_setup`, the same flag that decides WHICH lead card
+        renders, so the audience and the position cannot disagree. Deliberately
+        NOT on `admin_notice` (an empty instance) — that was tried, and it meant
+        the layout reflowed the moment a first table landed. Audience is stable;
+        data is not.
+
+        The trust line travels with the cards either way.
+        """
+        _enable_rail_chat(seeded_app, monkeypatch)
+        c = seeded_app["client"]
+
+        admin = c.get("/chat", headers=_auth(seeded_app["admin_token"])).text
+        assert admin.index('class="cld-doors"') < admin.index('id="chat-form"'), (
+            "an admin's cards belong above the composer"
+        )
+        assert admin.index('class="cld-doors"') < admin.index('class="cld-trust"')
+
+        _grant("Everyone", "chat", "chat", users=["analyst1"])
+        member = c.get("/chat", headers=_auth(seeded_app["analyst_token"])).text
+        assert member.index('id="chat-form"') < member.index('class="cld-doors"'), (
+            "a member's cards belong after the suggestions"
+        )
+        assert member.index('id="rdb-actions"') < member.index('class="cld-doors"')
+        assert member.index('class="cld-doors"') < member.index('class="cld-trust"')
+
+        # Exactly one of each, in both — the two emission points are mutually
+        # exclusive, not additive.
+        for who, body in (("admin", admin), ("member", member)):
+            assert body.count('class="cld-doors"') == 1, who
+            assert body.count('class="cld-trust"') == 1, who
 
     def test_orientation_routes_live_in_the_doors_row(self, seeded_app, monkeypatch):
         """The first-run path to /how-it-works, which the rail otherwise carries
         only as a quiet ``.rail-meta`` row in its foot (_app_rail.html).
 
         It used to be a text link under the hero's "Connect your tools" CTA.
-        With that hero retired it is one of three labelled doors at the foot of
-        the empty state — still a plain link, still not a button, and now beside
-        the two other routes off this page instead of competing with a banner
-        CTA above the composer.
+        With that hero retired it is one of TWO labelled doors at the foot of the
+        empty state — still a plain link, still not a button, and now beside the
+        one other route off this page instead of competing with a banner CTA
+        above the composer.
+
+        "How {brand} works" is no longer a door at all: it is reference reading,
+        not a move, so it sits in the foot line beside the trust caption where a
+        third card of equal weight used to imply it was a comparable choice.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         resp = seeded_app["client"].get("/chat", headers=_auth(seeded_app["admin_token"]))
@@ -248,7 +238,7 @@ class TestChatEmptyStatePill:
         body = resp.text
         doors = body[body.index('class="cld-doors"') :]
         doors = doors[: doors.index("</nav>")]
-        # All three routes, and each says where it goes. The FIRST card is
+        # Both routes, and each says where it goes. The FIRST card is
         # audience-dependent: an admin gets "Set up Agnes" (the job only they
         # can do) where a member gets the Library door, so this test — which
         # signs in as an admin — expects the setup card, and the member variant
@@ -256,115 +246,16 @@ class TestChatEmptyStatePill:
         assert "cld-door--setup" in doors
         assert "Set up Agnes" in doors
         assert 'href="/how-it-works#connect"' in doors
-        assert 'href="/how-it-works"' in doors
-        assert "Take Agnes to your own tools" in doors
-        assert "How Agnes works" in doors
+        assert "Take Agnes to your tools" in doors
+        # The third card is retired. Its destination survives as a foot link,
+        # OUTSIDE this row — a card gave reference reading the same weight as
+        # setting the instance up.
+        assert "How Agnes works" not in doors
+        assert 'class="cld-trust-link" href="/how-it-works"' in body
+        assert "See how Agnes works" in body
         # Links, not buttons — the composer above is the page's only action.
         for retired in ("btn btn-primary", 'class="klb-cta"', 'class="klb-ctas"', "klb-cta-secondary"):
             assert retired not in doors, f"a door rendered as a button: {retired}"
-
-    def test_context_line_hidden_at_zero(self, seeded_app, monkeypatch):
-        """analyst1 has no data/plugin grants → both counts are 0 and the
-        context line hides entirely ("Using 0 knowledge sources" would read as
-        broken). The CHAT grant only unlocks the route; it is not a knowledge
-        source, so it doesn't bump N."""
-        _enable_rail_chat(seeded_app, monkeypatch)
-        _grant("Everyone", "chat", "chat", users=["analyst1"])
-        c = seeded_app["client"]
-        resp = c.get("/chat", headers=_auth(seeded_app["analyst_token"]))
-        assert resp.status_code == 200, resp.text
-        assert _context_line(resp.text) == '<p class="rdb-context">'
-        # The rest of the dashboard still renders.
-        assert 'id="rdb-actions"' in resp.text
-
-    def test_context_line_reflects_rbac_grant(self, seeded_app, monkeypatch):
-        """A required data-package grant on the analyst's group bumps N — the
-        line appears, pluralized down to the singular "source" at N=1. The
-        analyst has no capabilities, so that clause is omitted entirely rather
-        than rendered as "and 0 capabilities"."""
-        _enable_rail_chat(seeded_app, monkeypatch)
-        _grant("Everyone", "chat", "chat", users=["analyst1"])
-        pkg_id = _make_pkg("ask-landing-pkg", "Ask landing pkg")
-        _grant("Everyone", "data_package", pkg_id, requirement="required", users=["analyst1"])
-        c = seeded_app["client"]
-        resp = c.get("/chat", headers=_auth(seeded_app["analyst_token"]))
-        assert resp.status_code == 200, resp.text
-        line = _context_line(resp.text)
-        assert "Using 1 knowledge source from your" in line
-        # Singular, not plural — the plural fragment must be absent.
-        assert "1 knowledge sources" not in line
-        # Zero capabilities → no clause at all.
-        assert "capabilit" not in line
-
-    def test_admin_counts_stack_not_catalog(self, seeded_app, monkeypatch):
-        """The line reads the caller's ACTUAL Stack, not the whole catalog:
-        creating a package does NOT bump the admin's count (god-mode lets
-        admin browse everything, but browse ≠ Stack); an admin self-serve
-        subscribe (POST /api/stack/subscribe, no grant needed) does."""
-        import re
-
-        _enable_rail_chat(seeded_app, monkeypatch)
-        c = seeded_app["client"]
-        headers = _auth(seeded_app["admin_token"])
-
-        def _count() -> int:
-            resp = c.get("/chat", headers=headers)
-            assert resp.status_code == 200, resp.text
-            m = re.search(r"(\d+) knowledge source", _context_line(resp.text))
-            return int(m.group(1)) if m else 0
-
-        before_n = _count()
-        pkg_id = _make_pkg("stack-count-pkg", "Stack count pkg")
-        assert _count() == before_n  # catalog growth alone isn't the Stack
-
-        resp = c.post(
-            "/api/stack/subscribe",
-            headers=headers,
-            json={"resource_type": "data_package", "resource_id": pkg_id},
-        )
-        assert resp.status_code == 200, resp.text
-        assert _count() == before_n + 1
-
-    def test_capabilities_count_pluralization(self, seeded_app, monkeypatch):
-        """capability_count == 1 renders the singular "1 capability from your
-        Stack" — and only SUBSCRIBED plugins count: RBAC resolves two
-        plugins for the caller, one subscription row exists, so M == 1.
-        Asserted inside the status line — the empty-state DOM also carries
-        an ``id="chat-capabilities"``, so a bare "capabilities" substring
-        check over the page would be a false negative."""
-        from src import marketplace_filter
-        from src.repositories import user_curated_subscriptions_repo
-
-        _enable_rail_chat(seeded_app, monkeypatch)
-        monkeypatch.setattr(
-            marketplace_filter,
-            "resolve_allowed_plugins",
-            lambda conn, user: [
-                {"marketplace_id": "mp1", "original_name": "demo-plugin", "manifest_name": "demo-plugin", "raw": {}},
-                {"marketplace_id": "mp1", "original_name": "other-plugin", "manifest_name": "other-plugin", "raw": {}},
-            ],
-        )
-        user_curated_subscriptions_repo().subscribe("admin1", "mp1", "demo-plugin")
-        c = seeded_app["client"]
-        headers = _auth(seeded_app["admin_token"])
-        # A subscribed package too, so both halves of the sentence are present
-        # and the "and" join is exercised.
-        pkg_id = _make_pkg("cap-plural-pkg", "Cap plural pkg")
-        assert (
-            c.post(
-                "/api/stack/subscribe",
-                headers=headers,
-                json={"resource_type": "data_package", "resource_id": pkg_id},
-            ).status_code
-            == 200
-        )
-        resp = c.get("/chat", headers=headers)
-        assert resp.status_code == 200, resp.text
-        line = _context_line(resp.text)
-        assert "1 capability from your" in line
-        assert "1 capabilities" not in line
-        # Non-zero → the clause joins the knowledge-source count with "and".
-        assert " and 1 capability" in line
 
     def test_requires_login(self, seeded_app):
         """Same auth gate as every other authenticated page — unauthenticated

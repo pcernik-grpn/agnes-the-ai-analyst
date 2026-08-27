@@ -50,8 +50,34 @@ class TestTheListIsGroupedByState:
 
     def test_an_empty_band_renders_nothing_at_all(self, markup):
         """A "Drafts" heading over no drafts reads as a rendering bug."""
-        block = re.search(r"function group\(title, sub, list\) \{(.*?)\n  \}", markup, re.S)
+        block = re.search(r"function group\(title, sub, list, lead\) \{(.*?)\n  \}", markup, re.S)
         assert block and "if (!list.length) return '';" in block.group(1)
+
+    def test_new_agent_is_the_first_card_not_a_toolbar_button(self, render_list, markup):
+        """Making an agent lands in the same builder as opening one, so it is a
+        card in the same grid rather than a button floating over the collection.
+
+        And it must lead whichever band actually RENDERS: `group()` drops an empty
+        band entirely, so handing the card to Ready unconditionally would lose it
+        on an instance whose every agent is still a draft."""
+        # No toolbar row above the grid any more.
+        assert "ag-listbar" not in render_list
+        assert "'+ New agent'" not in render_list.replace('"', "'"), "the button is a card now"
+        # The ZERO state keeps its own primary CTA, and should: an empty page has
+        # no grid for a card to lead, so that panel is the affordance.
+        empty = render_list.split("if (!agents.length)", 1)[1].split("return;", 1)[0]
+        assert "cc-btn--primary" in empty
+        assert "cc-btn--primary" not in render_list.replace(empty, ""), "no primary button outside the zero state"
+        # The card is a real cell of the grid, inside `group()`'s own container.
+        assert "newCard()" in render_list
+        block = re.search(r"function group\(title, sub, list, lead\) \{(.*?)\n  \}", markup, re.S)
+        assert "(lead || '')" in block.group(1), "the lead cell rides inside .ag-grid"
+        # Ready leads when it renders; Drafts inherits the card when it does not.
+        assert "readyHtml ? '' : newCard()" in render_list
+        card = re.search(r"function newCard\(\) \{(.*?)\n  \}", markup, re.S)
+        assert card, "newCard not found"
+        assert "data-ag-new" in card.group(1), "it must share the create path"
+        assert 'class="ag-new"' in card.group(1)
 
 
 class TestTheCardsPrimaryActionFollowsItsState:

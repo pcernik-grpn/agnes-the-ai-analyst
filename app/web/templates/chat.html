@@ -1,5 +1,6 @@
 {% extends 'base_ds.html' %}
 {% import "macros/_icon.html" as ico %}
+{% import "macros/_agnes_orb.html" as agnes_orb %}
 {% from "macros/_knowledge_layer.html" import knowledge_layer_banner, knowledge_hub_label with context %}
 
 {# Cloud chat page. Extends the canonical Agnes design-system base so
@@ -160,18 +161,86 @@
          take on faith. The greeting above it is small on purpose: it locates
          the reader, it is not the message. #}
       {% set _first_name = user.name.split(' ')[0] if user.name else '' %}
+      {# The trust claim and the one piece of reference reading that used to be a
+         third card. Defined once and emitted in BOTH intro branches (the admin
+         zero state writes its own greeting and heading), so the markup cannot
+         drift between them — and emitted rather than reordered in CSS, because
+         `order` would move it visually while leaving a screen reader to meet it
+         wherever the DOM still had it.
+
+         It CLOSES the page, under the two cards. Everything in it is consulted
+         rather than acted on, which is what last is for; and the two positions
+         tried above it both cost something real — between the heading and the
+         lede it split a heading from its own description, and in the gap between
+         the suggestions and the cards it would have consumed the page's ONE
+         section break (see the scale in chat.css), so the two regions would stop
+         separating.
+
+         A <div>, not a <p>. `knowledge_hub_label` emits a <div>, and a <div>
+         inside a <p> makes the parser CLOSE the paragraph before it — so this
+         element ended up empty, its children became block-level siblings of
+         whatever surrounded it, and the `justify-content: center` meant to centre
+         them applied to nothing. #}
+      {# The greeting, shared by both intro branches. Extracted for the same
+         reason as the trust line below: the zero state had its OWN opener — an
+         "{instance} · Admin" eyebrow — so the two states greeted the reader
+         differently for no reason the reader could benefit from. The setup state
+         is still a person arriving at their tool in the morning; only what they
+         should do next differs, and that is what the heading is for.
+
+         `data-tod` picks the glyph, and chat_dashboard.js rewrites BOTH the
+         attribute and `#rdb-greeting-tod` from the browser clock — the server's
+         clock can be in another timezone, and a sun over "Good evening" is the
+         kind of small wrongness that makes a page feel machine-generated.
+
+         Only one branch renders, so `#rdb-greeting-tod` stays unique in the DOM
+         and that lookup keeps working. #}
+      {% set _greeting_line %}
+        <p class="cld-greet" data-tod="{{ 'night' if greeting == 'Good evening' else 'day' }}">
+          <span class="cld-greet-ico cld-greet-ico--day" aria-hidden="true">{{ ico.icon('sun', 15) }}</span>
+          <span class="cld-greet-ico cld-greet-ico--night" aria-hidden="true">{{ ico.icon('moon', 15) }}</span>
+          {# Name INSIDE the span with the salutation. As a sibling text node it
+             became its own flex item and picked up the row gap, rendering
+             "Good morning , Admin". chat_dashboard.js rewrites only
+             #rdb-greeting-tod, so the comma has to live outside that element —
+             hence the wrapper. #}
+          <span class="cld-greet-txt"><span id="rdb-greeting-tod">{{ greeting }}</span>{% if _first_name %}, {{ _first_name }}{% endif %}</span>
+        </p>
+      {% endset %}
+      {% set _trust_line %}
+        <div class="cld-trust">
+          {{ knowledge_hub_label(show_title=False) }}
+          <span class="cld-trust-sep" aria-hidden="true"></span>
+          <a class="cld-trust-link" href="/how-it-works">
+            {{ ico.icon('info', 14) }}
+            See how {{ instance_brand_short or 'Agnes' }} works
+          </a>
+        </div>
+      {% endset %}
       {% if admin_notice %}
-      {# ZERO STATE, admin. The ordinary heading is "Ask {brand} anything" — a
-         lie on an instance that knows nothing, where every question fails and
-         all four suggested actions below would too. So the page states the
-         goal instead of the invitation, names the consequence rather than just
-         the fact ("so it can answer nothing" is what makes "no data is
-         registered" mean something), and offers the one move that changes it.
+      {# ZERO STATE, admin. The ordinary heading, "Ask {brand} anything", invites
+         the one thing this instance cannot yet do well — answer about the
+         company — so the page states the goal instead of the invitation and
+         offers the one move that changes it.
+
+         The lede says what is actually true, which took two tries. It read "it
+         knows nothing about your company yet, so it can answer nothing", and
+         that second clause was false: {brand} answers perfectly well from
+         general knowledge with no data registered at all. This very state proves
+         it — the composer's placeholder is "Ask how to get {brand} set up…" and
+         the suggested questions are "How do I connect our data?" and "What will
+         people be able to ask?", all of which get real answers. A reader who
+         typed one would catch the page lying to them on their first try, which
+         is an expensive thing to spend on an instance's first impression.
+
+         What is missing is not the ability to answer, it is the GROUNDING — so
+         the lede draws that line instead: general knowledge now, your own
+         numbers once you connect a source.
 
          This REPLACES the separate notice bar that used to sit above the
          heading: with the heading itself carrying the message, the bar was the
          same sentence twice. #}
-      {% if instance_org %}<p class="cld-greet">{{ instance_org }} &middot; Admin</p>{% endif %}
+      {{ _greeting_line }}
       {# Names the task rather than greeting the reader: a heading should say
          what to do, and the fact belongs one size down where the lede carries
          it. No first name — the personalized "Let's get {brand} answering,
@@ -181,12 +250,15 @@
          is DOCUMENTED as the deploying organization but nothing enforces it,
          and instances routinely leave it product-shaped — this one is called
          "AI Data Analyst", which turns the sentence into "it knows nothing
-         about AI Data Analyst yet" and reads as a bug. The name is fine as a
-         LABEL in the eyebrow above (that is what an eyebrow is for); it is not
-         safe inside a claim. "your company" is true on every instance. #}
+         about AI Data Analyst yet" and reads as a bug. It is not safe inside a
+         claim; "your company" is true on every instance. (The eyebrow that used
+         to carry the name as a plain LABEL is gone — this state greets the
+         reader like every other now. The deployment is still identified by the
+         rail's wordmark and the footer's build stamp.) #}
       <p class="cld-lede">
-        It knows nothing about your company yet, so it can answer nothing.
-        Connect where your data lives and it can start answering from your own numbers.
+        Nothing is connected yet, so {{ instance_brand_short or 'Agnes' }} answers from general knowledge rather
+        than your company's data. Connect where your data lives and it can answer
+        from your own numbers.
       </p>
       {# The hero's "Add your first data" chip + "Full checklist" link used to
          sit here. Removed: with the setup card below carrying a primary button,
@@ -194,7 +266,7 @@
          `connect_options` still resolves — the card's button uses it. #}
 
       {% else %}
-      <p class="cld-greet">{{ greeting }}{% if _first_name %}, {{ _first_name }}{% endif %}</p>
+      {{ _greeting_line }}
       <h2 class="rdb-ask-heading">Ask {{ instance_brand_short or 'Agnes' }} anything</h2>
       <p class="cld-lede">
         {{ instance_brand_short or 'Agnes' }} answers from your company's own data, documents and
@@ -216,69 +288,160 @@
          steps done → Admin overview" once there is. A member gets the Library
          door instead — the useful first stop for someone who cannot set
          anything up, and the one place that answers "what is here?". #}
+      {# TWO doors, not three. "How {brand} works" was the third card and is now
+         one link in the foot beside the trust caption: it is reference reading,
+         not a move, and giving it a card of equal size to "set your instance up"
+         said the two were comparable choices. Two cards also let the pair sit at
+         a readable width under the composer instead of three narrow columns.
+
+         The corner mark is `arrow-up-right`, not `chevron-right`: this door
+         hands the reader off to a page about their own editor, which is a
+         different promise from "next step in here". #}
       {% set _tool_door %}
-        <a class="cld-door" href="/how-it-works#connect">
-          <span class="cld-door-t">Take {{ instance_brand_short or 'Agnes' }} to your own tools</span>
-          <span class="cld-door-d">Same knowledge inside Claude Code, Cursor, VS Code or your terminal</span>
-          <span class="cld-door-tools" aria-hidden="true">
-            <img src="{{ static_url('img/tools/claude-code.ico') }}" alt="" width="15" height="15">
-            <img src="{{ static_url('img/tools/cursor.ico') }}" alt="" width="15" height="15">
-            <img src="{{ static_url('img/tools/vscode.ico') }}" alt="" width="15" height="15">
+        {# `--split` for the layout, NOT `--lead`: the tinted "this is Agnes
+           itself" surface belongs to the audience card alone, and on both cards
+           it made the pair a band of panels with nothing telling them apart. #}
+        <a class="cld-door cld-door--split cld-door--tools" href="/how-it-works#connect">
+          <span class="cld-door-mark" aria-hidden="true">{{ ico.icon('arrow-up-right', 15) }}</span>
+          {# A leading mark in the SAME slot its neighbour uses for the progress
+             ring. Without one, the two cards' text columns started at different
+             insets — the left card's title after a 46px ring, this one's at its
+             own padding — so the pair's two titles did not sit on a shared line
+             and the left card read as the heavier of the two. `link`, because
+             what this card offers is connecting {brand} to an editor you already
+             use. #}
+          <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('link', 17) }}</span>
+          {# Same `.cld-door-bd` column as the lead card's, so the two titles sit
+             on one line across the pair. Without it these three spans became
+             siblings of the row itself and the title took a column of its own,
+             one word per line. #}
+          <span class="cld-door-bd">
+            <span class="cld-door-t">Take {{ instance_brand_short or 'Agnes' }} to your tools</span>
+            <span class="cld-door-d">Same knowledge inside Claude Code, Cursor, VS Code or your terminal</span>
+            <span class="cld-door-tools" aria-hidden="true">
+              <img src="{{ static_url('img/tools/claude-code.ico') }}" alt="" width="16" height="16">
+              <img src="{{ static_url('img/tools/cursor.ico') }}" alt="" width="16" height="16">
+              <img src="{{ static_url('img/tools/vscode.ico') }}" alt="" width="16" height="16">
+            </span>
           </span>
         </a>
-        <a class="cld-door" href="/how-it-works">
-          <span class="cld-door-t">How {{ instance_brand_short or 'Agnes' }} works</span>
-          <span class="cld-door-d">Where your data goes, and what stays private</span>
-        </a>
       {% endset %}
+      {# `_doors` must be defined AFTER `_tool_door`: it renders it, and a
+         Jinja `{% set %}` block captures whatever the name holds at the
+         moment it runs — defined first, the reference was simply empty and
+         the tools card silently vanished from both states. #}
+{% set _doors %}
+      {# ---- The ways out, after the ways in ----
+         Two cards, centred and held to a reading width. The first is
+         audience-dependent and the difference is the point: an ADMIN owns
+         setting the instance up, so their card is that job and carries its
+         PROGRESS; a member cannot set anything up, so offering them a setup
+         card would be a chore they are not allowed to finish. They get the
+         one move they do have — see what is already here. #}
       <nav class="cld-doors" aria-label="Where to go next">
         {% if admin_setup %}
-        {# A block, not a wrapping <a>: it holds a button, and an anchor inside
-           an anchor is neither valid nor operable. The other two cards stay
-           whole-card links — they have nothing inside them to click. #}
-        <div class="cld-door cld-door--lead cld-door--setup">
-          <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('rows', 17) }}</span>
+        {# The WHOLE card is the link, so the action inside it is a <span>
+         styled as one — an anchor inside an anchor is neither valid nor
+         operable, and a card whose only hit area was its last line made the
+         reader aim at 13px of text. Both variants point where their own
+         action pointed. #}
+        {% set _go = (connect_options | selectattr('primary') | first) if connect_options else None %}
+        <a class="cld-door cld-door--lead cld-door--split cld-door--setup"
+         href="{% if admin_notice %}{{ _go.href if _go else '/admin/data-sources?add=1' }}{% else %}/admin{% endif %}">
+        <span class="cld-door-mark" aria-hidden="true">{{ ico.icon('layers', 15) }}</span>
+        {% if admin_notice %}
+        {# ZERO STATE. No ring: a meter reading 0/6 on an instance that
+           answers nothing measures the wrong thing — what matters is not
+           how far along the checklist is but that there is no data at all.
+           So the card states that and offers the one move. #}
+        <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('rows', 17) }}</span>
+        <span class="cld-door-bd">
           <span class="cld-door-t">Set up {{ instance_brand_short or 'Agnes' }}</span>
-          {% if admin_notice %}
-          <span class="cld-door-d">Nothing is registered yet, so nobody can ask anything</span>
-          {# The button is the CONNECT action, deliberately not
-             `admin_notice.cta`. That names the journey's current step, which on
-             a partly-set-up instance can be something like "Invite people" —
-             and "nothing is registered yet → Invite people" is incoherent. The
-             first thing to do about no data is add data. #}
-          {% set _go = (connect_options | selectattr('primary') | first) if connect_options else None %}
-          <a class="cld-door-btn" href="{{ _go.href if _go else '/admin/data-sources?add=1' }}">
+          <span class="cld-door-d">No data connected yet, so answers can't use your numbers</span>
+          {# The CONNECT action, deliberately not `admin_notice.cta`. That
+             names the journey's current step, which on a partly-set-up
+             instance can be something like "Invite people" — and "nothing is
+             registered yet → Invite people" is incoherent. The first thing
+             to do about no data is add data. (The card carries the href; see
+             the note above.) #}
+          <span class="cld-door-btn">
             {{ _go.label if _go else 'Add your first data' }} &rarr;
-          </a>
-          {% else %}
-          <span class="cld-door-d">Sources, tables, packages and who they reach</span>
-          <a class="cld-door-btn cld-door-btn--quiet" href="/admin">
-            {%- if admin_setup.complete %}All {{ admin_setup.total }} steps done
-            {%- else %}{{ admin_setup.done }} of {{ admin_setup.total }} steps done{% endif %}
-            &middot; Admin overview &rarr;
-          </a>
-          {% endif %}
-        </div>
+          </span>
+        </span>
         {% else %}
-        {# The member's counterpart to "Set up {brand}" — same slot, same
-           anatomy (icon, title, one line, one action), because it is the same
-           thing for a different audience: the one move this reader has before
-           they start asking. It was a bare two-line card while the admin's
-           carried an icon and a button, which made the member's landing look
-           like the admin's with the interesting part removed.
+        {# The ring replaces "3 of 6 steps done" as text. Same fact, but a
+           meter is read at a glance where a sentence has to be parsed, and
+           it puts the number where the eye lands first instead of at the
+           end of a link. Rendered server-side from `admin_setup` — the
+           rail's copy of this ring is filled by JS and can flash a wrong
+           number; here both halves of the fraction are already known.
 
-           A <span>, not an <a>, for the action: the whole card is the link
-           already and an anchor inside an anchor is neither valid nor
-           operable. It reads as the affordance without being a second one. #}
-        <a class="cld-door cld-door--lead cld-door--know" href="/library">
-          <span class="cld-door-ico" aria-hidden="true">{{ ico.icon('brain', 17) }}</span>
+           r=15 on a 36x36 viewBox, so the circumference is 2*pi*15 ~ 94.25;
+           the filled arc is that times done/total. #}
+        {% set _circ = 94.25 %}
+        <span class="cld-ring" aria-hidden="true">
+          <svg class="cld-ring-svg" viewBox="0 0 36 36">
+            <circle class="cld-ring-track" cx="18" cy="18" r="15"></circle>
+            <circle class="cld-ring-fill" cx="18" cy="18" r="15"
+                    stroke-dasharray="{{ (_circ * admin_setup.done / admin_setup.total) | round(2) }} {{ _circ }}"></circle>
+          </svg>
+          <span class="cld-ring-num">{{ admin_setup.done }}/{{ admin_setup.total }}</span>
+        </span>
+        <span class="cld-door-bd">
+          <span class="cld-door-t">Set up {{ instance_brand_short or 'Agnes' }}</span>
+          <span class="cld-door-d">Sources, tables, packages and who they reach</span>
+          {# The ring already says how far along this is, so this says what
+             to DO — the two used to be the same sentence twice. #}
+          <span class="cld-door-btn cld-door-btn--quiet">
+            {% if admin_setup.complete %}Admin overview{% else %}Continue setup{% endif %} &rarr;
+          </span>
+        </span>
+        {% endif %}
+        </a>
+        {% else %}
+        {# The member's counterpart, in the same slot with the same anatomy —
+         one icon, a title, one line, one action — because it is the same
+         KIND of thing for a different audience: the one move this reader
+         has before they start asking. Deliberately NOT a setup card with
+         the buttons greyed out: a member is not a blocked admin.
+
+         A <span>, not an <a>, for the action: the whole card is the link
+         already and an anchor inside an anchor is neither valid nor
+         operable. It reads as the affordance without being a second one. #}
+        <a class="cld-door cld-door--lead cld-door--split cld-door--know" href="/library">
+        <span class="cld-door-mark" aria-hidden="true">{{ ico.icon('arrow-up-right', 15) }}</span>
+        {# The brand ORB, not a line glyph. This card speaks for {brand}
+           itself — "here is what it knows" — and `brain` was a generic
+           abstraction that at 17px read as an unrecognisable pair of
+           shapes rather than as anything. The orb is the one mark a reader
+           already associates with the product, and it is the same shared
+           macro the rail logo and the connect banner render, so there is
+           still exactly one place the mark lives.
+
+           `--orb` drops the tinted chip and its halo: those exist to give a
+           monochrome line glyph a surface to sit on, and behind a
+           full-colour mark they are a second badge around a badge. #}
+        <span class="cld-door-ico cld-door-ico--orb" aria-hidden="true">
+          {{ agnes_orb.orb(css_class='cld-door-orb', size=32) }}
+        </span>
+        <span class="cld-door-bd">
           <span class="cld-door-t">See what {{ instance_brand_short or 'Agnes' }} knows</span>
           <span class="cld-door-d">Data packages, skills, memory and agents you can reach</span>
           <span class="cld-door-btn cld-door-btn--quiet">Browse the library &rarr;</span>
+        </span>
         </a>
         {% endif %}
         {{ _tool_door }}
       </nav>
+{% endset %}
+      {# The doors used to sit HERE, above the composer. They are BELOW the
+         suggestions now (in #chat-empty-extras) — see `.cld-doors` there.
+
+         What moved them: every one of them navigates AWAY from the composer,
+         and putting them between the heading and the input meant the reader's
+         first decision on a page whose whole point is "ask something" was
+         which of three places to leave for. The order now matches intent —
+         ask, or pick a question we suggest, and only then the ways out. #}
       {# A "Browse metrics & glossary" button used to sit here (#1108), the only
          in-page path to /catalog/semantics in the rail chrome. Retired: this is
          the moment of INTENT — the reader came to ask something and the
@@ -289,6 +452,48 @@
          The semantic layer is reached from the Library's Definitions band and
          from search (both of which can say how many definitions there are);
          citing it inside the answer that used it is issue #1134. #}
+
+      {# The trust line is NOT here. It closes the page under the two cards —
+         see `.cld-trust` in #chat-empty-extras. #}
+
+      {# ---- The two doors ----
+         Defined here, rendered in ONE of two places depending on whether the
+         instance has data. Normally they close the page, below the suggested
+         questions: they all navigate AWAY from the composer, so putting them
+         before it would make the reader's first decision on an "ask something"
+         page a choice of which way to leave.
+
+         On an EMPTY instance that reasoning inverts. There is nothing to ask
+         about the company yet, so the composer is not the thing to protect —
+         "Add your first data" is the only move that changes the state of the
+         product, and it should not sit below four other things. This is the same
+         rule the heading and lede already follow in this state (they state the
+         goal instead of the invitation); the cards just stopped following it.
+
+         `admin_notice` is the gate, so it is one condition for all three — the
+         heading, the lede and this — and they cannot disagree about which state
+         the page is in. #}
+      {# ADMINS get the cards here, above the composer. An admin's lead card is
+         a JOB — set the instance up, with its progress on it — and a job does
+         not belong below four suggested questions. Up here the page reads as
+         orientation then action: what this is, what it answers from, what you
+         still have to do, the promise about your data — then the field.
+
+         Members get them after the suggestions instead (see #chat-empty-extras).
+         Their lead card is "see what {brand} knows", which is genuinely
+         secondary to asking: a member arrives to ask something, and the ways to
+         go browsing belong past the thing they came for.
+
+         Gated on `admin_setup`, the same flag that decides WHICH lead card
+         renders — so the audience and the position cannot disagree. Deliberately
+         NOT on `admin_notice` (an empty instance): that was tried and it meant
+         the layout reflowed the moment a first table landed, which is a strange
+         thing to happen to a page an admin had just learned. Audience is stable;
+         data is not.
+
+         The trust line travels with the cards, closing whichever block holds
+         them. #}
+      {% if admin_setup %}{{ _doors }}{{ _trust_line }}{% endif %}
     </aside>
 
     <div id="chat-messages" class="cloud-chat-messages" aria-live="polite"></div>
@@ -353,6 +558,47 @@
          itself. #}
       <textarea id="chat-input" class="cloud-chat-input" rows="1"
         placeholder="{% if admin_notice %}Ask how to get {{ instance_brand_short or 'Agnes' }} set up…{% else %}Ask {{ instance_brand_short or 'Agnes' }} anything... (try: summarize revenue trends){% endif %}"></textarea>
+      {# Agent picker — which of the caller's agents this conversation runs AS,
+         INSIDE the composer, at the trailing end beside Send.
+
+         It belongs in the composer because choosing an agent is part of
+         composing: the agent is bound at session creation, so this control sets
+         a property of the message about to be sent, not of the page.
+
+         It belongs on the RIGHT, and that is the load-bearing part. Ahead of the
+         "+" it was in front of the textarea, so a longer agent name moved where
+         the placeholder began — a measured 58px jump between "Agnes" and
+         "Finance Proposals", which reflowed any draft already typed. After the
+         textarea, a wider pill shrinks the field from its trailing edge instead:
+         the text origin is fixed, and the give comes out of the end of a line
+         nobody is looking at. It also puts it in the right cluster with Send,
+         which is the "about to send" group — who answers and the act of asking.
+
+         TWO elements, one at a time. An agent is bound at session CREATION
+         (scope, memory notebook, pinned model and token budget are fixed for
+         the session's life), so mid-conversation there is nothing to choose and
+         the control becomes a plain label — not a greyed-out button, which
+         still announces itself as a button to a screen reader and still invites
+         the click it will refuse. chat.js swaps them on the first turn and back
+         on "+ New chat".
+
+         The popover escapes the pill because the pill does not clip: this wrap
+         is `position: relative` with an absolutely-positioned menu, the same
+         pattern `.cloud-chat-plus-wrap` already uses. #}
+      <span class="cloud-chat-agent-wrap">
+        <button type="button" id="chat-agent-btn"
+                class="cloud-chat-agent-btn"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="chat-agent-menu">
+          <span class="cloud-chat-agent-btn-label" id="chat-agent-btn-label">Default</span>
+          <svg class="cloud-chat-agent-btn-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        {# The in-conversation form: says who, offers nothing. #}
+        <span id="chat-agent-label" class="cloud-chat-agent-label" hidden></span>
+        <ul id="chat-agent-menu" class="cloud-chat-agent-menu" hidden
+            role="menu" aria-label="Choose an agent"></ul>
+      </span>
       <div class="cloud-chat-form-actions">
         <button type="button" id="cancel-btn"
                 class="btn btn-danger cloud-chat-stop-btn" hidden>Stop</button>
@@ -379,57 +625,11 @@
          the moment #chat-capabilities does. The Stack line keeps the old
          behaviour and hides with them (rule in chat.css), so in a live
          conversation this row carries the agent label alone, right-aligned. #}
-      <div class="cloud-chat-composer-foot">
-        <p class="rdb-context">
-          {% if knowledge_source_count or capability_count %}
-          <svg class="rdb-context-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 8.5 12 4l9 4.5-9 4.5-9-4.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m3 12.5 9 4.5 9-4.5M3 16.5l9 4.5 9-4.5" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
-          {# The link points at the LIBRARY with its "In stack only" filter already
-             applied (`/library?stack=in_stack`), not at /stack: My Stack is not a
-             rail destination any more (#1088), so pointing at it landed the caller
-             on a surface with no nav entry and no active state. The Library
-             renders every kind that page did — data packages and memory domains
-             come from the SAME StackResolver.browse() read — and its toggle
-             narrows that list to exactly what this line is counting. #}
-          <span>
-            Using
-            {%- if knowledge_source_count %}
-            {{ knowledge_source_count }} knowledge source{{ '' if knowledge_source_count == 1 else 's' }}
-            {%- if capability_count %} and{% endif %}
-            {%- endif %}
-            {%- if capability_count %}
-            {{ capability_count }} capabilit{{ 'y' if capability_count == 1 else 'ies' }}
-            {%- endif %}
-            from your <a href="/library?stack=in_stack">Stack</a>
-          </span>
-          {% endif %}
-        </p>
-        {# Agent picker — which of the caller's agents this conversation runs
-           AS. Trails the row so it sits under the send button, with the Stack
-           line leading: the reader's eye goes to what the conversation runs
-           with first, and the identity is the quiet right-hand answer.
-
-           TWO elements, one at a time. An agent is bound at session CREATION
-           (scope, memory notebook, pinned model and token budget are fixed for
-           the session's life), so mid-conversation there is nothing to choose
-           and the control becomes a plain label — not a greyed-out button,
-           which still announces itself as a button to a screen reader and
-           still invites the click it will refuse. chat.js swaps them on the
-           first turn and back on "+ New chat". #}
-        <span class="cloud-chat-agent-wrap">
-          <button type="button" id="chat-agent-btn"
-                  class="cloud-chat-agent-btn"
-                  aria-haspopup="menu"
-                  aria-expanded="false"
-                  aria-controls="chat-agent-menu">
-            <span class="cloud-chat-agent-btn-label" id="chat-agent-btn-label">{{ instance_brand_short or 'Agnes' }}</span>
-            <svg class="cloud-chat-agent-btn-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-          {# The in-conversation form: says who, offers nothing. #}
-          <span id="chat-agent-label" class="cloud-chat-agent-label" hidden></span>
-          <ul id="chat-agent-menu" class="cloud-chat-agent-menu" hidden
-              role="menu" aria-label="Choose an agent"></ul>
-        </span>
-      </div>
+      {# No footer row under the composer any more. It carried the agent picker
+         (now inside the pill, beside Send) and then the "Using N … from your
+         Stack" line, which is retired: it spent a line on a number nobody acts
+         on, and its whole row now belongs to the suggestions that follow. The
+         Stack itself is one click away from the rail and from the Library. #}
     </form>
 
     {# ── Upload dialogs ─────────────────────────────────────────────────────
@@ -602,14 +802,27 @@
     <div id="chat-empty-extras" class="cloud-chat-empty-extras">
 
       <div class="rdb">
-        {# Guided Agnes conversation-starters, sitting directly under the composer
-           (no heading) so they read as suggestions FOR the input. Items render
-           from the typed task model in js/chat_dashboard.js — each collects any
-           missing input in the shared dialog primitive and submits through
-           chat.js's submitUserMessage (the one conversation flow). The renderer
-           toggles the state elements below so loading / empty degrade
-           section-locally. #}
-        <section class="rdb-actions" id="rdb-actions" aria-label="Suggested actions">
+        {# Guided Agnes conversation-starters, directly under the composer so they
+           read as suggestions FOR the input. Items render from the typed task
+           model in js/chat_dashboard.js — each collects any missing input in the
+           shared dialog primitive and submits through chat.js's
+           submitUserMessage (the one conversation flow). The renderer toggles
+           the state elements below so loading / empty degrade section-locally.
+
+           The label reads "Suggested for you", which is the true claim and the
+           reason it is worth a line at all: these are not four static examples,
+           they are derived from what this caller can actually reach (the typed
+           task model in chat_dashboard.js, filtered by their own stack). An
+           earlier "Suggested to ask" only restated what the chips already look
+           like — questions under a question field — and that is what made it
+           feel like chrome. Naming the personalisation says something the chips
+           cannot say about themselves.
+
+           Not "Suggested questions": that exact phrase is the retired hero's
+           heading and a guard bans it returning anywhere in the body
+           (test_renders_dashboard_and_context_line). #}
+        <section class="rdb-actions" id="rdb-actions" aria-label="Suggested for you">
+          <h2 class="rdb-actions-hd" id="rdb-actions-hd">Suggested for you</h2>
           <ul id="rdb-actions-list" class="rdb-actions-list" role="list"></ul>
           <p id="rdb-actions-loading" class="rdb-panel-note">Loading suggestions&hellip;</p>
           <div id="rdb-actions-empty" class="rdb-actions-empty" hidden>
@@ -621,16 +834,13 @@
           </div>
         </section>
 
-        {# The doors used to sit HERE, below the suggested actions. They moved
-           above the composer (into #chat-capabilities): they are where you go
-           INSTEAD of asking, so offering them after the input asked the reader
-           to scroll past the thing they came for to find the thing they wanted.
-           See `.cld-doors` in that block. #}
 
-        {# The trust caption the retired hero carried. Kept — it is a claim the
-           reader cares about — but demoted to one quiet line at the foot
-           instead of riding above the composer. #}
-        <p class="cld-trust">{{ knowledge_hub_label(show_title=False) }}</p>
+        {# MEMBERS get the cards here, after the suggestions — see the note in
+           #chat-capabilities for why the two audiences differ. For an admin this
+           renders nothing and the region below the input is the suggestions
+           alone. #}
+        {% if not admin_setup %}{{ _doors }}{{ _trust_line }}{% endif %}
+
       </div>
     </div>
 
@@ -658,9 +868,11 @@
        /admin, where it is one collapsible card among many and reads correctly.
 
        What survives is the one thing that is a FACT rather than a milestone:
-       on an instance with nothing registered, nobody can ask about the company
-       at all. That is worth saying once, in a line, with the action next to it
-       — and it is true whenever it is true, so it neither graduates nor
+       with nothing registered, no answer can be grounded in company data. (Not
+       "nobody can ask anything" — asking works, and the answer arrives from
+       general knowledge; it is the grounding that is missing. See the lede's
+       note above.) That is worth saying once, in a line, with the action next to
+       it — and it is true whenever it is true, so it neither graduates nor
        returns misleadingly. #}
     <div id="chat-empty-banner" class="cloud-chat-empty-banner">
       {# The audience switch used to live here. It is chrome now — a corner
@@ -670,9 +882,8 @@
          preview. See templates/_dev_preview.html. #}
       {# The "no data is registered yet" notice bar used to sit here. Removed,
          not moved: the zero-state heading and lede above the composer now say
-         the same thing in the page's own voice ("It knows nothing about … yet,
-         so it can answer nothing"), and a bar repeating it directly above was
-         the sentence twice. `admin_notice` still gates that heading — it is the
+         the same thing in the page's own voice, and a bar repeating it directly
+         above was the sentence twice. `admin_notice` still gates that heading — it is the
          same signal, rendered once. #}
     </div>
 

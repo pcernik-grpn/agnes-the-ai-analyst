@@ -9000,25 +9000,13 @@ async def chat_page(
 
     if not can_access(user["id"], ResourceType.CHAT.value, "chat", conn):
         return RedirectResponse("/")
-    # Rail pre-conversation state = the Dashboard (issue #896): greeting,
-    # the real composer, a "Using N knowledge sources and M capabilities
-    # from your stack" context line, activity panels, and
-    # guided task starters — rendered by chat.html's rail empty-state
-    # blocks and hidden the moment a conversation starts. The counts are
-    # the caller's ACTUAL Stack contents (same reads as the /stack page
-    # the line links to), not everything RBAC lets them browse. Best-
-    # effort: a repo failure degrades them to 0 (the context line hides)
-    # instead of taking down the page.
-    try:
-        knowledge_source_count = _stack_knowledge_source_count(user)
-    except Exception:
-        logger.exception("chat empty state: knowledge source count failed")
-        knowledge_source_count = 0
-    try:
-        capability_count = _stack_capability_count(conn, user)
-    except Exception:
-        logger.exception("chat empty state: capability count failed")
-        capability_count = 0
+    # No Stack counts here any more. They fed one line under the composer
+    # ("Using N knowledge sources and M capabilities from your Stack"), which is
+    # retired — it reported a number the reader could not act on. Nothing else
+    # consumed them, and they were not free: two StackResolver reads plus an
+    # RBAC plugin resolve on every /chat render. The helpers went with them; git
+    # history holds the "actual Stack, not the whole catalog" reasoning if the
+    # line ever comes back.
 
     # Admin first landing — ONE line, not a checklist.
     #
@@ -9030,9 +9018,13 @@ async def chat_page(
     # card among many.
     #
     # What is left is the single claim that is a FACT about the instance rather
-    # than a milestone in a sequence: with nothing registered, nobody can ask
-    # about the company at all. So the gate is "no tables registered", not
-    # "chain unfinished" — true whenever it is true, and silent as soon as
+    # than a milestone in a sequence: with nothing registered, no answer can be
+    # grounded in company data. Note the scope — asking still WORKS in this
+    # state and the answer arrives from general knowledge, which is why the copy
+    # this gates says "answers from general knowledge rather than your company's
+    # data" and not "it can answer nothing" (it could, and a reader would find
+    # that out on their first question). So the gate is "no tables registered",
+    # not "chain unfinished" — true whenever it is true, and silent as soon as
     # there is data, without ever implying the work is finished.
     #
     # Still read off resolve_journey() rather than a new query, so the notice
@@ -9153,8 +9145,6 @@ async def chat_page(
         conn=conn,
         current_user=user,
         greeting=_time_of_day_greeting(),
-        knowledge_source_count=knowledge_source_count,
-        capability_count=capability_count,
         admin_notice=admin_notice,
         connect_options=connect_options,
         admin_setup=admin_setup,
@@ -9277,57 +9267,6 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     }
 
 
-def _stack_knowledge_source_count(user: dict) -> int:
-    """Count of knowledge sources actually IN the caller's Stack — data
-    packages + memory domains through the same ``StackResolver.stack()``
-    reads the /stack page renders, so the number agrees with the page the
-    context line links to. (Replaces the retired /ask landing count, which
-    summed everything the caller could *browse* — admin god-mode counted
-    every package in the instance — plus the Library surfaces; those
-    numbers never matched /stack.)
-
-    No ``conn``: like the /stack route, the resolver goes through the
-    factory repos so it observes just-written subscription rows.
-
-    Best-effort per resource type: a repo failure counting one type must
-    not blank the whole line, so each block is logged rather than
-    propagated.
-    """
-    from app.services.stack_resolver import StackResolver
-    from app.resource_types import ResourceType
-
-    resolver = StackResolver()
-    total = 0
-    for rt in (ResourceType.DATA_PACKAGE, ResourceType.MEMORY_DOMAIN):
-        try:
-            total += len(resolver.stack(user["id"], rt))
-        except Exception:
-            logger.warning("chat empty state: stack count failed for %s", rt.value)
-    return total
-
-
-def _stack_capability_count(conn: duckdb.DuckDBPyConnection, user: dict) -> int:
-    """Count of capabilities actually IN the caller's Stack — the same
-    roster ``GET /api/marketplace/items?tab=my`` serves to the Library's
-    Plugins section: curated plugins the caller subscribed to (or is
-    required into via a group grant), intersected with what RBAC actually
-    resolves for them, plus their Store installs. NOT
-    ``resolve_allowed_plugins`` alone — that is everything the caller
-    *could* add, not what's in the Stack.
-    """
-    from src.marketplace_filter import required_plugin_keys, resolve_allowed_plugins
-    from src.repositories import user_curated_subscriptions_repo, user_store_installs_repo
-
-    granted = resolve_allowed_plugins(conn, user)
-    # Same (rbac ∩ (subscriptions ∪ required)) composition as
-    # ``resolve_user_marketplace`` — but counted per item (each Store
-    # install counts one), matching the ?tab=my card count.
-    in_stack = user_curated_subscriptions_repo().subscribed_set(user["id"]) | required_plugin_keys(conn, user["id"])
-    curated = sum(1 for p in granted if (p["marketplace_id"], p["original_name"]) in in_stack)
-    store = len(user_store_installs_repo().list_for_user(user["id"]))
-    return curated + store
-
-
 @router.get("/ask", include_in_schema=False)
 async def ask_landing(user: dict = Depends(get_current_user)):
     """Retired surface (#896). ``/ask`` was a visual-only landing hero whose
@@ -9336,9 +9275,9 @@ async def ask_landing(user: dict = Depends(get_current_user)):
     lands users on the working chat (``/chat``) or the Library, so ``/ask``
     has no job. Kept as a 302 to ``/`` (not deleted) so any bookmarked/linked
     ``/ask`` resolves through the canonical home route instead of 404ing.
-    Its context-line idea lives on in ``/chat``'s empty state, now counting
-    the caller's actual Stack (``_stack_knowledge_source_count`` /
-    ``_stack_capability_count``) instead of everything browsable.
+    Its context-line idea outlived it in ``/chat``'s empty state for a while and
+    is retired there too — a count of the caller's Stack was a number with no
+    action attached.
     """
     return RedirectResponse(url="/", status_code=302)
 

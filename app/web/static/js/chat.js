@@ -1250,10 +1250,41 @@ function _markConversationNotStarted() {
  * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
  * answer to "who am I talking to?" — show the instance brand there instead.
  * A default the owner has since RENAMED keeps its own name. */
+/** How long a name may be before the pill abbreviates it. Sized to the widest
+ *  name that fits the 9rem cap at the button's weight without ellipsis. */
+const AGENT_LABEL_MAX = 14;
+
+/** The FULL name, for the menu, the in-conversation label and the title
+ *  attribute — everywhere there is room to say it.
+ *
+ *  The default agent is "Default", not the brand. It used to render as "Agnes",
+ *  which read more naturally on its own but was the odd one out once the caller
+ *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
+ *  different kind of thing), and it disagreed with the /agents page, where the
+ *  same row is called Default. One name per agent, everywhere. */
 function _agentLabel(a, brand) {
   if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return brand;
+  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
   return a.name || "Untitled agent";
+}
+
+/** The label as the PILL shows it: initials once a name is long enough to crowd
+ *  the composer ("Finance Proposals" → "FP").
+ *
+ *  Initials, not an ellipsis, so the pill's width is stable across agents rather
+ *  than growing to the cap — the trade is that two names sharing initials look
+ *  alike in the pill. The full name is always one hover (title) or one click
+ *  (the menu, which ticks the current row) away, and the in-conversation label
+ *  spells it out, so nothing depends on reading the pill alone.
+ *
+ *  Single long word has no initials to take, so it falls back to the CSS
+ *  ellipsis rather than rendering one lonely letter. */
+function _agentPillLabel(name) {
+  const full = String(name || "").trim();
+  if (full.length <= AGENT_LABEL_MAX) return full;
+  const words = full.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return full;
+  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1285,8 +1316,13 @@ function _syncAgentPicker() {
   }
   const agent = _agentById(_currentAgentId) || _defaultAgent();
   const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  if (btnLabel) btnLabel.textContent = name;
-  btn.title = "Choose which agent to chat with";
+  const pill = _agentPillLabel(name);
+  if (btnLabel) btnLabel.textContent = pill;
+  // When the pill abbreviates, the title is the only place the full name shows
+  // on hover — so say it there rather than repeating the generic instruction.
+  btn.title = pill === name
+    ? "Choose which agent to chat with"
+    : `${name} — choose which agent to chat with`;
   btn.hidden = _sessionHasTurns;
   if (staticLabel) {
     staticLabel.textContent = name;
@@ -1312,12 +1348,13 @@ function _renderAgentMenu() {
   if (!_agentsCache.length) {
     const note = document.createElement("li");
     note.className = "cloud-chat-agent-menu-note";
-    note.textContent = "No agents yet — build one on the Agents page.";
+    // No "build one on the Agents page" instruction any more: the create row
+    // below IS that path, so the note only has to state the fact.
+    note.textContent = "No agents yet.";
     menu.appendChild(note);
-    return;
   }
   const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of _agentsCache) {
+  for (const a of (_agentsCache.length ? _agentsCache : [])) {
     const li = document.createElement("li");
     li.className = "cloud-chat-agent-menu-item";
     if (a.id === currentId) li.classList.add("is-current");
@@ -1374,6 +1411,47 @@ function _renderAgentMenu() {
     });
     menu.appendChild(li);
   }
+
+  /* …and one row that is not an agent: the way to make another.
+   *
+   * It belongs here because this menu is where the caller finds out their
+   * agents are not enough — you go looking for the one that answers this
+   * question, do not find it, and the next move should be in reach rather than
+   * back through the rail to /agents. Standard account-switcher shape: the set,
+   * then "add one".
+   *
+   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
+   * (agents.html strips the param and calls createAgent, so the server mints
+   * the row) — not a second way to create an agent, just a second door to the
+   * one that exists. An <a>, so it is a real link: middle-click and
+   * open-in-new-tab work, and it needs no JS to function.
+   *
+   * Separated from the list by a rule, because it is a different KIND of row:
+   * every item above it switches this conversation, this one leaves the page. */
+  const create = document.createElement("li");
+  create.className = "cloud-chat-agent-menu-create";
+  create.setAttribute("role", "none");
+  const link = document.createElement("a");
+  link.href = "/agents?new=1";
+  link.setAttribute("role", "menuitem");
+  link.className = "cloud-chat-agent-menu-create-link";
+  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
+  plus.setAttribute("viewBox", "0 0 24 24");
+  plus.setAttribute("fill", "none");
+  plus.setAttribute("aria-hidden", "true");
+  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  pp.setAttribute("d", "M12 5v14M5 12h14");
+  pp.setAttribute("stroke", "currentColor");
+  pp.setAttribute("stroke-width", "2");
+  pp.setAttribute("stroke-linecap", "round");
+  plus.appendChild(pp);
+  link.appendChild(plus);
+  const ctext = document.createElement("span");
+  ctext.textContent = "Create new agent";
+  link.appendChild(ctext);
+  create.appendChild(link);
+  menu.appendChild(create);
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
