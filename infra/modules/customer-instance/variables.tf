@@ -536,7 +536,7 @@ variable "seed_admin_password" {
 }
 
 variable "data_source" {
-  description = "Data source type — keboola | bigquery | csv."
+  description = "Data source type — keboola | bigquery | csv. First-boot seed only (D1 residual, 2026-08): the value is written into instance.yaml's `data_source.type` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. **BREAKING** for pinned infra roots: this used to be an always-wins `.env` line (`DATA_SOURCE=...`) rewritten on EVERY boot, silently reverting any UI change; it no longer reaches `.env` at all. Also still threaded to the startup script to gate the one-time boot-side fetch of the keboola-storage-token secret."
   type        = string
   default     = "keboola"
 }
