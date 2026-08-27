@@ -163,6 +163,14 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/data-apps/{slug}/drafts": ("app draft create", "data_app_create_draft"),
     "/api/data-apps/{slug}/drafts/{draft_slug}": ("app draft delete", "data_app_delete_draft"),
     "/api/data-apps/{slug}/git-credential": ("app git-credential", "data_app_git_credential"),
+    # Fact graph over Collections — query surface (build order step 6,
+    # docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
+    # §12/§16). REST landed REST-only in a prior task (see the historical
+    # note that used to sit in _EXEMPT here); CLI (`agnes facts …`) and MCP
+    # tools (`fact_search`/`fact_neighbors`/`fact_claims`) now land together.
+    "/api/facts/search": ("facts search", "fact_search"),
+    "/api/facts/neighbors": ("facts neighbors", "fact_neighbors"),
+    "/api/facts/{subject_id}/claims": ("facts claims", "fact_claims"),
 }
 
 
@@ -1068,27 +1076,6 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven idle-app reaper trigger (data-apps platform Task 9) — "
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
-    ),
-    # Fact graph over Collections — build order steps 2+3 (read path with
-    # RBAC) landed REST-only, deliberately: build order step 6 (query
-    # surface across REST/CLI/MCP, per
-    # docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md
-    # §12/§16) is an explicitly separate follow-up task. Unlike every other
-    # entry in this dict, this is NOT a permanent exemption — when the CLI
-    # (`agnes facts search|neighbors|claims`) and MCP tools
-    # (`fact_search`/`fact_neighbors`/`fact_claims`) land, all three rows
-    # move to _COHORT rather than staying here.
-    "/api/facts/search": (
-        "fact graph read surface — CLI/MCP land in a follow-up task "
-        "(build order step 6); REST-only for now, see spec §12"
-    ),
-    "/api/facts/neighbors": (
-        "fact graph read surface — CLI/MCP land in a follow-up task "
-        "(build order step 6); REST-only for now, see spec §12"
-    ),
-    "/api/facts/{subject_id}/claims": (
-        "fact graph read surface — CLI/MCP land in a follow-up task "
-        "(build order step 6); REST-only for now, see spec §12"
     ),
 }
 

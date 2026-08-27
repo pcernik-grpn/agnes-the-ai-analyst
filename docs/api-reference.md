@@ -1416,8 +1416,12 @@ readable collection grants (see
 readable claims only; `claims` returns the caller's readable evidence for
 one subject, `404` (never `403`) when it does not exist or has no readable
 claim. This is a **read surface only** — the ingest endpoint that writes
-facts is a separate follow-up; so are the CLI (`agnes facts …`) and MCP
-(`fact_search`/`fact_neighbors`/`fact_claims`) surfaces.
+facts is a separate follow-up. Triple-surface: `agnes facts
+search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
+`fact_claims` (MCP foundation tools) call the same repository directly —
+facts have no local scope, so every result is labeled `[server]` on the
+CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
+convention (spec §12).
 
 - /api/facts/search
 - /api/facts/neighbors

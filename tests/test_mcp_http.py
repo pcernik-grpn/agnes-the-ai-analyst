@@ -296,6 +296,13 @@ class TestToolRegistration:
             # POST /api/collections/{cid}/files/{fid}/reingest +
             # `agnes collections reingest`.
             "collections_reingest",
+            # Fact graph over Collections — query surface (build order step
+            # 6). Triple-surface with POST /api/facts/search, POST
+            # /api/facts/neighbors, GET /api/facts/{subject_id}/claims, and
+            # `agnes facts search/neighbors/claims`.
+            "fact_search",
+            "fact_neighbors",
+            "fact_claims",
             # Config-surface introspection — an operator's Claude reads this
             # instance's live configurable surface (knobs + sources, registered
             # IWT, marketplaces, infra_repo_url). Triple-surface with
