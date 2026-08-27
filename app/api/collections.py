@@ -626,6 +626,39 @@ def _purge_file_row(collection_id: str, row: dict, *, keep_blob_path: str | None
             delete_corpus_file(blob)
 
 
+def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
+    """Post-step (outside the deleting transaction, spec §6) after a
+    ``corpus_files`` row is hard-deleted here: its claims already cascaded
+    (``claims.corpus_file_id`` -> ``corpus_files.id`` ``ON DELETE CASCADE``),
+    which can leave a subject with zero claims — sweep it and log the count,
+    attributed to ``trigger``, exactly like the ingest run report does for
+    the same sweep on its own write path.
+
+    Skips entirely — no DB round trip at all — when the ``facts`` feature
+    flag is off (the default), which is the vast majority of instances and
+    of every existing collections test. When it IS on but the backend is
+    still DuckDB, ``facts_repo()`` raises ``RequiresPostgresBackend``; that
+    is swallowed here (not surfaced as a 501) because a DuckDB-backed
+    instance can never have facts claims to begin with — this is routine
+    file-delete housekeeping, not a caller-facing facts API call.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        deleted = facts_repo().sweep_orphans()
+    except RequiresPostgresBackend:
+        return
+    except Exception:
+        logger.warning("facts orphan sweep failed after %s", trigger, exc_info=True)
+        return
+    if deleted:
+        logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
+
+
 def _purge_children_and_content(collection_id: str, row: dict) -> None:
     """Purge a matched row's zip-bundle children (fully — they are
     regenerated on the next ingest) plus the row's OWN chunks and derived
@@ -1103,6 +1136,7 @@ async def delete_file(
         collection_id,
         user.get("id") if isinstance(user, dict) else "?",
     )
+    _sweep_facts_orphans_after_delete(trigger=f"delete_file:{file_id}")
 
 
 def _is_stale_processing(row: dict) -> bool:

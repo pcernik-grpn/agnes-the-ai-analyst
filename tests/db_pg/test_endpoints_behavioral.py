@@ -1472,3 +1472,74 @@ class TestFactsReadSurfaceSmoke:
         claims = r.json()["claims"]
         assert len(claims) == 1
         assert claims[0]["quote"] == "The engagement is underway."
+
+
+# ---------------------------------------------------------------------------
+# Fact graph over Collections — write surface (build order step 4). Deep
+# ingest-protocol coverage (batch caps, the verbatim gate, union/replace,
+# alias/edge resolution, correction re-attachment, the orphan sweep, the
+# real upload->ingest->search round trip) lives in
+# tests/db_pg/test_facts_ingest_pg.py; this class proves the HTTP wiring +
+# the flag gate + the PG-only fail-clean shape, same division of labor as
+# TestFactsReadSurfaceSmoke above.
+# ---------------------------------------------------------------------------
+
+
+class TestFactsWriteSurfaceSmoke:
+    COVERED_ROUTES = {
+        "POST /api/facts/ingest",
+        "PUT /api/facts/corrections/{subject_kind}/{subject_id}",
+        "DELETE /api/facts/corrections/{subject_kind}/{subject_id}",
+        "GET /api/facts/corrections",
+    }
+
+    def test_flag_off_404s_all_four_routes(self, seeded_app_both):
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        assert client.post("/api/facts/ingest", json={}, headers=headers).status_code == 404
+        assert (
+            client.put(
+                "/api/facts/corrections/fact/f_x", json={"verdict": "wrong", "reason": "x"}, headers=headers
+            ).status_code
+            == 404
+        )
+        assert client.delete("/api/facts/corrections/fact/f_x", headers=headers).status_code == 404
+        assert client.get("/api/facts/corrections", headers=headers).status_code == 404
+
+    def test_write_routes_require_admin_on_both_backends(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _analyst_headers(s)
+        assert client.post("/api/facts/ingest", json={}, headers=headers).status_code == 403
+        assert client.get("/api/facts/corrections", headers=headers).status_code == 403
+
+    def test_ingest_fails_clean_on_duckdb(self, state_backend, seeded_app_both, monkeypatch):
+        if state_backend != "duckdb":
+            pytest.skip("DuckDB-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.post("/api/facts/ingest", json={}, headers=headers)
+        assert r.status_code == 501, r.text
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_corrections_round_trip_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+
+        put = client.put(
+            "/api/facts/corrections/fact/f_write_smoke",
+            json={"verdict": "wrong", "reason": "hallucinated"},
+            headers=headers,
+        )
+        assert put.status_code == 200, put.text
+
+        exported = client.get("/api/facts/corrections", headers=headers)
+        assert exported.status_code == 200, exported.text
+        assert any(r["subject_id"] == "f_write_smoke" for r in exported.json()["corrections"])
+
+        deleted = client.delete("/api/facts/corrections/fact/f_write_smoke", headers=headers)
+        assert deleted.status_code == 204, deleted.text

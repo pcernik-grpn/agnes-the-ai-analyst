@@ -68,8 +68,20 @@ _SKIP_SUBSTR = (
 # `GET /api/facts/{subject_id}/claims` is a path-param route, out of scope
 # for both sweeps by construction (`collect_statuses` skips any path
 # containing "{") — same treatment as every other path-param endpoint here.
+#
+# Build order step 4 (write path): `POST /api/facts/ingest` is also
+# genuinely parameter-free (every field on FactsIngestRequest defaults to an
+# empty list) and reaches `facts_repo().ingest_batch(...)` before any of
+# ingest's OWN validation — DuckDB -> typed 501, Postgres -> 200 (an empty
+# batch's run report, nothing seeded). `PUT`/`DELETE
+# /api/facts/corrections/{subject_kind}/{subject_id}` are path-param routes,
+# out of scope for the same construction reason as `claims` above.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "POST /api/facts/search": (
+        "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
+        "to resolve; see src/repositories/facts_pg.py"
+    ),
+    "POST /api/facts/ingest": (
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
     ),

@@ -1077,6 +1077,25 @@ _EXEMPT: dict[str, str] = {
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
     ),
+    # Build order step 4 (write path). Unlike the read routes (which live
+    # in _COHORT with their CLI/MCP halves), this IS a permanent
+    # exemption: the producer contract (ingest,
+    # corrections CRUD/export) is scheduler-token-or-admin surface, not an
+    # analyst command — spec §12's REST/CLI/MCP table covers only
+    # search/neighbors/claims, and ingest/corrections never appear there.
+    # Mirrors the run-knowledge-digests / run-corporate-memory / reap-idle
+    # exemptions above: a producer/admin maintenance op, no analyst CLI/MCP
+    # analogue by design.
+    "/api/facts/ingest": (
+        "fact graph producer contract (spec §7.2) — scheduler-token-or-admin "
+        "ingest endpoint, not an analyst command; no CLI/MCP analogue"
+    ),
+    "/api/facts/corrections/{subject_kind}/{subject_id}": (
+        "admin correction management (spec §4) — PUT/DELETE, no analyst CLI/MCP analogue"
+    ),
+    "/api/facts/corrections": (
+        "producer corrections export (spec §7.4) — scheduler-token-or-admin, no analyst CLI/MCP analogue"
+    ),
 }
 
 
