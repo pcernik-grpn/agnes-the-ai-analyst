@@ -5496,6 +5496,16 @@ function renderCoPresence(host, participants) {
       );
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      if (data.supported === false) {
+        // Engine-backed session (kai-agent) whose engine exposes no files
+        // channel for this chat — an honest notice, not an empty list.
+        setFilesStatus(
+          "Files for this conversation live in the engine's sandbox, and the engine connected " +
+            "to this instance doesn't expose them yet. Ask the assistant to include the content " +
+            "in its reply, or ask your operator about an engine upgrade."
+        );
+        return;
+      }
       const files = data.files || [];
       if (!files.length) {
         setFilesStatus(
