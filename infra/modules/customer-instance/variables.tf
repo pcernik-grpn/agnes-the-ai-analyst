@@ -41,8 +41,20 @@ variable "prod_instance" {
     machine_type = optional(string, "e2-small")
     disk_size_gb = optional(number, 30)
     data_disk_gb = optional(number, 50)
-    image_tag    = optional(string, "stable")
-    upgrade_mode = optional(string, "auto")
+    # GCE-side guard: while true, neither `terraform destroy` nor
+    # `gcloud compute instances delete` can remove this VM until someone
+    # clears the flag. Worth turning on for any instance carrying customer
+    # data. It does NOT block an in-place update, so a deployment that sets it
+    # can still be reconfigured normally — and note that clearing it is itself
+    # an ordinary apply, so it guards against accident rather than intent.
+    #
+    # Left at false so existing roots see no diff. A root that sets it out of
+    # band with gcloud, without this field, gets the flag reverted on the next
+    # apply: the provider's own default is false, and a module that never
+    # declares the attribute hands the provider that default every time.
+    deletion_protection = optional(bool, false)
+    image_tag           = optional(string, "stable")
+    upgrade_mode        = optional(string, "auto")
     # Standard 5-field cron expression consumed by startup-script.sh.tpl's
     # crontab install line. Default matches the historical fixed cadence —
     # override to reduce upgrade-triggered blips on a customer-facing
@@ -322,6 +334,12 @@ variable "dev_instances" {
     image_tag    = optional(string, "dev")
     tls_mode     = optional(string, "none")
     domain       = optional(string, "")
+    # See prod_instance.deletion_protection. Declared here too because
+    # Terraform silently drops attributes absent from the type — a dev entry
+    # setting it against an object type that does not declare it would be
+    # discarded without an error, which is the failure mode this file keeps
+    # calling out.
+    deletion_protection = optional(bool, false)
     # Legacy hostname to 308 onto `domain` during a domain migration. Same
     # semantics as prod_instance.domain_alias — see there. MUST be declared on
     # this object type: Terraform silently drops attributes absent from the

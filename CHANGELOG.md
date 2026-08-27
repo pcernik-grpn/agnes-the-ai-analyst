@@ -12,6 +12,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Instances can opt into GCE deletion protection.** The `customer-instance`
+  module exposes `deletion_protection` on `prod_instance` and on each
+  `dev_instances[]` entry and passes it through to the `google_compute_instance`
+  resource, so a `terraform destroy` (or an accidental `-replace`) is refused by
+  the API until the flag is cleared. Defaults preserve today's behaviour — an
+  instance that does not set it is unprotected, exactly as before.
+
 - **Chat session files now work under the default `kai-agent` provider**
   (#1611 follow-up). The Files listing/download/save-to-Library routes are
   provider-aware: engine-backed sessions proxy the engine's sandbox file
