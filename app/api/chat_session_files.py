@@ -41,6 +41,7 @@ import mimetypes
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
@@ -259,8 +260,17 @@ def _attachment_headers(filename: str) -> dict[str, str]:
     # break out of the quoted filename — same treatment as
     # app/chat/artifact_harvest.sanitize_filename.
     safe = os.path.basename(filename.replace("\r", "").replace("\n", "").replace('"', "")) or "download"
+    # ASGI header values are encoded latin-1, so a name carrying any code
+    # point above 255 (CJK, Cyrillic, emoji — all reachable, the agent picks
+    # the name) would blow up building the response. Emit the same two shapes
+    # Starlette's own FileResponse(filename=…) does — plain while the name
+    # survives percent-quoting unchanged, RFC 5987 extended otherwise — so
+    # the real name is preserved instead of mangled, and the header is always
+    # pure ASCII. Mirrors app/api/attachments.py.
+    quoted = quote(safe)
+    disposition = f'attachment; filename="{safe}"' if quoted == safe else f"attachment; filename*=utf-8''{quoted}"
     return {
-        "Content-Disposition": f'attachment; filename="{safe}"',
+        "Content-Disposition": disposition,
         "X-Content-Type-Options": "nosniff",
         "Cache-Control": "private, no-store",
     }

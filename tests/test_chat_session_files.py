@@ -249,6 +249,41 @@ def test_download_active_content_served_as_octet_stream(client: TestClient, sess
 
 
 @pytest.mark.parametrize(
+    "name",
+    ["分析報告.docx", "отчёт.pptx", "résumé.pdf", "report 📊.xlsx", "quarterly report.csv"],
+)
+def test_download_non_ascii_filename(client: TestClient, session_dir: Path, name: str) -> None:
+    """A filename the agent chose may contain any code point.
+
+    Starlette encodes header values as latin-1, so interpolating such a name
+    straight into ``filename="…"`` raises UnicodeEncodeError while the
+    response is built and the download 500s. The header must use the RFC 5987
+    extended form whenever the raw name would not survive verbatim (same
+    shapes Starlette's own ``FileResponse(filename=…)`` emits).
+    """
+    from urllib.parse import quote
+
+    (session_dir / name).write_bytes(b"payload")
+    resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": name})
+    assert resp.status_code == 200
+    assert resp.content == b"payload"
+    cd = resp.headers["content-disposition"]
+    assert cd.startswith("attachment")
+    assert f"filename*=utf-8''{quote(name)}" in cd
+    # Whatever we emit must be latin-1 encodable — that is the ASGI constraint
+    # the naive interpolation violated.
+    cd.encode("latin-1")
+
+
+def test_download_ascii_filename_keeps_plain_form(client: TestClient, session_dir: Path) -> None:
+    """A plain ASCII name stays in the widely-understood unextended form."""
+    (session_dir / "deck.pptx").write_bytes(b"x")
+    resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": "deck.pptx"})
+    assert resp.status_code == 200
+    assert resp.headers["content-disposition"] == 'attachment; filename="deck.pptx"'
+
+
+@pytest.mark.parametrize(
     "bad",
     ["../../../etc/passwd", "/etc/passwd", "..", "a/../../b.txt", "", "a\\..\\b"],
 )
