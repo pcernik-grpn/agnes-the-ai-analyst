@@ -570,9 +570,10 @@ notifications:
 
 # --- Corporate Memory AI (optional) ---
 # Extracts shared knowledge from team members' CLAUDE.local.md files.
-# Provider: "anthropic" (direct API) or "openai_compat" (LiteLLM, OpenRouter, Azure, etc.)
+# Provider: "anthropic" (direct API), "openai_compat" (LiteLLM, OpenRouter,
+# Azure, etc.), or "vertex" (Claude on Google Vertex AI, keyless — see below)
 ai:
-  provider: "anthropic"                    # or "openai_compat"
+  provider: "anthropic"                    # or "openai_compat" / "vertex"
   api_key: "${ANTHROPIC_API_KEY}"          # or "${LLM_API_KEY}" for proxy
   # base_url: "https://litellm.example.com"  # Required for provider='openai_compat' (LiteLLM,
                                               # OpenRouter, vLLM). Ignored when provider='anthropic'.
@@ -622,6 +623,21 @@ ai:
 #   api_key: "${OPENROUTER_API_KEY}"
 #   model: "anthropic/claude-3-haiku"
 #   structured_output: "auto"
+#
+# --- Google Vertex AI (Claude on Vertex; no API key — auth is Google ADC) ---
+# Credentials resolve via the standard google-auth chain:
+# GOOGLE_APPLICATION_CREDENTIALS (service-account JSON) -> gcloud user ADC
+# (`gcloud auth application-default login`) -> GCE/GKE attached service account.
+# First-party model ids are accepted; dated ids translate to the Vertex form
+# automatically ("claude-haiku-4-5-20251001" -> "claude-haiku-4-5@20251001").
+# structured_output is ignored (Vertex supports native json_schema, same as
+# provider: "anthropic"). Requires the anthropic[vertex] extra (bundled).
+# ai:
+#   provider: "vertex"
+#   vertex:
+#     project_id: "my-gcp-project"   # or env ANTHROPIC_VERTEX_PROJECT_ID
+#     region: "global"               # or "us-east5", "europe-west1", ...; env CLOUD_ML_REGION
+#   model: "claude-haiku-4-5-20251001"
 
 # --- Maintained digests (optional, K4) ---
 # Admin-defined digest documents (title + standing instructions + source
@@ -992,8 +1008,36 @@ chat:
   #                                 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN be
   #                                 unset. See docs/superpowers/specs/2026-07-15-
   #                                 keyless-llm-auth-design.md.
+  #
+  # chat.llm.provider — which LLM platform the chat broker forwards to:
+  #   anthropic (default)         first-party Anthropic API.
+  #   vertex                      Claude through Google Vertex AI. The sandbox
+  #                               CLI runs in its native Vertex gateway mode
+  #                               (CLAUDE_CODE_USE_VERTEX=1 + skip-auth), all
+  #                               traffic still egresses through the relay ->
+  #                               broker, and the broker signs upstream calls
+  #                               with Google ADC (GOOGLE_APPLICATION_CREDENTIALS
+  #                               -> gcloud ADC -> GCE/GKE attached service
+  #                               account). No Anthropic credential exists, and
+  #                               no Google credential ever enters the sandbox.
+  #                               Requires vertex.project_id + vertex.region;
+  #                               the broker pins both server-side. Mutually
+  #                               exclusive with llm.auth=workload_identity and
+  #                               with LLM_DISPATCHER_URL (boot refuses either
+  #                               combination). Prerequisites: enable the Claude
+  #                               models in Vertex Model Garden for the project/
+  #                               region and grant the identity
+  #                               roles/aiplatform.user.
+  #                               `agents.model` / chat.agent_api_utility_models
+  #                               accept either model-id spelling
+  #                               (claude-…-YYYYMMDD or claude-…@YYYYMMDD) —
+  #                               they compare canonically.
   # llm:
   #   auth: api_key
+  #   provider: anthropic         # anthropic (default) | vertex
+  #   vertex:
+  #     project_id: my-gcp-project
+  #     region: europe-west1      # or "global"
 
 # --- Hosted Data Apps (optional) ---
 # Hosted data apps (user web applications run next to the data)

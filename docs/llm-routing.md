@@ -16,7 +16,8 @@ Different clients deploying this platform use different AI providers:
 | Enterprise with central AI gateway | LiteLLM proxy | Cost control, audit, policy enforcement |
 | Single-vendor deployment | Direct Anthropic | Simplest setup, one provider to operate |
 | Multi-model deployments | OpenRouter | Multi-model access, cost optimization |
-| GCP-native stack | Google Gemini | Existing Google Cloud relationship |
+| GCP-native stack (Claude) | Google Vertex AI | Claude via GCP capacity/billing, keyless (ADC) |
+| GCP-native stack (Gemini) | Google Gemini | Existing Google Cloud relationship |
 
 **Problem**: The code only works with Anthropic. Adding a second client means duplicating
 or rewriting the AI calling logic.
@@ -155,12 +156,30 @@ instance.yaml (ai: section)
        ↓
   Extractor routes to the right API:
     ├─ Anthropic SDK  → api.anthropic.com/v1/messages
+    ├─ AnthropicVertex SDK → {region}-aiplatform.googleapis.com (Google ADC, no key)
     └─ OpenAI SDK     → litellm.example.com/v1/chat/completions
                          openrouter.ai/v1/chat/completions
                          any OpenAI-compatible endpoint
 ```
 
 ### Config examples
+
+**Claude on Google Vertex AI (keyless — Google ADC):**
+```yaml
+ai:
+  provider: "vertex"
+  vertex:
+    project_id: "my-gcp-project"   # or env ANTHROPIC_VERTEX_PROJECT_ID
+    region: "global"               # or a specific region; env CLOUD_ML_REGION
+  model: "claude-haiku-4-5-20251001"   # first-party ids accepted; dated ids
+                                       # translate to the @-form automatically
+```
+`structured_output` is ignored for vertex — like the anthropic provider it
+uses native `json_schema` output, so the semantics match exactly. No
+`api_key`: credentials come from Application Default Credentials
+(GOOGLE_APPLICATION_CREDENTIALS → gcloud ADC → GCE/GKE attached service
+account); requires the `anthropic[vertex]` extra (bundled in this repo's
+dependencies).
 
 **OpenAI-compatible proxy (LiteLLM, OpenRouter, Azure OpenAI, ...):**
 ```yaml
@@ -247,6 +266,10 @@ Each client controls their own provider, model, and API gateway independently.
 - Custom error hierarchy (auth / rate limit / timeout / format)
 - Retry with backoff for transient errors
 - Corporate Memory collector integration
+
+**In scope since the Vertex provider landed:**
+- Claude on Google Vertex AI (`provider: vertex`) — VertexExtractor subclasses
+  AnthropicExtractor, so the whole retry/structured-output loop is shared.
 
 **Explicitly NOT in scope (future):**
 - Azure OpenAI, OpenRouter, Gemini — listed as "untested" until verified per-provider

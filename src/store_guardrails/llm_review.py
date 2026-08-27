@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from connectors.llm.anthropic_provider import AnthropicExtractor
 from connectors.llm.exceptions import (
     LLMError,
 )
+from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
+
 from .prompts import (
     REVIEW_JSON_SCHEMA,
     SYSTEM_PROMPT,
@@ -46,10 +48,10 @@ def review_bundle(
     type_: str,
     name: str,
     version: str,
-    description: Optional[str],
+    description: str | None,
     api_key: str,
     model: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run the LLM review against the baked plugin tree.
 
     Returns a dict with the schema:
@@ -73,8 +75,13 @@ def review_bundle(
         # Constructed inside the error boundary: the SDK import is deferred
         # to first use, so client construction is a failure point too — an
         # escaped exception here would bubble through BackgroundTasks and
-        # pin the submission at pending_llm.
-        extractor = AnthropicExtractor(api_key=api_key, model=model)
+        # pin the submission at pending_llm. An empty api_key is the
+        # documented vertex sentinel from default_api_key_loader.
+        extractor: AnthropicExtractor
+        if not api_key and vertex_config_or_none():
+            extractor = create_vertex_extractor(model)
+        else:
+            extractor = AnthropicExtractor(api_key=api_key, model=model)
         # Pass SYSTEM_PROMPT via the SDK's separate ``system=`` parameter
         # so a crafted README inside the uploaded bundle cannot override
         # the reviewer rules. The user-content payload wraps the bundle
@@ -158,7 +165,7 @@ def review_bundle(
     }
 
 
-def _normalize_content_quality(value: Any) -> Dict[str, Any]:
+def _normalize_content_quality(value: Any) -> dict[str, Any]:
     """Coerce the model's content_quality output to a stable shape.
 
     Missing or malformed content_quality is treated as pass — keeps
@@ -208,7 +215,7 @@ def _normalize_content_quality(value: Any) -> Dict[str, Any]:
     return {"verdict": verdict, "issues": issues}
 
 
-def is_safe(verdict: Dict[str, Any]) -> bool:
+def is_safe(verdict: dict[str, Any]) -> bool:
     """Decide whether a review verdict permits publication.
 
     Pass condition: ``risk_level IN ('safe','low')`` AND no individual

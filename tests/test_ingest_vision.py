@@ -39,7 +39,7 @@ def _img_file(corpus_slug, tmp_path):
 
 
 def test_runner_indexes_image_when_vision_returns_text(e2e_env, tmp_path, monkeypatch):
-    import src.ingest.vision as vision
+    from src.ingest import vision
 
     monkeypatch.setattr(vision, "extract_image_text", lambda path, *, ext: "transcribed text from the scan")
     from src.ingest.runner import ingest_file
@@ -54,7 +54,7 @@ def test_runner_indexes_image_when_vision_returns_text(e2e_env, tmp_path, monkey
 
 
 def test_runner_leaves_image_pending_without_vision(e2e_env, tmp_path, monkeypatch):
-    import src.ingest.vision as vision
+    from src.ingest import vision
 
     monkeypatch.setattr(vision, "extract_image_text", lambda path, *, ext: None)
     from src.ingest.runner import ingest_file
@@ -112,3 +112,42 @@ def test_vision_builds_correct_request_and_parses(monkeypatch, tmp_path):
     assert src["media_type"] == "image/png"
     assert src["data"]  # non-empty base64
     assert any(b.get("type") == "text" for b in content)
+
+
+def test_vision_available_with_vertex_only(monkeypatch):
+    """No static key, but the instance runs on Vertex → vision is available."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda: ("p", "global"))
+    from src.ingest.vision import vision_available
+
+    assert vision_available() is True
+
+
+def test_extract_image_text_vertex_path(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda: ("proj-1", "global"))
+    captured = {}
+
+    class _Msgs:
+        def create(self, **kw):
+            captured.update(kw)
+            return type("R", (), {"content": [type("B", (), {"type": "text", "text": "hello table"})()]})()
+
+    class _FakeVertex:
+        def __init__(self, **kw):
+            captured["ctor"] = kw
+            self.messages = _Msgs()
+
+    import anthropic
+
+    monkeypatch.setattr(anthropic, "AnthropicVertex", _FakeVertex, raising=False)
+    img = tmp_path / "x.png"
+    img.write_bytes(b"\x89PNG fake")
+    from src.ingest.vision import extract_image_text
+
+    out = extract_image_text(str(img), ext="png")
+    assert out == "hello table"
+    assert captured["ctor"]["project_id"] == "proj-1"
+    assert "@" in captured["model"]  # vertex id form
