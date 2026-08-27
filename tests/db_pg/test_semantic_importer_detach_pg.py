@@ -70,6 +70,38 @@ def test_detached_row_is_never_overwritten_by_sync(system_db):
     assert after["sync_mode"] == "detached"
 
 
+def test_sync_does_not_re_project_a_detached_model_over_the_local_edit(system_db):
+    """The stored document surviving sync is only half the promise. The flat
+    tables (`metric_definitions`, and the glossary/column siblings) are what
+    `agnes catalog --metrics`, chat and search actually read, and BOTH writers
+    key them on ids scoped to (source, source_ref) — which a detached row
+    deliberately keeps. So if the source's version of a detached model stays
+    in the projection batch, every sync silently overwrites the admin's edit
+    in exactly the surface the edit was made for, while the document keeps it.
+    """
+    from src.repositories import metric_repo, semantic_model_repo
+    from src.semantic.importer import import_documents
+
+    import_documents(SOURCE, [_doc("retail")])
+    row = semantic_model_repo().get_by_slug("retail")
+    semantic_model_repo().detach(row["id"], by="admin@example.com", base_hash=row["content_hash"])
+
+    # The admin's local edit, through the same path the API uses.
+    from app.api.semantic_models import apply_manual_model
+
+    apply_manual_model(_doc("retail", metric="locally_fixed"))
+    edited = {m["id"]: m for m in metric_repo().list() if m["id"].endswith("/locally_fixed")}
+    assert edited, "precondition: the local edit projected a metric"
+
+    # Source keeps sending its own (wrong) version.
+    import_documents(SOURCE, [_doc("retail", metric="profit")])
+
+    after = {m["id"]: m for m in metric_repo().list()}
+    for metric_id in edited:
+        assert metric_id in after, f"sync pruned the locally-edited metric {metric_id}"
+    assert not [m for m in after if m.endswith("/profit")], "sync re-projected the source's version over the local edit"
+
+
 def test_detached_row_parks_the_latest_source_hash(system_db):
     from src.repositories import semantic_model_repo
     from src.semantic.importer import import_documents
