@@ -11442,7 +11442,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.86.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -11952,7 +11952,7 @@
     },
     "/admin/chat/secrets/test": {
       "post": {
-        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM auth mode actually\nuses: the static key in ``api_key`` mode, or the workload-identity federation\n(mint a token + confirm the API accepts it) in ``workload_identity`` mode \u2014\nso the admin \"test connection\" surface works in both modes.\n\nThe sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +\nimage, via the apps-runner probe) on a docker deployment; a kai-agent\ndeployment gets only the anthropic probe \u2014 the engine owns its own sandbox\nbacking, and a red row for a credential the instance will never use is\nnoise, not a signal.",
+        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM provider/auth mode\nactually uses: the static key in ``api_key`` mode, the workload-identity\nfederation (mint a token + confirm the API accepts it) in\n``workload_identity`` mode, or Google ADC + a Vertex completion when\n``chat.llm.provider`` is ``vertex`` \u2014 so the admin \"test connection\"\nsurface works in every mode. The slot name stays ``anthropic_api_key``\nfor UI compatibility; the detail string identifies which probe ran.\n\nThe sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +\nimage, via the apps-runner probe) on a docker deployment; a kai-agent\ndeployment gets only the anthropic probe \u2014 the engine owns its own sandbox\nbacking, and a red row for a credential the instance will never use is\nnoise, not a signal.",
         "operationId": "test_chat_secrets_admin_chat_secrets_test_post",
         "parameters": [
           {
@@ -37920,6 +37920,7 @@
     },
     "/api/marketplaces/{marketplace_id}/sync": {
       "post": {
+        "description": "Sync one marketplace on demand (\"Sync now\" in the admin UI).\n\nDeclared ``def`` (not ``async def``) for the same reason as\n:func:`trigger_sync_all` below \u2014 ``sync_one`` does blocking I/O\n(subprocess git clone/fetch, DuckDB writes, the module-wide sync lock)\nand would freeze the event loop for the duration of the sync if it ran\non the asyncio thread.",
         "operationId": "trigger_sync_api_marketplaces__marketplace_id__sync_post",
         "parameters": [
           {

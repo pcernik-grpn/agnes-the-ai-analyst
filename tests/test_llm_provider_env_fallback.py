@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from connectors.llm.factory import create_extractor, create_extractor_from_env_or_config
+from connectors.llm.factory import create_extractor_from_env_or_config
 
 
 class TestEnvFallback:
@@ -78,3 +78,43 @@ class TestEnvFallback:
         assert ex is mock_cls.return_value
         kwargs = mock_cls.call_args.kwargs
         assert kwargs["api_key"] == "sk-ant-from-env-ccc"
+
+
+class TestVertexEnvFallback:
+    """Step 4 of the resolution order: the Vertex env pair
+    (ANTHROPIC_VERTEX_PROJECT_ID [+ CLOUD_ML_REGION]) builds a VertexExtractor
+    — but only when neither static key is set (keys win, so every existing
+    deployment is byte-for-byte unchanged)."""
+
+    def test_vertex_env_pair_builds_extractor(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        monkeypatch.setenv("CLOUD_ML_REGION", "europe-west1")
+        with patch("connectors.llm.factory.VertexExtractor") as mock_cls:
+            ex = create_extractor_from_env_or_config(ai_config=None)
+        assert ex is mock_cls.return_value
+        kwargs = mock_cls.call_args.kwargs
+        assert kwargs["project_id"] == "env-proj"
+        assert kwargs["region"] == "europe-west1"
+        assert kwargs["model"]  # DEFAULT_MODEL, translated inside the extractor
+
+    def test_static_key_wins_over_vertex_env_pair(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-wins")
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        with patch("connectors.llm.factory.AnthropicExtractor") as mock_anthropic_cls:
+            ex = create_extractor_from_env_or_config(ai_config=None)
+        assert ex is mock_anthropic_cls.return_value
+
+    def test_explicit_ai_config_wins_over_everything(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        with patch("connectors.llm.factory.AnthropicExtractor") as mock_anthropic_cls:
+            ex = create_extractor_from_env_or_config({"provider": "anthropic", "api_key": "sk-explicit"})
+        assert ex is mock_anthropic_cls.return_value
+        assert mock_anthropic_cls.call_args.kwargs["api_key"] == "sk-explicit"
+
+    def test_no_config_error_mentions_vertex_option(self, monkeypatch):
+        for var in ("ANTHROPIC_API_KEY", "LLM_API_KEY", "ANTHROPIC_VERTEX_PROJECT_ID"):
+            monkeypatch.delenv(var, raising=False)
+        with pytest.raises(ValueError, match="ANTHROPIC_VERTEX_PROJECT_ID"):
+            create_extractor_from_env_or_config(ai_config=None)
