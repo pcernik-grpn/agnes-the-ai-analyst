@@ -742,7 +742,7 @@ through the existing foundation tools (`get_semantic_context`,
 `validate_semantic_query`). **No customer vocabulary ever enters Agnes code**
 — no `find_engagements`-style tool in the product.
 
-The first ontology exists: `ontology.yaml` v0.2.0 (10 node types, 11 edge
+The first ontology exists: `ontology.yaml` v0.2.0 (10 node types, 12 edge
 types, `evidence_required` rules). It is not Ossie — the import translates
 it and reports leftovers (rules without a field → `ai_context`; the
 `industry.parent` hierarchy → a self-relationship to confirm).
