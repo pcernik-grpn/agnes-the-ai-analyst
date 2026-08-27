@@ -11,6 +11,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **`scripts/ontology/import_ontology.py` translates a producer's ontology.yaml into an Agnes semantic-model (Apache Ossie) document** — node types become datasets, edge types become relationships, guidance/rules with no Ossie field fold into `ai_context` verbatim, and every judgment call (a hierarchy inferred from a plain attribute, a wildcard-endpoint relationship) is named in a leftover report printed before writing or posting. Validates against the vendored Ossie schema before writing (`--out`) or importing through `POST /api/admin/semantic-models` (`--server`/`--token`); refuses loudly on a schema-invalid translation. Fact-graph build-order step 1.
+
 - **Claude can run through Google Vertex AI — chat and server-side, keyless.**
   Two new provider switches, both authenticated by Google Application Default
   Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
