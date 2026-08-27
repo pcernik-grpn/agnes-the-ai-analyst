@@ -3599,6 +3599,17 @@
         "title": "DeployScriptRequest",
         "type": "object"
       },
+      "DetachRequest": {
+        "properties": {
+          "confirm_detach": {
+            "default": false,
+            "title": "Confirm Detach",
+            "type": "boolean"
+          }
+        },
+        "title": "DetachRequest",
+        "type": "object"
+      },
       "DisablePluginRequest": {
         "description": "Optional body of the disable endpoint.\n\n``revoke_grants=True`` turns the disable into a one-action retirement:\nevery ``marketplace_plugin`` grant on the plugin is deleted in the same\ncall. Without it (or with no body at all \u2014 the pre-existing call shape)\ngrants are left intact, so a later re-enable restores the plugin for the\nsame groups.",
         "properties": {
@@ -7419,6 +7430,17 @@
           "vote"
         ],
         "title": "RateRequest",
+        "type": "object"
+      },
+      "ReattachRequest": {
+        "properties": {
+          "confirm_reattach": {
+            "default": false,
+            "title": "Confirm Reattach",
+            "type": "boolean"
+          }
+        },
+        "title": "ReattachRequest",
         "type": "object"
       },
       "RefreshGroupsResponse": {
@@ -26781,6 +26803,152 @@
           }
         },
         "summary": "Update Semantic Model",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{model_id}/detach": {
+      "post": {
+        "description": "F3: danger-flow escape hatch out of the flat ``409 source_owned``\nguard \u2014 copies nothing, flips ``sync_mode`` on the SAME row in place.\nFrom here on, sync tracks drift (``source_content_hash``) instead of\noverwriting; the admin edits freely through ``PUT``/``/apply``.",
+        "operationId": "detach_semantic_model_api_admin_semantic_models__model_id__detach_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DetachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detach Semantic Model",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-models/{model_id}/reattach": {
+      "post": {
+        "description": "F3: return a detached model to the sync path. Without confirmation,\nreturns a staleness preview instead of acting \u2014 has the source changed\nsince detach, and when was it detached. Confirming flips\n``sync_mode='synced'``; the NEXT sync run is what actually rewrites\n``document`` back onto the model (this endpoint doesn't fabricate that\ncontent itself \u2014 the importer is the only place that knows how to\nassemble it).",
+        "operationId": "reattach_semantic_model_api_admin_semantic_models__model_id__reattach_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReattachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reattach Semantic Model",
         "tags": [
           "semantic-models"
         ]
