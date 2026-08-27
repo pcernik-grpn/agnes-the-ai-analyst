@@ -24974,7 +24974,7 @@
     },
     "/api/admin/run-databricks-semantic-layer-refresh": {
       "post": {
-        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto metric_definitions. See connectors/databricks/semantic_layer.py for\nthe mapping/prune logic.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 only when the upstream is unreachable or\nanswers 5xx.",
+        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto the semantic layer. See connectors/databricks/semantic_ossie.py for\nthe composition logic and connectors/databricks/semantic_layer.py for\nconnection resolution + the legacy-provenance cutover.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 when the upstream is unreachable, answers\n5xx, or the sync fails for any other reason.",
         "operationId": "run_databricks_semantic_layer_refresh_api_admin_run_databricks_semantic_layer_refresh_post",
         "parameters": [
           {
