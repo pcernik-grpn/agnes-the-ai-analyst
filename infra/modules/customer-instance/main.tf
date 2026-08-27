@@ -518,6 +518,12 @@ resource "google_compute_instance" "vm" {
   # running deployment actually wants.
   allow_stopping_for_update = true
 
+  # Opt-in per VM. Until this was wired, a deployment could only set the flag
+  # out of band, and the provider's own `false` default silently reverted it on
+  # the next apply — the module never sent the attribute, so every plan
+  # proposed turning the protection back off.
+  deletion_protection = each.value.deletion_protection
+
   boot_disk {
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
