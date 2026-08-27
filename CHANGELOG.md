@@ -27,6 +27,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`docs/llm-routing.md` scrubbed of customer-specific and stale planning
+  content.** The provider-selection table and one config-example heading named
+  a specific company where every neighbouring entry is a neutral deployment
+  profile; both now read as profiles ("Single-vendor deployment"). The
+  "Files to Modify" plan table is gone — it described a two-repo OSS/private
+  split and listed `server/bin/collect-knowledge`, `server/deploy.sh`,
+  `requirements.txt` and `tests/test_corporate_memory.py`, none of which exist
+  in this repo — and the "Deployment" section it fed is rewritten to the
+  configuration-only steps that actually apply now that the connector ships
+  with the platform. Docs only; no behaviour change.
+
 ## [0.90.0] - 2026-08-27
 
 ### Added
