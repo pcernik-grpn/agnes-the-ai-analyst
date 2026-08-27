@@ -360,3 +360,86 @@ def test_unexpected_sync_state_shapes_degrade_not_crash(tmp_path, monkeypatch, b
     assert result.exit_code == 0, result.output
     # Falls back to the slug heuristic: the table is still reported.
     assert "1 downloaded (no local view)" in _clean(result.output), result.output
+
+
+# ---------------------------------------------------------------------------
+# Issue #1312 (remaining scope, item 2): `status` printed `Workspace : <path>`
+# from `resolve_data_workspace()` (cwd-first) but silently counted
+# `Pending uploads` from the DIFFERENT `workspace_root` anchor — the two
+# mixed with no label, so an analyst standing in a foreign-but-shaped
+# directory saw an upload count for a workspace never named on screen.
+# ---------------------------------------------------------------------------
+
+
+def test_pending_uploads_labeled_when_anchor_differs_from_workspace(tmp_path, monkeypatch):
+    from cli.config import set_workspace_root
+
+    monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
+    anchor = tmp_path / "anchor"
+    anchor.mkdir()
+    set_workspace_root(str(anchor))
+
+    ws = tmp_path / "ws"
+    _init(ws)
+    monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+
+    result = runner.invoke(status_app)
+    assert result.exit_code == 0, result.output
+    out = _clean(result.output)
+    assert f"Workspace : {ws.resolve()}" in out
+    assert str(anchor.resolve()) in out
+    assert "(anchor:" in out
+
+
+def test_pending_uploads_json_carries_anchor(tmp_path, monkeypatch):
+    from cli.config import set_workspace_root
+
+    monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
+    anchor = tmp_path / "anchor"
+    anchor.mkdir()
+    set_workspace_root(str(anchor))
+
+    ws = tmp_path / "ws"
+    _init(ws)
+    monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+
+    result = runner.invoke(status_app, ["--json"])
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["session_anchor"] == str(anchor.resolve())
+    assert body["session_anchor_differs_from_workspace"] is True
+
+
+def test_pending_uploads_unlabeled_when_anchor_matches_workspace(tmp_path, monkeypatch):
+    from cli.config import set_workspace_root
+
+    monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
+    ws = tmp_path / "ws"
+    _init(ws)
+    set_workspace_root(str(ws))
+    monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+
+    result = runner.invoke(status_app)
+    assert result.exit_code == 0, result.output
+    out = _clean(result.output)
+    assert "(anchor:" not in out
+
+    result_json = runner.invoke(status_app, ["--json"])
+    body = json.loads(result_json.output)
+    assert body["session_anchor_differs_from_workspace"] is False
+
+
+def test_pending_uploads_without_configured_workspace_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
+    ws = tmp_path / "ws"
+    _init(ws)
+    monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+
+    result = runner.invoke(status_app)
+    assert result.exit_code == 0, result.output
+    assert "(anchor:" not in _clean(result.output)
+
+    result_json = runner.invoke(status_app, ["--json"])
+    body = json.loads(result_json.output)
+    assert body["session_anchor"] is None
+    assert body["session_anchor_differs_from_workspace"] is False

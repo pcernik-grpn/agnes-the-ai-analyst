@@ -278,3 +278,119 @@ class TestPullRevealsWorkspace:
         result = _run_pull_in(tmp_path, monkeypatch, ["--quiet"])
         assert result.exit_code == 0
         assert "Workspace:" not in _clean(result.stdout)
+
+
+def _shape(p):
+    (p / ".claude").mkdir(parents=True, exist_ok=True)
+    (p / ".claude" / "init-complete").write_text("x", encoding="utf-8")
+    return p
+
+
+def _run_pull_from_cwd(cwd, monkeypatch, args, config_dir=None):
+    """Like `_run_pull_in` but resolves the workspace the way an analyst
+    typing `agnes pull` from an arbitrary shell actually does — via
+    AGNES_CONFIG_DIR + workspace_root + cwd — instead of forcing
+    AGNES_LOCAL_DIR (which always wins and would mask anchor divergence)."""
+    monkeypatch.delenv("AGNES_LOCAL_DIR", raising=False)
+    monkeypatch.setenv("AGNES_SERVER", "http://server.test:8000")
+    monkeypatch.setenv("AGNES_TOKEN", "tok")
+    if config_dir is not None:
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+    monkeypatch.chdir(cwd)
+    with patch("cli.commands.pull.run_pull", return_value=_FakePullResult()):
+        return runner.invoke(pull_app, args)
+
+
+class TestPullWarnsOnAnchorDivergence:
+    """Issue #1312 (remaining scope, item 1): pull resolved a workspace and
+    said so, but never flagged when that workspace differs from the
+    anchored `workspace_root` — the one `agnes update` / SessionStart hooks
+    target. A pull that silently lands in the "wrong" (cwd) workspace looked
+    identical to a correct one."""
+
+    def test_note_when_cwd_differs_from_configured_anchor(self, tmp_path, monkeypatch):
+        from cli.config import set_workspace_root
+
+        config_dir = tmp_path / "config"
+        anchor = _shape(tmp_path / "anchor")
+        cwd = _shape(tmp_path / "cwd-ws")
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+        set_workspace_root(str(anchor))
+
+        result = _run_pull_from_cwd(cwd, monkeypatch, [])
+        assert result.exit_code == 0, result.output
+        err = _clean(result.stderr or "")
+        assert str(anchor.resolve()) in err
+        assert "differs" in err.lower() or "anchor" in err.lower()
+
+    def test_no_note_when_cwd_matches_anchor(self, tmp_path, monkeypatch):
+        from cli.config import set_workspace_root
+
+        config_dir = tmp_path / "config"
+        anchor = _shape(tmp_path / "anchor")
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+        set_workspace_root(str(anchor))
+
+        result = _run_pull_from_cwd(anchor, monkeypatch, [])
+        assert result.exit_code == 0, result.output
+        assert "anchor" not in _clean(result.stderr or "").lower()
+
+    def test_no_note_when_no_anchor_configured(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "config"
+        cwd = _shape(tmp_path / "cwd-ws")
+        result = _run_pull_from_cwd(cwd, monkeypatch, [], config_dir=config_dir)
+        assert result.exit_code == 0, result.output
+        assert "anchor" not in _clean(result.stderr or "").lower()
+
+    def test_no_note_with_explicit_workspace_flag(self, tmp_path, monkeypatch):
+        """An explicit `--workspace` is an intentional override — not the
+        silent divergence #1312 is about."""
+        from cli.config import set_workspace_root
+
+        config_dir = tmp_path / "config"
+        anchor = _shape(tmp_path / "anchor")
+        cwd = _shape(tmp_path / "cwd-ws")
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+        set_workspace_root(str(anchor))
+
+        result = _run_pull_from_cwd(cwd, monkeypatch, ["--workspace", str(cwd)])
+        assert result.exit_code == 0, result.output
+        assert "anchor" not in _clean(result.stderr or "").lower()
+
+    def test_note_suppressed_under_quiet_and_json(self, tmp_path, monkeypatch):
+        from cli.config import set_workspace_root
+
+        config_dir = tmp_path / "config"
+        anchor = _shape(tmp_path / "anchor")
+        cwd = _shape(tmp_path / "cwd-ws")
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+        set_workspace_root(str(anchor))
+
+        quiet_result = _run_pull_from_cwd(cwd, monkeypatch, ["--quiet"])
+        assert "anchor" not in _clean(quiet_result.stderr or "").lower()
+
+        json_result = _run_pull_from_cwd(cwd, monkeypatch, ["--json"])
+        assert json_result.exit_code == 0, json_result.output
+
+    def test_json_payload_carries_workspace_root(self, tmp_path, monkeypatch):
+        from cli.config import set_workspace_root
+
+        config_dir = tmp_path / "config"
+        anchor = _shape(tmp_path / "anchor")
+        cwd = _shape(tmp_path / "cwd-ws")
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(config_dir))
+        set_workspace_root(str(anchor))
+
+        result = _run_pull_from_cwd(cwd, monkeypatch, ["--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(_clean(result.stdout).strip())
+        assert payload["workspace"] == str(cwd.resolve())
+        assert payload["workspace_root"] == str(anchor.resolve())
+
+    def test_json_payload_workspace_root_null_when_unconfigured(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "config"
+        cwd = _shape(tmp_path / "cwd-ws")
+        result = _run_pull_from_cwd(cwd, monkeypatch, ["--json"], config_dir=config_dir)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(_clean(result.stdout).strip())
+        assert payload["workspace_root"] is None
