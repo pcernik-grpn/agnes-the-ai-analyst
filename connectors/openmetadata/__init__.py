@@ -1,1 +1,0 @@
-"""OpenMetadata catalog integration connector."""

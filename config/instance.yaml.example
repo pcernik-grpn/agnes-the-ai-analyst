@@ -516,19 +516,6 @@ data_source:
   #                                      # parquet size; a larger result is rejected, never written.
   #                                      # Default 10 GiB. Set 0 to disable.
 
-# --- OpenMetadata catalog (optional) ---
-# Enriches table and column metadata from OpenMetadata REST API.
-# If not configured, app works normally without catalog enrichment.
-# All openmetadata.* fields configurable via /admin/server-config UI.
-# openmetadata:
-#   url: "https://your-catalog.example.com"
-#   token: "${OPENMETADATA_TOKEN}"        # JWT bearer token
-#   cache_ttl_seconds: 3600               # Cache TTL in seconds
-#   verify_ssl: true                       # set to false ONLY for internal
-#                                          # CAs / self-signed certs; defaults
-#                                          # to true. Setting false ships the
-#                                          # JWT over an unverified channel.
-
 # --- Email delivery (optional, for magic link auth) ---
 # Without SMTP, magic links are shown directly in browser (development mode).
 # For production, configure any SMTP relay (Gmail, Mailgun, SendGrid SMTP, etc.)
