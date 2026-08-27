@@ -282,11 +282,18 @@
     {% endif %}
   </div>
   {% endif %}
+  {# Self-describing payload: every item carries a `kind` discriminator, so
+     a new review-item shape (spec §7.3's `single_valued_conflict`) is a
+     branch here, not a whole new section. #}
   {% if facts_summary.review_items %}
   <div class="facts-review">
-    <h3 class="facts-review__title">Possible duplicates</h3>
+    <h3 class="facts-review__title">Review items</h3>
     {% for item in facts_summary.review_items %}
+    {% if item.kind == 'single_valued_conflict' %}
+    <div class="fact-review-row">⚠ {{ item.src.display_name }} has {{ item.dsts|length }} conflicting "{{ item.type }}" values: {{ item.dsts | map(attribute='display_name') | join(', ') }}</div>
+    {% else %}
     <div class="fact-review-row">{{ item.a.display_name }} &harr; {{ item.b.display_name }}</div>
+    {% endif %}
     {% endfor %}
   </div>
   {% endif %}

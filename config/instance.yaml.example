@@ -1077,6 +1077,20 @@ data_apps:
                                 # every hosted app crash-loops.
 
 
+# --- Fact graph over Collections (optional) ---
+# `facts.enabled` / `facts.visibility_mode` are switches — set them via the
+# settings panel or AGNES_FACTS_ENABLED / AGNES_FACTS_VISIBILITY_MODE (see
+# docs/feature-flags.md), not here. `single_valued_edges` below is plain
+# instance data (a list, not a bool/select toggle), read directly via
+# get_value — see docs/api-reference.md's `/api/facts` section.
+facts:
+  # Edge types where a src fact should carry exactly ONE live dst (spec
+  # §7.3 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
+  # A second distinct dst becomes a `single_valued_conflict` review item on
+  # the collection detail page instead of silently picking one.
+  single_valued_edges: ["owned_by", "for_client"]
+
+
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
 # agents, data packages, connections, and corporate memory). On by default.
 # Set to false — or export AGNES_STUDIO_ENABLED=0 (the infra/Terraform .env

@@ -1432,7 +1432,18 @@ must be a substring of one chunk of the evidencing document's extracted
 text), union vs `full_documents` replace mode, alias/edge resolution,
 `wrong`-correction re-attachment across a subject's delete-then-recreate,
 and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
-Response is the run report: `{claims_written, claims_rejected: [{row,
+`review_items` mixes two self-describing shapes (a `kind` discriminator on
+each) — `possible_duplicate_of` entity-resolution candidates, and (§7.3)
+`single_valued_conflict`: a functionally single-valued edge type
+(`facts.single_valued_edges` in instance.yaml, default `owned_by`/
+`for_client`) whose src carries >1 distinct dst with a live claim — pre-
+existing edges included, nothing persisted, so it clears the moment a
+dst's claims are gone. Same detection re-runs at read time in
+`collection_facts_summary` (surfaced on the collection detail page),
+caller-scoped: a dst the caller cannot independently read (its own claim
+AND the edge's own claim both readable, the same discipline
+`possible_duplicate_of` review items get) never appears. Response is the
+run report: `{claims_written, claims_rejected: [{row,
 reason}], deferred: [...], subjects_created, subjects_deleted,
 corrections_active: [...], review_items: [...]}`. `documents` may be
 omitted only when every evidence `doc_id` already resolves through a prior

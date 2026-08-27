@@ -210,6 +210,159 @@ def test_facts_section_conflict_rendered_inline(seeded_app_both, state_backend, 
 
 
 # ---------------------------------------------------------------------------
+# §7.3 — `single_valued_conflict` review items on the collection detail.
+# ---------------------------------------------------------------------------
+
+
+def test_single_valued_conflict_rendered_on_collection_detail(seeded_app_both, state_backend, monkeypatch):
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Owned By", "owned-by")
+    file_id = _new_file(corpus_id)
+
+    from src.repositories import facts_repo
+
+    repo = facts_repo()
+    src = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=src, type="engagement", natural_key="engagement:acme")
+    repo.add_claim(
+        fact_id=src, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Acme engagement."
+    )
+    dst1 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst1, type="person", natural_key="person:alice")
+    repo.add_claim(fact_id=dst1, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Alice.")
+    dst2 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst2, type="person", natural_key="person:bob")
+    repo.add_claim(fact_id=dst2, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Bob.")
+
+    edge1 = repo.create_edge(src=src, type="owned_by", dst=dst1)
+    repo.add_claim(
+        edge_id=edge1, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Owned by Alice."
+    )
+    edge2 = repo.create_edge(src=src, type="owned_by", dst=dst2)
+    repo.add_claim(
+        edge_id=edge2, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Owned by Bob."
+    )
+
+    r = s["client"].get("/library/owned-by", headers=_admin_headers(s))
+    assert r.status_code == 200
+    # The review-item marker (not merely the raw names, which would also
+    # appear in the ordinary fact list) proves the NEW code path rendered.
+    assert 'conflicting "owned_by" values' in r.text
+    assert "person:alice" in r.text
+    assert "person:bob" in r.text
+
+
+def test_single_valued_conflict_hidden_when_second_edge_claim_unreadable(seeded_app_both, state_backend, monkeypatch):
+    """Same visibility discipline `possible_duplicate_of` review items get
+    (spec §7.3): a caller who cannot read the SECOND edge's claim must not
+    see the conflict at all — never a one-sided hint of it."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+
+    corpus_a = _new_corpus("Corpus SV A", "corpus-sv-a")
+    corpus_b = _new_corpus("Corpus SV B", "corpus-sv-b")
+    file_a = _new_file(corpus_a, "a.md")
+    file_b = _new_file(corpus_b, "b.md")
+
+    from src.repositories import facts_repo, users_repo
+
+    repo = facts_repo()
+    src = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=src, type="engagement", natural_key="engagement:acme-sv")
+    repo.add_claim(fact_id=src, corpus_file_id=file_a, corpus_id=corpus_a, file_sha256="sha_a.md", quote="Acme.")
+
+    dst1 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst1, type="person", natural_key="person:alice-sv")
+    repo.add_claim(fact_id=dst1, corpus_file_id=file_a, corpus_id=corpus_a, file_sha256="sha_a.md", quote="Alice.")
+    dst2 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst2, type="person", natural_key="person:bob-sv")
+    # Bob's own subject claim ALSO lives only in corpus_b — Ivan (corpus_a
+    # only) must not be able to reconstruct the conflict from Bob's fact
+    # existing, only from the edge that names him.
+    repo.add_claim(fact_id=dst2, corpus_file_id=file_b, corpus_id=corpus_b, file_sha256="sha_b.md", quote="Bob.")
+
+    edge1 = repo.create_edge(src=src, type="owned_by", dst=dst1)
+    repo.add_claim(
+        edge_id=edge1, corpus_file_id=file_a, corpus_id=corpus_a, file_sha256="sha_a.md", quote="Owned by Alice."
+    )
+    edge2 = repo.create_edge(src=src, type="owned_by", dst=dst2)
+    repo.add_claim(
+        edge_id=edge2, corpus_file_id=file_b, corpus_id=corpus_b, file_sha256="sha_b.md", quote="Owned by Bob."
+    )
+
+    users_repo().create(id="ivan1", email="ivan1@test.com", name="Ivan")
+    ivan_token = _issue_token("ivan1", "ivan1@test.com")
+    _grant_collection("g-ivan-sv-a", corpus_a, "ivan1")
+
+    r_ivan = s["client"].get("/library/corpus-sv-a", headers=_headers(ivan_token))
+    r_admin = s["client"].get("/library/corpus-sv-a", headers=_admin_headers(s))
+    assert r_ivan.status_code == 200
+    assert r_admin.status_code == 200
+    # Admin sees the full conflict (both dsts) -- Ivan only reaches corpus_a,
+    # so edge2's (corpus_b) claim is invisible to him and the conflict drops
+    # to a single visible dst, i.e. no conflict at all.
+    assert 'conflicting "owned_by" values' in r_admin.text
+    assert "person:bob-sv" in r_admin.text
+    assert 'conflicting "owned_by" values' not in r_ivan.text
+    assert "person:bob-sv" not in r_ivan.text
+
+
+def test_single_valued_conflict_clears_when_second_dst_claims_deleted(seeded_app_both, state_backend, monkeypatch):
+    """Nothing is persisted (spec §7.3): once the second dst's claim is
+    gone, the conflict disappears from the very next summary — no admin
+    action needed to "resolve" it."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Clearing", "clearing-sv")
+    file_id = _new_file(corpus_id)
+
+    from src.repositories import facts_repo
+
+    repo = facts_repo()
+    src = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=src, type="engagement", natural_key="engagement:clear")
+    repo.add_claim(fact_id=src, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Clear.")
+
+    dst1 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst1, type="person", natural_key="person:one")
+    repo.add_claim(fact_id=dst1, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="One is.")
+    dst2 = repo.create_fact(type="person")
+    repo.add_alias(fact_id=dst2, type="person", natural_key="person:two")
+    repo.add_claim(fact_id=dst2, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Two is.")
+
+    edge1 = repo.create_edge(src=src, type="owned_by", dst=dst1)
+    repo.add_claim(edge_id=edge1, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="One.")
+    edge2 = repo.create_edge(src=src, type="owned_by", dst=dst2)
+    repo.add_claim(edge_id=edge2, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha_a.md", quote="Two.")
+
+    r_before = s["client"].get("/library/clearing-sv", headers=_admin_headers(s))
+    # The marker phrase (not the raw "person:two" string, which stays on the
+    # page regardless -- dst2's OWN fact claim keeps it in the ordinary fact
+    # list even once its edge claim is gone) proves the conflict was live.
+    assert 'conflicting "owned_by" values' in r_before.text
+    assert "person:two" in r_before.text
+
+    import sqlalchemy as sa
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(sa.text("DELETE FROM claims WHERE edge_id = :eid"), {"eid": edge2})
+
+    r_after = s["client"].get("/library/clearing-sv", headers=_admin_headers(s))
+    assert 'conflicting "owned_by" values' not in r_after.text
+    # dst2 itself is untouched (still evidenced by its own claim) -- only
+    # the review item clears, never the fact.
+    assert "person:two" in r_after.text
+
+
+# ---------------------------------------------------------------------------
 # Library collection card — "N files · M facts" (PG only for content).
 # ---------------------------------------------------------------------------
 
