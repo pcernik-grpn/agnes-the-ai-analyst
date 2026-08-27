@@ -45,6 +45,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **A PAT could mint itself a fresh, longer-lived PAT through the Cowork setup
+  bundle.** `POST /api/user/cowork-bundle` mints two durable follow-on
+  credentials — a pre-baked PAT inline in the ZIP, and a setup token that
+  `POST /api/auth/exchange-setup-token` (unauthenticated by design — the
+  setup token IS the credential) trades for a fresh 90-day PAT — but was
+  gated only by `get_current_user`, which accepts any authenticated
+  credential including a PAT. A caller holding only a stolen PAT could
+  therefore mint a new 90-day one that outlives revoking the original,
+  defeating revocation. Now gated by `require_session_token`, the same
+  interactive-session-only guard already used by `POST /auth/tokens` and
+  agent-PAT issuance (which subsumes PR #1288's narrower
+  `X-StorageApi-Token`-only rejection on this route). No other
+  credential-minting endpoint had this gap: `POST /auth/tokens`, agent-PAT
+  issuance, and MCP-connect token creation already required a session; the
+  data-apps deploy/git-credential/draft/preview-grant mints are intentionally
+  PAT-reachable (the CLI's `agnes app …` commands run under the caller's own
+  PAT against their own app) and out of scope here — see #1292.
 
 ### Removed
 

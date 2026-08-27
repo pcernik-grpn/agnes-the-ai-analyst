@@ -9655,6 +9655,8 @@
     "tests/test_cowork_bundle.py::TestListAndRevoke::test_cannot_revoke_other_users_token": 0.8781463049995182,
     "tests/test_cowork_bundle.py::TestListAndRevoke::test_list_returns_generated_tokens": 0.8811966170001142,
     "tests/test_cowork_bundle.py::TestListAndRevoke::test_revoke_removes_token": 0.8854011999997056,
+    "tests/test_cowork_bundle.py::TestPatCannotMintCoworkBundle::test_pat_cannot_generate_bundle": 0.85,
+    "tests/test_cowork_bundle.py::TestPatCannotMintCoworkBundle::test_session_token_can_still_generate_bundle": 0.85,
     "tests/test_cowork_dark_theme_tokens.py::TestCoworkDarkThemeTokens::test_cowork_skills_note_no_hardcoded_hex": 0.002316357000381686,
     "tests/test_cowork_dark_theme_tokens.py::TestCoworkDarkThemeTokens::test_cowork_skills_note_uses_ds_border": 0.002232202999493893,
     "tests/test_cowork_dark_theme_tokens.py::TestCoworkDarkThemeTokens::test_cowork_skills_note_uses_ds_surface_dim": 0.002219925999725092,
