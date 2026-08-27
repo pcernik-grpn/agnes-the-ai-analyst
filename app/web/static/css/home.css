@@ -838,28 +838,35 @@
     padding: 20px;
 }
 .cta-modal-backdrop.is-open { display: flex; }
+/* Every color below is a --ds-* token (#1625): the modal previously stayed a
+   raw-white card with raw-hex ink even under dark theme, which was merely
+   ugly on its own — but a fix that only tokenized the flagged backgrounds
+   below (ol li, ol li code/kbd) while leaving this container's own
+   background+ink static would have flipped just the row tint and left the
+   inherited body text unreadable on it (measured 1.16:1). Converting the
+   whole component keeps it internally consistent. */
 .cta-modal {
-    background: white;
+    background: var(--ds-surface);
     border-radius: 14px;
     padding: 28px 32px;
     max-width: 520px;
     width: 100%;
     box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
-    color: #111827;
+    color: var(--ds-text-primary);
     font-family: inherit;
 }
 .cta-modal h2 {
     font-size: 18px;
     font-weight: 600;
     margin: 0 0 6px;
-    color: #047857;
+    color: var(--ds-accent-success-ink);
     display: flex;
     align-items: center;
     gap: 8px;
 }
 .cta-modal .lead {
     font-size: 13px;
-    color: #6B7280;
+    color: var(--ds-text-secondary);
     margin: 0 0 18px;
     line-height: 1.55;
 }
@@ -875,7 +882,7 @@
     gap: 14px;
     align-items: flex-start;
     padding: 12px;
-    background: #F9FAFB;
+    background: var(--ds-surface-dim);
     border-radius: 8px;
     margin-bottom: 10px;
     font-size: 13.5px;
@@ -896,22 +903,22 @@
 }
 .cta-modal ol li code,
 .cta-modal ol li kbd {
-    background: #fff;
-    border: 1px solid #E5E7EB;
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
     padding: 1px 6px;
     border-radius: 4px;
     font-family: var(--ds-font-mono, ui-monospace, monospace);
     font-size: 12px;
 }
 .cta-modal ol li kbd { border-bottom-width: 2px; }
-.cta-modal ol li strong { display: block; margin-bottom: 4px; color: #111827; }
+.cta-modal ol li strong { display: block; margin-bottom: 4px; color: var(--ds-text-primary); }
 .cta-modal-foot {
     display: flex; justify-content: space-between; align-items: center;
     gap: 12px;
     padding-top: 12px;
-    border-top: 1px solid #F3F4F6;
+    border-top: 1px solid var(--ds-border-light);
 }
-.cta-modal-foot .meta { font-size: 12px; color: #6B7280; }
+.cta-modal-foot .meta { font-size: 12px; color: var(--ds-text-secondary); }
 /* `.cta-modal-foot button` styling moved onto `.btn.btn-primary`
    (rendered via `ds.button`). The canonical .btn-primary supplies the
    green-fill CTA pattern and the hover-darken behavior. */

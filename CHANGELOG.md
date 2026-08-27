@@ -96,6 +96,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving the previous chat's rows on screen with their old download links.
 
 ### Fixed
+- **Dark theme: several light-hex backgrounds that never flipped now use
+  `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
+  `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),
+  `home.css` (the "setup script copied" confirmation modal), `admin.css`,
+  and `stack_card.css` (`.stack-card__btn--remove/--required`,
+  `.admin-only-hint`) previously pinned a light background under theme-aware
+  ink — the same invisible-text shape as #656 and #1193, now widened into a
+  guard (`tests/test_design_system_contract.py::test_no_raw_hex_light_background_outside_theme_scope`)
+  that scans every shipped stylesheet, not just the templates a past sweep
+  happened to touch. The guard's documented exemption for rules that already
+  declare a per-theme value now actually covers the media-query half of it:
+  the CSS walker used to discard at-rule preludes, so a fill inside
+  `@media (prefers-color-scheme: dark)` reached the check as a bare selector
+  and was reported as an offender, while a plain `@media (max-width: …)`
+  still is. Part of #1625.
 - **A PAT could mint itself a fresh, longer-lived PAT through the Cowork setup
   bundle.** `POST /api/user/cowork-bundle` mints two durable follow-on
   credentials — a pre-baked PAT inline in the ZIP, and a setup token that
@@ -177,6 +192,45 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   Files beside it, each button claimed the slack and the free space was split
   between them, stranding Files mid-header. Only the first action claims it
   now, so the pair reads as one group at the trailing edge.
+- **Three Corporate Memory governance knobs are wired up; the fourth is
+  clearly marked as not yet enforced (#1573).** `corporate_memory.approval_mode:
+  "threshold"` used to silently behave exactly like `"review_queue"` — there
+  was no confidence cutoff to compare against. It now compares each item's
+  confidence score against the new `corporate_memory.auto_publish_min_confidence`
+  knob (default `0.80`); an unrecognized `approval_mode` value is logged as a
+  warning instead of silently degrading. `corporate_memory.notify_on_new_items`
+  (default on) now actually notifies — every Admin-group member with a live
+  desktop session gets a notification when a collection run queues new items
+  for review. The count is what *that run* added, never the standing backlog:
+  the catalog is rebuilt by full refresh and preserved items keep their old
+  `pending` status, so counting the whole queue would re-announce it (as
+  "new") on every run where any watched file changed. It is also what
+  actually reached the review queue: the queue admins open is the
+  `knowledge_items` table, not `knowledge.json`, so the count comes from the
+  rows this run inserted. Counting the rebuilt catalog instead announced
+  items whose DB write had failed — sending admins to a queue that did not
+  contain them — and then went silent on the retry run that finally landed
+  the row, because by then the item was a *preserved* catalog entry rather
+  than a new one. The run stats now carry all three numbers —
+  `items_pending` (queue size), `items_pending_new` (this run's catalog
+  additions) and `items_pending_queued` (rows actually inserted as pending,
+  the one that is notified). `POST /api/memory` (the "add what you know" button)
+  used to hardcode `status="pending"` regardless of configuration; it now
+  respects `approval_mode` the same way the CLAUDE.local.md collector does —
+  **on an instance with no `corporate_memory:` block at all** (the documented
+  legacy "no admin review" default, and the common case today) items now
+  auto-approve immediately instead of sitting in the pending queue forever
+  with no notification. `distribution_mode` remains inert — `GET
+  /api/memory/bundle` still ships every approved item to every user
+  regardless of the configured mode — and is now labeled "NOT YET ENFORCED"
+  in its `/admin/server-config` hint and in `config/instance.yaml.example`
+  rather than silently doing nothing; wiring it up touches the JSON bundle
+  route, the per-domain markdown route `agnes pull` writes, and the
+  sync-manifest md5 those two must agree with, and is left as open work.
+  Also removed a dead `GOVERNANCE_MODE` JS constant on the admin Corporate
+  Memory page that always evaluated to `null` (the template read
+  `governance_mode`, the route passed `governance`) and had no other
+  reference in the page.
 - The "Add data source" wizard's Snowflake table picker no longer renders a
   raw, three-layer-wrapped driver exception when the connection itself can't
   authenticate (e.g. an expired temporary password) — a routine first-connect
