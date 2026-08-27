@@ -545,6 +545,22 @@ _LIBRARY_MOVE_REASON = (
     "into the intended collection, which already has surfaces."
 )
 
+_MCP_BUILDER_TURN_REASON = (
+    "one turn of the /admin/mcp-sources/new builder's CONVERSATION — web-UI"
+    "-only for the same reason as its three siblings. It writes nothing, its "
+    "inputs are the page's own transient state (the transcript and the unsaved "
+    "connection panel), and its output is a patch for the admin to review, not "
+    "a resource. The source it helps produce is created through POST "
+    "/api/admin/mcp-sources, which has its own coverage."
+)
+_MCP_PREVIEW_INTROSPECT_REASON = (
+    "pre-flight for the builder: dials a connection the admin has TYPED and "
+    "returns its tool list, writing nothing — the same relationship to POST "
+    "/mcp-sources that /entities/preview has to POST /entities, and exempt for "
+    "the same reason. A CLI or MCP caller registering a source has the "
+    "registered {source_id}/introspect available to it, which is the analogue "
+    "that exists; this one is only useful to a surface holding an unsaved form."
+)
 _PACKAGE_BUILDER_TURN_REASON = (
     "one turn of the data-package drawer's CONVERSATION — web-UI-only, same "
     "shape as the two builder-turn endpoints above. It writes NOTHING and has "
@@ -725,6 +741,8 @@ _EXEMPT: dict[str, str] = {
     "/api/store/entities/builder/turn": _ENTITY_BUILDER_TURN_REASON,
     "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
     "/api/admin/data-packages/builder/turn": _PACKAGE_BUILDER_TURN_REASON,
+    "/api/admin/mcp-sources/builder/turn": _MCP_BUILDER_TURN_REASON,
+    "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
     "/api/me/elevation": (

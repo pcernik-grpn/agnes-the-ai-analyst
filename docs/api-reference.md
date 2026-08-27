@@ -852,6 +852,8 @@ section for the full operator flow. CLI: `agnes admin analytics migrate
 ### `/api/admin/mcp-sources` — MCP source management
 
 - /api/admin/mcp-sources
+- /api/admin/mcp-sources/builder/turn
+- /api/admin/mcp-sources/preview-introspect
 - /api/admin/mcp-sources/{source_id}
 - /api/admin/mcp-sources/{source_id}/classify
 - /api/admin/mcp-sources/{source_id}/introspect
@@ -1923,6 +1925,31 @@ a composite must not be a probe for someone's private item),
 `component_type_unsupported` (a plugin cannot contain a plugin — that would
 mean merging two manifests), `component_bundle_missing`,
 `component_path_conflict`, `components_too_large`.
+
+`POST /api/admin/mcp-sources/builder/turn` is the fourth builder-turn
+endpoint (after the agent, entity and package builders) and backs
+`/admin/mcp-sources/new`. It proposes into the panel and writes nothing.
+
+Two refusals in its sanitizer are specific to what it configures. A `url` the
+admin has not already typed is dropped — the model may not choose which host
+the instance dials, and "correcting" a URL is the same act as choosing one. An
+`auth_secret_env` that is not shaped like an environment-variable name is
+dropped, which is what stops a pasted token being written into a field that is
+stored and displayed.
+
+`POST /api/admin/mcp-sources/preview-introspect` dials a connection the admin
+has typed and returns its tool list, writing nothing — the same relationship to
+`POST /mcp-sources` that `/entities/preview` has to `POST /entities`. The
+builder needs it because you cannot sensibly choose which tools to grant, or
+name the source, without seeing what it exposes; the alternative was registering
+a disabled row first and introspecting that, which puts a source in the list the
+admin never agreed to create. It builds a row-shaped dict and runs the SAME url
+guard (`_check_source_url_or_400`) and the SAME introspection the registered
+path does, because a probe dials with a credential attached whether or not a row
+exists. The secret is never in the payload: `auth_secret_env` names a variable
+and the credential resolves out of the vault exactly as it does for a registered
+source, so a connection whose secret is not stored yet fails here with that
+reason.
 
 - /api/store/bundle.zip
 - /api/store/categories

@@ -6147,6 +6147,27 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
+@router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
+async def admin_mcp_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Connect a tool server, in the same builder shell the other four use.
+
+    /admin/mcp-sources stays the LIST. What moved here is the create path,
+    which was the least builder-shaped surface in the product: a modal with
+    eleven fields, then a second page to introspect, curate the tools and grant
+    them — an order the admin was expected to know, with no way to find out
+    whether the server was even reachable until step three.
+
+    It suits the shell better than it looks. The procedure is fixed, so the
+    conversation sequences work and reports what the server said rather than
+    inventing anything; the exact values still arrive by paste, into fields,
+    because a URL and an env var name are values from another system.
+    """
+    return templates.TemplateResponse(request, "admin_mcp_builder.html", _build_context(request, user=user))
+
+
 @router.get("/admin/data-packages/new", response_class=HTMLResponse)
 async def admin_package_builder(
     request: Request,

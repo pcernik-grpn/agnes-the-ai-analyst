@@ -1,0 +1,39 @@
+{% extends "base_index.html" %}
+{# Connect a tool server, in the builder shell /agents and /skills use.
+
+   /admin/mcp-sources stays as the LIST — this is the create path only, and it
+   is the one that was five steps across two pages: register, store a secret,
+   introspect, curate the tools, grant them. The page owns nothing but the
+   mount; mcp_builder.js owns the panel, the conversation and every request. #}
+
+{% block title %}Connect an MCP source — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{% block head_extra %}
+{# The builder workspace: two panes, the shell header, the full-bleed
+   breakout, the section cards, the picker modal. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{% endblock %}
+
+{% block page_head %}
+{# Deliberately empty — `body.ag-building` collapses this band, and the shell
+   header carries the title and the actions. #}
+{% endblock %}
+
+{% block page_surface %}
+<div id="mcp-builder-view"></div>
+{% endblock %}
+
+{% block scripts %}
+{# Not deferred: the builder mounts on boot, so BuilderShell has to exist
+   before the script below runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script src="{{ static_url('js/components/mcp_builder.js') }}"></script>
+<script>
+  (function () {
+    'use strict';
+    var mount = document.getElementById('mcp-builder-view');
+    if (!mount || !window.AgnesMcpBuilder) return;
+    window.AgnesMcpBuilder.open({ mount: mount });
+  })();
+</script>
+{% endblock %}

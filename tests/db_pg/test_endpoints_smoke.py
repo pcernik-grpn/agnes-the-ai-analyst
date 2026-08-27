@@ -1337,6 +1337,47 @@ class TestStoreSmoke:
         assert composed["type"] == "plugin"
 
 
+class TestMcpBuilderSmoke:
+    """The MCP builder: its page, and the turn that opens its conversation."""
+
+    COVERED_ROUTES = {
+        "GET /admin/mcp-sources/new",
+        "POST /api/admin/mcp-sources/builder/turn",
+    }
+
+    def test_builder_page_renders_for_an_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        assert "mcp-builder-view" in r.text
+
+    def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
+        """An empty first message is the builder speaking first; it must come
+        back with what is still open, so the panel can show progress."""
+        r = seeded_app_both["client"].post(
+            "/api/admin/mcp-sources/builder/turn",
+            json={"message": "", "history": []},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["engine"] in ("stub", "model")
+        assert [s["key"] for s in body["slots"]] == ["endpoint", "auth", "name", "tools"]
+        assert not any(s["known"] for s in body["slots"])
+
+    def test_it_writes_nothing(self, seeded_app_both):
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        before = client.get("/api/admin/mcp-sources", headers=headers)
+        client.post(
+            "/api/admin/mcp-sources/builder/turn",
+            json={"message": "connect our CRM server", "history": []},
+            headers=headers,
+        )
+        after = client.get("/api/admin/mcp-sources", headers=headers)
+        assert before.json() == after.json(), "a builder turn registered a source"
+
+
 # ---------------------------------------------------------------------------
 # Flea Upload — state machine, visibility rules
 # ---------------------------------------------------------------------------
@@ -2481,6 +2522,14 @@ KNOWN_UNTESTED = {
     "DELETE /api/admin/mcp-sources/{source_id}/secret",
     "DELETE /api/admin/mcp-tools/{tool_id}",
     "DELETE /api/admin/mcp-tools/{tool_id}/grants/{group_id}",
+    # Dials a connection the admin typed and reports its tools. A smoke test
+    # would have to stand up an MCP server or assert on a connection error,
+    # neither of which says anything about the endpoint — its contract (build a
+    # row-shaped dict, run the SAME url guard and introspection as the
+    # registered path, write nothing) is what matters and is covered by reading
+    # it. The registered sibling {source_id}/introspect is excluded just below
+    # for the same reason.
+    "POST /api/admin/mcp-sources/preview-introspect",
     # Grant/revoke a whole MCP source at once — tested in test_keboola_chat_tools.py
     "POST /api/admin/mcp-sources/{source_id}/grants",
     "DELETE /api/admin/mcp-sources/{source_id}/grants/{group_id}",

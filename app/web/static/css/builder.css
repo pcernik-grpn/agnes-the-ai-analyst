@@ -163,6 +163,12 @@ body.ag-building .idx > footer { display: none; }
 .ag-kind--unknown { color: var(--ds-text-muted); background: var(--ds-surface-sunken); }
 .ag-note { font-size: 12.5px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 9px; padding: 8px 12px; margin: 12px 0 0; }
 .ag-note a { color: var(--ds-primary); }
+/* Two tints on the neutral note, for the two things a builder has to say that
+   are not standing guidance: a step that failed, and a degraded engine. Both
+   stay the same box — a different SHAPE for an error would read as a different
+   kind of thing, and it is the same sentence slot. */
+.ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
+.ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }
 
 /* Boundaries (read-only, admin-managed). */
 .ag-bnd { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
@@ -251,6 +257,42 @@ body.ag-building .idx > footer { display: none; }
 /* Composer + starter chips. */
 .ag-comp { padding: 10px 22px 20px; }
 .ag-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+/* Suggested prompts under the composer. Deliberately the SAME chip as the
+   chat landing screen's "Suggested for you" row (.rdb-action in
+   chat_dashboard.css): both are "things you could say next" sitting under a
+   composer, and shipping two different chips for one idea is how a product
+   stops reading as one system. Copied rather than shared because the two
+   sheets have no common ancestor to hang it on — if a third surface grows
+   one, that is the moment to lift it.
+
+   Softened border and translucent fill so the row stays quiet under the
+   composer, which is the loud element; 11px rather than a pill because these
+   carry a sentence, and a full pill on a long label reads as a tag.
+
+   Scoped to .ag-chips: the bare .ag-chip above is the agent builder's TONE
+   selector, a segmented choice where the pill is right. */
+.ag-chips .ag-chip {
+  border: 1px solid color-mix(in srgb, var(--ds-border) 70%, transparent);
+  background: color-mix(in srgb, var(--ds-surface) 60%, transparent);
+  color: var(--ds-text-secondary);
+  border-radius: 11px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--ds-motion-fast) var(--ds-ease-standard),
+              border-color var(--ds-motion-fast) var(--ds-ease-standard);
+}
+.ag-chips .ag-chip:hover {
+  border-color: var(--ds-primary);
+  background: color-mix(in srgb, var(--ds-primary) 6%, var(--ds-surface));
+  color: var(--ds-text-primary);
+}
+.ag-chips .ag-chip:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
 .ag-chip { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); border-radius: var(--ds-radius-pill); padding: 6px 14px; font-size: 13px; font-family: inherit; cursor: pointer; }
 .ag-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
 .ag-comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 12px; background: var(--ds-surface); padding: 7px 7px 7px 14px; }

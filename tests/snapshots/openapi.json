@@ -5687,6 +5687,79 @@
         "title": "MaterializeRequest",
         "type": "object"
       },
+      "McpDraft": {
+        "description": "The panel as it stands. Untrusted; used only to build the prompt.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "auth_decided": {
+            "default": false,
+            "title": "Auth Decided",
+            "type": "boolean"
+          },
+          "auth_method": {
+            "default": "",
+            "maxLength": 32,
+            "title": "Auth Method",
+            "type": "string"
+          },
+          "auth_secret_env": {
+            "default": "",
+            "maxLength": 64,
+            "title": "Auth Secret Env",
+            "type": "string"
+          },
+          "command": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Command",
+            "type": "string"
+          },
+          "introspected": {
+            "default": false,
+            "title": "Introspected",
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "scope": {
+            "default": "shared",
+            "maxLength": 16,
+            "title": "Scope",
+            "type": "string"
+          },
+          "tool_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tool Names",
+            "type": "array"
+          },
+          "transport": {
+            "default": "http",
+            "maxLength": 16,
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "maxLength": 2048,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "title": "McpDraft",
+        "type": "object"
+      },
       "McpEntry": {
         "properties": {
           "description": {
@@ -5720,6 +5793,35 @@
           "name"
         ],
         "title": "McpEntry",
+        "type": "object"
+      },
+      "McpTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "title": "McpTurnRequest",
         "type": "object"
       },
       "MemberResponse": {
@@ -7209,6 +7311,92 @@
           "message"
         ],
         "title": "PreviewFieldIssue",
+        "type": "object"
+      },
+      "PreviewIntrospectRequest": {
+        "description": "A connection the admin has typed but not yet registered.",
+        "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
+          },
+          "auth_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Method"
+          },
+          "auth_secret_env": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Secret Env"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env"
+          },
+          "transport": {
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "transport"
+        ],
+        "title": "PreviewIntrospectRequest",
         "type": "object"
       },
       "PreviewRequest": {
@@ -13450,6 +13638,56 @@
           }
         },
         "summary": "Admin Mcp Sources Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/mcp-sources/new": {
+      "get": {
+        "description": "Connect a tool server, in the same builder shell the other four use.\n\n/admin/mcp-sources stays the LIST. What moved here is the create path,\nwhich was the least builder-shaped surface in the product: a modal with\neleven fields, then a second page to introspect, curate the tools and grant\nthem \u2014 an order the admin was expected to know, with no way to find out\nwhether the server was even reachable until step three.\n\nIt suits the shell better than it looks. The procedure is fixed, so the\nconversation sequences work and reports what the server said rather than\ninventing anything; the exact values still arrive by paste, into fields,\nbecause a URL and an env var name are values from another system.",
+        "operationId": "admin_mcp_builder_admin_mcp_sources_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Mcp Builder",
         "tags": [
           "web"
         ]
@@ -19841,6 +20079,134 @@
           }
         },
         "summary": "Create Mcp Source",
+        "tags": [
+          "admin-mcp"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/builder/turn": {
+      "post": {
+        "description": "Run one turn of the MCP builder. Proposes into the panel; writes nothing.\n\nRegistering the source, storing its secret and granting its tools are all\nthe admin's own button presses, made against a panel they can read.",
+        "operationId": "mcp_builder_turn_api_admin_mcp_sources_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mcp Builder Turn",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/mcp-sources/preview-introspect": {
+      "post": {
+        "description": "Dial a connection the admin has typed and list its tools. Writes nothing.\n\nThe builder needs to show what a server exposes BEFORE the admin presses\nSave \u2014 you cannot sensibly choose which tools to grant, or name the source,\nwithout seeing them. The alternative was registering a disabled row first\nand introspecting that, which puts a source in the list that the admin\nnever agreed to create.\n\nSame shape as ``POST /entities/preview``: the values that would be saved\ngo in, a verdict comes back, and the temp state is gone before the response\nis. It builds a row-shaped dict and runs the SAME guard and the SAME\nintrospection the registered path does \u2014 a probe dials with a credential\nattached, so it takes the configuration-time url check whether or not a row\nexists yet.\n\nThe secret is NOT in this payload and never should be: ``auth_secret_env``\nnames an environment variable, and the credential resolves out of the vault\nexactly as it does for a registered source. A connection whose secret is not\nstored yet fails here with the reason, which is the truthful answer \u2014 store\nit, then check.",
+        "operationId": "preview_introspect_mcp_source_api_admin_mcp_sources_preview_introspect_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewIntrospectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Introspect Mcp Source",
         "tags": [
           "admin-mcp"
         ]
