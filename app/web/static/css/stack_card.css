@@ -636,17 +636,20 @@
 .stack-card__btn--add:hover {
   background: var(--primary-dark, #0056A3);
 }
+/* --ds-accent-danger-* and --ds-accent-warn-* (#1625) — the border-color
+   hairlines stay their original pastel literals; they're decorative rims,
+   not text/background pairs, so they don't need a dark-theme value. */
 .stack-card__btn--remove {
-  background: #fff;
-  color: #b91c1c;
+  background: var(--ds-surface);
+  color: var(--ds-accent-danger-ink);
   border-color: #fecaca;
 }
 .stack-card__btn--remove:hover {
-  background: #fee2e2;
+  background: var(--ds-accent-danger-bg);
 }
 .stack-card__btn--required {
-  background: #fef3c7;
-  color: #92400e;
+  background: var(--ds-accent-warn-bg);
+  color: var(--ds-accent-warn-ink);
   border-color: #fde68a;
   cursor: not-allowed;
 }
@@ -720,8 +723,8 @@
   display: inline-block;
   margin-left: 6px;
   padding: 1px 6px;
-  background: #fef3c7;
-  color: #92400e;
+  background: var(--ds-accent-warn-bg);
+  color: var(--ds-accent-warn-ink);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
