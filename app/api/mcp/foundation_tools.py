@@ -2244,12 +2244,14 @@ def register_foundation_tools(
 
     @tool(read_only=False, idempotent=True)
     async def data_app_set_description(slug: str, description: str) -> dict:
-        """Set the admin description override on a managed (linked) data app.
+        """Set a data app's description — hosted or linked.
 
-        Linked apps are org resources whose ``description`` the ingest sync
-        refreshes; this pins a human-authored description the sync won't clobber.
-        Owner/Admin only; managed rows only (a 409 ``not_managed`` comes back for
-        a hosted app — edit those via the normal update flow).
+        For a linked app the ingest sync refreshes its ``description`` and this
+        pins a human-authored one the sync won't clobber. For a hosted app there
+        is no sync, so this is simply how the description changes after create
+        seeded it — worth knowing because an app's description is the one place
+        an agent can read what the app is and how to interrogate it without
+        waking its container. Owner/Admin only.
 
         Args:
             slug:        The app's slug.

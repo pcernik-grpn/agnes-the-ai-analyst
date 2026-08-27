@@ -11,6 +11,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **A hosted data app's description can be edited after it is created.**
+  `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
+  not_managed`, so a hosted app's description was write-once: `POST
+  /api/data-apps` seeded it and a typo could only be fixed by recreating the
+  app. Hosted rows now accept it too (Owner/Admin, unchanged). No new column —
+  every data-app reader already resolves through `effective_description`
+  (`description_override or description`), in `_serialize` and in the
+  library/RBAC projection alike, and a hosted row has no ingest sync to clobber
+  the value, so the existing override column simply holds its current
+  description. Matters more than a typo fix: an app's description is the one
+  place an agent can read what the app is and how to interrogate it **without
+  waking its container**, and a description frozen at creation goes stale the
+  first time the app grows a surface. `agnes app set-description` and the
+  `data_app_set_description` MCP tool drop their managed-only wording.
 
 - **`agnes admin config export` / `agnes admin config apply`** round-trip the
   server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
@@ -34,6 +48,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   apply unchanged — after filtering out any non-editable section or literal
   secret client-side. Supports `--dry-run` (diff against the current
   overlay, writes nothing).
+- **The chat agent now knows the web UI.** A new bundled workspace-template
+  skill, `agnes-web-guide`, gives every chat sandbox a page-by-page map of
+  the product — the rail, every user-facing page, the admin area, and a
+  "common questions → destinations" table — so when a user asks "where do I
+  ...?" the agent directs them to the same pages they actually see, instead
+  of denying a surface exists or inventing one. Kept honest by a new guard
+  (`tests/test_web_guide_skill_sync.py`): every user-facing route and every
+  admin-nav destination must be mentioned in the guide, and the guide may
+  only mention live paths — so adding, renaming, or retiring a page without
+  updating the guide fails CI in both directions. The guide also reaches
+  analyst laptops: it is mirrored into the built-in marketplace's
+  `agnes-analyst` plugin (granted to Everyone, distributed by
+  `agnes refresh-marketplace`), with the mirror pinned byte-identical to the
+  bundled original by the same guard.
+
 - **`chat_provider = "docker"` now provisions its own backing** in the
   `customer-instance` Terraform module, instead of only pinning the choice.
   Web chat's docker provider spawns each session through the apps-runner

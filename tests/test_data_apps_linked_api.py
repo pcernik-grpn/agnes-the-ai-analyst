@@ -169,10 +169,34 @@ def test_non_admin_cannot_set_description(linked_env):
     assert r.status_code == 403
 
 
-def test_description_override_rejected_on_hosted(linked_env):
+def test_hosted_app_description_is_editable(linked_env):
+    """A hosted app's description used to be write-once: `POST /api/data-apps`
+    set it and this route refused every hosted row with 409 `not_managed`, so a
+    typo could only be fixed by recreating the app. There is no sync behind a
+    hosted row, so the override column is simply its current description — and
+    every data-app reader already resolves through `effective_description`."""
     c, pats = linked_env["client"], linked_env["pats"]
-    r = c.patch("/api/data-apps/hosted-x", json={"description": "x"}, headers=_auth(pats["admin1"]))
-    assert r.status_code == 409  # not managed
+    r = c.patch("/api/data-apps/hosted-x", json={"description": "fixed"}, headers=_auth(pats["admin1"]))
+    assert r.status_code == 200, r.text
+    assert r.json()["effective_description"] == "fixed"
+    # and it survives a re-read, not just the write's own response
+    r2 = c.get("/api/data-apps/hosted-x", headers=_auth(pats["admin1"]))
+    assert r2.json()["effective_description"] == "fixed"
+
+
+def test_hosted_app_description_editable_by_owner_not_only_admin(linked_env):
+    """The gate is `_require_owner_or_admin` — an owner must not need an admin
+    to fix their own app's description."""
+    c, pats = linked_env["client"], linked_env["pats"]
+    owner_pat = pats.get("owner1") or pats.get("admin1")
+    r = c.patch("/api/data-apps/hosted-x", json={"description": "by owner"}, headers=_auth(owner_pat))
+    assert r.status_code == 200, r.text
+
+
+def test_stranger_still_cannot_edit_a_hosted_description(linked_env):
+    c, pats = linked_env["client"], linked_env["pats"]
+    r = c.patch("/api/data-apps/hosted-x", json={"description": "x"}, headers=_auth(pats["grantee1"]))
+    assert r.status_code == 403
 
 
 def _hide_linked(slug="kbc-sales"):
