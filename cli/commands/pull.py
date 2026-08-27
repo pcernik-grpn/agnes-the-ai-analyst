@@ -96,6 +96,7 @@ def pull(
         )
         raise typer.Exit(1)
 
+    explicit_workspace = bool(workspace_str)
     if workspace_str:
         workspace = Path(workspace_str).resolve()
     else:
@@ -121,6 +122,24 @@ def pull(
             )
             raise typer.Exit(1)
         workspace = resolved
+
+    # #1312 (remaining scope, item 1): `agnes pull` names the workspace it
+    # resolved (below), but until now never said whether that differs from
+    # the anchored `workspace_root` — the directory `agnes update` and the
+    # SessionStart/SessionEnd hooks converge. A pull that silently lands in
+    # the "wrong" (cwd) workspace looked identical to a correct one. An
+    # explicit `--workspace` is a deliberate override, not the silent
+    # divergence this is about, so it never gets the note.
+    from cli.lib.workspace_resolve import workspace_anchor
+
+    anchor = workspace_anchor()
+    if anchor is not None and not explicit_workspace and anchor != workspace and not (quiet or as_json):
+        typer.echo(
+            f"note: this differs from your configured workspace anchor ({anchor}) "
+            "— `agnes update` and the Claude Code hooks target that directory instead. "
+            "Run from there, or pass --workspace to make this pull's target explicit.",
+            err=True,
+        )
 
     # Legacy-hook nudge (#478): workspaces bootstrapped by the OLD server
     # flow (a `collect_session` / `server/scripts/` SessionEnd hook, no
@@ -212,6 +231,11 @@ def pull(
                     # cwd / the anchored workspace_root), so a scripted
                     # caller doesn't have to re-derive it.
                     "workspace": str(workspace),
+                    # #1312 — the configured `workspace_root` anchor (or
+                    # null when unset), so a scripted caller can detect the
+                    # same divergence the human-readable note above warns
+                    # about without re-reading config.yaml itself.
+                    "workspace_root": str(anchor) if anchor is not None else None,
                     "tables_updated": result.tables_updated,
                     "tables_removed": result.tables_removed,
                     "parquets_total": result.parquets_total,
