@@ -43,6 +43,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   instance that does not set it is unprotected, exactly as before.
 
 ### Changed
+- **BREAKING: Databricks Unity Catalog metric views now flow through the
+  semantic-source adapter contract, like Snowflake — no more direct
+  `metric_definitions` writer.** A new `databricks_semantic` adapter
+  (`connectors/databricks/semantic_ossie.py`) composes one Apache Ossie
+  document per metric view (measures → metrics, dimensions → dataset
+  fields, every expression tagged dialect `DATABRICKS`); a metric's
+  dialect expression is the full `SELECT MEASURE(...) FROM <metric view>`
+  statement (not the bare `expr` fragment, which is not runnable on its
+  own), and it projects into `metric_definitions` as a warehouse-only row
+  with a "run server-side" note — Task A's projector, now exercised by a
+  second connector. `POST /api/admin/run-databricks-semantic-layer-refresh`
+  keeps its path, scheduler cadence and single-flight guard, but now
+  registers the workspace as a `connection`-kind semantic source (fixed id
+  `databricks_default`) and syncs it via `src.semantic.transports.
+  import_source` — its response shape changed from the old counters
+  (`created_or_updated`/`pruned`/...) to the generic import report
+  (`models_written`/`models_pruned`/`projection`/...). Rows land stamped
+  `source='ossie_connection'` + `source_ref='databricks_default'` instead
+  of `source='databricks_semantic_layer'` + the workspace host; every
+  refresh reconciles any rows still carrying the old stamp (one-time,
+  idempotent — a no-op once they're gone), so an upgrading instance loses
+  nothing. This was the last connector writing `metric_definitions`
+  directly — every source (native, git, upload, Keboola, Snowflake,
+  Databricks) now goes through the same document → projector pipeline.
 
 ### Fixed
 - **Dark theme: several light-hex backgrounds that never flipped now use
@@ -55,6 +79,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   guard (`tests/test_design_system_contract.py::test_no_raw_hex_light_background_outside_theme_scope`)
   that scans every shipped stylesheet, not just the templates a past sweep
   happened to touch. Part of #1625.
+- **A stolen PAT can no longer be laundered into a 30-day MCP refresh token.**
+  The MCP-OAuth consent bridge (`/api/mcp/oauth/consent`) resolved its
+  `Authorization: Bearer` header through the generic token resolver, which
+  accepts a plain personal access token — so a caller holding only a PAT could
+  drive the consent POST, mint an authorization code, and exchange it for an
+  access token *plus* a 30-day refresh token that outlived revoking the PAT it
+  came from. The bridge's existing cross-origin gate did not cover this: it is
+  a CSRF control against a tricked browser, and a programmatic caller simply
+  sends the matching `Origin`. Consent now requires a genuine interactive
+  session, applying the same classification `require_session_token` already
+  enforces on `POST /auth/tokens` and MCP connect — PATs, agent PATs, the
+  scheduler secret, and `X-StorageApi-Token` are refused, as are agent-surface
+  session JWTs (the web-chat sandbox token, and an MCP-OAuth connector token
+  re-consenting itself an endless chain of fresh refresh tokens). The browser
+  consent flow, which authenticates by the `access_token` cookie, is unchanged.
+
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
 - The "Add data source" wizard's Snowflake table picker no longer renders a
