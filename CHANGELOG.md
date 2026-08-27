@@ -112,6 +112,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   grant; non-admin uploads and chat file drops stay private. The
   `POST /api/collections` response now reports the resulting `visibility`
   (`workspace`/`private`).
+
 - **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
   (remediation-program Track C1.1, additive — the builder router is
   unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
@@ -133,6 +134,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
   also cleans up sharing grants on delete, closing a gap versus the
   builder's own delete.
+
 - **`agent_scope` rows now record who granted them, and a non-admin writer
   can no longer declare a data item they cannot themselves reach**
   (remediation-program Track C2.1, staged agent-owned authority — no
@@ -149,7 +151,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   uses `granted_by` to let an admin-shared agent reach items its owner
   personally does not hold.
 
-
 - **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
   the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
   `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
@@ -160,6 +161,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (a missing `auth.allowed_domain` discarded the whole static config with an
   ERROR log) and is now a passive warning, so the gap needed its own explicit
   check.
+
 - Snowflake connection spec in `src/connection_specs.py` (config keys
   `account`/`user`/`database`/`warehouse`/`role`/`auth_type`, mirroring
   `resolve_snowflake_settings`'s read set), and first-boot seeding
@@ -167,6 +169,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `source_connections` rows from `instance.yaml`, matching the existing
   Keboola/BigQuery seeding — see the connection-ownership table in
   `docs/DATA_SOURCES.md`.
+
 - **The Snowflake/BigQuery/Databricks `source_connections` row is now the
   live source of truth, resolved fresh on every call** (D2 slice 2):
   `resolve_snowflake_settings()`/`resolve_databricks_settings()` and
@@ -179,6 +182,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   materialized sync (and every other threaded call site — extract-init,
   discovery, v2 schema/scan, semantic syncs, card probes) now resolves
   against exactly the registered connection's coordinates and credential.
+
 - **Security: a connection's config-embedded `token_env`/`private_key_env`/
   `private_key_passphrase_env` (Snowflake/Databricks) is now allowlist-checked
   at write time** (`POST`/`PUT /api/admin/source-connections`), the same
@@ -206,6 +210,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   token-env allowlist alongside `SNOWFLAKE_PASSWORD`/`SNOWFLAKE_PRIVATE_KEY`
   so the module's own default key-pair passphrase path keeps working
   unconfigured.
+
 - **Security: the `source_connections` default/identity-repoint guard now
   covers every way to change WHICH connection (if any) a source_type
   resolves against — promote, demote, wipe, and delete.** Guarded from the
@@ -312,6 +317,31 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **VM auto-upgrade refreshes host artifacts from the release image, not
+  the repo's raw `main` branch.** The 5-minute tick
+  (`scripts/ops/agnes-auto-upgrade.sh`) now extracts the bind-mounted
+  config files (compose overlays, Caddyfile, the data-app subdomain vhost
+  fragment, maintenance page, the compose-file resolver) and its own
+  self-update from `/opt/agnes-host/` inside the pinned image — the same
+  artifact contract the boot startup script already uses — instead of
+  curling the public `raw.githubusercontent.com/.../main` URLs. Every
+  artifact, without exception: the vhost fragment's refresh was the last
+  raw-`main` fetch, and leaving it behind would have been worse than
+  cosmetic — its `$RAW_BASE` base URL no longer had a definition, so under
+  `set -euo pipefail` the expansion aborted the whole tick on any VM with
+  `APPS_SUBDOMAIN_BASE` set, stopping auto-upgrade there for good (the
+  self-update that would have shipped the repair never ran). Host config
+  now stays in lockstep with the image tag the VM actually runs (a config
+  change rides the release that ships it, instead of racing ahead of — or
+  outliving — the image), and the tick keeps working when the source
+  repository is private or the host's egress is restricted to the
+  container registry.
+  Failure posture is unchanged: a failed pull/extract keeps the existing
+  file and WARNs to syslog. Rollout note: a VM still running the previous
+  curl-based script picks this up on its next reboot/recreate (the boot
+  path extracts the script from the image); the old script's raw-fetch
+  self-update cannot deliver it while the repo is private.
+
 - **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
   `none` (internal-only network, no route to the internet) instead of `open`.
   The chat agent runs with bypassed tool permissions over a read-write
@@ -320,7 +350,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   with `chat.docker_egress_mode: open`, or `allowlist` +
   `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
   or blank value now fails closed to `none`.
-
 
 - **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
   Databricks panes now save the connection onto the `source_connections` ROW
@@ -340,6 +369,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `/admin/connections` instead. Multi-connection-per-type stays out of scope
   for this slice — one Snowflake/Databricks connection per instance, as
   before.
+
 - **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
   `experience`, `home_route` and `studio_enabled` knobs stop rewriting
   `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
@@ -358,6 +388,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   is unaffected (it pins deployment-provisioned backing, not a presentation
   choice, so it is out of scope). See the new "Config ownership map" in
   `docs/CONFIGURATION.md`.
+
 - **A THIRD-PARTY admin-granted agent scope item now reaches its agent
   unconditionally, instead of being silently narrowed to the owner's own
   grants** (remediation-program Track C2.2, consuming C2.1's `granted_by`).
@@ -395,11 +426,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.
+
 - Agent-session principals no longer crash (500) when reaching collection
   authorization (`accessible_collection_ids`, `require_collection_access`);
   an `AgentPrincipal` now resolves to its live scoped-collection intersection
   or a clean 403, matching the existing co-session/agent-session seam and
   never inheriting owner-owned collections.
+
 - Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
   the same canonical subpath used for policy and dispatcher classification, and
   rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
@@ -409,35 +442,39 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
   duplicate-slash message paths can likewise no longer route the destination
   somewhere the authorization decision did not intend.
+
 - Token persistence refuses to write (instead of silently downgrading to
   plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
   valid Fernet key; a genuinely unset key still uses the plaintext keyless
   fallback as before. A previously-silent misconfigured production vault now
   fails loudly on secret saves instead of writing the secret in cleartext.
 
-
 - Web chat: a user message's hover actions (timestamp + copy) now hang
   BELOW the bubble instead of renting an invisible second row inside it —
   a one-line message no longer renders as a two-row-tall bubble. On touch
   devices (no hover) the row stays visible and the turn reserves the space.
+
 - Web chat: on a history reload, a multi-part assistant turn (text → tool
   card → text) now carries its sources chips, copy/actions row, "Ask again"
   and collapse cap on the turn's LAST text segment — where the live stream
   already put them — instead of stapling them after the first segment,
   mid-turn. The reload timestamp also reads the row's real `created_at` on
   every segment rather than "now" on continuations.
+
 - Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
   The sessions/messages endpoints (incl. copresence) pre-stringified their
   naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
   that labels them `+00:00` — the browser then parsed the offset-less
   string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
   They now return raw datetimes and the encoder stamps the offset.
+
 - Web chat: the permanent "Connected." pill is gone — connected is the
   normal state and reconnection is automatic, so the status surfaces only
   when something is in progress or wrong ("Resuming session…", warnings,
   errors), as a pill below the thread header. "Copy transcript" moves to
   the header's right edge (the removed pill's spot) restyled as a quiet
   ghost button, and a cleared status no longer leaves an empty dot-pill.
+
 - **The GCP Cloud Logging overlay can no longer take an instance down**
   (#1557, #1558; observed live as a 9-minute full outage on a routine
   auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
@@ -460,6 +497,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `COMPOSE_FILE` and the recurring resolver can never disagree about the
   overlay again, and a missing IAM role now degrades to "Cloud Logging off
   + loud warning" instead of an outage.
+
 - **`config/loader.py` no longer raises on a static `instance.yaml` missing
   `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
   `auth.webapp_secret_key`.** The check never actually gated anything: a
@@ -469,6 +507,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   warning naming the missing field(s) instead of raising, so a direct caller
   of `config.loader.load_instance_config()` (e.g. a connector script) no
   longer gets an exception on an otherwise-bootable config.
+
 - `POST`/`PUT /api/admin/source-connections` now validate `source_type` +
   `config` via `src.connection_specs.validate_connection_config`: an unknown
   `source_type` or a malformed config (e.g. a non-`https://` `stack_url`, a
@@ -522,6 +561,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   create that never did. Direct callers of `/api/agents*` (there were none
   outside this repo's own web UI) must move to `/api/v1/agents*`; see
   `docs/api-reference.md`.
+
 - **Deleted dead config surfaces flagged by the 2026-08 audit.** The
   `jira:` section is gone from both the `/admin/server-config` UI (it never
   had any `instance.yaml` wiring — `connectors/jira/service.py` reads
@@ -536,25 +576,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
-- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
-  A fast, pure-file-parse test that catches the recurring silent-rebase
-  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
-  into an already-released section — sometimes duplicating a version heading —
-  while reporting zero conflicts; it struck four times during the 2026-08
-  remediation program). Asserts exactly one `## [Unreleased]` heading, no
-  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
-  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
-  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
-  passes the first three. Reuses `assert_no_duplicate_headings` /
-  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
-  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
-  carrying that fourth corruption at the time this guard was written — `###
-  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
-  `### Internal` block — so this change also repairs it: each group is
-  consolidated into its first occurrence and `### Internal` moves last. All
-  3489 bullets and all 15513 lines of released history are byte-identical; the
-  only lines removed are the three duplicate group headings. No behavior
-  change.
 - **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
   genuine schema change on an existing DuckDB↔Postgres pair under the A3
   PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
@@ -566,22 +587,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   0073_agent_scope_granted_by.py` backfills every pre-existing row to its
   agent's `owner_user_id`.
 
-
-- **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
-  second genuine schema change on an existing DuckDB↔Postgres pair under
-  the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
-  "Adding a PG-only feature".** No DuckDB `_vN_to_v(N+1)` step, no
-  `SCHEMA_VERSION` bump; `LlmUsageRepository.insert_batch` (DuckDB) accepts
-  the same `caller_user_id` row key for call-site symmetry but has no
-  column to persist it into, and its new
-  `usage_breakdown_by_caller_for_month` degrades to a single, honestly
-  unattributed (`caller_user_id=None`) bucket there, while the Postgres
-  sibling groups by the real column. `migrations/versions/
-  0074_llm_usage_caller_user_id.py` adds the column with NO backfill — a
-  pre-existing row's actual caller is genuinely unknown, unlike
-  `granted_by`'s owner backfill (every pre-C2.1 write path was
-  ownership-gated; no equivalent fact exists for who was driving a past
-  turn).
 - **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
 - **PG-first development rule (remediation-program Track A3): the DuckDB
@@ -606,6 +611,43 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
+
+- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
+  A fast, pure-file-parse test that catches the recurring silent-rebase
+  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
+  into an already-released section — sometimes duplicating a version heading —
+  while reporting zero conflicts; it struck four times during the 2026-08
+  remediation program). Asserts exactly one `## [Unreleased]` heading, no
+  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
+  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
+  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
+  passes the first three. Reuses `assert_no_duplicate_headings` /
+  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
+  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
+  carrying that fourth corruption at the time this guard was written — `###
+  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
+  `### Internal` block — so this change also repairs it: each group is
+  consolidated into its first occurrence and `### Internal` moves last. All
+  3489 bullets and all 15513 lines of released history are byte-identical; the
+  only lines removed are the three duplicate group headings. No behavior
+  change.
+
+- **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
+  second genuine schema change on an existing DuckDB↔Postgres pair under
+  the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
+  "Adding a PG-only feature".** No DuckDB `_vN_to_v(N+1)` step, no
+  `SCHEMA_VERSION` bump; `LlmUsageRepository.insert_batch` (DuckDB) accepts
+  the same `caller_user_id` row key for call-site symmetry but has no
+  column to persist it into, and its new
+  `usage_breakdown_by_caller_for_month` degrades to a single, honestly
+  unattributed (`caller_user_id=None`) bucket there, while the Postgres
+  sibling groups by the real column. `migrations/versions/
+  0074_llm_usage_caller_user_id.py` adds the column with NO backfill — a
+  pre-existing row's actual caller is genuinely unknown, unlike
+  `granted_by`'s owner backfill (every pre-C2.1 write path was
+  ownership-gated; no equivalent fact exists for who was driving a past
+  turn).
+
 - **The CHANGELOG integrity guard now rejects a duplicated *bullet* under
   `[Unreleased]`, not just a duplicated group heading.** The guard's fourth
   check catches `### Added` … `### Added`, and the tempting repair for that is
