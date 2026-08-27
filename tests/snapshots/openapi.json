@@ -3887,6 +3887,90 @@
         "title": "EntityRating",
         "type": "object"
       },
+      "FactsNeighborsRequest": {
+        "properties": {
+          "depth": {
+            "default": 1,
+            "maximum": 2.0,
+            "minimum": 1.0,
+            "title": "Depth",
+            "type": "integer"
+          },
+          "edge_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Types"
+          },
+          "fanout": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Fanout",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 500,
+            "maximum": 500.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "subject_id": {
+            "title": "Subject Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_id"
+        ],
+        "title": "FactsNeighborsRequest",
+        "type": "object"
+      },
+      "FactsSearchRequest": {
+        "properties": {
+          "filters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filters"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "title": "FactsSearchRequest",
+        "type": "object"
+      },
       "FileEntry": {
         "description": "One file in a plugin / skill / agent bundle. Path is relative to the\nbundle root; size is bytes (rendered with ``humanbytes`` on the client).",
         "properties": {
@@ -35115,6 +35199,209 @@
         "summary": "Debug Throw",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/api/facts/neighbors": {
+      "post": {
+        "description": "Bounded graph traversal from one subject.\n\nAn edge appears in the response only if it has its own readable claim\n(never inferred from its endpoints' visibility) AND both its endpoint\nfacts are independently visible to the caller \u2014 traversal never walks\nfrom a visible subject into one whose claims are unreadable, and never\nreveals that a path continues past it (spec \u00a75 rule 3). `depth`\ndefaults to 1 (max 2), `fanout` per node and total `limit` are capped,\nand the underlying query runs under a Postgres statement timeout.\nResponse: ``{\"nodes\": [...], \"edges\": [...], \"truncated\": {\"depth\",\n\"fanout\", \"result\"}}``. `404` (never `403`) when `subject_id` does not\nexist or has no readable claim \u2014 indistinguishable from the caller's\npoint of view (spec \u00a75 rule 2).",
+        "operationId": "facts_neighbors_api_facts_neighbors_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsNeighborsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Neighbors Api Facts Neighbors Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Neighbors",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/search": {
+      "post": {
+        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). Response:\n``{\"subjects\": [{\"id\", \"type\", \"aliases\", \"attrs\", \"claim_count\",\n\"quote_count\", \"revealed\"}], \"limit_applied\"}`` \u2014 `limit_applied` is\nTrue only when the CALLER'S OWN readable result set exceeds `limit`,\nnever a signal that grants hid additional matches.",
+        "operationId": "facts_search_api_facts_search_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Search Api Facts Search Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Search",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/{subject_id}/claims": {
+      "get": {
+        "description": "The caller's readable evidence for one subject (fact or edge).\n\nEach entry carries the evidencing document's identity (``corpus_id``,\n``corpus_file_id``, ``document: {name, path, source_url?}``), the\nverbatim ``quote``, that claim's own (unprojected) ``attrs``, and\n``document_date``. A subject under an active `revealed` correction is\nserved to every authenticated caller regardless of grants, but with\nevery ``quote`` suppressed to an empty string (`\"revealed\": true` on\nthe response marks this). `404` (never `403`) when `subject_id` does\nnot exist or has no readable claim \u2014 same status, body shape, and cost\nprofile either way (spec \u00a75 rule 2): this endpoint never lets a caller\ndistinguish \"nothing there\" from \"something you can't see\".",
+        "operationId": "facts_claims_api_facts__subject_id__claims_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "title": "Subject Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Claims Api Facts  Subject Id  Claims Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Claims",
+        "tags": [
+          "facts"
         ]
       }
     },

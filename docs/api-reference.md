@@ -1402,6 +1402,27 @@ viewable by the person it was shared with.
 - /api/collections/{collection_id}/files/{file_id}/raw
 - /api/collections/{collection_id}/files/{file_id}/reingest
 
+### `/api/facts` — Fact graph over Collections (read surface)
+
+Typed subjects (facts/edges) extracted from Collections documents, each
+claim carrying its evidencing document, a verbatim quote and a date. Behind
+the `facts` feature flag (off by default; `404` on the whole router when
+disabled) and Postgres-only (A3 ratchet — a DuckDB-backed instance answers a
+typed `501`). Any authenticated caller may call these; there is no admin
+gate — visibility is enforced entirely server-side, per caller, from
+readable collection grants (see
+`docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`
+§4/§5). `search` and `neighbors` project attributes and traverse edges from
+readable claims only; `claims` returns the caller's readable evidence for
+one subject, `404` (never `403`) when it does not exist or has no readable
+claim. This is a **read surface only** — the ingest endpoint that writes
+facts is a separate follow-up; so are the CLI (`agnes facts …`) and MCP
+(`fact_search`/`fact_neighbors`/`fact_claims`) surfaces.
+
+- /api/facts/search
+- /api/facts/neighbors
+- /api/facts/{subject_id}/claims
+
 ### `/api/connectors` — Connector manifest
 
 - /api/connectors/manifest

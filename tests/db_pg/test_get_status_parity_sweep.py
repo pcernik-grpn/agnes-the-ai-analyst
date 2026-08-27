@@ -35,6 +35,15 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # merely return some unrelated 4xx. Empty until the first PG-only route ships
 # (Track C); the mechanism itself is proven in
 # `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
+#
+# The fact graph over Collections (first PG-only route, see
+# test_mutation_status_parity_sweep.py) has no GET entry here on purpose:
+# its one GET route, `/api/facts/{subject_id}/claims`, carries a path param
+# and is out of scope for THIS sweep by construction (`collect_statuses`
+# skips any path containing "{") — same treatment as every other path-param
+# endpoint in the codebase, none of which are exempted here either. Its two
+# parameter-free routes (`search`, `neighbors`) are POST, so they live in
+# the mutation sweep instead.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {}
 
 

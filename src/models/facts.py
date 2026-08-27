@@ -1,0 +1,127 @@
+"""SQLAlchemy models for the fact graph over Collections (PG-only, A3
+ratchet — no DuckDB sibling).
+
+Mirrors migrations/versions/0076_facts_tables.py. See
+docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md §3
+for the schema rationale and §5 for why every read goes through
+``src/repositories/facts_pg.py``'s single shared visibility helper rather
+than through these models directly.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+
+import sqlalchemy as sa
+from sqlalchemy import Date, DateTime, ForeignKey, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from src.db_pg import Base
+
+
+class Fact(Base):
+    __tablename__ = "facts"
+    __table_args__ = (sa.Index("idx_facts_type", "type"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    type: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class FactAlias(Base):
+    """Producer node id `<type>:<slug>` resolution table.
+
+    No surrogate id column (spec §3) — `(type, natural_key)` IS the row's
+    identity, hence the composite primary key. `type` is denormalized from
+    `facts.type` (like `corpus_id` on claims) so the alias lookup never
+    joins.
+    """
+
+    __tablename__ = "fact_aliases"
+    __table_args__ = (sa.Index("idx_fact_aliases_fact_id", "fact_id"),)
+
+    type: Mapped[str] = mapped_column(String, primary_key=True)
+    natural_key: Mapped[str] = mapped_column(String, primary_key=True)
+    fact_id: Mapped[str] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False)
+
+
+class Edge(Base):
+    __tablename__ = "edges"
+    __table_args__ = (
+        sa.UniqueConstraint("src", "type", "dst", name="uq_edges_src_type_dst"),
+        sa.Index("idx_edges_src", "src"),
+        sa.Index("idx_edges_dst", "dst"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    src: Mapped[str] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False)
+    dst: Mapped[str] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=False)
+    type: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class Claim(Base):
+    """One document saying one thing about one subject (§2 — the unit).
+
+    Exactly one of ``fact_id``/``edge_id`` is set (``ck_claims_fact_xor_edge``).
+    ``corpus_id`` is denormalized from the claim's ``corpus_file_id`` so the
+    visibility predicate (§5) is a single indexed equality filter, never a
+    join, at every traversal hop.
+    """
+
+    __tablename__ = "claims"
+    __table_args__ = (
+        sa.CheckConstraint("(fact_id IS NULL) <> (edge_id IS NULL)", name="ck_claims_fact_xor_edge"),
+        sa.Index("idx_claims_corpus_id", "corpus_id"),
+        sa.Index("idx_claims_fact_id", "fact_id"),
+        sa.Index("idx_claims_edge_id", "edge_id"),
+        sa.Index("idx_claims_corpus_file_id", "corpus_file_id"),
+        # Functional unique index — Postgres cannot express COALESCE in a
+        # plain UNIQUE table constraint (spec §3); backs §7.2's union-mode
+        # ingest idempotency.
+        sa.Index(
+            "uq_claims_subject_file_quote",
+            sa.text("COALESCE(fact_id, edge_id)"),
+            sa.text("corpus_file_id"),
+            sa.text("quote_hash"),
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    fact_id: Mapped[str | None] = mapped_column(String, ForeignKey("facts.id", ondelete="CASCADE"), nullable=True)
+    edge_id: Mapped[str | None] = mapped_column(String, ForeignKey("edges.id", ondelete="CASCADE"), nullable=True)
+    corpus_file_id: Mapped[str] = mapped_column(
+        String, ForeignKey("corpus_files.id", ondelete="CASCADE"), nullable=False
+    )
+    corpus_id: Mapped[str] = mapped_column(String, nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String, nullable=False)
+    attrs: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)
+    quote: Mapped[str] = mapped_column(Text, nullable=False)
+    quote_hash: Mapped[str] = mapped_column(String, nullable=False)
+    document_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
+    )
+
+
+class Correction(Base):
+    """Admin verdict on a subject (`wrong` / `restricted` / `revealed`),
+    enforced at read time in every repository read method (§4), never
+    cascaded with its subject — see ``natural_keys`` docstring below.
+    """
+
+    __tablename__ = "corrections"
+    __table_args__ = (sa.Index("idx_corrections_natural_keys_gin", "natural_keys", postgresql_using="gin"),)
+
+    subject_kind: Mapped[str] = mapped_column(String, primary_key=True)  # 'fact' | 'edge'
+    subject_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # Snapshot of the subject's natural keys (a fact's alias keys; an edge's
+    # [src_key, type, dst_key]) so a subject deleted and later re-created
+    # under a new surrogate id re-attaches this correction at write time.
+    natural_keys: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    verdict: Mapped[str] = mapped_column(String, nullable=False)  # 'wrong' | 'restricted' | 'revealed'
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    decided_by: Mapped[str] = mapped_column(String, nullable=False)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
+    )
