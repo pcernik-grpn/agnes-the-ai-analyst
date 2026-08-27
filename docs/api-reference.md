@@ -512,15 +512,21 @@ administrators out of the instance.
 (`${STATE_DIR}/instance.yaml`) filtered to the editable sections — not the
 merged, env-resolved config `GET /api/admin/server-config` serves. An
 unresolved `${VAR}` reference or an env-var NAME field (`token_env`) passes
-through unchanged; a literal cleartext value under a secret-shaped key
-(`smtp_password`, …) is omitted. `agnes admin config export`/`apply` wrap
-this endpoint and the partial-patch POST above into a round-trip: export the
-overlay to a file, review/edit it, commit it, and `apply` it to a new or
-existing instance through the exact same validated path an admin's form
-save would use. This is the "onboard a new client via a reviewed PR"
-building block — REST+CLI only, never MCP-exposed (same reasoning as the
-sections above: it is a one-call dump of the instance's editable config
-surface).
+through unchanged; a literal never leaves the server in two cases: (a) the
+`connectors` section is free-form and admin-typed (per-connector keys with
+no static schema, e.g. a Slack webhook URL) so every literal there is
+omitted regardless of key name, and (b) a value that is unambiguously
+credential-shaped (a JWT, a PEM block, a URL carrying userinfo or a long
+opaque token segment) is omitted everywhere else too. The response's
+`omitted_keys` lists every dropped path — nothing is silently discarded.
+`agnes admin config export`/`apply` wrap this endpoint and the partial-patch
+POST above into a round-trip: export the overlay to a file (the CLI prints
+a comment header + stderr note listing anything `omitted_keys` reported),
+review/edit it, commit it, and `apply` it to a new or existing instance
+through the exact same validated path an admin's form save would use. This
+is the "onboard a new client via a reviewed PR" building block — REST+CLI
+only, never MCP-exposed (same reasoning as the sections above: it is a
+one-call dump of the instance's editable config surface).
 
 ### 5.3 BigQuery config shape
 

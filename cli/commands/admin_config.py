@@ -57,9 +57,17 @@ def _scrub_secrets(value: Any, secret_patterns: list[str], warned: list[str], pa
     leaves this machine.
 
     ``secret_patterns`` comes from the server's own GET /server-config
-    response (``secret_key_patterns``) — this is defense-in-depth, not the
-    authoritative gate; the server never accepts a literal secret through
-    this path either way, since `apply` is meant for git-committed config.
+    response (``secret_key_patterns``) — this is defense-in-depth, NOT the
+    authoritative gate. The server enforces the section ALLOWLIST on
+    write, not secret-value blocking: `POST /server-config` has always
+    accepted a literal secret when an admin types one into the settings
+    form (e.g. `email.smtp_password`), and `apply` must not change that —
+    an admin onboarding a brand-new connector legitimately types its
+    credential straight into the `connectors` section (see
+    `app.api.admin._FREE_FORM_EXPORT_SECTIONS`'s docstring). This scrub is
+    the only thing standing between a leftover literal secret and a
+    git-committed apply file; it protects against re-applying a stale
+    export, not against an admin who deliberately wants to set one.
     A key ending in ``_env`` (an env-var NAME), a ``${VAR}`` reference, or a
     boolean value is left alone — a boolean cannot itself be a credential,
     and several switches (e.g. `mcp.allow_query_param_token`) have "token"/
@@ -113,15 +121,37 @@ def export_config(
     with secret-shaped literal values already stripped server-side. The
     output is valid `agnes admin config apply` input — commit it to a
     reviewed PR to onboard a new client from a known-good baseline.
+
+    Some values are never emitted at all — a real credential typed
+    directly into a free-form section (e.g. a per-connector webhook URL
+    under `connectors`) or anything that looks unambiguously like a
+    credential regardless of section (a URL with an embedded token, a JWT,
+    a PEM block, …). This is not a silent drop: every omitted key path is
+    listed in a comment header (YAML output) and on stderr, so you know
+    what to set via env/`${VAR}` on the target instance.
     """
     resp = api_get("/api/admin/server-config/overlay")
     if resp.status_code != 200:
         _fail(resp)
-    sections = resp.json().get("sections", {})
+    body = resp.json()
+    sections = body.get("sections", {})
+    omitted_keys = body.get("omitted_keys", [])
+    if omitted_keys:
+        typer.echo(
+            f"Note: {len(omitted_keys)} value(s) omitted as potentially secret — "
+            f"set these via env/${{VAR}} on the target: {', '.join(omitted_keys)}",
+            err=True,
+        )
     if as_json:
         text = json.dumps(sections, indent=2, sort_keys=True) + "\n"
     else:
         text = yaml.dump(sections, default_flow_style=False, sort_keys=True)
+        if omitted_keys:
+            header_lines = [
+                f"# agnes admin config export: {len(omitted_keys)} value(s) omitted as potentially secret.",
+                "# Set these via env/${VAR} on the target instance:",
+            ] + [f"#   - {key}" for key in omitted_keys]
+            text = "\n".join(header_lines) + "\n" + text
     if out:
         out.write_text(text)
         typer.echo(f"Wrote {out}")

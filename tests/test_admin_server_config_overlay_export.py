@@ -213,3 +213,223 @@ class TestOverlayExportApplyRoundTrip:
         reapplied = yaml.safe_load((state / "instance.yaml").read_text())
         assert reapplied["email"]["smtp_password"] == "real-secret-value"
         assert reapplied["email"]["smtp_host"] == "smtp.example.com"
+
+
+class TestFreeFormSectionFailClosed:
+    """`connectors` is a free-form, admin-typed dict — per-connector slugs
+    (e.g. `connector-slack`) come from the runtime seed manifest, not any
+    static registry, and the section's own hint text SANCTIONS storing a
+    literal credential there (`SLACK_WEBHOOK_URL`, `CONSUMER_KEY`, …). A
+    key-name blocklist (`_SECRET_KEY_PATTERNS`) cannot police a key it has
+    never seen, so export must fail closed for this whole section: keep
+    only `${VAR}` references and `*_env`-named keys, omit every other
+    literal — regression coverage for the leak a key-name-only scrub let
+    through (BLOCKING finding on PR #1607)."""
+
+    def test_literal_connector_credential_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "connectors": {
+                        "connector-slack": {
+                            "SLACK_WEBHOOK_URL": (
+                                "https://hooks.chat-example.test/services/T00000000/B00000000/7fA9kQ3mZpL1xR2vN4hT6bY8"
+                            ),
+                            "CONSUMER_KEY": "a-literal-consumer-key-value",
+                        }
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        slack = data["sections"]["connectors"]["connector-slack"]
+        assert "SLACK_WEBHOOK_URL" not in slack
+        assert "CONSUMER_KEY" not in slack
+        assert "hooks.chat-example.test" not in resp.text
+        assert "a-literal-consumer-key-value" not in resp.text
+        assert "connectors.connector-slack.SLACK_WEBHOOK_URL" in data["omitted_keys"]
+        assert "connectors.connector-slack.CONSUMER_KEY" in data["omitted_keys"]
+
+    def test_env_ref_and_env_name_key_survive_inside_free_form_section(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "connectors": {
+                        "connector-slack": {
+                            "SLACK_WEBHOOK_URL": "${SLACK_WEBHOOK_URL}",
+                            "webhook_url_env": "SLACK_WEBHOOK_URL",
+                        }
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        slack = resp.json()["sections"]["connectors"]["connector-slack"]
+        assert slack["SLACK_WEBHOOK_URL"] == "${SLACK_WEBHOOK_URL}"
+        assert slack["webhook_url_env"] == "SLACK_WEBHOOK_URL"
+        assert resp.json()["omitted_keys"] == []
+
+
+class TestValueShapeBackstop:
+    """Defense-in-depth: a literal that is unambiguously credential-shaped
+    is omitted regardless of section or key name — catches a secret pasted
+    into an innocuously-named field anywhere in the overlay."""
+
+    def test_webhook_url_under_innocuous_key_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "email": {
+                        "smtp_host": "smtp.example.com",
+                        "notify_url": (
+                            "https://hooks.chat-example.test/services/T00000000/B00000000/7fA9kQ3mZpL1xR2vN4hT6bY8"
+                        ),
+                    }
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        email = data["sections"]["email"]
+        assert email["smtp_host"] == "smtp.example.com"
+        assert "notify_url" not in email
+        assert "hooks.chat-example.test" not in resp.text
+        assert "email.notify_url" in data["omitted_keys"]
+
+    def test_jwt_under_innocuous_key_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQmXybGkeE0GtxdxBFn6VOGZKfoGeD7Kbk"
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(yaml.dump({"instance": {"name": "Acme", "auth_ref": jwt}}))
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["instance"] == {"name": "Acme"}
+        assert jwt not in resp.text
+        assert "instance.auth_ref" in data["omitted_keys"]
+
+    def test_pem_block_under_innocuous_key_is_omitted(self, seeded_app, tmp_path, monkeypatch):
+        pem = "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQ\n-----END PRIVATE KEY-----"
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(yaml.dump({"instance": {"name": "Acme", "keypair": pem}}))
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["instance"] == {"name": "Acme"}
+        assert "BEGIN PRIVATE KEY" not in resp.text
+        assert "instance.keypair" in data["omitted_keys"]
+
+    def test_ordinary_values_are_not_flagged(self, seeded_app, tmp_path, monkeypatch):
+        """Conservatism check: hostnames, emails, short enums, and normal
+        URLs must survive — the backstop must not nuke legit config."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump(
+                {
+                    "instance": {"name": "Acme Analyst", "subtitle": "Data"},
+                    "server": {"hostname": "agnes.example.com"},
+                    "auth": {"allowed_domain": "example.com"},
+                    "data_source": {
+                        "type": "keboola",
+                        "keboola": {"stack_url": "https://connection.keboola.com"},
+                    },
+                }
+            )
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/server-config/overlay", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["instance"] == {"name": "Acme Analyst", "subtitle": "Data"}
+        assert data["sections"]["server"] == {"hostname": "agnes.example.com"}
+        assert data["sections"]["auth"] == {"allowed_domain": "example.com"}
+        assert data["sections"]["data_source"]["keboola"]["stack_url"] == "https://connection.keboola.com"
+        assert data["omitted_keys"] == []
+
+
+class TestFreeFormApplyRoundTrip:
+    def test_apply_of_export_with_omitted_connector_secret_preserves_existing_value(
+        self, seeded_app, tmp_path, monkeypatch
+    ):
+        """Mirrors `test_apply_with_redacted_secret_preserves_existing_secret`
+        for the free-form-section path: the omitted literal is simply absent
+        from the re-applied patch, so deep-merge leaves the existing value
+        on disk untouched."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        original = {
+            "connectors": {
+                "connector-slack": {
+                    "SLACK_WEBHOOK_URL": (
+                        "https://hooks.chat-example.test/services/T00000000/B00000000/7fA9kQ3mZpL1xR2vN4hT6bY8"
+                    )
+                }
+            }
+        }
+        (state / "instance.yaml").write_text(yaml.dump(original))
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        exported = c.get("/api/admin/server-config/overlay", headers=_auth(token)).json()["sections"]
+        assert "SLACK_WEBHOOK_URL" not in exported["connectors"]["connector-slack"]
+
+        resp = c.post("/api/admin/server-config", json={"sections": exported}, headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+
+        reapplied = yaml.safe_load((state / "instance.yaml").read_text())
+        assert (
+            reapplied["connectors"]["connector-slack"]["SLACK_WEBHOOK_URL"]
+            == (original["connectors"]["connector-slack"]["SLACK_WEBHOOK_URL"])
+        )

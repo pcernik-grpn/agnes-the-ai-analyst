@@ -2037,27 +2037,116 @@ def _looks_like_env_ref(value: Any) -> bool:
     return isinstance(value, str) and bool(_ENV_REF_RE.match(value))
 
 
-def _export_scrub(value: Any) -> Any:
-    """Recursively drop literal secret-shaped values from an overlay subtree.
+# Sections whose sub-schema is genuinely free-form — admin-typed keys that
+# no static registry enumerates. `connectors` is the one instance today: its
+# `_KNOWN_FIELDS` entry above documents that the sibling keys of `globals`
+# are per-connector slugs sourced from the runtime seed manifest, and its
+# own hint text SANCTIONS storing "connector app identifiers... as plain
+# values" there — e.g. `connectors."connector-slack".SLACK_WEBHOOK_URL`.
+# `_is_secret_key`'s 8 substring patterns cannot police a key name they've
+# never seen, so for these sections export can't use a key-name blocklist
+# at all — it flips to a POSITIVE allowlist instead: keep ONLY a `${VAR}`
+# reference or an `*_env`-named key; every other literal is omitted,
+# INCLUDING one that doesn't look secret-shaped (a plain string, a bool, a
+# number) — the section's admin-typed nature makes any finer carve-out
+# unreliable by construction. The transparency note the endpoint returns
+# alongside `sections` (`omitted_keys`) is what keeps this from silently
+# discarding a legitimate non-secret global.
+_FREE_FORM_EXPORT_SECTIONS: frozenset = frozenset({"connectors"})
 
-    Mirrors `_redact`'s key-matching (`_is_secret_key`) but OMITS the leaf
-    entirely instead of masking it, and carves out the two shapes that are
-    not actually secrets: a `*_env` key (an env-var name) and a `${VAR}`
-    reference under any key. Used only by the export/apply overlay endpoint
-    below — GET /server-config's on-screen redaction is unaffected.
+# --- Value-shape backstop ----------------------------------------------
+#
+# Defense-in-depth for a literal secret pasted into a field whose NAME
+# doesn't hint at a credential anywhere in the overlay, in ANY section —
+# not just the free-form ones above (e.g. an admin naming a custom BigQuery
+# field `webhook` instead of `token`). Deliberately conservative: an
+# ordinary hostname, email, or short enum must never be caught, so this
+# only fires on shapes that are unambiguously a credential — a PEM block, a
+# signed JWT, a URL carrying userinfo or a long opaque path segment (the
+# shape of a Slack/Discord/Teams incoming-webhook token, a presigned link,
+# an OAuth callback code, …), or a single long opaque alphanumeric run
+# typical of an API key/hash. This is a backstop, not a claim of
+# completeness — it will not catch every secret shape, which is exactly why
+# `_FREE_FORM_EXPORT_SECTIONS` and the `omitted_keys` transparency note
+# exist alongside it rather than in place of it.
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$")
+_URL_USERINFO_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s@]+:[^/\s@]+@")
+_ALNUM_ONLY_RE = re.compile(r"^[A-Za-z0-9]+$")
+_URL_TOKEN_SEGMENT_MIN_LEN = 20
+_OPAQUE_TOKEN_MIN_LEN = 24
+
+
+def _looks_like_secret_value(value: Any) -> bool:
+    """True if `value` is a literal string that is unambiguously
+    credential-shaped, independent of what key it is stored under."""
+    if not isinstance(value, str) or _looks_like_env_ref(value):
+        return False
+    v = value.strip()
+    if not v:
+        return False
+    if "-----BEGIN" in v:
+        return True
+    if _JWT_RE.match(v):
+        return True
+    if v.lower().startswith(("http://", "https://")):
+        if _URL_USERINFO_RE.match(v):
+            return True
+        path = v.split("?", 1)[0].split("#", 1)[0]
+        segments = [s for s in path.split("/") if s]
+        last = segments[-1] if segments else ""
+        return len(last) >= _URL_TOKEN_SEGMENT_MIN_LEN and bool(_ALNUM_ONLY_RE.match(last))
+    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and bool(_ALNUM_ONLY_RE.match(v))
+
+
+def _export_scrub(
+    value: Any,
+    *,
+    free_form: bool = False,
+    path: str = "",
+    omitted: Optional[List[str]] = None,
+) -> Any:
+    """Recursively drop secret-shaped values from an overlay subtree.
+
+    Three independent gates, any one omits a leaf (a `*_env`-named key or a
+    `${VAR}` reference always wins over all three and is kept verbatim):
+
+    1. Key-name gate (`_is_secret_key`) — as before.
+    2. Free-form-section gate (`free_form=True`, set by the caller for every
+       section in `_FREE_FORM_EXPORT_SECTIONS`, and propagated to every
+       descendant once set) — a positive allowlist: every literal is
+       omitted regardless of key name or shape.
+    3. Value-shape gate (`_looks_like_secret_value`) — fires everywhere,
+       free-form or not.
+
+    A dict/list value caught by gate 1 or 2 is not blanket-dropped — it is
+    recursed into (forcing `free_form=True` for the subtree) so a nested
+    `${VAR}` reference or `*_env` key inside it still survives; only an
+    actual literal leaf is omitted. `omitted` collects the dotted path of
+    every leaf actually dropped, so the caller can surface a transparency
+    note instead of a silent drop.
     """
+    if omitted is None:
+        omitted = []
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
         for k, v in value.items():
-            if _is_secret_key(k) and not _is_env_name_key(k):
-                if _looks_like_env_ref(v):
-                    out[k] = v
-                # else: literal secret-shaped value — omit.
+            child_path = f"{path}.{k}" if path else k
+            if _is_env_name_key(k) and isinstance(v, str):
+                out[k] = v
                 continue
-            out[k] = _export_scrub(v)
+            if _looks_like_env_ref(v):
+                out[k] = v
+                continue
+            if _is_secret_key(k) or free_form or _looks_like_secret_value(v):
+                if isinstance(v, (dict, list)):
+                    out[k] = _export_scrub(v, free_form=True, path=child_path, omitted=omitted)
+                else:
+                    omitted.append(child_path)
+                continue
+            out[k] = _export_scrub(v, free_form=free_form, path=child_path, omitted=omitted)
         return out
     if isinstance(value, list):
-        return [_export_scrub(item) for item in value]
+        return [_export_scrub(item, free_form=free_form, path=path, omitted=omitted) for item in value]
     return value
 
 
@@ -2555,9 +2644,22 @@ async def get_server_config_overlay(
       ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.
     - Secret-shaped LITERAL values are omitted, not masked — an env-var
       NAME (``token_env``) or a ``${VAR}`` reference passes through
-      unchanged (see ``_export_scrub``), but a real cleartext credential
-      never leaves the server. There is no DB config table — the overlay
-      IS the writable state POST /server-config maintains.
+      unchanged, but a real cleartext credential never leaves the server
+      (see ``_export_scrub``). This applies two ways: (a) any section in
+      ``_FREE_FORM_EXPORT_SECTIONS`` (``connectors`` today — an admin-typed
+      dict whose key names no registry enumerates, e.g.
+      ``connectors."connector-slack".SLACK_WEBHOOK_URL``) has EVERY literal
+      leaf omitted, not just secret-*named* ones, because a key-name
+      blocklist cannot police a key it has never seen; (b) a value that is
+      unambiguously credential-shaped (a PEM block, a JWT, a URL with
+      userinfo or a long opaque path segment, a long opaque alphanumeric
+      run) is omitted everywhere else too, regardless of its key's name.
+      There is no DB config table — the overlay IS the writable state
+      POST /server-config maintains.
+    - ``omitted_keys`` lists the dotted path of every leaf this endpoint
+      dropped, so the operator knows what to set via env/``${VAR}`` on the
+      target instead of silently losing it — `agnes admin config export`
+      surfaces this as a YAML comment header and a stderr note.
 
     Deliberately REST+CLI only, never MCP-exposed — see CONTRIBUTING.md's
     "operator security-posture diagnostics" standing exemption: a one-call
@@ -2566,12 +2668,21 @@ async def get_server_config_overlay(
     prompt-injected chat session, not an agent affordance.
     """
     raw = _load_raw_overlay()
+    omitted: List[str] = []
     sections = {
-        section: _export_scrub(raw[section]) for section in _EDITABLE_SECTIONS if isinstance(raw.get(section), dict)
+        section: _export_scrub(
+            raw[section],
+            free_form=section in _FREE_FORM_EXPORT_SECTIONS,
+            path=section,
+            omitted=omitted,
+        )
+        for section in _EDITABLE_SECTIONS
+        if isinstance(raw.get(section), dict)
     }
     return {
         "sections": sections,
         "editable_sections": list(_EDITABLE_SECTIONS),
+        "omitted_keys": sorted(omitted),
     }
 
 
