@@ -10,7 +10,7 @@ platform diagram, the analyst loop, and query routing, in
 ```
 agnes-the-ai-analyst/
 ├── src/                  Core engine (db, orchestrator, rbac, profiler, repositories)
-├── connectors/           Pluggable data connectors (keboola, bigquery, jira, llm, openmetadata)
+├── connectors/           Pluggable data connectors (keboola, bigquery, jira, llm)
 ├── app/                  FastAPI application (API + web UI)
 │   ├── api/              REST API routers
 │   ├── auth/             Auth providers (JWT, Google OAuth, email magic link, password)
