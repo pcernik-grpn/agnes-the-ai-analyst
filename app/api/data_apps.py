@@ -1252,18 +1252,29 @@ async def set_data_app_description(
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Set the admin description override on a managed (sync-owned) app.
+    """Set an app's description — hosted or linked.
 
-    Linked apps are org resources whose ``description`` is refreshed by the
-    ingest sync; this override lets an owner/Admin pin a human-authored
-    description the sync won't clobber. Only ``managed`` rows accept it —
-    hosted apps edit their description via the normal create/update flow.
+    For a **linked** app the stored ``description`` is refreshed by the ingest
+    sync, and this writes an override the sync won't clobber. For a **hosted**
+    app there is no sync, so the same column simply holds its current
+    description: ``POST /api/data-apps`` seeds one at create time and this is
+    the only way to change it afterwards. (Hosted rows were refused here with
+    ``409 not_managed`` until this release, which made the description
+    write-once — a typo could only be fixed by recreating the app.)
+
+    One column serves both because every data-app reader already resolves
+    through ``effective_description`` (``description_override or description``)
+    — ``_serialize`` here, and the library/RBAC projection in
+    ``app/resource_types.py``. The column keeps its ``_override`` name, which
+    reads oddly for a hosted app with nothing to override; renaming it is a
+    migration for no behavioural gain, and the API surface exposes
+    ``effective_description`` rather than either raw column.
+
+    Owner or Admin only, both cases.
     """
     _feature_gate()
     row = _get_row_or_404(slug)
     _require_owner_or_admin(user, row)
-    if not row.get("managed"):
-        raise HTTPException(status_code=409, detail="not_managed")
     data_apps_repo().set_description_override(slug, payload.description)
     _audit(conn, user["id"], "data_app.set_description", f"data_app:{slug}", {})
     return _serialize(_get_row_or_404(slug))
