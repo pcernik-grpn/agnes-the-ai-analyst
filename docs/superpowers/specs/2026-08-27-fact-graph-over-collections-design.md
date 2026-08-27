@@ -396,7 +396,88 @@ app-state together. It is removed; nothing here should be blocked by it.
 7. **Edges + traversal** — gated on §11.
 8. **Ontology authoring UI, collection detail, conflict surfacing.**
 
-## 13. Acceptance — the tests that define "done"
+## 13. Obligations from the customer workbook (v0.2)
+
+Four commitments the workbook creates that this design must absorb. Two are
+time-critical, and the first one **reorders the work**.
+
+### 13.1 R0 must run before ingestion — and ingestion is imminent
+
+The workbook: *"Run this before building anything — once Agnes has content, the
+pre-build baseline is unrecoverable."* R0 needs only arms A0/A1/A2 and does not
+involve Agnes at all.
+
+The crawler is about to fill Agnes with the real corpus. **Once it does, the
+baseline cannot be reconstructed** — not by rolling back, not by exporting,
+not by asking people to forget. This is the one step in the whole programme
+with a genuinely irreversible ordering constraint, and everything in §12's
+build order is reversible by comparison.
+
+**Consequence: R0 runs first, this week, before any ingestion into the target
+instance.** It blocks nothing else — it needs no Agnes — so the only way to
+lose it is to let ingestion start while nobody scheduled it. Raise it at the
+daily; treat a completed R0 as a precondition on the crawler's first
+production run, not as a parallel workstream.
+
+Without it, §11's gate ("does the graph beat retrieval") loses its control
+group, and §14.6's final step compares against a baseline that no longer
+exists.
+
+### 13.2 Access personas are now a graded test, not an internal concern
+
+Two personas need confirmation before R0, and Agnes must enforce the split:
+
+| persona | structured data | unstructured (documents, facts) |
+|---|---|---|
+| **Principal** | yes | yes |
+| **Associate** | **no** | yes |
+
+**Leak count = 0 is Decision Test 5** in the customer's rubric — i.e. this is
+scored, not assumed.
+
+The split runs across *two different grant mechanisms*, which is worth stating
+because it is easy to test only half: unstructured reach is collection grants
+(§5), structured reach is **data package** grants. An Associate is a user with
+collection grants and no data package grants. Both halves must be exercised —
+a persona that cannot reach tables but can reach a fact *derived from* a table
+would be a leak the collection-side tests would never catch, and it is one more
+reason facts stay document-derived only (§14.7).
+
+§14.1's S1–S7 are the implementation of Decision Test 5. They should be
+renamed to the personas so results map onto the customer's sheet without
+translation, and the run must record a leak count of exactly zero rather than
+"no failures observed".
+
+### 13.3 X1 now sources from Kantata — new, unscoped integration
+
+Per the 26 Aug guidance, X1 (utilisation by business unit) is no longer
+out-of-scope structured data: it sources from **Kantata** time tracking, and it
+feeds both X1 and the AC2 access test.
+
+Nobody has scoped this. It is a live structured-data integration, which means:
+a connection, registered tables, a data package, and grants — the whole
+structured path, none of which this design touches. Two things follow:
+
+- It is **not** in scope here and should not be smuggled in. This design covers
+  document-derived facts; a Kantata table is the other lane.
+- But it **is** a dependency of the evaluation, because X1 is one of the graded
+  questions and AC2 tests access against it. So the eval cannot be completed
+  without it, and whoever owns the eval owns getting it scoped.
+
+### 13.4 Observability is now a customer requirement
+
+The workbook asks Keboola to confirm **Agnes's OTel token-export method**. That
+moves token accounting from internal hygiene to a contractual answer, and it
+lands on the same numbers §14.6 already requires (tokens and cost per run,
+against a pre-run estimate).
+
+Two gaps: the export method itself has to be confirmed and written down, not
+described in a meeting; and the workbook references a separate **token
+measurement methodology** note that has not reached us. Until it does, our
+numbers and theirs may not be measuring the same thing — which is the kind of
+disagreement that surfaces at the worst moment. Ask for it now.
+
+## 14. Acceptance — the tests that define "done"
 
 **Nothing here ships on a demo. It ships when these pass against a real
 SharePoint tenant, with a recorded, graded run.** Test names are the contract;
@@ -407,7 +488,7 @@ Fixtures are planted, never sampled: the corpus contains documents whose facts
 we know, so "correct" is decidable. The corpus-intake design's ground-truth
 approach is reused rather than reinvented.
 
-### 13.1 Security — the source's sharing decides
+### 14.1 Security — the source's sharing decides
 
 The premise a customer is buying: *what I cannot open in SharePoint, Agnes will
 not tell me.*
@@ -460,7 +541,7 @@ it rather than asserting a threshold someone invented. Separately: she must
 never be able to open the original, at any point — the source enforces that
 live.
 
-### 13.2 Synchronisation — the crawler notices
+### 14.2 Synchronisation — the crawler notices
 
 **C1 — a new file is picked up.** Upload to a crawled folder; within one cycle
 it is indexed, extracted, and its facts answerable.
@@ -501,7 +582,7 @@ SharePoint, touch nothing else. Delta reports nothing, so this must be caught
 by the periodic ACL re-read. *Fails if* nothing ever notices — the known gap in
 §9, which the test exists to bound rather than hide.
 
-### 13.3 Crawler completeness — against what was actually specified
+### 14.3 Crawler completeness — against what was actually specified
 
 Verified against TCRD-184 and the reference implementation, so the port does
 not silently drop capability:
@@ -521,9 +602,9 @@ not silently drop capability:
 | **retry on 503/504** | **not built** | required; Graph sheds load with these too |
 | **incremental persistence** | **not built** | required — C8 |
 | **OCR for scans** | flag-gated (`--vision`) | **on by default**; it is a cost decision, not a capability toggle |
-| **per-item ACL where inheritance breaks** | not built | required for §13.1 to mean anything |
+| **per-item ACL where inheritance breaks** | not built | required for §14.1 to mean anything |
 
-### 13.4 Extraction quality — graded, not eyeballed
+### 14.4 Extraction quality — graded, not eyeballed
 
 **Q1 — the verbatim gate rejects fabrication.** Plant a document that tempts
 paraphrase (a table whose caption almost states a fact). Any claim whose quote
@@ -557,7 +638,7 @@ full pass, verify it does not return. *Fails if* the producer overwrites
 two subjects; merge them; verify a single subject with both aliases and the
 union of claims, and that the merge is reversible.
 
-### 13.5 Anonymization — currently unspecifiable
+### 14.5 Anonymization — currently unspecifiable
 
 **Blocked.** The service to integrate has not been identified: a search of the
 `keboola` org and of GitHub for anonymisation/redaction repositories found
@@ -579,7 +660,7 @@ collection is two subjects, permanently. This is a **documented limitation**
 with a test proving the documentation matches behaviour, not a bug to fix
 later.
 
-### 13.6 The end-to-end run — what "done" actually means
+### 14.6 The end-to-end run — what "done" actually means
 
 One scripted run, recorded, repeatable, against the real tenant. Not a demo.
 
@@ -590,7 +671,7 @@ One scripted run, recorded, repeatable, against the real tenant. Not a demo.
    found, wall-clock, throttling events.
 3. **Extract.** Record: claims written, claims rejected by the gate, failures
    by category, tokens and cost against the pre-run estimate.
-4. **Gate on quality** (§13.4). A run that produces facts nobody graded is not
+4. **Gate on quality** (§14.4). A run that produces facts nobody graded is not
    a passing run.
 5. **Ask in chat**, as three different people with different access, the twelve
    evaluation questions. Grade blind against the frozen gold answers, using the
@@ -602,7 +683,7 @@ One scripted run, recorded, repeatable, against the real tenant. Not a demo.
    the only test that catches it.
 7. **Mutate and re-run**: add a document, change one, delete one, revoke one
    person's access. Re-run the questions. Answers must move accordingly, and
-   §13.2's numbers must hold.
+   §14.2's numbers must hold.
 8. **Compare against no graph.** The same twelve questions answered with
    Collections' existing hybrid retrieval alone. This is the gate from §11: if
    the graph does not win where it is supposed to, that result is the finding,
@@ -611,14 +692,14 @@ One scripted run, recorded, repeatable, against the real tenant. Not a demo.
 Every step emits a machine-readable record. "It worked when I tried it" is not
 a result; the run is the artefact.
 
-### 13.7 What is deliberately not tested yet
+### 14.7 What is deliberately not tested yet
 
 Named so their absence is a decision rather than an oversight: load and
 concurrency at corpus scale, multi-language extraction (blocked by the gate,
 §7), a second document source, and facts not derived from documents. Each needs
 its own design before it can have a test.
 
-## 14. Open questions
+## 15. Open questions
 
 - **Who writes the producer.** Neither crawler nor extraction pass is built
   here, and a store with no producer holds nothing. This is the first question,
