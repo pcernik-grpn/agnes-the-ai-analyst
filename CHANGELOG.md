@@ -12,6 +12,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Alternate / private image registry support (`AGNES_IMAGE_REPO`).** The
+  app-image repository is now a single seam instead of a hardcoded
+  reference: the compose overlays interpolate
+  `${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}`, the
+  recurring host scripts (`agnes-auto-upgrade.sh`,
+  `agnes-state-applier.sh`) read the same key from `/opt/agnes/.env` and
+  export it for compose, and the Terraform module writes it from its
+  existing `image_repo` variable. For a GCP Artifact Registry repository
+  (`*-docker.pkg.dev` — `release.yml` can already mirror images there) the
+  startup script runs `gcloud auth configure-docker` before the first
+  pull, so the VM's own service account authenticates and the recurring
+  ticks inherit the credential helper — an instance can run entirely from
+  a private registry with no long-lived registry secret on the VM. Default
+  behavior is unchanged.
+
 - **Shared-agent runtime: a user an agent was shared with can now run it**
   (remediation program Track C, C2.3). Previously only an agent's OWNER
   could open a session against it — a `ResourceType.AGENT` grant (the
@@ -642,6 +657,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
+- **The CHANGELOG integrity guard now rejects a duplicated *bullet* under
+  `[Unreleased]`, not just a duplicated group heading.** The guard's fourth
+  check catches `### Added` … `### Added`, and the tempting repair for that is
+  to concatenate the two groups' bodies under one heading — which merges the
+  headings while keeping *both* copies of every bullet the groups had in
+  common. That is what a consolidation commit did during #1588: headings
+  merged, bullets doubled, all four checks green, and the doubled release
+  notes were caught by eye rather than by CI. A fifth check
+  (`assert_no_duplicate_unreleased_bullets`) compares whole bullet *blocks* —
+  the marker line plus its hanging-indented continuations, second paragraph
+  included, whitespace collapsed so a re-wrap is not a new bullet. Whole
+  blocks rather than first lines because released history holds bullets whose
+  opening line is identical and whose bodies genuinely differ (one revised in
+  place, both revisions surviving), and a first-line check would reject those.
+  Scoped to `[Unreleased]` for the same reason the heading check is: 30
+  bullets in shipped sections are already exact duplicates within their own
+  section, and no merge of pending bullets can reach them. Replayed over all
+  1,367 historical revisions of `CHANGELOG.md` (17,840 parsed `[Unreleased]`
+  bullets) it flags 12 commits, every one of them a real duplication — three
+  separate corruption windows, two of which shipped — and nothing else.
 
 ## [0.89.1] - 2026-08-26
 

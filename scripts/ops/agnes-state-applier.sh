@@ -68,6 +68,11 @@ _env_get() {
 # Assign separately from `export` (SC2155: avoid masking the substitution's rc).
 AGNES_TAG="$(_env_get AGNES_TAG)"
 export AGNES_TAG
+# AGNES_IMAGE_REPO: alternate registry/repository for the app image (see
+# agnes-auto-upgrade.sh). Exported for docker compose interpolation; the
+# migrator IMAGE below applies the same default the compose files use.
+AGNES_IMAGE_REPO="$(_env_get AGNES_IMAGE_REPO)"
+export AGNES_IMAGE_REPO
 
 # Compose chain reused for every invocation, resolved through the single
 # shared resolver (scripts/ops/agnes-compose-file.sh) so this daemon can
@@ -663,7 +668,7 @@ PY
 TARGET_URL_EFFECTIVE="${TARGET_URL_PINNED_IP:-$TARGET_URL}"
 SOURCE_URL_EFFECTIVE="${SOURCE_URL_PINNED_IP:-$SOURCE_URL}"
 
-IMAGE="ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}"
+IMAGE="${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}"
 SOURCE_URL_ARGS=()
 if [ -n "$SOURCE_URL_EFFECTIVE" ]; then
     SOURCE_URL_ARGS=( --source-url "$SOURCE_URL_EFFECTIVE" )
