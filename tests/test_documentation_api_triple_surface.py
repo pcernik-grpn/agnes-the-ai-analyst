@@ -83,7 +83,51 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
     # registered tables with NO valid semantic model at all, regardless of
     # source — distinct from the Keboola-only endpoint above.
-    "/api/admin/semantic-coverage": ("semantic-model coverage", "admin_semantic_coverage"),
+    "/api/admin/semantic-coverage": ("semantic-model coverage tables", "admin_semantic_coverage"),
+    # Cross-domain, cross-source completeness (F4.1) — deliberately a
+    # DIFFERENT path from the Keboola-only report above, which it aggregates
+    # rather than replaces. The tag/untag mutations are in the cohort, not
+    # _EXEMPT: neither standing exemption (credential-provisioning writes,
+    # security-posture diagnostics) covers an admin tagging a skill to a
+    # source.
+    "/api/admin/semantic-model/coverage": (
+        "semantic-model coverage show",
+        "semantic_model_coverage",
+    ),
+    "/api/admin/semantic-model/coverage/tags": (
+        "semantic-model coverage tag",
+        "semantic_model_coverage_tag",
+    ),
+    "/api/admin/semantic-model/coverage/tags/{tag_id}": (
+        "semantic-model coverage untag",
+        "semantic_model_coverage_untag",
+    ),
+    # Semantic-layer health roll-up (F4.2) — sync failures, disconnected
+    # models, invalid documents, static document-quality checks, F4.1's
+    # coverage counts, and F4.3's active mutes, in one read.
+    "/api/admin/semantic-layer/health": ("semantic-model health", "semantic_layer_health"),
+    # Muting a semantic-layer health check (F4.3) — "I know, it is deliberate".
+    # Same reasoning as the tag/untag pair above for why the mutations are in
+    # the cohort rather than _EXEMPT; and a mute an agent can create but not
+    # SEE would be the silent disappearance the feature exists to prevent, so
+    # the list is triple-surface too. One cohort row per PATH: the first row's
+    # MCP column names the GET's tool, and the POST's `mute_semantic_check` is
+    # asserted in FOUNDATION_TOOL_NAMES by tests/test_mcp_tool_parity.py (same
+    # shape as the /api/store/entities/{entity_id} row above).
+    "/api/admin/semantic-layer/mutes": ("semantic-model mutes", "semantic_mutes_list"),
+    "/api/admin/semantic-layer/mutes/{mute_id}": ("semantic-model unmute", "unmute_semantic_check"),
+    # Semantic-layer feedback (F4.5) — "that answer looked wrong". Submit is
+    # open to any signed-in caller (and is the tool the chat agent offers when
+    # it cannot ground an answer); the queue and resolve are admin. All three
+    # are in the cohort rather than _EXEMPT: neither standing exemption
+    # (credential-provisioning writes, security-posture diagnostics) covers a
+    # bug report about a metric.
+    "/api/semantic-feedback": ("semantic-model feedback submit", "flag_semantic_issue"),
+    "/api/admin/semantic-feedback": ("semantic-model feedback list", "semantic_feedback_list"),
+    "/api/admin/semantic-feedback/{feedback_id}/resolve": (
+        "semantic-model feedback resolve",
+        "semantic_feedback_resolve",
+    ),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
     # this same endpoint (wraps its raw YAML text into a dict); `agnes admin
@@ -995,6 +1039,28 @@ _EXEMPT: dict[str, str] = {
     "/api/chat/sessions/{chat_id}/permanent": (
         "web chats-page affordance — permanently deletes one of the caller's "
         "own conversations and its messages; no analyst CLI/MCP analogue"
+    ),
+    # Session-workspace file delivery (#1611) — the browser's way to reach
+    # deliverables a chat agent rendered into its session workspace (list /
+    # download / save a copy to the Library). Self-scoped to the caller's own
+    # session (404, never 403). No analyst CLI/MCP analogue: the CLI runs IN
+    # the workspace, so its files are already local, and MCP agents write
+    # files rather than fetch them back.
+    "/api/chat/sessions/{chat_id}/files": (
+        "web chat affordance — lists files in the caller's own session "
+        "workspace so the browser can offer downloads; CLI sessions already "
+        "have the files locally, no MCP analogue"
+    ),
+    "/api/chat/sessions/{chat_id}/files/download": (
+        "web chat affordance — streams one session-workspace file to the "
+        "browser as an attachment; CLI sessions already have the files "
+        "locally, no MCP analogue"
+    ),
+    "/api/chat/sessions/{chat_id}/files/save-artefact": (
+        "web chat affordance — saves one session-workspace file as the "
+        "caller's private Library artefact (same bridge the chat composer "
+        "upload uses); CLI sessions already have the files locally, no MCP "
+        "analogue"
     ),
     # Keboola glossary import (2026-07-17 design). `/api/glossary/search`
     # carries the triple-surface contract in _COHORT; list and get-by-id are

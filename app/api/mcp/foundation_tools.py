@@ -123,8 +123,42 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
     # registered tables with NO valid semantic model at all, regardless of
     # which source wrote it. Triple-surface with
-    # /api/admin/semantic-coverage + `agnes semantic-model coverage`.
+    # /api/admin/semantic-coverage + `agnes semantic-model coverage tables`.
     "admin_semantic_coverage",
+    # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
+    # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
+    # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
+    # semantic-model coverage[ tag| untag]`. The tag/untag pair is NOT
+    # read_only and is deliberately NOT MCP-exempt: CONTRIBUTING.md's only
+    # standing exemptions are credential-provisioning writes and
+    # security-posture diagnostics, and "low-frequency admin action" is
+    # neither.
+    "semantic_model_coverage",
+    "semantic_model_coverage_tag",
+    "semantic_model_coverage_untag",
+    # Muting one of those checks (F4.3) — "I know, it is deliberate". The pair
+    # is NOT read_only and, like tag/untag above, is deliberately not
+    # MCP-exempt. The list rides along on purpose: a mute an agent can create
+    # but never SEE is the anonymous disappearance the feature exists to
+    # prevent.
+    "semantic_mutes_list",
+    "mute_semantic_check",
+    "unmute_semantic_check",
+    # Is the layer trustworthy right now (F4.2) — sync failures, models whose
+    # source is gone, invalid documents, three static document-quality checks,
+    # F4.1's coverage roll-up, and every active mute, in one call. Triple-
+    # surface with GET /api/admin/semantic-layer/health + `agnes
+    # semantic-model health`.
+    "semantic_layer_health",
+    # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
+    # here an ORDINARY caller may use — the agent that cannot ground its own
+    # answer is the intended reporter, which is why it is not admin-gated and
+    # why the workspace prompt tells the agent to offer filing one. The other
+    # two are the admin side of the same queue; same reasoning as the tag/untag
+    # pair above for why they are not MCP-exempt.
+    "flag_semantic_issue",
+    "semantic_feedback_list",
+    "semantic_feedback_resolve",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -1596,7 +1630,7 @@ def register_foundation_tools(
 
         Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
         ``GET /api/admin/semantic-coverage`` and `agnes semantic-model
-        coverage`.
+        coverage tables`.
 
         Requires an admin PAT.
         """
@@ -1605,6 +1639,327 @@ def register_foundation_tools(
                 f"{base_url}/api/admin/semantic-coverage",
                 headers=headers_fn(),
                 timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_model_coverage(source: str = "") -> dict:
+        """What each connected data source still lacks, across every domain (admin only).
+
+        One entry per data source, one status per domain — semantic model,
+        metrics, glossary, skill, agent, knowledge base — as ``ok`` /
+        ``partial`` / ``missing`` / ``not_applicable``, each with a
+        one-sentence ``detail`` and, where a create flow exists, an
+        ``action``. Use it to answer "what is undocumented here" rather than
+        guessing from an empty catalog.
+
+        ``not_applicable`` is NOT a gap: it means the domain cannot be filled
+        for that source type in this build (e.g. no semantic-layer adapter
+        exists for it), so do not report it as work to do.
+
+        Broader than ``admin_semantic_layer_coverage`` above, which covers
+        Keboola's metric binding only — that report is one provider inside
+        this one, and rides along per-source as ``domains.semantic.raw``.
+
+        Args:
+            source: Optional source connection id to narrow to. ``__local__``
+                is the synthetic bucket for registered tables that belong to
+                no connection.
+
+        Mirrors ``GET /api/admin/semantic-model/coverage`` and
+        ``agnes semantic-model coverage``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-model/coverage",
+                params={"source": source} if source else None,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_tag(resource_type: str, resource_id: str, source_id: str) -> dict:
+        """Record that a skill / agent / knowledge domain is ABOUT a data source (admin only).
+
+        The one input the coverage report cannot derive: skills, agents and
+        memory domains live in their own tables with no notion of a source.
+
+        Args:
+            resource_type: ``marketplace_plugin`` (a skill) | ``agent`` |
+                ``memory_domain`` (a knowledge base).
+            resource_id: The same id format the RBAC grant for that type
+                uses — ``<marketplace_id>/<plugin_name>`` for a plugin, the
+                row id for an agent or memory domain.
+            source_id: The ``source_connections.id`` the resource is about.
+
+        Mirrors ``POST /api/admin/semantic-model/coverage/tags`` and
+        ``agnes semantic-model coverage tag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-model/coverage/tags",
+                json={
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "source_id": source_id,
+                },
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_untag(tag_id: str) -> dict:
+        """Remove one source tag (admin only).
+
+        Args:
+            tag_id: The tag's id, as carried in
+                ``semantic_model_coverage``'s ``domains.<domain>.raw``.
+
+        Mirrors ``DELETE /api/admin/semantic-model/coverage/tags/{tag_id}``
+        and ``agnes semantic-model coverage untag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-model/coverage/tags/{tag_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return {"deleted": tag_id}
+
+    @tool(read_only=True)
+    async def semantic_mutes_list(include_expired: bool = False) -> dict:
+        """List the semantic-layer checks an admin has deliberately silenced (admin only).
+
+        Read this before reporting a coverage or health gap as news: a scope
+        listed here is one somebody has already seen, judged expected, and
+        signed for. Each entry carries ``scope``, ``muted_by``, ``muted_at``
+        and (when given) ``reason`` — the reason is usually the answer to "why
+        is this still missing".
+
+        Args:
+            include_expired: Also return mutes whose expiry has passed. They no
+                longer silence anything, but the record of who chose it stands.
+
+        Mirrors ``GET /api/admin/semantic-layer/mutes`` and
+        ``agnes semantic-model mutes``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                params={"include_expired": "true"} if include_expired else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def mute_semantic_check(scope: str, reason: str = "", expires_at: str = "") -> dict:
+        """Silence one semantic-layer check that is known and expected (admin only).
+
+        OFFER this rather than reaching for it: muting is how a real gap stops
+        being reported, and the caller's identity, the time and the reason are
+        stored on the row and shown everywhere the mute appears. Say what you
+        would mute and why, and file it once the user agrees. Never as a way to
+        make a finding you could not explain go away.
+
+        409 if the scope is already muted — read ``semantic_mutes_list`` first;
+        somebody may have signed for it already.
+
+        Args:
+            scope: ``domain:<domain>`` (one domain across every source),
+                ``source:<source_id>`` (one source entirely), or
+                ``source:<source_id>:domain:<domain>`` (a single cell). The
+                domains are the ones ``semantic_model_coverage`` reports;
+                ``__local__`` is the source id of the no-connection bucket.
+            reason: Why the check is expected. Optional at the API and strongly
+                worth filling: it is what the next reader inherits.
+            expires_at: ISO-8601 instant at which the check starts reporting
+                again (e.g. ``2026-10-01T00:00:00Z``). Omit for "until somebody
+                unmutes it". Must be in the future.
+
+        Mirrors ``POST /api/admin/semantic-layer/mutes`` and
+        ``agnes semantic-model mute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        payload = {"scope": scope, "reason": reason or None, "expires_at": expires_at or None}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def unmute_semantic_check(mute_id: str) -> dict:
+        """Let a silenced semantic-layer check report again (admin only).
+
+        Args:
+            mute_id: The mute's id, from ``semantic_mutes_list``.
+
+        Mirrors ``DELETE /api/admin/semantic-layer/mutes/{mute_id}`` and
+        ``agnes semantic-model unmute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-layer/mutes/{mute_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return {"unmuted": mute_id}
+
+    @tool(read_only=True)
+    async def semantic_layer_health() -> dict:
+        """Is the semantic layer trustworthy right now (admin only)?
+
+        Sync failures, models whose source was deleted or renamed away from
+        under them, documents that failed schema validation, three static
+        document-quality checks (a metric with no description, one name
+        defined twice with a different formula, a cross-dataset metric with
+        no declared relationship between the datasets it touches),
+        ``semantic_model_coverage``'s missing/partial counts rolled up into
+        one pair of numbers, and every currently active mute — so a finding
+        already silenced by an admin does not get reported as news twice.
+
+        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes
+        semantic-model health``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend`` — the mute overlay
+        has no DuckDB implementation, and a health report that silently
+        dropped it would hide exactly what F4.3 exists to keep visible).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/health",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False, idempotent=False)
+    async def flag_semantic_issue(
+        question: str,
+        sql: str | None = None,
+        metric_id: str | None = None,
+        comment: str | None = None,
+    ) -> dict:
+        """Report that an answer looked wrong or could not be supported by the semantic layer.
+
+        Call this when a number cannot be traced to a documented metric, when a
+        metric's definition contradicts what the question asked for, or when a
+        concept in the question is not defined anywhere in the layer. OFFER it
+        to the user first and file it once they agree — never silently, and
+        never instead of answering.
+
+        This is the only write on this surface an ordinary (non-admin) caller
+        may make, deliberately: whoever read the doubtful answer is the one who
+        knows it was doubtful, and that is rarely an admin. An admin then works
+        the queue (``semantic_feedback_list`` / ``semantic_feedback_resolve``).
+
+        Args:
+            question: The question as asked, in the asker's own words — the
+                evidence for what the semantic layer failed to answer.
+            sql: The SQL that produced the suspect answer, if there was any.
+            metric_id: Metric id the answer relied on (e.g. ``revenue/mrr``).
+            comment: What looks wrong about it.
+
+        Mirrors ``POST /api/semantic-feedback`` and
+        ``agnes semantic-model feedback submit``.
+
+        Requires the Postgres app-state backend (a DuckDB instance answers
+        ``501 requires_postgres_backend``).
+        """
+        payload = {"question": question, "sql": sql, "metric_id": metric_id, "comment": comment}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/semantic-feedback",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_feedback_list(status: str = "") -> dict:
+        """List reported semantic-layer issues (admin only).
+
+        The queue behind ``flag_semantic_issue`` — what people and agents said
+        looked wrong, newest first, each with who filed it and (once closed)
+        who resolved it and how.
+
+        Args:
+            status: Optional filter — ``open``, ``acknowledged`` or
+                ``resolved``. Omit for every report.
+
+        Mirrors ``GET /api/admin/semantic-feedback`` and
+        ``agnes semantic-model feedback list``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-feedback",
+                params={"status": status} if status else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            r.raise_for_status()
+        # The queue only grows, and each report carries a question, a comment
+        # and possibly a whole query — so it is one of the few admin lists that
+        # can genuinely outgrow a model's context. Refuse loudly rather than
+        # return a silently truncated queue.
+        return ensure_output_size(
+            r.json(),
+            "semantic_feedback_list",
+            hint="narrow with `status='open'`",
+        )
+
+    @tool(read_only=False)
+    async def semantic_feedback_resolve(feedback_id: str, resolution_note: str = "") -> dict:
+        """Close one reported semantic-layer issue, on the record (admin only).
+
+        Args:
+            feedback_id: The report's id, from ``semantic_feedback_list``.
+            resolution_note: What was done about it — stored on the report, so
+                the next reader of the same question can see the answer.
+
+        Mirrors ``POST /api/admin/semantic-feedback/{id}/resolve`` and
+        ``agnes semantic-model feedback resolve``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-feedback/{feedback_id}/resolve",
+                json={"resolution_note": resolution_note or None},
+                headers=headers_fn(),
+                timeout=30,
             )
             r.raise_for_status()
             return r.json()
@@ -2279,12 +2634,14 @@ def register_foundation_tools(
 
     @tool(read_only=False, idempotent=True)
     async def data_app_set_description(slug: str, description: str) -> dict:
-        """Set the admin description override on a managed (linked) data app.
+        """Set a data app's description — hosted or linked.
 
-        Linked apps are org resources whose ``description`` the ingest sync
-        refreshes; this pins a human-authored description the sync won't clobber.
-        Owner/Admin only; managed rows only (a 409 ``not_managed`` comes back for
-        a hosted app — edit those via the normal update flow).
+        For a linked app the ingest sync refreshes its ``description`` and this
+        pins a human-authored one the sync won't clobber. For a hosted app there
+        is no sync, so this is simply how the description changes after create
+        seeded it — worth knowing because an app's description is the one place
+        an agent can read what the app is and how to interrogate it without
+        waking its container. Owner/Admin only.
 
         Args:
             slug:        The app's slug.

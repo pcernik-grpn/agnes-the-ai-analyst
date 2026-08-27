@@ -243,6 +243,19 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "match": ["/admin/semantic-layer"],
                 # No `chain` — see the block comment above the tabs list.
             },
+            # Semantic layer (above) answers "is what exists complete and
+            # healthy" — coverage/health/mute/feedback over the DOCUMENTS
+            # already imported. This tab answers the question upstream of
+            # that: where a document comes from in the first place —
+            # every `semantic_source` row, any kind (git/upload/connection)
+            # and any adapter (Keboola, Snowflake, Databricks), with its own
+            # sync-now action. Same "no chain" reasoning: instance-wide, not
+            # a pipeline stage.
+            {
+                "label": "Semantic sources",
+                "href": "/admin/semantic-sources",
+                "match": ["/admin/semantic-sources"],
+            },
         ],
     },
     {
@@ -358,7 +371,7 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {"label": "Audit log", "href": "/admin/activity", "match": ["/admin/activity"]},
             {"label": "Telemetry", "href": "/admin/telemetry", "match": ["/admin/telemetry", "/admin/usage"]},
             {"label": "Analyst sessions", "href": "/admin/sessions", "match": ["/admin/sessions"]},
-            {"label": "Chat sessions", "href": "/admin/chat", "match": ["/admin/chat"]},
+            {"label": "Chat runners", "href": "/admin/chat", "match": ["/admin/chat"]},
             {"label": "Adoption", "href": "/admin/adoption", "match": ["/admin/adoption"]},
         ],
     },

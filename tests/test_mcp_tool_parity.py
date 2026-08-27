@@ -66,6 +66,47 @@ def test_semantic_context_and_schema_tools_are_foundation_tools():
         assert name in FOUNDATION_TOOL_NAMES
 
 
+def test_semantic_feedback_tools_are_foundation_tools():
+    """Feedback channel (F4.5) — an agent that cannot ground its answer must be
+    able to say so from the same surface it answers on."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in ("flag_semantic_issue", "semantic_feedback_list", "semantic_feedback_resolve"):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_semantic_mute_tools_are_foundation_tools():
+    """Muting a health check (F4.3). CONTRIBUTING.md's only standing MCP
+    exemptions are credential-provisioning writes and security-posture
+    diagnostics; "low-frequency admin action" is neither, so the pair rides the
+    same three surfaces as everything else on this page."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in ("semantic_mutes_list", "mute_semantic_check", "unmute_semantic_check"):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_mute_semantic_check_is_declared_a_write():
+    """It silences a warning. A read-only hint would let a client auto-approve
+    it — an agent quietly muting the check that names its own gap is precisely
+    the failure this feature is designed against."""
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    for name in ("mute_semantic_check", "unmute_semantic_check"):
+        assert _tools_by_name(mcp_http.mcp)[name].annotations.readOnlyHint is False
+
+
+def test_flag_semantic_issue_is_declared_a_write():
+    """It stores a row. A read-only hint would let a client auto-approve it,
+    which is how a "helpful" agent files reports nobody asked for."""
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    ann = _tools_by_name(mcp_http.mcp)["flag_semantic_issue"].annotations
+    assert ann.readOnlyHint is False
+
+
 def test_data_apps_tools_are_foundation_tools():
     from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
 

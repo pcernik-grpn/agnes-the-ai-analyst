@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_PREV = "0076_semantic_draft_pending"
+_PREV = "0075_semantic_health_mutes"
 _THIS = "0077_semantic_models_detach"
 
 _NEW_COLS = {

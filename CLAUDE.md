@@ -126,6 +126,20 @@ a SQL statement obey a document's constraints and dialects);
 `src/semantic/document_validation.py` is a **document** validator (does a
 document conform to the schema). Different concerns, adjacent names.
 
+Completeness and trust are a separate, cross-source concern layered on top:
+`src/semantic/coverage.py` scores every connected data source across six
+domains (semantic model, metrics, glossary, skill, agent, knowledge base —
+`compute_cross_domain_coverage`) and rolls up sync failures, disconnected
+models, invalid documents, and static document-quality checks into one health
+report (`compute_semantic_layer_health`), both served at `/admin/
+semantic-layer`. Keboola's own binding-coverage engine
+(`connectors/keboola/semantic_layer.py::compute_semantic_coverage`) is one
+provider *inside* the cross-domain report, not a competitor. An admin can mute
+a known finding (`semantic_health_mutes` — always with who/when/why, never
+silently) and anyone can flag a wrong answer (`semantic_feedback`,
+MCP `flag_semantic_issue`). All three new tables are Postgres-only (see
+"Dual-backend discipline" below).
+
 ### Agent profiles & agent-as-API
 
 Named, scoped agents layered over a user's own stack — CRUD/scope/PAT issuance

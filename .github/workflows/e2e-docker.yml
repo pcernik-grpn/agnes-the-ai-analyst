@@ -136,6 +136,15 @@ jobs:
             tests/e2e/test_adversarial.py \
             -v --tb=short
 
+      # Semantic-layer eval (phase 4.4). Its own step rather than another entry
+      # in the list above for two reasons: it needs no compose stack (the only
+      # external dependency is the Anthropic API), and `-s` keeps pytest from
+      # swallowing the per-question baseline-vs-semantic report, which is the
+      # artefact an operator reads when the gate moves.
+      - name: Run the semantic-layer eval (baseline vs. semantic arms)
+        if: env.ANTHROPIC_API_KEY != ''
+        run: .venv/bin/pytest tests/e2e/test_semantic_layer_eval.py -v -s --tb=short
+
       - name: Tear down compose stack
         if: always() && env.ANTHROPIC_API_KEY != ''
         run: docker compose -f tests/e2e/docker-compose.e2e.yml down -v

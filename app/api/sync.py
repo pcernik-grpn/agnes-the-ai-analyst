@@ -273,6 +273,13 @@ def _run_materialized_pass(
     body) need this, otherwise an admin asking to re-sync `kbc_job` would
     re-process every other materialized row that's also due. Matched
     against both the registry id and name (admins often pass either).
+    A row that survives this filter (i.e. is explicitly targeted) also
+    BYPASSES the `sync_schedule` `due_check` gate below (#1620) — an
+    operator naming a specific table is a bounded, explicit request and
+    must not be silently dropped by the routine hourly cadence just
+    because a prior sync attempt already stamped `sync_state`. An
+    untargeted sweep (`tables=None`) still honors `due_check` exactly as
+    before.
 
     ``source_type`` (when not None) restricts the pass to rows whose
     registry ``source_type`` matches — the partial-rebuild path
@@ -483,7 +490,11 @@ def _run_materialized_pass(
             state.set_skipped(sync_key, "source_filter")
             continue
 
-        if target_set is not None and not (ref_name in target_set or row.get("id") in target_set):
+        # `explicitly_targeted` is True once we know this row survived the
+        # `target_set` filter above — i.e. the operator named this exact
+        # table (by id or name), not a routine untargeted sweep.
+        explicitly_targeted = target_set is not None
+        if explicitly_targeted and not (ref_name in target_set or row.get("id") in target_set):
             summary["skipped"].append({"table": ref_name, "reason": "not_in_target"})
             state.set_skipped(sync_key, "not_in_target")
             continue
@@ -497,7 +508,16 @@ def _run_materialized_pass(
         # data freshness budget is "once per day" and the hourly default
         # over-fetches.
         schedule = row.get("sync_schedule") or os.environ.get("AGNES_DEFAULT_SYNC_SCHEDULE", "").strip() or "every 1h"
-        if not is_table_due(schedule, last_iso):
+        # #1620: the `due_check` cadence gate exists for the routine,
+        # untargeted sweep (scheduler tick / unscoped `POST /api/sync/
+        # trigger`) — it must NOT swallow an explicit, bounded operator
+        # request naming this exact table (`agnes admin sync <table>`).
+        # Without this bypass, a table whose `sync_state.last_sync` was
+        # already stamped (even by a prior attempt that produced nothing
+        # useful — e.g. before its `query_mode`/`source_query` were fixed)
+        # would silently skip every re-sync attempt within the schedule
+        # window, no matter how many times an operator retriggered it.
+        if not explicitly_targeted and not is_table_due(schedule, last_iso):
             summary["skipped"].append({"table": ref_name, "reason": "due_check"})
             continue
 
@@ -1021,6 +1041,7 @@ sys.exit(compute_exit_code(result, len(configs)))
 def _run_sync(
     tables: Optional[List[str]] = None,
     source_type_filter: Optional[str] = None,
+    result_sink: Optional[dict] = None,
 ) -> Optional[bool]:
     """Run extractor as subprocess + orchestrator rebuild.
 
@@ -1070,6 +1091,18 @@ def _run_sync(
         wave-2B W2B-4/7). ``_run_data_refresh`` raises ``RuntimeError`` when
         this returns ``False`` so the job's failure/retry semantics apply;
         it treats ``None`` the same as ``True`` (no-op, not a failure).
+
+    ``result_sink`` (#1620, observability): when given a dict, this call
+    populates it (in the ``finally`` below, so every return path except
+    the immediate lock-contention no-op above fills it in) with
+    ``{"materialized": <_run_materialized_pass summary or None if that
+    pass never ran/blew up>, "errors": [...], "synced_tables": [...]}``.
+    Does NOT change the True/False/None return contract above — existing
+    callers that ignore this kwarg see no behavior change.
+    ``app.worker.kinds._run_data_refresh`` passes one through so the
+    per-table skip/error detail (previously visible only in server logs)
+    surfaces via ``GET /api/jobs/{id}``'s stored ``payload_json["result"]``
+    (``JobsRepository.complete(..., result=...)``).
     """
     import sys as _sys
 
@@ -1095,6 +1128,11 @@ def _run_sync(
     # passing it straight through spammed a "tables refreshed" notification
     # on every scheduler tick even when nothing was due).
     synced_table_names: set = set()
+
+    # `_run_materialized_pass`'s summary (#1620) — surfaced via
+    # `result_sink` below. Stays None if the pass never ran or blew up
+    # before returning (see the `except Exception` around the call).
+    mat_summary_result: Optional[dict] = None
 
     try:
         from app.instance_config import get_data_source_type
@@ -1361,6 +1399,7 @@ def _run_sync(
             finally:
                 if mat_conn is not None:
                     mat_conn.close()
+            mat_summary_result = mat_summary
             skipped_count = len(mat_summary["skipped"])
             in_flight_count = sum(1 for s in mat_summary["skipped"] if s.get("reason") == "in_flight")
             print(
@@ -1555,6 +1594,16 @@ def _run_sync(
             logger.exception("sync-failure notifier raised on fatal path")
         return False
     finally:
+        # #1620: fills in `result_sink` (when the caller passed one) on
+        # every path through the try above — success, per-table failure,
+        # or the fatal-exception handlers — using whatever was collected
+        # before things went wrong. Runs before `_sync_lock.release()`;
+        # order between the two doesn't matter (`result_sink` is caller-
+        # owned, not synchronized by the lock).
+        if result_sink is not None:
+            result_sink["materialized"] = mat_summary_result
+            result_sink["errors"] = list(collected_errors)
+            result_sink["synced_tables"] = sorted(synced_table_names)
         _sync_lock.release()
 
 

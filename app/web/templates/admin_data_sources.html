@@ -1136,9 +1136,23 @@
             <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs in Snowflake) or <strong>materialized</strong>
                (a scheduled copy to parquet). For custom SQL or partitioning, use
                <a href="/admin/tables">Tables → Register new table</a>.</p>
-            <p style="margin-left:0;">Snowflake <strong>semantic views</strong> are not tables. Import their definitions —
-               logical tables, relationships, metrics — on the <a href="/admin/semantic-layer">Semantic layer</a> page.
-               Their metric SQL is Snowflake-flavour, so Agnes reads it but will not run it locally.</p>
+          </div>
+          {# Semantic views (CREATE SEMANTIC VIEW) are not tables and are not
+             picked up by anything above — connecting Snowflake used to leave
+             them undiscoverable short of the CLI. Mirrors Keboola's own
+             semantic-layer opt-in (`ds-new-semantic` above): optional,
+             non-fatal, and reachable again later on its own page if skipped
+             or if it fails. #}
+          <div class="ds-wsl-opt">
+            <label class="ds-wsl-opt__head">
+              <input type="checkbox" id="ds-new-semantic-snowflake">
+              <span>Also sync semantic views (business metrics &amp; glossary)</span>
+            </label>
+            <p>Snowflake <strong>semantic views</strong> (<code>CREATE SEMANTIC VIEW</code>) are not tables — this
+               imports their logical tables, relationships and metrics into {{ instance_brand or 'Agnes' }}'s semantic
+               layer, using this connection's own credentials. Their metric SQL is Snowflake-flavour, so Agnes reads
+               it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync any
+               time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
           </div>
         </div>
 
@@ -1170,6 +1184,18 @@
             <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs on the SQL warehouse) or <strong>materialized</strong>
                (a scheduled copy to parquet). For custom SQL, partitioning or metric views, use
                <a href="/admin/tables">Tables → Register new table</a> — the full editor (live, materialized, custom SQL with <code>MEASURE()</code>) lives there.</p>
+          </div>
+          {# Mirrors the identical Snowflake opt-in above — see its comment. #}
+          <div class="ds-wsl-opt">
+            <label class="ds-wsl-opt__head">
+              <input type="checkbox" id="ds-new-semantic-databricks">
+              <span>Also sync semantic views (business metrics &amp; glossary)</span>
+            </label>
+            <p>Unity Catalog <strong>metric views</strong> are not ordinary tables — this imports their dimensions
+               and measures into {{ instance_brand or 'Agnes' }}'s semantic layer, using this connection's own
+               credentials. Their measure SQL uses <code>MEASURE()</code>, a Databricks-only aggregate, so Agnes
+               reads it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync
+               any time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
           </div>
         </div>
 
@@ -2926,6 +2952,54 @@ function _renderSfCredStatus(host, kind) {
    row's `config` does not carry a custom `private_key_passphrase_env`. */
 const _SF_PASSPHRASE_ENV_DEFAULT = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
 
+/* Shared by the Snowflake and Databricks "also sync semantic views" opt-ins
+   — the same shape as Keboola's own opt-in above, generalized to any
+   connector with a registered `connection`-kind semantic adapter
+   (src/semantic/adapters/__init__.py). Reuses the existing
+   /api/admin/semantic-sources* API — no new endpoint.
+
+   Idempotent: reuses an existing `connection` source for this adapter
+   instead of creating a duplicate one every time the wizard runs (e.g. an
+   admin re-opening it to fix a credential). Returns a short status string;
+   never throws — this must never block the wizard's own connection flow. */
+async function _connectSemanticSource(adapter, label) {
+  try {
+    const listResp = await fetch("/api/admin/semantic-sources", { credentials: "include" });
+    if (!listResp.ok) throw new Error(`HTTP ${listResp.status}`);
+    const existing = (await listResp.json()).find((s) => s.kind === "connection" && s.adapter === adapter);
+
+    let sourceId = existing && existing.id;
+    if (!sourceId) {
+      const createResp = await fetch("/api/admin/semantic-sources", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "connection", name: label, adapter, config: {}, enabled: true }),
+      });
+      if (!createResp.ok) {
+        const detail = await createResp.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${createResp.status}`);
+      }
+      sourceId = (await createResp.json()).id;
+    }
+
+    const syncResp = await fetch(`/api/admin/semantic-sources/${encodeURIComponent(sourceId)}/sync`, {
+      method: "POST", credentials: "include",
+    });
+    if (!syncResp.ok) {
+      const detail = await syncResp.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${syncResp.status}`);
+    }
+    const report = await syncResp.json();
+    const invalidCount = (report.invalid || []).length;
+    if (invalidCount) {
+      return { ok: false, message: `Semantic layer: synced with ${invalidCount} document(s) skipped — see Semantic sources.` };
+    }
+    return { ok: true, message: `Semantic layer enabled — ${report.models_written ?? 0} model(s) imported.` };
+  } catch (e) {
+    return { ok: false, message: `Semantic layer sync failed (${e.message || e}) — set it up later on the Semantic sources page.` };
+  }
+}
+
 async function _saveSnowflakeAndContinue() {
   const err = document.getElementById("ds-wizard-error");
   const account = document.getElementById("ds-sf-account").value.trim();
@@ -3011,6 +3085,18 @@ async function _saveSnowflakeAndContinue() {
     _sfConfigLoaded = true;
     _setWizStep(2);
     _renderSfRowsEditor();
+    // Non-fatal, after the step-2 banner has its own text — appended, not
+    // awaited-before-navigation, since a stalled/slow sync must never hold
+    // up table browsing (Devin Review precedent on the identical Keboola
+    // opt-in above).
+    if (document.getElementById("ds-new-semantic-snowflake").checked) {
+      _connectSemanticSource("snowflake_semantic", "Snowflake semantics").then((result) => {
+        const banner = document.getElementById("ds-wizard-connected-banner");
+        if (banner) {
+          banner.innerHTML += ` <span style="${result.ok ? "" : "color:var(--ds-accent-warn-ink)"}">${_esc(result.message)}</span>`;
+        }
+      });
+    }
   } catch (e) {
     err.textContent = "Could not save Snowflake settings: " + (e.message || e);
     err.style.display = "block";
@@ -3143,6 +3229,15 @@ async function _saveDatabricksAndContinue() {
       _renderDbxCredStatus();
     }
     _dbxConfigLoaded = true;
+    // Unlike Snowflake/Keboola, this flow closes the wizard and navigates
+    // away immediately — there is no banner left to append to, and a
+    // fire-and-forget call here would be cancelled by the navigation before
+    // it completes. Awaited so it actually runs; still non-fatal (no
+    // `throw`), and its own checkbox copy already sets the expectation that
+    // this can be checked/retried later on the Semantic sources page.
+    if (document.getElementById("ds-new-semantic-databricks").checked) {
+      await _connectSemanticSource("databricks_metric_views", "Databricks semantics");
+    }
     closeWizard();
     window.location.href = "/admin/tables";
   } catch (e) {
@@ -3176,6 +3271,8 @@ function openWizard(connector) {
   document.getElementById("ds-new-token").value = "";
   document.getElementById("ds-new-semantic").checked = false;
   document.getElementById("ds-new-master").value = "";
+  document.getElementById("ds-new-semantic-snowflake").checked = false;
+  document.getElementById("ds-new-semantic-databricks").checked = false;
   document.getElementById("ds-sf-account").value = "";
   document.getElementById("ds-sf-user").value = "";
   document.getElementById("ds-sf-auth-type").value = "password";

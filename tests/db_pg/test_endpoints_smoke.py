@@ -1890,6 +1890,30 @@ KNOWN_UNTESTED = {
     # sweep_pg.py (dedup, batch limit, concurrency-cap degradation).
     "GET /api/admin/semantic-coverage",
     "POST /api/admin/semantic-auto-draft-sweep",
+    # Cross-domain semantic-layer coverage/health/mute/feedback (F4.1-4.3,
+    # 4.5) — all admin-gated except the feedback submit, all Postgres-only
+    # (resource_source_tags / semantic_health_mutes / semantic_feedback),
+    # and every mutation needs a body — not parameter-free-GET shaped for
+    # this smoke sweep. Behaviourally covered in dedicated files instead:
+    # tests/test_semantic_model_coverage_endpoint.py (RBAC + DuckDB 501),
+    # tests/db_pg/test_semantic_model_coverage_pg.py (per-domain status
+    # logic, live PG); tests/test_semantic_layer_health_endpoint.py +
+    # tests/db_pg/test_semantic_layer_health_pg.py (roll-up, mute overlay);
+    # tests/test_semantic_health_mutes_endpoint.py +
+    # tests/db_pg/test_semantic_health_mutes_pg.py (scope grammar, 409/404,
+    # expiry); tests/test_semantic_feedback_endpoint.py +
+    # tests/db_pg/test_semantic_feedback_pg.py (open-submit RBAC, guarded
+    # resolve).
+    "GET /api/admin/semantic-model/coverage",
+    "POST /api/admin/semantic-model/coverage/tags",
+    "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}",
+    "GET /api/admin/semantic-layer/health",
+    "GET /api/admin/semantic-layer/mutes",
+    "POST /api/admin/semantic-layer/mutes",
+    "DELETE /api/admin/semantic-layer/mutes/{mute_id}",
+    "POST /api/semantic-feedback",
+    "GET /api/admin/semantic-feedback",
+    "POST /api/admin/semantic-feedback/{feedback_id}/resolve",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
@@ -2216,6 +2240,10 @@ KNOWN_UNTESTED = {
     # Admin semantic-layer sources page (multi-project sync) — tested in
     # tests/test_admin_semantic_layer_page.py.
     "GET /admin/semantic-layer",
+    # Admin semantic-sources page — shell over the existing
+    # /api/admin/semantic-sources* REST API; tested in
+    # tests/test_admin_semantic_sources_page.py (render + admin-gate).
+    "GET /admin/semantic-sources",
     # Guided linked-apps admin wizard (v0.77.28) — tested in
     # tests/test_web_data_apps.py (render + admin-gate).
     "GET /admin/linked-apps",
@@ -2651,6 +2679,15 @@ KNOWN_UNTESTED = {
     # session repos (tests/db_pg/test_chat_pg.py), not parameter-free.
     "PUT /api/chat/sessions/{chat_id}/archived",
     "DELETE /api/chat/sessions/{chat_id}/permanent",
+    # Session-workspace file delivery (#1611) — owner-scoped reads over the
+    # caller's own session dir plus the save-to-Library bridge. No new repo
+    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # path reuses create_single_file_artefact — both already parity-proven);
+    # behaviour (ownership 404s, traversal/symlink containment, download
+    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    "GET /api/chat/sessions/{chat_id}/files",
+    "GET /api/chat/sessions/{chat_id}/files/download",
+    "POST /api/chat/sessions/{chat_id}/files/save-artefact",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",
     "POST /api/chat/{session_id}/invite",

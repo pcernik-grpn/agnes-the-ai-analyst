@@ -6,9 +6,10 @@ CLAUDE.md -> "Dual-backend discipline": a repository registered PG-only
 frozen DuckDB app-state backend. The point of the error being *typed* is that
 ``app/main.py`` can translate it into a clean 501 for every such route
 without each handler needing its own try/except — proven here directly
-against the registered handler rather than via a live route (no production
-route reaches a PG-only repo yet; this is the mechanism test referenced by
-``docs/migrations.md`` -> "Adding a PG-only feature").
+against the registered handler as well as, since F4.1, through a live route
+(``/api/admin/semantic-model/coverage*``, pinned in
+``tests/test_semantic_model_coverage_endpoint.py``). This is the mechanism
+test referenced by ``docs/migrations.md`` -> "Adding a PG-only feature".
 """
 
 from __future__ import annotations
@@ -86,6 +87,28 @@ def test_requires_postgres_backend_handler_returns_clean_501(shared_app):
     assert body["error"] == "requires_postgres_backend"
     assert body["feature"] == "widgets"
     assert "docs/migrations.md" in body["detail"]
+
+
+def test_the_error_class_survives_a_reload_of_the_repository_factory():
+    """Class IDENTITY must be stable across ``importlib.reload(src.repositories)``.
+
+    Exception handlers are keyed on the class object. Several PG test
+    harnesses reload the factory module to pick up a backend env flip
+    (``tests/db_pg/_parity_sweep_util.py``, the ``state_backend`` fixture); if
+    the class were DEFINED there, the reload would mint a new one and
+    ``app/main.py``'s handler — bound once at app construction — would stop
+    matching, turning the documented clean 501 into an unhandled 500. It bit
+    exactly that way when the first PG-only route landed, which is why the
+    class lives in ``src/repository_errors.py`` and is only re-exported here.
+    """
+    import importlib
+
+    import src.repositories as factory
+
+    before = factory.RequiresPostgresBackend
+    importlib.reload(factory)
+    assert factory.RequiresPostgresBackend is before
+    assert factory.RequiresPostgresBackend is RequiresPostgresBackend
 
 
 def test_requires_postgres_backend_handler_is_distinct_from_the_catch_all(shared_app):

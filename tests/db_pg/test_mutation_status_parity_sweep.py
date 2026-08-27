@@ -55,9 +55,14 @@ _SKIP_SUBSTR = (
 # (DuckDB has no implementation) — list them here (route -> one-line reason)
 # instead of letting the sweep flag them. `assert_pg_only_exemptions_fail_clean`
 # below still requires each one to fail CLEAN (a typed 501) on DuckDB, not
-# crash or merely return some unrelated 4xx. The mechanism itself is proven
-# in `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
+# crash or merely return some unrelated 4xx. The mechanism itself is proven in
+# `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "POST /api/admin/semantic-model/coverage/tags": (
+        "coverage tagging writes `resource_source_tags`, a PG-only table (F4.1)"
+    ),
+    "POST /api/semantic-feedback": "filing feedback writes `semantic_feedback`, a PG-only table (F4.5)",
+    "POST /api/admin/semantic-layer/mutes": ("muting a check writes `semantic_health_mutes`, a PG-only table (F4.3)"),
     "POST /api/admin/semantic-auto-draft-sweep": (
         "the sweep's dedup flag (table_registry.mark_semantic_draft_pending / "
         "clear_semantic_draft_pending) is a Postgres-only column (semantic-"
