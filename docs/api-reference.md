@@ -494,6 +494,7 @@ Platform-wide settings live here, including the data source connection configura
 |---|---|---|
 | `GET` | `/api/admin/server-config` | Return current config + `known_fields` self-documentation |
 | `POST` | `/api/admin/server-config` | **Partial-patch** (preferred) — only the sections you send are changed |
+| `GET` | `/api/admin/server-config/overlay` | Raw, editable-section-only instance.yaml overlay (unresolved, secrets stripped) — the `agnes admin config export`/`apply` round-trip projection |
 | `POST` | `/api/admin/configure` | Full wizard-style setup; missing fields get nulled. Prefer the partial-patch above. |
 
 `POST /api/admin/server-config` accepts a `sections` object keyed by section name
@@ -505,7 +506,29 @@ Sections `auth` and `server` are "danger zones" — mutating them requires sendi
 `confirm_danger: true` in the request body, since incorrect values can lock
 administrators out of the instance.
 
-### 5.2 BigQuery config shape
+### 5.2 Export/apply the overlay as reviewable YAML
+
+`GET /api/admin/server-config/overlay` returns the raw on-disk overlay
+(`${STATE_DIR}/instance.yaml`) filtered to the editable sections — not the
+merged, env-resolved config `GET /api/admin/server-config` serves. An
+unresolved `${VAR}` reference or an env-var NAME field (`token_env`) passes
+through unchanged; a literal never leaves the server in two cases: (a) the
+`connectors` section is free-form and admin-typed (per-connector keys with
+no static schema, e.g. a Slack webhook URL) so every literal there is
+omitted regardless of key name, and (b) a value that is unambiguously
+credential-shaped (a JWT, a PEM block, a URL carrying userinfo or a long
+opaque token segment) is omitted everywhere else too. The response's
+`omitted_keys` lists every dropped path — nothing is silently discarded.
+`agnes admin config export`/`apply` wrap this endpoint and the partial-patch
+POST above into a round-trip: export the overlay to a file (the CLI prints
+a comment header + stderr note listing anything `omitted_keys` reported),
+review/edit it, commit it, and `apply` it to a new or existing instance
+through the exact same validated path an admin's form save would use. This
+is the "onboard a new client via a reviewed PR" building block — REST+CLI
+only, never MCP-exposed (same reasoning as the sections above: it is a
+one-call dump of the instance's editable config surface).
+
+### 5.3 BigQuery config shape
 
 ```json
 {
@@ -729,6 +752,7 @@ checks against.
 ### `/api/admin/server-config` and `/api/admin/configure` — Instance configuration
 
 - /api/admin/server-config
+- /api/admin/server-config/overlay
 - /api/admin/configure
 
 ### `/api/admin/uploads` — File uploads
@@ -2005,7 +2029,7 @@ Mirrored by `agnes agent memory list [--status pending|active|archived] [--json]
 
 ### `/api/v1/agents/{slug}/usage` — Agent-as-API monthly token usage (V1b Task 8)
 
-`GET /api/v1/agents/{slug}/usage?period=YYYY-MM` — per-agent monthly token usage against its budget. Same owner/agent-PAT auth as `/responses`. `period` defaults to the current UTC month; an explicitly passed value that isn't `YYYY-MM` is `400 {"code": "invalid_period"}`. Returns `{period, agent_slug, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, budget_limit, budget_remaining}` — the usage-shaped fields mirror Anthropic's own usage object. `total_tokens` is `input + output + cache_creation`, deliberately EXCLUDING `cache_read_tokens` (informational only) — the same quantity the broker's `check_budget` compares against `token_budget_monthly`, so `budget_remaining` (floored at `0`) lines up with when a call against this agent would actually start 429ing with `budget_exhausted`. `budget_limit`/`budget_remaining` are `null` for an agent with no configured budget. Mirrors `agnes agent usage` and the `agent_usage` MCP tool.
+`GET /api/v1/agents/{slug}/usage?period=YYYY-MM` — per-agent monthly token usage against its budget, plus a per-caller breakdown for a SHARED agent (C2.3) run by multiple users (remediation Track C, C2.4). Auth (`require_agent_usage_principal`) is owner/runnable-grantee/agent-PAT like `/responses`, PLUS an admin inspection fallback the other runtime routes deliberately lack. `period` defaults to the current UTC month; an explicitly passed value that isn't `YYYY-MM` is `400 {"code": "invalid_period"}`. Returns `{period, agent_slug, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, budget_limit, budget_remaining, by_caller}` — the usage-shaped fields mirror Anthropic's own usage object. `total_tokens` is `input + output + cache_creation`, deliberately EXCLUDING `cache_read_tokens` (informational only) — the same quantity the broker's `check_budget` compares against `token_budget_monthly`, so `budget_remaining` (floored at `0`) lines up with when a call against this agent would actually start 429ing with `budget_exhausted`. `budget_limit`/`budget_remaining` are `null` for an agent with no configured budget. `by_caller` is a list of `{caller_user_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens}`, one row per distinct caller who ran the agent that month (`caller_user_id` is `null` for an unattributed row — pre-C2.4 usage, or the DuckDB backend, which has no column to distinguish callers) — visible ONLY to the agent's owner or an admin; a plain runnable grantee gets `by_caller: null` (aggregate totals only, never other callers' usage). Mirrors `agnes agent usage` and the `agent_usage` MCP tool.
 
 - /api/v1/agents/{slug}/usage
 

@@ -70,14 +70,26 @@ COMPOSE_FILE="$(_env_get COMPOSE_FILE)"
 # later wave (this one only makes the host scripts role-split-ready).
 SCHEDULER_API_TOKEN="$(_env_get SCHEDULER_API_TOKEN)"
 COMPOSE_PROFILES="$(_env_get COMPOSE_PROFILES)"
+# AGNES_IMAGE_REPO: alternate registry/repository for the app image (e.g. a
+# GCP Artifact Registry mirror when the default registry needs auth the VM
+# doesn't have). Written by startup-script.sh.tpl from the module's
+# `image_repo` variable; empty → the compose files' default. Exported so
+# `docker compose` interpolates the same repo this script pulls/inspects.
 # Hosted data apps run under the `apps` compose profile, applied as a --profile
 # flag below (NOT via COMPOSE_PROFILES: compose ignores that env var whenever any
 # --profile flag — e.g. `--profile tls` — is present; the two are not merged).
 DATA_APPS_ENABLED="$(_env_get AGNES_DATA_APPS_ENABLED)"
+# Web chat with chat.provider=docker spawns its sessions through that SAME
+# apps-runner sidecar, so it needs the `apps` profile below even on a VM that
+# runs no data apps. Env pin > instance.yaml (app/chat/config.py), and only
+# the pin is visible from a host script — an instance.yaml-only `docker`
+# provider keeps the sidecar through COMPOSE_PROFILES=apps in .env instead.
+CHAT_PROVIDER="$(_env_get AGNES_CHAT_PROVIDER)"
 # The runtime image data apps actually run. Pre-pulled below so the first
 # deploy on this host isn't a 1.3 GB fetch inside the runner's request.
 DATA_APPS_RUNTIME_IMAGE="$(_env_get AGNES_DATA_APPS_RUNTIME_IMAGE)"
-export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES
+AGNES_IMAGE_REPO="$(_env_get AGNES_IMAGE_REPO)"
+export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES AGNES_IMAGE_REPO
 
 STATE_DIR="${STATE_DIR:-/data/state}"
 
@@ -125,7 +137,7 @@ if [ -e "$CONFIG_DEVICE" ]; then
   mount --make-rprivate "$STATE_DIR" 2>/dev/null || true
 fi
 
-IMAGE="ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}"
+IMAGE="${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}"
 # Array form (vs. word-split string) — quoted expansion survives paths
 # with spaces and is the modern bash idiom. Functionally identical here
 # since /opt/agnes paths are tame, but it's a cheap habit to keep.
@@ -157,23 +169,62 @@ if [ -n "$COMPOSE_PROFILES" ]; then
     done
 fi
 
-# Re-fetch the bind-mounted config files (compose overlays + Caddyfile)
-# from the OSS main branch on every tick. Without this, an image-only
-# change is fine, but a change to the Caddyfile or any compose overlay
-# (e.g. a new bind mount, a route, an env_file path) only lands on VMs
-# that get a fresh `startup.sh` boot — leaving long-uptime VMs running
-# the new image against stale config. Confirmed live on 2026-05-05
-# when a Caddyfile change adding a `data:/srv:ro` mount + a new
-# `forward_auth` + `file_server` route for parquet downloads landed
-# in main but stayed inert on running VMs because auto-upgrade only
-# watched image digests.
+# Docker GC. Deliberately OUTSIDE the drift block below, and ahead of
+# BOTH pulls (the artifact-refresh `docker pull` right below and the
+# `docker compose pull` further down): `docker image prune -f` used to be
+# the last statement inside that block, so a VM reclaimed disk only on a
+# tick that happened to recreate containers — never on a box already
+# sitting on the current image, and never when the recreate aborted
+# (role-split) or was deferred. Garbage accrues from more than upgrades,
+# too: a manual `docker compose build` on a dev VM, a tag pulled by hand.
+# Nothing else on the host reclaims it — agnes-watchdog.sh alerts on
+# `/data`, while images and build cache live on the BOOT disk under
+# /var/lib/docker, which no probe watches, so the first symptom is a
+# failed pull or a wedged daemon. Running before the pulls is what makes
+# this self-healing on an already-full disk: the tick frees the
+# superseded image, then fetches the new one.
 #
-# Hash before/after to detect content drift; treat as "trigger recreate"
-# alongside an image digest change. Atomic move-after-fetch guards
-# against a partial download corrupting compose at the next docker
-# action — `curl --fail` plus the `.new` rename means a 404 / network
-# blip leaves the existing file untouched.
-RAW_BASE="https://raw.githubusercontent.com/keboola/agnes-the-ai-analyst/main"
+# Scope is intentionally conservative:
+#   * `image prune -f` (no -a) removes DANGLING images only — the previous
+#     :stable that lost its tag when the new digest landed. Tagged images
+#     stay, including a data app's runtime image that happens to have no
+#     container running right now (src/data_apps/spec.py::build_container_spec).
+#   * `builder prune` reclaims BuildKit cache, which `image prune` cannot
+#     see at all; `until=168h` keeps a week of warm cache so a local
+#     rebuild on a dev VM stays fast.
+# Both are best-effort: `|| true` keeps a docker hiccup — or an older
+# daemon with no `builder` subcommand — from aborting the tick under
+# `set -e` and blocking the upgrade (and the self-update) behind it.
+docker image prune -f >/dev/null 2>&1 || true
+docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
+
+# Refresh the bind-mounted config files (compose overlays + Caddyfile) on
+# every tick. Without this, an image-only change is fine, but a change to
+# the Caddyfile or any compose overlay (e.g. a new bind mount, a route,
+# an env_file path) only lands on VMs that get a fresh `startup.sh` boot
+# — leaving long-uptime VMs running the new image against stale config.
+# Confirmed live on 2026-05-05 when a Caddyfile change adding a
+# `data:/srv:ro` mount + a new `forward_auth` + `file_server` route for
+# parquet downloads landed in main but stayed inert on running VMs
+# because auto-upgrade only watched image digests.
+#
+# The files come from /opt/agnes-host/ inside the pinned release image —
+# the same artifact contract the boot startup script extracts (see the
+# Dockerfile's /opt/agnes-host layer) — replacing the previous
+# unauthenticated fetch of the source repo's raw main branch:
+#   * Version pin: the image tag is the single pin for the image AND the
+#     host artifacts it runs against; a main-branch fetch silently broke
+#     that pin (config could run ahead of, or outlive, the image).
+#   * Private repo / egress: the container registry is the only external
+#     dependency left — the refresh keeps working when the source repo
+#     is private or the host's egress is restricted.
+# Every step is best-effort with the same posture the fetch had: atomic
+# copy-then-rename per file, so a registry blip, a missing extract
+# container, or an image predating /opt/agnes-host degrades to "stale
+# config + WARN in syslog", never a truncated compose file.
+#
+# Hash the refreshed tree to detect content drift; treat it as "trigger
+# recreate" alongside an image digest change.
 CONFIG_FILES=(
   docker-compose.yml docker-compose.prod.yml docker-compose.host-mount.yml
   docker-compose.postgres.yml docker-compose.postgres-host-mount.yml
@@ -198,47 +249,149 @@ hash_config_files() {
       sha256sum "$f" 2>/dev/null || printf 'missing %s\n' "$f"
     done ) | sort | sha256sum | awk '{print $1}'
 }
-for f in "${CONFIG_FILES[@]}"; do
-  mkdir -p "/opt/agnes/$(dirname "$f")"
-  if curl -fsSL "$RAW_BASE/$f" -o "/opt/agnes/$f.new" 2>/dev/null; then
-    mv -f "/opt/agnes/$f.new" "/opt/agnes/$f"
-  else
-    rm -f "/opt/agnes/$f.new"
-    logger -t agnes-auto-upgrade "WARN: failed to fetch $f from $RAW_BASE — keeping existing /opt/agnes/$f"
+
+# Pull the pinned tag BEFORE creating the extract container, so the
+# artifacts refreshed this tick come from the image a recreate below
+# would actually run (`docker create` only ever reads the local store).
+# Best-effort: a failed pull falls back to the locally available image —
+# the tick-level equivalent of the old fetch's network-blip fallback.
+docker pull "$IMAGE" >/dev/null 2>&1 \
+  || logger -t agnes-auto-upgrade "WARN: docker pull $IMAGE failed — refreshing host artifacts from the locally available image"
+EXTRACT_CID=$(docker create "$IMAGE" 2>/dev/null || true)
+if [ -n "$EXTRACT_CID" ]; then
+  # The container lives until the end of the tick — the self-update at
+  # the bottom extracts from the same one.
+  trap 'docker rm -f "$EXTRACT_CID" >/dev/null 2>&1 || true' EXIT
+else
+  logger -t agnes-auto-upgrade "WARN: cannot create an extract container from $IMAGE — keeping existing host config artifacts"
+fi
+
+# extract_host_artifact <path-under-/opt/agnes-host/> <destination>
+# Atomic copy-then-rename; any failure leaves the destination untouched
+# and returns non-zero (callers decide whether that deserves a WARN).
+extract_host_artifact() {
+  local src="$1" dest="$2"
+  [ -n "$EXTRACT_CID" ] || return 1
+  if docker cp "$EXTRACT_CID:/opt/agnes-host/$src" "$dest.new" >/dev/null 2>&1; then
+    mv -f "$dest.new" "$dest"
+    return 0
   fi
-done
+  rm -f "$dest.new"
+  return 1
+}
+
+if [ -n "$EXTRACT_CID" ]; then
+  for f in "${CONFIG_FILES[@]}"; do
+    mkdir -p "/opt/agnes/$(dirname "$f")"
+    extract_host_artifact "$f" "/opt/agnes/$f" \
+      || logger -t agnes-auto-upgrade "WARN: failed to extract $f from $IMAGE — keeping existing /opt/agnes/$f"
+  done
+fi
+
+# Data-app subdomains: re-apply the wiring the BOOT script does, because the
+# Caddyfile it wired was just re-fetched pristine by the loop above. Without
+# this, a VM with a data-app subdomain base lost its `*.<base>` vhost and its
+# `on_demand_tls` block on the first tick after boot, and the recreate below
+# then served a Caddy that could reach no hosted app at all — hosted apps are
+# refused on the main origin by default, so their own origin is the only
+# supported way to reach them. Boot script and upgrade tick must both do this,
+# exactly as both already mirror `--profile apps`.
+#
+# The block between the markers is byte-identical to the one in
+# `startup-script.sh.tpl` — `tests/test_startup_data_apps_toggle.py` asserts
+# that, and `tests/test_caddyfile_apps_subdomain_docker.py` runs it through
+# Caddy's own parser. Keep them in sync by editing both.
+#
+# Placed BEFORE `hash_config_files` so the drift hash describes the file Caddy
+# will actually load. That is also what makes the base converge in both
+# directions without a reboot: adding or clearing APPS_SUBDOMAIN_BASE in .env
+# changes the hash, and the resulting recreate is what puts it into effect.
+APP_DIR=/opt/agnes
+APPS_SUBDOMAIN_BASE="$(_env_get APPS_SUBDOMAIN_BASE)"
+# The vhost fragment normally arrives with the boot-time image extract. Refresh
+# it here too, so a VM whose last boot predates the fragment picks it up within
+# a tick instead of waiting for a reboot (the block below warns and no-ops
+# while it is absent, leaving the pristine Caddyfile untouched).
+#
+# Same source as every other host artifact above: /opt/agnes-host/ inside the
+# PINNED image (the Dockerfile copies deploy/caddy/Caddyfile.apps-subdomain to
+# the top level of that tree, which is why the extract path has no directory
+# component). It is deliberately NOT in CONFIG_FILES — only a VM with a
+# subdomain base has any use for it, and its content reaches the drift hash
+# anyway through the Caddyfile the wiring block below rewrites.
+#
+# Guarded on EXTRACT_CID exactly like the CONFIG_FILES loop: no extract
+# container means the tick already WARNed once at creation time and every
+# artifact keeps its existing on-disk copy.
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -n "$EXTRACT_CID" ]; then
+  extract_host_artifact Caddyfile.apps-subdomain "$APP_DIR/Caddyfile.apps-subdomain" \
+    || logger -t agnes-auto-upgrade "WARN: failed to extract Caddyfile.apps-subdomain from $IMAGE — keeping existing"
+fi
+# --- apps-subdomain-caddy begin (extracted + executed by tests/test_caddyfile_apps_subdomain_docker.py) ---
+# Data-app subdomains: Caddy vhost + per-app certificates
+# Hosted apps are refused on the main origin (they run user-authored JS that
+# would otherwise be same-origin with /api), so they are only reachable once
+# Caddy terminates TLS for *.$APPS_SUBDOMAIN_BASE.
+#
+# Certificates are issued PER HOSTNAME on first request (on-demand, HTTP-01),
+# not as one wildcard: a wildcard can only be validated over DNS-01, which
+# would put a DNS-zone write credential on this very host — the host that runs
+# user-authored app code. Issuance is gated by the `ask` endpoint below, so a
+# stranger cannot drive ACME by requesting made-up names.
+#
+# Only when a base is configured: `*.` with an empty value is a site address
+# Caddy refuses to parse, taking the PRIMARY site down with it — the same way
+# an empty DOMAIN_ALIAS once did.
+#
+# The global options block must be FIRST in a Caddyfile, so it is prepended,
+# not appended. Guarded on its own marker because this script runs on EVERY
+# boot and a second copy is a file Caddy cannot parse. (The boot-time image
+# extract normally restores a pristine Caddyfile first; the guard covers the
+# paths that do not.)
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -f "$APP_DIR/Caddyfile" ]; then
+    if [ ! -f "$APP_DIR/Caddyfile.apps-subdomain" ]; then
+        echo "WARN: Caddyfile.apps-subdomain missing from the image — data apps will not be reachable on *.$APPS_SUBDOMAIN_BASE" >&2
+    elif grep -q on_demand_tls "$APP_DIR/Caddyfile"; then
+        :  # already wired this boot — idempotent
+    else
+        {
+            printf '{\n\ton_demand_tls {\n\t\task http://app:8000/api/data-apps-tls-check\n\t}\n}\n\n'
+            cat "$APP_DIR/Caddyfile"
+            printf '\n'
+            cat "$APP_DIR/Caddyfile.apps-subdomain"
+        } > "$APP_DIR/.Caddyfile.new" && mv "$APP_DIR/.Caddyfile.new" "$APP_DIR/Caddyfile"
+        echo "INFO: data-app subdomains wired for *.$APPS_SUBDOMAIN_BASE (per-app certs via on-demand TLS)"
+    fi
+fi
+# --- apps-subdomain-caddy end ---
 
 # docker-compose.gcp-logging.yml is placement-driven: deliberately NOT in
-# CONFIG_FILES (those are fetched unconditionally). It must exist ONLY where
-# the deploy layer placed it -- the overlay-append further down gates on its
-# presence plus the driver-probe marker (see below), and its gcplogs driver
-# needs the GCE metadata server, so a non-GCE host must never acquire it.
-# But once present it still has to track
-# @main: if a service is dropped from the base compose (e.g. ws-gateway) while
-# a stale gcp-logging.yml keeps referencing it, the merged project becomes
-# invalid and every `docker compose` below fails (pull, config, up) -- which
+# CONFIG_FILES (those are refreshed unconditionally). It must exist ONLY
+# where the deploy layer placed it -- the overlay-append further down gates
+# on its presence plus the driver-probe marker (see below), and its gcplogs
+# driver needs the GCE metadata server, so a non-GCE host must never
+# acquire it. But once present it still has to track the image: if a
+# service is dropped from the base compose (e.g. ws-gateway) while a stale
+# gcp-logging.yml keeps referencing it, the merged project becomes invalid
+# and every `docker compose` below fails (pull, config, up) -- which
 # silently strands the VM on its cached image. So refresh it in place, but
 # only when it already exists.
 if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
-  if curl -fsSL "$RAW_BASE/docker-compose.gcp-logging.yml" -o /opt/agnes/docker-compose.gcp-logging.yml.new 2>/dev/null; then
-    mv -f /opt/agnes/docker-compose.gcp-logging.yml.new /opt/agnes/docker-compose.gcp-logging.yml
-  else
-    rm -f /opt/agnes/docker-compose.gcp-logging.yml.new
-    logger -t agnes-auto-upgrade "WARN: failed to refresh docker-compose.gcp-logging.yml from $RAW_BASE -- keeping existing"
-  fi
+  extract_host_artifact docker-compose.gcp-logging.yml /opt/agnes/docker-compose.gcp-logging.yml \
+    || logger -t agnes-auto-upgrade "WARN: failed to refresh docker-compose.gcp-logging.yml from $IMAGE -- keeping existing"
 fi
 
 # Source the single shared resolver (scripts/ops/agnes-compose-file.sh —
-# just re-fetched above as part of CONFIG_FILES) here, AFTER the config
-# re-fetch so a Caddyfile or gcp-logging overlay that just landed THIS tick
+# just refreshed above as part of CONFIG_FILES) here, AFTER the artifact
+# refresh so a Caddyfile or gcp-logging overlay that just landed THIS tick
 # is reflected immediately, not on the next one, and BEFORE
 # hash_config_files so the gcplogs probe below can arm its marker inside
 # this tick's drift window.
 #
 # Sourced by absolute path, and its absence ends the tick rather than
 # being worked around. Two situations produce an absent resolver: the
-# fetch loop above could not reach GitHub on the tick that first delivers
-# it (an instance upgrading from a build that predates this file), or a
+# extraction above could not deliver it on the tick that first needs it
+# (registry unreachable, or the pinned image predates this file), or a
 # harness relocated the tree. Neither is worth improvising through —
 # every overlay decision below, TLS included, comes from this file, so a
 # partial run would recreate the stack from a half-known overlay set.
@@ -319,9 +472,19 @@ fi
 # across upgrade ticks. Must be a flag (mirrors the startup script): once
 # `--profile tls` is in PROFILE_ARGS the COMPOSE_PROFILES env var is ignored, so
 # relying on it would silently drop the sidecar on the default TLS instance.
+APPS_PROFILE_WANTED=0
 case "$DATA_APPS_ENABLED" in
-  1|true|TRUE|yes|on) PROFILE_ARGS+=( --profile apps ) ;;
+  1|true|TRUE|yes|on) APPS_PROFILE_WANTED=1 ;;
 esac
+# Same sidecar, second consumer: chat.provider=docker. Dropping the profile
+# here would stop the sandbox runner on the next tick and 503 every chat
+# session on a VM whose chat was fine a moment earlier.
+[ "$CHAT_PROVIDER" = "docker" ] && APPS_PROFILE_WANTED=1
+# Guard the append: COMPOSE_PROFILES in .env is already folded into flags
+# above, so a VM carrying `apps` there would otherwise get it twice.
+if [ "$APPS_PROFILE_WANTED" = "1" ] && [[ " ${PROFILE_ARGS[*]-} " != *" apps "* ]]; then
+    PROFILE_ARGS+=( --profile apps )
+fi
 
 # gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging.
 # Gated on file presence (the file is baked into the image but PLACED only
@@ -335,32 +498,8 @@ esac
 # RESOLVED_COMPOSE_FILE above (the same agnes_gcp_logging_active gate, done
 # once in agnes_resolve_compose_file) — nothing left to do here.
 
-# Docker GC. Deliberately OUTSIDE the drift block below, and ahead of the
-# pull: `docker image prune -f` used to be the last statement inside that
-# block, so a VM reclaimed disk only on a tick that happened to recreate
-# containers — never on a box already sitting on the current image, and
-# never when the recreate aborted (role-split) or was deferred. Garbage
-# accrues from more than upgrades, too: a manual `docker compose build` on
-# a dev VM, a tag pulled by hand. Nothing else on the host reclaims it —
-# agnes-watchdog.sh alerts on `/data`, while images and build cache live
-# on the BOOT disk under /var/lib/docker, which no probe watches, so the
-# first symptom is a failed pull or a wedged daemon. Running before the
-# pull is what makes this self-healing on an already-full disk: the tick
-# frees the superseded image, then fetches the new one.
-#
-# Scope is intentionally conservative:
-#   * `image prune -f` (no -a) removes DANGLING images only — the previous
-#     :stable that lost its tag when the new digest landed. Tagged images
-#     stay, including a data app's runtime image that happens to have no
-#     container running right now (src/data_apps/spec.py::build_container_spec).
-#   * `builder prune` reclaims BuildKit cache, which `image prune` cannot
-#     see at all; `until=168h` keeps a week of warm cache so a local
-#     rebuild on a dev VM stays fast.
-# Both are best-effort: `|| true` keeps a docker hiccup — or an older
-# daemon with no `builder` subcommand — from aborting the tick under
-# `set -e` and blocking the upgrade (and the self-update) behind it.
-docker image prune -f >/dev/null 2>&1 || true
-docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
+# (Docker GC runs at the top of the tick — see the prune block above the
+# host-artifact refresh — so a full boot disk gets room before either pull.)
 
 # COMPOSE_FILE is exported above; docker compose picks it up automatically.
 # `|| …` so a pull failure (registry outage, transient network/auth blip)
@@ -404,6 +543,26 @@ if [[ ":$COMPOSE_FILE:" == *":docker-compose.kai-agent.yml:"* ]]; then
     if [ -z "$(docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} ps -q --status running kai-agent 2>/dev/null)" ]; then
         docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d kai-agent >/dev/null 2>&1 \
             || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; retrying next tick"
+    fi
+fi
+
+# The chat sandbox image is the same boot-failure shape, one provider over.
+# The boot build is deliberately best-effort (a failed build must not abort a
+# VM boot), so a box whose build failed once — daemon not up yet, a transient
+# registry error — comes up with the image MISSING, and the app refuses the
+# ChatManager without it: every chat route 503s. The drift-gated refresh below
+# never fires on a no-change tick, so without this the VM would stay chat-less
+# until something unrelated to chat happened to change.
+# Gated on the image being ABSENT, for the same reason the engine retry is
+# gated on the engine being down: the helper is idempotent, but its no-op path
+# still extracts the build context out of the app image, which is not worth
+# doing every 5 minutes on a healthy box. A context that legitimately MOVED is
+# the drift branch's job — that is the case an image-presence check cannot see.
+# The tag mirrors the helper's own default; neither caller passes one.
+if [ "$CHAT_PROVIDER" = "docker" ] && [ -x /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh ]; then
+    if ! docker image inspect agnes-chat-sandbox:latest >/dev/null 2>&1; then
+        /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE" \
+            || logger -t agnes-auto-upgrade "WARN: chat sandbox image is missing and the rebuild failed — chat stays disabled; retrying next tick"
     fi
 fi
 
@@ -642,6 +801,16 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
             fi
         fi
     fi
+    # chat.provider=docker: refresh the sandbox image BEFORE the recreate.
+    # Its build context ships inside the app image, so an app upgrade can
+    # change it — and the app probes the image during boot, refusing the
+    # ChatManager when it is missing or unbuildable. The helper is a no-op
+    # unless the context hash actually moved, and best-effort: a failed
+    # build must not abort the tick and leave the config marker unwritten.
+    if [ "$CHAT_PROVIDER" = "docker" ] && [ -x /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh ]; then
+        /opt/agnes/scripts/ops/agnes-chat-sandbox-image.sh "$IMAGE" \
+            || logger -t agnes-auto-upgrade "WARN: chat sandbox image refresh failed — chat may refuse to start after this recreate"
+    fi
     # ${arr[@]+"${arr[@]}"} pattern: expands to nothing when array is
     # empty (vs. plain "${arr[@]}" which trips `set -u` on bash <4.4).
     # COMPOSE_FILE (incl. any conditionally-appended overlays) is exported
@@ -695,13 +864,18 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
     # drifting. See the prune block above the pull.)
 fi
 
-# Self-update: re-fetch *this* script too. Without this, the very fix
-# that lets auto-upgrade watch config files would itself never land on
-# running VMs — a self-perpetuating "old script" problem. Atomic via
-# .new + mv; chmod preserved. The next tick (5 min later) runs the
-# new logic. Skipping if curl fails leaves the existing script in place.
-if curl -fsSL "$RAW_BASE/scripts/ops/agnes-auto-upgrade.sh" \
-   -o /usr/local/bin/agnes-auto-upgrade.sh.new 2>/dev/null; then
+# Self-update: extract *this* script too (shipped at the TOP level of
+# /opt/agnes-host/, unlike its scripts/ops/ home in the repo — see the
+# Dockerfile's chmod 0755 list). Without this, the very fix that lets
+# auto-upgrade track host artifacts would itself never land on running
+# VMs — a self-perpetuating "old script" problem. Atomic via .new + mv
+# (the running bash keeps reading its old inode); chmod before the
+# rename. The next tick (5 min later) runs the new logic. Any failure —
+# no extract container, an image predating the artifact — leaves the
+# existing script in place.
+if [ -n "$EXTRACT_CID" ] && \
+   docker cp "$EXTRACT_CID:/opt/agnes-host/agnes-auto-upgrade.sh" \
+     /usr/local/bin/agnes-auto-upgrade.sh.new >/dev/null 2>&1; then
   if ! cmp -s /usr/local/bin/agnes-auto-upgrade.sh.new \
                 /usr/local/bin/agnes-auto-upgrade.sh; then
     chmod +x /usr/local/bin/agnes-auto-upgrade.sh.new
@@ -711,4 +885,6 @@ if curl -fsSL "$RAW_BASE/scripts/ops/agnes-auto-upgrade.sh" \
   else
     rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
   fi
+else
+  rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
 fi

@@ -404,7 +404,7 @@ class TableRegistryRepository:
     # NOTE (A3 PG-first ratchet): mark_semantic_draft_pending /
     # clear_semantic_draft_pending do NOT exist on this DuckDB repo.
     # table_registry.semantic_draft_pending_at is a Postgres-only column
-    # (migrations/versions/0074_semantic_draft_pending.py) — the
+    # (migrations/versions/0076_semantic_draft_pending.py) — the
     # DuckDB app-state ladder is frozen at v124 and does not gain this
     # capability. See src/repositories/table_registry_pg.py for the
     # PG-only pair and CLAUDE.md -> "Dual-backend discipline".

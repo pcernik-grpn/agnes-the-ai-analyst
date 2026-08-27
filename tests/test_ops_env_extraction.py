@@ -30,12 +30,13 @@ _OPS = Path("scripts/ops")
 _SCRIPTS: dict[str, set[str]] = {
     "agnes-auto-upgrade.sh": {
         "AGNES_TAG",
+        "AGNES_IMAGE_REPO",
         "STATE_DIR",
         "COMPOSE_FILE",
         "SCHEDULER_API_TOKEN",
         "COMPOSE_PROFILES",
     },
-    "agnes-state-applier.sh": {"AGNES_TAG"},
+    "agnes-state-applier.sh": {"AGNES_TAG", "AGNES_IMAGE_REPO"},
     "agnes-tls-rotate.sh": {
         "TLS_FULLCHAIN_URL",
         "TLS_PRIVKEY_URL",
@@ -50,6 +51,7 @@ _SCRIPTS: dict[str, set[str]] = {
 _HOSTILE_ENV = textwrap.dedent(
     """\
     AGNES_TAG=dev-hostile-tag
+    AGNES_IMAGE_REPO=europe-docker.pkg.dev/example-project/agnes/agnes
     STATE_DIR=/data/state
     COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
     DOMAIN=agnes.example.com
@@ -64,6 +66,7 @@ _HOSTILE_ENV = textwrap.dedent(
 
 _EXPECTED = {
     "AGNES_TAG": "dev-hostile-tag",
+    "AGNES_IMAGE_REPO": "europe-docker.pkg.dev/example-project/agnes/agnes",
     "STATE_DIR": "/data/state",
     "COMPOSE_FILE": "docker-compose.yml:docker-compose.prod.yml",
     "DOMAIN": "agnes.example.com",

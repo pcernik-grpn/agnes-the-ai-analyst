@@ -9,6 +9,7 @@ from cli.commands.admin_activity import activity_app
 from cli.commands.admin_analytics import analytics_app as admin_analytics_app
 from cli.commands.admin_ask import app as admin_ask_app
 from cli.commands.admin_autodoc import autodoc_tables
+from cli.commands.admin_config import admin_config_app
 from cli.commands.admin_connection import admin_connection_app
 from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_data_semantics import admin_data_semantics_app
@@ -72,6 +73,9 @@ admin_app.add_typer(admin_semantic_source_app, name="semantic-source", help="Sem
 admin_app.add_typer(
     admin_connection_app, name="connection", help="Named source-connection CRUD (multi-project Keboola)"
 )
+admin_app.add_typer(
+    admin_config_app, name="config", help="Export/apply the server-config overlay as reviewable YAML (Track D3)"
+)
 admin_app.add_typer(admin_skills_app, name="skill", help="Contributed skills management")
 admin_app.add_typer(admin_jobs_app, name="jobs", help="Job queue admin (wave-2B worker runtime)")
 admin_app.add_typer(admin_analytics_app, name="analytics", help="DuckLake analytics-backend migration (wave-2G)")
@@ -95,19 +99,60 @@ admin_app.add_typer(table_policy_app, name="table-policy")
 def add_user(
     email: str = typer.Argument(..., help="User email"),
     name: str = typer.Option("", help="User display name"),
+    invite: bool = typer.Option(
+        False,
+        "--invite",
+        help="Also issue a setup link and email it (needs SMTP_HOST). The link is printed either way.",
+    ),
 ):
-    """Add a new user. New users start with no group memberships — to make
-    them admin, add them to the Admin group separately:
+    """Add a new user, optionally inviting them.
+
+    Without --invite the account exists but carries no way in yet — issue the
+    setup link later with `agnes admin reset-password <email>`. New users also
+    start with no group memberships — to make them admin, add them to the Admin
+    group separately:
 
         agnes admin group add-member <admin-group-id> <email>
     """
-    resp = api_post("/api/users", json={"email": email, "name": name or email.split("@")[0]})
-    if resp.status_code == 201:
-        data = resp.json()
-        typer.echo(f"Created user: {data['email']} (id: {data['id']})")
-    else:
+    resp = api_post(
+        "/api/users",
+        json={"email": email, "name": name or email.split("@")[0], "send_invite": invite},
+    )
+    if resp.status_code != 201:
         typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
         raise typer.Exit(1)
+
+    data = resp.json()
+    typer.echo(f"Created user: {data['email']} (id: {data['id']})")
+
+    if not invite:
+        typer.echo(
+            "  No invitation sent — the account has no way in yet.\n"
+            "  Re-run with --invite next time, or send the setup link now:\n"
+            f"    agnes admin reset-password {data['email']}"
+        )
+        return
+
+    # An invite the server never issued must not read as one that went out —
+    # the person would sit waiting for mail that is not coming.
+    setup_url = data.get("invite_url")
+    if not setup_url:
+        typer.echo(
+            "  Invitation requested but the server returned no setup link.\n"
+            "  The account exists — do NOT re-run add-user; send the link with:\n"
+            f"    agnes admin reset-password {data['email']}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if data.get("invite_email_sent"):
+        typer.echo(f"  Invitation emailed to {data['email']}.")
+    else:
+        typer.echo(
+            "  Warning: email transport not configured — send this link to the user yourself.",
+            err=True,
+        )
+    typer.echo(f"  Setup link: {setup_url}")
 
 
 @admin_app.command("list-users")

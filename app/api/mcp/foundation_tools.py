@@ -2045,14 +2045,18 @@ def register_foundation_tools(
 
         Returns ``{period, agent_slug, input_tokens, output_tokens,
         cache_read_tokens, cache_creation_tokens, total_tokens,
-        budget_limit, budget_remaining}`` — the usage-shaped fields mirror
-        Anthropic's own usage object; ``total_tokens`` excludes
-        ``cache_read_tokens`` (informational only, not counted against
-        budget), so ``budget_remaining`` lines up with when a call against
-        this agent would actually start 429ing with ``budget_exhausted``.
-        ``budget_limit``/``budget_remaining`` are ``null`` for an agent
-        with no configured budget. Mirrors
-        ``GET /api/v1/agents/{slug}/usage`` and ``agnes agent usage``.
+        budget_limit, budget_remaining, by_caller}`` — the usage-shaped
+        fields mirror Anthropic's own usage object; ``total_tokens``
+        excludes ``cache_read_tokens`` (informational only, not counted
+        against budget), so ``budget_remaining`` lines up with when a call
+        against this agent would actually start 429ing with
+        ``budget_exhausted``. ``budget_limit``/``budget_remaining`` are
+        ``null`` for an agent with no configured budget. ``by_caller`` is a
+        per-caller token breakdown for a SHARED agent run by multiple
+        users — ``null`` unless you own this agent or are an admin (a
+        grantee sees the aggregate total only, never other callers'
+        usage). Mirrors ``GET /api/v1/agents/{slug}/usage`` and ``agnes
+        agent usage``.
         """
         params: dict[str, Any] = {"period": period} if period else {}
         async with httpx.AsyncClient() as c:
