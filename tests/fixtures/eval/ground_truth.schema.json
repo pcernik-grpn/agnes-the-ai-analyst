@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agnes.example.com/schemas/eval/ground_truth.schema.json",
+  "title": "Fact-graph planted ground-truth manifest",
+  "description": "Schema for the ground-truth manifest that scripts/eval/metrics.py (EQ3/EQ9) grades a fact-graph extraction run against. A conforming manifest describes facts and edges DELIBERATELY PLANTED in a corpus (spec Sec. 15.5, Run P), so precision/recall, entity-resolution cluster purity, conflict rate, and orphan rate can be computed against a known-correct answer instead of eyeballed. Field names follow the facts/edges/claims schema in docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md Sec. 3 (facts.type, fact_aliases.natural_key, edges.type). A sibling corpus-generator task emits conforming instances; this repository only defines the contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["corpus_id", "generated_at", "document_count", "facts"],
+  "properties": {
+    "corpus_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The collection/corpus this manifest was planted into (matches claims.corpus_id in the live schema)."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp the manifest was generated, ISO 8601."
+    },
+    "document_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total documents in the planted corpus (the denominator for the EQ9 conflict-rate-per-1000-documents metric)."
+    },
+    "facts": {
+      "type": "array",
+      "description": "Every fact (ontology node) deliberately planted in the corpus.",
+      "items": { "$ref": "#/$defs/plantedFact" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Every edge (ontology relationship) deliberately planted in the corpus. Optional -- a manifest testing fact extraction alone may omit it.",
+      "items": { "$ref": "#/$defs/plantedEdge" }
+    }
+  },
+  "$defs": {
+    "plantedFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["natural_key", "type", "source_doc_ids"],
+      "properties": {
+        "natural_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The canonical producer slug for this fact (fact_aliases.natural_key in the live schema), e.g. 'myers-emergency-power-systems'."
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Ontology node type (facts.type in the live schema), e.g. 'engagement', 'client', 'sponsor'."
+        },
+        "aliases": {
+          "type": "array",
+          "description": "Additional natural-key spellings/variants planted in the corpus that a correct extraction must resolve into this SAME fact (entity-resolution challenge). Used for both precision/recall matching (any alias counts as a hit) and EQ9 cluster-purity scoring (the full set -- natural_key plus aliases -- is one expected cluster).",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "expected_attrs": {
+          "type": "object",
+          "description": "Attribute key/value pairs a correct extraction should record for this fact, evaluated against the live API's per-key projected value (design spec Sec. 4). Optional -- some manifests test presence/resolution only, not attribute accuracy.",
+          "additionalProperties": true
+        },
+        "source_doc_ids": {
+          "type": "array",
+          "description": "Corpus document ids (source_doc_id / a generator-assigned stable id) this fact was planted into -- at least one.",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      }
+    },
+    "plantedEdge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["src_natural_key", "type", "dst_natural_key", "source_doc_ids"],
+      "properties": {
+        "src_natural_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "natural_key of the source fact (must match a facts[].natural_key or one of its aliases)."
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Ontology edge type (edges.type in the live schema), e.g. 'sponsored_by', 'subsidiary_of'."
+        },
+        "dst_natural_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "natural_key of the destination fact (must match a facts[].natural_key or one of its aliases)."
+        },
+        "source_doc_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      }
+    }
+  }
+}
