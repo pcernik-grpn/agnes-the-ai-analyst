@@ -126,6 +126,18 @@ def test_listing_engine_404_degrades_to_unsupported(
     assert body == {"files": [], "truncated": False, "source": "engine", "supported": False}
 
 
+@pytest.mark.parametrize("body", [b"", b"not json", b"<html>gateway</html>"])
+def test_listing_engine_malformed_body_maps_to_502(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict, body: bytes
+) -> None:
+    """A 200 whose body is empty or not JSON is an engine fault, not a
+    caller error — 502, never an unhandled 500 (Devin review on #1628)."""
+    client = _make_client(data_dir, monkeypatch, lambda request: httpx.Response(200, content=body))
+    resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["kind"] == "engine_files_unavailable"
+
+
 @pytest.mark.parametrize("status", [500, 502, 503])
 def test_listing_engine_5xx_maps_to_502(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict, status: int

@@ -134,7 +134,10 @@ async def fetch_engine_listing(
                         return None  # no files channel for this chat
                     continue  # a subdirectory vanished mid-walk; keep going
                 _raise_for_engine_status(resp, chat_id=chat_id, what="listing")
-                body = resp.json()
+                try:
+                    body = resp.json()
+                except ValueError as exc:
+                    raise EngineFilesUnavailable("engine listing body is not JSON") from exc
                 entries = body.get("entries") if isinstance(body, dict) else None
                 if not isinstance(entries, list):
                     raise EngineFilesUnavailable("engine listing has no entries array")
