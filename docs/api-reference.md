@@ -1350,6 +1350,9 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/sessions
 - /api/chat/sessions/{chat_id}
 - /api/chat/sessions/{chat_id}/archived
+- /api/chat/sessions/{chat_id}/files
+- /api/chat/sessions/{chat_id}/files/download
+- /api/chat/sessions/{chat_id}/files/save-artefact
 - /api/chat/sessions/{chat_id}/messages
 - /api/chat/sessions/{chat_id}/permanent
 - /api/chat/sessions/{chat_id}/pin
