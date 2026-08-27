@@ -42,6 +42,43 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the API until the flag is cleared. Defaults preserve today's behaviour — an
   instance that does not set it is unprotected, exactly as before.
 
+- **The builders lead the setup instead of waiting for it.** Every builder
+  opened with a paragraph the page hardcoded and then waited for the author to
+  describe the whole artifact in one go. Nothing modelled what was still
+  unknown, and the prompts said so outright — *"ask at most ONE question per
+  turn, and only when the answer would change the configuration."*
+  - A **declared interview** per type: an ordered list of what the thing still
+    needs, computed from the draft on every turn and handed to the model as that
+    turn's job. The panel shows it — *"2 of 5 — still to settle: the trigger,
+    the steps, a category"* — from the same predicates the prompt is built out
+    of, so the assistant and the form cannot disagree about what is missing.
+  - **The builder speaks first.** An empty message on the first turn is now the
+    opening turn, generated from the empty draft and the first open slot; a
+    later empty message is still refused.
+  - Slot thresholds match the store's own content guardrail (a description under
+    ~60 characters or a body under ~200 is rejected at Check), so the interview
+    cannot lead an author into a wall. Slots that may legitimately end empty —
+    an agent's knowledge, a package's groups — are deliberately absent: one that
+    can never be settled turns the progress line into a nag.
+  - `app/api/builder_core.py` now owns what the three turn endpoints each
+    re-implemented (transcript model, caps, stub gate, LLM call, response
+    envelope, prompt scaffolding). Each adapter keeps its own patchable fields,
+    candidates, type brief, slots and **sanitizer** — that last one
+    deliberately not generalized, since model output is untrusted input.
+- **Every builder turn now reports which engine answered it**, and the page
+  renders a scripted one as a standing notice. The stub also has its own flag
+  (`AGNES_BUILDER_STUB`) instead of being implied by `LOCAL_DEV_MODE` — which,
+  since `LOCAL_DEV_MODE` is also what provides local auto-auth, meant there was
+  no way to run a local instance with auth *and* a real turn, and every local
+  judgement about builder quality was made against a string-slicer returning the
+  identical wire shape. `TESTING=1` still forces the stub.
+- **`/admin/mcp-sources` and `/admin/linked-apps` are in the Library's + Add
+  menu.** Both are create verbs — a new capability appears in the workspace —
+  and both lived only in admin, so the menu that claims to be where you add
+  things listed four of the six things you can add. They keep the menu's
+  blast-radius grouping (an MCP source adds tool-calling reach to every agent
+  granted it) and still open their existing pages.
+
 - **A plugin can now be composed from items already in the Library** — the
   builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
   and `POST /api/store/entities/from-components` assembles the bundle
@@ -141,6 +178,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   internal kind.
 
 ### Changed
+
+- **The data-package drawer shows the package, not the warehouse.** Its tables
+  field rendered the *entire* registry — ~500 rows in a project › bucket tree
+  with tri-state boxes — and ticked the members somewhere inside it, so five
+  chosen tables were five ticks scattered through a hundred collapsed groups,
+  and a table the drawer's own conversation proposed landed where nobody would
+  look. The panel now carries only what is in the package (source, query mode,
+  Remove each, count on the label) plus **+ Add tables**; the tree is kept
+  verbatim and moved inside the picker, bulk tri-state boxes and all. It opens
+  the tree when there is only one project, since otherwise a single-source
+  instance opens the picker onto one collapsed heading. The panel also says how
+  many of the chosen tables actually reach a laptop
+  (`query_mode IN ('local','materialized')` and not `server_only`) rather than
+  leaving an admin to know that rule by heart. Groups get the same treatment in
+  a follow-up — that pool carries a three-state tier per row and a grant diff on
+  save.
+- **`POST /api/store/entities/from-components` gained a CLI and an MCP surface**
+  — `agnes store compose <name> --add <id> --add <id>` and the
+  `store_compose_plugin` tool — matching its sibling `from-markdown` rather than
+  taking a REST-only exemption.
 - **A chat send that never started no longer eats the message.** The composer
   is cleared synchronously on submit, for immediate feedback while the runner
   boots — but when `ensureWsReady()` then failed (chat disabled, no live

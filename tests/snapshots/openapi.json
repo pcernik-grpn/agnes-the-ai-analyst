@@ -1256,6 +1256,7 @@
         "type": "object"
       },
       "BuilderMessage": {
+        "description": "One turn of the transcript, as the page replays it.",
         "properties": {
           "role": {
             "maxLength": 16,
