@@ -46,7 +46,18 @@ class _FakeChatRepo:
         return SimpleNamespace(id=chat_id, user_email=email)
 
 
-def _make_app(*, data_dir: Path, sessions: dict[str, str] | None = None) -> FastAPI:
+#: The host-path harness default. Explicit on purpose: the instance default
+#: provider is ``kai-agent``, and _chat_config_for_delivery's fallback would
+#: load exactly that — flipping every host-walk test onto the engine branch.
+_DOCKER_CONFIG = SimpleNamespace(provider="docker")
+
+
+def _make_app(
+    *,
+    data_dir: Path,
+    sessions: dict[str, str] | None = None,
+    chat_config: object | None = _DOCKER_CONFIG,
+) -> FastAPI:
     os.environ["DATA_DIR"] = str(data_dir)
 
     from app.api.chat_session_files import require_chat_access
@@ -55,6 +66,8 @@ def _make_app(*, data_dir: Path, sessions: dict[str, str] | None = None) -> Fast
     app = FastAPI()
     app.include_router(files_router)
     app.state.chat_repo = _FakeChatRepo(sessions if sessions is not None else {CHAT_ID: TEST_USER["email"]})
+    if chat_config is not None:
+        app.state.chat_config = chat_config
     app.dependency_overrides[require_chat_access] = lambda: TEST_USER
     return app
 
@@ -233,16 +246,109 @@ def test_list_skips_noise_dirs_and_escaping_symlinks(client: TestClient, session
 
     resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files")
     paths = {f["path"] for f in resp.json()["files"]}
-    assert not any(p.startswith("__pycache__") or p.startswith(".git") for p in paths)
+    assert not any(p.startswith(("__pycache__", ".git")) for p in paths)
     assert not any(p.startswith("loot") for p in paths)
 
 
 def test_list_empty_when_session_dir_missing(data_dir: Path) -> None:
-    """A session that never spawned locally (e.g. remote engine) lists empty."""
+    """A docker-provider session that never spawned lists empty (host path)."""
     app = _make_app(data_dir=data_dir)
     resp = TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files")
     assert resp.status_code == 200
-    assert resp.json()["files"] == []
+    body = resp.json()
+    assert body["files"] == []
+    assert body["source"] == "host"
+    assert body["supported"] is True
+
+
+# ---------------------------------------------------------------------------
+# Provider gating (kai-agent = engine sandbox; host dir is template noise)
+# ---------------------------------------------------------------------------
+
+_KAI_CONFIG = SimpleNamespace(provider="kai-agent", kai_agent_url="http://engine.invalid:3000")
+
+
+def _engine_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the engine transport at a 404-everything engine (an engine
+    build without the sandbox-files routes / an unknown chat) and stub the
+    JWT mint. The full proxy behavior matrix lives in
+    tests/test_chat_kai_engine_files.py."""
+    import httpx
+
+    import app.api.chat_session_files as mod
+    from app.api import kai
+
+    monkeypatch.setattr(mod, "_ENGINE_TRANSPORT", httpx.MockTransport(lambda request: httpx.Response(404)))
+    monkeypatch.setattr(kai, "mint_engine_session_token", lambda email, chat_id: ("jwt", 0))
+
+
+def test_list_under_kai_agent_reports_unsupported_not_workspace_noise(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under kai-agent the host session dir exists but holds only workspace
+    template symlinks — listing it would surface hundreds of files that are
+    not session output. When the engine has no files channel, the listing
+    must be an honest ``supported: false``, never the template noise."""
+    _engine_gone(monkeypatch)
+    noise = session_dir.resolve() / ".claude" / "skills" / "sales-proposal" / "SKILL.md"
+    noise.write_bytes(b"template noise")
+    app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG)
+    resp = TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["files"] == []
+    assert body["source"] == "engine"
+    assert body["supported"] is False
+
+
+def test_download_and_save_artefact_404_under_kai_agent_without_engine(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host files must be unreachable through an engine-backed session even
+    when they exist on disk — the engine (which 404s here) is the only
+    source of truth for what the session produced."""
+    _engine_gone(monkeypatch)
+    (session_dir / "real.txt").write_bytes(b"host bytes the engine session must not serve")
+    app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG)
+    client = TestClient(app)
+    assert client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": "real.txt"}).status_code == 404
+    assert (
+        client.post(f"/api/chat/sessions/{CHAT_ID}/files/save-artefact", json={"path": "real.txt"}).status_code == 404
+    )
+    # Path validation still runs first — same 400-before-404 ordering as host.
+    assert client.get(f"/api/chat/sessions/{CHAT_ID}/files/download", params={"path": "../x"}).status_code == 400
+
+
+def test_config_double_without_provider_stays_on_host_path(data_dir: Path, session_dir: Path) -> None:
+    """A chat_config double lacking ``provider`` (the test_chat_web_deeplink
+    harness shape) must resolve to the local host path, mirroring the
+    duck-typed-double rule for provider capability flags."""
+    (session_dir / "hello.txt").write_bytes(b"hi")
+    app = _make_app(data_dir=data_dir, chat_config=SimpleNamespace(enabled=True))
+    resp = TestClient(app).get(f"/api/chat/sessions/{CHAT_ID}/files")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "host"
+    assert {f["path"] for f in body["files"]} == {"hello.txt"}
+
+
+def test_files_routes_are_provider_gated_defensively() -> None:
+    """Source-text guard (pattern: tests/test_kai_engine_provider.py): every
+    route resolves the files source via the defensive config read before any
+    host-dir access, so a MagicMock/duck-typed config can never flip a test
+    double onto the outbound-HTTP engine branch."""
+    src = (Path(__file__).parent.parent / "app" / "api" / "chat_session_files.py").read_text()
+    assert "_ENGINE_SANDBOX_PROVIDERS" in src
+    assert 'getattr(chat_config, "provider", "")' in src
+    for fn in (
+        "async def list_session_files",
+        "async def download_session_file",
+        "async def save_session_file_as_artefact",
+    ):
+        body = src[src.index(fn) :]
+        nxt = body.find("\n@router")
+        body = body[: nxt if nxt != -1 else len(body)]
+        assert "_files_source" in body, f"{fn} is not provider-gated"
 
 
 # ---------------------------------------------------------------------------

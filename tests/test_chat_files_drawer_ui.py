@@ -202,6 +202,31 @@ def test_a_slow_open_seed_cannot_clobber_a_newer_turn_end_baseline():
     assert res["opened"] == 0, "the late seed must not reset the baseline the turn-end already advanced"
 
 
+def test_an_engine_without_a_files_channel_still_says_so_in_the_drawer():
+    """``supported: false`` (an engine-backed session whose engine exposes no
+    files channel) must reach the reader as the honest notice, not as an empty
+    list reading "your agent produced nothing".
+
+    Guarded here because splitting fetch from render — the drawer refactor —
+    moved this branch across a seam: it used to live inside the one function
+    that both fetched and painted, and the unattended turn-end poll now shares
+    that fetch and must NOT paint.
+    """
+    js = _read(CHAT_JS)
+    fetch_fn = js[js.index("async function fetchSessionFiles") : js.index("function updateFilesBadge")]
+    assert "supported: data.supported !== false" in fetch_fn, (
+        "the flag must be carried out of the fetch, not rendered inside it — the turn-end poll shares this function"
+    )
+    assert "setFilesStatus(" not in fetch_fn.split("function renderFileList")[0], (
+        "fetchSessionFiles runs unattended on every turn-end; it must not write into the drawer"
+    )
+    render_fn = js[js.index("function renderFileList") : js.index("function updateFilesBadge")]
+    assert "if (!supported)" in render_fn
+    assert "doesn't expose them yet" in render_fn
+    # Every render call site passes the flag through, or the notice is dead code.
+    assert js.count("renderFileList(chatId, files, truncated, supported)") == 3
+
+
 def test_open_session_is_the_one_place_that_announces_a_conversation_change():
     """Structural guard on the seam: ``openSession`` is the only assigner of a
     non-null ``currentChatId``, so it is the only honest place to raise the

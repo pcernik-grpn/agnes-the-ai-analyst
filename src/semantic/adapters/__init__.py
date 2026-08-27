@@ -51,3 +51,7 @@ register_adapter("keboola_metastore", KeboolaMetastoreAdapter())
 from connectors.snowflake.semantic_ossie import SnowflakeSemanticAdapter  # noqa: E402
 
 register_adapter("snowflake_semantic", SnowflakeSemanticAdapter())
+
+from connectors.databricks.semantic_ossie import DatabricksSemanticAdapter  # noqa: E402
+
+register_adapter("databricks_semantic", DatabricksSemanticAdapter())

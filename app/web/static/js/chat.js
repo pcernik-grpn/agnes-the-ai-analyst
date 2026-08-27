@@ -5431,7 +5431,10 @@ function renderCoPresence(host, participants) {
     name.title = f.path;
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
-    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    // Engine listings carry no mtime (modified_at is null) — skip the segment
+    // rather than render the epoch.
+    hint.textContent =
+      f.path + " · " + fmtSize(f.size_bytes) + (f.modified_at ? " · " + fmtWhen(f.modified_at) : "");
     meta.appendChild(name);
     meta.appendChild(hint);
 
@@ -5510,16 +5513,35 @@ function renderCoPresence(host, participants) {
       );
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
-      return { files: data.files || [], truncated: !!data.truncated, ok: true };
+      // `supported: false` is an engine-backed session (kai-agent) whose
+      // engine exposes no files channel for this chat. Carried through as a
+      // flag rather than rendered here: this function is also the unattended
+      // turn-end poll, which must not paint into the drawer.
+      return {
+        files: data.files || [],
+        truncated: !!data.truncated,
+        supported: data.supported !== false,
+        ok: true,
+      };
     } catch (err) {
       if (!quiet) showDialogError(filesErrorEl, "Could not load session files: " + String(err));
-      return { files: [], truncated: false, ok: false };
+      return { files: [], truncated: false, supported: true, ok: false };
     }
   }
 
-  function renderFileList(chatId, files, truncated) {
+  function renderFileList(chatId, files, truncated, supported = true) {
     if (!filesListEl) return;
     filesListEl.replaceChildren();
+    if (!supported) {
+      // Engine-backed session whose engine has no files channel — an honest
+      // notice, not an empty list that reads as "your agent produced nothing".
+      setFilesStatus(
+        "Files for this conversation live in the engine's sandbox, and the engine connected " +
+          "to this instance doesn't expose them yet. Ask the assistant to include the content " +
+          "in its reply, or ask your operator about an engine upgrade."
+      );
+      return;
+    }
     if (!files.length) {
       setFilesStatus(
         "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
@@ -5545,8 +5567,8 @@ function renderCoPresence(host, participants) {
     setFilesStatus("Loading…");
     filesListEl.replaceChildren();
     const seq = ++_filesSeq;
-    const { files, truncated } = await fetchSessionFiles(chatId);
-    renderFileList(chatId, files, truncated);
+    const { files, truncated, supported } = await fetchSessionFiles(chatId);
+    renderFileList(chatId, files, truncated, supported);
     // Third writer of the auto-open baseline, and it must claim the sequence
     // like the other two: an open-time seed still in flight would otherwise
     // land on top of what the user is looking at right now.
@@ -5642,13 +5664,13 @@ function renderCoPresence(host, participants) {
       filesListEl.replaceChildren();
       setFilesStatus("Loading…");
     }
-    const { files, truncated, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
     // A newer switch (or a turn-end baseline) landed while this was in
     // flight — that one owns the state now.
     if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
     updateFilesBadge(files.length);
-    if (drawerOpen()) renderFileList(chatId, files, truncated);
+    if (drawerOpen()) renderFileList(chatId, files, truncated, supported);
   });
 
   document.addEventListener("agnes:turn-end", async () => {
@@ -5670,7 +5692,7 @@ function renderCoPresence(host, participants) {
       return;
     }
     const seq = ++_filesSeq;
-    const { files, truncated, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId, { quiet: true });
     // Same in-flight guard as the seed above: a slower open-time fetch must
     // not overwrite this newer baseline, or the next turn re-reports these
     // same files as fresh.
@@ -5680,7 +5702,7 @@ function renderCoPresence(host, participants) {
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
     if (!fresh.length) return;
     if (drawerOpen()) {
-      renderFileList(chatId, files, truncated);
+      renderFileList(chatId, files, truncated, supported);
       return;
     }
     openFilesDrawer();
