@@ -78,7 +78,7 @@ services:
     # the prod path) — when the pulled image is present compose uses it instead
     # of building.
     build: .
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
     command: alembic upgrade head
     depends_on:
       postgres:
@@ -105,7 +105,7 @@ services:
   data-migrate:
     # build/image split as for `migrate` above — prod uses the pulled image.
     build: .
-    image: ghcr.io/keboola/agnes-the-ai-analyst:${AGNES_TAG:-stable}
+    image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
     # --missing-source-ok: on a brand-new data volume there is no
     # system.duckdb yet (nothing has ever run in DuckDB mode) — that is
     # "nothing to migrate", not a failure. Without the flag the one-shot

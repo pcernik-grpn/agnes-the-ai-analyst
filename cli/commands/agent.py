@@ -408,6 +408,16 @@ def agent_usage(
     typer.echo(f"budget_limit:        {budget_limit if budget_limit is not None else '(unbounded)'}")
     typer.echo(f"budget_remaining:    {budget_remaining if budget_remaining is not None else '(unbounded)'}")
 
+    # Per-caller breakdown (C2.4) — owner/admin only; a plain runnable
+    # grantee gets `by_caller: null` and this section is simply omitted.
+    by_caller = body.get("by_caller")
+    if by_caller:
+        typer.echo("")
+        typer.echo("by_caller:")
+        for row in by_caller:
+            caller = row.get("caller_user_id") or "(unattributed)"
+            typer.echo(f"  {caller}: {row.get('total_tokens')} tokens")
+
 
 def _render_ask_answer(body: dict, as_json: bool) -> None:
     if as_json:

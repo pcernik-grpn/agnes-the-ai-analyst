@@ -105,6 +105,22 @@
        as markdown. #}
     <header id="chat-thread-header" class="cloud-chat-thread-header" hidden>
       <h2 id="chat-thread-title" class="cloud-chat-thread-title">Untitled chat</h2>
+      {# "Files" — the way OUT for files the agent generated in the session
+         workspace (#1611): a skill renders a .docx/.pptx into the sandbox and
+         without this the browser has no route to it. Opens an overlay listing
+         the session's files (GET /api/chat/sessions/{id}/files) with a
+         download action and a save-to-Library action per row. #}
+      <button type="button" id="chat-session-files"
+              class="cloud-chat-thread-action"
+              title="View and download files generated in this conversation"
+              aria-label="Session files">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9.5 1.75H4A1.5 1.5 0 0 0 2.5 3.25v9.5A1.5 1.5 0 0 0 4 14.25h8a1.5 1.5 0 0 0 1.5-1.5V5.75z"/>
+          <path d="M9.5 1.75v4h4"/>
+        </svg>
+        <span>Files</span>
+      </button>
       <button type="button" id="chat-copy-transcript"
               class="cloud-chat-thread-action"
               title="Copy this whole conversation as markdown"
@@ -646,6 +662,32 @@
          • .btn / .btn-primary / .btn-secondary from style-custom.css.
          • Keyboard trap handled in chat.js (focus lock + Esc to close).
     #}
+
+    {# Dialog 0: Session files (#1611) — list / download / save-to-Library for
+       files the agent generated in this session's workspace. Reuses the
+       upload-overlay shell classes; rows are rendered by chat.js from
+       GET /api/chat/sessions/{id}/files. #}
+    <div id="chat-files-overlay" class="cloud-chat-upload-overlay" hidden
+         role="dialog" aria-modal="true" aria-labelledby="chat-files-title">
+      <div class="cloud-chat-upload-panel">
+        <div class="cloud-chat-upload-panel-head">
+          <h2 id="chat-files-title" class="cloud-chat-upload-panel-title">Session files</h2>
+          <button type="button" class="cloud-chat-upload-close" data-close-upload aria-label="Close">&#x2715;</button>
+        </div>
+        <p class="cloud-chat-upload-desc">
+          Files in this conversation's workspace, newest first &mdash; including documents
+          {{ instance_brand_short or 'Agnes' }} generated for you. Download a copy, or save it
+          to your <a href="/library" target="_blank" rel="noopener" style="color:var(--ds-primary)">Library</a> so it outlives the session.
+        </p>
+        <div id="chat-files-status" class="cloud-chat-files-status" hidden></div>
+        <ul id="chat-files-list" class="cloud-chat-files-list"></ul>
+        <div id="chat-files-error" class="cloud-chat-upload-error" hidden></div>
+        <div class="cloud-chat-upload-actions">
+          <button type="button" id="chat-files-refresh" class="btn btn-secondary">Refresh</button>
+          <button type="button" class="btn btn-primary" data-close-upload>Close</button>
+        </div>
+      </div>
+    </div>
 
     {# Dialog 1: Data file upload #}
     <div id="chat-upload-data-overlay" class="cloud-chat-upload-overlay" hidden

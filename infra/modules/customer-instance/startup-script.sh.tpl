@@ -12,6 +12,7 @@ UPGRADE_MODE="${upgrade_mode}"
 UPGRADE_SCHEDULE="${upgrade_schedule}"
 TLS_MODE="${tls_mode}"
 DOMAIN="${domain}"
+APPS_SUBDOMAIN_BASE="${data_apps_subdomain_base}"
 DOMAIN_ALIAS="${domain_alias}"
 ACME_EMAIL="${acme_email}"
 DATA_SOURCE="${data_source}"
@@ -157,9 +158,11 @@ YAML
     # copyright / favicon / theme colours / custom_scripts) PLUS — since D1,
     # 2026-08 — the presentation knobs that used to be always-wins `.env`
     # lines: `instance.theme` (palette name), `instance.experience`,
-    # `instance.home_route` and `studio.enabled`. All of it comes from the
-    # Terraform variables, pre-rendered to a base64'd top-level
-    # `instance:` + `theme:` + `studio:` YAML fragment. Appended ONLY here,
+    # `instance.home_route`, `studio.enabled` and — D1 residual —
+    # `data_source.type` (the connector type: keboola/bigquery/local). All
+    # of it comes from the Terraform variables, pre-rendered to a base64'd
+    # top-level `instance:` + `theme:` + `studio:` + `data_source:` YAML
+    # fragment. Appended ONLY here,
     # inside the "file absent" branch, so it seeds a fresh instance without
     # ever clobbering an operator's later edits or a migrated
     # database.backend — from day 2 onward, `/admin/server-config` (or a
@@ -180,6 +183,66 @@ fi
 # exists — the mode is only safe once the ownership it depends on is
 # established, and that user is what finally owns this file.
 
+# --- 2b. Backfill `data_source.type` into an EXISTING instance.yaml ---
+# The first-boot seed above only fires when instance.yaml is ABSENT — a VM
+# provisioned BEFORE this seed existed already has one, so it is skipped
+# forever on that VM. Combined with the `.env` heredoc (section 4 below) no
+# longer writing a `DATA_SOURCE=...` line on ANY boot (see its own comment),
+# such a VM's overlay AND `.env` both go empty the moment `.env` is next
+# rewritten (recreate / apply / auto-upgrade tick) — get_data_source_type()
+# then falls through to its `"local"` default and the instance silently
+# loses its real connector. Deliberately OUTSIDE the `[ ! -f "$INSTANCE_YAML" ]`
+# guard above and unconditional (runs on EVERY boot, not just first) so it
+# also reaches every already-deployed keboola/bigquery VM, not just new ones.
+#
+# Idempotent by construction: fires only when `data_source.type` is ABSENT
+# from the on-disk file. Once present — from this backfill, the first-boot
+# seed above, OR a later `/admin/server-config` edit — every subsequent boot
+# is a permanent no-op, so this can never re-shadow a deliberate UI change.
+# `$DATA_SOURCE` empty means no `var.data_source` was configured; write
+# nothing rather than backfill an implicit "local" over that intentional
+# absence.
+#
+# Same key-scoped, non-destructive PyYAML merge as
+# scripts/ops/agnes-state-applier.sh's write_instance_yaml (read the file →
+# set exactly one key → atomic tmp+rename) so no other top-level or nested
+# key in the overlay is ever touched. python3-yaml is installed
+# unconditionally in section 1 above; if it is somehow still missing (or the
+# existing file fails to parse), this degrades to a loud warning instead of
+# aborting the boot — the backfill simply retries on the next boot.
+if [ -n "$DATA_SOURCE" ] && [ -f "$INSTANCE_YAML" ]; then
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+        echo "WARN: python3-yaml unavailable — cannot backfill data_source.type into $INSTANCE_YAML this boot; will retry next boot" >&2
+    else
+        IY_OWNER=$(stat -c '%u:%g' "$INSTANCE_YAML")
+        IY_MODE=$(stat -c '%a' "$INSTANCE_YAML")
+        if python3 - "$INSTANCE_YAML" "$DATA_SOURCE" <<'PY'
+import sys, os, yaml
+path, value = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        existing = yaml.safe_load(f.read()) or {}
+except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
+    print(f"cannot read {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+data_source = dict(existing.get("data_source") or {})
+if not data_source.get("type"):
+    data_source["type"] = value
+    existing["data_source"] = data_source
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(existing, f, default_flow_style=False, sort_keys=True)
+    os.replace(tmp, path)
+PY
+        then
+            chown "$IY_OWNER" "$INSTANCE_YAML"
+            chmod "$IY_MODE" "$INSTANCE_YAML"
+        else
+            echo "WARN: data_source.type backfill into $INSTANCE_YAML failed — will retry next boot" >&2
+        fi
+    fi
+fi
+
 # --- 3. App directory + extract host artifacts from the pinned image ---
 APP_DIR="/opt/agnes"
 mkdir -p "$APP_DIR"
@@ -198,6 +261,19 @@ cd "$APP_DIR"
 #     internet is no longer required for boot.
 #   - Rollback: revert is one tag bump. Curl-from-main has no per-customer
 #     rollback path.
+#
+# Registry auth: when the image lives in GCP Artifact Registry
+# (*-docker.pkg.dev) the VM's own service account authenticates the pull —
+# grant it artifactregistry.reader on the repository. Same helper (and the
+# same best-effort posture) as the kai-agent engine image further down; the
+# credential helper lands in root's docker config, so the recurring
+# agnes-auto-upgrade tick inherits it with no extra step. Any other private
+# registry needs pre-authenticated pull access on the VM.
+IMAGE_HOST="$${IMAGE_REPO%%/*}"
+case "$IMAGE_HOST" in
+    *-docker.pkg.dev) gcloud auth configure-docker "$IMAGE_HOST" --quiet \
+        || echo "WARN: gcloud auth configure-docker $IMAGE_HOST failed — the image pull will likely fail below" >&2 ;;
+esac
 docker pull "$${IMAGE_REPO}:$${IMAGE_TAG}"
 EXTRACT_CONTAINER=$(docker create "$${IMAGE_REPO}:$${IMAGE_TAG}")
 trap "docker rm '$EXTRACT_CONTAINER' >/dev/null 2>&1 || true" EXIT
@@ -528,6 +604,44 @@ if [ "$TLS_MODE" = "caddy" ] && [ -n "$DOMAIN" ]; then
     fi
 fi
 
+# --- apps-subdomain-caddy begin (extracted + executed by tests/test_caddyfile_apps_subdomain_docker.py) ---
+# Data-app subdomains: Caddy vhost + per-app certificates
+# Hosted apps are refused on the main origin (they run user-authored JS that
+# would otherwise be same-origin with /api), so they are only reachable once
+# Caddy terminates TLS for *.$APPS_SUBDOMAIN_BASE.
+#
+# Certificates are issued PER HOSTNAME on first request (on-demand, HTTP-01),
+# not as one wildcard: a wildcard can only be validated over DNS-01, which
+# would put a DNS-zone write credential on this very host — the host that runs
+# user-authored app code. Issuance is gated by the `ask` endpoint below, so a
+# stranger cannot drive ACME by requesting made-up names.
+#
+# Only when a base is configured: `*.` with an empty value is a site address
+# Caddy refuses to parse, taking the PRIMARY site down with it — the same way
+# an empty DOMAIN_ALIAS once did.
+#
+# The global options block must be FIRST in a Caddyfile, so it is prepended,
+# not appended. Guarded on its own marker because this script runs on EVERY
+# boot and a second copy is a file Caddy cannot parse. (The boot-time image
+# extract normally restores a pristine Caddyfile first; the guard covers the
+# paths that do not.)
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -f "$APP_DIR/Caddyfile" ]; then
+    if [ ! -f "$APP_DIR/Caddyfile.apps-subdomain" ]; then
+        echo "WARN: Caddyfile.apps-subdomain missing from the image — data apps will not be reachable on *.$APPS_SUBDOMAIN_BASE" >&2
+    elif grep -q on_demand_tls "$APP_DIR/Caddyfile"; then
+        :  # already wired this boot — idempotent
+    else
+        {
+            printf '{\n\ton_demand_tls {\n\t\task http://app:8000/api/data-apps-tls-check\n\t}\n}\n\n'
+            cat "$APP_DIR/Caddyfile"
+            printf '\n'
+            cat "$APP_DIR/Caddyfile.apps-subdomain"
+        } > "$APP_DIR/.Caddyfile.new" && mv "$APP_DIR/.Caddyfile.new" "$APP_DIR/Caddyfile"
+        echo "INFO: data-app subdomains wired for *.$APPS_SUBDOMAIN_BASE (per-app certs via on-demand TLS)"
+    fi
+fi
+# --- apps-subdomain-caddy end ---
+
 # DOMAIN_ALIAS — a legacy hostname Caddy serves alongside DOMAIN and 308s onto
 # it, so a domain cutover doesn't break old bookmarks / CLI configs / MCP
 # connector URLs (Caddyfile's second site block). Written ONLY when non-empty:
@@ -802,8 +916,13 @@ DISPYAML
 
 COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.dispatcher.yml"
 %{ endif ~}
-%{ if data_apps_enabled ~}
-# --- Data apps (apps-runner sidecar) ---
+%{ if data_apps_enabled || chat_provider == "docker" ~}
+# --- apps-runner sidecar (data apps AND/OR chat.provider=docker) ---
+# Two features ride the same sidecar: hosted data apps, and web chat with
+# `chat_provider = "docker"`, whose sandboxes it creates (it is the only
+# process holding the Docker socket). The token + gid below are therefore
+# minted whenever EITHER is on; only the runtime-image lines further down are
+# data-apps-specific.
 # APPS_RUNNER_TOKEN — shared secret between the app and the apps-runner sidecar
 # (both source the same .env). Preserve across reboots like SCHEDULER_API_TOKEN:
 # read back from an existing .env, mint fresh only on first boot.
@@ -819,10 +938,12 @@ fi
 # a supplementary group. Resolve the host socket's gid so uid 999 can talk to
 # the daemon (else every up()/stop() 502s with PermissionError(13)).
 DOCKER_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)
+%{ if data_apps_enabled ~}
 # The runner only pulls images under this prefix (everything before the last
 # ':' of the full runtime image); the app reads the full image via the env var.
 DATA_APPS_RUNTIME_IMAGE="${data_apps_runtime_image}"
 APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
+%{ endif ~}
 %{ endif ~}
 %{ if kai_agent_enabled ~}
 # --- 4c. Opt-in embedded kai-agent turn engine ---
@@ -1057,7 +1178,6 @@ JWT_SECRET_KEY=$JWT_KEY
 SESSION_SECRET=$SESSION_KEY
 $SERVER_URL_LINE
 DATA_DIR=$DATA_MNT
-DATA_SOURCE=$DATA_SOURCE
 KEBOOLA_STORAGE_TOKEN=$KEBOOLA_TOKEN
 KEBOOLA_STACK_URL=$KEBOOLA_STACK_URL
 SEED_ADMIN_EMAIL=$SEED_ADMIN_EMAIL
@@ -1067,17 +1187,23 @@ AGNES_VAULT_KEY=$AGNES_VAULT_KEY
 LOG_LEVEL=info
 DOMAIN=$DOMAIN
 AGNES_TAG=$EFFECTIVE_AGNES_TAG
+AGNES_IMAGE_REPO=$IMAGE_REPO
 AGNES_APP_MEM_LIMIT=${app_mem_limit}
 AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
-# home_route / studio_enabled / theme / experience do NOT write env lines
-# here (D1, 2026-08): an always-wins line rewritten into this file on EVERY
-# boot permanently shadowed the admin UI's `/admin/server-config` control of
-# the same knob. They ride the instance_branding_b64 first-boot-only seed
-# instead — see section 2's INSTANCE_YAML block above. chat_provider is the
-# one exception: it pins deployment-provisioned backing (the kai-agent
-# sidecar / apps-runner), not a pure presentation choice.
+# home_route / studio_enabled / theme / experience / data_source.type do NOT
+# write env lines here (D1, 2026-08 + residual): an always-wins line
+# rewritten into this file on EVERY boot permanently shadowed the admin UI's
+# `/admin/server-config` control of the same knob. They ride the
+# instance_branding_b64 first-boot-only seed instead — see section 2's
+# INSTANCE_YAML block above. $DATA_SOURCE (the bash var, not an env line) is
+# still used further up in this script to decide whether to fetch the
+# keboola-storage-token secret — that boot-time decision is unrelated to what
+# the running app reads back as its config. chat_provider is the one
+# exception that still writes an env line: it pins deployment-provisioned
+# backing (the kai-agent sidecar / apps-runner), not a pure presentation
+# choice.
 %{ if chat_provider != "" ~}
 AGNES_CHAT_PROVIDER=${chat_provider}
 %{ endif ~}
@@ -1110,8 +1236,24 @@ COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}
 AGNES_DATA_APPS_ENABLED=true
 AGNES_DATA_APPS_RUNTIME_IMAGE=${data_apps_runtime_image}
+%{ if data_apps_subdomain_base != "" ~}
+AGNES_DATA_APPS_SUBDOMAIN_BASE=${data_apps_subdomain_base}
+# Same value, second consumer: the app reads AGNES_DATA_APPS_SUBDOMAIN_BASE,
+# Caddy substitutes {$APPS_SUBDOMAIN_BASE} into the vhost address. The name is
+# baked into the shipped Caddyfile.apps-subdomain, hence two vars, one source.
+APPS_SUBDOMAIN_BASE=${data_apps_subdomain_base}
+%{ endif ~}
 APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN
 APPS_RUNNER_IMAGE_PREFIX=$APPS_RUNNER_IMAGE_PREFIX
+DOCKER_GID=$DOCKER_GID
+%{ endif ~}
+%{ if chat_provider == "docker" && !data_apps_enabled ~}
+# chat.provider=docker needs the same sidecar as data apps, but NOT the
+# data-apps feature itself: no AGNES_DATA_APPS_ENABLED here, so the app keeps
+# hosted apps off while the sandbox half of the sidecar's API stays reachable.
+# The negated guard exists only to keep these two keys from being written
+# twice when both features are on.
+APPS_RUNNER_TOKEN=$APPS_RUNNER_TOKEN
 DOCKER_GID=$DOCKER_GID
 %{ endif ~}
 $CADDY_TLS_LINE
@@ -1143,15 +1285,16 @@ COMPOSE_PROFILES_ARG=""
 if [ "$TLS_MODE" = "caddy" ] && [ -n "$DOMAIN" ]; then
     COMPOSE_PROFILES_ARG="--profile tls"
 fi
-%{ if data_apps_enabled ~}
+%{ if data_apps_enabled || chat_provider == "docker" ~}
 # The `apps` profile MUST be a command-line --profile flag, not COMPOSE_PROFILES
 # in .env: docker compose does not merge the two — the moment ANY --profile flag
 # is passed (e.g. `--profile tls` on the default caddy/TLS instance) the
 # COMPOSE_PROFILES env var is ignored entirely, so an apps profile carried
 # through .env would be silently dropped and the apps-runner sidecar never start
-# (data-app deploys then 502). Multiple --profile flags DO union, so appending
-# here activates apps alongside tls. agnes-auto-upgrade.sh mirrors this so the
-# recurring upgrade tick keeps the sidecar running.
+# (data-app deploys then 502; with chat_provider=docker every chat session
+# 503s instead). Multiple --profile flags DO union, so appending here activates
+# apps alongside tls. agnes-auto-upgrade.sh mirrors this so the recurring
+# upgrade tick keeps the sidecar running.
 COMPOSE_PROFILES_ARG="$COMPOSE_PROFILES_ARG --profile apps"
 %{ endif ~}
 
@@ -1196,6 +1339,16 @@ docker compose $COMPOSE_PROFILES_ARG pull
 # Best-effort (`|| true`) — a registry hiccup must not fail the whole boot;
 # the deploy path still works, just slowly, on the cold-pull backstop.
 docker pull "$AGNES_DATA_APPS_RUNTIME_IMAGE" || echo "WARN: could not pre-pull data-app runtime image $AGNES_DATA_APPS_RUNTIME_IMAGE"
+%{ endif ~}
+%{ if chat_provider == "docker" ~}
+# Build the chat sandbox image BEFORE `up -d`: the app probes it through the
+# apps-runner during its own lifespan and refuses the ChatManager when it is
+# absent, so a VM that built it afterwards would boot with chat 503ing until
+# something restarted the app. Best-effort by the same rule as the pre-pull
+# above — a build failure must not strand the boot before cron and the
+# watchdog are installed; the app's gate then says why chat is off.
+"$APP_DIR/scripts/ops/agnes-chat-sandbox-image.sh" "$${IMAGE_REPO}:$${IMAGE_TAG}" \
+    || echo "WARN: chat sandbox image unavailable — chat.provider=docker will refuse to start"
 %{ endif ~}
 # Retry `up`: on a first boot the app can exceed its healthcheck start window
 # (fresh image, DuckDB->PG data migration, keboola table attach), which makes

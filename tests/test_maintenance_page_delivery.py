@@ -40,19 +40,19 @@ def test_auto_upgrade_config_files_includes_maintenance_html():
     )
 
 
-def test_auto_upgrade_creates_parent_dir_before_fetch():
+def test_auto_upgrade_creates_parent_dir_before_extract():
     body = AUTO_UPGRADE.read_text()
-    # The fetch loop must mkdir -p the destination's parent before curl -o,
-    # since curl does not create intermediate directories and
+    # The refresh loop must mkdir -p the destination's parent before the
+    # docker-cp extraction writes its `.new` file there, since
     # static/maintenance.html introduces the first nested CONFIG_FILES path.
-    m = re.search(r'for f in "\$\{CONFIG_FILES\[@\]\}"; do\n(.*?)\ndone', body, re.DOTALL)
-    assert m, "could not find the CONFIG_FILES fetch loop"
+    m = re.search(r'for f in "\$\{CONFIG_FILES\[@\]\}"; do\n(.*?)\n\s*done', body, re.DOTALL)
+    assert m, "could not find the CONFIG_FILES refresh loop"
     loop_body = m.group(1)
     assert 'mkdir -p "/opt/agnes/$(dirname "$f")"' in loop_body, (
-        "fetch loop must mkdir -p the parent dir before curl -o, or a nested "
-        "CONFIG_FILES path (e.g. static/maintenance.html) fails on a VM "
-        "where that subdirectory doesn't already exist"
+        "refresh loop must mkdir -p the parent dir before extracting, or a "
+        "nested CONFIG_FILES path (e.g. static/maintenance.html) fails on a "
+        "VM where that subdirectory doesn't already exist"
     )
-    assert loop_body.index("mkdir -p") < loop_body.index("curl -fsSL"), (
-        "mkdir -p must run BEFORE the curl call in the loop"
+    assert loop_body.index("mkdir -p") < loop_body.index("extract_host_artifact"), (
+        "mkdir -p must run BEFORE the extraction call in the loop"
     )

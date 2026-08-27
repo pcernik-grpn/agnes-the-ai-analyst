@@ -1702,6 +1702,21 @@ async def _start_relay() -> int:
     os.environ["AGNES_SERVER_BASE"] = f"http://127.0.0.1:{port}"
     os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}/anthropic"
     os.environ["ANTHROPIC_API_KEY"] = "sk-dummy-broker"
+    # Vertex mode (AGNES_LLM_PROVIDER=vertex, set by the manager from
+    # chat.llm.provider): flip the CLI into Claude Code's documented
+    # LLM-gateway pattern for Vertex — it then emits native Vertex request
+    # shapes (…/publishers/anthropic/models/<model>:streamRawPredict) with NO
+    # auth headers, still egressing through the relay's /anthropic leg; the
+    # broker validates project/region server-side and attaches the Google
+    # OAuth token there. The ANTHROPIC_BASE_URL/API_KEY rewrites above stay
+    # in place as defense in depth for any non-vertex-aware in-sandbox tool
+    # (the CLI ignores them once CLAUDE_CODE_USE_VERTEX is set).
+    if os.environ.get("AGNES_LLM_PROVIDER", "").strip().lower() == "vertex":
+        os.environ["CLAUDE_CODE_USE_VERTEX"] = "1"
+        os.environ["ANTHROPIC_VERTEX_BASE_URL"] = f"http://127.0.0.1:{port}/anthropic"
+        os.environ["CLAUDE_CODE_SKIP_VERTEX_AUTH"] = "1"
+        os.environ["ANTHROPIC_VERTEX_PROJECT_ID"] = os.environ.get("AGNES_VERTEX_PROJECT_ID", "")
+        os.environ["CLOUD_ML_REGION"] = os.environ.get("AGNES_VERTEX_REGION", "")
     return port
 
 

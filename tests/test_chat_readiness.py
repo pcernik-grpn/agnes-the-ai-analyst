@@ -238,6 +238,134 @@ def test_test_anthropic_key_auth_failure_classified(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Vertex mode (chat.llm.provider: vertex)
+# ---------------------------------------------------------------------------
+
+
+def _vertex_cfg(**kw):
+    base = {"llm_provider": "vertex", "vertex_project_id": "proj-1", "vertex_region": "europe-west1"}
+    base.update(kw)
+    return _cfg(**base)
+
+
+def test_secret_status_vertex_rows_required_and_key_not(monkeypatch):
+    from app.auth import vertex_gcp
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(vertex_gcp, "credentials_resolvable", lambda: (True, "ok"))
+    s = readiness.secret_status(_vertex_cfg())
+    assert s["llm_provider"] == "vertex"
+    assert s["secrets"]["anthropic_api_key"]["required"] is False
+    assert s["secrets"]["vertex_project_id"] == {"set": True, "required": True}
+    assert s["secrets"]["vertex_region"] == {"set": True, "required": True}
+    assert s["secrets"]["google_credentials"] == {"set": True, "required": True}
+
+
+def test_secret_status_vertex_flags_missing_pieces(monkeypatch):
+    from app.auth import vertex_gcp
+
+    monkeypatch.setattr(vertex_gcp, "credentials_resolvable", lambda: (False, "no ADC"))
+    s = readiness.secret_status(_vertex_cfg(vertex_project_id=""))
+    assert "vertex_project_id" in s["missing"]
+    assert "google_credentials" in s["missing"]
+    assert s["ready"] is False
+
+
+def test_secret_status_non_vertex_never_probes_google(monkeypatch):
+    """Non-vertex deployments must not pay ADC-resolution latency on an admin
+    poll — the probe must not even be called."""
+    from app.auth import vertex_gcp
+
+    def _boom():
+        raise AssertionError("credentials_resolvable must not run for non-vertex configs")
+
+    monkeypatch.setattr(vertex_gcp, "credentials_resolvable", _boom)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-x")
+    s = readiness.secret_status(_cfg())
+    assert s["secrets"]["google_credentials"] == {"set": False, "required": False}
+
+
+def test_test_vertex_credentials_unconfigured():
+    import asyncio
+
+    r = asyncio.run(readiness.test_vertex_credentials("", ""))
+    assert r["ok"] is False
+    assert "chat.llm.vertex.project_id" in r["detail"]
+
+
+def test_test_vertex_credentials_token_failure(monkeypatch):
+    import asyncio
+
+    from app.auth import vertex_gcp
+
+    def _boom():
+        raise vertex_gcp.VertexAuthError("no ADC anywhere")
+
+    monkeypatch.setattr(vertex_gcp, "get_vertex_access_token", _boom)
+    r = asyncio.run(readiness.test_vertex_credentials("proj-1", "europe-west1"))
+    assert r["ok"] is False
+    assert "google credential resolution failed" in r["detail"]
+
+
+def test_test_vertex_credentials_valid(monkeypatch):
+    import asyncio
+
+    import anthropic
+
+    from app.auth import vertex_gcp
+
+    monkeypatch.setattr(vertex_gcp, "get_vertex_access_token", lambda: "tok")
+    captured = {}
+
+    class _Msgs:
+        def create(self, **kw):
+            captured.update(kw)
+            return SimpleNamespace(content=[])
+
+    class _FakeVertexClient:
+        def __init__(self, **kw):
+            captured["ctor"] = kw
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "AnthropicVertex", _FakeVertexClient, raising=False)
+    r = asyncio.run(readiness.test_vertex_credentials("proj-1", "europe-west1"))
+    assert r["ok"] is True
+    assert captured["ctor"]["project_id"] == "proj-1"
+    assert captured["ctor"]["region"] == "europe-west1"
+    assert "@" in captured["model"]  # probe model translated to the Vertex id form
+
+
+def test_test_vertex_credentials_api_failure_classified_with_model_garden_hint(monkeypatch):
+    import asyncio
+
+    import anthropic
+
+    from app.auth import vertex_gcp
+
+    monkeypatch.setattr(vertex_gcp, "get_vertex_access_token", lambda: "tok")
+    cleared = {"n": 0}
+    monkeypatch.setattr(vertex_gcp, "clear_token_cache", lambda: cleared.__setitem__("n", cleared["n"] + 1))
+
+    class _PermErr(Exception):
+        status_code = 403
+
+    class _Msgs:
+        def create(self, **kw):
+            raise _PermErr("permission denied on aiplatform.endpoints.predict")
+
+    class _FakeVertexClient:
+        def __init__(self, **kw):
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "AnthropicVertex", _FakeVertexClient, raising=False)
+    r = asyncio.run(readiness.test_vertex_credentials("proj-1", "europe-west1"))
+    assert r["ok"] is False
+    assert "authentication failed" in r["detail"]
+    assert "Model Garden" in r["detail"]
+    assert cleared["n"] == 1
+
+
+# ---------------------------------------------------------------------------
 # classify_llm_failure — shared auth/credit/provider classifier (#884)
 # ---------------------------------------------------------------------------
 

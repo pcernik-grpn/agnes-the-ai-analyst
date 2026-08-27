@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -2006,6 +2007,211 @@ def _public_view(config: dict) -> dict:
     return _redact(copy.deepcopy(config))
 
 
+# --- Overlay export/apply (agnes admin config export / apply, Track D3) -----
+#
+# `_public_view` above (used by GET /server-config) masks EVERY secret-shaped
+# key to `***`/`<empty>` for on-screen display — including keys like
+# `token_env`/`private_key_env` that hold an env-var NAME, not a credential
+# (see the docstring on `_is_secret_key`'s callers). That over-redaction is
+# fine for a settings form nobody round-trips, but it is wrong for
+# `agnes admin config export`: a NAME reference is not a secret and must
+# survive so a fresh instance can be onboarded from the exported YAML.
+#
+# `_export_scrub` instead OMITS a secret-shaped leaf only when its value is
+# a literal (neither an env-var-name key nor an unresolved `${VAR}`
+# reference) — the one shape that could actually leak a credential into a
+# git-reviewed file.
+_ENV_REF_RE = re.compile(r"^\$\{[A-Za-z0-9_]+\}$")
+
+
+def _is_env_name_key(key: str) -> bool:
+    """True for the `*_env` naming convention (`token_env`, `private_key_env`,
+    …) that stores an env-var NAME, never the credential itself — see
+    `config/instance.yaml.example`'s "never YAML" comments on these fields."""
+    return key.lower().endswith("_env")
+
+
+# Env-var identifiers are `[A-Za-z_][A-Za-z0-9_]*` (POSIX shell rules — the
+# same charset every `os.environ` lookup in this codebase assumes). A
+# `*_env`-suffixed key is only a safe pass-through when its VALUE actually
+# has this shape — an admin who mis-suffixes a pasted literal (a plausible
+# mistake in the free-form `connectors` section, where field names are
+# admin-chosen) must not get free rein over `_is_env_name_key`'s allowlist.
+_ENV_NAME_VALUE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_valid_env_name_value(value: Any) -> bool:
+    """True if `value` looks like an env-var NAME rather than a pasted
+    literal — the shape a `*_env`-suffixed key's value must have to be
+    trusted as a name reference instead of scrubbed as an ordinary leaf."""
+    return isinstance(value, str) and bool(_ENV_NAME_VALUE_RE.match(value))
+
+
+def _looks_like_env_ref(value: Any) -> bool:
+    """True if `value` is an unresolved `${VAR}` placeholder — a pointer to
+    an env var, not a cleartext secret."""
+    return isinstance(value, str) and bool(_ENV_REF_RE.match(value))
+
+
+# Sections whose sub-schema is genuinely free-form — admin-typed keys that
+# no static registry enumerates. `connectors` is the one instance today: its
+# `_KNOWN_FIELDS` entry above documents that the sibling keys of `globals`
+# are per-connector slugs sourced from the runtime seed manifest, and its
+# own hint text SANCTIONS storing "connector app identifiers... as plain
+# values" there — e.g. `connectors."connector-slack".SLACK_WEBHOOK_URL`.
+# `_is_secret_key`'s 8 substring patterns cannot police a key name they've
+# never seen, so for these sections export can't use a key-name blocklist
+# at all — it flips to a POSITIVE allowlist instead: keep ONLY a `${VAR}`
+# reference or an `*_env`-named key; every other literal is omitted,
+# INCLUDING one that doesn't look secret-shaped (a plain string, a bool, a
+# number) — the section's admin-typed nature makes any finer carve-out
+# unreliable by construction. The transparency note the endpoint returns
+# alongside `sections` (`omitted_keys`) is what keeps this from silently
+# discarding a legitimate non-secret global.
+_FREE_FORM_EXPORT_SECTIONS: frozenset = frozenset({"connectors"})
+
+# --- Value-shape backstop ----------------------------------------------
+#
+# Defense-in-depth for a literal secret pasted into a field whose NAME
+# doesn't hint at a credential anywhere in the overlay, in ANY section —
+# not just the free-form ones above (e.g. an admin naming a custom BigQuery
+# field `webhook` instead of `token`). Deliberately conservative: an
+# ordinary hostname, email, or short enum must never be caught, so this
+# only fires on shapes that are unambiguously a credential — a PEM block, a
+# signed JWT, a URL carrying userinfo or a long opaque path segment (the
+# shape of a Slack/Discord/Teams incoming-webhook token, a presigned link,
+# an OAuth callback code, …), or a single long opaque alphanumeric run
+# typical of an API key/hash. This is a backstop, not a claim of
+# completeness — it will not catch every secret shape, which is exactly why
+# `_FREE_FORM_EXPORT_SECTIONS` and the `omitted_keys` transparency note
+# exist alongside it rather than in place of it.
+_JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$")
+_URL_USERINFO_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s@]+:[^/\s@]+@")
+_ALNUM_ONLY_RE = re.compile(r"^[A-Za-z0-9]+$")
+_URL_TOKEN_SEGMENT_MIN_LEN = 20
+_OPAQUE_TOKEN_MIN_LEN = 24
+
+
+def _looks_like_secret_value(value: Any) -> bool:
+    """True if `value` is a literal string that is unambiguously
+    credential-shaped, independent of what key it is stored under."""
+    if not isinstance(value, str) or _looks_like_env_ref(value):
+        return False
+    v = value.strip()
+    if not v:
+        return False
+    if "-----BEGIN" in v:
+        return True
+    if _JWT_RE.match(v):
+        return True
+    if v.lower().startswith(("http://", "https://")):
+        if _URL_USERINFO_RE.match(v):
+            return True
+        path = v.split("?", 1)[0].split("#", 1)[0]
+        segments = [s for s in path.split("/") if s]
+        last = segments[-1] if segments else ""
+        return len(last) >= _URL_TOKEN_SEGMENT_MIN_LEN and bool(_ALNUM_ONLY_RE.match(last))
+    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and bool(_ALNUM_ONLY_RE.match(v))
+
+
+def _export_scrub(
+    value: Any,
+    *,
+    free_form: bool = False,
+    path: str = "",
+    omitted: Optional[List[str]] = None,
+) -> Any:
+    """Recursively drop secret-shaped values from an overlay subtree —
+    dict VALUES keyed on their key name, list ITEMS on their shape alone
+    (a list element has no key to name-match).
+
+    A `${VAR}` reference always wins and is kept verbatim, checked first
+    and unconditionally on every leaf regardless of key or position. Next,
+    for a dict leaf only, a `*_env`-suffixed key whose value actually looks
+    like an env-var NAME (`_is_valid_env_name_value` — not a pasted
+    literal) is kept verbatim too. Past those two carve-outs, three
+    independent gates, any one omits a leaf:
+
+    1. Key-name gate (`_is_secret_key`) — dict leaves only, as before.
+    2. Free-form-section gate (`free_form=True`, set by the caller for every
+       section in `_FREE_FORM_EXPORT_SECTIONS`, and propagated to every
+       descendant — dict AND list — once set) — a positive allowlist:
+       every literal is omitted regardless of key name, list position, or
+       shape.
+    3. Value-shape gate (`_looks_like_secret_value`) — fires everywhere,
+       free-form or not, dict value or list item alike.
+
+    A dict/list value caught by gate 1 or 2 is not blanket-dropped — it is
+    recursed into (forcing `free_form=True` for the subtree) so a nested
+    `${VAR}` reference or `*_env` key inside it still survives; only an
+    actual literal leaf is omitted. `omitted` collects the dotted/indexed
+    path (`a.b[2].c`) of every leaf actually dropped, so the caller can
+    surface a transparency note instead of a silent drop.
+    """
+    if omitted is None:
+        omitted = []
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            child_path = f"{path}.{k}" if path else k
+            if _looks_like_env_ref(v):
+                out[k] = v
+                continue
+            if _is_env_name_key(k) and _is_valid_env_name_value(v):
+                out[k] = v
+                continue
+            if _is_secret_key(k) or free_form or _looks_like_secret_value(v):
+                if isinstance(v, (dict, list)):
+                    out[k] = _export_scrub(v, free_form=True, path=child_path, omitted=omitted)
+                else:
+                    omitted.append(child_path)
+                continue
+            out[k] = _export_scrub(v, free_form=free_form, path=child_path, omitted=omitted)
+        return out
+    if isinstance(value, list):
+        out_list: List[Any] = []
+        for i, item in enumerate(value):
+            item_path = f"{path}[{i}]"
+            if isinstance(item, (dict, list)):
+                out_list.append(_export_scrub(item, free_form=free_form, path=item_path, omitted=omitted))
+                continue
+            if _looks_like_env_ref(item):
+                out_list.append(item)
+                continue
+            if free_form or _looks_like_secret_value(item):
+                omitted.append(item_path)
+                continue
+            out_list.append(item)
+        return out_list
+    return value
+
+
+def _load_raw_overlay() -> dict:
+    """Read `instance.yaml` straight off disk — no static-config merge, no
+    `${VAR}` resolution. This is the literal file `POST /server-config`
+    writes and `agnes admin config apply` re-produces; `_load_current_
+    instance_yaml()` (used by GET /server-config) is the wrong source here
+    because it merges in the static file's defaults and resolves every env
+    reference to its runtime value.
+    """
+    import yaml
+
+    from app.secrets import _state_dir
+
+    overlay_path = _state_dir() / "instance.yaml"
+    if not overlay_path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(overlay_path.read_text())
+    except Exception as e:
+        logger.exception("server-config/overlay: refusing to read corrupt overlay at %s", overlay_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"cannot read the instance.yaml overlay at {overlay_path}: {e}",
+        ) from e
+    return data if isinstance(data, dict) else {}
+
+
 _REPOINT_SAMPLE_SIZE = 5
 
 
@@ -2450,6 +2656,73 @@ async def get_server_config(
         # value, and where it resolved from. Toggling still happens through
         # the per-section editors above (or an env var); this is display-only.
         "feature_flags": _feature_flags_inventory(),
+    }
+
+
+@router.get("/server-config/overlay")
+async def get_server_config_overlay(
+    user: dict = Depends(require_admin),
+):
+    """Return the raw, editable-section-only instance.yaml OVERLAY.
+
+    The export projection behind ``agnes admin config export`` /
+    ``agnes admin config apply`` — a small, reviewable slice of the config
+    an operator can commit to a PR to onboard a new client from a known-good
+    baseline (Track D3). Distinct from ``GET /server-config`` above:
+
+    - This reads the overlay file directly — no merge with the static
+      config, no ``${VAR}`` resolution — so an unresolved env reference
+      round-trips as the reference, never the cleartext value it resolves
+      to at runtime.
+    - Only sections that actually exist in the overlay are returned (an
+      admin who never touched a section shouldn't see it materialize in
+      their exported YAML); every returned section is still one of
+      ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.
+    - Secret-shaped LITERAL values are omitted, not masked — an env-var
+      NAME (``token_env``, itself validated to actually look like a name
+      rather than a mis-suffixed pasted literal) or a ``${VAR}`` reference
+      passes through unchanged, but a real cleartext credential never
+      leaves the server (see ``_export_scrub``). This applies two ways:
+      (a) any section in ``_FREE_FORM_EXPORT_SECTIONS`` (``connectors``
+      today — an admin-typed dict whose key names no registry enumerates,
+      e.g. ``connectors."connector-slack".SLACK_WEBHOOK_URL``) has EVERY
+      literal leaf omitted, not just secret-*named* ones, because a
+      key-name blocklist cannot police a key it has never seen; (b) a
+      value that is unambiguously credential-shaped (a PEM block, a JWT, a
+      URL with userinfo or a long opaque path segment, a long opaque
+      alphanumeric run) is omitted everywhere else too, regardless of its
+      key's name. Both apply equally to a LIST item, which has no key to
+      name-match at all — a scalar array entry gets the same free-form and
+      value-shape checks as a dict value, indexed in ``omitted_keys`` as
+      ``a.b[2]``. There is no DB config table — the overlay IS the
+      writable state POST /server-config maintains.
+    - ``omitted_keys`` lists the dotted path of every leaf this endpoint
+      dropped, so the operator knows what to set via env/``${VAR}`` on the
+      target instead of silently losing it — `agnes admin config export`
+      surfaces this as a YAML comment header and a stderr note.
+
+    Deliberately REST+CLI only, never MCP-exposed — see CONTRIBUTING.md's
+    "operator security-posture diagnostics" standing exemption: a one-call
+    dump of the instance's entire editable config surface (which upstream
+    it points at, what auth is configured) is reconnaissance in a
+    prompt-injected chat session, not an agent affordance.
+    """
+    raw = _load_raw_overlay()
+    omitted: List[str] = []
+    sections = {
+        section: _export_scrub(
+            raw[section],
+            free_form=section in _FREE_FORM_EXPORT_SECTIONS,
+            path=section,
+            omitted=omitted,
+        )
+        for section in _EDITABLE_SECTIONS
+        if isinstance(raw.get(section), dict)
+    }
+    return {
+        "sections": sections,
+        "editable_sections": list(_EDITABLE_SECTIONS),
+        "omitted_keys": sorted(omitted),
     }
 
 
