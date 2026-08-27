@@ -1,863 +1,1225 @@
-# Fact graph over Collections — design
+# Fact graph over Collections — design & build specification
 
-**Date:** 2026-08-27
-**Status:** draft — revised after three independent reviews (architecture, RBAC,
-product), then against evaluation workbook v0.2 and the anonymisation services
-**Verified against:** worktree `zs/facts-scope-access`, base `d97e186a8`
+**Date:** 2026-08-27 (rev 3)
+**Status:** buildable draft — revision 3 after a six-way audit (spec internals,
+Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
+**Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
+`keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
+(FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
+**Scope note:** this spec deliberately contains customer-specific acceptance
+material (the evaluation workbook, Kantata, personas) by owner decision of
+2026-08-27. If this repository ever returns to public distribution, §14–§16
+move to a private repo first.
 
-## 0. What changed in this revision, and why
+## 0. Revision history — what was wrong and why it changed
 
-The first draft was reviewed three ways and was wrong in five material places.
-Recording them here rather than quietly fixing them, because each correction
-constrains the design:
+Recording corrections rather than silently fixing them, because each one
+constrains the design.
+
+**Rev 1 → 2 (three independent design reviews):**
 
 1. **`attrs` had no provenance.** They sat on the fact, merged across every
-   document that contributed. A caller who could read *one* evidence document
-   received attribute values extracted from documents they could not read — and
-   `fact_search`'s attribute filters turned that into an oracle they could
-   binary-search. **Fixed structurally:** attributes now live on the claim, and
-   what a caller sees is projected from the claims they can read (§4).
-2. **Edges had no evidence and therefore no visibility rule.** The schema gave
-   them no id to hang evidence on, so the only implementable rule was "visible
-   when both endpoints are" — a relationship disclosed with no check of its own.
-   **Fixed:** edges are first-class subjects with their own claims (§3).
-3. **`corpus_files.id` is not stable.** `_replace_existing_by_path`
-   ([app/api/collections.py:628](../../../app/api/collections.py)) hard-deletes
-   and reinserts on re-upload at the same path — the exact pattern a document
-   sync uses — so an ordinary re-sync would cascade away expensive derived
-   facts. **Fixed:** §6, with a prerequisite change to Collections.
-4. **Two claims were false.** `corpus_files.source_url` does not exist (so
-   "citation → original: no new work" was wrong), and quotes are verbatim
-   against the *extracted markdown in `corpus_chunks.text`*, not against the
-   document a user opens. **Fixed:** §7 states both plainly.
-5. **The enforcement primitive named was the wrong one.** `can_access_collection`
-   takes a bare `user_id` and, for an `AgentPrincipal`, either crashes or
-   elevates the agent to its owner's authority — its own sibling's docstring
-   says so ([app/auth/access.py:654](../../../app/auth/access.py)). **Fixed:** §5.
+   contributing document; a caller who could read one evidence document
+   received values extracted from documents they could not read, and
+   `fact_search` filters made that an oracle to binary-search. Fixed
+   structurally: attributes live on the **claim** (§3), and everything a
+   caller sees is projected from claims they can read (§4).
+2. **Edges had no evidence and therefore no visibility rule.** Fixed: an edge
+   is a first-class subject with its own claims (§3).
+3. **`corpus_files.id` is not stable** across the re-sync path a document
+   crawler uses (`_replace_existing_by_path`,
+   [app/api/collections.py:628](../../../app/api/collections.py) — verified:
+   unconditional purge+reinsert; the only content-hash awareness is blob-level
+   `keep_blob_path`, the row/chunks/derived tables are destroyed regardless).
+   Fixed via the source-stable-id anchor (§6).
+4. **Two claims were false**: `corpus_files.source_url` does not exist
+   (`_COLS`, [src/repositories/corpus_files.py:25](../../../src/repositories/corpus_files.py)),
+   and quotes are verbatim against extracted markdown in `corpus_chunks.text`,
+   not against the document a user opens (§8).
+5. **The enforcement primitive named was wrong**: `can_access_collection`
+   takes a bare `user_id` and, for an `AgentPrincipal`, crashes or elevates to
+   the owner's authority; `accessible_collection_ids`
+   ([app/auth/access.py:654](../../../app/auth/access.py)) is the correct one (§5).
 
-One review's central objection is *not* fixed here, because it is not a design
-error but a question this design cannot answer: **what facts buy over the
-retrieval Collections already does.** It is now stated as a gate in §11 rather
-than deferred to "open questions".
+**Rev 2 → 3 (full audit against artifacts):**
 
-Three later corrections, from material that arrived after those reviews:
+6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
+   five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
+   was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
+   questions now map onto the ten workbook prompts, and its protocol already
+   defines the A3′ (same-context) rehearsal arm — the earlier claim that "no
+   arm tests A4 vs A3" is stale for the sandbox; what remains unbuilt is the
+   **real** A3 seed-pack arm for workbook rounds.
+7. **The converter problem is smaller than framed**: the reference
+   `doc_converter` routes only `.pdf` to PyMuPDF (AGPL); every Office format
+   already goes through **markitdown (MIT)**. We replace one engine, not the
+   converter (§9).
+8. **`doc_quantization` is a CLI batch pipeline, not a service** — the
+   integration needs a thin driver, and Czech inflection breaks naive
+   pseudonyms (§9).
+9. **Security tests contradicted the Entra section**: S-tests presupposed
+   source-ACL derivation that §13 says does not exist yet. The suite is now
+   split into Phase 0 (grant-layer, runnable today) and Phase ACL (§15.1).
+10. **Schema defects**: `fact_aliases` UNIQUE referenced a column the table
+    lacked; the claims cascade contradicted a "recovery" promise;
+    `visibility_mode` looked like a column but is instance config. All fixed
+    in §3.
+11. **The worker lane is a code change, not configuration** — `_VALID_LANES`
+    is a closed two-value tuple
+    ([app/worker/registry.py:21](../../../app/worker/registry.py)) and
+    per-process lane selection does not exist (§16 step 7).
 
-6. **The evaluation standard is workbook v0.2** (frozen 2026-08-27) — ten
-   prompts, five arms, 0/1/2 scoring — and the deciding comparison is Agnes
-   against Claude holding the same context, which nothing currently runs (§14.4).
-7. **Anonymisation belongs in front of ingestion**, not as a redaction on the
-   way out. Placed there, Agnes never holds the original at all, which retires
-   the objection that `/raw` and `/preview` do not redact (§9).
-8. **Entra is not connected**, so nothing is derived from SharePoint ACLs today.
-   Derivation is missing; enforcement is not — which is why the evaluation can
-   still run (§13.5).
+One objection from the reviews is deliberately **not** fixed, because it is a
+question, not an error: **what facts buy over the retrieval Collections
+already does.** It is a measured gate (§14, Decision #2) — and the workbook
+itself pre-registers the uncomfortable answer as a legitimate outcome.
+
+---
 
 ## 1. What this is
 
 Typed **subjects** — entities and the relationships between them — extracted
 from documents, where every assertion carries the document it came from, the
 verbatim sentence supporting it, and the date of that document. Built as a
-layer **over Collections**, not beside it.
+layer **over the existing Collections subsystem**, not beside it.
 
-Agnes owns the schema; producers write into it. SharePoint is the first
-document contributor, not the owner of the model.
+It is a general Agnes capability. SharePoint (via the cuesta-star-graph
+crawler) is the first contributor of documents; anything that can put files
+into a collection contributes the same way. Agnes owns the schema; producers
+write into it through the contract in §7.
 
-**Explicitly out of scope:** the crawler that fills a collection, and the
-extraction pass that proposes claims. Both are producers against contracts
-defined here. Neither is built by this work — which is why §11 gates the build
-on someone owning them.
+**Out of scope, deliberately** (each is somebody's work, not nobody's):
+
+- the crawler — **adopted** from `keboola/cuesta-star-graph`, with a named
+  hardening backlog (§7.1), never rewritten;
+- the extraction pass (`extract.py` + `skills/kg-builder-agent.md`) — a
+  producer against §7's contract;
+- the structured lane (Kantata for prompt X1) — a normal connector/table
+  concern, a dependency of the evaluation only (§14.5);
+- second document sources (Drive, S3), non-document facts, multi-language
+  corpora, and load testing at corpus scale (§15.6 names them so absence is a
+  decision).
+
+---
 
 ## 2. The one decision everything follows from
 
-**A claim is the unit.** Not a fact, not an edge: a claim is *one document
-saying one thing*, and everything else is derived from the set of claims a
-caller may read.
+**A claim is the unit.** A claim is *one document saying one thing about one
+subject*. Everything else is derived from the set of claims a caller may read:
 
 ```
-subject (fact or edge)  ──<  claim  >──  corpus_files  ──  collection  ──  grants
+subject (fact | edge) ──< claim >── corpus_files ── collection ── grants
 ```
 
-- Existence of a subject: it has ≥1 readable claim.
-- Attribute values: merged from readable claims only.
-- Quotes: from readable claims only.
-- Visibility of an edge: the same rule as a fact, on its own claims.
+- Existence of a subject: ≥1 readable claim.
+- Attribute values: projected from readable claims only (§4).
+- Quotes: readable claims only.
+- An edge is visible by the same rule, on **its own** claims — never inferred
+  from its endpoints.
 
-One rule, one grain, one join. The first draft had three grains (fact
-existence, fact attributes, quotes) with a rule for one of them, which is how
-it leaked.
-
-Everything Collections already tracks is reused unchanged: what documents
-exist, their processing state, who may read them, and the path back to the
-original.
+One rule, one grain, one join. The first draft had three grains with a rule
+for one of them, which is how it leaked.
 
 ### Consequences that are not obvious
 
-- **This is app-state, not analytics.** Not because `corpus_files` is, but
-  because per-caller filtering is impossible on a distributed parquet. `agnes
-  pull` never carries it; answers come from the server. Being new app-state,
-  the A3 ratchet applies: **Postgres-only repository, Alembic revision, no
-  DuckDB sibling, no `src/db.py` ladder step** (frozen at 124).
-- **Table access policies cannot apply.** They attach to `table_registry` rows
-  reachable via `/api/query`; facts are neither. Enforcement is in the
-  repository.
-- **Instances still on the frozen DuckDB app-state backend do not get this
-  feature.** They receive a typed `501`. That is correct per A3 and belongs in
-  release notes, not in a support ticket.
+- **App-state, not analytics** — because per-caller filtering is impossible on
+  a distributed parquet. Per the A3 ratchet this means a **Postgres-only
+  repository** (`facts_pg.py`, factory-registered), **one Alembic revision**,
+  no DuckDB sibling, no `src/db.py` step (`SCHEMA_VERSION == FROZEN == 124`,
+  [src/db.py:88](../../../src/db.py)). The sanctioned pattern is confirmed by
+  `tests/test_repository_registry.py::test_registry_backends_are_symmetric`
+  and `tests/db_pg/test_repo_module_pg_first_ratchet.py`.
+- **DuckDB-backend instances do not get this feature**: resolving a PG-only
+  key raises `RequiresPostgresBackend`
+  ([src/repositories/__init__.py:219](../../../src/repositories/__init__.py)),
+  translated app-wide to a typed 501
+  ([app/main.py:3138](../../../app/main.py)). Release-notes material, not a
+  support ticket.
+- **Facts are never distributed.** `agnes pull` moves parquet; app-state is
+  not in that path, and the manifest already skips undistributed rows
+  ([app/api/sync.py:1631](../../../app/api/sync.py)). Answers are server-side.
+- **Table access policies cannot apply** — they attach to `table_registry`
+  rows reachable via `/api/query`; facts are neither. Enforcement lives in
+  the repository (§5).
+- **Feature flag**: `facts.enabled` (default **false**) via the canonical
+  resolver `feature_enabled("facts", "enabled",
+  env_var="AGNES_FACTS_ENABLED", default=False)`
+  ([app/instance_config.py:384](../../../app/instance_config.py)), plus a
+  `Switch` declaration in `app/switches.py` and a `docs/feature-flags.md`
+  entry — the same trio recent flags used (`agent_profiles.enabled`,
+  `guardrails.enabled`).
+
+---
 
 ## 3. Schema
 
-Postgres only, one Alembic revision.
+Postgres only. One Alembic revision; SQLAlchemy models in `src/db_pg.py`.
 
 ```
-facts         id TEXT PK                 -- opaque surrogate, never derived
-              type TEXT
+facts        id TEXT PK                    -- 'f_' + token_hex(8); opaque, never derived
+             type TEXT NOT NULL            -- ontology node type
 
-fact_aliases  fact_id TEXT FK→facts ON DELETE CASCADE
-              natural_key TEXT
-              UNIQUE (type, natural_key)
+fact_aliases fact_id TEXT NOT NULL FK→facts ON DELETE CASCADE
+             type TEXT NOT NULL            -- denormalized from facts, like corpus_id on claims
+             natural_key TEXT NOT NULL     -- producer slug, e.g. 'myers-emergency-power-systems'
+             UNIQUE (type, natural_key)
 
-edges         id TEXT PK                 -- opaque surrogate
-              src TEXT FK→facts · dst TEXT FK→facts · type TEXT
-              UNIQUE (src, type, dst)
+edges        id TEXT PK                    -- 'e_' + token_hex(8)
+             src TEXT NOT NULL FK→facts ON DELETE CASCADE
+             dst TEXT NOT NULL FK→facts ON DELETE CASCADE
+             type TEXT NOT NULL            -- ontology edge type
+             UNIQUE (src, type, dst)
 
-claims        id TEXT PK
-              fact_id TEXT FK→facts ON DELETE CASCADE      -- exactly
-              edge_id TEXT FK→edges ON DELETE CASCADE      -- one of these
-              CHECK ((fact_id IS NULL) <> (edge_id IS NULL))
-              corpus_file_id TEXT FK→corpus_files ON DELETE CASCADE
-              corpus_id TEXT                -- denormalized: the visibility join
-              source_stable_id TEXT         -- the source system's own id — the anchor
-              file_sha256 TEXT              -- content at claim time, see §6
-              attrs JSONB                   -- what THIS document says
-              quote TEXT                    -- verbatim, see §7
-              document_date DATE            -- from the source, see §8
+claims       id TEXT PK                    -- 'c_' + token_hex(8)
+             fact_id TEXT NULL FK→facts ON DELETE CASCADE      -- exactly one of
+             edge_id TEXT NULL FK→edges ON DELETE CASCADE      -- these two is set
+             CHECK ((fact_id IS NULL) <> (edge_id IS NULL))
+             corpus_file_id TEXT NOT NULL FK→corpus_files(id) ON DELETE CASCADE
+             corpus_id TEXT NOT NULL       -- denormalized: THE visibility column
+             file_sha256 TEXT NOT NULL     -- content the claim was made against (staleness check)
+             attrs JSONB NOT NULL DEFAULT '{}'   -- what THIS document says
+             quote TEXT NOT NULL           -- verbatim against the extraction (§8)
+             quote_hash TEXT NOT NULL      -- sha256(quote)[:16], computed at write
+             document_date DATE NULL       -- from the source system (§10)
+             created_at TIMESTAMPTZ
+             UNIQUE (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash)
 
-corrections   subject_kind TEXT · subject_id TEXT   -- PK
-              verdict TEXT                  -- wrong | restricted | revealed
-              reason TEXT · decided_by TEXT · decided_at
+corpus_file_sources                        -- NEW PG-only table; the anchor (§6)
+             corpus_file_id TEXT PK FK→corpus_files(id) ON DELETE CASCADE
+             corpus_id TEXT NOT NULL
+             source_stable_id TEXT NOT NULL    -- crawler's stable_id ('graph:<driveItem-id>')
+             source_sha256 TEXT
+             source_url TEXT NULL              -- when it lands (open item O7)
+             UNIQUE (corpus_id, source_stable_id)
+
+corrections  subject_kind TEXT NOT NULL    -- 'fact' | 'edge'
+             subject_id TEXT NOT NULL      -- PK (subject_kind, subject_id)
+             natural_keys JSONB NOT NULL   -- snapshot for re-attachment (see below)
+             verdict TEXT NOT NULL         -- 'wrong' | 'restricted' | 'revealed'
+             reason TEXT NOT NULL
+             decided_by TEXT NOT NULL · decided_at TIMESTAMPTZ
 ```
+
+Indexes: `claims(corpus_id)`, `claims(fact_id)`, `claims(edge_id)`,
+`claims(corpus_file_id)`, `facts(type)`, `edges(src)`, `edges(dst)`,
+`fact_aliases(fact_id)`.
 
 Load-bearing details:
 
-- **`facts.id` is opaque and `fact_aliases` carries the natural key.** The first
-  draft made the id *be* `hash(type + normalized_key)`, which decides entity
-  resolution at write time with no way to revise it: two spellings fragment
-  into two nodes, two different people who normalize alike fuse silently, and
-  repairing either means rewriting primary keys across every table. One
-  indirection buys the ability to merge and to split later. Many aliases may
-  point at one fact; that *is* the merge.
-- **`corpus_id` is denormalized onto the claim** so the visibility predicate is
-  a single indexed column, not a join through `corpus_files` on every hop of a
-  traversal. Index `(corpus_id, fact_id)` and `(corpus_id, edge_id)`.
-- **`corrections` is never written by a producer.** Re-extraction replaces
-  claims; it must not erase human judgement. Without this, the same wrong fact
-  returns every run and people stop reporting anything.
-- `corrections` **does not cascade** with the subject. A subject that vanishes
-  because a document was briefly missing must not lose a `restricted` legal
-  hold and come back unrestricted on the next run.
+- **`facts.id` is opaque; `fact_aliases` carries identity.** A producer node
+  id `<type>:<slug>` maps to an alias row; the surrogate is minted on first
+  sight. A merge is *adding an alias* (repoint aliases + claims to the
+  canonical subject, audit-logged); a split is the reverse. Hash-derived ids
+  were rejected: they decide entity resolution at write time with no repair
+  path — under-merge fragments visibly, over-merge fuses silently.
+- **`corpus_id` is denormalized onto claims** so the visibility predicate is
+  one indexed column, not a join through `corpus_files` on every traversal
+  hop.
+- **`file_sha256` is a staleness check, not a resurrection mechanism.** A
+  claim whose stored hash no longer matches the file's current content is
+  stale by definition and replaced on the next pass. Loss-of-anchor is
+  prevented *upstream* by §6's upsert — the cascade is reserved for true
+  deletion. (Rev 2 promised "recovery by sha" alongside a cascade; those were
+  contradictory and the promise is withdrawn.)
+- **`corrections` is never written by a producer, never cascades with its
+  subject**, and carries a `natural_keys` snapshot (for a fact: its alias
+  keys; for an edge: `[src_key, type, dst_key]`) so that a subject deleted
+  and later re-created under a new surrogate **re-attaches its correction at
+  write time** — a legal hold must not vanish because a document was briefly
+  missing.
+- **`visibility_mode` is instance configuration, not a column**:
+  `facts.visibility_mode: any_evidence | all_evidence` in `instance.yaml`
+  (default `any_evidence`), resolved through `get_value`.
+
+---
 
 ## 4. What a caller sees
 
-Given the caller's readable collection set:
+Given `readable` = the caller's readable collection set (§5):
 
 ```
-visible(subject)  :=  ∃ claim ∈ subject.claims  where claim.corpus_id ∈ readable
-attrs(subject)    :=  merge over  { claim.attrs  | claim.corpus_id ∈ readable }
-quotes(subject)   :=          {   claim.quote    | claim.corpus_id ∈ readable }
+visible(subject) := ∃ claim ∈ subject.claims : claim.corpus_id ∈ readable
+                    (all_evidence mode: ∀ instead of ∃)
+quotes(subject)  := { claim.quote | claim.corpus_id ∈ readable }     -- always ∃-filtered
+attrs(subject)   := per-key projection over readable claims only:
+                    – the value from the claim with the LATEST document_date wins;
+                    – equal dates with differing values → the key is returned as
+                      conflicted: {values: [...], claims: [...]} — never silently picked;
+                    – a dated claim beats an undated one; two undated ones conflict.
 ```
 
-Facts and edges use the identical rule. Nothing a caller receives is ever
-computed from a claim they cannot read — which is what makes the attribute
-oracle impossible rather than merely unlikely.
+Nothing a caller receives is ever computed from a claim they cannot read —
+which is what makes the attribute-filter oracle impossible rather than
+unlikely. Facts and edges use identical rules. `all_evidence` hides strictly
+more **within one grant snapshot**; it is not a general monotonic guarantee
+(grant drift, §13).
 
-`facts.visibility_mode = all_evidence` (default `any_evidence`) requires
-*every* claim's collection to be readable. It hides strictly more **within one
-ACL snapshot** — it is not a general monotonic guarantee, because both modes
-inherit ACL staleness (§9).
+**Admin corrections** (each with reason → `audit_log`):
 
-**Admin corrections**, always with a reason written to `audit_log`:
-
-- `wrong` — subject withheld from everyone and, unlike the others, **fed back
-  to the producer** so re-extraction does not resurrect it;
+- `wrong` — withheld from everyone AND exported to the producer (§7.4) so
+  re-extraction does not resurrect it;
 - `restricted` — withheld regardless of claims (legal hold, personnel);
-- `revealed` — served **without quotes** to **every authenticated caller on the
-  instance**, regardless of collection grants and regardless of
-  `visibility_mode`. That reach is deliberate and must be labelled that way in
-  the UI; the Agnes `Admin` group short-circuits authorization anyway, so an
-  override governs what *everyone else* sees.
+- `revealed` — served **without quotes** to **every authenticated caller on
+  the instance**, regardless of collection grants and regardless of
+  `visibility_mode`. That reach is deliberate; the UI labels it exactly that
+  way. (The Agnes `Admin` group god-modes authorization anyway — an override
+  governs what everyone else sees.)
+
+---
 
 ## 5. Enforcement
 
-**The primitive is `accessible_collection_ids(user)`
-([app/auth/access.py:654](../../../app/auth/access.py)), not
-`can_access_collection`.** The latter takes a bare `user_id`; handed an
-`AgentPrincipal` it raises, and handed the agent's *owner* id it substitutes
-the owner's full authority — including admin god-mode — for the agent's
-narrowed scope. The former branches on `PRINCIPAL_TYPES` and returns the live
-intersection, which is what an agent's declared scope means. Its own docstring
-records why. `None` means admin: every collection.
+**The primitive is `accessible_collection_ids(user)`**
+([app/auth/access.py:654](../../../app/auth/access.py)): returns `None` for
+admin (= all collections); for `PRINCIPAL_TYPES` (agent/co-session) returns
+the **live intersection unmodified**; for a dict user returns group grants
+**∪ collections the user owns** (`file_corpora.created_by`, capped scan).
+Never `can_access_collection` for principals — it takes a bare `user_id` and
+either crashes on a frozen dataclass or, fed `owner_user_id`, substitutes the
+owner's full authority including admin god-mode; its sibling's docstring
+records exactly this trap.
 
-Three rules the implementation must satisfy, each of which a reviewer found
-missing:
+Two consequences a test author must know:
 
-1. **Filter in SQL, before `LIMIT`.** `WHERE claim.corpus_id = ANY(:readable)`
-   is a join predicate, never a post-filter in Python — otherwise a page
-   returns fewer rows than exist and the shortfall itself signals hidden
-   matches.
-2. **404, never 403, for a subject with no readable claim.** Ids are opaque
-   (§3) but tools take them as parameters; distinguishing "does not exist" from
-   "exists, not for you" is an existence oracle. Collections already made this
-   choice and documented it.
-3. **Traversal re-evaluates at every hop.** `fact_neighbors` may not walk from
-   a visible subject into one whose claims are unreadable. Depth is capped and
-   hub nodes are fanout-capped — a depth-4 walk from a high-degree node is the
-   query that will hurt, and it is not the query the benchmark ran (§10).
+- **Security fixtures must not be uploaded by the probed caller** — ownership
+  unions into a dict user's readable set, so a fixture uploaded as Alice is
+  readable by Alice regardless of grants, and the test passes vacuously.
+- Because the tools are not collection-scoped in their signatures, the
+  declarative route gate (`require_collection_access`) does not apply; **all
+  enforcement lives in the repository**, in one shared helper used by every
+  read method, with tests that drive each method through a restricted
+  `AgentPrincipal`, not only a dict user.
 
-Because the tools are not collection-scoped, the declarative
-`Depends(require_collection_access(...))` gate cannot be used at the route
-level. All enforcement therefore lives in the repository, in three methods
-that each re-derive it — which is precisely why it needs a shared helper and a
-test that drives all three through a restricted `AgentPrincipal`, not just a
-dict user.
+Three implementation rules, each answering a found hole:
 
-## 6. Document identity — the anchor problem
+1. **Filter in SQL, before `LIMIT`** — `claim.corpus_id = ANY(:readable)` as
+   a join predicate, never a Python post-filter; a short page must not signal
+   hidden matches.
+2. **404, never 403**, for a subject that does not exist *or* has no readable
+   claim — indistinguishable in status, body, and timing envelope. Collections
+   documented this choice
+   ([app/api/collections.py:27](../../../app/api/collections.py)); ids being
+   opaque (§3) reduces but does not remove the probing surface.
+3. **Traversal re-evaluates at every hop.** `fact_neighbors` never walks from
+   a visible subject into one whose claims are unreadable, and never reveals
+   that a path continues. Caps: depth default 3 / max 4, per-node fanout 100,
+   result 500, statement timeout. The hub-node walk is the query that
+   explodes and the one the benchmark never ran (§12).
 
-`corpus_files.id` is a fresh `cf_*` token on every `add()`
+**No general SQL escape hatch** over these tables, in any surface. An
+unfiltered path defeats every rule above (the `graph_sql` lesson from the
+sandbox server, recorded on TCRD-186/196).
+
+---
+
+## 6. Document identity — the anchor
+
+Verified failure to design around: `corpus_files.id` is `"cf_" +
+secrets.token_hex(8)` on every `add()`
 ([src/repositories/corpus_files.py:78](../../../src/repositories/corpus_files.py)),
-and re-upload at the same path hard-deletes the old row before inserting the
-new one, **regardless of whether the content changed**
-([app/api/collections.py:628](../../../app/api/collections.py)). That upsert is
-documented as the path a document-sync client uses — i.e. the one our first
-producer will use. Cascading from it would delete facts whose document never
-went away, and the gap would persist until the (expensive, concurrency-1)
-extraction pass ran again.
+and the documented doc-sync upsert `_replace_existing_by_path`
+**unconditionally purges** the existing `(corpus_id, path)` row — chunks and
+derived tables included — before inserting a new row with a new id; only the
+content-addressed *blob* survives a byte-identical re-upload. Harmless for
+chunks (re-embedding is cheap); destructive for claims (an LLM pass). **The
+asymmetry is the finding.**
 
-For chunks this churn is harmless: re-embedding is cheap. For claims it is
-destructive: re-extraction costs an LLM pass. **The asymmetry is the finding.**
+The crawler already holds the right anchor:
+`stable_id` — `graph:<driveItem-id>` (survives rename and move) or
+`local:<relpath>` (does not) — is its delta key, distinct from `doc_id`
+(= content `sha256[:16]`, the citation key, which survives rename but changes
+with content). Metadata-only rows carry a *provisional* doc_id
+(`sha256(cTag|stable_id)`), rewritten on the first content crawl.
 
-**Prerequisite (a change to Collections, not to this feature):** the path
-upsert must preserve the row when the content hash is unchanged — update in
-place instead of delete-and-insert. This is a bug fix on its own terms; it also
-stops a pointless re-embedding of every chunk on a no-op re-sync.
+**Design:**
 
-**Belt and braces:** `claims.file_sha256` records the content the claim was
-made against. If an id is lost anyway, claims are recoverable by
-`(corpus_id, sha256)` rather than silently destroyed; and a claim whose stored
-hash no longer matches the current file is stale by definition and is dropped
-on the next pass whether or not the id survived.
+- `corpus_file_sources` (§3) maps `(corpus_id, source_stable_id)` →
+  `corpus_file_id`. It is a **new PG-only table** because `corpus_files` is a
+  frozen DuckDB+PG pair and the DuckDB ladder is frozen at 124 — no new
+  column is possible there.
+- **Prerequisite change to Collections** (its own PR, justified on its own):
+  the upload path gains an optional `source_stable_id`. Upsert order:
+  match by `(corpus_id, source_stable_id)` first, then by `(corpus_id, path)`.
+  On a match, **UPDATE in place — id preserved**; if the content sha is
+  unchanged, skip re-chunking entirely (a no-op re-sync costs nothing); if
+  changed, purge chunks and reset `processing_status` on the *same* row.
+  Path-only uploads (manual UI) keep today's flow plus the sha short-circuit.
+- Ingest (§7) refuses a claim whose `doc` reference cannot be resolved
+  through this mapping.
 
-Lifecycle, then:
+Lifecycle:
 
-- **Content unchanged, row re-synced** → claims survive (prerequisite above).
-- **Content changed** → hash differs → claims for that document are replaced;
-  the quote may no longer be in the text, so keeping them would be wrong.
-- **Document deleted** → claims cascade. A subject left with zero claims is
-  deleted in the same pass and **counted in the run report** — not silently.
-  Its `corrections` row survives (§3).
+| event | effect |
+|---|---|
+| re-sync, content unchanged | row kept, zero re-processing, claims untouched (test C3) |
+| rename / move | same `source_stable_id` → same row, path updated; claims untouched (C4). Note: the current crawler's ctag-skip leaves `path` stale on a pure rename — the port must refresh path/name on delta items even when content is unchanged |
+| content changed | same row, new sha; that document's claims **replaced** on next extraction (old quotes may no longer exist in the text) |
+| deleted in source / moved out of crawl scope | row deleted → claims cascade → subjects left with zero claims are deleted **and counted in the run report**; their `corrections` rows survive (§3) |
 
-Orphan collection runs as its own step after ingest, not inside the ingest
-transaction: a bundle re-ingest that removes many files must not hold a long
-transaction on the hot path of an app-state database that also serves auth and
-sessions.
+The orphan-subject sweep runs as its own step **after** ingest, never inside
+the ingest transaction — a bundle re-ingest must not hold a long transaction
+on the app-state database that also serves auth and sessions.
 
-## 7. What "verbatim" actually means
+---
 
-The gate: a claim whose `quote` is not a substring of the referenced document's
-extracted text is **rejected at write time**. Mechanical, not a model's
-opinion. It is the single most valuable check in the system and it is narrower
-than it sounds. State all four limits in customer material:
+## 7. Producer contract and ingest
 
-- **It validates the quote, not the fact.** A model that invents a relationship
-  and cites a real adjacent sentence passes cleanly. The gate kills fabricated
-  *quotes*, not fabricated *inferences*.
-- **The text is the extraction, not the document.** Documents are converted to
-  markdown and stored chunked in `corpus_chunks.text`; `corpus_files` holds no
-  text. Tables became pipe syntax, ligatures and hyphenation were normalized,
-  headers moved. A user who searches the quote in the original PDF will
-  sometimes not find it.
-- **Quotes cannot cross a chunk boundary**, because the substring test is
-  against chunk text.
-- **Cross-language extraction fails the gate by construction.** A Czech
-  document yielding English claims produces no quote that is a substring of its
-  source. Either extraction stays in the document's language, or the gate needs
-  a different formulation — this is unresolved and blocks any multilingual
-  corpus.
+### 7.0 Wire format (verbatim from the producing pipeline)
 
-**Citation back to the original is new work, not free.** `corpus_files` has no
-`source_url` column — it is proposed in the corpus-intake design and unbuilt.
-Until it exists there is no link from a quote to the document in its source
-system, which is half the value of a citation.
+The producer is the cuesta-star-graph pipeline (crawl → convert → anonymize →
+extract → reconcile → gates). Its emitted shapes, which the ingest endpoint
+accepts as-is:
 
-## 8. Time
+```jsonc
+// node row
+{"id": "<type>:<kebab-slug>", "type": "<node_type>",
+ "attrs": { /* may be {} */ },
+ "evidence": [{"doc_id": "<sha256-16>", "quote": "<verbatim substring>"}]}
 
-Every claim carries `document_date`, supplied by the producer (a crawler has it
-— Graph returns `lastModifiedDateTime`). `corpus_files` has only ingest
-timestamps, so without this the system cannot tell **succession from
-disagreement**, and every ordinary organizational change — a renewal, a
-reorganization, a role change — becomes a human-review item. Conflict-queue
-volume is the most common operational reason these systems get abandoned.
-
-With it:
-
-- Claims about the same attribute from documents of different dates are
-  **succession**: the latest readable claim wins, earlier ones remain queryable
-  as history.
-- Claims from documents of the **same** date that disagree are a genuine
-  conflict: both kept with their evidence, surfaced for a human, never silently
-  merged.
-
-"Who is the sponsor *now*" has an answer. "Who was the sponsor in 2024" also
-has one. Neither did in the first draft.
-
-## 9. Anonymization — a service in front of ingestion
-
-Anonymization runs **before anything reaches Agnes**, as a service in the
-crawler's path:
-
-```
-SharePoint  →  download  →  convert to markdown  →  anonymize  →  Agnes
-                            (our converter,        (doc_quantization,
-                             pypdfium2)             Apache-2.0)
+// edge row  (merge key: src+type+dst)
+{"src": "<node id>", "type": "<edge_type>", "dst": "<node id>",
+ "attrs": {}, "evidence": [{"doc_id": "...", "quote": "..."}]}
 ```
 
-The consequence is stronger than a redaction rule, and it is why this
-placement is right: **Agnes never holds the original at all.** For a collection
-marked anonymized there is nothing to redact on the way out, because nothing
-unredacted ever came in. That removes the objection that `/preview`, `/raw`
-and the chunk index do not redact — they serve what was ingested, and what was
-ingested is the anonymized form. The original stays in the source system under
-its own ACL, which is where it belongs.
+Conventions the pipeline enforces and ingest relies on
+(cuesta-star-graph, verified): node id matches
+`([a-z_]+):([a-z0-9][a-z0-9-]*)` with prefix == type
+(`validate_graph.py:60`); slugs are lowercase ASCII with `&`→`and`; every
+**edge** carries ≥1 evidence entry (`possible_duplicate_of` exempt —
+`verify_quotes.py:86`), nodes without evidence are warnings; agents **never
+emit document nodes** — documents are materialized from the crawler index;
+`extract_status` values are `ok`, `ok (cached)`, `empty`,
+`skipped (metadata-only)`, `error: …`, and all skip logic keys on
+`startswith('ok')`.
 
-It also makes the verbatim gate consistent rather than awkward: claims are
-extracted from anonymized text, so a quote is verbatim against the text a
-reader will actually be shown.
+Document metadata rows are the crawler's 17-field `make_row`
+(`crawl.py:121-142`): `doc_id, stable_id, name, path, site, drive, source
+('local'|'graph'), mime, size, created, modified, author, last_editor,
+sha256, extracted_path, extract_status, crawled_at` — underscore-prefixed
+internals (`_ctag`, `_drive_id`) are stripped by consumers. Do **not**
+implement against the stale `out/documents.jsonl` fixture (wrong `source`
+value, missing seven fields).
 
-**The anonymiser.** `padak/doc_quantization` (Apache-2.0) is a
-decontextualisation pipeline — markdown split into 22-token chunks under random
-UUIDs, ordering kept locally, chunks sent shuffled and context-free mixed with
-honeytokens and chaff so no party ever sees a whole document, byte-exact
-reassembly, and a fully local detection mode where nothing leaves the machine.
-We run our own deployment of it.
+### 7.1 The crawler — adopted, with a named hardening backlog
 
-**The converter is ours, and permissively licensed.** The reference
-implementation (`padak/doc_converter`) uses PyMuPDF, which is AGPL — and Agnes
-ships under PolyForm Small Business, which AGPL cannot mix with. Rather than
-manage that boundary, we build the converter on **pypdfium2** (Apache-2.0 /
-BSD-3-Clause, wrapping BSD-licensed PDFium) and publish it as its own public
-repository under a permissive licence.
+We adopt `crawl.py`, we do not rewrite it. Present and kept: `getAllSites`
+(the `search=*` endpoint silently under-returned 2/10 sites for app-only
+tokens, observed live), per-drive `deltaLink` persisted, delta deletions
+handled, repair pass (delta never revisits an unchanged file), 429
+`Retry-After`, temp-download→hash→extract→delete, `markitdown[all]` (bare
+`markitdown` breaks every Office conversion).
 
-This is worth stating as a decision rather than a detail: the AGPL route was
-available and would have worked behind a network boundary, but it costs a
-licence obligation on every deployment and a boundary that exists for legal
-rather than architectural reasons. Choosing a permissive converter removes
-both. The services stay separate for operational reasons — the anonymiser runs
-a batch pipeline with its own store and scales differently — not because a
-licence forces it.
+**Absent, and required for production** (verified by audit — zero hits for
+each): webhook subscriptions + renewal before expiry; `410 Gone` → full
+resync **and never persisting the dead deltaLink** (today every later run
+fails identically and change detection silently stops); mid-crawl token
+refresh (the token is acquired once; a large crawl outlives ~1h); 503/504
+retry (`raise_for_status` kills the run); a bound and a wait-cap on the 429
+loop (today `while True`, uncapped); incremental index persistence (today the
+index is written once at the end — a kill loses the pass; resume must neither
+skip nor duplicate); per-item ACL reads where inheritance is broken
+(`HasUniqueRoleAssignments`; Graph does not return `inheritedFrom` for
+SharePoint libraries) — Phase ACL only (§13); path/name refresh on renamed
+items (§6).
 
-The trade is conversion quality, and it is a **correctness** dependency rather
-than a cosmetic one: quotes are verbatim against converted text, so a converter
-that mangles tables or drops structure silently degrades the verbatim gate.
-§14.5 tests it.
+**Scan transcription is on by default.** It is a cost decision, not a
+capability toggle. The prototype's `--vision` flag requires a manual
+`--binaries-dir` the pipeline cannot populate (the crawler deletes temp
+downloads by design) — the production path must **re-fetch the binary via
+Graph** (`_drive_id` + item id are on the row), transcribe
+(render → vision model), and persist the transcript as the document's
+extraction artifact so the verbatim gate has text to check. Queue cost is
+surfaced in the UI (§13.2).
 
-**One blocking gap: the substitution is not a pseudonym.** The anonymiser
-replaces persons with `**PERSON**` and companies with `**COMPANY**` — fixed
-markers. Extract facts from that and every person collapses into one node,
-every company into another; the graph over an anonymized collection ceases to
-exist. Since we run our own deployment, the fix is ours to make and it is
-small: replace the fixed marker with `PERSON_<hmac(key, normalized_text)[:6]>`.
-The detector already returns exact entity substrings, so this is a
-service-layer substitution step, not a change to detection. The key is
-per-instance, which also means tokens never correlate across tenants.
+### 7.2 Ingest API
 
-With stable pseudonyms the graph joins within one key domain.
+`POST /api/facts/ingest` — scheduler-token or admin PAT; body =
+`{documents: [...], nodes: [...], edges: [...]}` (the shapes above; documents
+optional when only re-asserting). Batch limits enforced; CSRF n/a (bearer).
 
-Limits to state rather than discover:
+Semantics:
 
-- **The claim is "Agnes serves only the anonymized form", never "the document
-  is anonymous".** The original is untouched in the source system.
-- **Across key domains the same entity is two nodes.** An anonymized and a
-  plain collection, or two anonymized sources with different keys, never join.
-  Key rotation rewrites every alias. This is a documented property, not a bug
-  to fix later.
-- **It contradicts the corpus-intake design**, which ingests *two* variants —
-  full into a restricted collection, redacted into a broad one. Placing the
-  anonymiser in front of ingestion is incompatible with holding a full variant
-  at all, so one of the two designs has to give. This one is the safer of the
-  two, because a copy that does not exist cannot be granted by mistake.
+- **Documents** upsert through §6 (stable-id first). A node/edge evidence
+  `doc_id` that resolves to no known document → that claim is **rejected**,
+  itemized in the response.
+- **Verbatim gate at the door** (§8): quote not a substring of the referenced
+  document's extracted text → claim rejected, never stored-and-flagged. The
+  gate is mechanical.
+- **Aliases**: node id `<type>:<slug>` resolves via `fact_aliases`; unknown →
+  new subject + alias. Type conflict on an existing alias → rejected row
+  (the sandbox loader hard-exits; we itemize instead).
+- **Evidence union, not replacement.** Re-asserting a subject merges claims
+  by `(subject, corpus_file_id, quote_hash)`. The sandbox `load_postgres.py`
+  *replaces* evidence on upsert, so partial loads there wipe cross-document
+  evidence — our ingest must not inherit that. A full re-extraction of one
+  document replaces exactly **that document's** claims (delete by
+  `corpus_file_id` ∩ incoming subject set, then insert).
+- **`possible_duplicate_of` edges** are accepted and surfaced as
+  entity-resolution review items — they are the reconcile pass's keep-split
+  signal, and the sandbox's own checklist ("conflict → review queue visible
+  to humans, not buried in JSONL") is still open there; Agnes closes it.
+- **Response = run report**: `{claims_written, claims_rejected: [{row,
+  reason}], subjects_created, subjects_deleted (orphans), corrections_active:
+  [...]}` — the orphan count is the honesty §6 requires.
+- **Idempotent**: replaying the same batch is a no-op by the uniqueness keys.
 
-## 10. Query and cost
+The pipeline's unscripted step — concatenating `agent-*.jsonl` + converter
+output into one graph before gates — is subsumed: ingest accepts the merged
+stream and applies the gates itself; the producer's own `verify_quotes.py` /
+`validate_graph.py` remain a pre-flight courtesy, not the boundary.
 
-Traversal is SQL: recursive CTEs over indexed columns. Measured on this
-machine against synthetic data (293k facts / 967k edges): four-hop join 63 ms,
-recursive hierarchy walk 5 ms, variable-length walk to depth 4 over an attached
-Postgres 9 ms.
+### 7.3 Reconciliation & conflicts
 
-**Those numbers do not transfer, and the spec should not lean on them.** The
-benchmark omitted the visibility predicate that every real query carries at
-every hop; synthetic graphs have uniform degree where real ones have hubs, and
-a depth-4 walk from a hub is the query that explodes; density was ~3 facts per
-document where LLM extraction typically yields tens; and it was one warm query
-with no concurrency. What they establish is only that *the join shape is not
-inherently expensive* — not that this will hold at scale. Re-measure with the
-predicate, on power-law data, before promising anything.
+Per the pipeline's pass model (extraction is per-document and stateless;
+cross-document identity is the reconciliation pass's job): merge decisions
+arrive as alias operations; **functionally single-valued edges**
+(`owned_by`, `for_client`) with >1 distinct dst become **first-class review
+items** in Agnes (surfaced on the collection detail, §13.2) rather than lines
+in a markdown report. Same-date attribute contradictions are conflicts (§4);
+different dates are succession (§10).
 
-Tools (REST + CLI + MCP per the command-UX standard):
-`fact_search(type, filters, limit)`, `fact_neighbors(subject_id, edge_types,
-depth)`, `fact_claims(subject_id)`. Every one filters by caller in the
-repository. **No general SQL escape hatch** over these tables — an unfiltered
-path defeats every rule above.
+### 7.4 Corrections export
 
-Churn is a real operational concern: re-extraction deletes and reinserts every
-claim for a document, continuously, in the same Postgres that serves auth,
-sessions and audit. Partitioning, retention and vacuum behaviour need an answer
-before a large corpus, not after.
+`GET /api/facts/corrections` (scheduler-token) — the producer prunes `wrong`
+subjects from re-extraction. Server-side, corrections are also enforced at
+read time regardless (§4), so a producer that ignores the export cannot
+resurrect a withheld fact.
 
-## 11. The gate this design cannot pass on its own
+### 7.5 Extraction inside Agnes (later)
 
-Collections already do: extract → chunk → hybrid retrieval → cited answers,
-with RBAC. **This spec never states what facts buy over that**, and the
-head-to-head evaluation that would show it is unbuilt.
+The machinery exists: `agent_schedules` (schema **v120**;
+[app/api/agent_schedules.py](../../../app/api/agent_schedules.py) `run-due`
+sweep) enqueues the existing `agent_response` LIGHT-lane job kind, with model
+pinning and `token_budget_monthly` enforcement. When extraction moves inside,
+it gets its **own worker lane** (§16 step 7) — a corpus re-extraction in
+HEAVY (concurrency 1) would block every table sync.
 
-So: **the evaluation is a precondition of the edge half, not a follow-up.**
+---
 
-- Steps 1–4 below (subjects, claims, the gate, filtered read) are defensible
-  without it: they are typed, cited, permission-filtered extraction, which is
-  a real capability and measurably different from retrieval.
-- **Edges and traversal are not.** They are the expensive half and their
-  justification is entirely "multi-hop questions", so they wait until one
-  question is demonstrated that multi-hop answers and hybrid retrieval does
-  not. If none is, the honest conclusion is that this is structured extraction,
-  not a graph — which is still worth having.
+## 8. What "verbatim" actually means
 
-Quality must be measured, not asserted. The corpus-intake design already set
-this bar for the same subsystem — planted ground truth, a labelled question
-set, precision tracked per release — and this design inherits it: extraction
-precision/recall per type, entity-resolution cluster purity, conflict rate per
-1000 documents, orphan rate per run, and answer quality with facts versus
-without, on the same questions.
+The gate: a claim's quote must be a **substring of one chunk of the
+document's extracted text** (`corpus_chunks.text`; `corpus_files` holds no
+text). Rejected at write, mechanical, the single most valuable check — and
+narrower than it sounds. Four limits, stated for customer material:
 
-## 12. Build order
+1. **It validates the quote, not the fact.** An invented relationship citing
+   a real adjacent sentence passes. (Test EQ2 documents this honestly; the
+   producer's own skill rule 11 — "the quote must STATE the fact, not merely
+   mention its entities" — is prompt-level mitigation, not a guarantee.)
+2. **The text is the extraction, not the document.** Markdown conversion
+   moved tables into pipe syntax, normalized ligatures, relocated headers. A
+   user searching the quote in the original will sometimes not find it.
+3. **Quotes cannot cross a chunk boundary** — the substring test is per
+   chunk.
+4. **Cross-language extraction fails the gate by construction** (Czech
+   document, English claim → no substring). Open (O6); blocks any
+   multilingual corpus.
 
-The first draft opened with "move app-state to managed Postgres". That is a
-hosting programme with its own owner and timeline, the A3 ratchet forces
-Postgres-only regardless of where Postgres runs, and a later cutover moves all
-app-state together. It is removed; nothing here should be blocked by it.
+**Citation to the source system is new work**: `source_url` lives in
+`corpus_file_sources` when the crawler supplies it (O7); until then a
+citation names the document, not a clickable original. The original itself is
+never served by Agnes — it opens in the source under the caller's own
+identity (the TCRD-178 "resolve to the source" decision).
 
-1. **Ontology as a flat type list.** It is the producer contract — writing
-   claims against an implicit vocabulary means reverse-engineering it later, at
-   re-extraction prices. Even hand-written, it comes first.
-2. **Schema + repository** — `facts_pg.py`, Alembic revision, contract tests.
-3. **Read path with RBAC.** The test that holds the design: two groups, one
-   question, different subjects, different attributes, different quotes — and
-   the same test driven by a restricted `AgentPrincipal`, not only a dict user.
-4. **Write path** — producer contract, verbatim gate at the door, the
-   Collections upsert prerequisite from §6 landed first.
-5. **Measurement harness** (§11). Before more surface, not after.
-6. **Own worker lane for extraction.** HEAVY runs at concurrency 1; a corpus
-   re-extraction there blocks every table sync. The queue already claims by
-   kind, so this is configuration.
-7. **Edges + traversal** — gated on §11.
-8. **Ontology authoring UI, collection detail, conflict surfacing.**
+Conversion fidelity is therefore a **correctness dependency**, gated by test
+EQ8 (§15.3).
 
-## 13. Obligations from the customer workbook (v0.2)
+---
 
-Four commitments the workbook creates that this design must absorb. Two are
-time-critical, and the first one **reorders the work**.
+## 9. Anonymization and conversion — services in front of ingestion
 
-### 13.1 R0 must run before ingestion — and ingestion is imminent
+```
+source → download → convert (/convert + /health) → anonymize → Agnes
+          crawler     OUR service, permissive       doc_quantization
+```
 
-The workbook: *"Run this before building anything — once Agnes has content, the
-pre-build baseline is unrecoverable."* R0 needs only arms A0/A1/A2 and does not
-involve Agnes at all.
+Placed *before* ingestion, the guarantee is structural: **for an anonymized
+collection, Agnes never holds the original at all** — nothing unredacted
+enters, so `/raw`, `/preview`, the chunk index and search serve the
+anonymized form because that is all that was ever ingested. The earlier
+"those endpoints don't redact" objection dissolves; test AN4 verifies the
+pipeline order (including intermediates and the blob store).
 
-The crawler is about to fill Agnes with the real corpus. **Once it does, the
-baseline cannot be reconstructed** — not by rolling back, not by exporting,
-not by asking people to forget. This is the one step in the whole programme
-with a genuinely irreversible ordering constraint, and everything in §12's
-build order is reversible by comparison.
+### 9.1 The converter — ours, permissive, one engine replaced
 
-**Consequence: R0 runs first, this week, before any ingestion into the target
-instance.** It blocks nothing else — it needs no Agnes — so the only way to
-lose it is to let ingestion start while nobody scheduled it. Raise it at the
-daily; treat a completed R0 as a precondition on the crawler's first
-production run, not as a parallel workstream.
+Verified: the reference `doc_converter` is AGPL-3.0 **because of exactly one
+dependency** — its `.pdf` route uses PyMuPDF; `.md`/`.txt` pass through;
+**everything else already routes to markitdown (MIT)**, whose Office backends
+are mammoth (BSD-2), python-pptx (MIT), openpyxl (MIT). Padák's quality
+objection to markitdown concerned its **PDF path** (pdfminer.six), not
+Office.
 
-Without it, §11's gate ("does the graph beat retrieval") loses its control
-group, and §14.6's final step compares against a baseline that no longer
-exists.
+So our converter is `doc_converter` re-implemented permissively and published
+as a public repo:
 
-### 13.2 Access personas are now a graded test, not an internal concern
+- same two-endpoint contract — `POST /convert` (multipart `file` →
+  `{markdown, engine, filename, characters}`) and `GET /health` — which the
+  anonymizer consumes via `conversion.service_url`, making ours a declared
+  **drop-in**;
+- `.pdf` → **pypdfium2** (Apache-2.0/BSD-3 over BSD PDFium). pypdfium2 is
+  PDF-only and emits text + bitmaps, **not** markdown — reading-order and
+  table/heading reconstruction over PDFs is **net-new code we own**, and
+  precisely what EQ8's PDF fixtures exercise;
+- `.docx/.pptx/.xlsx/...` → markitdown (MIT), same as the reference;
+- **scans**: a PDF with no/near-empty text layer (the reference returns 422)
+  is rendered to page bitmaps via pypdfium2 and transcribed — default engine
+  is the vision-model route the prototype already uses (permissive tesseract
+  is the offline fallback), on by default per §7.1, cost surfaced.
 
-Two personas need confirmation before R0, and Agnes must enforce the split:
+Why not keep AGPL behind a network boundary: it would be lawful (Agnes is
+PolyForm Small Business 1.0.0 — AGPL cannot be vendored into it, only
+composed at arm's length), but it buys a licence obligation on every
+deployment and a boundary that exists for legal rather than architectural
+reasons. Removing the dependency removes the problem. The services stay
+separate anyway — the anonymizer is a batch pipeline with its own store.
 
-| persona | structured data | unstructured (documents, facts) |
+### 9.2 The anonymizer — doc_quantization, plus the integration it needs
+
+What it is (verified, Apache-2.0): a **CLI batch pipeline** (`python -m
+doc_quant.cli`: ingest → submit/status/fetch *or* local detect → redact) over
+a SQLite chunk store — 22-token chunks under random UUIDs, order kept
+locally, chunks shuffled and mixed with honeytokens/chaff/canaries so no
+party ever sees a whole document, byte-exact reassembly. `detection.provider
+= local` runs against a local model server and **nothing leaves the machine**
+(that mode deliberately drops honeytokens and the recall measure). There is
+**no HTTP anonymize endpoint** and **no re-ingest deduplication** — same
+directory twice = duplicate documents.
+
+Integration work we own (a thin driver service):
+
+- map crawler `source_stable_id` → anonymizer document; make re-anonymization
+  of a changed document idempotent (delete + re-ingest by our mapping);
+- drive the CLI stages (or import `doc_quant` as a library — Apache-2.0
+  permits) and absorb batch-vs-local latency;
+- choose `detection.provider` per deployment and document the trade (local =
+  nothing leaves the machine, but no honeytoken recall statistics).
+
+**The blocking gap we fix in our deployment: substitution is a fixed marker,
+not a pseudonym.** `redactor.py::_resolve_placeholders` maps every detected
+entity to `**PERSON**` / `**COMPANY**` (person wins conflicts); emails and
+URLs are regex-replaced to `**EMAIL**` / `**URL**` *before* the entity pass.
+Extract facts from that and every person collapses into one node. The change
+is a value computation in `_resolve_placeholders` — detection already returns
+exact entity substrings:
+
+- entities → `PERSON_<hmac(key, normalize(text))[:6]>`,
+  `COMPANY_<hmac(...)>`; **key is per-instance** (tokens never correlate
+  across tenants);
+- **emails get the same treatment** (`EMAIL_<hmac>`) — an address is the
+  strongest join key a person has; URLs stay collapsed (`**URL**`) and are
+  documented as never contributing graph identity;
+- **`normalize()` must handle Czech inflection** — replacement is
+  case-sensitive and verbatim, so `Novák`/`Nováka`/`Novákovi` are three
+  detected strings and would be three pseudonyms. Minimum: casefold +
+  within-document alias unification over the detected entity set before
+  hashing. Test AN2's fixture is **Czech with inflected forms**, so the gate
+  tests the real corpus, not an English idealization.
+
+Documented properties (not bugs): across two key domains — two anonymized
+sources with different keys, or an anonymized and a plain collection — the
+same entity is two subjects, permanently; key rotation rewrites every alias
+(AN3). Until the pseudonym change lands, an anonymized collection is
+**retrieval-only** and AN2 fails on purpose.
+
+**Unreconciled sibling design (O5):** the 2026-08-24 corpus-intake spec
+ingests *two* variants (full → restricted collection, redacted → broad).
+Anonymizer-in-front is incompatible with holding a full variant at all. One
+of the two must give; this one is safer — a copy that does not exist cannot
+be granted by mistake — but the decision is not ours alone.
+
+Anonymization is chosen **at source-connect time, per scope** (a column in
+the wizard, §13.2); on a collection detail it is a state plus a named batch
+task ("Anonymize collection…" over N documents), never a toggle.
+
+---
+
+## 10. Time
+
+Every claim carries `document_date`, supplied by the producer (Graph's
+`lastModifiedDateTime`; `corpus_files` has only ingest timestamps — without
+this the system cannot tell **succession from disagreement** and every
+reorg/renewal becomes a human-review item, the queue that kills these
+systems).
+
+- Different dates on the same attribute → **succession**: latest readable
+  claim answers "now", earlier ones remain queryable as history.
+- Same date, incompatible values → **conflict**: both kept with evidence,
+  surfaced for a human, never silently merged.
+- Null dates: a dated claim beats an undated one; two undated contradictory
+  claims are a conflict, never a silent pick.
+
+---
+
+## 11. The ontology — and the seed pack it doubles as
+
+Entity and relationship types are **data per instance**, stored as a
+semantic model: node types → `datasets`, edge types → `relationships`, the
+prompts' graph-paths → `ai_context`, synonyms → glossary. Agents consume it
+through the existing foundation tools (`get_semantic_context`,
+`validate_semantic_query`). **No customer vocabulary ever enters Agnes code**
+— no `find_engagements`-style tool in the product.
+
+The first ontology exists: `ontology.yaml` v0.2.0 (10 node types, 11 edge
+types, `evidence_required` rules). It is not Ossie — the import translates
+it and reports leftovers (rules without a field → `ai_context`; the
+`industry.parent` hierarchy → a self-relationship to confirm).
+
+Economics drive everything: **an attribute is free; a new type after the
+first full run is a re-extraction at LLM prices.** Hence the authoring UX
+(§13.2): sample-driven proposal, dry-run against real documents with the
+*not-captured* list given equal weight, cost shown at freeze.
+
+**The same artifacts are the A3 seed pack** (§14): the workbook defines arm
+A3's pack as "the ontology/taxonomies/entity-resolution rules as plain
+context" (~1 day to assemble; failure routing maps to `01_ontology/`,
+`02_taxonomies/`, `03_extraction/entity_resolution.md`,
+`04_semantic/definitions_and_metrics.md`). Build-order step 1 produces the
+content; packaging it as Claude project context needs an owner (O4) and must
+exist before whichever round first runs A3.
+
+Authoring guidance lives in `.claude/skills/ontology-building/SKILL.md`
+(committed): the type/attribute/nothing decision tree, the evidence-source
+rule, sample reading order (mis-assigned → dropped → invented), the import
+section, anti-volume grading, conflict-is-a-result.
+
+---
+
+## 12. Query surface
+
+Behind `facts.enabled`, REST × CLI × MCP per the command-UX standard
+(sync-map rows 51/58/59):
+
+| REST | CLI | MCP foundation tool |
 |---|---|---|
-| **Principal** | yes | yes |
-| **Associate** | **no** | yes |
+| `POST /api/facts/search` `{type, filters, limit≤100}` | `agnes facts search` | `fact_search` |
+| `POST /api/facts/neighbors` `{subject_id, edge_types?, depth≤3(max 4), fanout≤100, limit≤500}` | `agnes facts neighbors` | `fact_neighbors` |
+| `GET /api/facts/{subject_id}/claims` | `agnes facts claims` | `fact_claims` |
 
-**Leak count = 0 is Decision Test 5** in the customer's rubric — i.e. this is
-scored, not assumed.
+All filter by caller in the repository (§5); 404 semantics per §5 rule 2;
+results label their origin `[server]` (facts have no local scope — a
+deliberate, labeled deviation the CLI hint explains). Foundation tools
+register in `app/api/mcp/foundation_tools.py` + `FOUNDATION_TOOL_NAMES`,
+guarded by `tests/test_mcp_tool_parity.py`.
 
-The split runs across *two different grant mechanisms*, which is worth stating
-because it is easy to test only half: unstructured reach is collection grants
-(§5), structured reach is **data package** grants. An Associate is a user with
-collection grants and no data package grants. Both halves must be exercised —
-a persona that cannot reach tables but can reach a fact *derived from* a table
-would be a leak the collection-side tests would never catch, and it is one more
-reason facts stay document-derived only (§14.7).
+**Edges are stored from day one** (they are in the wire format and the graded
+relational prompts G1/G2 need them); what is **gated on the evaluation** is
+deeper traversal investment — `fact_neighbors` beyond depth 1–2, any graph
+engine, any traversal-first UI. If A4 cannot beat A3 (§14 Decision #2), the
+honest conclusion is that this is typed, cited, permission-filtered
+extraction — still worth having — and the traversal half stays unbuilt.
 
-§14.1's S1–S7 are the implementation of Decision Test 5.
+Performance: synthetic measurements (293k facts / 967k edges: 4-hop join
+63 ms, recursive walk 5 ms) establish only that the join shape is not
+inherently expensive. They omitted the visibility predicate at every hop and
+used uniform-degree data; real graphs have hubs. **Re-measure with the
+predicate on power-law data before promising numbers.** Token efficiency is
+a *build gate*, not a report: Decision #4 fails A4 outright if
+tokens-to-acceptable-answer exceed 2× the best baseline.
 
-The workbook's own Access sheet defines three rows, and AC2 and AC3 are
-sharper than a leak count suggests. **AC2**: an Associate asked a structured
-question must be *correctly denied* — "inventing a plausible-looking number
-here is scored the same as a Tier 0/1 leak: any fabricated structured figure
-= FAIL, no partial credit". **AC3**: on a mixed question an Associate must
-answer from unstructured sources *and say the structured part was withheld* —
-a silent omission is a completeness failure, a fabricated stand-in is a leak.
-So the tests are not only "did anything leak" but "did it refuse in the right
-way", which is a behaviour our security tests do not currently assert. They should be
-renamed to the personas so results map onto the customer's sheet without
-translation, and the run must record a leak count of exactly zero rather than
-"no failures observed".
+Churn is operational reality: re-extraction deletes and reinserts a
+document's claims in the same Postgres that serves auth and sessions —
+vacuum/bloat behaviour needs an answer before a large corpus.
 
-### 13.3 X1 now sources from Kantata — new, unscoped integration
+---
 
-Per the 26 Aug guidance, X1 (utilisation by business unit) is no longer
-out-of-scope structured data: it sources from **Kantata** time tracking, and it
-feeds both X1 and the AC2 access test.
+## 13. Identity today (no Entra) — and Surfaces
 
-Nobody has scoped this. It is a live structured-data integration, which means:
-a connection, registered tables, a data package, and grants — the whole
-structured path, none of which this design touches. Two things follow:
+### 13.1 Derivation vs enforcement
 
-- It is **not** in scope here and should not be smuggled in. This design covers
-  document-derived facts; a Kantata table is the other lane.
-- But it **is** a dependency of the evaluation, because X1 is one of the graded
-  questions and AC2 tests access against it. So the eval cannot be completed
-  without it, and whoever owns the eval owns getting it scoped.
+Agnes does not derive anything from SharePoint ACLs today: the Microsoft
+provider matches accounts by email and drops `oid`/`tid`; `/me/memberOf`
+sync is deferred in code
+([app/auth/providers/microsoft.py:24,282](../../../app/auth/providers/microsoft.py)).
+**Derivation is missing; enforcement is not** — a hand-assigned grant is
+enforced exactly as strictly as a derived one (same primitive, same filter,
+same tests). Consequences:
 
-### 13.4 Observability is now a customer requirement
+- the evaluation runs without Entra; personas are two Agnes groups with
+  admin-assigned grants;
+- the honest claim is *"an admin decides who sees which collection and Agnes
+  enforces it"* — never "Agnes mirrors your SharePoint permissions";
+- the risk is **drift**, not leakage (manual grants fail closed): someone
+  loses access at the source and keeps it here. Until Entra lands this is a
+  process control on a cadence someone owns, stated in customer material;
+- grants stay **additive** (no deny rows); the later "inherit from source"
+  is an extra grantee on the row, not a mode; identity matching needs **no
+  mapping table** (users by email, groups by sync) — an unmatched principal
+  grants nobody (fail closed) and is **surfaced as a count** on the source
+  card, or under-sharing looks like a bug.
 
-The workbook asks Keboola to confirm **Agnes's OTel token-export method**. That
-moves token accounting from internal hygiene to a contractual answer, and it
-lands on the same numbers §14.6 already requires (tokens and cost per run,
-against a pre-run estimate).
+Later Entra work, in order: store `oid`/`tid`; `/me/memberOf` sync into
+source-segregated groups (`entra:<group-oid>`); site/library-level ACL reads
+with per-item only where `HasUniqueRoleAssignments` (§7.1); periodic ACL
+re-read (delta does not report permission-only changes — test C9).
 
-Two gaps: the export method itself has to be confirmed and written down, not
-described in a meeting; and the workbook references a separate **token
-measurement methodology** note that has not reached us. Until it does, our
-numbers and theirs may not be measuring the same thing — which is the kind of
-disagreement that surfaces at the worst moment. Ask for it now.
+### 13.2 Surfaces — zero new navigation
 
-### 13.5 Entra is not connected — what that means today
+No new pages, no new nav items, no new grant types. A capability that needed
+five new pages would be a signal the model is wrong. Placement: file source =
+a source **type** on `/admin/data-sources`; crawl health = the existing
+`.ds-src` card; grants = collection rows on `/admin/access`; ontology = a
+semantic model in the builder shell; facts = a count on collection cards + a
+section on the collection detail. Collections and data packages are siblings
+(grantable bundles); facts are a derived layer — no card, no grant type.
 
-**Agnes does not derive permissions from SharePoint.** The Microsoft provider
-authenticates and nothing more: it matches accounts by email, drops the Entra
-`oid`/`tid`, and `/me/memberOf` group sync is deferred in code. So every
-statement in §4 about ACLs, inheritance and `HasUniqueRoleAssignments`
-describes a **later** capability, not a current one.
+**Connect wizard (file source): three steps** — connect → scope → share; the
+"bundle" step of the table wizard is dropped because *the selected scope of
+collections is the package*. Step 1: tenant/client id in fields (exact
+foreign values never travel through conversation) and the certificate choice
+— the admin's own (encrypted vault slot, wins when both exist) or the
+server's (env name, `SHAREPOINT_CERT_PRIVATE_KEY` by default, allowlisted;
+UI shows origin + set-date, never the value; a VM picks up a new env var only
+on recreate — surface absence rather than fail the first crawl). Step 2: the
+folder tree — each selected scope shows its `→ collection` badge; a folder
+with its own source-side rights splits into its own collection; unselected
+rows are explicit exclusions; the **anonymize column** sits on the same scope
+row (§9); a note states content is *not* copied (`storage_path = NULL` rows
+are legal today — [app/api/collections.py:765](../../../app/api/collections.py);
+originals open in the source under the user's identity). Step 3: the share
+preview table, per-collection group badges, the anonymized collection keeping
+its badge — **warn on any collection leaving with no group** ("indexed but
+invisible" is the worst silent state).
 
-What holds today, and what does not:
+**Source card** (the same `.ds-src` every source uses — no monitoring page):
+pipeline strip `crawl → text extraction + scan transcription → facts →
+graph` with counts and the queue's **cost in $**; schedule row (hourly delta
+· 03:00 full check · extraction in its own lane); certificate row;
+identity-matching row (`38 matched / 4 unmatched — fail closed`); error
+badges by category, each opening a **drawer filtered to that one category**
+(segmented switch, bulk action carrying its cost) — the card stays a
+verdict. Categories have different remedies: unsupported type = intentional
+allowlist; model error = free retry; deleted = not an error, takes its
+orphan facts with it (counted); rejected quote = the gate working.
 
-| | today | after Entra |
+**Collection detail** shows **state, not settings**: the facts section with
+per-fact rows and the **conflict row inline** (surfaced where its evidence
+lives, not in a detached queue); aside rows — about (content not retained),
+processing counts, owner, **sharing with a provenance label** (*set by an
+admin* today / *inherited from SharePoint* later — required by §13.1),
+anonymization as a fact plus the batch-task button. Sharing is deliberately
+editable in two places writing the same grants — wizard step 3 (so no
+collection is born invisible) and the detail (the wizard is gone a month
+later) — with `/admin/access` as the third, group-cut view of the same data.
+
+**`/admin/access`**: collections appear as rows in the existing group Access
+section, per-row Optional/Automatic tier — zero new code, no new grant type,
+and **facts are never granted** (visibility derives from evidencing
+collections by construction). Rows carry the same provenance label.
+
+**Library**: two sections — *Files* (collections + single files; stay on the
+server, return citations) and *Data* (packages pulled locally via `agnes
+pull`) — two distribution models, named. A collection card reads "N files ·
+M facts"; **there is no graph card** — the graph is a property of things you
+have, like a search index; nobody has a "search index" card. All counts are
+caller-scoped: an ungranted collection is invisible and unacknowledged.
+
+**Chat**: the tool call renders as a collapsed `<details>` with a
+human-readable head (the `glossary_search` precedent — "Searched the
+knowledge graph", not a tool id); each claim in the answer carries its
+verbatim quote and an open-in-source link; the footer is the scope line —
+*"answered from N documents in M collections you can access"* — without
+which a user cannot distinguish "we don't have it" from "you can't see it".
+**Slack must answer identically** (the parity run in §15.5 is the only test
+that catches surface divergence).
+
+**Ontology builder**: the shared builder shell (`Create | Preview` left,
+numbered sections right; the right panel is the source of truth; **Save is
+the only write** — conversation and import both fill an unsaved draft, never
+apply). Entry paths: paste a finished ontology (a field, not prose — exact
+foreign values), propose from a document sample, or from scratch. Sections:
+source (import + translation leftovers), entity types, relationship types,
+document sample (real documents into the agent's context — without them it
+proposes from impression), dry-run output (source sentence side-by-side with
+extracted facts, plus the **not-captured block** with add-as-attribute
+affordance), freeze (attribute free / new type = re-extraction ≈ $ over the
+corpus).
+
+---
+
+## 14. Evaluation — workbook v0.2, the only standard
+
+`eval_scoring_workbook_v0.2.xlsx`, owner Shan Wang, **FROZEN 2026-08-27**:
+"prompt set, weights, and decision thresholds locked … Do not edit … without
+versioning as v0.3 and re-grading R0 under the new version." Where any
+earlier material disagrees, the workbook wins — with one pin: the operative
+scale is **0/1/2** (the STATUS line and Rubric scale note); residual "0–5"
+wording inside the workbook is stale v0.1 text and cannot resurrect the old
+scale ("a 5-scoring answer" reads as the top anchor, i.e. 2).
+
+### 14.1 Why five arms (Framework sheet, verbatim where it matters)
+
+The original three-arm comparison "cannot answer the question being asked,
+because the three arms differ in two ways at once: platform AND context
+investment … If Agnes wins, the result is uninterpretable." Hence:
+
+| arm | definition | isolates |
 |---|---|---|
-| who may read a collection | **admin sets it by hand** | derived from the source ACL, admin overrides |
-| person ↔ SharePoint identity | matched by email | matched by `oid` |
-| Agnes group ↔ Entra group | none | synced |
-| a file's sharing changes | Agnes does not notice | picked up by the periodic ACL read |
-| enforcement of what a caller sees | **already correct** | unchanged |
+| A0 | Claude, no connectors | hallucination floor |
+| A1 | Claude + M365/SharePoint connector | out-of-box |
+| A2 | ChatGPT + SharePoint connector | out-of-box, alternate vendor |
+| **A3** | Claude + M365 connector + **seed pack** as project context | **"THE CONTROL THAT MATTERS"** — same raw SharePoint, ontology/taxonomies/ER-rules as plain context, "~1 day to set up" |
+| A4 | Agnes + seed pack + knowledge graph | the thing being built |
 
-The last row is the one that matters: **enforcement and derivation are
-different problems, and only derivation is missing.** A grant assigned by hand
-is enforced exactly as strictly as a grant derived from a source ACL — same
-`accessible_collection_ids`, same repository filter, same tests. Nothing about
-§14.1's security tests depends on Entra.
+"A3 is the arm that decides the build — do not skip it because it
+complicates the story." Interpretation table: A4≫A3≫A1/A2 → build Agnes;
+**A4≈A3≫A1/A2 → "the value is context engineering, not the platform. Sell
+context engineering; reconsider platform spend"**; A4≈A1/A2 → stop and
+diagnose. The middle outcome is pre-registered as legitimate and sellable —
+"far better … than discovering the same thing in month four of a build."
 
-**So the evaluation can run without it**, and the workbook's Principal /
-Associate personas are two Agnes users in two Agnes groups with grants an admin
-assigned. AC1–AC3 test whether the split is *enforced*, which is precisely the
-half we have.
+### 14.2 Protocol, prompts, rubric
 
-Two obligations follow, and both are about not overclaiming:
+Protocol (frozen): pre-register everything before a single prompt executes;
+**identical prompt strings to every arm** (rewording for one arm is a
+finding, not a fix); **three runs per prompt per arm — variance is a result,
+not noise**; report mean AND spread ("high spread is disqualifying for
+client-facing use even at a high mean"); Consistency is scored once per
+arm+prompt across the three runs.
 
-- **Do not say "Agnes mirrors your SharePoint permissions."** It does not yet.
-  The true sentence is "an admin decides who sees which collection, and Agnes
-  enforces that decision" — which is a weaker promise and an honest one.
-- **Manual grants must be visibly manual.** A collection whose audience was
-  hand-assigned should say so, so nobody later assumes it tracks the source.
-  The same UI row that will one day read *inherited from SharePoint* reads
-  *set by an admin* today.
+Ten prompts, frozen (Prompts sheet, all built by S. Wang 2026-08-27): **X1**
+(structured — utilization by BU, **live Kantata**, "an unstructured-only
+system has no path to a correct answer"; fabricating a figure = gate fail);
+**P1** (precedent join: engagement type + industry + recency; traps: Myers
+Diligence vs AIVB folders, Rapid-Roadmap engagements never saying "AIVB",
+PolyVision still a pursuit); **P2** (scenario-to-precedent within Rapid
+Roadmap: Forte/Greenfiber/York, methodology-difference flag); **T1**
+(cross-engagement synthesis, no single source document); **T2** (feedback
+embedded in `Mickey_Week 2.pptx`, no standalone artifact; no invented
+quotes); **A1** (ambiguity: "Show me our manufacturing work" — name the
+ambiguity, state the interpretation, then answer); **L1** (honest sourcing of
+an inference — CCS industry from debrief filenames, not a formal record);
+**N1** (honest refusal — no retail/banking client; Schellman is the
+closest-but-not-matching trap); **G1** (two-step aggregation: top sponsor,
+then de-duplicated industry list — "the question the knowledge-graph
+architecture argument exists to win"); **G2** (entity resolution: ARCO
+Innovations vs N.B. Handy — a real parent with four operating companies,
+not a yes/no).
 
-The risk of the gap is not a leak — hand-assigned grants fail closed. It is
-**drift**: someone loses access in SharePoint, keeps it in Agnes, and nobody
-notices because nothing was ever watching. Until Entra lands, that is a
-process control (re-check on a cadence someone owns), not a technical one, and
-it belongs in the customer material rather than in a footnote.
+Rubric: seven dimensions × 0/1/2, weights **Correctness 12.5, Completeness
+10, Precision 7.5, Grounding 7.5, Disambiguation 5, Actionability 5,
+Consistency 2.5** (composite /100). Correctness 0 is *reserved for
+fabrication* — "wrong is recoverable, invented looks correct at a glance and
+is not." Grounding 0 includes a citation that does not support the claim
+(scores the same as no sourcing). **Gold answers are abolished in v0.2** —
+grading is against each prompt's *Traps to score against* and *Key elements
+expected*, blind, per the frozen anchors. Governance is a **gate, not a
+dimension**: any Tier 0/1 leak or fabricated past-performance claim zeroes
+the question. Token efficiency is a separate axis — tokens-to-**acceptable**-
+answer, counting retrieval, retries and clarifying turns ("a wrong answer in
+400 tokens was not efficient; it was cheap and useless").
 
-## 14. Acceptance — the tests that define "done"
+### 14.3 Decision thresholds (all five, verbatim consequences)
 
-**Nothing here ships on a demo. It ships when these pass against a real
-SharePoint tenant, with a recorded, graded run.** Test names are the contract;
-each states what it plants, what it does, and what failure looks like — because
-a test whose failure mode is unstated tends to be written so it cannot fail.
+1. A4 beats A1 and A2 by **≥15** — else "beating out-of-box by a few points
+   does not justify a platform."
+2. A4 beats A3 by **≥10** — **"THE DECIDING TEST."**
+3. A4 governance gate pass rate **= 100%** — "not negotiable and not 95%.
+   One leak ends the program."
+4. A4 tokens-to-answer **≤ 2×** the best baseline — "higher cost per correct
+   answer means the retrieval design is wrong." (A build gate on §12.)
+5. **Access leak count = 0** (Access sheet; never averaged in).
 
-Fixtures are planted, never sampled: the corpus contains documents whose facts
-we know, so "correct" is decidable. The corpus-intake design's ground-truth
-approach is reused rather than reinvented.
+### 14.4 Access personas (Decision #5)
 
-### 14.1 Security — the source's sharing decides
+**"CONFIRM WITH LEONARD BEFORE R0"** — and confirm the split matches real
+Agnes permission groups before freezing. Two personas: **Principal**
+(structured + unstructured, full) and **Associate** (unstructured only —
+"structured financial/utilization data should be **denied, not
+masked-and-guessed**"). The split spans **two grant mechanisms** — collection
+grants (unstructured) and data-package grants (structured) — test only one
+half and you miss leaks.
 
-The premise a customer is buying: *what I cannot open in SharePoint, Agnes will
-not tell me.*
+- **AC1**: unstructured question → both get the **same full answer**; a
+  false denial for Associate is a *usability bug*, logged, but **not a
+  leak** — the positive direction our S-tests alone do not cover.
+- **AC2**: structured question (X1/Kantata) → Principal gets the real
+  figure; Associate is **correctly denied — "must say access is restricted,
+  not guess"**; a fabricated plausible figure = leak, no partial credit.
+- **AC3**: mixed question → Associate answers from unstructured sources
+  **with an explicit statement that the structured portion was withheld**;
+  silent omission = completeness failure; a fabricated stand-in = leak.
 
-**S1 — a document not shared to me contributes nothing.** Plant `secret.docx`
-in a SharePoint folder shared only with Bob, containing a unique fact
-("Project Kestrel budget is $412,000"). Alice asks the question the fact
-answers. Expect: no fact, no quote, no paraphrase, no acknowledgement it
-exists. *Fails if* the number, the project name, or "I found something you
-cannot see" appears in any form.
+### 14.5 Cadence, R0, and the sandbox state
 
-**S2 — a group boundary holds.** Alice ∈ group B, collection granted to group C
-only. Same shape as S1 at the grant layer rather than the source layer. *Fails
-if* Alice reaches any subject whose every claim sits in C.
+- **R0** — "Before Agnes has any content … Run A1, A2, and A0. **Run this
+  before building anything — once Agnes has content, the pre-build baseline
+  is unrecoverable.**" The only irreversible ordering constraint in the
+  whole programme: R0 **gates the crawler's first production run** and needs
+  scheduling this week. The Scoring sheet pre-lays all 150 R0 rows including
+  A3/A4: A4 rows stay blank at R0 by definition; **A3 runs at R0 iff the
+  seed pack exists by then, else at R1** — decided here so the sheet and the
+  plan agree.
+- R1 after the first extraction pass ("expect it to be poor"); R2 after the
+  first fix cycle (tests the failure-routing loop: wrong label →
+  taxonomies; couldn't distinguish → entity_resolution.md; misunderstood a
+  term → definitions; missing connection → ontology; invented → grounding/
+  retrieval config); R3+ every two weeks — the ten prompts never change, new
+  ones go to a separately-reported v2 set.
+- Known failure modes are pre-registered (questions chosen to flatter Agnes;
+  baselines run half-heartedly; expected-elements written after the fact —
+  "the single most likely failure of the whole exercise"; rubric drift).
+- **Sandbox state** (cuesta repo main `753be22`): 12 sandbox questions
+  Q01–Q12 now carry `shan_category` mappings onto the ten v0.2 prompts;
+  Q07 (v0.1 S1) and Q09 (v0.1 R1) are **sandbox-only** (dropped upstream);
+  **L1 and N1 have no dedicated sandbox question** — eval prep must add them
+  or accept the gap; the sandbox protocol defines rehearsal arms A1′/A3′/A4′
+  with the same Test-2 bar, so the deciding comparison is rehearsable before
+  the real rounds.
+- The workbook prompts are grounded in the **real corpus** (named real
+  folders; N1's answer is the absence over the full 24-project corpus; X1 is
+  live Kantata). **They cannot be graded against a planted tenant** — §15.5
+  separates the two runs.
 
-**S3 — the attribute leak.** One fact with two claims: one from a document
-Alice reads (establishing it exists), one from a document she cannot
-(carrying `attrs.price`). Alice sees the fact **without** `price`. Then Alice
-calls `fact_search(type=…, filters={price: 412000})`. Expect **no match** —
-the filter must not confirm a value she cannot read. *This is the test the
-first design would have failed*, and it is the one most likely to be quietly
-weakened during implementation.
+### 14.6 Token accounting (per-arm methods are in the workbook)
 
-**S4 — edges are not a side door.** An edge whose only claim is in a restricted
-document, between two facts Alice can see. `fact_neighbors` from either
-endpoint must not return it. *Fails if* edge visibility is inferred from
-endpoints.
+The README specifies them: A0/A1 — Anthropic `count_tokens` (A1 including
+connector schema + retrieved content, not just the reply); A2 — OpenAI's
+counting endpoint or after-the-fact transcript count; A3 — as A1 plus the
+seed pack, **cache hits flagged separately**; **A4 — Anthropic
+`count_tokens` on Agnes's outbound payload if visible, else "whatever
+Agnes's OpenTelemetry export provides — confirm the exact mechanism with
+Keboola first."** That confirmation is contractual and ours to write down.
+The separately-shared "token measurement methodology" note should be
+obtained to confirm it matches the README (narrowed open item O3) — the
+in-workbook version is already actionable.
 
-**S5 — traversal does not tunnel.** A path A→B→C where B is readable and C is
-not. Depth-3 traversal from A returns A and B, never C, and does not reveal
-that the path continues.
+---
 
-**S6 — an agent cannot exceed its scope.** An agent whose `connections_mode` is
-`selected` over a strict subset of its owner's collections, run via its PAT.
-It must see the subset only. *Fails if* it sees anything its owner can see —
-which is what happens if the implementation reaches for
-`can_access_collection` with the owner's id instead of
-`accessible_collection_ids(principal)`. Run every read path through this, not
-just one.
+## 15. Acceptance — the tests that define "done"
 
-**S7 — no existence oracle.** Request a subject id that (a) does not exist and
-(b) exists with no readable claim. Both return 404, indistinguishable in
-status, body, and timing envelope. And `fact_search(limit=20)` where 50 match
-but only 5 are readable returns 5 **without** signalling that 45 were withheld.
+Nothing ships on a demo. Test ids are namespaced to avoid collision with
+arms (A0–A4) and prompts (X1/P1/A1…): **S** security, **C** sync, **EQ**
+extraction quality, **AN** anonymization. Fixtures are planted, never
+sampled. Each test states its failure mode — a test whose failure is
+unstated tends to be written so it cannot fail.
 
-**S8 — revocation propagates, and we know how fast.** Remove Alice's SharePoint
-access; measure how long until facts and quotes stop reaching her. The number
-is the product claim ("permissions converge within N"), so the test **records**
-it rather than asserting a threshold someone invented. Separately: she must
-never be able to open the original, at any point — the source enforces that
-live.
+### 15.1 Security — split by what exists
 
-### 14.2 Synchronisation — the crawler notices
+**Phase 0 (runnable now — grant layer).** Premise: *what my grants don't
+cover, Agnes will not tell me.* Fixtures uploaded by an account that is
+**not** the probed caller (§5 ownership union).
 
-**C1 — a new file is picked up.** Upload to a crawled folder; within one cycle
-it is indexed, extracted, and its facts answerable.
+- **S1** — a collection granted only to group C contributes nothing to Alice
+  ∈ group B: no fact, no quote, no paraphrase, no acknowledgement. *Fails
+  if* the planted value or "something exists that you cannot see" appears in
+  any form.
+- **S2** — the attribute oracle: one fact, two claims (one readable —
+  existence; one not — carrying `attrs.price`). Alice sees the fact without
+  `price`, and `fact_search(filters={price: 412000})` returns **no match**.
+  *The test rev 1 would have failed; the one most likely to be quietly
+  weakened in implementation.*
+- **S3** — an edge whose only claim is in an unreadable collection, between
+  two readable facts: `fact_neighbors` never returns it. *Fails if* edge
+  visibility is inferred from endpoints.
+- **S4** — traversal does not tunnel: A→B→C with C unreadable returns A,B
+  and does not reveal continuation.
+- **S5** — an `AgentPrincipal` scoped to a subset of its owner's collections
+  sees the subset only, **on every read path** (search, neighbors, claims).
+  *Fails if* any path reaches for `can_access_collection` with the owner id.
+- **S6** — no existence oracle: nonexistent id vs no-readable-claim id →
+  identical 404s (status, body, timing envelope); `limit=20` where 50 match
+  and 5 are readable returns 5 with no shortfall signal.
+- **S7** — revocation of an **Agnes grant** propagates: the test *measures*
+  the latency and records it (the number becomes the product claim).
+- **S8** — `revealed` correction serves the fact without quotes
+  instance-wide; `restricted` hides it from a caller with full grants;
+  `wrong` survives a re-ingest of the same batch.
 
-**C2 — a changed file is re-processed.** Edit the file's content. The crawler
-must notice, re-extract, and **replace** the old claims — not accumulate both.
-Verify the old value is gone from answers, not merely outranked.
+**Phase ACL (after Entra derivation — §13.1).** Source-layer S1 (sharing set
+in SharePoint, not in Agnes), source-revocation S7, and C9. Until then these
+are explicitly *not runnable*, and no claim is made that they pass.
 
-**C3 — an unchanged file is not re-processed.** Re-run with no changes: zero
-new claims, zero LLM spend. *Fails if* the ordinary re-sync path churns
-`corpus_files.id` and re-extracts — the finding from §6, tested rather than
-assumed.
+### 15.2 Synchronisation — the crawler notices
 
-**C4 — rename and move preserve identity.** Rename the file, then move it to
-another crawled folder. Facts survive with the same subject ids and do not
-duplicate. This is what `stable_id` (the Graph item id, already the crawler's
-delta key) is for; the test proves the anchor actually holds.
+**C1** new file → indexed, extracted, answerable within a cycle. **C2**
+changed file → re-extracted, old claims **replaced** (old value absent from
+answers, not outranked). **C3** unchanged re-sync → zero new claims, zero
+LLM spend, `corpus_files.id` preserved (tests the §6 upsert; today's
+behaviour fails this). **C4** rename then move → same subjects, no
+duplicates, path refreshed (tests the stable-id anchor AND the ctag-skip
+path-staleness fix, §7.1). **C5** delete → claims cascade, orphan subjects
+deleted and **counted**; a subject with another document's claim survives
+with that document's values. **C6** moved out of crawl scope = deleted.
+**C7** delta token invalidated (`410`) → resync, dead token never persisted,
+change detection continues. **C8** crawl killed mid-pass → resume without
+loss or duplication (requires incremental persistence, §7.1). **C9**
+*(Phase ACL)* permission-only change → caught by the periodic ACL re-read.
 
-**C5 — deletion propagates.** Delete the file. Its claims go; subjects left
-with zero claims go with them and are **counted in the run report**. A subject
-that still has another document's claim survives with that document's values
-only.
+### 15.3 Extraction quality — graded, not eyeballed
 
-**C6 — a moved-out-of-scope file is treated as deleted.** Move a file to a
-folder that is not crawled. Same expectation as C5 — otherwise scope
-reductions leak indefinitely.
+**EQ0** — the eval harness matches workbook v0.2 exactly: ten prompts, five
+arms, three runs, 0/1/2 anchors, frozen weights, governance gate, spread
+reporting. **EQ1** — the verbatim gate rejects fabrication on an adversarial
+fixture with a **non-zero** rejection count (a gate that never fires is
+indistinguishable from one switched off). **EQ2** — a claim whose quote is
+present but does not entail the assertion **passes** — documented honesty
+about what the gate is. **EQ3** — precision/recall per fact type against
+planted truth, recorded per release. **EQ4** — same-date conflict → both
+claims kept, review item created, no answer silently picks one (fixture: the
+recorded sponsor conflict). **EQ5** — different-date succession → the later
+value answers "now", the earlier queryable as history, **no conflict-queue
+entry** (the failure that drowns the queue). **EQ6** — a `wrong` correction
+survives a full re-extraction. **EQ7** — ER repair: two spellings merge into
+one subject (union of claims, both aliases), and the merge is reversible.
+**EQ8** — conversion fidelity: fixtures covering the corpus's real shapes
+(table-heavy xlsx, deck, scanned PDF, Czech diacritics) survive with
+human-quotable sentences as contiguous substrings — this gates the pypdfium2
+PDF path (structure reconstruction is our net-new code) and any future
+converter change.
 
-**C7 — a stale delta token recovers.** Force Graph to invalidate the token
-(or simulate its `410`). The crawler must resync rather than die, and must not
-persist the dead token — the failure that would otherwise stop all change
-detection permanently and silently.
+### 15.4 Anonymization
 
-**C8 — a crawl interrupted mid-run resumes without loss or duplication.** Kill
-the process mid-pass; restart. No document is skipped, none is extracted twice.
+**AN1** — a unique planted name appears nowhere in Agnes: facts, claim
+attrs, quotes, `corpus_chunks.text`, `/raw`, `/preview`, search, audit log.
+Passes *by construction* once §9's order holds — so a failure means the
+pipeline order broke, which is what the test is for. **AN2** — the same
+entity in two documents yields one subject; **fixture is Czech with
+inflected forms**; fails until the stable-pseudonym + normalization change
+lands (deliberately). **AN3** — cross-key-domain: same entity across an
+anonymized and a plain collection = two subjects, permanently; asserts the
+documented limitation so documentation cannot drift. **AN4** — nothing
+unredacted exists at any stage for an anonymized collection: blob store,
+extraction artifacts, intermediates. **AN5** — emails join: `EMAIL_<hmac>`
+pseudonyms are stable across documents; URLs remain collapsed and
+non-identifying.
 
-**C9 — permissions change without the file changing.** Alter sharing in
-SharePoint, touch nothing else. Delta reports nothing, so this must be caught
-by the periodic ACL re-read. *Fails if* nothing ever notices — the known gap in
-§9, which the test exists to bound rather than hide.
+### 15.5 The end-to-end runs — two, not one
 
-### 14.3 Crawler completeness — against what was actually specified
+**Run P — planted proving run** (private tenant area or direct upload):
+≥1000 documents across ≥4 sites, divergent sharing, planted facts, traps (a
+scan, a duplicate, a superseded version, a contradiction pair). Proves
+S/C/EQ/AN. Machine-readable record per step; blind grading not required.
 
-Verified against TCRD-184 and the reference implementation, so the port does
-not silently drop capability:
+**Rounds R0–R3+ — the workbook, real corpus + live Kantata:**
 
-| requirement | status in the prototype | port must keep |
-|---|---|---|
-| `/sites/getAllSites`, not `/sites?search=*` | done — search returns a fraction for app-only tokens | yes, with a test that counts sites |
-| sites → drives → `/delta`, `deltaLink` persisted | done | yes |
-| stable item id as the delta key | done (`stable_id`) | yes — and it becomes the claim anchor |
-| `Retry-After` honoured on 429 | done | plus a bounded attempt count and a ceiling on the wait |
-| full delta at most once/day | done | yes |
-| metadata-only index, no content stored | done | yes |
-| repair pass for failed extractions | done | yes — delta never revisits an unchanged file |
-| **webhook subscriptions** | **not built** | required, with renewal before expiry |
-| **`410` resync** | **not built** | required — C7 |
-| **token refresh mid-crawl** | **not built** | required; a large crawl outruns a one-hour token |
-| **retry on 503/504** | **not built** | required; Graph sheds load with these too |
-| **incremental persistence** | **not built** | required — C8 |
-| **OCR for scans** | flag-gated (`--vision`) | **on by default**; it is a cost decision, not a capability toggle |
-| **per-item ACL where inheritance breaks** | not built | required for §14.1 to mean anything |
+1. **R0 first, before ingestion** (§14.5) — A0/A1/A2 (+A3 iff seed pack
+   ready).
+2. Crawl the real corpus from cold; record discovered-vs-tenant counts,
+   throttling, wall clock; extract with cost vs pre-run estimate; gates
+   green.
+3. R1: all arms, ten prompts × 3 runs, as **Principal and Associate** (two
+   Agnes groups; a restricted `AgentPrincipal` run is a spec-side addition,
+   labeled, not a workbook requirement). Blind-grade per traps/expected
+   elements; record mean, spread, gate results, tokens, turns; AC1–AC3
+   scored; leak count feeds Decision #5.
+4. **The same prompts through Slack, same personas — answers must agree
+   with chat.** The only test that catches surface divergence.
+5. Mutate and re-run: add a document, change one, delete one, revoke one
+   grant — answers move accordingly and §15.2 numbers hold.
+6. Score the five thresholds. **If #2 fails, the finding is reported as the
+   workbook pre-registers it** — context engineering is the value; that
+   outcome is explicitly "legitimate and sellable" and better discovered now
+   than in month four.
 
-### 14.4 Extraction quality — graded, not eyeballed
+Every step emits a machine-readable record. "It worked when I tried it" is
+not a result; the run is the artifact.
 
-**Q1 — the verbatim gate rejects fabrication.** Plant a document that tempts
-paraphrase (a table whose caption almost states a fact). Any claim whose quote
-is not a substring of the extracted text is rejected at write time. Assert the
-rejection count is non-zero on an adversarial fixture — a gate that never fires
-is indistinguishable from a gate that is switched off.
+### 15.6 Deliberately untested (named so absence is a decision)
 
-**Q2 — the gate's limit is documented by a test.** A claim whose quote *is*
-present but whose assertion does not follow from it **passes**. This test
-exists to keep everyone honest about what the gate does: it validates quotes,
-not inferences.
+Load/concurrency at corpus scale; multi-language (blocked by the gate, O6);
+a second document source; facts not derived from documents (structurally
+excluded: zero-claim subjects are garbage-collected by design — a fact from
+a registered table cannot exist in this model and that is a boundary, not a
+bug).
 
-**Q0 — we validate against the frozen workbook, and only that.** Evaluation
-scoring workbook **v0.2**, frozen 2026-08-27, is the standard: ten prompts
-(X1, P1, P2, T1, T2, A1, L1, N1, G1, G2), five arms, three runs each, seven
-dimensions scored 0/1/2 with the weights in its Rubric sheet, and the five
-pre-registered decision thresholds. Nothing is graded against an internal
-variant — where earlier material disagrees, the workbook wins.
+---
 
-The arm that matters most is one we do not currently run: **A4 versus A3** —
-Agnes against Claude *holding the same context* (the seed pack), by ≥10
-points. The workbook calls it "THE DECIDING TEST" and states the consequence
-plainly: if Agnes cannot beat Claude given the same context, the value is
-context engineering rather than the platform. Standing that arm up is part of
-the work, not a comparison to defer.
+## 16. Build order
 
-**Q3 — recall against planted truth.** Precision and recall per fact type on
-the labelled corpus. Recorded per release, not asserted once.
+1. **Ontology as data** — translate `ontology.yaml` into the semantic model;
+   its content (+ taxonomies + ER rules) **is** the A3 seed pack (§11);
+   packaging owner assigned (O4). First because it is the producer contract
+   and because R0/A3 need it.
+2. **Schema + repository** — Alembic revision, `facts_pg.py` PG-only via the
+   factory, contract tests. *(Blocked-with: the Collections upsert
+   prerequisite from §6 — its own PR, lands first.)*
+3. **Read path with RBAC** — the shared visibility helper; the test that
+   holds the design: two groups, one question → different subjects,
+   different attrs, different quotes; the same driven by a restricted
+   `AgentPrincipal`.
+4. **Write path** — ingest per §7.2 with the gate at the door; corrections;
+   run report; orphan sweep as a post-step.
+5. **Measurement harness** (EQ0, EQ3) before more surface.
+6. **Query surface** — the three tools across REST/CLI/MCP with caps.
+7. **Worker lane** *(when extraction moves inside)* — a **code change**, not
+   configuration: new lane constant in `app/worker/registry.py`
+   (`_VALID_LANES` is a closed tuple), a concurrency constant + slot spawn in
+   `app/worker/runtime.py`, the extraction kind registered to it; plus a
+   per-process lane-selection env var if it must run in its own process
+   (none exists today — every worker runs both lanes).
+8. **Deep traversal + any engine** — gated on Decision #2 (§12).
+9. **UI** per §13.2.
 
-**Q4 — conflict is surfaced, not merged.** Two documents, same date,
-incompatible values. Both claims survive, the conflict appears for a human,
-and no answer silently picks one. The recorded Kohlberg-vs-Jordan-Company case
-is the fixture.
+### Builder obligations (this repo's conventions, named so a plan carries them)
 
-**Q5 — succession is not a conflict.** Same shape, different document dates.
-The later value answers "now"; the earlier remains queryable as history. *Fails
-if* it lands in the conflict queue — the failure mode that drowns the queue and
-gets these systems abandoned.
+- Every new route: `COVERED_ROUTES` in `tests/db_pg/test_endpoints_smoke.py`
+  (or `test_endpoints_behavioral.py`), enforced by
+  `test_every_route_is_covered_or_excluded`.
+- PG-only routes: entries in **both** sweep files'
+  `_PG_ONLY_ROUTE_EXEMPTIONS` — `tests/db_pg/test_get_status_parity_sweep.py`
+  and `test_mutation_status_parity_sweep.py` (the helpers live in
+  `_parity_sweep_util.py`) — with the DuckDB side answering the typed 501.
+- REST×CLI×MCP triple surface per CONTRIBUTING sync-map rows 51/58/59
+  (`tests/test_documentation_api_triple_surface.py`,
+  `tests/test_api_docs_coverage.py`, `tests/test_mcp_tool_parity.py`);
+  OpenAPI snapshot regenerated (`make update-openapi-snapshot`) when endpoint
+  docstrings change.
+- Feature flag trio: `feature_enabled(...)` + `app/switches.py` `SWITCHES` +
+  `docs/feature-flags.md`.
+- CHANGELOG bullet in the same PR; tests request `shared_app`/`seeded_app`
+  (enforced by `tests/test_shared_app_contract.py`); UI uses `--ds-*` tokens
+  only; security playbook for every untrusted input (ingest is one); draft
+  PR after the first commit — CI is the gate, no local full suite.
 
-**Q6 — human correction survives re-extraction.** Mark a fact wrong, re-run the
-full pass, verify it does not return. *Fails if* the producer overwrites
-`corrections`.
+### Repo-state cleanup (this branch, before the build starts)
 
-**Q7 — entity resolution is repairable.** Two spellings of one company produce
-two subjects; merge them; verify a single subject with both aliases and the
-union of claims, and that the merge is reversible.
+Commit `623b93e24` is partially dead design. **Revert**: the
+`ResourceType.DOCUMENT_SCOPE` enum value, `_file_source_connections`,
+`_document_scope_blocks`, its `ResourceTypeSpec` registration
+(app/resource_types.py), `tests/test_document_scope_resource_type.py`, and
+the "File sources can be granted per crawl scope" CHANGELOG bullet —
+collections are the grant unit; a competing grant surface must not ship.
+**Keep**: `connectors/sharepoint/settings.py` + tests (vault-first
+certificate resolution through the shared env allowlist) and
+`SHAREPOINT_CERT_PRIVATE_KEY` in `src/orchestrator_security.py` — but
+**move its CHANGELOG bullet under Internal** (groundwork; no SharePoint
+connector ships yet, and a release note claiming connection behaviour would
+overclaim).
 
-### 14.5 Anonymization
+### Removed from the plan, with reasons
 
-The anonymiser runs in front of ingestion (§9), so these tests assert an
-absence in Agnes rather than a redaction on the way out.
+- **App-state → Cloud SQL** as a step here: a hosting programme with its own
+  owner; the A3 ratchet forces Postgres-only regardless of where Postgres
+  runs; a later cutover moves all app-state together.
+- **PuppyGraph / graph engines**: decision gate is after the eval (the
+  sandbox spike verified zero-ETL and both query languages, but its views
+  read `public.nodes` directly — any future use must sit behind the
+  visibility layer, its view set is incomplete (no skill/has_skill), and its
+  schema JSON embeds literal credentials — not a pattern to copy).
+- **A standalone documents table, DOCUMENT_SCOPE grants, `_remote_attach` to
+  an external fact store**: superseded by claims-over-Collections; kept in
+  §0 so nobody re-proposes them.
 
-**A1 — the planted name appears nowhere in Agnes.** Plant a unique token in a
-document destined for an anonymized collection. Assert its absence in facts,
-claim attributes, quotes, `corpus_chunks.text`, `GET /files/{id}/raw`, `GET
-/files/{id}/preview`, search results, and the audit log. Unlike the earlier
-draft, these should now pass by construction — the unredacted form never
-entered — so a failure means the pipeline order was broken, which is exactly
-what the test is for.
+---
 
-**A2 — the graph still joins.** The same entity in two documents yields one
-subject. **Fails against the anonymiser as it stands today**, which substitutes
-fixed markers, and passes only once the stable-pseudonym change lands (§9).
-Written to fail now, deliberately: it is the gate on that work.
+## 17. Open items (owners to assign — first question, not last)
 
-**A3 — cross-key reality is documented, not fixed.** The same entity in an
-anonymized and a plain collection is two subjects, permanently. The test
-asserts the documented behaviour so the documentation cannot drift from it.
-
-**A4 — the original never reaches Agnes.** Inspect the blob store and the
-extracted text for an anonymized collection after a full run: nothing
-unredacted is present, at any stage, including intermediates. This is the test
-that makes §9's guarantee checkable rather than architectural.
-
-**A5 — conversion fidelity, because the verbatim gate depends on it.** Convert
-a fixture set covering the corpus's real shapes — a table-heavy xlsx, a deck, a
-scan, a document with Czech diacritics — and assert that sentences a human
-would quote survive as contiguous substrings. A converter change is a change to
-what quotes are possible, so this test guards the switch to pypdfium2 and any
-future one.
-
-### 14.6 The end-to-end run — what "done" actually means
-
-One scripted run, recorded, repeatable, against the real tenant. Not a demo.
-
-1. **Plant** the corpus in SharePoint: ≥1000 documents, ≥4 sites, deliberately
-   divergent sharing, planted facts with known answers, and the traps —
-   a scan, a duplicate, a superseded version, a document contradicting another.
-2. **Crawl** from cold. Record: documents discovered vs. tenant count, sites
-   found, wall-clock, throttling events.
-3. **Extract.** Record: claims written, claims rejected by the gate, failures
-   by category, tokens and cost against the pre-run estimate.
-4. **Gate on quality** (§14.4). A run that produces facts nobody graded is not
-   a passing run.
-5. **Ask in chat**, as three different people with different access, the twelve
-   evaluation questions. Grade blind against the frozen gold answers, using the
-   agreed rubric. **Record per-person answers** — the security tests above prove
-   the negative; this proves the positive is still correct for someone who has
-   access.
-6. **Ask the same questions through Slack**, same people. Answers must agree
-   with the chat run — a surface that answers differently is a bug, and this is
-   the only test that catches it.
-7. **Mutate and re-run**: add a document, change one, delete one, revoke one
-   person's access. Re-run the questions. Answers must move accordingly, and
-   §14.2's numbers must hold.
-8. **Compare against no graph.** The same twelve questions answered with
-   Collections' existing hybrid retrieval alone. This is the gate from §11: if
-   the graph does not win where it is supposed to, that result is the finding,
-   and it is more valuable than shipping.
-
-Every step emits a machine-readable record. "It worked when I tried it" is not
-a result; the run is the artefact.
-
-### 14.7 What is deliberately not tested yet
-
-Named so their absence is a decision rather than an oversight: load and
-concurrency at corpus scale, multi-language extraction (blocked by the gate,
-§7), a second document source, and facts not derived from documents. Each needs
-its own design before it can have a test.
-
-## 15. Open questions
-
-- **Who writes the producer.** Neither crawler nor extraction pass is built
-  here, and a store with no producer holds nothing. This is the first question,
-  not the last.
-- **`/preview` and `/raw` under anonymization** (§9) — in scope or the
-  guarantee is void.
-- **Reconciling the two anonymization designs** (§9).
-- **Cross-language extraction** versus the verbatim gate (§7).
-- **`source_url`** — who builds it, since citations are half-blind without it.
-- Whether extraction runs as a scheduled agent, and who owns its token budget.
-- **The anonymiser substitutes a fixed marker, not a stable pseudonym.** With
-  `**PERSON**` / `**COMPANY**` every person collapses into one node and every
-  company into another, so an anonymized collection cannot carry a graph. The
-  fix is ours to make in our own deployment — replace the marker with
-  `PERSON_<hmac(key, normalized_text)[:6]>`, a service-layer step, since
-  detection already returns exact entity substrings. Until it lands, an
-  anonymized collection is retrieval-only, and §14.5's A2 fails on purpose.
+- **O1 — the producer end-to-end**: who runs crawl → convert → anonymize →
+  extract → ingest against the real tenant (the hardening backlog of §7.1 is
+  part of this). A store with no producer holds nothing.
+- **O2 — tenant access** for Run P and the rounds (credentials live in the
+  Cuesta Star 1P vault); plus the site layout for the planted area.
+- **O3 — token methodology note**: obtain; confirm it matches the workbook
+  README; write down Agnes's exact OTel token-export mechanism (contractual,
+  §14.6).
+- **O4 — seed-pack packaging owner** (§11): assemble
+  ontology/taxonomies/ER-rules as Claude project context before the first
+  A3 round; plus **Leonard's persona confirmation before R0** (§14.4) and a
+  **Kantata integration owner** (X1/AC2, §14.5 — a structured-lane
+  dependency of the eval, not of this design).
+- **O5 — reconcile the two anonymization designs** (§9.2 vs the 2026-08-24
+  corpus-intake spec).
+- **O6 — cross-language extraction vs the verbatim gate** (§8).
+- **O7 — `source_url`**: who extends the crawler rows and
+  `corpus_file_sources` so citations link to the source system.
