@@ -389,16 +389,22 @@ class TestSenderAddressUnified:
         return sent[0]
 
     def test_smtp_from_wins_over_legacy_key(self, client, monkeypatch):
+        from email.utils import parseaddr
+
         monkeypatch.setenv("SMTP_FROM", "canonical@example.com")
         monkeypatch.setenv("EMAIL_FROM_ADDRESS", "legacy@example.com")
         msg = self._send_and_capture(client, monkeypatch)
-        assert msg["From"] == "canonical@example.com"
+        # The address part is what these tests pin; the display name is the
+        # instance name (covered in test_auth_email_templates.py).
+        assert parseaddr(str(msg["From"]))[1] == "canonical@example.com"
 
     def test_legacy_email_from_address_is_a_fallback(self, client, monkeypatch):
+        from email.utils import parseaddr
+
         monkeypatch.delenv("SMTP_FROM", raising=False)
         monkeypatch.setenv("EMAIL_FROM_ADDRESS", "legacy@example.com")
         msg = self._send_and_capture(client, monkeypatch)
-        assert msg["From"] == "legacy@example.com"
+        assert parseaddr(str(msg["From"]))[1] == "legacy@example.com"
 
 
 class TestEmailCaseInsensitiveSignIn:
