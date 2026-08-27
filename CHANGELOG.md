@@ -30,6 +30,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `workload_identity` or `LLM_DISPATCHER_URL`, and the admin readiness page
   gains vertex rows plus a live test-connection probe. See
   `docs/cloud-chat.md` → "LLM provider: Google Vertex AI".
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.90.0] - 2026-08-27
+
+### Added
 - **A hosted data app's description can be edited after it is created.**
   `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
   not_managed`, so a hosted app's description was write-once: `POST
@@ -557,6 +569,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   admin-granted row to owner-granted.
 
 ### Fixed
+
+- `use_pg()` no longer reverts a Postgres instance running purely on the
+  `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`
+  declaration) to an empty DuckDB backend the first time an admin saves an
+  unrelated `/admin/server-config` section. The overlay editor writes only
+  the touched section, so the resulting file — created for the first time,
+  with no `database` key — was indistinguishable from an explicit
+  `backend: duckdb` declaration; on the next restart every repository
+  factory silently switched to a fresh DuckDB, orphaning the Postgres data
+  and returning `401 User not found` for real users until manually
+  repointed. `read_backend_state()` / `is_backend_explicitly_declared()`
+  now tell "declared DuckDB" apart from "overlay exists but never mentions
+  the database backend", and only the former short-circuits `use_pg()`.
 
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header

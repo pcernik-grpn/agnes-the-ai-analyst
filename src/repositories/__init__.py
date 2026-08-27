@@ -176,12 +176,13 @@ def use_pg() -> bool:
     """Return True when the active backend is Postgres (side-car or cloud).
 
     Precedence:
-      1. ``instance.yaml::database.backend`` (admin-controlled).
+      1. ``instance.yaml::database.backend`` — ONLY when EXPLICITLY declared
+         (admin-controlled / migrator / first-boot seed).
       2. ``DATABASE_URL`` env var presence (12-factor convention).
       3. ``AGNES_DB_URL`` env var presence (legacy alias).
     """
     try:
-        from src.db_state_machine import BackendState, _OVERLAY_PATH, read_backend_state
+        from src.db_state_machine import BackendState, is_backend_explicitly_declared, read_backend_state
 
         state, _ = read_backend_state()
         if state in (
@@ -191,9 +192,16 @@ def use_pg() -> bool:
             BackendState.CLOUD_IN_PROGRESS,
         ):
             return True
-        # Only treat DUCKDB as authoritative when the overlay actually exists;
-        # otherwise fall through to the env-var fallback (fresh-install default).
-        if state == BackendState.DUCKDB and _OVERLAY_PATH.exists():
+        # Only treat DUCKDB as authoritative when the overlay EXPLICITLY
+        # declares it (`database: {backend: duckdb}` present) — an overlay
+        # that merely EXISTS (e.g. because an unrelated
+        # /admin/server-config save touching only data_source/theme/etc.
+        # created the file) with no `database` key at all is NOT a DuckDB
+        # declaration. Checking `_OVERLAY_PATH.exists()` alone here used to
+        # conflate the two and silently revert a DATABASE_URL-based Postgres
+        # instance to an empty DuckDB backend on the next restart — see
+        # CHANGELOG "PG-backend-revert" fix.
+        if state == BackendState.DUCKDB and is_backend_explicitly_declared():
             return False
     except Exception:
         pass
