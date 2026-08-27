@@ -439,6 +439,37 @@ class TestCollectionResourceType:
         assert items[0]["name"] == "My Files"
         assert items[0]["slug"] == "my-files"
 
+    def test_collection_blocks_grant_count_zero_when_ungranted(self, system_conn):
+        """spec §13.2 "/admin/access" — a collection with no group grant at
+        all carries ``grant_count == 0``, the field the "⚠ nobody" badge is
+        driven from."""
+        from app.resource_types import _collection_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_none', 'none', 'None', 'u1')"
+        )
+        items = _collection_blocks()[0]["items"]
+        assert items[0]["grant_count"] == 0
+
+    def test_collection_blocks_grant_count_reflects_every_group(self, system_conn):
+        """`grant_count` counts ALL groups holding a grant, independent of
+        which group an admin has selected in the /admin/access pane."""
+        from app.resource_types import _collection_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_shared', 'shared', 'Shared', 'u1')"
+        )
+        system_conn.execute("INSERT INTO user_groups (id, name) VALUES ('g1', 'Group One')")
+        system_conn.execute("INSERT INTO user_groups (id, name) VALUES ('g2', 'Group Two')")
+        from src.repositories import resource_grants_repo
+
+        grants_repo = resource_grants_repo()
+        grants_repo.create("g1", "collection", "col_shared", "admin1")
+        grants_repo.create("g2", "collection", "col_shared", "admin1")
+
+        items = _collection_blocks()[0]["items"]
+        assert items[0]["grant_count"] == 2
+
     def test_collection_blocks_excludes_soft_deleted(self, system_conn):
         from app.resource_types import _collection_blocks
 

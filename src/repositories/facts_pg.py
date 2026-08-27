@@ -705,3 +705,301 @@ class FactsPgRepository:
         if row is not None:
             return "edge"
         return None
+
+    # ------------------------------------------------------------------
+    # collection-scoped summaries — spec §13.2 "Surfaces": the Library
+    # collection card's "N files · M facts" and the collection-detail facts
+    # section. Both are ADDITIONS to this frozen-app-state pair's read
+    # surface (the A3 ratchet only forbids a brand-new DuckDB module — an
+    # extra method on an existing PG-only repo is unaffected), and both
+    # funnel through the SAME `_visible_facts_for_corpus` CTE, so a caller
+    # can never see a bigger "M" on the card than the facts section it opens
+    # into actually lists.
+    # ------------------------------------------------------------------
+
+    def _visible_facts_for_corpus_cte(self, is_admin: bool, all_evidence: bool) -> str:
+        """SQL for a ``visible(subject_id, is_revealed)`` CTE: facts with at
+        least one claim evidenced by ``:corpus_id`` (bound by the caller),
+        withheld ones (`wrong`/`restricted`) excluded, `revealed` ones
+        included unconditionally, and everything else gated by the SAME
+        any_evidence/all_evidence rule `search()` applies — over the
+        subject's claims EVERYWHERE, not just this corpus, so a fact only
+        partly evidenced here still obeys `all_evidence` correctly. Returned
+        as a fragment (no leading ``WITH``) so callers can embed it beside
+        their own CTEs; every caller must bind ``:corpus_id`` and, when
+        ``is_admin`` is False, ``:readable``."""
+        vis = self._visibility_predicate("c2.corpus_id", is_admin)
+        vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
+        all_ev_sql = "TRUE" if all_evidence else "FALSE"
+        return f"""
+            candidates AS (
+                SELECT DISTINCT c.fact_id AS subject_id
+                FROM claims c
+                WHERE c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM corrections co
+                    WHERE co.subject_kind = 'fact' AND co.subject_id = c.fact_id
+                      AND co.verdict IN ('wrong', 'restricted')
+                  )
+            ),
+            revealed_ids AS (
+                SELECT subject_id FROM corrections WHERE subject_kind = 'fact' AND verdict = 'revealed'
+            ),
+            visible AS (
+                SELECT cand.subject_id,
+                       (cand.subject_id IN (SELECT subject_id FROM revealed_ids)) AS is_revealed
+                FROM candidates cand
+                WHERE cand.subject_id IN (SELECT subject_id FROM revealed_ids)
+                   OR (
+                        NOT {all_ev_sql}
+                        AND EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id AND {vis})
+                   )
+                   OR (
+                        {all_ev_sql}
+                        AND EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM claims c3
+                            WHERE c3.fact_id = cand.subject_id AND NOT ({vis3})
+                        )
+                   )
+            )
+            """
+
+    def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
+        """Caller-scoped count of facts evidenced by ``corpus_id`` — the
+        Library collection card's "M facts" number (spec §13.2 "Library").
+        Cheap: one indexed-`corpus_id` query, no traversal. Two callers with
+        different grants on the SAME collection can see a different M: under
+        `all_evidence` mode a fact whose OTHER claims live in a collection
+        one caller cannot reach is hidden from them but visible to a caller
+        who can reach every collection it is evidenced from; a caller with no
+        access to `corpus_id` at all (not gated here — the caller of this
+        method is expected to have already confirmed collection access)
+        would still see only `revealed` subjects, if any."""
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        params: Dict[str, Any] = {"corpus_id": corpus_id}
+        if not is_admin:
+            params["readable"] = list(readable)
+        sql = sa.text(f"WITH {self._visible_facts_for_corpus_cte(is_admin, all_evidence)} SELECT COUNT(*) FROM visible")
+        with self._engine.connect() as conn:
+            row = conn.execute(sql, params).first()
+        return int(row[0]) if row else 0
+
+    def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+        """Caller-scoped facts section for one collection's detail page
+        (spec §13.2 "Collection detail"): fact count by type, a paged list of
+        facts evidenced by ``corpus_id`` (display name from the first
+        natural-key alias, GLOBAL claim/quote counts matching `search()`'s
+        contract so the same subject reads the same numbers everywhere), a
+        same-key attribute conflict rendered INLINE on the fact that carries
+        it (never a detached queue — every conflicting value with its
+        document name/date, from the caller's own readable claims), and
+        `possible_duplicate_of` review-item edges whose own claim AND both
+        endpoints are independently visible to the caller (the same rule
+        `neighbors()` applies to every edge — never inferred from an
+        endpoint).
+
+        Honesty note on "conflict": this is a SIMPLER definition than
+        `search()`'s attrs projection (which shows a conflict only when the
+        LATEST document_date ties across values) — here, every distinct
+        value a caller can read for one attribute key is a conflict, because
+        this surface's job is showing a reader the disagreement, not picking
+        a winner. It intentionally surfaces more than the projection would.
+        """
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        vis_params: Dict[str, Any] = {"corpus_id": corpus_id}
+        if not is_admin:
+            vis_params["readable"] = list(readable)
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
+
+        with self._engine.connect() as conn:
+            type_sql = sa.text(
+                f"WITH {cte} "
+                "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
+                "GROUP BY f.type ORDER BY f.type"
+            )
+            type_rows = conn.execute(type_sql, vis_params).mappings().all()
+            type_counts = {r["type"]: int(r["n"]) for r in type_rows}
+            total = sum(type_counts.values())
+
+            page_sql = sa.text(
+                f"WITH {cte} "
+                "SELECT v.subject_id, v.is_revealed, f.type FROM visible v JOIN facts f ON f.id = v.subject_id "
+                "ORDER BY f.type, v.subject_id LIMIT :limit_plus_one OFFSET :offset"
+            )
+            page_params = dict(vis_params)
+            page_params["limit_plus_one"] = limit + 1
+            page_params["offset"] = offset
+            page_rows = conn.execute(page_sql, page_params).mappings().all()
+            limit_applied = len(page_rows) > limit
+            page_rows = page_rows[:limit]
+            page_ids = [r["subject_id"] for r in page_rows]
+            revealed_by_id = {r["subject_id"]: bool(r["is_revealed"]) for r in page_rows}
+            type_by_id = {r["subject_id"]: r["type"] for r in page_rows}
+
+            facts_out: List[Dict[str, Any]] = []
+            review_items: List[Dict[str, Any]] = []
+
+            if page_ids:
+                alias_sql = sa.text(
+                    "SELECT fact_id, natural_key FROM fact_aliases WHERE fact_id = ANY(:ids) "
+                    "ORDER BY fact_id, natural_key"
+                )
+                alias_rows = conn.execute(alias_sql, {"ids": page_ids}).mappings().all()
+                display_name: Dict[str, str] = {}
+                for r in alias_rows:
+                    display_name.setdefault(r["fact_id"], r["natural_key"])
+
+                # GLOBAL readable claims for the page's subjects — same rule
+                # search()'s counted_claims applies: a revealed subject counts
+                # every claim regardless of grants (quotes suppressed instead,
+                # not the count), everyone else counts only grant-visible ones.
+                claim_vis = self._visibility_predicate("c.corpus_id", is_admin)
+                revealed_ids = [fid for fid, rev in revealed_by_id.items() if rev]
+                claims_sql = sa.text(
+                    f"""
+                    SELECT c.fact_id, c.attrs, c.document_date, cf.filename
+                    FROM claims c
+                    JOIN corpus_files cf ON cf.id = c.corpus_file_id
+                    WHERE c.fact_id = ANY(:ids) AND (c.fact_id = ANY(:revealed_ids) OR ({claim_vis}))
+                    """
+                )
+                claims_params: Dict[str, Any] = {"ids": page_ids, "revealed_ids": revealed_ids}
+                if not is_admin:
+                    claims_params["readable"] = list(readable)
+                claim_rows = conn.execute(claims_sql, claims_params).mappings().all()
+
+                claim_count: Dict[str, int] = {}
+                # subject_id -> attr key -> value's json key -> {"value", "docs": {(name, date), ...}}
+                attr_values: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+                for r in claim_rows:
+                    fid = r["fact_id"]
+                    claim_count[fid] = claim_count.get(fid, 0) + 1
+                    attrs = _decode_jsonb(r["attrs"]) or {}
+                    doc_date = r["document_date"].isoformat() if r["document_date"] else None
+                    for key, value in attrs.items():
+                        value_key = json.dumps(value, sort_keys=True)
+                        bucket = attr_values.setdefault(fid, {}).setdefault(key, {})
+                        entry = bucket.setdefault(value_key, {"value": value, "docs": set()})
+                        entry["docs"].add((r["filename"], doc_date))
+
+                for fid in page_ids:
+                    is_revealed = revealed_by_id.get(fid, False)
+                    n_claims = claim_count.get(fid, 0)
+                    conflicts = []
+                    for key, values in (attr_values.get(fid) or {}).items():
+                        if len(values) < 2:
+                            continue
+                        entries = []
+                        for entry in values.values():
+                            for doc_name, doc_date in sorted(entry["docs"], key=lambda t: (t[0] or "", t[1] or "")):
+                                entries.append(
+                                    {"value": entry["value"], "document_name": doc_name, "document_date": doc_date}
+                                )
+                        conflicts.append({"key": key, "entries": entries})
+                    facts_out.append(
+                        {
+                            "id": fid,
+                            "type": type_by_id.get(fid),
+                            "display_name": display_name.get(fid, fid),
+                            "claim_count": n_claims,
+                            "quote_count": 0 if is_revealed else n_claims,
+                            "revealed": is_revealed,
+                            "conflicts": conflicts,
+                        }
+                    )
+
+                review_items = self._review_items_for_corpus(
+                    conn, corpus_id=corpus_id, is_admin=is_admin, all_evidence=all_evidence, readable=readable
+                )
+
+        return {
+            "total": total,
+            "type_counts": type_counts,
+            "facts": facts_out,
+            "limit_applied": limit_applied,
+            "review_items": review_items,
+        }
+
+    def _review_items_for_corpus(
+        self, conn, *, corpus_id: str, is_admin: bool, all_evidence: bool, readable: Optional[frozenset]
+    ) -> List[Dict[str, Any]]:
+        """`possible_duplicate_of` edges touching a fact evidenced by
+        ``corpus_id`` — spec §7.2's entity-resolution review items, surfaced
+        as rows with both subjects named rather than a detached queue. Every
+        edge is independently visibility-checked (its OWN claim, never
+        inferred from its endpoints — the same rule S3/S4 pin for
+        `neighbors()`), and both endpoints must be independently visible too,
+        so this can never announce a fact the caller cannot otherwise see.
+        Capped at 50 candidate edges — a review surface, not a full scan."""
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
+        vis_params: Dict[str, Any] = {"corpus_id": corpus_id}
+        if not is_admin:
+            vis_params["readable"] = list(readable)
+        edge_sql = sa.text(
+            f"""
+            WITH {cte}
+            SELECT DISTINCT e.id, e.src, e.dst
+            FROM edges e
+            WHERE e.type = 'possible_duplicate_of'
+              AND (e.src IN (SELECT subject_id FROM visible) OR e.dst IN (SELECT subject_id FROM visible))
+            ORDER BY e.id
+            LIMIT 50
+            """
+        )
+        edge_rows = conn.execute(edge_sql, vis_params).mappings().all()
+        out: List[Dict[str, Any]] = []
+        for erow in edge_rows:
+            eid, src, dst = erow["id"], erow["src"], erow["dst"]
+            edge_status = self._subject_status(
+                conn,
+                subject_kind="edge",
+                subject_id=eid,
+                is_admin=is_admin,
+                all_evidence=all_evidence,
+                readable=readable,
+            )
+            if not self._is_visible(edge_status):
+                continue
+            a_status = self._subject_status(
+                conn,
+                subject_kind="fact",
+                subject_id=src,
+                is_admin=is_admin,
+                all_evidence=all_evidence,
+                readable=readable,
+            )
+            b_status = self._subject_status(
+                conn,
+                subject_kind="fact",
+                subject_id=dst,
+                is_admin=is_admin,
+                all_evidence=all_evidence,
+                readable=readable,
+            )
+            if not (self._is_visible(a_status) and self._is_visible(b_status)):
+                continue
+            out.append({"edge_id": eid, "a": self._subject_label(conn, src), "b": self._subject_label(conn, dst)})
+        return out
+
+    def _subject_label(self, conn, fact_id: str) -> Dict[str, Any]:
+        row = conn.execute(sa.text("SELECT id, type FROM facts WHERE id = :id"), {"id": fact_id}).mappings().first()
+        alias_row = (
+            conn.execute(
+                sa.text("SELECT natural_key FROM fact_aliases WHERE fact_id = :id ORDER BY natural_key LIMIT 1"),
+                {"id": fact_id},
+            )
+            .mappings()
+            .first()
+        )
+        return {
+            "id": fact_id,
+            "type": row["type"] if row else None,
+            "display_name": (alias_row["natural_key"] if alias_row else fact_id),
+        }
