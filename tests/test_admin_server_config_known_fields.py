@@ -229,22 +229,25 @@ def test_ai_base_url_populated(seeded_app):
     assert fields["structured_output"]["default"] == "auto"
 
 
-def test_openmetadata_is_editable_section_with_known_fields(seeded_app):
-    """openmetadata is a new editable section with full registry."""
+def test_openmetadata_section_is_gone(seeded_app):
+    """The OpenMetadata catalog-export job was deleted entirely (D6c,
+    2026-08) — `src/catalog_export.py` had zero non-test runtime callers
+    and `connectors/openmetadata/` was reachable only from it and tests.
+    Its config section is no longer served or writable (unknown sections
+    are rejected loudly, not merged into the YAML root)."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     body = r.json()
-    assert "openmetadata" in body["editable_sections"]
-    fields = body["known_fields"].get("openmetadata", {})
-    assert "url" in fields
-    assert "token" in fields
-    assert fields["token"]["kind"] == "secret"
-    assert "verify_ssl" in fields
-    assert fields["verify_ssl"]["kind"] == "bool"
-    assert fields["verify_ssl"]["default"] is True
-    assert "cache_ttl_seconds" in fields
-    assert fields["cache_ttl_seconds"]["kind"] == "int"
+    assert "openmetadata" not in body["editable_sections"]
+    assert "openmetadata" not in body["known_fields"]
+    r = c.post(
+        "/api/admin/server-config",
+        headers=_auth(token),
+        json={"sections": {"openmetadata": {"url": "https://om.example.com"}}},
+    )
+    assert r.status_code == 400
+    assert "unknown section" in r.json()["detail"]
 
 
 def test_desktop_section_is_gone(seeded_app):
@@ -308,41 +311,6 @@ def test_post_connectors_section_persists(seeded_app, tmp_path, monkeypatch):
         loaded = _yaml.safe_load((state / "instance.yaml").read_text())
         assert loaded["connectors"]["globals"]["AGNES_INSTANCE_BRAND"] == "Acme Analytics"
         assert loaded["connectors"]["connector-atlassian"]["ATLASSIAN_BASE_URL"] == "https://acme.atlassian.net"
-    finally:
-        ic._instance_config = None
-
-
-def test_post_openmetadata_section_persists(seeded_app, tmp_path, monkeypatch):
-    """openmetadata is now in _EDITABLE_SECTIONS; POST flow accepts it."""
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    state = tmp_path / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    import app.instance_config as ic
-
-    ic._instance_config = None
-    try:
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        r = c.post(
-            "/api/admin/server-config",
-            headers=_auth(token),
-            json={
-                "sections": {
-                    "openmetadata": {
-                        "url": "https://om.example.com",
-                        "cache_ttl_seconds": 1800,
-                        "verify_ssl": True,
-                    },
-                },
-            },
-        )
-        assert r.status_code in (200, 204), r.text
-        # Verify it landed on disk.
-        import yaml as _yaml
-
-        loaded = _yaml.safe_load((state / "instance.yaml").read_text())
-        assert loaded["openmetadata"]["url"] == "https://om.example.com"
-        assert loaded["openmetadata"]["cache_ttl_seconds"] == 1800
     finally:
         ic._instance_config = None
 

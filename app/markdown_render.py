@@ -220,8 +220,7 @@ def render_plain(markdown: Optional[str], *, html_source: bool = False) -> str:
 # `source` values (on `metric_definitions` / `glossary_terms`) whose text is the
 # upstream catalog's, stored with no normalization — routinely rich HTML. Every
 # other writer produces markdown: `manual` (the admin UI / POST endpoints) and
-# `yaml_import` (docs/metrics/*.yaml, and the OpenMetadata export, which strips
-# HTML before writing the YAML). Includes both the pre- and post-flat-table-
+# `yaml_import` (docs/metrics/*.yaml). Includes both the pre- and post-flat-table-
 # cutover Keboola writer sources (`src.semantic.keboola_sources`) — the
 # projector's rows carry HTML descriptions from the same upstream catalog as
 # the retired flat composer's did.

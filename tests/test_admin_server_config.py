@@ -288,6 +288,24 @@ class TestPostServerConfigAPI:
         assert resp.status_code == 400
         assert "jira" in resp.json()["detail"]
 
+    def test_post_openmetadata_section_rejected(self, seeded_app):
+        """Regression guard: `openmetadata:` was the config surface for the
+        OpenMetadata catalog-export job — deleted entirely (D6c, 2026-08)
+        as an orphaned module with zero non-test runtime callers, along
+        with `src/catalog_export.py` and `connectors/openmetadata/`.
+        Deleted from `_STATIC_EDITABLE_SECTIONS` / `_SECTION_BASELINE_EFFECT` /
+        `_KNOWN_FIELDS`. An `openmetadata:` patch must be rejected loudly,
+        not silently accepted-and-ignored."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/server-config",
+            json={"sections": {"openmetadata": {"anything": "value"}}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 400
+        assert "openmetadata" in resp.json()["detail"]
+
     def test_post_danger_section_without_confirmation_rejected(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
