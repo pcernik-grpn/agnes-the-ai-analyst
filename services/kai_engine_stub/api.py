@@ -13,9 +13,19 @@ This service closes it. It speaks the subset of the engine's HTTP surface the
 provider actually calls, over real HTTP, with deterministic scripted turns
 and no LLM, no Anthropic key and no database:
 
-    POST /api/chat                  → text/event-stream of AI-SDK UI events
-    POST /api/chat/{id}/stop        → {"stopped": true}
-    POST /api/chat/{id}/approval    → {"success": true, ...}
+    POST /api/chat                        → text/event-stream of AI-SDK UI events
+    POST /api/chat/{id}/stop              → {"stopped": true}
+    POST /api/chat/{id}/approval          → {"success": true, ...}
+    GET  /api/chat/{id}/sandbox/files     → {"entries": [{name, path, type, size?}]}
+    GET  /api/chat/{id}/sandbox/file/download?path=… → raw bytes
+
+The sandbox file routes mirror the engine's real file browser (one directory
+level per listing call) plus the download route Agnes's session-files proxy
+targets (`app/chat/kai_engine_files.py` documents the wire contract). The
+`deliverable` scenario registers two files for the chat so "type
+`deliverable`, click Files" works end to end; `KAI_STUB_FILES_ROUTES=0` makes
+both routes answer 404, simulating an engine build that predates them (the
+proxy must degrade to `supported: false`, not error).
 
 What it deliberately does NOT do: run a model, execute a tool, or persist a
 transcript. It is a protocol fixture, so a turn's shape is chosen by keyword
@@ -51,7 +61,8 @@ import hmac
 import json
 import os
 import time
-from typing import Any, AsyncIterator, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -73,7 +84,7 @@ def _b64url_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
 
 
-def _verify_session_jwt(authorization: Optional[str]) -> dict:
+def _verify_session_jwt(authorization: str | None) -> dict:
     """Verify the host-minted session JWT exactly as the real engine would.
 
     Deliberately hand-rolled rather than pulled from PyJWT: this stub must be
@@ -223,11 +234,21 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("\n\nTwo tables registered."),
         {"type": "finish"},
     ],
+    # A turn that "renders" deliverables: registers real bytes in the stub's
+    # sandbox file store for this chat (see `chat()`), so the web UI's Files
+    # overlay lists and downloads them end to end.
+    "deliverable": [
+        _text("Rendering the documents.\n\n"),
+        _tool_call("call_render", "Bash", {"command": "python render_deliverables.py"}),
+        _tool_output("call_render", "wrote outputs/report.docx and outputs/deck.pptx"),
+        _text("\n\nBoth documents are rendered — open **Files** to download them."),
+        {"type": "finish"},
+    ],
     "default": [
         _text("You said something I have no script for, so here is the default turn. "),
         _tool_call("call_d", "server_info", {}),
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
-        _text("\n\nTry `interleaved`, `table`, `fail`, `approval`, `error` or `markdown`."),
+        _text("\n\nTry `interleaved`, `table`, `fail`, `approval`, `error`, `markdown` or `deliverable`."),
         {"type": "finish"},
     ],
 }
@@ -283,14 +304,23 @@ def _record(event: dict) -> bytes:
 
 
 @app.post("/api/chat")
-async def chat(request: Request, authorization: Optional[str] = Header(default=None)):
+async def chat(request: Request, authorization: str | None = Header(default=None)):
     _verify_session_jwt(authorization)
     body = await request.json()
     if not body.get("id"):
         raise HTTPException(status_code=400, detail="missing_session_id")
-    events = _pick_scenario(_user_text(body))
+    message = _user_text(body)
+    events = _pick_scenario(message)
     approvals_supported = bool(body.get("supportsApprovalRequestedEvent"))
     chat_id = str(body["id"])
+    _touch_sandbox(chat_id)
+    if "deliverable" in message.lower():
+        _session_files[chat_id].update(
+            {
+                "outputs/report.docx": b"PK\x03\x04 stub docx bytes - report",
+                "outputs/deck.pptx": b"PK\x03\x04 stub pptx bytes - deck",
+            }
+        )
 
     async def _stream() -> AsyncIterator[bytes]:
         # `start` then the scripted body: the provider ignores both `start`
@@ -338,14 +368,14 @@ async def _await_approval(chat_id: str, tool_call_id: str) -> str:
     _pending.setdefault(chat_id, {})[tool_call_id] = future
     try:
         return await asyncio.wait_for(future, timeout=_APPROVAL_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return "deny"
     finally:
         _pending.get(chat_id, {}).pop(tool_call_id, None)
 
 
 @app.post("/api/chat/{chat_id}/approval")
-async def approval(chat_id: str, request: Request, authorization: Optional[str] = Header(default=None)):
+async def approval(chat_id: str, request: Request, authorization: str | None = Header(default=None)):
     _verify_session_jwt(authorization)
     body = await request.json()
     tool_call_id = str(body.get("toolUseId") or body.get("toolCallId") or "")
@@ -360,7 +390,7 @@ async def approval(chat_id: str, request: Request, authorization: Optional[str] 
 
 
 @app.post("/api/chat/{chat_id}/stop")
-async def stop(chat_id: str, authorization: Optional[str] = Header(default=None)):
+async def stop(chat_id: str, authorization: str | None = Header(default=None)):
     _verify_session_jwt(authorization)
     # Release anything blocked on an approval so the turn's generator can
     # unwind instead of sitting on the timeout after the user cancelled.
@@ -368,6 +398,92 @@ async def stop(chat_id: str, authorization: Optional[str] = Header(default=None)
         if not future.done():
             future.set_result("deny")
     return {"stopped": True}
+
+
+# ------------------------------------------------------- sandbox files
+#: chat_id → {relative path: bytes}. The stub's stand-in for the engine's
+#: E2B sandbox workspace. A chat exists here once it ran a turn (the real
+#: engine 404s file routes for a chat id its DB has never seen — mirrored).
+_session_files: dict[str, dict[str, bytes]] = {}
+
+
+def _touch_sandbox(chat_id: str) -> None:
+    _session_files.setdefault(chat_id, {})
+
+
+def _files_routes_enabled() -> bool:
+    raw = os.environ.get("KAI_STUB_FILES_ROUTES", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _sandbox_files_or_404(chat_id: str, claims: dict) -> dict[str, bytes]:
+    if not _files_routes_enabled():
+        # Simulate an engine build that predates the sandbox file routes:
+        # the framework-level 404 the proxy must read as "no files channel".
+        raise HTTPException(status_code=404, detail="not_found")
+    # The real engine binds the session token to its chat (scope_id ==
+    # chat id) for host-JWT callers — a token minted for chat A must not
+    # browse chat B's sandbox. Enforced here so the Agnes-side contract
+    # tests fail if the mint ever drifts.
+    if claims and str(claims.get("scope_id", "")) != chat_id:
+        raise HTTPException(status_code=403, detail="session_token_scope_mismatch")
+    files = _session_files.get(chat_id)
+    if files is None:
+        raise HTTPException(status_code=404, detail="chat_not_found")
+    return files
+
+
+def _valid_rel(path: str) -> bool:
+    if path.startswith("/") or "\\" in path or "\x00" in path:
+        return False
+    return all(seg not in ("", "..") for seg in path.split("/")) if path else True
+
+
+@app.get("/api/chat/{chat_id}/sandbox/files")
+async def sandbox_files(chat_id: str, path: str = "", authorization: str | None = Header(default=None)):
+    """One directory level, the way the engine's real listing answers."""
+    claims = _verify_session_jwt(authorization)
+    files = _sandbox_files_or_404(chat_id, claims)
+    if not _valid_rel(path):
+        raise HTTPException(status_code=400, detail="bad_path")
+    prefix = f"{path}/" if path else ""
+    names_seen: set[str] = set()
+    entries: list[dict] = []
+    for rel, blob in sorted(files.items()):
+        if not rel.startswith(prefix):
+            continue
+        remainder = rel[len(prefix) :]
+        head, _, rest = remainder.partition("/")
+        if not head or head in names_seen:
+            continue
+        names_seen.add(head)
+        if rest:
+            entries.append({"name": head, "path": f"{prefix}{head}", "type": "dir"})
+        else:
+            entries.append({"name": head, "path": rel, "type": "file", "size": len(blob)})
+    return {"entries": entries}
+
+
+@app.get("/api/chat/{chat_id}/sandbox/file/download")
+async def sandbox_file_download(chat_id: str, path: str, authorization: str | None = Header(default=None)):
+    from fastapi.responses import Response as _Response
+
+    claims = _verify_session_jwt(authorization)
+    files = _sandbox_files_or_404(chat_id, claims)
+    if not _valid_rel(path):
+        raise HTTPException(status_code=400, detail="bad_path")
+    blob = files.get(path)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="file_not_found")
+    name = path.rsplit("/", 1)[-1]
+    return _Response(
+        content=blob,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/health")
