@@ -166,6 +166,7 @@ docs/AGENT-REPORTS/
 
 # Git worktrees
 .worktrees/
+.worktrees-local/
 
 # Internal transcripts and meeting notes
 docs/ZS_PADAK_*
