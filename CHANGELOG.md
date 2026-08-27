@@ -56,12 +56,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   defeating revocation. Now gated by `require_session_token`, the same
   interactive-session-only guard already used by `POST /auth/tokens` and
   agent-PAT issuance (which subsumes PR #1288's narrower
-  `X-StorageApi-Token`-only rejection on this route). No other
-  credential-minting endpoint had this gap: `POST /auth/tokens`, agent-PAT
-  issuance, and MCP-connect token creation already required a session; the
-  data-apps deploy/git-credential/draft/preview-grant mints are intentionally
-  PAT-reachable (the CLI's `agnes app …` commands run under the caller's own
-  PAT against their own app) and out of scope here — see #1292.
+  `X-StorageApi-Token`-only rejection on this route). No other endpoint that
+  mints a PAT through a FastAPI auth dependency had this gap: `POST
+  /auth/tokens`, agent-PAT issuance, and MCP-connect token creation already
+  required a session; the data-apps deploy/git-credential/draft/preview-grant
+  mints are intentionally PAT-reachable (the CLI's `agnes app …` commands run
+  under the caller's own PAT against their own app) and out of scope here —
+  see #1292. The MCP-OAuth consent route resolves its caller through its own
+  helper rather than a dependency and still accepts a PAT; that is tracked
+  separately, not fixed here.
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
 - The "Add data source" wizard's Snowflake table picker no longer renders a
