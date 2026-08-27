@@ -100,6 +100,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`scripts/eval/corpus_gen.py` generates the planted proving-run corpus for
+  the fact-graph spec's Run P (§15.5).** A deterministic (seeded), SharePoint-
+  shaped filesystem corpus — ≥4 sites, 2-3 libraries each, mixed
+  .md/.docx/.pptx/.xlsx (falls back to Markdown when an Office writer library
+  isn't installed) — plus `ground_truth.json` recording every planted
+  fact/edge in the producer wire format (§7.0), the S1-S4 security fixtures,
+  six traps (scan / duplicate / superseded version / same-date contradiction
+  / entity-resolution pair / adversarial fabrication), and the AN1 canary +
+  AN2 Czech-inflected-name pair, plus a `sharing.yaml` mapping every
+  site/library to the groups it would be granted to. `--small` (~30 docs, no
+  filler) is committed at `tests/fixtures/eval/planted_corpus_small/` for
+  CI-speed acceptance tests; the full ≥1000-document mode is invoked at Run P
+  time. Fixture factory only — no application code changed.
+
 - **A SharePoint connection resolves its certificate from the vault or from
   the deployment.** Microsoft Graph refuses client secrets for app-only
   access, so the certificate is the credential: an admin either uploads their
