@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Fact graph over Collections — read surface** (`facts.enabled`, off by default; Postgres-only). Typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, a verbatim quote and a date. `POST /api/facts/search` (typed subject search with attribute filters, projected per-caller from readable claims), `POST /api/facts/neighbors` (bounded graph traversal, depth ≤2, capped fanout/result, statement-timeout guarded), and `GET /api/facts/{subject_id}/claims` (the caller's readable evidence for one subject) — any authenticated caller, no admin gate; every bit of visibility enforcement lives server-side in the repository, never in a route dependency, so an agent's restricted scope or a group's collection grants are the only thing that decides what a caller sees. A subject under an admin `revealed` correction is served instance-wide without quotes; `restricted`/`wrong` withhold it everywhere; a nonexistent id and an unreadable one are indistinguishable (`404`, never `403`). Honest scope: this is the READ surface only (build order steps 2+3) — the ingest endpoint that writes facts, and the CLI/MCP surfaces, land in a follow-up. DuckDB-backed instances answer a typed `501` (A3 PG-first ratchet). See `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
 - **`scripts/ontology/import_ontology.py` translates a producer's ontology.yaml into an Agnes semantic-model (Apache Ossie) document** — node types become datasets, edge types become relationships, guidance/rules with no Ossie field fold into `ai_context` verbatim, and every judgment call (a hierarchy inferred from a plain attribute, a wildcard-endpoint relationship) is named in a leftover report printed before writing or posting. Validates against the vendored Ossie schema before writing (`--out`) or importing through `POST /api/admin/semantic-models` (`--server`/`--token`); refuses loudly on a schema-invalid translation. Fact-graph build-order step 1.
 
 - **`scripts/eval/` — the fact-graph evaluation measurement harness, encoding eval workbook v0.2 exactly (EQ0/EQ3/EQ9).** `run_eval.py` drives an eval round from a YAML run-config against the frozen ten-prompt set (`tests/fixtures/eval/workbook_v0_2/`, sha256-pinned — the harness refuses to run on a locally-edited prompt) across five arms: A0 (bare Anthropic API) and A4 (Agnes, via a pluggable surface — `chat` implemented against the same one-shot endpoint `agnes agent ask` uses) run directly; A1/A2/A3 run in external product UIs this harness cannot drive headlessly, so `import-transcript` ingests an operator-pasted transcript into the same machine-readable record shape. `grade.py` produces blind grading sheets (arm identity hidden behind a nonce until scored), computes the composite (seven 0/1/2 dimensions, frozen weights, a governance-gate FAIL zeroing the question), and supports `--llm-assist` grading (always labeled, never a silent substitute for human grading). `decision.py` computes the five pre-registered decision thresholds with PASS/FAIL/incomplete verdicts. `metrics.py` computes EQ3 (precision/recall per fact type) and EQ9 (entity-resolution cluster purity, conflict rate, orphan rate) against the facts REST API's documented response shapes, against a planted ground-truth manifest (`tests/fixtures/eval/ground_truth.schema.json`). Fact-graph build-order step 5.
@@ -47,6 +48,46 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   instance that does not set it is unprotected, exactly as before.
 
 ### Changed
+- **BREAKING: Databricks Unity Catalog metric views now flow through the
+  semantic-source adapter contract, like Snowflake — no more direct
+  `metric_definitions` writer.** A new `databricks_semantic` adapter
+  (`connectors/databricks/semantic_ossie.py`) composes one Apache Ossie
+  document per metric view (measures → metrics, dimensions → dataset
+  fields, every expression tagged dialect `DATABRICKS`); a metric's
+  dialect expression is the full `SELECT MEASURE(...) FROM <metric view>`
+  statement (not the bare `expr` fragment, which is not runnable on its
+  own), and it projects into `metric_definitions` as a warehouse-only row
+  with a "run server-side" note — Task A's projector, now exercised by a
+  second connector. `POST /api/admin/run-databricks-semantic-layer-refresh`
+  keeps its path, scheduler cadence and single-flight guard, but now
+  registers the workspace as a `connection`-kind semantic source (fixed id
+  `databricks_default`) and syncs it via `src.semantic.transports.
+  import_source` — its response shape changed from the old counters
+  (`created_or_updated`/`pruned`/...) to the generic import report
+  (`models_written`/`models_pruned`/`projection`/...). Rows land stamped
+  `source='ossie_connection'` + `source_ref='databricks_default'` instead
+  of `source='databricks_semantic_layer'` + the workspace host; every
+  refresh reconciles any rows still carrying the old stamp (one-time,
+  idempotent — a no-op once they're gone), so an upgrading instance loses
+  nothing. This was the last connector writing `metric_definitions`
+  directly — every source (native, git, upload, Keboola, Snowflake,
+  Databricks) now goes through the same document → projector pipeline.
+- **Collections file upload now preserves a matched file's id on every
+  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
+  gains optional positionally-paired form fields — `source_stable_ids` (+
+  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
+  client can supply a producer's own stable id (e.g. a crawler's delta key)
+  alongside the existing `paths` field. A match is tried on
+  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
+  as before; either way, the existing `corpus_files` row is now updated IN
+  PLACE — a content-unchanged match (a rename/move) only refreshes
+  filename/path and skips re-chunking entirely, while a changed-content
+  match purges chunks/derived tables and resets `processing_status` on the
+  SAME row. A manual `paths`-only re-upload of a file previously anchored by
+  a stable id now also preserves that row's id, so a hand upload can no
+  longer orphan anything referencing it. The stable-id mapping table is
+  Postgres-only: supplying `source_stable_ids` on a DuckDB-backed instance
+  returns `501`; omitting the field keeps today's flow unchanged.
 
 ### Fixed
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.

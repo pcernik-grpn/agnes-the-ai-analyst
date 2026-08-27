@@ -10,6 +10,7 @@ Each test:
 All tests run twice: once with DuckDB-only (seeded_app_both/state_backend=duckdb)
 and once with Postgres active (state_backend=pg).
 """
+
 from __future__ import annotations
 
 import io
@@ -48,11 +49,11 @@ def _duck_probe(table, id_col, id_val):
     is absent. Re-raises unexpected errors so they don't silence real bugs.
     """
     import duckdb
+
     try:
         from src.db import get_system_db
-        return get_system_db().execute(
-            f"SELECT 1 FROM {table} WHERE {id_col} = ?", [id_val]
-        ).fetchone()
+
+        return get_system_db().execute(f"SELECT 1 FROM {table} WHERE {id_col} = ?", [id_val]).fetchone()
     except duckdb.CatalogException:
         return None
 
@@ -89,6 +90,7 @@ class TestUsersRBACBehavioral:
         )
         # Verify the returned email matches what we created
         from src.repositories import users_repo as _ur
+
         row = _ur().get_by_id(user_id)
         assert row["email"] == new_email
 
@@ -220,8 +222,10 @@ class TestUsersRBACBehavioral:
         rp = client.post(
             "/api/admin/grants",
             json={
-                "group_id": group_id, "resource_type": "data_package",
-                "resource_id": pkg_id, "requirement": "required",
+                "group_id": group_id,
+                "resource_type": "data_package",
+                "resource_id": pkg_id,
+                "requirement": "required",
             },
             headers=_admin_headers(s),
         )
@@ -288,8 +292,10 @@ class TestUsersRBACBehavioral:
         rp = client.post(
             "/api/admin/grants",
             json={
-                "group_id": group_id, "resource_type": "data_package",
-                "resource_id": pkg_id, "requirement": "required",
+                "group_id": group_id,
+                "resource_type": "data_package",
+                "resource_id": pkg_id,
+                "requirement": "required",
             },
             headers=_admin_headers(s),
         )
@@ -312,12 +318,11 @@ class TestUsersRBACBehavioral:
         # Table is no longer in manifest
         rm2 = client.get("/api/sync/manifest", headers=_analyst_headers(s))
         assert rm2.status_code == 200, rm2.text
-        assert source_name not in rm2.json().get("tables", {}), (
-            "table still in manifest after grant revoked"
-        )
+        assert source_name not in rm2.json().get("tables", {}), "table still in manifest after grant revoked"
 
         # Grant row is gone from active backend
         from src.repositories import resource_grants_repo
+
         assert resource_grants_repo().get(grant_id) is None
 
 
@@ -443,7 +448,6 @@ class TestTableRegistrySyncBehavioral:
             headers=_admin_headers(s),
         )
         assert r2.status_code == 201, r2.text
-        ungranted_id = r2.json()["id"]
 
         # Create group + add analyst + grant first table only
         rg = client.post(
@@ -480,8 +484,10 @@ class TestTableRegistrySyncBehavioral:
         client.post(
             "/api/admin/grants",
             json={
-                "group_id": group_id, "resource_type": "data_package",
-                "resource_id": pkg_id, "requirement": "required",
+                "group_id": group_id,
+                "resource_type": "data_package",
+                "resource_id": pkg_id,
+                "requirement": "required",
             },
             headers=_admin_headers(s),
         )
@@ -493,13 +499,10 @@ class TestTableRegistrySyncBehavioral:
         assert rm.status_code == 200, rm.text
         tables_dict = rm.json().get("tables", {})
         assert source_name in tables_dict, (
-            f"granted table {source_name!r} missing from analyst manifest; "
-            f"tables: {list(tables_dict.keys())!r}"
+            f"granted table {source_name!r} missing from analyst manifest; tables: {list(tables_dict.keys())!r}"
         )
         # ungranted_table has no sync_state entry and no data_package grant → absent
-        assert "ungrantd_table" not in tables_dict, (
-            "ungranted table leaked into analyst manifest"
-        )
+        assert "ungrantd_table" not in tables_dict, "ungranted table leaked into analyst manifest"
 
 
 # ---------------------------------------------------------------------------
@@ -601,11 +604,10 @@ class TestMemoryBehavioral:
         assert rp.status_code == 200, rp.text
 
         from src.repositories import knowledge_repo
+
         updated = knowledge_repo().get_by_id(item_id)
         assert updated is not None
-        assert updated.get("title") == new_title, (
-            f"Expected title {new_title!r}, got {updated.get('title')!r}"
-        )
+        assert updated.get("title") == new_title, f"Expected title {new_title!r}, got {updated.get('title')!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -655,10 +657,16 @@ class TestStoreBehavioral:
 
     def test_upload_skill_guardrails_on_llm_approve_flow(self, seeded_app_both, monkeypatch):
         """Mock LLM approve: POST → pending_llm; run_llm_review → approved."""
-        monkeypatch.setattr("src.store_guardrails.llm_review.review_bundle", lambda *a, **kw: {
-            "risk_level": "low", "summary": "mock approve", "findings": [],
-            "reviewed_by_model": "mock", "error": None,
-        })
+        monkeypatch.setattr(
+            "src.store_guardrails.llm_review.review_bundle",
+            lambda *a, **kw: {
+                "risk_level": "low",
+                "summary": "mock approve",
+                "findings": [],
+                "reviewed_by_model": "mock",
+                "error": None,
+            },
+        )
         monkeypatch.setattr("app.api.store.get_guardrails_enabled", lambda: True)
         monkeypatch.setattr("app.api.store.get_guardrails_llm_provider_ready", lambda: True)
 
@@ -677,7 +685,6 @@ class TestStoreBehavioral:
 
         from src.repositories import store_submissions_repo
         from src.store_guardrails.runner import run_llm_review
-        from pathlib import Path
 
         sub = store_submissions_repo().latest_for_entity(entity_id)
         assert sub is not None
@@ -701,11 +708,16 @@ class TestStoreBehavioral:
 
     def test_upload_skill_guardrails_on_llm_block_flow(self, seeded_app_both, monkeypatch):
         """Mock LLM block → pending_llm; run_llm_review → blocked_llm; admin override → approved."""
-        monkeypatch.setattr("src.store_guardrails.llm_review.review_bundle", lambda *a, **kw: {
-            "risk_level": "high", "summary": "mock block",
-            "findings": [{"file": "x", "explanation": "mock"}],
-            "reviewed_by_model": "mock", "error": None,
-        })
+        monkeypatch.setattr(
+            "src.store_guardrails.llm_review.review_bundle",
+            lambda *a, **kw: {
+                "risk_level": "high",
+                "summary": "mock block",
+                "findings": [{"file": "x", "explanation": "mock"}],
+                "reviewed_by_model": "mock",
+                "error": None,
+            },
+        )
         monkeypatch.setattr("app.api.store.get_guardrails_enabled", lambda: True)
         monkeypatch.setattr("app.api.store.get_guardrails_llm_provider_ready", lambda: True)
 
@@ -719,7 +731,6 @@ class TestStoreBehavioral:
 
         from src.repositories import store_submissions_repo, store_entities_repo
         from src.store_guardrails.runner import run_llm_review
-        from pathlib import Path
 
         sub = store_submissions_repo().latest_for_entity(entity_id)
         assert sub is not None
@@ -736,9 +747,7 @@ class TestStoreBehavioral:
         )
 
         blocked_sub = store_submissions_repo().get(sub_id)
-        assert blocked_sub["status"] == "blocked_llm", (
-            f"Expected blocked_llm, got {blocked_sub['status']!r}"
-        )
+        assert blocked_sub["status"] == "blocked_llm", f"Expected blocked_llm, got {blocked_sub['status']!r}"
 
         # Admin override
         ro = client.post(
@@ -780,12 +789,11 @@ class TestStoreBehavioral:
         rl = client.get("/api/store/entities", headers=_analyst_headers(s))
         assert rl.status_code == 200, rl.text
         listed_ids = [e["id"] for e in rl.json()["items"]]
-        assert entity_id not in listed_ids, (
-            f"Pending entity {entity_id!r} leaked into non-owner analyst listing"
-        )
+        assert entity_id not in listed_ids, f"Pending entity {entity_id!r} leaked into non-owner analyst listing"
 
         # Active backend confirms entity is still pending (not approved)
         from src.repositories import store_entities_repo
+
         assert_only_in_active_backend(
             repo_read=lambda: store_entities_repo().get(entity_id),
             backend=backend,
@@ -798,11 +806,16 @@ class TestStoreBehavioral:
 
     def test_approved_entity_visible_after_override(self, seeded_app_both, monkeypatch):
         """Block → admin override → entity visible to non-owner in store listing."""
-        monkeypatch.setattr("src.store_guardrails.llm_review.review_bundle", lambda *a, **kw: {
-            "risk_level": "high", "summary": "mock block",
-            "findings": [{"file": "x", "explanation": "mock"}],
-            "reviewed_by_model": "mock", "error": None,
-        })
+        monkeypatch.setattr(
+            "src.store_guardrails.llm_review.review_bundle",
+            lambda *a, **kw: {
+                "risk_level": "high",
+                "summary": "mock block",
+                "findings": [{"file": "x", "explanation": "mock"}],
+                "reviewed_by_model": "mock",
+                "error": None,
+            },
+        )
         monkeypatch.setattr("app.api.store.get_guardrails_enabled", lambda: True)
         monkeypatch.setattr("app.api.store.get_guardrails_llm_provider_ready", lambda: True)
 
@@ -934,6 +947,7 @@ class TestReaperContract:
         if backend == "duckdb":
             old_ts = old_ts_utc.replace(tzinfo=None)
             from src.db import get_system_db
+
             get_system_db().execute(
                 "UPDATE store_submissions SET created_at = ? WHERE id = ?",
                 [old_ts, sub_id],
@@ -941,11 +955,10 @@ class TestReaperContract:
         else:
             import sqlalchemy as sa
             from src.db_pg import get_engine
+
             with get_engine().begin() as conn:
                 conn.execute(
-                    sa.text(
-                        "UPDATE store_submissions SET created_at = :ts WHERE id = :id"
-                    ),
+                    sa.text("UPDATE store_submissions SET created_at = :ts WHERE id = :id"),
                     {"ts": old_ts_utc, "id": sub_id},
                 )
 
@@ -972,9 +985,7 @@ class TestReaperContract:
         r = client.post("/api/admin/run-reap-stuck-reviews", headers=_admin_headers(s))
         assert r.status_code == 200, r.text
         result = r.json()
-        assert result.get("details", {}).get("reaped", 0) >= 1, (
-            f"Expected reaped >= 1, got: {result!r}"
-        )
+        assert result.get("details", {}).get("reaped", 0) >= 1, f"Expected reaped >= 1, got: {result!r}"
 
         assert_only_in_active_backend(
             repo_read=lambda: store_submissions_repo().get(sub_id),
@@ -1048,16 +1059,12 @@ class TestReaperContract:
         assert r.status_code == 200, r.text
         result = r.json()
         # Response must report exactly 3 reaped (not 0 from wrong-backend read)
-        assert result.get("details", {}).get("reaped") == 3, (
-            f"Expected reaped=3 in response, got: {result!r}"
-        )
+        assert result.get("details", {}).get("reaped") == 3, f"Expected reaped=3 in response, got: {result!r}"
 
         # All 3 aged rows should be review_error
         for sid in aged_ids:
             sub = store_submissions_repo().get(sid)
-            assert sub["status"] == "review_error", (
-                f"Expected review_error for aged sub {sid!r}, got {sub['status']!r}"
-            )
+            assert sub["status"] == "review_error", f"Expected review_error for aged sub {sid!r}, got {sub['status']!r}"
 
         # Fresh row should remain pending_llm
         fresh_sub = store_submissions_repo().get(fresh_id)
@@ -1085,9 +1092,7 @@ class TestDataAccessBehavioral:
             f"/api/data/{table_id}/check-access",
             headers=_analyst_headers(s),
         )
-        assert r_before.status_code == 403, (
-            f"Expected 403 before grant, got {r_before.status_code}: {r_before.text}"
-        )
+        assert r_before.status_code == 403, f"Expected 403 before grant, got {r_before.status_code}: {r_before.text}"
 
         # Create group + add analyst + grant table access
         rg = client.post(
@@ -1122,8 +1127,10 @@ class TestDataAccessBehavioral:
         rp = client.post(
             "/api/admin/grants",
             json={
-                "group_id": group_id, "resource_type": "data_package",
-                "resource_id": pkg_id, "requirement": "required",
+                "group_id": group_id,
+                "resource_type": "data_package",
+                "resource_id": pkg_id,
+                "requirement": "required",
             },
             headers=_admin_headers(s),
         )
@@ -1177,8 +1184,10 @@ class TestDataAccessBehavioral:
         client.post(
             "/api/admin/grants",
             json={
-                "group_id": group_id, "resource_type": "data_package",
-                "resource_id": pkg_id, "requirement": "required",
+                "group_id": group_id,
+                "resource_type": "data_package",
+                "resource_id": pkg_id,
+                "requirement": "required",
             },
             headers=_admin_headers(s),
         )
@@ -1230,9 +1239,7 @@ class TestAdminOverviewBehavioral:
             submission_ids = [ss["id"] for ss in body]
         else:
             submission_ids = [ss["id"] for ss in body.get("items", body.get("submissions", []))]
-        assert sub_id in submission_ids, (
-            f"submission {sub_id!r} not in admin list; ids: {submission_ids[:10]!r}"
-        )
+        assert sub_id in submission_ids, f"submission {sub_id!r} not in admin list; ids: {submission_ids[:10]!r}"
 
     def test_admin_sessions_list_reflects_uploads(self, seeded_app_both):
         """GET /api/admin/sessions/list returns 200 list."""
@@ -1244,9 +1251,7 @@ class TestAdminOverviewBehavioral:
         assert r.status_code == 200, r.text
         body = r.json()
         # Body is either a list or dict with a "sessions"/"items" key
-        assert isinstance(body, (list, dict)), (
-            f"Expected list or dict, got {type(body)!r}"
-        )
+        assert isinstance(body, (list, dict)), f"Expected list or dict, got {type(body)!r}"
 
     def test_admin_activity_feed_shows_recent_actions(self, seeded_app_both):
         """Register a table → activity feed is non-empty (has at least the register event)."""
@@ -1374,3 +1379,96 @@ class TestToolProjectionMapBehavioral:
             headers=headers,
         )
         assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Fact graph over Collections — read surface (build order steps 2+3,
+# docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
+# RBAC/projection depth lives in tests/db_pg/test_facts_read_pg.py (the repo
+# directly) and tests/test_api_facts.py (REST, DuckDB backend) — this class
+# proves the HTTP wiring + the flag gate + the PG-only fail-clean shape.
+# ---------------------------------------------------------------------------
+
+
+class TestFactsReadSurfaceSmoke:
+    COVERED_ROUTES = {
+        "POST /api/facts/search",
+        "POST /api/facts/neighbors",
+        "GET /api/facts/{subject_id}/claims",
+    }
+
+    def test_flag_off_404s_all_three_routes(self, seeded_app_both):
+        """facts.enabled defaults off — the whole router disappears, on
+        either backend."""
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        assert client.post("/api/facts/search", json={}, headers=headers).status_code == 404
+        assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
+        assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
+
+    def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
+        """422 identically on both backends — Pydantic validation runs
+        before the PG-only repo is ever reached, so this route never
+        diverges (see test_mutation_status_parity_sweep.py's comment on why
+        it carries no exemption entry)."""
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.post("/api/facts/neighbors", json={}, headers=headers)
+        assert r.status_code == 422
+
+    def test_search_fails_clean_on_duckdb(self, state_backend, seeded_app_both, monkeypatch):
+        """DuckDB-backed instance: facts_repo() is Postgres-only (A3
+        ratchet) — the typed 501, never a raw 500 or a silent 200."""
+        if state_backend != "duckdb":
+            pytest.skip("DuckDB-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.post("/api/facts/search", json={}, headers=headers)
+        assert r.status_code == 501, r.text
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_search_and_claims_round_trip_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        """Postgres-backed instance: a directly-seeded fact + claim is
+        reachable through both REST endpoints for the (Admin god-mode)
+        caller."""
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+
+        from src.repositories import corpus_files_repo, facts_repo, file_corpora_repo
+
+        corpus_id = file_corpora_repo().create(
+            name="Facts Smoke", slug="facts-smoke", description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="a.md",
+            sha256="sha1",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/a.md",
+        )
+        fact_id = facts_repo().create_fact(type="engagement")
+        facts_repo().add_claim(
+            fact_id=fact_id,
+            corpus_file_id=file_id,
+            corpus_id=corpus_id,
+            file_sha256="sha1",
+            quote="The engagement is underway.",
+            attrs={"status": "active"},
+        )
+
+        r = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert fact_id in {s_["id"] for s_ in body["subjects"]}
+
+        r = client.get(f"/api/facts/{fact_id}/claims", headers=headers)
+        assert r.status_code == 200, r.text
+        claims = r.json()["claims"]
+        assert len(claims) == 1
+        assert claims[0]["quote"] == "The engagement is underway."

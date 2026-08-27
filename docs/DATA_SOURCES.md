@@ -448,28 +448,39 @@ runs on the SQL warehouse.
 
 ### Semantic-layer sync (Unity Catalog metric views)
 
-`POST /api/admin/run-databricks-semantic-layer-refresh` (scheduler default:
-every 6 h, `SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL`)
-enumerates metric views per configured catalog
-(`information_schema.tables`, `table_type='METRIC_VIEW'`), reads each YAML
-definition (`SHOW CREATE TABLE`), and upserts **one metric per declared
-measure** into `metric_definitions`:
+Unity Catalog metric views import into the [semantic layer](semantic-layer.md)
+through the `databricks_semantic` adapter
+(`connectors/databricks/semantic_ossie.py`), the same
+git/upload/connection pipeline every other semantic source uses — not a
+direct `metric_definitions` writer. `POST
+/api/admin/run-databricks-semantic-layer-refresh` (scheduler default: every
+6 h, `SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL`) registers the
+workspace as a `connection`-kind semantic source the first time it runs
+(fixed id `databricks_default`) and syncs it:
 
-- rows are stamped `source='databricks_semantic_layer'` +
-  `source_ref=<workspace host>`; the prune only ever touches rows inside
-  that scope (manual / yaml-imported / Keboola rows are untouchable), and a
-  fetch yielding zero usable measures skips the prune entirely;
-- the stored `sql` is warehouse-flavor (`SELECT MEASURE(...) FROM
-  <metric view>`) and the notes say so explicitly — `MEASURE()` cannot be
-  evaluated locally, so agents route it through a materialized row or run it
-  server-side;
-- declared dimensions land in the metric's `dimensions` list; metric names
-  already owned by another writer are skipped and counted
-  (`skipped_conflict`), never shadowed.
+- enumerates metric views per configured catalog
+  (`information_schema.tables`, `table_type='METRIC_VIEW'`), reads each
+  YAML definition (`SHOW CREATE TABLE`), and composes one Apache Ossie
+  document per view — measures become metrics, dimensions become dataset
+  fields;
+- every expression is tagged dialect `DATABRICKS`: readable in the catalog,
+  not spliceable into a local DuckDB query
+  (`src/semantic/dialect.py`). A metric's expression is the full,
+  actionable statement (`SELECT MEASURE(...) FROM <metric view>`), because
+  `MEASURE()` only evaluates against its owning view — an agent runs it
+  server-side (a materialized row, or `agnes query --remote`);
+- rows land in `metric_definitions` stamped `source='ossie_connection'` +
+  `source_ref='databricks_default'`, projected by the same
+  `src/semantic/projection.py` every source is projected through — a name
+  already owned by another writer is skipped, never shadowed;
+- pre-cutover rows (`source='databricks_semantic_layer'`, from the retired
+  direct writer) are reconciled once per run — idempotent, a no-op once
+  they are gone.
 
 `agnes catalog --metrics` then surfaces the definitions to analysts and
 agents like any other metric. Extra catalogs can be enumerated via
-`data_source.databricks.semantic_layer_catalogs`.
+`data_source.databricks.semantic_layer_catalogs`, or per-sync via the
+semantic source's `config.catalogs`.
 
 ## Writing a Custom Connector
 

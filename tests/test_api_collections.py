@@ -1022,7 +1022,11 @@ class TestFileUpsert:
         _seed_collection_grant(corpus_id, "analyst1")
         return corpus_id
 
-    def test_reupload_same_path_replaces_row(self, seeded_app):
+    def test_reupload_same_path_preserves_row_id(self, seeded_app):
+        """fact-graph-over-Collections §6: ANY match through this code path
+        preserves the existing row id — content is updated in place, not
+        delete+insert — so anything anchored to that id (a future claim)
+        survives a re-upload."""
         c = seeded_app["client"]
         corpus_id = self._create_and_grant(seeded_app, "Upsert Replace")
 
@@ -1044,18 +1048,50 @@ class TestFileUpsert:
         )
         assert second.status_code == 201, second.text
         fid2 = second.json()[0]["file_id"]
-        assert fid2 != fid1  # replaced, not updated-in-place
+        assert fid2 == fid1  # updated in place, id preserved
 
         listing = c.get(
             f"/api/collections/{corpus_id}/files",
             headers=_auth(seeded_app["analyst_token"]),
         )
         files = listing.json()["files"]
-        # Exactly one row survives for that path — the new one.
+        # Exactly one row survives for that path — the same row, refreshed.
         assert len(files) == 1
-        assert files[0]["file_id"] == fid2
+        assert files[0]["file_id"] == fid1
         assert files[0]["path"] == "docs/a.md"
         assert files[0]["size_bytes"] == len(b"bravo beta gamma")
+
+    def test_reupload_same_path_unchanged_content_skips_reprocessing(self, seeded_app):
+        """Unchanged sha256 short-circuits: no chunk purge, no status reset —
+        a byte-identical re-upload (or a pure rename) leaves the row's
+        processing state exactly as it was."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Upsert Short Circuit")
+
+        first = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"same bytes"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert first.status_code == 201, first.text
+        fid1 = first.json()[0]["file_id"]
+
+        from src.repositories import corpus_files_repo
+
+        corpus_files_repo().set_status(fid1, status="indexed", detail={"chunk_count": 3})
+
+        second = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"same bytes"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert second.status_code == 201, second.text
+        assert second.json()[0]["file_id"] == fid1
+        # processing_status untouched — the short-circuit never reset it.
+        assert second.json()[0]["processing_status"] == "indexed"
+        assert second.json()[0]["processing_detail"]["chunk_count"] == 3
 
     def test_uploads_without_path_do_not_upsert(self, seeded_app):
         c = seeded_app["client"]
@@ -1229,6 +1265,122 @@ class TestFileUpsert:
             headers=_auth(seeded_app["analyst_token"]),
         )
         assert listing.json()["files"] == []
+
+
+class TestSourceAnchoredUpsert:
+    """`source_stable_ids` (+ optional `source_doc_ids`, `source_sha256s`,
+    `document_dates`) — the crawler-anchor upsert prerequisite for the
+    fact-graph-over-Collections design (§6). The mapping table is
+    Postgres-only; these tests exercise the DuckDB-backed default app, where
+    every one of these fields is either omitted (byte-identical to today) or
+    triggers the typed 501 before any file is touched. End-to-end PG-backed
+    behavior (stable-id matching, mapping upserts) lives in
+    tests/db_pg/test_collections_upsert_pg.py."""
+
+    def _create_and_grant(self, seeded_app, name: str = "Source Upsert Target"):
+        c = seeded_app["client"]
+        cr = c.post(
+            "/api/collections",
+            json={"name": name},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        corpus_id = cr.json()["id"]
+        _seed_collection_grant(corpus_id, "analyst1")
+        return corpus_id
+
+    def test_source_stable_ids_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+            ],
+            data={"source_stable_ids": "graph:only-one"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_stable_ids_length_mismatch" in resp.text
+
+    def test_source_doc_ids_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+            ],
+            data={
+                "source_stable_ids": ["graph:a", "graph:b"],
+                "source_doc_ids": ["doc-a"],
+            },
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_doc_ids_length_mismatch" in resp.text
+
+    def test_source_sha256s_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[("files", ("a.md", io.BytesIO(b"a"), "text/markdown"))],
+            data={"source_sha256s": ["sha-a", "sha-b"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_sha256s_length_mismatch" in resp.text
+
+    def test_document_dates_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[("files", ("a.md", io.BytesIO(b"a"), "text/markdown"))],
+            data={"document_dates": ["2026-01-01", "2026-01-02"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "document_dates_length_mismatch" in resp.text
+
+    def test_source_stable_ids_on_duckdb_backend_yields_typed_501(self, seeded_app):
+        """The mapping table is PG-only — supplying `source_stable_ids` on a
+        DuckDB-backed instance must fail clean (typed 501), before any file
+        is written, never a raw 500 or a silent partial upload."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+            data={"source_stable_ids": "graph:abc123"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 501, resp.text
+        body = resp.json()
+        assert body["error"] == "requires_postgres_backend"
+
+        # Nothing was created — the 501 fired before any file was touched.
+        listing = c.get(
+            f"/api/collections/{corpus_id}/files",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert listing.json()["files"] == []
+
+    def test_omitting_source_stable_ids_is_byte_identical_to_today(self, seeded_app):
+        """Omitting the field entirely never resolves the PG-only repo — the
+        plain `paths` upsert flow keeps working on a DuckDB-backed instance."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()[0]["path"] == "docs/a.md"
 
 
 # ---------------------------------------------------------------------------

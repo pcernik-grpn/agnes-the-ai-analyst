@@ -390,8 +390,13 @@ def test_move_to_corpus_reparents_and_clears_path(repo):
     file keeps its identity; `path` is cleared because it described a location
     inside the OLD collection and is unique per (corpus_id, path)."""
     a = repo.add(
-        corpus_id="col_src", filename="f.md", sha256="s1", file_type="md",
-        size_bytes=10, storage_path="blobs/s1", path="sub/f.md",
+        corpus_id="col_src",
+        filename="f.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=10,
+        storage_path="blobs/s1",
+        path="sub/f.md",
     )
     assert repo.move_to_corpus(a, "col_dst") is True
     row = repo.get(a)
@@ -404,3 +409,85 @@ def test_move_to_corpus_reparents_and_clears_path(repo):
 
 def test_move_to_corpus_returns_false_when_missing(repo):
     assert repo.move_to_corpus("cf_nonexistent", "col_dst") is False
+
+
+def test_update_in_place_preserves_id_and_refreshes_fields(repo):
+    """Upsert-in-place (fact-graph-over-Collections §6 prerequisite): a
+    matched re-upload refreshes content fields on the SAME row instead of
+    delete+insert, so its id (and anything that references it) survives."""
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="old.md",
+        sha256="old-sha",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/old-sha.md",
+        path="docs/a.md",
+    )
+    repo.update_in_place(
+        file_id,
+        filename="new.md",
+        sha256="new-sha",
+        file_type="md",
+        size_bytes=9,
+        storage_path="/blobs/new-sha.md",
+        path="docs/a.md",
+    )
+    row = repo.get(file_id)
+    assert row["id"] == file_id
+    assert row["filename"] == "new.md"
+    assert row["sha256"] == "new-sha"
+    assert row["size_bytes"] == 9
+    assert row["storage_path"] == "/blobs/new-sha.md"
+    assert row["path"] == "docs/a.md"
+
+
+def test_update_in_place_can_change_path_rename(repo):
+    """Rename/move: same row, new path (spec §6 lifecycle table)."""
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+        path="old/location.md",
+    )
+    repo.update_in_place(
+        file_id,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+        path="new/location.md",
+    )
+    assert repo.get(file_id)["path"] == "new/location.md"
+    assert repo.get_by_path(CORPUS_ID, "old/location.md") is None
+    assert repo.get_by_path(CORPUS_ID, "new/location.md")["id"] == file_id
+
+
+def test_update_in_place_does_not_touch_processing_status(repo):
+    """The caller (collections upload endpoint) decides whether content
+    changed and resets status itself via ``set_status`` — this method never
+    resets status on its own, so an unchanged-content match can leave an
+    'indexed' row exactly as it was (skip-re-chunking short-circuit)."""
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+    )
+    repo.set_status(file_id, status="indexed")
+    repo.update_in_place(
+        file_id,
+        filename="a-renamed.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+        path=None,
+    )
+    assert repo.get(file_id)["processing_status"] == "indexed"
