@@ -1547,6 +1547,18 @@ async function openSession(chatId, wsUrlOverride) {
   const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
+  // The session-files drawer keeps per-conversation state — the count badge,
+  // the rendered rows (whose download links carry a chat id), and the
+  // baseline of deliverables the auto-open compares against. Nothing else
+  // told it the conversation changed, so it kept announcing the previous
+  // chat's numbers until a turn landed here, and it had to guess its own
+  // baseline lazily on the first turn-end — too late to notice that turn's
+  // own deliverable. This is the only place a non-null currentChatId is
+  // assigned, so it is the one honest signal. Fired for a re-open too: a
+  // reconnect is not a new conversation, but the listing may have moved on.
+  document.dispatchEvent(
+    new CustomEvent("agnes:session-open", { detail: { chatId, switching: _switchingSession } })
+  );
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
@@ -5532,9 +5544,15 @@ function renderCoPresence(host, participants) {
     clearDialogError(filesErrorEl);
     setFilesStatus("Loading…");
     filesListEl.replaceChildren();
+    const seq = ++_filesSeq;
     const { files, truncated } = await fetchSessionFiles(chatId);
     renderFileList(chatId, files, truncated);
+    // Third writer of the auto-open baseline, and it must claim the sequence
+    // like the other two: an open-time seed still in flight would otherwise
+    // land on top of what the user is looking at right now.
+    if (seq !== _filesSeq || currentChatId !== chatId) return;
     updateFilesBadge(files.length);
+    _filesSessionId = chatId;
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
   }
 
@@ -5593,26 +5611,70 @@ function renderCoPresence(host, participants) {
   const OUTPUTS_PREFIX = "outputs/";
   let _knownOutputs = new Set();
   let _filesSessionId = null;
+  // Bumped by every baseline write. Two fetches for the same conversation can
+  // be in flight at once (the open-time seed and a turn-end poll), and they
+  // can land out of order; without this, a slow seed overwrites the newer
+  // turn-end baseline and the next turn re-reports files as fresh.
+  let _filesSeq = 0;
 
   function isDeliverable(f) {
     return typeof f.path === "string" && f.path.startsWith(OUTPUTS_PREFIX);
   }
 
+  // The baseline is established when the conversation OPENS. Deriving it
+  // lazily from the first turn-end could not work: that listing is fetched
+  // AFTER the turn ran, so the turn's own deliverable was already in the
+  // baseline it seeded, and the first turn of a conversation — much the
+  // commonest way to get a deliverable — could never auto-open the drawer.
+  // Doing it here also retires the stale badge/rows a switch used to leave
+  // behind.
+  document.addEventListener("agnes:session-open", async (e) => {
+    const chatId = (e.detail && e.detail.chatId) || currentChatId;
+    if (!chatId) return;
+    // Reset synchronously, before the round-trip: until it lands the badge
+    // and any open drawer would otherwise still show the previous
+    // conversation's count and rows, whose links carry the old chat id.
+    const seq = ++_filesSeq;
+    _filesSessionId = chatId;
+    _knownOutputs = new Set();
+    updateFilesBadge(0);
+    if (drawerOpen() && filesListEl) {
+      filesListEl.replaceChildren();
+      setFilesStatus("Loading…");
+    }
+    const { files, truncated, ok } = await fetchSessionFiles(chatId, { quiet: true });
+    // A newer switch (or a turn-end baseline) landed while this was in
+    // flight — that one owns the state now.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
+    _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    updateFilesBadge(files.length);
+    if (drawerOpen()) renderFileList(chatId, files, truncated);
+  });
+
   document.addEventListener("agnes:turn-end", async () => {
     const chatId = currentChatId;
     if (!chatId) return;
-    // A conversation switch invalidates the previous baseline — otherwise the
-    // first turn in the new session reads every pre-existing file as "new".
+    // Defensive only: agnes:session-open seeds the baseline for every
+    // conversation before a turn can end in it. If some future path reaches a
+    // turn-end with no baseline at all, re-seed rather than treat every
+    // pre-existing file as new — a spurious auto-open on someone else's old
+    // files is worse than one missed.
     if (_filesSessionId !== chatId) {
+      const seq = ++_filesSeq;
       _filesSessionId = chatId;
       _knownOutputs = new Set();
       const seed = await fetchSessionFiles(chatId, { quiet: true });
+      if (seq !== _filesSeq || currentChatId !== chatId) return;
       _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
       updateFilesBadge(seed.files.length);
       return;
     }
+    const seq = ++_filesSeq;
     const { files, truncated, ok } = await fetchSessionFiles(chatId, { quiet: true });
-    if (!ok) return;
+    // Same in-flight guard as the seed above: a slower open-time fetch must
+    // not overwrite this newer baseline, or the next turn re-reports these
+    // same files as fresh.
+    if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
     updateFilesBadge(files.length);
     const fresh = files.filter(isDeliverable).filter((f) => !_knownOutputs.has(f.path));
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
