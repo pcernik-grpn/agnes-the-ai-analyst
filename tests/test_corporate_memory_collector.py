@@ -770,7 +770,7 @@ class TestNotifyOnNewItems:
         assert published_ids == {"admin-1", "admin-2"}
         _, payload = published[0]
         assert payload["kind"] == "corporate_memory_pending"
-        assert payload["pending_count"] == 1
+        assert payload["new_pending_count"] == 1
 
     def test_notify_disabled_publishes_nothing(self, tmp_path, monkeypatch):
         stats, published = self._run(
@@ -811,3 +811,134 @@ class TestNotifyOnNewItems:
             admin_members=[{"id": "admin-1", "active": True}],
         )
         assert len(published) == 1
+
+
+class TestNotifyCountsOnlyNewPendingItems:
+    """The knob is ``notify_on_new_items``, so the number admins receive must
+    be what *this run* queued — not the standing backlog.
+
+    The collector rebuilds the catalog by full refresh, and
+    ``_process_catalog_response`` copies ``status`` forward for every
+    preserved item via GOVERNANCE_FIELDS. So a queue that has been sitting
+    unreviewed for weeks reappears in ``final_items`` still marked
+    ``pending`` on every run. Counting all of it re-notified every admin
+    about the whole backlog whenever any watched file changed, and the
+    message called all of it "new".
+    """
+
+    # Three items already queued by earlier runs, plus one the LLM reports as
+    # genuinely new (existing_id is null).
+    _EXISTING_CATALOG = {
+        "items": {
+            f"old-{n}": {
+                "id": f"old-{n}",
+                "title": f"Old tip {n}",
+                "content": f"Something learned a while ago ({n}).",
+                "category": "conventions",
+                "tags": ["legacy"],
+                "source_users": ["alice"],
+                "extracted_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "status": "pending",
+                "confidence": 0.5,
+                "approved_by": None,
+                "approved_at": None,
+                "mandatory_reason": None,
+                "audience": "all",
+                "review_by": None,
+                "edited_by": None,
+                "edited_at": None,
+            }
+            for n in (1, 2, 3)
+        },
+        "metadata": {},
+    }
+
+    _RESPONSE_WITH_ONE_NEW = {
+        "items": [
+            {
+                "existing_id": f"old-{n}",
+                "title": f"Old tip {n}",
+                "content": f"Something learned a while ago ({n}).",
+                "category": "conventions",
+                "tags": ["legacy"],
+                "source_users": ["alice"],
+            }
+            for n in (1, 2, 3)
+        ]
+        + [
+            {
+                "existing_id": None,
+                "title": "Use indexes",
+                "content": "Always add indexes for frequent query columns.",
+                "category": "performance",
+                "tags": ["sql", "indexes"],
+                "source_users": ["alice"],
+            }
+        ]
+    }
+
+    _RESPONSE_ALL_PRESERVED = {"items": _RESPONSE_WITH_ONE_NEW["items"][:3]}
+
+    def _run(self, tmp_path, monkeypatch, llm_response: dict):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, llm_response)
+        # Seed the backlog the previous runs left behind. _make_collect_all_env
+        # points KNOWLEDGE_FILE here but never creates it.
+        _write_json(tmp_path / "knowledge.json", self._EXISTING_CATALOG)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, published
+
+    def test_backlog_plus_one_new_notifies_about_one(self, tmp_path, monkeypatch):
+        """Three preserved pending items + one newly queued must announce 1,
+        not 4. Without the fix the notification carried
+        ``stats["items_pending"]`` (== 4) and read "4 new knowledge items"."""
+        stats, published = self._run(tmp_path, monkeypatch, self._RESPONSE_WITH_ONE_NEW)
+
+        assert stats["items_preserved"] == 3
+        assert stats["items_new"] == 1
+        # The backlog gauge keeps its meaning — it is what the CLI prints and
+        # what POST /api/admin/run-corporate-memory returns.
+        assert stats["items_pending"] == 4
+        assert stats["items_pending_new"] == 1
+
+        assert len(published) == 1
+        _, payload = published[0]
+        assert payload["new_pending_count"] == 1
+        assert payload["message"] == "1 new knowledge item awaiting review"
+
+    def test_backlog_with_nothing_new_notifies_nobody(self, tmp_path, monkeypatch):
+        """A run that only carries the queue forward must stay silent. This is
+        the re-notification loop itself: files changed, the LLM returned no
+        new item, yet the old code still published "3 new knowledge items"."""
+        stats, published = self._run(tmp_path, monkeypatch, self._RESPONSE_ALL_PRESERVED)
+
+        assert stats["items_preserved"] == 3
+        assert stats["items_new"] == 0
+        assert stats["items_pending"] == 3
+        assert stats["items_pending_new"] == 0
+        assert published == []

@@ -486,9 +486,19 @@ def check_sensitivity(extractor, item: dict) -> bool:
         return False
 
 
-def _notify_admins_of_pending_items(pending_count: int) -> None:
+def _notify_admins_of_pending_items(new_pending_count: int) -> None:
     """Best-effort desktop notification to every Admin-group member when a
     collection run leaves new items awaiting review (#1573 finding 2).
+
+    ``new_pending_count`` is the number of items *this run* added to the
+    review queue — never the size of the whole queue. The catalog is
+    rebuilt by full refresh on every run, so items an earlier run queued
+    are carried over into ``final_items`` still marked ``pending``;
+    counting those too would re-notify every admin about the entire
+    backlog whenever any watched file changed, and call all of it "new"
+    (which is exactly what the message below says). The backlog gauge
+    lives in ``stats["items_pending"]`` and is deliberately not what gets
+    published here.
 
     Mirrors ``app.services.sync_notifier.notify_sync_completed``'s fan-out
     pattern: ``publish_notification`` only reaches a member with a live
@@ -499,7 +509,7 @@ def _notify_admins_of_pending_items(pending_count: int) -> None:
     queue is still there next time an admin opens
     ``/admin/corporate-memory`` — so this never raises into the caller.
     """
-    if pending_count <= 0:
+    if new_pending_count <= 0:
         return
     try:
         from app.notifications import publish_notification
@@ -512,8 +522,8 @@ def _notify_admins_of_pending_items(pending_count: int) -> None:
         members = user_group_members_repo().list_members_for_group(admin_group["id"])
         message = (
             "1 new knowledge item awaiting review"
-            if pending_count == 1
-            else f"{pending_count} new knowledge items awaiting review"
+            if new_pending_count == 1
+            else f"{new_pending_count} new knowledge items awaiting review"
         )
         for member in members:
             if not member.get("active", True):
@@ -525,7 +535,7 @@ def _notify_admins_of_pending_items(pending_count: int) -> None:
                         "kind": "corporate_memory_pending",
                         "title": "Corporate Memory review queue",
                         "message": message,
-                        "pending_count": pending_count,
+                        "new_pending_count": new_pending_count,
                         "url": "/admin/corporate-memory",
                     },
                 )
@@ -559,6 +569,7 @@ def collect_all(dry_run: bool = False) -> dict:
         "items_preserved": 0,
         "items_new": 0,
         "items_pending": 0,
+        "items_pending_new": 0,
         "skipped": False,
         "errors": [],
         "items_db_inserted": 0,
@@ -677,7 +688,16 @@ def collect_all(dry_run: bool = False) -> dict:
             else:
                 stats["items_filtered"] += 1
 
+    # Two different questions, two different numbers. ``items_pending`` is the
+    # size of the whole review queue after this refresh (the gauge the CLI
+    # prints and POST /api/admin/run-corporate-memory returns);
+    # ``items_pending_new`` is what *this run* added to it — preserved items
+    # keep their old status through GOVERNANCE_FIELDS, so the two only
+    # coincide on a first run. Only the latter is notification-worthy.
     stats["items_pending"] = sum(1 for item in final_items.values() if item.get("status") == "pending")
+    stats["items_pending_new"] = sum(
+        1 for item_id, item in final_items.items() if item_id not in existing_ids and item.get("status") == "pending"
+    )
 
     # Step 8: Auto-tag new items with topic vocabulary (best-effort)
     new_items = [item for item_id, item in final_items.items() if item_id not in existing_ids]
@@ -766,10 +786,13 @@ def collect_all(dry_run: bool = False) -> dict:
         stats["items_db_updated"] = updated_count
         stats["items_db_errors"] = errors
 
-        # #1573: notify admins a review queue exists to triage, unless the
-        # instance opted out. Defaults on to match the schema default.
+        # #1573: notify admins that this run queued something new to triage,
+        # unless the instance opted out. Defaults on to match the schema
+        # default. Deliberately items_pending_new, not items_pending — the
+        # knob is named notify_on_new_items, and re-announcing the standing
+        # backlog on every run is how a notification channel gets muted.
         if governance_config.get("notify_on_new_items", True):
-            _notify_admins_of_pending_items(stats["items_pending"])
+            _notify_admins_of_pending_items(stats["items_pending_new"])
 
         # Save user hashes only after DB sync — if every item failed to sync,
         # skip the hash write so the next scheduled run retries rather than
@@ -877,6 +900,7 @@ def main() -> int:
     print(f"  Items filtered (sensitive): {stats['items_filtered']}")
     if stats.get("items_pending"):
         print(f"  Items pending review: {stats['items_pending']}")
+        print(f"    ...of which new this run: {stats.get('items_pending_new', 0)}")
 
     if stats["errors"]:
         print(f"\nErrors ({len(stats['errors'])}):")
