@@ -1206,6 +1206,7 @@ class TestStoreSmoke:
         "POST /api/store/entities/dryrun",
         "POST /api/store/entities",
         "POST /api/store/entities/from-markdown",
+        "POST /api/store/entities/from-components",
         "PUT /api/store/entities/{entity_id}",
         "POST /api/store/entities/{entity_id}/install",
         "DELETE /api/store/entities/{entity_id}/install",
@@ -1289,6 +1290,51 @@ class TestStoreSmoke:
         body = r.json()
         assert body["id"]
         assert body["type"] == "agent"
+
+    def test_entities_create_from_components(self, seeded_app_both):
+        """POST /entities/from-components — bundle published items into one plugin.
+
+        Composes from an entity created in the same test rather than a fixture
+        id: the endpoint resolves every component against the caller's own
+        visibility, so a borrowed id would pass or 404 depending on seed order.
+        """
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        body = (
+            "Step one: describe the scenario under test in plain language. "
+            "Step two: call the endpoint with a valid payload and capture the response. "
+            "Step three: assert the entity was created with status 201 and a non-empty id field."
+        )
+        made = client.post(
+            "/api/store/entities/from-markdown",
+            json={
+                "name": "smoke-compose-part",
+                "description": (
+                    "Use when smoke-testing the compose endpoint's component resolution across both backends."
+                ),
+                "category": "Other",
+                "skill_md": body,
+            },
+            headers=headers,
+        )
+        assert made.status_code == 201, made.text
+
+        r = client.post(
+            "/api/store/entities/from-components",
+            json={
+                "name": "smoke-composed-plugin",
+                "description": (
+                    "Use when smoke-testing that several published items bundle into one installable plugin."
+                ),
+                "category": "Other",
+                "components": [made.json()["id"]],
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        composed = r.json()
+        assert composed["id"]
+        assert composed["type"] == "plugin"
 
 
 # ---------------------------------------------------------------------------

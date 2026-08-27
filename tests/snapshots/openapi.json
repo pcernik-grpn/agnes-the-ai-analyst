@@ -2498,6 +2498,73 @@
         "title": "CreateDraftRequest",
         "type": "object"
       },
+      "CreateFromComponentsBody": {
+        "description": "JSON contract for composing a plugin out of Library entities.\n\nDeliberately the same metadata fields as ``CreateFromMarkdownBody`` \u2014 the\nbuilder posts one shape or the other depending on which source the author\npicked, and both delegate to ``create_entity`` so quota, guardrails, LLM\nreview, naming and versioning apply identically.",
+        "properties": {
+          "access": {
+            "default": "everyone",
+            "enum": [
+              "private",
+              "everyone"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "components": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "publisher_kind": {
+            "default": "user",
+            "enum": [
+              "user",
+              "organization"
+            ],
+            "title": "Publisher Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateFromComponentsBody",
+        "type": "object"
+      },
       "CreateFromMarkdownBody": {
         "description": "JSON contract for markdown-first publishing (studio Skill Builder /\nAgent Builder).",
         "properties": {
@@ -45284,6 +45351,70 @@
           }
         },
         "summary": "Dryrun Entity",
+        "tags": [
+          "store"
+        ]
+      }
+    },
+    "/api/store/entities/from-components": {
+      "post": {
+        "description": "Compose a plugin from Library entities the caller can already see.\n\nMerges each selected entity's baked subtree into one plugin tree, zips it\nin memory, and delegates to ``create_entity`` \u2014 so a composite is\nindistinguishable downstream from an uploaded ``.zip`` of the same bytes,\nand pays the same guardrail review.\n\n``dry_run=True`` returns a ``PreviewResponse`` (the shape the ``.zip``\nCheck path returns) and writes nothing.",
+        "operationId": "create_entity_from_components_api_store_entities_from_components_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFromComponentsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Entity From Components",
         "tags": [
           "store"
         ]

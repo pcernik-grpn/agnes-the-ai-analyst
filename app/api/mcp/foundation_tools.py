@@ -90,6 +90,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "store_rate",
     "store_status",
     "store_publish_markdown",
+    "store_compose_plugin",
     # Full agent/skill lifecycle parity (REST × CLI × MCP): discover, inspect,
     # install/remove, edit, delete — an agent can manage its own store
     # entities and stack without leaving the chat. Binary paths (ZIP upload,
@@ -1091,6 +1092,48 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.post(
                 f"{base_url}/api/store/entities/from-markdown",
+                json=payload,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=False)
+    async def store_compose_plugin(
+        name: str,
+        components: list[str],
+        description: str | None = None,
+        category: str | None = None,
+    ) -> dict:
+        """Bundle skills and agent templates you already have into one plugin.
+
+        Every store entity is already served as a plugin in its own right, so
+        this is not how a single skill is published — it is how several are
+        handed over in ONE install. The server merges each component's bundle
+        into one tree and runs it through the same guardrail + review pipeline
+        as a ZIP upload. Mirrors ``POST /api/store/entities/from-components``
+        and ``agnes store compose``.
+
+        Args:
+            name:        Name for the plugin — lowercase letters, digits, dashes.
+            components:  Store entity ids to bundle (skills and agent templates
+                         only; find them with ``marketplace_search``). A plugin
+                         cannot contain another plugin.
+            description: What the plugin adds and who should install it.
+            category:    Optional store category (case-insensitive).
+
+        Returns the created entity — ``{"id", "name", "invocation_name",
+        "version", "visibility_status", …}``.
+        """
+        payload: dict = {"name": name, "components": list(components)}
+        if description:
+            payload["description"] = description
+        if category:
+            payload["category"] = category
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/store/entities/from-components",
                 json=payload,
                 headers=headers_fn(),
                 timeout=60,

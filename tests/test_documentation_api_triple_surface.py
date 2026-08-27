@@ -48,6 +48,9 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Markdown-first skill publish (studio Skill Builder direct-publish flow,
     # issue #688). CLI: `store publish-md`. MCP: `store_publish_markdown`.
     "/api/store/entities/from-markdown": ("store publish-md", "store_publish_markdown"),
+    # The composed sibling of from-markdown: same JSON-create shape, so it takes
+    # the same three surfaces. The .zip upload path stays _EXEMPT (binary).
+    "/api/store/entities/from-components": ("store compose", "store_compose_plugin"),
     # Full agent/skill lifecycle parity — an agent can discover, inspect,
     # install/remove marketplace items and edit/delete its own store entities
     # over any of the three surfaces. Binary siblings (ZIP upload/replace,
