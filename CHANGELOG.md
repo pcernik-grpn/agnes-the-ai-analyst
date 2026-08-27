@@ -12,6 +12,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
+  A ready agent's card used to start a conversation, which meant the one obvious
+  gesture on the page whose whole subject is the *configuration* went somewhere
+  else, and editing was left to a small `Edit` button in the card's footer. Cards
+  now behave the same in both bands — click to configure — and **Chat** is the
+  footer action on every card (draft ones already had it). Nothing became
+  unreachable: the composer's own agent picker still opens a session as any
+  agent.
+
 - **Fixed: the empty-instance chat landing told the reader something untrue.**
   Its lede read "It knows nothing about your company yet, so it can answer
   nothing", and that second clause is false — with no data registered {brand}

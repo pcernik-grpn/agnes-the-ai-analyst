@@ -1,10 +1,14 @@
 """The /agents index sorts by what you would do with the agent, not by name.
 
 A ready agent and a draft are different objects to their owner: one is a thing
-you use, the other a thing you are still making. The list says so twice — in
-two titled bands (ready first), and in what a card's click does. Clicking a
-ready card starts a conversation with it; clicking a draft reopens the builder.
-Neither route is lost, because each card carries the other as a footer action.
+you use, the other a thing you are still making. The list says so in two titled
+bands, ready first.
+
+What a CARD does is the same in both bands: it opens the builder. This page is
+where an agent is configured, so the one obvious gesture on a card has to reach
+that; a ready card used to start a conversation instead, which left editing to a
+small footer button on the page whose whole subject is the configuration.
+Chatting keeps a footer action on every card, so neither route is lost.
 
 Markup-level contracts on ``agents.html``, whose list view is rendered by the
 page's own inline script (as the rest of this page's suites already assume).
@@ -80,35 +84,30 @@ class TestTheListIsGroupedByState:
         assert 'class="ag-new"' in card.group(1)
 
 
-class TestTheCardsPrimaryActionFollowsItsState:
-    def test_a_ready_card_opens_a_conversation(self, agent_card, markup):
-        assert "data-ag-chatcard=" in agent_card
-        handler = re.search(
-            r"t\.hasAttribute\('data-ag-chatcard'\)\) \{(.*?)\n    \}", markup, re.S
-        )
-        assert handler, "no data-ag-chatcard branch in the click handler"
-        assert "/chat?agent=" in handler.group(1)
+class TestEveryCardOpensTheBuilder:
+    def test_the_card_click_opens_the_builder_in_both_states(self, agent_card):
+        """Not a conversation: the card stands for the CONFIGURATION on the page
+        that configures it. Unconditional, so a ready card and a draft behave
+        the same."""
+        assert "var open = 'data-ag-open=\"' + esc(a.id) + '\"';" in agent_card
+        assert "data-ag-chatcard" not in agent_card, "a card still opens a chat"
 
-    def test_a_draft_card_opens_the_builder(self, agent_card):
-        assert "data-ag-open=" in agent_card
+    def test_no_chatcard_route_is_left_anywhere_on_the_page(self, markup):
+        """Including the click handler and the keyboard-activation selector — a
+        branch nothing emits is a trap for the next reader."""
+        assert "data-ag-chatcard" not in markup
 
-    def test_a_ready_card_still_offers_edit(self, agent_card):
-        """The builder must stay reachable once an agent is marked ready —
-        otherwise marking it ready is a one-way door."""
-        assert re.search(r"isReady\s*\n?\s*\?\s*'<button[^']*data-ag-open=", agent_card)
-        assert ">Edit<" in agent_card
-
-    def test_a_draft_card_still_offers_chat(self, agent_card):
-        """Every agent stays talk-to-able, draft included — see the comment on
-        `alt` in agentCard for why this is not gated on surfaces.web."""
+    def test_every_card_offers_chat_in_its_footer(self, agent_card):
+        """The route the card click used to be. Every agent stays talk-to-able,
+        draft included — see the comment on `alt` in agentCard for why this is
+        not gated on surfaces.web."""
         assert "'<a class=\"ag-chat\" href=\"/chat?agent=" in agent_card
+        assert ">Edit<" not in agent_card, "the card itself is the edit route now"
 
-    def test_a_ready_agent_without_a_slug_falls_back_to_the_builder(self, agent_card):
-        """There is no session to open without a slug; a dead card is worse
-        than one that opens the editor."""
-        assert "isReady && a.slug" in agent_card
+    def test_an_agent_without_a_slug_offers_no_chat_action(self, agent_card):
+        """There is no session to open without a slug, and a dead link is worse
+        than no link. The card still opens the builder."""
+        assert re.search(r"var alt = a\.slug\s*\n?\s*\?", agent_card)
 
     def test_the_card_is_keyboard_reachable(self, markup):
-        assert re.search(
-            r"closest\('\[data-ag-open\],\[data-ag-chatcard\],\[data-ag-toggle-sec\]'\)", markup
-        )
+        assert re.search(r"closest\('\[data-ag-open\],\[data-ag-toggle-sec\]'\)", markup)
