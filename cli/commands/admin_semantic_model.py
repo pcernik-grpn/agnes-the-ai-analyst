@@ -156,6 +156,51 @@ def export_model(
     typer.echo(text, nl=not text.endswith("\n"))
 
 
+@admin_semantic_model_app.command("detach")
+def detach_model(
+    model_ref: str = typer.Argument(..., help="Model id or slug"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """F3: stop sync from overwriting a source-owned model, so it can be
+    edited (``import``/``agnes admin semantic-model import``, or via the
+    web UI). PG-only (A3 ratchet) — 501s naming the feature on a
+    DuckDB-backed instance."""
+    if not yes:
+        if not typer.confirm(f"Detach {model_ref}? Sync will stop overwriting it until you re-attach."):
+            raise typer.Abort()
+    resp = api_post(f"/api/admin/semantic-models/{model_ref}/detach", json={"confirm_detach": True})
+    if resp.status_code == 404:
+        _not_found(model_ref)
+    if resp.status_code != 200:
+        _fail(resp)
+    typer.echo(f"Detached {model_ref}")
+
+
+@admin_semantic_model_app.command("reattach")
+def reattach_model(
+    model_ref: str = typer.Argument(..., help="Model id or slug"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """F3: return a detached model to the sync path — the next sync run
+    rewrites its document from the source, discarding any local edit."""
+    if not yes:
+        resp = api_get(f"/api/admin/semantic-models/{model_ref}")
+        row = resp.json() if resp.status_code == 200 else {}
+        source_content_hash = row.get("source_content_hash")
+        # NULL means no sync has run since detach yet — "unknown", not
+        # "changed" (a bare `!=` would misreport that).
+        changed = source_content_hash is not None and source_content_hash != row.get("detach_base_hash")
+        warning = " The source has changed since you detached it." if changed else ""
+        if not typer.confirm(f"Re-attach {model_ref}? Your local edits will be replaced at the next sync.{warning}"):
+            raise typer.Abort()
+    resp = api_post(f"/api/admin/semantic-models/{model_ref}/reattach", json={"confirm_reattach": True})
+    if resp.status_code == 404:
+        _not_found(model_ref)
+    if resp.status_code != 200:
+        _fail(resp)
+    typer.echo(f"Re-attached {model_ref}")
+
+
 @admin_semantic_model_app.command("validate")
 def validate_model(
     path: str = typer.Argument(..., help="Path to a local Ossie YAML document"),

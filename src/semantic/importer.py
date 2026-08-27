@@ -141,6 +141,17 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             report.invalid.append({"content_hash": content_hash, "errors": errors})
 
         existing = existing_by_slug.get(slug_key)
+        if existing is not None and existing.get("sync_mode") == "detached":
+            # F3: a detached row is never overwritten by sync — the admin's
+            # local edit stays authoritative. Park the latest hash seen from
+            # the source (cheap no-op write once it stops changing) so the
+            # "source changed since you detached" indicator and re-attach
+            # preview can read it without a live fetch.
+            if content_hash != existing.get("source_content_hash"):
+                repo.update_source_content_hash(existing["id"], content_hash)
+            if status == "valid":
+                report.models_unchanged += 1
+            continue
         if existing is not None and existing.get("content_hash") == content_hash:
             if status == "valid":
                 report.models_unchanged += 1
@@ -163,6 +174,19 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
         )
         if status == "valid":
             report.models_written += 1
+
+    # F3: a detached row's slug not in `keep_slugs` means the source stopped
+    # sending it this run — track that as "missing", never delete it
+    # (`delete_missing` already excludes detached rows on its own). A slug
+    # that comes back after being missing gets the marker cleared.
+    for existing in existing_rows:
+        if existing.get("sync_mode") != "detached":
+            continue
+        if existing["slug"] in keep_slugs:
+            if existing.get("source_missing_since") is not None:
+                repo.clear_source_missing(existing["id"])
+        else:
+            repo.mark_source_missing(existing["id"])
 
     report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
 
