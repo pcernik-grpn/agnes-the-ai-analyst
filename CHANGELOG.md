@@ -539,6 +539,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- `POST /api/marketplaces/{id}/sync` ("Sync now") no longer blocks the
+  event loop (#1614). The handler was declared `async def` but called the
+  fully synchronous `sync_one()` (subprocess git clone, DuckDB writes, a
+  process-wide lock) directly, so it ran on the asyncio thread and froze
+  every other request — health checks, logins, unrelated API calls — for
+  the duration of the sync. Declared `def` now, matching the bulk
+  `POST /api/marketplaces/sync-all` sibling, which already runs in a
+  thread pool for the same reason.
+
+- A manual "Sync now" (`sync_one()`) now invalidates the marketplace ZIP
+  ETag and cowork bundle caches on success, matching the nightly bulk sync
+  (`sync_marketplaces()`) (#1615). Previously a manual sync reported a
+  fresh commit while `/marketplace.zip` and the cowork bundle kept serving
+  pre-sync bytes until their TTL expired (up to 5 minutes) — the opposite
+  of what an on-demand sync is for. Both paths now share one
+  `_invalidate_served_caches()` helper so they cannot drift apart again; a
+  failed sync still leaves the caches untouched.
+
 - `use_pg()` no longer reverts a Postgres instance running purely on the
   `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`
   declaration) to an empty DuckDB backend the first time an admin saves an
