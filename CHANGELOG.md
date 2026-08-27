@@ -99,6 +99,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [0.90.0] - 2026-08-27
 
 ### Added
+- **File sources can be granted per crawl scope.** A source that crawls documents rather than tables (the first is SharePoint) records which sites and folders an admin chose to crawl, and each of those becomes a grantable `document_scope` resource on `/admin/access`. A scope left ungranted is indexed but reaches nobody, so the page shows each scope's document count and groups them by connection. Backed by the connection's own configuration — no new table and no migration.
+- **A SharePoint connection resolves its certificate from the vault or from the deployment.** Microsoft Graph refuses client secrets for app-only access, so the certificate is the credential: an admin either uploads their own (held encrypted in the connection's vault slot, and preferred when both exist) or points at one the deployment already injects, named by `config.cert_private_key_env` and defaulting to `SHAREPOINT_CERT_PRIVATE_KEY`. That name is admin-writable, so it is checked against the shared credential-variable allowlist — a connection cannot name an unrelated secret and have its value handed out as the certificate.
 - **A hosted data app's description can be edited after it is created.**
   `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
   not_managed`, so a hosted app's description was write-once: `POST
