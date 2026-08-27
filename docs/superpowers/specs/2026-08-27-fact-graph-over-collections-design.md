@@ -6,10 +6,12 @@ Agnes code, cuesta-star-graph, evaluation workbook v0.2, licences/services, UI)
 **Verified against:** Agnes worktree `zs/facts-scope-access` (base `d97e186a8`),
 `keboola/cuesta-star-graph` main `753be22`, `eval_scoring_workbook_v0.2.xlsx`
 (FROZEN 2026-08-27), `padak/doc_quantization`, `padak/doc_converter`.
-**Scope note:** this spec deliberately contains customer-specific acceptance
-material (the evaluation workbook, Kantata, personas) by owner decision of
-2026-08-27. If this repository ever returns to public distribution, §14–§16
-move to a private repo first.
+**Scope note:** this spec deliberately contains customer-specific material
+(the evaluation workbook, Kantata, personas, TCRD ticket ids, the 1P vault
+name) by owner decision of 2026-08-27 — concentrated in §14–§17 but also
+present in §1, §5, §7 and §8. If this repository ever returns to public
+distribution, the spec must be scrubbed or moved to a private repo as a
+whole; a section-range excision is not sufficient.
 
 ## 0. Revision history — what was wrong and why it changed
 
@@ -46,7 +48,8 @@ constrains the design.
 6. **The evaluation standard is workbook v0.2 in full** (§14) — five arms,
    five thresholds, 0/1/2 rubric, cadence, protocol. The cuesta repo's eval
    was aligned to v0.2 on 2026-08-27 (commit `753be22`): its 12 sandbox
-   questions now map onto the ten workbook prompts, and its protocol already
+   questions now map onto the ten workbook prompts (two are sandbox-only
+   leftovers and two workbook ids are uncovered — §14.5), and its protocol already
    defines the A3′ (same-context) rehearsal arm — the earlier claim that "no
    arm tests A4 vs A3" is stale for the sandbox; what remains unbuilt is the
    **real** A3 seed-pack arm for workbook rounds.
@@ -64,7 +67,13 @@ constrains the design.
     lacked; the claims cascade contradicted a "recovery" promise;
     `visibility_mode` looked like a column but is instance config. All fixed
     in §3.
-11. **The worker lane is a code change, not configuration** — `_VALID_LANES`
+11. **Three designs were rejected and are recorded here so nobody
+    re-proposes them**: a standalone `documents` table (duplicates
+    `corpus_files` and the grant model), `DOCUMENT_SCOPE` grants (a competing
+    grant surface — the collection IS the grant unit; the committed remnant
+    is reverted per §16), and `_remote_attach` to an external fact store
+    (facts must live beside `corpus_files` for the FK and the filter).
+12. **The worker lane is a code change, not configuration** — `_VALID_LANES`
     is a closed two-value tuple
     ([app/worker/registry.py:21](../../../app/worker/registry.py)) and
     per-process lane selection does not exist (§16 step 7).
@@ -153,7 +162,9 @@ for one of them, which is how it leaked.
 
 ## 3. Schema
 
-Postgres only. One Alembic revision; SQLAlchemy models in `src/db_pg.py`.
+Postgres only. One Alembic revision for the facts tables (the
+`corpus_file_sources` DDL belongs to the §6 prerequisite PR); SQLAlchemy
+models added per repo convention.
 
 ```
 facts        id TEXT PK                    -- 'f_' + token_hex(8); opaque, never derived
@@ -182,15 +193,20 @@ claims       id TEXT PK                    -- 'c_' + token_hex(8)
              quote_hash TEXT NOT NULL      -- sha256(quote)[:16], computed at write
              document_date DATE NULL       -- from the source system (§10)
              created_at TIMESTAMPTZ
-             UNIQUE (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash)
+             -- functional UNIQUE INDEX (not a table constraint — Postgres
+             -- cannot express COALESCE in UNIQUE; Alembic: op.create_index
+             -- with sa.text and unique=True):
+             --   (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash)
 
 corpus_file_sources                        -- NEW PG-only table; the anchor (§6)
              corpus_file_id TEXT PK FK→corpus_files(id) ON DELETE CASCADE
              corpus_id TEXT NOT NULL
              source_stable_id TEXT NOT NULL    -- crawler's stable_id ('graph:<driveItem-id>')
+             source_doc_id TEXT                -- crawler's citation key, sha256[:16] (§7.2);
+                                               --   rewritten when a provisional id is replaced
              source_sha256 TEXT
              source_url TEXT NULL              -- when it lands (open item O7)
-             UNIQUE (corpus_id, source_stable_id)
+             UNIQUE (corpus_id, source_stable_id) · INDEX (corpus_id, source_doc_id)
 
 corrections  subject_kind TEXT NOT NULL    -- 'fact' | 'edge'
              subject_id TEXT NOT NULL      -- PK (subject_kind, subject_id)
@@ -202,7 +218,9 @@ corrections  subject_kind TEXT NOT NULL    -- 'fact' | 'edge'
 
 Indexes: `claims(corpus_id)`, `claims(fact_id)`, `claims(edge_id)`,
 `claims(corpus_file_id)`, `facts(type)`, `edges(src)`, `edges(dst)`,
-`fact_aliases(fact_id)`.
+`fact_aliases(fact_id)`, **GIN on `corrections.natural_keys`** (the
+re-attach lookup runs on every ingest). All timestamps carry
+`server_default=now()`.
 
 Load-bearing details:
 
@@ -302,8 +320,8 @@ Three implementation rules, each answering a found hole:
    opaque (§3) reduces but does not remove the probing surface.
 3. **Traversal re-evaluates at every hop.** `fact_neighbors` never walks from
    a visible subject into one whose claims are unreadable, and never reveals
-   that a path continues. Caps: depth default 3 / max 4, per-node fanout 100,
-   result 500, statement timeout. The hub-node walk is the query that
+   that a path continues. Caps live in §12 (one home): ships with depth
+   default 1 / max 2, per-node fanout 100, result 500, statement timeout. The hub-node walk is the query that
    explodes and the one the benchmark never ran (§12).
 
 **No general SQL escape hatch** over these tables, in any surface. An
@@ -337,13 +355,24 @@ with content). Metadata-only rows carry a *provisional* doc_id
   `corpus_file_id`. It is a **new PG-only table** because `corpus_files` is a
   frozen DuckDB+PG pair and the DuckDB ladder is frozen at 124 — no new
   column is possible there.
-- **Prerequisite change to Collections** (its own PR, justified on its own):
-  the upload path gains an optional `source_stable_id`. Upsert order:
-  match by `(corpus_id, source_stable_id)` first, then by `(corpus_id, path)`.
-  On a match, **UPDATE in place — id preserved**; if the content sha is
-  unchanged, skip re-chunking entirely (a no-op re-sync costs nothing); if
-  changed, purge chunks and reset `processing_status` on the *same* row.
-  Path-only uploads (manual UI) keep today's flow plus the sha short-circuit.
+- **Prerequisite change to Collections** (its own PR, precisely scoped):
+  – **owns the `corpus_file_sources` DDL** in its own Alembic revision (the
+    facts revision of §16 step 2 depends on it, never creates it);
+  – API: the upload endpoint gains positionally-paired form fields
+    `source_stable_ids` (+ optional `source_doc_ids`, `source_sha256s`,
+    `document_dates`), mirroring how `paths` pairs with files today;
+  – upsert order: match `(corpus_id, source_stable_id)` first, then
+    `(corpus_id, path)`; **any match via this code path preserves the row
+    id** — including a manual path re-upload of a crawler-anchored file, so
+    a hand upload can no longer cascade a document's claims away. Unchanged
+    sha → skip re-chunking entirely; changed → purge chunks + reset
+    `processing_status` on the same row. In-place update purges zip-bundle
+    children exactly as today's purge walk does;
+  – **frozen-pair obligation**: the update-in-place methods land in
+    `corpus_files.py` AND `corpus_files_pg.py` with the contract test
+    extended — this PR touches a maintained pair, unlike the facts PR;
+  – **DuckDB backends**: supplying `source_stable_ids` yields the typed 501
+    (the mapping table is PG-only); omitting it keeps today's flow intact.
 - Ingest (§7) refuses a claim whose `doc` reference cannot be resolved
   through this mapping.
 
@@ -356,9 +385,12 @@ Lifecycle:
 | content changed | same row, new sha; that document's claims **replaced** on next extraction (old quotes may no longer exist in the text) |
 | deleted in source / moved out of crawl scope | row deleted → claims cascade → subjects left with zero claims are deleted **and counted in the run report**; their `corrections` rows survive (§3) |
 
-The orphan-subject sweep runs as its own step **after** ingest, never inside
-the ingest transaction — a bundle re-ingest must not hold a long transaction
-on the app-state database that also serves auth and sessions.
+The orphan-subject sweep runs as its own step **after any batch of
+`corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
+file from a collection cascades claims exactly the same way) — never inside
+the deleting transaction. Its counts land in the run report or, for UI
+deletions, on the source card, attributed to the operation that triggered
+them.
 
 ---
 
@@ -406,8 +438,9 @@ We adopt `crawl.py`, we do not rewrite it. Present and kept: `getAllSites`
 (the `search=*` endpoint silently under-returned 2/10 sites for app-only
 tokens, observed live), per-drive `deltaLink` persisted, delta deletions
 handled, repair pass (delta never revisits an unchanged file), 429
-`Retry-After`, temp-download→hash→extract→delete, `markitdown[all]` (bare
-`markitdown` breaks every Office conversion).
+`Retry-After`, at most one full delta pass per day, temp-download→hash→
+extract→delete, `markitdown[all]` (bare `markitdown` breaks every Office
+conversion).
 
 **Absent, and required for production** (verified by audit — zero hits for
 each): webhook subscriptions + renewal before expiry; `410 Gone` → full
@@ -433,9 +466,45 @@ surfaced in the UI (§13.2).
 
 ### 7.2 Ingest API
 
-`POST /api/facts/ingest` — scheduler-token or admin PAT; body =
-`{documents: [...], nodes: [...], edges: [...]}` (the shapes above; documents
-optional when only re-asserting). Batch limits enforced; CSRF n/a (bearer).
+`POST /api/facts/ingest` — scheduler-token
+([app/auth/scheduler_token.py](../../../app/auth/scheduler_token.py)) or
+admin PAT; CSRF n/a (bearer). Body:
+
+```jsonc
+{"documents": [...],            // make_row rows, each EXTENDED by the producer
+                                 //   with "corpus_id" (from its scope config —
+                                 //   crawl.py does not know collections)
+ "full_documents": ["<doc_id>"], // replace-mode markers, see below
+ "nodes": [...], "edges": [...]}
+```
+
+**Two modes, explicit in the wire contract:**
+
+- A document listed in `full_documents` is **replaced**: ALL existing claims
+  with its `corpus_file_id` are deleted, then the incoming ones inserted — so
+  a subject the re-extraction no longer mentions loses its stale claim (this
+  is what makes test C2 pass; the earlier "delete by file ∩ incoming
+  subjects" mechanism could not, because a dropped subject is not in the
+  incoming set). **A listed document's complete claim set must arrive in the
+  same request** — batch limits are sized for that (≤500 documents, ≤5000
+  claims per request; one document exceeding the claim cap is a protocol
+  error to surface, never to split).
+- A document *not* listed is in **union mode**: claims merge by
+  `(subject, corpus_file_id, quote_hash)` — re-asserting is a no-op, new
+  quotes accumulate.
+
+**`doc_id` resolution is defined, not guessed:** `corpus_file_sources`
+carries `source_doc_id` (the crawler's citation key, `sha256[:16]`; rewritten
+when a provisional metadata-only id is replaced by the content id). Evidence
+`doc_id` resolves `→ corpus_file_sources.source_doc_id → corpus_file_id`.
+The `documents` array may be omitted **only** when every referenced `doc_id`
+already resolves; otherwise the batch is rejected with the unresolved ids
+itemized.
+
+**Timing:** a claim referencing a file whose `processing_status` is not yet
+`indexed` is **deferred, not rejected** — the response lists it under
+`deferred` with retry-after semantics, because the verbatim gate needs the
+chunk text to exist.
 
 Semantics:
 
@@ -448,12 +517,10 @@ Semantics:
 - **Aliases**: node id `<type>:<slug>` resolves via `fact_aliases`; unknown →
   new subject + alias. Type conflict on an existing alias → rejected row
   (the sandbox loader hard-exits; we itemize instead).
-- **Evidence union, not replacement.** Re-asserting a subject merges claims
-  by `(subject, corpus_file_id, quote_hash)`. The sandbox `load_postgres.py`
-  *replaces* evidence on upsert, so partial loads there wipe cross-document
-  evidence — our ingest must not inherit that. A full re-extraction of one
-  document replaces exactly **that document's** claims (delete by
-  `corpus_file_id` ∩ incoming subject set, then insert).
+- **Union is the default; replacement is explicit** (`full_documents`,
+  above). The sandbox `load_postgres.py` *replaces* evidence on upsert, so a
+  partial load there wipes cross-document evidence — our ingest must not
+  inherit that; union mode is why it cannot.
 - **`possible_duplicate_of` edges** are accepted and surfaced as
   entity-resolution review items — they are the reconcile pass's keep-split
   signal, and the sandbox's own checklist ("conflict → review queue visible
@@ -462,6 +529,17 @@ Semantics:
   reason}], subjects_created, subjects_deleted (orphans), corrections_active:
   [...]}` — the orphan count is the honesty §6 requires.
 - **Idempotent**: replaying the same batch is a no-op by the uniqueness keys.
+
+**What the producer uploads as file content — decided, because §8's gate
+depends on it:** the crawler uploads the **converted (and, for anonymized
+scopes, anonymized) markdown** as the collection file's content, via the
+normal upload endpoint. Agnes chunks that markdown; quotes are checked
+against those chunks; the gate is consistent because producer and store hold
+the same text. The **original binary is never uploaded** — "content is not
+copied" in §13.2 means the *source file*; the markdown extraction is stored
+(so `storage_path` is set in this flow; the `storage_path = NULL` case
+remains what it is today — a metadata-only registration, not this pipeline's
+path).
 
 The pipeline's unscripted step — concatenating `agent-*.jsonl` + converter
 output into one graph before gates — is subsumed: ingest accepts the merged
@@ -647,7 +725,11 @@ systems).
 - Same date, incompatible values → **conflict**: both kept with evidence,
   surfaced for a human, never silently merged.
 - Null dates: a dated claim beats an undated one; two undated contradictory
-  claims are a conflict, never a silent pick.
+  claims are a conflict, never a silent pick. (Deliberate refinement of the
+  earlier "null always routes to conflict" rule: Graph sources always carry
+  `lastModifiedDateTime`, so undated claims are the rare case, and routing
+  every dated-vs-undated pair to a human would flood the queue the design
+  exists to keep small.)
 
 ---
 
@@ -687,13 +769,15 @@ section, anti-volume grading, conflict-is-a-result.
 
 ## 12. Query surface
 
-Behind `facts.enabled`, REST × CLI × MCP per the command-UX standard
-(sync-map rows 51/58/59):
+Behind `facts.enabled`, REST × CLI × MCP per the command-UX standard (the
+CONTRIBUTING sync-map rows for the REST/CLI/MCP triple surface, the
+command-UX flag vocabulary, and foundation-tool registration — cite by
+content; row numbers drift):
 
 | REST | CLI | MCP foundation tool |
 |---|---|---|
 | `POST /api/facts/search` `{type, filters, limit≤100}` | `agnes facts search` | `fact_search` |
-| `POST /api/facts/neighbors` `{subject_id, edge_types?, depth≤3(max 4), fanout≤100, limit≤500}` | `agnes facts neighbors` | `fact_neighbors` |
+| `POST /api/facts/neighbors` `{subject_id, edge_types?, depth≤1(max 2), fanout≤100, limit≤500}` | `agnes facts neighbors` | `fact_neighbors` |
 | `GET /api/facts/{subject_id}/claims` | `agnes facts claims` | `fact_claims` |
 
 All filter by caller in the repository (§5); 404 semantics per §5 rule 2;
@@ -702,14 +786,41 @@ deliberate, labeled deviation the CLI hint explains). Foundation tools
 register in `app/api/mcp/foundation_tools.py` + `FOUNDATION_TOOL_NAMES`,
 guarded by `tests/test_mcp_tool_parity.py`.
 
+**Response shapes** (the OpenAPI snapshot, CLI output and MCP schemas all
+derive from these):
+
+```jsonc
+// search →
+{"subjects": [{"id", "type", "aliases": [..],
+   "attrs": {"<key>": {"value", "document_date"} | {"conflicted": true, "values": [..]}},
+   "claim_count", "quote_count"}], "limit_applied"}
+// neighbors →
+{"nodes": [<subject as above>],
+ "edges": [{"id", "src", "dst", "type",
+            "attrs": {<same projected shape>}}],
+ "truncated": {"depth": bool, "fanout": bool, "result": bool}}
+// claims →
+{"claims": [{"id", "corpus_id", "corpus_file_id",
+   "document": {"name", "path", "source_url"?},
+   "quote", "attrs", "document_date"}]}
+```
+
+**The attrs projection runs in SQL, not Python** — a lateral `jsonb_each`
+over readable claims with per-key latest-date resolution — because §5 rule 1
+makes placement load-bearing: `filters` must evaluate against the projected
+values **before LIMIT**, or the short-page shortfall oracle (S6) returns
+through the back door.
+
 **Edges are stored from day one** (they are in the wire format and the graded
-relational prompts G1/G2 need them); what is **gated on the evaluation** is
-deeper traversal investment — `fact_neighbors` beyond depth 1–2, any graph
-engine, any traversal-first UI. If A4 cannot beat A3 (§14 Decision #2), the
+relational prompts G1/G2 need them). `fact_neighbors` **ships with depth
+default 1 / max 2** — enough for S3/S4 and the graded prompts; the **3/4
+ceiling, any graph engine, and any traversal-first UI unlock only with
+Decision #2** (§16 step 8). One rule, stated here; §5 references it. If A4 cannot beat A3 (§14 Decision #2), the
 honest conclusion is that this is typed, cited, permission-filtered
 extraction — still worth having — and the traversal half stays unbuilt.
 
-Performance: synthetic measurements (293k facts / 967k edges: 4-hop join
+Performance: synthetic scratch measurements (2026-08-27, dev workstation,
+unreproduced — no committed artifact; 293k facts / 967k edges: 4-hop join
 63 ms, recursive walk 5 ms) establish only that the join shape is not
 inherently expensive. They omitted the visibility predicate at every hop and
 used uniform-degree data; real graphs have hubs. **Re-measure with the
@@ -774,9 +885,11 @@ on recreate — surface absence rather than fail the first crawl). Step 2: the
 folder tree — each selected scope shows its `→ collection` badge; a folder
 with its own source-side rights splits into its own collection; unselected
 rows are explicit exclusions; the **anonymize column** sits on the same scope
-row (§9); a note states content is *not* copied (`storage_path = NULL` rows
-are legal today — [app/api/collections.py:765](../../../app/api/collections.py);
-originals open in the source under the user's identity). Step 3: the share
+row (§9); a note states the *original file* is not copied — Agnes stores the
+extracted markdown (§7.2), and originals open in the source under the user's
+identity. A selected scope is **stored by the source folder/drive id, not by
+path**, so renaming or moving the scoped folder in the source neither drops
+nor duplicates the scope. Step 3: the share
 preview table, per-collection group badges, the anonymized collection keeping
 its badge — **warn on any collection leaving with no group** ("indexed but
 invisible" is the worst silent state).
@@ -805,7 +918,11 @@ later) — with `/admin/access` as the third, group-cut view of the same data.
 **`/admin/access`**: collections appear as rows in the existing group Access
 section, per-row Optional/Automatic tier — zero new code, no new grant type,
 and **facts are never granted** (visibility derives from evidencing
-collections by construction). Rows carry the same provenance label.
+collections by construction). Rows carry the same provenance label, and a
+collection with **no granted group carries a visible "⚠ nobody" badge** in
+every list that shows it — the wizard warning covers birth only; a
+collection that later loses its last group must not drift silently into
+"indexed but invisible".
 
 **Library**: two sections — *Files* (collections + single files; stay on the
 server, return citations) and *Data* (packages pulled locally via `agnes
@@ -1066,7 +1183,10 @@ one subject (union of claims, both aliases), and the merge is reversible.
 (table-heavy xlsx, deck, scanned PDF, Czech diacritics) survive with
 human-quotable sentences as contiguous substrings — this gates the pypdfium2
 PDF path (structure reconstruction is our net-new code) and any future
-converter change.
+converter change. **EQ9** — tracked-per-release harness metrics beyond
+EQ3's precision/recall: **entity-resolution cluster purity**, **conflict
+rate per 1000 documents**, and **orphan rate per run** — numbers, recorded
+per release, not one-off assertions.
 
 ### 15.4 Anonymization
 
@@ -1077,8 +1197,10 @@ pipeline order broke, which is what the test is for. **AN2** — the same
 entity in two documents yields one subject; **fixture is Czech with
 inflected forms**; fails until the stable-pseudonym + normalization change
 lands (deliberately). **AN3** — cross-key-domain: same entity across an
-anonymized and a plain collection = two subjects, permanently; asserts the
-documented limitation so documentation cannot drift. **AN4** — nothing
+anonymized and a plain collection = two subjects, permanently; and a key
+rotation on a fixture produces a disjoint pseudonym set (documenting that
+rotation rewrites every alias). Asserts the documented limitations so
+documentation cannot drift. **AN4** — nothing
 unredacted exists at any stage for an anonymized collection: blob store,
 extraction artifacts, intermediates. **AN5** — emails join: `EMAIL_<hmac>`
 pseudonyms are stable across documents; URLs remain collapsed and
@@ -1089,7 +1211,12 @@ non-identifying.
 **Run P — planted proving run** (private tenant area or direct upload):
 ≥1000 documents across ≥4 sites, divergent sharing, planted facts, traps (a
 scan, a duplicate, a superseded version, a contradiction pair). Proves
-S/C/EQ/AN. Machine-readable record per step; blind grading not required.
+S/C/EQ/AN, **plus the ablation Decision #2 cannot give us**: the ten prompts
+answered by Agnes **with facts vs. Agnes with Collections retrieval only** —
+the within-platform control that isolates what the fact layer adds (A4-vs-A3
+compares against Claude holding the context, a different question). Spec-side
+diagnostic, labeled as such, not a workbook row. Machine-readable record per
+step; blind grading not required.
 
 **Rounds R0–R3+ — the workbook, real corpus + live Kantata:**
 
@@ -1140,7 +1267,12 @@ bug).
    `AgentPrincipal`.
 4. **Write path** — ingest per §7.2 with the gate at the door; corrections;
    run report; orphan sweep as a post-step.
-5. **Measurement harness** (EQ0, EQ3) before more surface.
+5. **Measurement harness** (EQ0, EQ3, EQ9) before more surface. It lives
+   in `scripts/eval/` with fixtures (the frozen prompt strings, the planted
+   ground truth) under `tests/fixtures/eval/` — committed under the header's
+   scope-note waiver. Step 1's ontology translation is a one-off script
+   posting through the semantic-model API (the builder UI is step 9, not a
+   dependency).
 6. **Query surface** — the three tools across REST/CLI/MCP with caps.
 7. **Worker lane** *(when extraction moves inside)* — a **code change**, not
    configuration: new lane constant in `app/worker/registry.py`
@@ -1160,7 +1292,7 @@ bug).
   `_PG_ONLY_ROUTE_EXEMPTIONS` — `tests/db_pg/test_get_status_parity_sweep.py`
   and `test_mutation_status_parity_sweep.py` (the helpers live in
   `_parity_sweep_util.py`) — with the DuckDB side answering the typed 501.
-- REST×CLI×MCP triple surface per CONTRIBUTING sync-map rows 51/58/59
+- REST×CLI×MCP triple surface per the CONTRIBUTING sync-map
   (`tests/test_documentation_api_triple_surface.py`,
   `tests/test_api_docs_coverage.py`, `tests/test_mcp_tool_parity.py`);
   OpenAPI snapshot regenerated (`make update-openapi-snapshot`) when endpoint
@@ -1216,8 +1348,8 @@ overclaim).
 - **O4 — seed-pack packaging owner** (§11): assemble
   ontology/taxonomies/ER-rules as Claude project context before the first
   A3 round; plus **Leonard's persona confirmation before R0** (§14.4) and a
-  **Kantata integration owner** (X1/AC2, §14.5 — a structured-lane
-  dependency of the eval, not of this design).
+  **Kantata integration owner** (X1 per §14.5's cadence, AC2 per §14.4 — a
+  structured-lane dependency of the eval, not of this design).
 - **O5 — reconcile the two anonymization designs** (§9.2 vs the 2026-08-24
   corpus-intake spec).
 - **O6 — cross-language extraction vs the verbatim gate** (§8).
