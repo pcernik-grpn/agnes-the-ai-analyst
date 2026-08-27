@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -7489,31 +7489,31 @@ def _keboola_credentialed() -> bool:
     return value is not None
 
 
-def _orphan_reason(connection_id: str) -> str:
-    """Why this connection dropped out of the semantic-layer sync.
+# The in-page lenses of /admin/semantic-layer. "coverage" (F4.1), "mute"
+# (F4.3) and "feedback" (F4.5) are built; "health" is the settled shape of the
+# section that follows, rendered as a named placeholder rather than left
+# invisible — a tab nobody can see is a tab the next author redesigns from
+# scratch.
+_SEMANTIC_LAYER_ADMIN_TABS = ("coverage", "health", "mute", "feedback")
 
-    `_enumerate_master_sources()` skips a connection for THREE different
-    reasons, and the page reported all of them as "master token missing" — so
-    an admin whose connection was missing a stack URL, or whose token the
-    server could no longer decrypt, was sent to re-add a token that was
-    already there, and the rows still did not refresh.
-    (Devin Review on this PR.)
-    """
-    from app.api.admin_source_connections import master_secret_key
-    from src.repositories import connection_secrets_repo, source_connections_repo
+_SEMANTIC_LAYER_ADMIN_TAB_LABELS = {
+    "coverage": "Coverage",
+    "health": "Health",
+    "mute": "Mute",
+    "feedback": "Feedback",
+}
 
-    row = source_connections_repo().get(connection_id)
-    if row is None:
-        return "the connection no longer exists"
-    if not ((row.get("config") or {}).get("stack_url") or ""):
-        return "no connection URL on this project — add one at"
-    try:
-        token = connection_secrets_repo().get(master_secret_key(connection_id)) or ""
-    except Exception:  # noqa: BLE001 — an unreadable secret is itself the answer
-        return "its master token cannot be read (vault key changed?) — re-add it at"
-    if not token:
-        return "master token missing — add it at"
-    return "it did not sync on the last run — check its status at"
+# Column headers for the cross-domain grid, in the report's own order
+# (src.semantic.coverage.DOMAINS). The keys travel to the client as-is; only
+# the labels differ.
+_COVERAGE_DOMAIN_LABELS = {
+    "semantic": "Semantic",
+    "metrics": "Metrics",
+    "glossary": "Glossary",
+    "skill": "Skill",
+    "agent": "Agent",
+    "knowledge_base": "Knowledge base",
+}
 
 
 @router.get("/admin/semantic-layer", response_class=HTMLResponse)
@@ -7521,188 +7521,126 @@ async def admin_semantic_layer_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
-    """Per-source breakdown for the Keboola semantic-layer sync (#853/#920/
-    #953, task 7): one row per connection enumerated by
-    ``_enumerate_master_sources()`` (master-token Keboola projects), each
-    with its own metric/glossary counts and the last sync's per-source
-    result. NULL ``source_ref`` rows (legacy, pre-provenance) fold into the
-    default connection's row since that's the only connection legacy rows
-    can belong to. Rows whose ``source_ref`` no longer matches any
-    enumerated source (connection deleted/rotated away) surface separately
-    as "orphaned" rather than silently vanishing.
+    """Cross-source, cross-domain completeness for the semantic layer.
 
-    Master tokens are never put into the template context — only
-    name/id/stack_url leave ``_enumerate_master_sources()``.
+    REBUILT in F4.1. This was a Keboola sync-ops page — one row per
+    master-token Keboola connection, with hand-computed "connections without a
+    master token", "orphaned rows" and "legacy / unattributed" sections
+    alongside. Every one of those is gone, replaced by ONE report that asks
+    the same questions of EVERY connected source
+    (``src.semantic.coverage.compute_cross_domain_coverage``), which is why
+    this handler is now smaller than the page it replaces rather than larger:
+
+    * a Keboola connection with no owner token is a ROW in that report (the
+      wrapper fills the hole K0.5 leaves) instead of a list underneath it;
+    * the connection-scoped "orphaned" count measured stale flat
+      ``metric_definitions`` rows — projections of the canonical document, not
+      the truth — and its successor is F4.2's source-agnostic
+      "disconnected models" check over the document itself;
+    * the "legacy / unattributed" bucket is the report's synthetic
+      ``__local__`` source.
+
+    The grid itself is fetched after paint, not rendered here: the report's
+    Keboola provider makes upstream Metastore calls (the retired page already
+    refused to block on those), and the report is Postgres-only, so a DuckDB
+    instance gets an inline explanation instead of a page that will not load.
+
+    What this handler still renders server-side is what the client cannot ask
+    for: the tab shell, the Keboola sync strip, and the tagging form's
+    options — the latter straight off ``app/resource_types.py``'s
+    ``list_blocks`` delegates, the same projection /admin/access renders, so
+    the two can never disagree about what is taggable.
+
+    The Feedback tab (F4.5) is the same shape one layer down: the report queue
+    is fetched after paint (also Postgres-only, and its status filter re-queries
+    without a reload), so all this handler renders for it is the filter's
+    vocabulary — read from the API's own ``FEEDBACK_STATUSES`` rather than
+    re-typed, since a status the select offers but the endpoint rejects would
+    400 on click.
+
+    The Mute tab (F4.3) follows the same rule once more: the list of silenced
+    checks is fetched after paint, and what this handler renders is the scope
+    vocabulary the form composes from — the report's own ``DOMAINS`` and the
+    connected sources, so a scope the picker offers is always a scope something
+    is actually scored on.
     """
     from app.api.keboola_semantic_layer_refresh import get_last_refresh_summary
-    from connectors.keboola.semantic_layer import _default_keboola_connection, _enumerate_master_sources
+    from app.resource_types import RESOURCE_TYPES, ResourceType
+    from src.models.semantic_feedback import FEEDBACK_STATUSES
     from src.repositories import source_connections_repo
+    from src.semantic.coverage import DOMAINS, LOCAL_BUCKET_ID, LOCAL_BUCKET_NAME, TAG_RESOURCE_TYPE_BY_DOMAIN
 
     ctx = _build_context(request, user=user)
 
-    metrics = metric_repo().list()
-    terms = glossary_repo().list(limit=100000)
+    requested = (request.query_params.get("tab") or "").strip().lower()
+    active_tab = requested if requested in _SEMANTIC_LAYER_ADMIN_TABS else "coverage"
 
-    def _counts(ref: Optional[str]) -> tuple[int, int]:
-        m = sum(1 for x in metrics if x.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and x.get("source_ref") == ref)
-        g = sum(1 for x in terms if x.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and x.get("source_ref") == ref)
-        return m, g
+    ctx["lens_tabs"] = [
+        {
+            "key": tab,
+            "label": _SEMANTIC_LAYER_ADMIN_TAB_LABELS[tab],
+            "href": f"/admin/semantic-layer?tab={tab}",
+            "active": tab == active_tab,
+        }
+        for tab in _SEMANTIC_LAYER_ADMIN_TABS
+    ]
+    ctx["active_tab"] = active_tab
+    ctx["coverage_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    # The Feedback tab's filter reads the API's own vocabulary rather than a
+    # hand-typed copy: a status the select offers but the endpoint rejects
+    # would 400 on click, and one it drops would hide reports.
+    ctx["feedback_statuses"] = list(FEEDBACK_STATUSES)
 
-    raw_sources = _enumerate_master_sources()  # names/ids/stack_url only — token stripped below
-    default_conn = _default_keboola_connection()
-    default_id = default_conn["id"] if default_conn else None
-
-    summary = get_last_refresh_summary()
-    last_result = summary.get("last_result")
-    last_by_ref: dict[Any, dict] = {}
-    if isinstance(last_result, dict) and isinstance(last_result.get("sources"), list):
-        for entry in last_result["sources"]:
-            last_by_ref[entry.get("connection_id")] = entry
-
-    sources = []
-    null_absorbed = False
-    for source in raw_sources:
-        connection_id = source["connection_id"]
-        metric_count, glossary_count = _counts(connection_id)
-        if connection_id == default_id:
-            null_metric_count, null_glossary_count = _counts(None)
-            metric_count += null_metric_count
-            glossary_count += null_glossary_count
-            null_absorbed = True
-        stack_url = source["stack_url"]
-        # The stack host alone does not identify anything: several projects on
-        # one stack render as the same string, so a page listing two sources
-        # gave no way to tell which project each row's metrics came from. The
-        # project id is the only unambiguous handle Keboola offers.
-        host = urlsplit(stack_url).netloc or stack_url
-        project_id = source.get("project_id")
-        detail = host
-        if project_id is not None:
-            project_name = source.get("project_name") or "unnamed"
-            detail = f"{project_name} (project {project_id}) · {host}"
-        sources.append(
+    # The tagging form: one option group per taggable resource type, each
+    # projected by the SAME `list_blocks` delegate the RBAC grant form uses.
+    # Ordered as the report's columns are, so the picker and the grid read in
+    # the same direction.
+    tag_types = []
+    for domain in ("skill", "agent", "knowledge_base"):
+        resource_type = TAG_RESOURCE_TYPE_BY_DOMAIN[domain]
+        spec = RESOURCE_TYPES[ResourceType(resource_type)]
+        items = []
+        for block in spec.list_blocks():
+            for item in block.get("items") or []:
+                items.append(
+                    {
+                        "resource_id": item.get("resource_id"),
+                        "label": f"{block.get('name')} · {item.get('name')}" if block.get("name") else item.get("name"),
+                    }
+                )
+        tag_types.append(
             {
-                "connection_id": connection_id,
-                "label": source["name"],
-                "detail": detail,
-                "project_id": project_id,
-                "metric_count": metric_count,
-                "glossary_count": glossary_count,
-                "last": last_by_ref.get(connection_id),
+                "key": resource_type,
+                "label": spec.display_name,
+                "id_format": spec.id_format,
+                # NOT "items": Jinja resolves `tag_type.items` on a dict to
+                # dict.items (the METHOD), so the template would iterate a
+                # bound builtin and blow up at render time.
+                "resources": items,
             }
         )
+    ctx["tag_types"] = tag_types
+    ctx["tag_sources"] = [
+        {"id": c["id"], "name": c.get("name") or c["id"], "source_type": c.get("source_type") or ""}
+        for c in source_connections_repo().list()
+    ]
+    ctx["prefill_tag_source"] = request.query_params.get("tag_source") or ""
+    ctx["prefill_tag_type"] = request.query_params.get("tag_type") or ""
 
-    known_ids = {s["connection_id"] for s in raw_sources}
+    # The Mute tab's scope picker. Two selects — source and domain, each with
+    # an "any" option — compose all three scope forms (`domain:<d>`,
+    # `source:<s>`, `source:<s>:domain:<d>`) without asking the admin to learn
+    # the string grammar. The domain list is the report's own, so the picker
+    # cannot offer a domain nothing is scored on; the source list adds the
+    # synthetic local bucket, which IS a row in the report even though it is
+    # not a connection.
+    ctx["mute_domains"] = [{"key": key, "label": _COVERAGE_DOMAIN_LABELS[key]} for key in DOMAINS]
+    ctx["mute_sources"] = [{"id": LOCAL_BUCKET_ID, "label": LOCAL_BUCKET_NAME}] + [
+        {"id": source["id"], "label": source["name"] + (f" ({source['source_type']})" if source["source_type"] else "")}
+        for source in ctx["tag_sources"]
+    ]
 
-    # Every Keboola connection that exists but holds no master token. Without
-    # this the page could only say "no projects have a master token yet",
-    # which reads as "no project is connected" to an admin looking at a
-    # working Keboola connection — the state every wizard-connected instance
-    # starts in, since the master token is a SEPARATE slot from the storage
-    # token the wizard fills.
-    #
-    # Each carries WHY it isn't syncing, because "no master token" is only one
-    # of three reasons `_enumerate_master_sources()` skips a connection, and
-    # telling an admin to add a token they already added — while the real
-    # cause is a missing stack URL or a token no longer decryptable under the
-    # current AGNES_VAULT_KEY — sends them to fix the wrong thing entirely
-    # (Devin Review on #1242). `has()` is an existence check, so naming the
-    # reason costs no decrypt.
-    from app.api.admin_source_connections import master_secret_key
-    from src.repositories import connection_secrets_repo
-
-    keboola_connections = source_connections_repo().list(source_type="keboola")
-    secrets = connection_secrets_repo()
-    connections_without_master = []
-    for c in keboola_connections:
-        if c["id"] in known_ids:
-            continue
-        try:
-            has_master = secrets.has(master_secret_key(c["id"]))
-        except Exception:
-            has_master = False
-        if not has_master:
-            reason = "no master (owner) token"
-        elif not ((c.get("config") or {}).get("stack_url") or "").strip():
-            reason = "master token set, but the connection has no stack URL"
-        else:
-            reason = "master token set, but it cannot be read — AGNES_VAULT_KEY changed since it was stored"
-        connections_without_master.append({"id": c["id"], "name": c.get("name") or c["id"], "reason": reason})
-    connection_names = {c["id"]: (c.get("name") or c["id"]) for c in keboola_connections}
-
-    all_refs = {
-        m.get("source_ref")
-        for m in metrics
-        if m.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and m.get("source_ref")
-    }
-    all_refs |= {
-        t.get("source_ref") for t in terms if t.get("source") in KEBOOLA_SEMANTIC_LAYER_SOURCES and t.get("source_ref")
-    }
-    orphaned = []
-    for ref in sorted(all_refs - known_ids):
-        metric_count, glossary_count = _counts(ref)
-        # A ref that still names a live connection is not a mystery UUID — it
-        # is "this project lost its master token", which is both the common
-        # case and the one with an obvious next step. Only a ref with no
-        # connection left behind it stays an opaque id.
-        orphaned.append(
-            {
-                "source_ref": ref,
-                "label": connection_names.get(ref, ref),
-                "connection_exists": ref in connection_names,
-                "reason": _orphan_reason(ref) if ref in connection_names else None,
-                "metric_count": metric_count,
-                "glossary_count": glossary_count,
-            }
-        )
-
-    # NULL-source_ref rows (legacy, pre-provenance) normally fold into the
-    # default connection's row above. When the default connection has no
-    # master token — so it's never enumerated by `_enumerate_master_sources()`
-    # and never appears in `sources` — those rows would otherwise be counted
-    # nowhere: the truthy `source_ref` filter above excludes them from
-    # `all_refs` too. Surface them here instead, so they're never invisible.
-    if not null_absorbed:
-        null_metric_count, null_glossary_count = _counts(None)
-        if null_metric_count or null_glossary_count:
-            orphaned.append(
-                {
-                    "source_ref": None,
-                    "label": "legacy / unattributed",
-                    "metric_count": null_metric_count,
-                    "glossary_count": null_glossary_count,
-                }
-            )
-
-    # Datasets whose Keboola table isn't registered here, deduped across
-    # sources. Every metric hanging off one is dropped as
-    # `skipped_unresolved_table`, and until now that count went nowhere the
-    # admin could see: a sync reporting "9 glossary, 0 metrics" gave no hint
-    # that 50 metrics died on 12 unregistered tables.
-    unresolved_tables: list[str] = []
-    for entry in last_by_ref.values():
-        for tid in entry.get("unresolved_tables") or []:
-            if tid not in unresolved_tables:
-                unresolved_tables.append(tid)
-
-    ctx["sources"] = sources
-    ctx["orphaned"] = orphaned
-    ctx["connections_without_master"] = connections_without_master
-    ctx["unresolved_tables"] = sorted(unresolved_tables)
-    # Whether the list above is a SUBSET — deliberately a boolean, not a count.
-    # The list is de-duplicated across projects (two projects can report the
-    # same table) while any total would be summed per project, so the two do
-    # not measure the same thing: a table reported twice made the page claim
-    # tables were hidden when none were. And a true union total is not
-    # available, because each project's list is already capped before it gets
-    # here. So the page says a subset is shown, without a number it cannot
-    # compute honestly. (Devin Review on this PR.)
-    ctx["unresolved_tables_truncated"] = any(
-        int(e.get("unresolved_tables_total") or 0) > len(e.get("unresolved_tables") or []) for e in last_by_ref.values()
-    )
-    ctx["skipped_unresolved_total"] = sum(int(e.get("skipped_unresolved_table") or 0) for e in last_by_ref.values())
-    ctx["default_connection_id"] = default_id
-    ctx["semantic_refresh_summary"] = summary
+    ctx["semantic_refresh_summary"] = get_last_refresh_summary()
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 
 

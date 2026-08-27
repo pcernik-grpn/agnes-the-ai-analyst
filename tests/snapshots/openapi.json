@@ -1849,6 +1849,29 @@
         "title": "ConsentBody",
         "type": "object"
       },
+      "CoverageTagCreate": {
+        "properties": {
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_type",
+          "resource_id",
+          "source_id"
+        ],
+        "title": "CoverageTagCreate",
+        "type": "object"
+      },
       "CreateAgentRequest": {
         "properties": {
           "description": {
@@ -3829,6 +3852,87 @@
           }
         },
         "title": "EntityRating",
+        "type": "object"
+      },
+      "FeedbackCreate": {
+        "description": "One report. Only the question is required.\n\nThe caps are the point of declaring these at all: the columns are ``TEXT``,\nthe submitter is any signed-in caller, and an uncapped field is an\ninvitation to store a megabyte of paste per row. They are generous enough\nthat no genuine report hits them.",
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "metric_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Id"
+          },
+          "model_content_hash": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Content Hash"
+          },
+          "question": {
+            "maxLength": 4000,
+            "title": "Question",
+            "type": "string"
+          },
+          "sql": {
+            "anyOf": [
+              {
+                "maxLength": 20000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "FeedbackCreate",
+        "type": "object"
+      },
+      "FeedbackResolve": {
+        "properties": {
+          "resolution_note": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Note"
+          }
+        },
+        "title": "FeedbackResolve",
         "type": "object"
       },
       "FileEntry": {
@@ -5819,6 +5923,45 @@
           "target_collection_id"
         ],
         "title": "MoveFileBody",
+        "type": "object"
+      },
+      "MuteCreate": {
+        "description": "One mute. ``muted_by`` is deliberately NOT a field \u2014 it is taken from the\nauthenticated caller, because a signature you can address to somebody else\nis not a signature.\n\nThe caps matter for the same reason they do on feedback: the columns are\n``TEXT``/``VARCHAR`` and generous enough that no genuine mute hits them.",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "scope": {
+            "maxLength": 200,
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope"
+        ],
+        "title": "MuteCreate",
         "type": "object"
       },
       "MySecretBody": {
@@ -11362,7 +11505,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.86.0"
+    "version": "0.71.60"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -13253,7 +13396,7 @@
     },
     "/admin/semantic-layer": {
       "get": {
-        "description": "Per-source breakdown for the Keboola semantic-layer sync (#853/#920/\n#953, task 7): one row per connection enumerated by\n``_enumerate_master_sources()`` (master-token Keboola projects), each\nwith its own metric/glossary counts and the last sync's per-source\nresult. NULL ``source_ref`` rows (legacy, pre-provenance) fold into the\ndefault connection's row since that's the only connection legacy rows\ncan belong to. Rows whose ``source_ref`` no longer matches any\nenumerated source (connection deleted/rotated away) surface separately\nas \"orphaned\" rather than silently vanishing.\n\nMaster tokens are never put into the template context \u2014 only\nname/id/stack_url leave ``_enumerate_master_sources()``.",
+        "description": "Cross-source, cross-domain completeness for the semantic layer.\n\nREBUILT in F4.1. This was a Keboola sync-ops page \u2014 one row per\nmaster-token Keboola connection, with hand-computed \"connections without a\nmaster token\", \"orphaned rows\" and \"legacy / unattributed\" sections\nalongside. Every one of those is gone, replaced by ONE report that asks\nthe same questions of EVERY connected source\n(``src.semantic.coverage.compute_cross_domain_coverage``), which is why\nthis handler is now smaller than the page it replaces rather than larger:\n\n* a Keboola connection with no owner token is a ROW in that report (the\n  wrapper fills the hole K0.5 leaves) instead of a list underneath it;\n* the connection-scoped \"orphaned\" count measured stale flat\n  ``metric_definitions`` rows \u2014 projections of the canonical document, not\n  the truth \u2014 and its successor is F4.2's source-agnostic\n  \"disconnected models\" check over the document itself;\n* the \"legacy / unattributed\" bucket is the report's synthetic\n  ``__local__`` source.\n\nThe grid itself is fetched after paint, not rendered here: the report's\nKeboola provider makes upstream Metastore calls (the retired page already\nrefused to block on those), and the report is Postgres-only, so a DuckDB\ninstance gets an inline explanation instead of a page that will not load.\n\nWhat this handler still renders server-side is what the client cannot ask\nfor: the tab shell, the Keboola sync strip, and the tagging form's\noptions \u2014 the latter straight off ``app/resource_types.py``'s\n``list_blocks`` delegates, the same projection /admin/access renders, so\nthe two can never disagree about what is taggable.\n\nThe Feedback tab (F4.5) is the same shape one layer down: the report queue\nis fetched after paint (also Postgres-only, and its status filter re-queries\nwithout a reload), so all this handler renders for it is the filter's\nvocabulary \u2014 read from the API's own ``FEEDBACK_STATUSES`` rather than\nre-typed, since a status the select offers but the endpoint rejects would\n400 on click.\n\nThe Mute tab (F4.3) follows the same rule once more: the list of silenced\nchecks is fetched after paint, and what this handler renders is the scope\nvocabulary the form composes from \u2014 the report's own ``DOMAINS`` and the\nconnected sources, so a scope the picker offers is always a scope something\nis actually scored on.",
         "operationId": "admin_semantic_layer_page_admin_semantic_layer_get",
         "parameters": [
           {
@@ -25565,6 +25708,149 @@
         ]
       }
     },
+    "/api/admin/semantic-feedback": {
+      "get": {
+        "description": "The report queue, newest first (admin only).\n\n``?status=open`` is the working view. An unrecognized status is a 400\nrather than an empty list: \"nothing to do\" is the opposite of the truth\nwhen the filter itself was a typo.",
+        "operationId": "list_semantic_feedback_api_admin_semantic_feedback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
+        ]
+      }
+    },
+    "/api/admin/semantic-feedback/{feedback_id}/resolve": {
+      "post": {
+        "description": "Close one report, recording who closed it and what was done.\n\n404 when it does not exist; 409 when somebody already resolved it \u2014 the\nrepository's guarded transition refuses to overwrite the first admin's\nnote, so the queue never loses who actually fixed the thing.",
+        "operationId": "resolve_semantic_feedback_api_admin_semantic_feedback__feedback_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "feedback_id",
+            "required": true,
+            "schema": {
+              "title": "Feedback Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackResolve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
+        ]
+      }
+    },
     "/api/admin/semantic-layer/coverage": {
       "get": {
         "description": "How much of each connected Keboola project's semantic layer actually\nreaches Agnes, recomputed live (see\n``connectors.keboola.semantic_layer.compute_semantic_coverage``).\n\nRead-only and stateless \u2014 it does not touch metric_definitions and does not\nread the last sync's counters, which live in a process-local dict that\nempties on restart. Two conditions are worth acting on and are surfaced as\n``warnings[]``: a connection whose storage and master tokens point at\ndifferent projects, and a project none of whose metrics can bind to a\nregistered table. Tables the instance simply does not register are reported\nas a plain count, never as pending work.\n\n``?warnings_only=true`` answers with the token-identity checks alone and\nskips the Metastore enumeration \u2014 two `verify_token` calls per connection\ninstead of every project's whole semantic model. The Data sources page\ndraws its warning strip from that: it uses only the mismatch messages, and\npulling the full report on every page view was work nobody asked for.\nCounts are zeroed in that mode. (Devin Review on this PR.)\n\nUpstream calls run off the event loop \u2014 one project's Metastore being slow\nmust not stall every other request in the process.",
@@ -25624,6 +25910,415 @@
           }
         },
         "summary": "Get Semantic Layer Coverage"
+      }
+    },
+    "/api/admin/semantic-layer/health": {
+      "get": {
+        "description": "Is the semantic layer trustworthy right now (admin only)?\n\nSync failures, models whose source was deleted or renamed away from under\nthem, documents that failed validation, three cheap static quality checks\n(a metric with no description, one name defined twice with a different\nformula, a cross-dataset metric with no declared relationship between the\ndatasets it touches), a roll-up of F4.1's coverage counts, and every\nactive mute (F4.3) \u2014 one report for the admin banner, the CLI, and MCP.\n\n``mutes_repo`` is resolved as a dependency for the same reason the\ncoverage/tags routes are: on a DuckDB-backed instance this must answer\nthe typed ``501`` before any work runs, not a partial report missing the\none field (which findings are silenced) F4.3 exists to keep visible.",
+        "operationId": "get_semantic_layer_health_api_admin_semantic_layer_health_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Layer Health"
+      }
+    },
+    "/api/admin/semantic-layer/mutes": {
+      "get": {
+        "description": "Every check currently silenced, and by whom (admin only).\n\nIts own route rather than a corner of the health report: this is the answer\nto \"what are we not being told about\", and an admin auditing that should\nnot have to fetch (and re-compute) the whole health roll-up to read it.\nF4.2's health response includes the same rows \u2014 the list is deliberately\nreachable from both.\n\n``?include_expired=true`` adds the lapsed ones. The silence ends at the\nexpiry; the record of who chose it does not.",
+        "operationId": "list_mutes_api_admin_semantic_layer_mutes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_expired",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Expired",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Mutes"
+      },
+      "post": {
+        "description": "Silence one check, on the record (admin only).\n\nReturns the stored row \u2014 ``muted_by``, ``muted_at``, ``reason`` and all \u2014\nso the caller sees the signature it just left rather than a bare ``201``.\n\n409 when an ACTIVE mute already covers the scope: two rows for one check\nread as two independent judgements when it is one, and unmuting either\nwould leave the check silent with no visible reason why. 404 when the scope\nnames a source connection that does not exist \u2014 a mute pointing at nothing\nsilences nothing, forever, while looking like it works.",
+        "operationId": "create_mute_api_admin_semantic_layer_mutes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MuteCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Mute"
+      }
+    },
+    "/api/admin/semantic-layer/mutes/{mute_id}": {
+      "delete": {
+        "description": "Unmute \u2014 the check starts reporting again (admin only).\n\n404 when the mute does not exist, so an admin never reads a success for an\nunmute that unmuted nothing and then wonders why the warning is still\nquiet.",
+        "operationId": "delete_mute_api_admin_semantic_layer_mutes__mute_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mute_id",
+            "required": true,
+            "schema": {
+              "title": "Mute Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Mute"
+      }
+    },
+    "/api/admin/semantic-model/coverage": {
+      "get": {
+        "description": "Coverage of every connected data source, per domain (admin only).\n\nEach source carries one entry per domain with ``status``\n(``ok`` | ``partial`` | ``missing`` | ``not_applicable``), a\none-sentence ``detail``, an optional ``action`` naming the create flow\nthat fills it, and a ``raw`` payload as deep as that source type's\nconnector can compute (rich for Keboola, thin elsewhere \u2014 see\n``src/semantic/coverage.py``).\n\n``?source=<id>`` narrows to one source; ``__local__`` is the synthetic\nbucket for registered tables belonging to no connection.\n\nRecomputed live, never cached: the Keboola provider makes upstream calls,\nso the work runs off the event loop \u2014 one slow project must not stall\nevery other request in the process.",
+        "operationId": "get_cross_domain_coverage_api_admin_semantic_model_coverage_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Cross Domain Coverage"
+      }
+    },
+    "/api/admin/semantic-model/coverage/tags": {
+      "post": {
+        "description": "Record that a skill / agent / knowledge domain is about a data source.\n\n409 when the same triple is already tagged \u2014 \"already recorded\" is\ninformation the admin asked for, not something to swallow into a second\nidentical row that would make the roll-up count one skill twice.",
+        "operationId": "create_coverage_tag_api_admin_semantic_model_coverage_tags_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoverageTagCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Coverage Tag"
+      }
+    },
+    "/api/admin/semantic-model/coverage/tags/{tag_id}": {
+      "delete": {
+        "description": "Remove one source tag. 404 when it does not exist, so an admin never\nreads a success for a deletion that removed nothing.",
+        "operationId": "delete_coverage_tag_api_admin_semantic_model_coverage_tags__tag_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag_id",
+            "required": true,
+            "schema": {
+              "title": "Tag Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Coverage Tag"
       }
     },
     "/api/admin/semantic-models": {
@@ -42644,6 +43339,70 @@
         "summary": "Run Deployed Script",
         "tags": [
           "scripts"
+        ]
+      }
+    },
+    "/api/semantic-feedback": {
+      "post": {
+        "description": "File a report that an answer looked wrong (any signed-in caller).\n\nDeliberately NOT ``require_admin``: the analyst who ran the analysis and\nthe agent that could not ground its answer are the two callers most likely\nto notice, and neither is an admin. The report lands ``status='open'`` in\nthe admin queue.",
+        "operationId": "submit_semantic_feedback_api_semantic_feedback_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Semantic Feedback",
+        "tags": [
+          "semantic-feedback"
         ]
       }
     },

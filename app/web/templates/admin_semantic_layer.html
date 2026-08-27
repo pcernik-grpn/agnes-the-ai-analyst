@@ -1,28 +1,26 @@
 {% extends "base_admin_page.html" %}
-{% import "macros/_icon.html" as ico %}
 {% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {# Section-level and PLAIN, matching /admin/data-sources: the h1 names the
    section, the tab strip below names the lens (Sources · Tables · Packages ·
    Semantic). See `.page-header--plain` in style-custom.css. #}
 {% set page_hero_title = "Data" %}
-{% set page_hero_subtitle = "Per-project sync status for Keboola's semantic layer (business metrics + glossary terms). Connect projects at <a href=\"/admin/data-sources\">Sources</a>." %}
+{% set page_hero_subtitle = "What each connected data source still has — and still lacks — across semantics, metrics, glossary, skills, agents and knowledge. Connect sources at <a href=\"/admin/data-sources\">Sources</a>." %}
 {% set page_hero_plain = True %}
 
 {% block head_extra %}
 <style>
   .sl-page { font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif); }
 
-  /* The status line, the section heads and their one-sentence descriptions
-     are the shared admin page vocabulary now (`.apg-strip`, `.apg-sechead`,
-     `.apg-sec-desc` in css/admin_page.css) — this page carried a third copy
-     of the same three objects, at its own sizes. */
-
-  /* A second section stands off the first by air (the shared `.apg-sec`
-     rhythm), not by a heavier heading. */
+  /* The status line, section heads and their one-sentence descriptions are the
+     shared admin page vocabulary (`.apg-strip`, `.apg-sechead`, `.apg-sec-desc`
+     in css/admin_page.css) — never a local copy at local sizes. */
   .sl-page .apg-sechead { margin-top: 24px; }
-  .sl-page > .apg-strip + .apg-sechead,
-  .sl-page > template + .apg-sechead { margin-top: 0; }
+  .sl-page > .apg-strip + .apg-sechead { margin-top: 0; }
+
+  /* The in-page lens strip sits under the section strip, so it needs air of
+     its own without becoming a second heading. */
+  .sl-lenses { margin: 16px 0 4px; }
 
   .sl-empty {
     text-align: center; padding: 28px 20px;
@@ -32,66 +30,101 @@
     border-radius: 10px;
   }
   .sl-empty a { color: var(--ds-primary); }
-  {# No flex/alignment of its own: the list inherits text-align from whichever
-     block hosts it (centred inside .sl-empty, left inside .sl-orphan-note). #}
-  .sl-empty-list { list-style: none; margin: 10px 0; padding: 0; line-height: 1.7; }
-  .sl-note { margin: 8px 0 0; font-size: 13px; color: var(--ds-text-muted); }
-  .sl-empty-list code {
-    font-family: var(--font-mono, ui-monospace, monospace);
-    font-size: 11px; color: var(--ds-text-primary);
-  }
+  .sl-note { margin: 8px 0 0; font-size: 13px; color: var(--ds-text-muted); line-height: 1.5; }
+  .sl-mono { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; }
 
   .sl-source-name { font-weight: 600; color: var(--ds-text-primary); }
   .sl-source-detail {
     font-size: 11px; color: var(--ds-text-secondary);
     font-family: var(--font-mono, ui-monospace, monospace);
   }
-  .sl-badge-default {
-    display: inline-block; margin-left: 6px;
-    font-size: 10px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
-    padding: 2px 6px; border-radius: 5px;
-    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
-  }
-  .sl-last-ok { color: var(--ds-accent-success-ink); }
-  .sl-last-error { color: var(--ds-accent-danger-ink); }
-  .sl-last-skipped { color: var(--ds-text-secondary); }
-  .sl-last-none { color: var(--ds-text-muted); }
 
-  /* Live coverage — filled from /api/admin/semantic-layer/coverage after load. */
-  .sl-cov { color: var(--ds-text-secondary); font-weight: 400; }
-  .sl-cov.sl-cov--none { color: var(--ds-accent-warn-ink); font-weight: 600; }
+  /* One badge vocabulary for all four statuses. `n/a` is deliberately the
+     quietest: it is NOT a gap (the domain cannot be filled for that source
+     type in this build), and dressing it like one would invent work. */
+  .sl-badge {
+    display: inline-block; min-width: 64px; text-align: center;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+    padding: 2px 8px; border-radius: 6px;
+    border: 1px solid transparent;
+  }
+  .sl-badge--ok      { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border-color: var(--ds-accent-success-line); }
+  .sl-badge--partial { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink);    border-color: var(--ds-accent-warn-line); }
+  .sl-badge--missing { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink);  border-color: var(--ds-accent-danger-line); }
+  .sl-badge--na      { background: var(--ds-surface-muted, var(--ds-surface)); color: var(--ds-text-muted); border-color: var(--ds-border); }
+
+  /* Every cell is clickable — clicking opens that cell's detail row. The
+     affordance is uniform on purpose: the rich Keboola detail and the thin
+     Snowflake one live in the SAME place, so a reader never learns "detail
+     only exists for one vendor". */
+  .sl-cell { cursor: pointer; background: none; border: 0; padding: 0; font: inherit; }
+  .sl-cell:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 2px; border-radius: 6px; }
 
   .sl-detail { display: grid; gap: 8px; padding: 4px 0 8px; }
-  .sl-warn {
-    display: flex; gap: 8px; align-items: flex-start;
-    font-size: 12px; line-height: 1.5;
-    background: var(--ds-accent-warn-bg);
-    border: 1px solid var(--ds-accent-warn-line);
-    color: var(--ds-accent-warn-ink);
-    border-radius: 8px; padding: 8px 10px;
+  .sl-detail-title { font-size: 12px; font-weight: 600; color: var(--ds-text-primary); }
+  .sl-detail-body { font-size: 12px; color: var(--ds-text-secondary); line-height: 1.5; }
+  .sl-detail-raw {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px; color: var(--ds-text-secondary);
+    background: var(--ds-surface); border: 1px solid var(--ds-border);
+    border-radius: 8px; padding: 8px 10px; margin: 0;
+    white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto;
   }
-  .sl-note { font-size: 12px; color: var(--ds-text-secondary); line-height: 1.5; }
-  .sl-note b { color: var(--ds-text-primary); font-weight: 600; }
-  .sl-mono { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; }
+  .sl-detail-action a { color: var(--ds-primary); font-size: 12px; font-weight: 600; }
 
-  .sl-orphan-ref { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; }
-  .sl-orphan-note {
-    font-size: 12px; color: var(--ds-text-secondary); margin-bottom: 10px;
+  /* Tagging form — the one input the report cannot derive. */
+  .sl-tagform { display: grid; gap: 10px; max-width: 720px; }
+  .sl-tagform label { font-size: 12px; font-weight: 600; color: var(--ds-text-primary); }
+  .sl-tagform select, .sl-tagform input {
+    width: 100%; padding: 7px 10px; font-size: 13px;
+    color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: 8px;
   }
-  /* The tokenless-connection list inside the shared strip. The strip owns the
-     box, the type scale and the ink; all this adds is the list's own rhythm,
-     which a strip has no opinion about because no other strip carries one. */
-  .sl-orphans .sl-empty-list { margin: 4px 0 0; line-height: 1.6; }
+  .sl-tagform-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 720px) { .sl-tagform-row { grid-template-columns: 1fr; } }
+
+  /* Feedback queue — the report list + its inline resolve form. */
+  .sl-fb-filter { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
+  .sl-fb-filter label { font-size: 12px; font-weight: 600; color: var(--ds-text-primary); }
+  .sl-fb-filter select {
+    padding: 6px 10px; font-size: 13px;
+    color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: 8px;
+  }
+  .sl-fb-when { font-size: 11px; color: var(--ds-text-secondary); white-space: nowrap; }
+  .sl-fb-who { font-size: 12px; color: var(--ds-text-secondary); word-break: break-word; }
+  .sl-fb-question { color: var(--ds-text-primary); }
+  .sl-fb-context { display: grid; gap: 2px; margin-top: 4px; }
+  .sl-fb-context span {
+    font-size: 11px; color: var(--ds-text-secondary);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .sl-fb-resolveform { display: grid; gap: 8px; padding: 4px 0 8px; max-width: 720px; }
+  .sl-fb-resolveform input {
+    width: 100%; padding: 7px 10px; font-size: 13px;
+    color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: 8px;
+  }
+  .sl-fb-resolveform .sl-note { margin: 0; }
+
+  .sl-placeholder {
+    padding: 28px 20px; text-align: center;
+    font-size: 13px; color: var(--ds-text-secondary);
+    background: var(--ds-surface);
+    border: 1px dashed var(--ds-border);
+    border-radius: 10px;
+  }
 
   /* Toast */
   .sl-toast {
     position: fixed; bottom: 24px; right: 24px;
     padding: 10px 16px; border-radius: 8px;
     font-size: 13px; font-weight: 500;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    box-shadow: 0 4px 12px var(--ds-shadow, rgba(0, 0, 0, 0.12));
     z-index: 9999; display: none; align-items: center; gap: 8px; max-width: 520px;
-    /* Failure text is the whole point of the toast — it must be readable and
-       copy-pasteable, so no ellipsis and no wrapping-forbidden single line. */
+    /* Failure text is the whole point of the toast — readable and
+       copy-pasteable, so no ellipsis and no forbidden wrap. */
     white-space: pre-wrap; user-select: text;
   }
   .sl-toast.show { display: flex; }
@@ -103,8 +136,7 @@
 
 {# No toolbar block: it renders between the head and the tab strip, where a
    lone button floats with no row to belong to. "Sync now" is an action on the
-   Sources section, so it sits on that section's head — the same place
-   /admin/data-sources puts "+ Add Keboola project". #}
+   Keboola sync strip, so it sits there. #}
 
 {% block page %}
 {% include "_admin_tabs.html" %}
@@ -112,191 +144,233 @@
   {% set rs = semantic_refresh_summary or {} %}
   <div class="apg-strip {{ 'apg-strip--danger' if rs.last_status == 'error' }}">
     <span>
-      <strong>Semantic layer:</strong>
+      <strong>Keboola semantic-layer sync:</strong>
       {% if rs.last_status == 'ok' %}
-        Last sync {{ rs.last_completed_at }} — OK.
+        Last run {{ rs.last_completed_at }} — OK.
       {% elif rs.last_status == 'error' %}
-        Last sync attempt ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
+        Last run ({{ rs.last_completed_at }}) failed: {{ rs.last_result }}
       {% else %}
         Never synced yet.
       {% endif %}
     </span>
-    <span class="apg-strip__end"><a href="/catalog/semantics">Browse it →</a></span>
-  </div>
-
-  {# The warning rows are built in JS, but their icon is not: it is rendered
-     once here by the shared macro and cloned, so no markup string is assembled
-     client-side. #}
-  <template id="sl-warn-icon">{{ ico.icon('warning', 16) }}</template>
-
-  <div class="apg-sechead">
-    <h2 class="apg-sechead__title">Sources</h2>
-    <span class="apg-sechead__count">{{ sources|length }} project{{ '' if sources|length == 1 else 's' }}</span>
-    <span class="apg-sechead__end">
+    <span class="apg-strip__end">
+      <a href="/catalog/semantics">Browse the layer →</a>
       <button type="button" class="btn btn-primary" id="sl-refresh-btn">Sync now</button>
     </span>
   </div>
-  {% if not sources %}
-  <div class="sl-empty">
-    {% if connections_without_master %}
-    {# Name the connections instead of saying "no projects". The master token is
-       a SEPARATE vault slot from the storage token the "Add Keboola project"
-       wizard fills, so a fully working, table-syncing connection still shows up
-       here as "nothing configured" — which reads as "your project isn't
-       connected" and sends admins looking for a problem that isn't there. #}
-    These Keboola projects are connected but the semantic layer can't sync them:
-    <ul class="sl-empty-list">
-      {% for c in connections_without_master %}
-      <li><strong>{{ c.name }}</strong> — {{ c.reason }}</li>
-      {% endfor %}
-    </ul>
-    A master token is set in the <em>Master token (semantic layer)</em> row at
-    <a href="/admin/data-sources">Data sources</a> — it is a separate token from the
-    storage token used to pull tables, and it must be the project owner's.
+
+  <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer lens') }}</div>
+
+  {% if active_tab == 'coverage' %}
+  <section id="sl-coverage">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Coverage</h2>
+      <span class="apg-sechead__count" id="sl-cov-count"></span>
+    </div>
+    <p class="apg-sec-desc">
+      One row per data source, one column per domain. <strong>n/a</strong> is not a gap — it means the domain
+      cannot be filled for that source type in this build (no adapter exists for it yet), so it is never
+      counted as work to do. Click any cell for its detail; how much detail there is depends on what that
+      source's connector can compute, not on which vendor it is.
+    </p>
+
+    <table class="ds-table" id="sl-cov-table">
+      <thead>
+        <tr>
+          <th>Source</th>
+          {% for domain in coverage_domains %}<th>{{ domain.label }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody id="sl-cov-body">
+        <tr><td colspan="{{ coverage_domains|length + 1 }}"><span class="sl-note">Loading coverage…</span></td></tr>
+      </tbody>
+    </table>
+    <div class="sl-empty" id="sl-cov-empty" hidden></div>
+
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Tag a resource to a source</h2>
+    </div>
+    <p class="apg-sec-desc">
+      A skill, an agent and a knowledge domain each live in their own registry with no notion of a data
+      source, so this is the one input the report above cannot work out for itself. The pickers are the same
+      projection the grant form on <a href="/admin/access">Access</a> renders.
+    </p>
+    {% if not tag_sources %}
+    <div class="sl-empty">
+      No data sources are connected yet — connect one at <a href="/admin/data-sources">Sources</a> first.
+    </div>
     {% else %}
-    No Keboola projects are connected yet. Connect one at
-    <a href="/admin/data-sources">Data sources</a> to enable the semantic-layer sync.
+    <form class="sl-tagform" id="sl-tag-form">
+      <div class="sl-tagform-row">
+        <div>
+          <label for="sl-tag-source">Data source</label>
+          <select id="sl-tag-source" name="source_id">
+            {% for source in tag_sources %}
+            <option value="{{ source.id }}"{% if source.id == prefill_tag_source %} selected{% endif %}>{{ source.name }}{% if source.source_type %} ({{ source.source_type }}){% endif %}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="sl-tag-type">What is about it</label>
+          <select id="sl-tag-type" name="resource_type">
+            {% for tag_type in tag_types %}
+            <option value="{{ tag_type.key }}"{% if tag_type.key == prefill_tag_type %} selected{% endif %}>{{ tag_type.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      {% for tag_type in tag_types %}
+      <div class="sl-tag-items" data-type="{{ tag_type.key }}"
+           {% if not ((tag_type.key == prefill_tag_type) or (not prefill_tag_type and loop.first)) %}hidden{% endif %}>
+        <label for="sl-tag-item-{{ tag_type.key }}">{{ tag_type.label }}</label>
+        {% if tag_type.resources %}
+        <select id="sl-tag-item-{{ tag_type.key }}" name="resource_id">
+          {% for item in tag_type.resources %}
+          <option value="{{ item.resource_id }}">{{ item.label }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <input id="sl-tag-item-{{ tag_type.key }}" name="resource_id" type="text"
+               placeholder="{{ tag_type.id_format }}">
+        <p class="sl-note">Nothing of this kind exists yet — the id format is <span class="sl-mono">{{ tag_type.id_format }}</span>.</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+      <div><button type="submit" class="btn btn-primary" id="sl-tag-submit">Tag</button></div>
+    </form>
     {% endif %}
-  </div>
+  </section>
+  {% elif active_tab == 'health' %}
+  <section id="sl-health">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Health</h2>
+    </div>
+    <p class="apg-sec-desc">
+      <a href="/admin/semantic-layer?tab=coverage">Coverage</a> answers what exists; this answers whether what
+      exists is broken, stale, or internally inconsistent — sync failures, models whose source was deleted or
+      renamed away from under them, documents that failed validation, and three static checks over the
+      documents themselves. A finding already
+      <a href="/admin/semantic-layer?tab=mute">muted</a> is still listed here, marked as silenced, never
+      dropped — silently omitting it would be exactly the anonymous disappearance muting exists to prevent.
+    </p>
+    <div class="sl-empty" id="sl-health-empty" hidden></div>
+    <div id="sl-health-body"></div>
+  </section>
+  {% elif active_tab == 'mute' %}
+  <section id="sl-mute">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Muted checks</h2>
+      <span class="apg-sechead__count" id="sl-mute-count"></span>
+    </div>
+    <p class="apg-sec-desc">
+      Silencing a check you have read and judged expected is a normal thing to do — silencing it
+      <em>anonymously</em> is not. Every mute below carries who made it, when, and the reason they gave, so a
+      check that stopped appearing can always be told apart from one that was fixed. Unmute puts it straight
+      back.
+    </p>
+
+    <table class="ds-table" id="sl-mute-table">
+      <thead>
+        <tr>
+          <th>Scope</th>
+          <th>Muted by</th>
+          <th>Reason</th>
+          <th>Until</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="sl-mute-body">
+        <tr><td colspan="5"><span class="sl-note">Loading muted checks…</span></td></tr>
+      </tbody>
+    </table>
+    <div class="sl-empty" id="sl-mute-empty" hidden></div>
+
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Mute a check</h2>
+    </div>
+    <p class="apg-sec-desc">
+      Pick what to silence: a domain on its own covers every source, a source on its own covers every domain,
+      and both together silence the single cell in the <a href="/admin/semantic-layer?tab=coverage">Coverage</a>
+      grid. The reason is what the next admin inherits — write the one sentence you would want to read.
+    </p>
+    <form class="sl-tagform" id="sl-mute-form">
+      <div class="sl-tagform-row">
+        <div>
+          <label for="sl-mute-source">Data source</label>
+          <select id="sl-mute-source">
+            <option value="">Any source</option>
+            {% for source in mute_sources %}
+            <option value="{{ source.id }}">{{ source.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="sl-mute-domain">Domain</label>
+          <select id="sl-mute-domain">
+            <option value="">Any domain</option>
+            {% for domain in mute_domains %}
+            <option value="{{ domain.key }}">{{ domain.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label for="sl-mute-reason">Reason</label>
+        <input id="sl-mute-reason" type="text" placeholder="e.g. tracked in the Q3 modelling epic — no metric until it lands">
+      </div>
+      <div>
+        <label for="sl-mute-expires">Un-silence itself on (optional)</label>
+        <input id="sl-mute-expires" type="date">
+        <p class="sl-note">
+          Leave empty to mute until somebody unmutes it. A date makes the check come back on its own — the
+          honest option when you expect to have fixed it by then.
+        </p>
+      </div>
+      <p class="sl-note" id="sl-mute-preview">Scope: <span class="sl-mono">(pick a source, a domain, or both)</span></p>
+      <div><button type="submit" class="btn btn-primary" id="sl-mute-submit">Mute</button></div>
+    </form>
+  </section>
   {% else %}
-  <p class="apg-sec-desc">One row per Keboola project with a master token. Legacy rows with no recorded project (synced before per-project tracking) fold into the default project's counts.</p>
-  <table class="ds-table">
-    <thead>
-      <tr>
-        <th>Source</th>
-        <th class="num">Metrics <span class="sl-source-detail">stored / upstream</span></th>
-        <th class="num">Glossary</th>
-        <th>Last sync</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for s in sources %}
-      <tr>
-        <td>
-          <span class="sl-source-name">{{ s.label }}</span>
-          {% if s.connection_id == default_connection_id %}<span class="sl-badge-default">default</span>{% endif %}
-          <br><span class="sl-source-detail">{{ s.detail }}</span>
-        </td>
-        <td class="num">{{ s.metric_count }}<span class="sl-cov" data-conn="{{ s.connection_id }}"></span></td>
-        <td class="num">{{ s.glossary_count }}</td>
-        <td>
-          {% if s.last and s.last.status == 'ok' and not (s.last.created_or_updated | default(0))
-                and not (s.last.glossary_created_or_updated | default(0))
-                and not (s.last.pruned | default(0)) %}
-            {# A healthy run re-upserts every upstream metric, so zero written is
-               not a quiet success — don't dress it as one. Glossary counts too:
-               a project that publishes terms but no metrics is a normal shape,
-               and reading it as "imported nothing" sent admins looking for a
-               fault that was not there. So does the prune count: a run that
-               wrote nothing but REMOVED stale rows did work, and hiding the
-               deletions is the one direction an admin cannot check by
-               looking. (Devin Review, twice.) #}
-            <span class="sl-last-none">— ran, imported nothing</span>
-          {% elif s.last and s.last.status == 'ok' %}
-            <span class="sl-last-ok">✓ {{ s.last.created_or_updated | default(0) }} updated{% if s.last.glossary_created_or_updated | default(0) %}, {{ s.last.glossary_created_or_updated }} terms{% endif %}, {{ s.last.pruned | default(0) }} pruned</span>
-          {% elif s.last and s.last.status == 'skipped' %}
-            <span class="sl-last-skipped">— skipped (duplicate project)</span>
-          {% elif s.last %}
-            <span class="sl-last-error">✗ {{ s.last.error | default('failed') }}</span>
-          {% else %}
-            <span class="sl-last-none">—</span>
-          {% endif %}
-        </td>
-      </tr>
-      <tr class="sl-detail-row" data-conn="{{ s.connection_id }}" hidden>
-        <td colspan="4"><div class="sl-detail"></div></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {# The tokenless connections again, for the MIXED case. Listing them only in
-     the empty state hid them the moment any one project got a master token:
-     such a connection is not a Sources row and is not orphaned either (unless
-     it happens to own previously-imported rows), so it appeared nowhere at
-     all — the same silent state one level up. Devin Review on #1242. #}
-  {# The shared strip, not a bare paragraph: this is a standing fact about the
-     surface with one action that fixes it, which is exactly what `.apg-strip`
-     is for on every other Data lens. `--block` because it wraps to several
-     lines, so the glyph aligns to the top rather than centring against a
-     paragraph, and the fix rides `.apg-strip__end` where the reader already
-     looks for it. Neutral, not tinted: a project with no master token is a
-     configuration state, not a fault. #}
-  {% if connections_without_master %}
-  {# No `.apg-strip__mark`: the glyph is the strip's alarm affordance, and this
-     strip is neutral — the same shape the status strip above it takes. #}
-  <div class="apg-strip apg-strip--block sl-orphans">
-    <span>
-      <strong>Also connected, but not syncing</strong>
-      <ul class="sl-empty-list">
-        {% for c in connections_without_master %}
-        <li><b>{{ c.name }}</b> — {{ c.reason }}</li>
-        {% endfor %}
-      </ul>
-    </span>
-    <span class="apg-strip__end"><a href="/admin/data-sources">Fix at Data sources →</a></span>
-  </div>
-  {% endif %}
-  {% endif %}
+  <section id="sl-feedback">
+    <div class="apg-sechead">
+      <h2 class="apg-sechead__title">Feedback</h2>
+      <span class="apg-sechead__count" id="sl-fb-count"></span>
+    </div>
+    <p class="apg-sec-desc">
+      What people and agents said looked wrong — an unsupported number, a metric that means something other
+      than its name, a concept nobody defined. Coverage and Health cannot see these: the layer looked complete
+      and the answer was still wrong, which only whoever read it knows. Anyone signed in can file one
+      (<span class="sl-mono">agnes semantic-model feedback submit</span>, or the chat agent offers to when it
+      cannot support its own answer).
+    </p>
 
-  {% if skipped_unresolved_total %}
-  {# The counter existed in the API response all along but never reached a
-     human: a run reporting "9 glossary terms, 0 metrics" looked like a broken
-     import when it was 50 metrics dropped on 12 unregistered tables. Say the
-     number, name the tables, and give the one action that fixes it. #}
-  <div class="apg-sechead"><h2 class="apg-sechead__title">Skipped metrics</h2></div>
-  <div class="sl-orphan-note">
-    {{ skipped_unresolved_total }} metric definition{{ 's' if skipped_unresolved_total != 1 else '' }}
-    from the last sync {{ 'were' if skipped_unresolved_total != 1 else 'was' }} skipped: the Keboola
-    tables their datasets point at are not registered in {{ instance_brand or 'Agnes' }}. Register them with
-    <em>Browse &amp; register tables</em> at <a href="/admin/data-sources">Data sources</a> and sync
-    again. Glossary terms don't reference tables, which is why a project can import terms while
-    importing no metrics at all.
-    {% if unresolved_tables %}
-    <ul class="sl-empty-list">
-      {% for t in unresolved_tables %}<li><code>{{ t }}</code></li>{% endfor %}
-    </ul>
-    {% if unresolved_tables_truncated %}
-    <p class="sl-note">At least one project has more unregistered tables than the list shows — it is capped
-      per project. Registering only the tables here will not be enough; sync again afterwards to see the rest.</p>
-    {% endif %}
-    {% endif %}
-  </div>
-  {% endif %}
+    <div class="sl-fb-filter">
+      <label for="sl-fb-status">Show</label>
+      <select id="sl-fb-status">
+        <option value="open" selected>Open</option>
+        {% for status in feedback_statuses %}{% if status != 'open' %}
+        <option value="{{ status }}">{{ status|capitalize }}</option>
+        {% endif %}{% endfor %}
+        <option value="">All</option>
+      </select>
+    </div>
 
-  {% if orphaned %}
-  <div class="apg-sechead"><h2 class="apg-sechead__title">Orphaned rows</h2></div>
-  <div class="sl-orphan-note">
-    These rows carry a project reference that no longer matches any connected Keboola project
-    (the connection was deleted or its master token removed). They are left in place — never
-    silently pruned — but won't refresh until the source connection is restored.
-  </div>
-  <table class="ds-table">
-    <thead>
-      <tr>
-        <th>Source ref</th>
-        <th class="num">Metrics</th>
-        <th class="num">Glossary</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for o in orphaned %}
-      <tr>
-        <td>
-          {# A ref that still names a live connection gets that name and the
-             reason, not a bare UUID nobody can act on. #}
-          {% if o.connection_exists %}
-          <span class="sl-source-name">{{ o.label }}</span>
-          <br><span class="sl-source-detail">{{ o.reason }} <a href="/admin/data-sources">Data sources</a> to adopt these rows again</span>
-          {% else %}
-          <span class="sl-orphan-ref">{{ o.label }}</span>
-          {% endif %}
-        </td>
-        <td class="num">{{ o.metric_count }}</td>
-        <td class="num">{{ o.glossary_count }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+    <table class="ds-table" id="sl-fb-table">
+      <thead>
+        <tr>
+          <th>Filed</th>
+          <th>By</th>
+          <th>Question</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="sl-fb-body">
+        <tr><td colspan="5"><span class="sl-note">Loading reports…</span></td></tr>
+      </tbody>
+    </table>
+    <div class="sl-empty" id="sl-fb-empty" hidden></div>
+  </section>
   {% endif %}
 </div>
 
@@ -308,10 +382,9 @@ function showToast(msg, ok) {
   el.textContent = msg;
   el.className = "sl-toast show " + (ok ? "toast-ok" : "toast-fail");
   clearTimeout(el._t);
-  // Successes may auto-dismiss; failures must NOT. A sync error here is a long,
-  // actionable line from the Keboola API, and hiding it after 3.5s is why these
-  // failures got reported as a bare status code with the reason lost. It stays
-  // until the admin clicks it away.
+  // Successes may auto-dismiss; failures must NOT. A failure here is a long,
+  // actionable line from the server, and hiding it after 3.5s is how these
+  // got reported as a bare status code with the reason lost.
   el.title = ok ? "" : "Click to dismiss";
   if (ok) {
     el._t = setTimeout(() => { el.className = "sl-toast"; }, 3500);
@@ -320,104 +393,6 @@ function showToast(msg, ok) {
 document.getElementById("sl-toast").addEventListener("click", (e) => {
   e.currentTarget.className = "sl-toast";
 });
-
-// Coverage is recomputed live server-side, so it is fetched after paint rather
-// than blocking the page on a round-trip to every connected project's Metastore.
-//
-// Every string below (metric names, dataset ids, upstream error text) comes from
-// a customer's Keboola project — untrusted. Nodes are built and filled with
-// textContent; nothing here goes near innerHTML.
-const REASON_LABELS = {
-  missing_name: "no name upstream",
-  embedded_sql_comment: "SQL comment in the expression swallows the FROM clause",
-  foreign_alias_reference: "references another dataset via an alias (needs a relationship)",
-  ambiguous_relationship: "more than one relationship touches this dataset",
-  unsupported_relationship_type: "relationship type is not supported",
-  unverified_relationship_direction: "dataset sits on the unverified side of the relationship",
-};
-const SAMPLE = 6;
-
-function el(tag, cls, text) {
-  const node = document.createElement(tag);
-  if (cls) node.className = cls;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function renderCoverage(source) {
-  const conn = source.connection_id;
-  const covSpan = document.querySelector(`.sl-cov[data-conn="${CSS.escape(String(conn))}"]`);
-  const row = document.querySelector(`.sl-detail-row[data-conn="${CSS.escape(String(conn))}"]`);
-  if (!covSpan || !row) return;
-
-  const metrics = source.metrics || {};
-  const upstream = metrics.upstream || 0;
-  const importable = metrics.importable || 0;
-  if (upstream) {
-    covSpan.textContent = ` / ${upstream}`;
-    if (!importable) covSpan.classList.add("sl-cov--none");
-  }
-
-  const box = row.querySelector(".sl-detail");
-  box.textContent = "";
-  let any = false;
-
-  const iconTpl = document.getElementById("sl-warn-icon");
-  for (const w of source.warnings || []) {
-    const warn = el("div", "sl-warn");
-    if (iconTpl) warn.appendChild(iconTpl.content.cloneNode(true));
-    warn.appendChild(el("span", null, w.message || ""));
-    box.appendChild(warn);
-    any = true;
-  }
-
-  const blocked = source.blocked || [];
-  if (blocked.length) {
-    const note = el("div", "sl-note");
-    note.appendChild(el("b", null, `${blocked.length} metric(s) blocked by their own definition: `));
-    blocked.slice(0, SAMPLE).forEach((b, i) => {
-      if (i) note.appendChild(document.createTextNode("; "));
-      note.appendChild(el("span", "sl-mono", b.metric || ""));
-      note.appendChild(document.createTextNode(" — " + (REASON_LABELS[b.reason] || b.reason || "")));
-    });
-    if (blocked.length > SAMPLE) {
-      note.appendChild(document.createTextNode(` … and ${blocked.length - SAMPLE} more`));
-    }
-    box.appendChild(note);
-    any = true;
-  }
-
-  // Stated as fact, not as a queue: a semantic layer normally describes more of
-  // a project than an instance ever registers, and those metrics are meant to
-  // stay out.
-  const unregistered = source.unregistered_tables || [];
-  if (unregistered.length) {
-    const note = el("div", "sl-note");
-    note.appendChild(document.createTextNode(`No table registered here for ${unregistered.length} dataset(s): `));
-    unregistered.slice(0, SAMPLE).forEach((t, i) => {
-      if (i) note.appendChild(document.createTextNode(", "));
-      note.appendChild(el("span", "sl-mono", t));
-    });
-    if (unregistered.length > SAMPLE) {
-      note.appendChild(document.createTextNode(` … and ${unregistered.length - SAMPLE} more`));
-    }
-    box.appendChild(note);
-    any = true;
-  }
-
-  row.hidden = !any;
-}
-
-(async () => {
-  try {
-    const r = await fetch("/api/admin/semantic-layer/coverage", { credentials: "include" });
-    if (!r.ok) return;
-    const body = await r.json();
-    (body.sources || []).forEach(renderCoverage);
-  } catch (e) {
-    // Coverage is additive: the page is fully usable without it.
-  }
-})();
 
 document.getElementById("sl-refresh-btn").addEventListener("click", async () => {
   const btn = document.getElementById("sl-refresh-btn");
@@ -446,4 +421,783 @@ document.getElementById("sl-refresh-btn").addEventListener("click", async () => 
   }
 });
 </script>
+
+{% if active_tab == 'coverage' %}
+<script>
+// The coverage grid is fetched after paint: the report's Keboola provider makes
+// upstream Metastore calls, and it is Postgres-only, so a page that rendered it
+// server-side would either block on a remote project or refuse to load at all
+// on a DuckDB instance.
+//
+// EVERY string below — source names, details, raw payloads — comes from
+// customer data or an upstream API. Nodes are built and filled with
+// textContent; nothing here goes near innerHTML.
+const DOMAINS = {{ coverage_domains | map(attribute='key') | list | tojson }};
+const BADGE_CLASS = {
+  ok: "sl-badge sl-badge--ok",
+  partial: "sl-badge sl-badge--partial",
+  missing: "sl-badge sl-badge--missing",
+  not_applicable: "sl-badge sl-badge--na",
+};
+const BADGE_LABEL = { ok: "ok", partial: "partial", missing: "missing", not_applicable: "n/a" };
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function detailRow(source, domainKey, cell, columnCount) {
+  const row = el("tr");
+  row.hidden = true;
+  const td = el("td");
+  td.colSpan = columnCount;
+  const box = el("div", "sl-detail");
+  box.appendChild(el("div", "sl-detail-title", `${source.name} — ${domainKey}`));
+  box.appendChild(el("div", "sl-detail-body", cell.detail || "(no detail)"));
+  const action = cell.action || {};
+  if (action.href) {
+    const wrap = el("div", "sl-detail-action");
+    const link = el("a", null, action.label || "Fix this");
+    link.href = action.href;
+    wrap.appendChild(link);
+    box.appendChild(wrap);
+  }
+  // The one general detail slot. Rich for a connector that computes a lot
+  // (Keboola: token identity, blocked metrics, unregistered datasets), thin
+  // for one that does not yet — same place either way.
+  if (cell.raw && Object.keys(cell.raw).length) {
+    box.appendChild(el("pre", "sl-detail-raw", JSON.stringify(cell.raw, null, 2)));
+  }
+  td.appendChild(box);
+  row.appendChild(td);
+  return row;
+}
+
+function renderCoverage(sources) {
+  const body = document.getElementById("sl-cov-body");
+  const count = document.getElementById("sl-cov-count");
+  body.textContent = "";
+  const columnCount = DOMAINS.length + 1;
+
+  for (const source of sources) {
+    const row = el("tr");
+    const nameCell = el("td");
+    nameCell.appendChild(el("span", "sl-source-name", source.name || source.source_id));
+    nameCell.appendChild(document.createElement("br"));
+    nameCell.appendChild(el("span", "sl-source-detail", source.source_type || ""));
+    row.appendChild(nameCell);
+
+    const detailRows = [];
+    for (const domainKey of DOMAINS) {
+      const cell = (source.domains || {})[domainKey] || {};
+      const td = el("td");
+      const button = el("button", "sl-cell");
+      button.type = "button";
+      button.setAttribute("aria-expanded", "false");
+      button.appendChild(el("span", BADGE_CLASS[cell.status] || "sl-badge", BADGE_LABEL[cell.status] || cell.status || "?"));
+      const opened = detailRow(source, domainKey, cell, columnCount);
+      button.addEventListener("click", () => {
+        const nowHidden = !opened.hidden;
+        for (const other of detailRows) { other.hidden = true; }
+        opened.hidden = nowHidden;
+        button.setAttribute("aria-expanded", String(!nowHidden));
+      });
+      td.appendChild(button);
+      row.appendChild(td);
+      detailRows.push(opened);
+    }
+
+    body.appendChild(row);
+    for (const opened of detailRows) { body.appendChild(opened); }
+  }
+  count.textContent = `${sources.length} source${sources.length === 1 ? "" : "s"}`;
+}
+
+function showCoverageEmpty(message, linkHref, linkLabel) {
+  const table = document.getElementById("sl-cov-table");
+  const empty = document.getElementById("sl-cov-empty");
+  table.hidden = true;
+  empty.hidden = false;
+  empty.textContent = message;
+  if (linkHref) {
+    empty.appendChild(document.createTextNode(" "));
+    const link = el("a", null, linkLabel);
+    link.href = linkHref;
+    empty.appendChild(link);
+  }
+}
+
+(async () => {
+  try {
+    const r = await fetch("/api/admin/semantic-model/coverage", { credentials: "include" });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 501 && body.error === "requires_postgres_backend") {
+      // Named rather than hidden: this instance runs the frozen DuckDB
+      // app-state backend, so the report's tag-backed columns have no table to
+      // read. Saying "no sources" here would send an admin looking for a
+      // connection problem that does not exist.
+      showCoverageEmpty(
+        "Coverage needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to see this report:",
+        "/admin/database",
+        "Database backend"
+      );
+      return;
+    }
+    if (!r.ok) {
+      showCoverageEmpty("Could not load coverage: " + (body.detail || r.statusText));
+      return;
+    }
+    const sources = body.sources || [];
+    if (!sources.length) {
+      showCoverageEmpty("No data sources are connected yet — connect one at", "/admin/data-sources", "Sources");
+      return;
+    }
+    renderCoverage(sources);
+  } catch (e) {
+    showCoverageEmpty("Could not load coverage: " + e.message);
+  }
+})();
+
+const tagForm = document.getElementById("sl-tag-form");
+if (tagForm) {
+  const typeSelect = document.getElementById("sl-tag-type");
+  const groups = Array.from(document.querySelectorAll(".sl-tag-items"));
+  typeSelect.addEventListener("change", () => {
+    for (const group of groups) { group.hidden = group.dataset.type !== typeSelect.value; }
+  });
+
+  tagForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const submit = document.getElementById("sl-tag-submit");
+    const resourceType = typeSelect.value;
+    const group = groups.find((g) => g.dataset.type === resourceType);
+    const field = group ? group.querySelector("[name=resource_id]") : null;
+    const resourceId = field ? field.value.trim() : "";
+    if (!resourceId) {
+      showToast("Pick (or type) which one it is first.", false);
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const r = await fetch("/api/admin/semantic-model/coverage/tags", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          resource_type: resourceType,
+          resource_id: resourceId,
+          source_id: document.getElementById("sl-tag-source").value,
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        showToast("Tagged.", true);
+        setTimeout(() => window.location.reload(), 900);
+        return;
+      }
+      const detail = body.detail || {};
+      showToast(detail.message || detail || r.statusText, false);
+    } catch (err) {
+      showToast("Could not tag: " + err.message, false);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+}
+</script>
+{% endif %}
+
+{% if active_tab == 'feedback' %}
+<script>
+// The queue is fetched after paint for the same two reasons as the coverage
+// grid: it is Postgres-only (a DuckDB instance must still render the page and
+// say why the list is empty), and the status filter re-queries without a
+// reload.
+//
+// EVERY string below — questions, comments, SQL, emails — was typed by a user
+// or produced by an agent. Nodes are built and filled with textContent;
+// nothing here goes near innerHTML.
+const FB_BADGE_CLASS = {
+  open: "sl-badge sl-badge--missing",
+  acknowledged: "sl-badge sl-badge--partial",
+  resolved: "sl-badge sl-badge--ok",
+};
+
+function fbEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function fbWhen(value) {
+  if (!value) return "";
+  // Server timestamps are UTC-aware; render in the reader's zone rather than
+  // shifting a naive string by the local offset.
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function fbResolveRow(item, columnCount, reload) {
+  const row = fbEl("tr");
+  row.hidden = true;
+  const td = fbEl("td");
+  td.colSpan = columnCount;
+  const form = fbEl("div", "sl-fb-resolveform");
+  form.appendChild(fbEl("p", "sl-note", "What was done about it? Recorded on the report, so the next reader of the same question sees the answer."));
+  const input = fbEl("input");
+  input.type = "text";
+  input.placeholder = "e.g. added revenue/net with the refund exclusion";
+  form.appendChild(input);
+  const confirm = fbEl("button", "btn btn-primary", "Resolve");
+  confirm.type = "button";
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = true;
+    try {
+      const r = await fetch(`/api/admin/semantic-feedback/${encodeURIComponent(item.id)}/resolve`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution_note: input.value.trim() || null }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        showToast("Resolved.", true);
+        reload();
+        return;
+      }
+      const detail = body.detail || {};
+      showToast(detail.message || detail || r.statusText, false);
+    } catch (err) {
+      showToast("Could not resolve: " + err.message, false);
+    } finally {
+      confirm.disabled = false;
+    }
+  });
+  form.appendChild(confirm);
+  td.appendChild(form);
+  row.appendChild(td);
+  return { row, input };
+}
+
+function fbShowEmpty(message, linkHref, linkLabel) {
+  const table = document.getElementById("sl-fb-table");
+  const empty = document.getElementById("sl-fb-empty");
+  table.hidden = true;
+  empty.hidden = false;
+  empty.textContent = message;
+  if (linkHref) {
+    empty.appendChild(document.createTextNode(" "));
+    const link = fbEl("a", null, linkLabel);
+    link.href = linkHref;
+    empty.appendChild(link);
+  }
+}
+
+function fbRender(items, reload) {
+  const table = document.getElementById("sl-fb-table");
+  const empty = document.getElementById("sl-fb-empty");
+  const body = document.getElementById("sl-fb-body");
+  const count = document.getElementById("sl-fb-count");
+  table.hidden = false;
+  empty.hidden = true;
+  body.textContent = "";
+  const columnCount = 5;
+
+  for (const item of items) {
+    const row = fbEl("tr");
+    const whenCell = fbEl("td");
+    whenCell.appendChild(fbEl("span", "sl-fb-when", fbWhen(item.created_at)));
+    row.appendChild(whenCell);
+    const whoCell = fbEl("td");
+    whoCell.appendChild(fbEl("span", "sl-fb-who", item.created_by || "unknown"));
+    row.appendChild(whoCell);
+
+    const questionCell = fbEl("td");
+    questionCell.appendChild(fbEl("div", "sl-fb-question", item.question || ""));
+    const context = fbEl("div", "sl-fb-context");
+    if (item.metric_id) context.appendChild(fbEl("span", null, "metric: " + item.metric_id));
+    if (item.comment) context.appendChild(fbEl("span", null, "comment: " + item.comment));
+    if (item.sql) context.appendChild(fbEl("span", null, "sql: " + item.sql));
+    if (item.model_content_hash) context.appendChild(fbEl("span", null, "model: " + item.model_content_hash));
+    if (item.resolution_note || item.resolved_by) {
+      context.appendChild(fbEl("span", null, `resolved by ${item.resolved_by || "?"}: ${item.resolution_note || "(no note)"}`));
+    }
+    if (context.childNodes.length) questionCell.appendChild(context);
+    row.appendChild(questionCell);
+
+    const statusCell = fbEl("td");
+    statusCell.appendChild(fbEl("span", FB_BADGE_CLASS[item.status] || "sl-badge", item.status || "?"));
+    row.appendChild(statusCell);
+
+    const actionCell = fbEl("td");
+    if (item.status !== "resolved") {
+      const opener = fbEl("button", "btn btn-secondary", "Resolve…");
+      opener.type = "button";
+      opener.setAttribute("aria-expanded", "false");
+      const { row: formRow, input } = fbResolveRow(item, columnCount, reload);
+      opener.addEventListener("click", () => {
+        formRow.hidden = !formRow.hidden;
+        opener.setAttribute("aria-expanded", String(!formRow.hidden));
+        if (!formRow.hidden) input.focus();
+      });
+      actionCell.appendChild(opener);
+      row.appendChild(actionCell);
+      body.appendChild(row);
+      body.appendChild(formRow);
+    } else {
+      row.appendChild(actionCell);
+      body.appendChild(row);
+    }
+  }
+  // The count names the FILTER too: "3 reports" under a status filter reads as
+  // "three in total", which is how a full queue looks empty.
+  const status = document.getElementById("sl-fb-status").value;
+  const noun = `report${items.length === 1 ? "" : "s"}`;
+  count.textContent = status ? `${items.length} ${status} ${noun}` : `${items.length} ${noun}`;
+}
+
+async function fbLoad() {
+  const status = document.getElementById("sl-fb-status").value;
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  try {
+    const r = await fetch("/api/admin/semantic-feedback" + query, { credentials: "include" });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 501 && body.error === "requires_postgres_backend") {
+      // Named rather than hidden: this instance runs the frozen DuckDB
+      // app-state backend, so there is no table to file reports into. "No
+      // reports" here would read as "nobody complained".
+      fbShowEmpty(
+        "Feedback needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to collect reports:",
+        "/admin/database",
+        "Database backend"
+      );
+      return;
+    }
+    if (!r.ok) {
+      fbShowEmpty("Could not load feedback: " + (body.detail || r.statusText));
+      return;
+    }
+    const items = body.items || [];
+    if (!items.length) {
+      fbShowEmpty(
+        status
+          ? `No ${status} reports. Anyone signed in can file one — from chat, the CLI, or an agent.`
+          : "No reports yet. Anyone signed in can file one — from chat, the CLI, or an agent."
+      );
+      document.getElementById("sl-fb-count").textContent = status ? `0 ${status} reports` : "0 reports";
+      return;
+    }
+    fbRender(items, fbLoad);
+  } catch (e) {
+    fbShowEmpty("Could not load feedback: " + e.message);
+  }
+}
+
+document.getElementById("sl-fb-status").addEventListener("change", fbLoad);
+fbLoad();
+</script>
+{% endif %}
+
+{% if active_tab == 'mute' %}
+<script>
+// Fetched after paint for the same two reasons as the coverage grid and the
+// feedback queue: the table is Postgres-only (a DuckDB instance must still
+// render the page and say why the list is empty), and unmuting re-queries
+// without a reload.
+//
+// EVERY string below — scopes, reasons, emails — was typed by an admin. Nodes
+// are built and filled with textContent; nothing here goes near innerHTML.
+const MUTES_URL = "/api/admin/semantic-layer/mutes";
+
+function mtEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function mtWhen(value) {
+  if (!value) return "";
+  // Server timestamps are UTC-aware; render in the reader's zone rather than
+  // shifting a naive string by the local offset.
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function mtScope() {
+  const source = document.getElementById("sl-mute-source").value;
+  const domain = document.getElementById("sl-mute-domain").value;
+  if (source && domain) return `source:${source}:domain:${domain}`;
+  if (source) return `source:${source}`;
+  if (domain) return `domain:${domain}`;
+  return "";
+}
+
+function mtRefreshPreview() {
+  const scope = mtScope();
+  const preview = document.getElementById("sl-mute-preview");
+  preview.textContent = "";
+  preview.appendChild(document.createTextNode("Scope: "));
+  preview.appendChild(mtEl("span", "sl-mono", scope || "(pick a source, a domain, or both)"));
+  // "Any source and any domain" is not a mute of everything — it names
+  // nothing, and the server refuses it. Say so before the click, not after.
+  document.getElementById("sl-mute-submit").disabled = !scope;
+}
+
+function mtShowEmpty(message, linkHref, linkLabel) {
+  const table = document.getElementById("sl-mute-table");
+  const empty = document.getElementById("sl-mute-empty");
+  table.hidden = true;
+  empty.hidden = false;
+  empty.textContent = message;
+  if (linkHref) {
+    empty.appendChild(document.createTextNode(" "));
+    const link = mtEl("a", null, linkLabel);
+    link.href = linkHref;
+    empty.appendChild(link);
+  }
+  document.getElementById("sl-mute-count").textContent = "";
+}
+
+async function mtUnmute(mute) {
+  const r = await fetch(`${MUTES_URL}/${encodeURIComponent(mute.id)}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (r.ok) {
+    showToast(`Unmuted ${mute.scope} — the check reports again.`, true);
+    mtLoad();
+    return;
+  }
+  const body = await r.json().catch(() => ({}));
+  const detail = body.detail || {};
+  showToast(detail.message || detail || r.statusText, false);
+}
+
+function mtRender(items) {
+  const table = document.getElementById("sl-mute-table");
+  const empty = document.getElementById("sl-mute-empty");
+  const body = document.getElementById("sl-mute-body");
+  table.hidden = false;
+  empty.hidden = true;
+  body.textContent = "";
+
+  for (const item of items) {
+    const row = mtEl("tr");
+    const scopeCell = mtEl("td");
+    scopeCell.appendChild(mtEl("span", "sl-mono", item.scope || ""));
+    row.appendChild(scopeCell);
+
+    // Who and when together: the signature is one fact, and splitting it
+    // across sortable columns invites reading the name without the date.
+    const whoCell = mtEl("td");
+    whoCell.appendChild(mtEl("div", "sl-fb-who", item.muted_by || "unknown"));
+    whoCell.appendChild(mtEl("div", "sl-fb-when", mtWhen(item.muted_at)));
+    row.appendChild(whoCell);
+
+    const reasonCell = mtEl("td");
+    // An unexplained mute is legal but conspicuous — it reads as an omission,
+    // which is exactly what it is.
+    reasonCell.appendChild(
+      item.reason ? mtEl("span", null, item.reason) : mtEl("span", "sl-note", "no reason given")
+    );
+    row.appendChild(reasonCell);
+
+    const untilCell = mtEl("td");
+    untilCell.appendChild(
+      item.expires_at ? mtEl("span", "sl-fb-when", mtWhen(item.expires_at)) : mtEl("span", "sl-note", "until unmuted")
+    );
+    row.appendChild(untilCell);
+
+    const actionCell = mtEl("td");
+    const button = mtEl("button", "btn btn-secondary", "Unmute");
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await mtUnmute(item);
+      } catch (err) {
+        showToast("Could not unmute: " + err.message, false);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    actionCell.appendChild(button);
+    row.appendChild(actionCell);
+    body.appendChild(row);
+  }
+
+  const noun = `check${items.length === 1 ? "" : "s"}`;
+  document.getElementById("sl-mute-count").textContent = `${items.length} muted ${noun}`;
+}
+
+async function mtLoad() {
+  try {
+    const r = await fetch(MUTES_URL, { credentials: "include" });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 501 && body.error === "requires_postgres_backend") {
+      // Named rather than hidden: this instance runs the frozen DuckDB
+      // app-state backend, so there is no table to store a mute in. "Nothing
+      // muted" here would read as "nobody silenced anything".
+      mtShowEmpty(
+        "Muting needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to mute checks:",
+        "/admin/database",
+        "Database backend"
+      );
+      document.getElementById("sl-mute-submit").disabled = true;
+      return;
+    }
+    if (!r.ok) {
+      mtShowEmpty("Could not load muted checks: " + (body.detail || r.statusText));
+      return;
+    }
+    const items = body.items || [];
+    if (!items.length) {
+      mtShowEmpty("Nothing is muted — every check reports.");
+      return;
+    }
+    mtRender(items);
+  } catch (e) {
+    mtShowEmpty("Could not load muted checks: " + e.message);
+  }
+}
+
+(function wireMuteForm() {
+  const form = document.getElementById("sl-mute-form");
+  const submit = document.getElementById("sl-mute-submit");
+  const expires = document.getElementById("sl-mute-expires");
+  // A date already past would be refused by the server; keep it unpickable.
+  expires.min = new Date().toISOString().slice(0, 10);
+
+  document.getElementById("sl-mute-source").addEventListener("change", mtRefreshPreview);
+  document.getElementById("sl-mute-domain").addEventListener("change", mtRefreshPreview);
+  mtRefreshPreview();
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const scope = mtScope();
+    if (!scope) {
+      showToast("Pick a source, a domain, or both — a mute has to name something.", false);
+      return;
+    }
+    const reason = document.getElementById("sl-mute-reason").value.trim();
+    const payload = { scope: scope };
+    if (reason) payload.reason = reason;
+    if (expires.value) {
+      // End of the chosen day in the reader's own zone: a bare date parsed as
+      // UTC midnight would already be in the past for anyone picking today.
+      const until = new Date(`${expires.value}T23:59:59`);
+      payload.expires_at = until.toISOString();
+    }
+
+    submit.disabled = true;
+    try {
+      const r = await fetch(MUTES_URL, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        showToast(`Muted ${scope}.`, true);
+        document.getElementById("sl-mute-reason").value = "";
+        mtLoad();
+        return;
+      }
+      const detail = body.detail || {};
+      showToast(detail.message || detail || r.statusText, false);
+    } catch (err) {
+      showToast("Could not mute: " + err.message, false);
+    } finally {
+      mtRefreshPreview();
+    }
+  });
+})();
+
+mtLoad();
+</script>
+{% endif %}
+
+{% if active_tab == 'health' %}
+<script>
+// Fetched after paint for the same reason as the coverage grid: the report
+// is Postgres-only (the mute overlay has no DuckDB implementation), so a
+// DuckDB instance must still render the page and say why.
+//
+// EVERY string below was typed by an admin or read off the database. Nodes
+// are built and filled with textContent; nothing here goes near innerHTML.
+const HEALTH_URL = "/api/admin/semantic-layer/health";
+
+function hlEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function hlWhen(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  return isNaN(parsed) ? String(value) : parsed.toLocaleString();
+}
+
+function hlMutedScopes(mutes) {
+  // A finding is "muted" when its own scope, its whole domain, or its whole
+  // source is silenced — the three forms `agnes semantic-model mute` accepts.
+  const scopes = new Set();
+  for (const m of mutes) if (m.scope) scopes.add(m.scope);
+  return scopes;
+}
+
+function hlIsMuted(mutedScopes, ...candidates) {
+  for (const c of candidates) if (c && mutedScopes.has(c)) return true;
+  return false;
+}
+
+function hlSection(container, title, items, renderItem) {
+  if (!items.length) return;
+  const section = hlEl("div", "sl-fb-context");
+  section.style.marginTop = "20px";
+  const head = hlEl("div", "sl-detail-title", `${title} (${items.length})`);
+  section.appendChild(head);
+  const list = hlEl("ul");
+  list.style.margin = "8px 0 0";
+  list.style.paddingLeft = "18px";
+  for (const item of items) {
+    const li = hlEl("li");
+    li.style.marginBottom = "6px";
+    li.style.fontSize = "12px";
+    li.style.color = "var(--ds-text-secondary)";
+    renderItem(li, item);
+    list.appendChild(li);
+  }
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function hlMutedBadge(muted) {
+  const badge = hlEl("span", "sl-badge sl-badge--na", "muted");
+  badge.style.marginLeft = "8px";
+  return muted ? badge : null;
+}
+
+function hlRender(body) {
+  const container = document.getElementById("sl-health-body");
+  const empty = document.getElementById("sl-health-empty");
+  container.textContent = "";
+  empty.hidden = true;
+
+  const mutedScopes = hlMutedScopes(body.mutes || []);
+  const failedSources = (body.sources || []).filter((s) => s.last_sync_status === "error");
+  const orphaned = body.orphaned_models || [];
+  const invalid = body.invalid_models || [];
+  const missingDesc = body.metrics_missing_description || [];
+  const dupes = body.duplicate_metric_names || [];
+  const missingRel = body.metrics_missing_relationships || [];
+  const summary = body.coverage_summary || {};
+
+  const nothingWrong =
+    !failedSources.length && !orphaned.length && !invalid.length && !missingDesc.length && !dupes.length && !missingRel.length;
+
+  const headline = hlEl(
+    "p",
+    "apg-sec-desc",
+    nothingWrong
+      ? "No sync failures, disconnected models, or invalid documents."
+      : "Findings below, newest checks first within each group."
+  );
+  container.appendChild(headline);
+
+  const coverageLine = hlEl(
+    "p",
+    "sl-note",
+    `Coverage: ${summary.missing_count || 0} missing cell(s), ${summary.partial_count || 0} partial — see the Coverage tab.`
+  );
+  container.appendChild(coverageLine);
+
+  hlSection(container, "Sync failures", failedSources, (li, s) => {
+    const muted = hlIsMuted(mutedScopes, `source:${s.source_id}`);
+    li.appendChild(hlEl("strong", null, s.name || s.source_id));
+    li.appendChild(document.createTextNode(": " + (s.last_sync_error || "unknown error")));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "Models whose source is gone", orphaned, (li, m) => {
+    li.appendChild(hlEl("span", "sl-mono", m.slug || m.model_id));
+    li.appendChild(document.createTextNode(` — source_ref ${m.source_ref} no longer exists`));
+  });
+
+  hlSection(container, "Documents that failed validation", invalid, (li, m) => {
+    li.appendChild(hlEl("span", "sl-mono", m.slug || m.model_id));
+    const errors = Array.isArray(m.validation_errors) ? m.validation_errors.join("; ") : String(m.validation_errors || "");
+    if (errors) li.appendChild(document.createTextNode(": " + errors));
+  });
+
+  hlSection(container, "Metrics with no description", missingDesc, (li, m) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", m.name));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "The same metric name defined twice, differently", dupes, (li, d) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", d.name));
+    li.appendChild(document.createTextNode(` — ${(d.expressions || []).length} different formula(s)`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+
+  hlSection(container, "Cross-dataset metrics with no declared relationship", missingRel, (li, m) => {
+    const muted = hlIsMuted(mutedScopes, "domain:metrics");
+    li.appendChild(hlEl("span", "sl-mono", m.metric_name));
+    li.appendChild(document.createTextNode(` spans ${(m.datasets || []).join(", ")}`));
+    const badge = hlMutedBadge(muted);
+    if (badge) li.appendChild(badge);
+  });
+}
+
+async function hlLoad() {
+  const empty = document.getElementById("sl-health-empty");
+  const body = document.getElementById("sl-health-body");
+  try {
+    const r = await fetch(HEALTH_URL, { credentials: "include" });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.status === 501 && respBody.error === "requires_postgres_backend") {
+      body.textContent = "";
+      empty.hidden = false;
+      empty.textContent = "";
+      empty.appendChild(
+        document.createTextNode(
+          "Health needs the Postgres app-state backend — this instance still runs the DuckDB one. Migrate it to see this report:"
+        )
+      );
+      empty.appendChild(document.createTextNode(" "));
+      const link = hlEl("a", null, "Database backend");
+      link.href = "/admin/database";
+      empty.appendChild(link);
+      return;
+    }
+    if (!r.ok) {
+      body.textContent = "";
+      empty.hidden = false;
+      empty.textContent = "Could not load health: " + (respBody.detail || r.statusText);
+      return;
+    }
+    hlRender(respBody);
+  } catch (e) {
+    body.textContent = "";
+    empty.hidden = false;
+    empty.textContent = "Could not load health: " + e.message;
+  }
+}
+
+hlLoad();
+</script>
+{% endif %}
 {% endblock %}

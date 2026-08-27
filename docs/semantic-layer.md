@@ -239,6 +239,136 @@ custom_extensions:
 Not to be confused with `agnes admin semantic-model validate <file>` below,
 which schema-checks a *document*, offline, before it is ever stored.
 
+## Coverage: what each source still lacks
+
+`GET /api/admin/semantic-model/coverage` (admin, `/admin/semantic-layer` →
+**Coverage**) asks one question of **every** connected data source, not just
+the ones with a semantic model: is there a semantic model, are there metrics,
+glossary terms, a skill, a specialized agent, a knowledge base? Each answer is
+`ok` / `partial` / `missing` / `not_applicable`.
+
+Three things about it are deliberate:
+
+- **`not_applicable` is not a gap.** Only three adapters exist (see *Adapters*
+  above), so a BigQuery connection has no semantic-layer adapter at all.
+  Reporting that as `missing`, next to a link into a create flow that does not
+  exist for it, would invent work nobody can do.
+- **Detail depth follows the connector, not the vendor.** Every cell has one
+  `raw` slot in one place in the UI. Keboola's is fat because
+  `connectors/keboola/semantic_layer.py::compute_semantic_coverage` computes a
+  lot (token-identity mismatches, metrics blocked by their own definition,
+  unregistered dataset tables); Snowflake's is thin because its adapter does
+  not compute that yet. That report is a *provider* inside this one — it is
+  neither replaced nor duplicated, and its own endpoint
+  (`/api/admin/semantic-layer/coverage`) is unchanged.
+- **Skills, agents and knowledge domains have to be told.** They live in their
+  own registries with no notion of a data source, so the link is an explicit
+  admin act — `resource_source_tags`, maintained via `… coverage tag/untag`.
+  That table is **Postgres-only** (see `docs/migrations.md` → "Adding a PG-only
+  feature"), so on the frozen DuckDB app-state backend these routes answer
+  `501 requires_postgres_backend`.
+
+## Health: is the layer trustworthy right now
+
+Coverage answers "what exists"; `GET /api/admin/semantic-layer/health`
+(admin, `/admin/semantic-layer` → **Health**) answers "is what exists broken,
+stale, or internally inconsistent" — a different question, in one response:
+
+- **`sources`** — every `semantic_sources` row's last sync outcome, verbatim.
+- **`orphaned_models`** — non-`manual` models whose `source_ref` names no live
+  source. Deleting a source (`DELETE /api/admin/semantic-sources/{id}`) does
+  not cascade to the models it fed, so a project can vanish and leave its
+  models silently pointing at nothing.
+- **`invalid_models`** — documents with `status='invalid'`, and why.
+- **Three static, document-only quality checks**, none of which touch live
+  data: `metrics_missing_description` (a formula with no business decision
+  written down — is "Revenue" gross or net?), `duplicate_metric_names` (the
+  same name defined twice with a *different* formula — the "four sources of
+  truth" anti-pattern), and `metrics_missing_relationships` (a metric whose
+  SQL table-qualifies columns from two datasets with no declared relationship
+  between them, read straight off the Ossie document — a substring heuristic
+  over the expression text, advisory rather than authoritative, since exact
+  parsing would need a grammar per dialect).
+- **`coverage_summary`** — the missing/partial cell counts from Coverage,
+  rolled up into two numbers.
+- **`mutes`** — every currently active silence, so a finding already signed
+  for by an admin is never reported as news a second time.
+
+`semantic_health_mutes` is **Postgres-only**, and it is resolved *first* —
+before any of the other, backend-agnostic checks run — so a DuckDB-backed
+instance answers one clean `501 requires_postgres_backend` for the whole
+report rather than a partial one that silently drops the one field muting
+exists to keep visible.
+
+## Muting: turning a check off is a signature
+
+An admin who has read a finding, decided it is expected and put the work in a
+plan should be able to stop it shouting. What they must not be able to do is
+make it vanish without a trace — a check that simply stops appearing leaves the
+next reader unable to tell "fixed" from "hidden". So Agnes has no "dismiss"
+button; it has a mute that carries **who**, **when** and **why**, and hands all
+three back on every read (`/admin/semantic-layer` → **Mute**).
+
+A mute names a scope, in one of three widths:
+
+| Scope | Silences |
+|---|---|
+| `domain:<domain>` | that domain across every source |
+| `source:<source_id>` | that source, every domain |
+| `source:<source_id>:domain:<domain>` | one cell of the coverage grid |
+
+`__local__` is a valid source id — it is the report's synthetic bucket for
+registered tables with no connection. A scope that parses to neither form is
+refused (`400 invalid_scope`) rather than stored: a row that looks like a mute
+but matches nothing is worse than either outcome. So is a scope naming a source
+that does not exist (`404`), and re-muting something already muted (`409`, with
+the existing mute's id — read the reason somebody already gave before adding a
+second one).
+
+`expires_at` is the honest middle option: say when you expect to have fixed it
+and let the check come back on its own. Omit it and the mute stands until
+somebody unmutes it. Expired mutes drop out of the default list but stay
+readable with `?include_expired=true` / `--include-expired` — the silence ends
+at the expiry, the record of who chose it does not.
+
+Muting is admin-only on every surface (UI, `agnes semantic-model
+mute/unmute/mutes`, MCP `mute_semantic_check` / `unmute_semantic_check` /
+`semantic_mutes_list`, REST), and both mutations are audit-logged.
+`semantic_health_mutes` is **Postgres-only** (see `docs/migrations.md` →
+"Adding a PG-only feature") — on the frozen DuckDB app-state backend every one
+of these surfaces answers `501 requires_postgres_backend` rather than
+pretending the check was silenced.
+
+## Feedback: "that answer looked wrong"
+
+Coverage says what is undocumented and health says what is broken. Neither can
+see the third failure: the layer looked complete and the **answer** was still
+wrong — a number nothing supports, a metric that means something other than its
+name, a concept nobody defined. Only whoever read the answer knows that, so the
+report channel is open to **any signed-in caller** (`POST
+/api/semantic-feedback`), while the queue behind it is admin-only
+(`/admin/semantic-layer` → **Feedback**).
+
+Four surfaces file the same report, on purpose:
+
+- **UI** — the Feedback tab lists the queue and resolves with a note.
+- **Chat / agent** — the MCP tool `flag_semantic_issue`, whose contract is to
+  *offer* filing when it cannot support its own answer and file only once the
+  user agrees: reporting silently on someone's behalf and waiting for the user
+  to remember are both wrong. (The matching workspace-prompt sentence ships
+  with the agent-grounding rules.)
+- **CLI** — `agnes semantic-model feedback submit/list/resolve`.
+- **REST** — the endpoints above; the only surface that also accepts
+  `model_content_hash`, which pins the report to the document version that
+  produced the answer.
+
+Resolving is a guarded transition: the second admin to close the same report
+gets `409`, so the record of who fixed it and how is never overwritten.
+`semantic_feedback` is **Postgres-only** (see `docs/migrations.md` → "Adding a
+PG-only feature") — on the frozen DuckDB app-state backend every one of these
+surfaces answers `501 requires_postgres_backend` rather than pretending the
+report was filed.
+
 ## Commands
 
 ```bash
@@ -251,6 +381,21 @@ agnes admin semantic-model validate <file>   # offline: no server, no token
 agnes admin semantic-source add ... | list | sync <id>
 
 agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
+
+agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
+agnes semantic-model coverage tag <type> <resource-id> <source-id>
+agnes semantic-model coverage untag <tag-id>
+agnes semantic-model coverage tables [--limit N] [--json]   # source-agnostic: tables with NO model at all
+
+agnes semantic-model health [--json]   # admin, see "Health" above
+
+agnes semantic-model mute <scope> [--reason "..."] [--expires <ISO8601>]  # admin
+agnes semantic-model unmute <mute-id>                                    # admin
+agnes semantic-model mutes [--include-expired] [--json]                  # admin
+
+agnes semantic-model feedback submit "<question>" [--sql ...] [--metric ...] [--comment ...]
+agnes semantic-model feedback list [--status open] [--json]   # admin
+agnes semantic-model feedback resolve <id> [--note "..."]     # admin
 ```
 
 `validate` deliberately needs neither a server nor a token — someone fixing a

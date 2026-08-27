@@ -32,10 +32,21 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # implementation) — list them here (route -> one-line reason) instead of
 # letting the sweep flag them. `assert_pg_only_exemptions_fail_clean` below
 # still requires each one to fail CLEAN (a typed 501) on DuckDB, not crash or
-# merely return some unrelated 4xx. Empty until the first PG-only route ships
-# (Track C); the mechanism itself is proven in
+# merely return some unrelated 4xx. The mechanism itself is proven in
 # `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
-_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {}
+_PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "GET /api/admin/semantic-model/coverage": (
+        "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
+    ),
+    "GET /api/admin/semantic-feedback": "the feedback queue reads `semantic_feedback`, a PG-only table (F4.5)",
+    "GET /api/admin/semantic-layer/mutes": (
+        "the muted-check list reads `semantic_health_mutes`, a PG-only table (F4.3)"
+    ),
+    "GET /api/admin/semantic-layer/health": (
+        "the health roll-up resolves `semantic_health_mutes` (the mute overlay) as a "
+        "gate dependency before any other check runs, a PG-only table (F4.2)"
+    ),
+}
 
 
 def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
