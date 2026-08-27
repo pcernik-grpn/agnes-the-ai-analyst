@@ -235,17 +235,22 @@ def model_glossary(model: dict) -> list[dict]:
     return entries
 
 
-def dialect_skipped_count(model: dict) -> int:
-    """How many of the model's metrics never made it into the flat
-    projection (``metric_definitions``) because none of their declared
-    dialects is one this instance can run (SNOWFLAKE-only, DATABRICKS-only,
-    etc.) — the same check ``src/semantic/projection.py`` makes at write
-    time, recomputed here since a stored ``semantic_models`` row carries no
-    column of its own to persist it in.
-    """
-    from src.semantic.dialect import count_dialect_skipped_metrics
+def warehouse_only_metric_count(model: dict) -> int:
+    """How many of the model's metrics project into ``metric_definitions``
+    with only a warehouse-specific dialect (SNOWFLAKE-only, DATABRICKS-only,
+    etc.) rather than DUCKDB/ANSI_SQL — the same check
+    ``src/semantic/projection.py`` makes at write time, recomputed here since
+    a stored ``semantic_models`` row carries no column of its own to persist
+    it in.
 
-    return count_dialect_skipped_metrics(model.get("metrics") or [])
+    These metrics ARE in the catalog (unlike a genuinely skipped metric —
+    e.g. one with no expression at all); they just cannot run through a
+    local DuckDB query and need server-side (remote/materialized) execution
+    instead.
+    """
+    from src.semantic.dialect import count_warehouse_only_metrics
+
+    return count_warehouse_only_metrics(model.get("metrics") or [])
 
 
 def object_counts(model: dict) -> dict[str, int]:
@@ -394,7 +399,6 @@ __all__ = [
     "ai_groups",
     "ai_instructions_and_examples",
     "dataset_field_rows",
-    "dialect_skipped_count",
     "find_object",
     "is_imported",
     "metric_expressions",
@@ -405,4 +409,5 @@ __all__ = [
     "object_counts",
     "object_id",
     "source_label",
+    "warehouse_only_metric_count",
 ]

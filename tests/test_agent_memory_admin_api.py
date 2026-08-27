@@ -174,6 +174,100 @@ def test_list_memories_cross_owner_returns_404(other_client, env):
 
 
 # ---------------------------------------------------------------------------
+# GET — list, owner-vs-grantee (private notebook, not a runnable-share surface)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def grantee_env(env):
+    """Shares `env["agent_id"]` (owned by owner1) to a group holding a THIRD
+    user, `grantee1` — a runnable grantee (C2.3: a `ResourceType.AGENT` row
+    via the caller's group, the same reach `GET /api/v1/agents` and the
+    session-creation routes honor for READ/RUN). Also seeds an admin user
+    in the system admin group, for the admin-still-reads assertion.
+
+    Deliberately does NOT touch `agent_scope`/data packages/tables — the
+    memory notebook is private regardless of what data scope the agent
+    carries.
+    """
+    from src.db import SYSTEM_ADMIN_GROUP, get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+    from src.repositories.users import UserRepository
+
+    conn = get_system_db()
+    UserRepository(conn).create(id="grantee1", email="grantee@test.com", name="Grantee")
+    UserRepository(conn).create(id="admin1", email="admin@test.com", name="Admin")
+
+    admin_gid = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()[0]
+    UserGroupMembersRepository(conn).add_member("admin1", admin_gid, source="system_seed")
+
+    shared_group = UserGroupsRepository(conn).create(name="grantee-shared-agent-group", created_by="owner1")
+    UserGroupMembersRepository(conn).add_member("grantee1", shared_group["id"], source="admin", added_by="owner1")
+    # Library "Share" action: the exact grant C2.3 introduced.
+    ResourceGrantsRepository(conn).create(shared_group["id"], "agent", env["agent_id"], assigned_by="owner1")
+    conn.close()
+
+    env = dict(env)
+    env["grantee_token"] = create_access_token("grantee1", "grantee@test.com")
+    env["admin_token"] = create_access_token("admin1", "admin@test.com")
+    return env
+
+
+def test_list_memories_grantee_returns_404_not_owner_content(grantee_env):
+    """The bug: a runnable grantee (shared the agent, C2.3) could read the
+    owner's private memory notebook verbatim via this same list route that
+    admits them for `GET /api/v1/agents/{id}`. The notebook is private —
+    owner/admin only — so a grantee must 404 exactly like any other
+    non-owner, non-admin caller, never see the content."""
+    _create_memory(
+        grantee_env["agent_id"],
+        content="OWNER PRIVATE: prefer margin over revenue for Q3 board deck",
+        status="active",
+    )
+    client = _AuthedClient(grantee_env["client"], grantee_env["grantee_token"])
+
+    resp = client.get(f"/api/v1/agents/{grantee_env['agent_id']}/memories")
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["code"] == "agent_not_found"
+    assert "OWNER PRIVATE" not in resp.text
+
+
+def test_list_memories_owner_still_reads_their_own(grantee_env):
+    client = _AuthedClient(grantee_env["client"], grantee_env["owner_token"])
+    memory_id = _create_memory(grantee_env["agent_id"], content="owner note", status="active")
+
+    resp = client.get(f"/api/v1/agents/{grantee_env['agent_id']}/memories")
+
+    assert resp.status_code == 200, resp.text
+    assert {row["id"] for row in resp.json()["data"]} == {memory_id}
+
+
+def test_list_memories_admin_still_reads_god_mode(grantee_env):
+    client = _AuthedClient(grantee_env["client"], grantee_env["admin_token"])
+    memory_id = _create_memory(grantee_env["agent_id"], content="owner note", status="active")
+
+    resp = client.get(f"/api/v1/agents/{grantee_env['agent_id']}/memories")
+
+    assert resp.status_code == 200, resp.text
+    assert {row["id"] for row in resp.json()["data"]} == {memory_id}
+
+
+def test_grantee_still_sees_the_agent_itself(grantee_env):
+    """Control: only the private notebook tightens — the agent-list/detail
+    surface a runnable grantee legitimately relies on (and can run) must
+    stay reachable."""
+    client = _AuthedClient(grantee_env["client"], grantee_env["grantee_token"])
+
+    resp = client.get(f"/api/v1/agents/{grantee_env['agent_id']}")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == grantee_env["agent_id"]
+
+
+# ---------------------------------------------------------------------------
 # PATCH — approve / archive
 # ---------------------------------------------------------------------------
 

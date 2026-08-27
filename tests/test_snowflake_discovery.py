@@ -200,7 +200,87 @@ def test_endpoint_maps_driver_failure_to_502_not_empty(seeded_app, monkeypatch):
     resp = c.get("/api/admin/data-sources/snowflake/tables", headers=_auth(seeded_app["admin_token"]))
 
     assert resp.status_code == 502, resp.text
-    assert "ADBC driver not found" in resp.json()["detail"]
+    # #1616: the wizard used to render this raw driver text verbatim. The
+    # 502 body is now the classified, generic fallback sentence — the raw
+    # exception text stays server-side (see the classifier tests below).
+    assert "ADBC driver not found" not in resp.json()["detail"]
+    assert "Snowflake" in resp.json()["detail"]
+
+
+def test_endpoint_classifies_expired_password_as_a_human_sentence(seeded_app, monkeypatch):
+    """#1616: the wizard rendered this exact three-layer wrapped exception
+    verbatim on an expired-password Snowflake connection. The 502 `detail`
+    must instead be a short, human sentence naming the credential problem —
+    with none of the driver/DuckDB internals (exception class, SQLSTATE,
+    Snowflake error code, request id) that made the original unreadable.
+    """
+    raw = (
+        "snowflake ATTACH failed (IOException): IO Error: Failed to initialize "
+        "connection: [Snowflake] 390106 (08004): Specified password has expired. "
+        "Password must be changed using the Snowflake web console. "
+        "[6fcaea81-520b-45b6-b25b-0a39a4c52732]"
+    )
+
+    def _boom(schema=None):
+        raise RuntimeError(raw)
+
+    monkeypatch.setattr("connectors.snowflake.discovery.list_tables", _boom)
+    c = seeded_app["client"]
+
+    resp = c.get("/api/admin/data-sources/snowflake/tables", headers=_auth(seeded_app["admin_token"]))
+
+    assert resp.status_code == 502, resp.text
+    detail = resp.json()["detail"]
+    assert "expired" in detail.lower() and "password" in detail.lower()
+    for leaked in (
+        "IOException",
+        "390106",
+        "08004",
+        "6fcaea81-520b-45b6-b25b-0a39a4c52732",
+        "could not list Snowflake tables",
+    ):
+        assert leaked not in detail, detail
+
+
+def test_endpoint_classifies_wrong_credentials_as_a_human_sentence(seeded_app, monkeypatch):
+    """A different Snowflake auth failure shape — same classification bucket."""
+
+    def _boom(schema=None):
+        raise RuntimeError(
+            "snowflake ATTACH failed (IOException): [Snowflake] 390103 (08004): "
+            "Incorrect username or password was specified."
+        )
+
+    monkeypatch.setattr("connectors.snowflake.discovery.list_tables", _boom)
+    c = seeded_app["client"]
+
+    resp = c.get("/api/admin/data-sources/snowflake/tables", headers=_auth(seeded_app["admin_token"]))
+
+    assert resp.status_code == 502, resp.text
+    detail = resp.json()["detail"]
+    assert "credential" in detail.lower() or "password" in detail.lower()
+    assert "390103" not in detail
+    assert "Incorrect username or password" not in detail
+
+
+def test_endpoint_generic_failure_gets_a_sensible_fallback_not_a_dump(seeded_app, monkeypatch):
+    """A non-auth failure (network, driver, misc) is not the expired-password
+    sentence, but it must still be short and actionable — not the raw
+    exception text."""
+
+    def _boom(schema=None):
+        raise RuntimeError("connection reset by peer while negotiating TLS")
+
+    monkeypatch.setattr("connectors.snowflake.discovery.list_tables", _boom)
+    c = seeded_app["client"]
+
+    resp = c.get("/api/admin/data-sources/snowflake/tables", headers=_auth(seeded_app["admin_token"]))
+
+    assert resp.status_code == 502, resp.text
+    detail = resp.json()["detail"]
+    assert "connection reset by peer" not in detail
+    assert "Snowflake" in detail
+    assert "expired" not in detail.lower()  # not misclassified as the auth case
 
 
 def test_endpoint_maps_allowlist_refusal_to_400(seeded_app, monkeypatch):
@@ -325,7 +405,6 @@ def test_attach_failure_does_not_leak_a_password_truncated_mid_value(monkeypatch
     """The same open-delimiter hole on the PASSWORD arm. The substring pass
     usually saves it there (the password IS passed verbatim), so this pins the
     backstop itself rather than relying on that coincidence."""
-    from unittest.mock import MagicMock
 
     from connectors.snowflake.attach import _scrub_secret_material
 

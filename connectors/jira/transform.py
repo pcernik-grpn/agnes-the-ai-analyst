@@ -321,10 +321,36 @@ REMOTE_LINKS_SCHEMA = {
 }
 
 
+#: Dtype strings recognized in a Jira schema dict, other than the
+#: ``datetime64`` prefix family (``datetime64[ns, UTC]`` today, matched by
+#: prefix so a future tz/unit variant does not need a new literal here).
+_RECOGNIZED_DTYPES = frozenset({"string", "Int64", "bool"})
+
+
+def _check_known_dtype(col: str, dtype: str) -> None:
+    """Raise if ``dtype`` is not one this module knows how to map.
+
+    An unrecognized dtype used to fall through to ``pa.string()`` in
+    ``get_pyarrow_schema`` (and to skip conversion entirely in
+    ``apply_schema``), so a typo'd dtype in a schema dict silently produced a
+    wrong-typed column instead of failing (#1395). Called at the top of both
+    functions, before any column is touched, so a typo fails the one schema
+    dict that carries it — loudly, and before any row data moves — without
+    disturbing tables that use a different, valid schema.
+    """
+    if dtype in _RECOGNIZED_DTYPES or dtype.startswith("datetime64"):
+        return
+    raise ValueError(
+        f"unrecognized dtype {dtype!r} for column {col!r}; "
+        f"accepted values are {sorted(_RECOGNIZED_DTYPES)} or a 'datetime64' prefix"
+    )
+
+
 def get_pyarrow_schema(schema_dict: dict) -> pa.Schema:
     """Convert schema dict to PyArrow schema for consistent Parquet types."""
     pa_fields = []
     for col, dtype in schema_dict.items():
+        _check_known_dtype(col, dtype)
         if dtype == "string":
             pa_fields.append(pa.field(col, pa.string()))
         elif dtype.startswith("datetime64"):
@@ -333,8 +359,6 @@ def get_pyarrow_schema(schema_dict: dict) -> pa.Schema:
             pa_fields.append(pa.field(col, pa.int64()))
         elif dtype == "bool":
             pa_fields.append(pa.field(col, pa.bool_()))
-        else:
-            pa_fields.append(pa.field(col, pa.string()))
     return pa.schema(pa_fields)
 
 
@@ -345,6 +369,12 @@ def apply_schema(df: pd.DataFrame, schema: dict) -> pa.Table:
     This ensures all monthly chunks have the same column types,
     preventing DuckDB union errors when querying with glob patterns.
     """
+    # Validate every dtype before touching a single column: a typo'd schema
+    # dict must fail the whole call up front (#1395), not leave some columns
+    # converted and others silently untouched.
+    for col, dtype in schema.items():
+        _check_known_dtype(col, dtype)
+
     # Ensure all schema columns exist
     for col in schema:
         if col not in df.columns:
