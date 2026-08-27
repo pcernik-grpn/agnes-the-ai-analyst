@@ -16,14 +16,25 @@ the true inverse — the table is new, so dropping it restores the previous
 schema exactly.
 
 Revision ID: 0073_resource_source_tags
-Revises: 0073_agent_scope_granted_by
+Revises: 0074_semantic_draft_pending
 Create Date: 2026-08-26
 
-Re-chained (not renamed) when this branch merged ``main``: ``0073_agent_scope_
-granted_by`` landed there off the same ``0072`` parent, and two revisions
-sharing one parent are two Alembic HEADS — ``upgrade head`` refuses to pick.
-The revision ID is unchanged so an instance that already applied this table
-does not re-run it; only its parent moved.
+Re-chained (not renamed) TWICE, both times when this branch merged ``main``,
+and both times for the identical reason: a revision landing on ``main``
+claimed the same parent this file's ``down_revision`` pointed at, forking
+the chain into two Alembic HEADS (``upgrade head`` refuses to pick between
+them). First re-chain: onto ``0073_agent_scope_granted_by``, which had
+landed off the same ``0072`` parent this file originally revised. Second
+re-chain (this one): ``0073_column_metadata_source_ref_v125`` had ALSO
+landed off ``0073_agent_scope_granted_by`` — via a separate, already-merged
+``main`` feature (semantic-phase5) — extending it to
+``0074_semantic_draft_pending`` before this file's first re-chain ever
+reached `main`, so pointing at ``0073_agent_scope_granted_by`` was already
+stale the moment it was written. Re-chained onto the chain's actual current
+tip instead of guessing at another single parent, since a THIRD unrelated
+chain landing on the same parent again would only repeat the fork. The
+revision ID is unchanged so an instance that already applied this table
+does not re-run it; only its parent moved, twice.
 """
 
 from __future__ import annotations
@@ -34,7 +45,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0073_resource_source_tags"
-down_revision: Union[str, None] = "0073_agent_scope_granted_by"
+down_revision: Union[str, None] = "0074_semantic_draft_pending"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
