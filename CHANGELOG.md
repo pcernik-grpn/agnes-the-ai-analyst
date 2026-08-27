@@ -23,6 +23,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **Three Corporate Memory governance knobs are wired up; the fourth is
+  clearly marked as not yet enforced (#1573).** `corporate_memory.approval_mode:
+  "threshold"` used to silently behave exactly like `"review_queue"` — there
+  was no confidence cutoff to compare against. It now compares each item's
+  confidence score against the new `corporate_memory.auto_publish_min_confidence`
+  knob (default `0.80`); an unrecognized `approval_mode` value is logged as a
+  warning instead of silently degrading. `corporate_memory.notify_on_new_items`
+  (default on) now actually notifies — every Admin-group member with a live
+  desktop session gets a notification when a collection run leaves new items
+  in the review queue. `POST /api/memory` (the "add what you know" button)
+  used to hardcode `status="pending"` regardless of configuration; it now
+  respects `approval_mode` the same way the CLAUDE.local.md collector does —
+  **on an instance with no `corporate_memory:` block at all** (the documented
+  legacy "no admin review" default, and the common case today) items now
+  auto-approve immediately instead of sitting in the pending queue forever
+  with no notification. `distribution_mode` remains inert — `GET
+  /api/memory/bundle` still ships every approved item to every user
+  regardless of the configured mode — and is now labeled "NOT YET ENFORCED"
+  in its `/admin/server-config` hint and in `config/instance.yaml.example`
+  rather than silently doing nothing; wiring it up touches the JSON bundle
+  route, the per-domain markdown route `agnes pull` writes, and the
+  sync-manifest md5 those two must agree with, and is left as open work.
+  Also removed a dead `GOVERNANCE_MODE` JS constant on the admin Corporate
+  Memory page that always evaluated to `null` (the template read
+  `governance_mode`, the route passed `governance`) and had no other
+  reference in the page.
+
 ### Removed
 
 ### Internal

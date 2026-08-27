@@ -537,6 +537,21 @@ async def create_knowledge(
     except Exception:
         pass  # tagging is non-critical — never block item creation
 
+    # #1573: this endpoint used to hardcode status="pending" regardless of
+    # corporate_memory.approval_mode — the one config knob that DID have a
+    # reader (services/corporate_memory/collector.py) simply wasn't
+    # consulted here, so a human asserting a known fact got the same
+    # mandatory-review treatment as an unverified LLM extraction even on an
+    # instance explicitly configured for auto_publish. Route through the
+    # same resolver the collector uses so the two ingestion paths can't
+    # drift (services/corporate_memory/governance.py).
+    from app.instance_config import get_corporate_memory_config
+    from services.corporate_memory.governance import resolve_initial_status
+
+    governance_config = get_corporate_memory_config()
+    confidence = 0.50
+    initial_status = resolve_initial_status(governance_config, confidence=confidence)
+
     create_kwargs = dict(
         id=item_id,
         title=request.title,
@@ -546,12 +561,13 @@ async def create_knowledge(
         tags=tags or None,
         domain=request.domain_slug,
         entities=request.entities,
-        confidence=0.50,
+        confidence=confidence,
+        status=initial_status,
     )
     if request.source_type:
         create_kwargs["source_type"] = request.source_type
     repo.create(**create_kwargs)
-    return {"id": item_id, "status": "pending"}
+    return {"id": item_id, "status": initial_status}
 
 
 @router.post("/{item_id}/vote")
