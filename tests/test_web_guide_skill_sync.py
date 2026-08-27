@@ -26,7 +26,19 @@ A path counts as MENTIONED only inside backticks (`` `/library` ``). That
 keeps the extraction exact — prose stays free, and a parameterized shape like
 `` `/catalog/t/{table_id}` `` is deliberately outside the liveness sweep (the
 brace never matches), because detail pages are reached from their list, not
-recommended by URL.
+recommended by URL. Coverage is PER FILE: a user-facing route must be
+described in ``references/user-pages.md`` and an admin destination in
+``references/admin-pages.md`` — a bare path in SKILL.md's questions table
+must not stand in for the descriptive entry the agent actually reads back.
+
+Two known boundaries, held by their own guards below:
+
+* API endpoints are named verb-first (`` `POST /api/...` ``) so they stay out
+  of the page sweeps; ``test_verb_prefixed_mentions_are_api_paths_only``
+  keeps that idiom from smuggling a WEB path past both sweeps.
+* The liveness universe is ``app/web/router.py`` + ``admin_nav.py``. A live
+  page registered by another router (e.g. an auth provider's) is invisible
+  to it and needs an ``ALLOWED_EXTRA_PATHS`` entry naming where it lives.
 """
 
 from __future__ import annotations
@@ -37,24 +49,33 @@ from pathlib import Path
 from tests.test_web_nav_user_parity import _user_facing_page_routes
 
 SKILL_DIR = Path("app/initial_workspace_default/.claude/skills/agnes-web-guide")
+USER_PAGES = SKILL_DIR / "references" / "user-pages.md"
+ADMIN_PAGES = SKILL_DIR / "references" / "admin-pages.md"
 
 #: Paths the guide may mention that are neither user-facing template routes
 #: nor admin-nav entries. Each needs a reason; an entry without one is drift.
-ALLOWED_EXTRA_PATHS: dict[str, str] = {}
+ALLOWED_EXTRA_PATHS: dict[str, str] = {
+    "/auth/password/change": (
+        "live page registered by the password auth provider "
+        "(app/auth/providers/password.py), outside app/web/router.py's "
+        "sweep; linked from the rail's user menu as 'Change password'"
+    ),
+}
 
 _MENTION_RE = re.compile(r"`(/[a-z0-9/_=?&-]*)`")
+_VERB_MENTION_RE = re.compile(r"`([A-Z]+) (/[^\s`]*)`")
 
 
 def _guide_files() -> list[Path]:
     return sorted(SKILL_DIR.rglob("*.md"))
 
 
-def _mentioned_paths() -> set[str]:
-    """Every backticked absolute path across the skill's markdown files,
-    query string stripped — `` `/admin/access?lens=simulate` `` is a mention
-    of ``/admin/access``."""
+def _mentioned_paths(files: list[Path] | None = None) -> set[str]:
+    """Every backticked absolute path across *files* (default: the whole
+    skill), query string stripped — `` `/admin/access?lens=simulate` `` is a
+    mention of ``/admin/access``."""
     out: set[str] = set()
-    for md in _guide_files():
+    for md in _guide_files() if files is None else files:
         for m in _MENTION_RE.findall(md.read_text(encoding="utf-8")):
             out.add(m.split("?", 1)[0].rstrip("/") or "/")
     return out
@@ -98,23 +119,36 @@ def test_the_guide_ships_in_the_bundled_template():
 
 
 def test_every_user_facing_page_is_in_the_guide():
-    missing = _user_facing_page_routes() - _mentioned_paths()
+    missing = _user_facing_page_routes() - _mentioned_paths([USER_PAGES])
     assert not missing, (
-        f"User-facing pages the web guide never mentions: {sorted(missing)}. "
+        f"User-facing pages {USER_PAGES} never mentions: {sorted(missing)}. "
         "The chat agent answers 'where do I ...?' from this skill alone — a "
-        "page it does not know about is one it will deny exists. Add each to "
-        f"{SKILL_DIR}/references/user-pages.md (backticked path + what the "
-        "user sees there)."
+        "page it does not know about is one it will deny exists. Add each "
+        "(backticked path + what the user sees there)."
     )
 
 
 def test_every_admin_nav_destination_is_in_the_guide():
-    missing = _admin_nav_paths() - _mentioned_paths()
+    missing = _admin_nav_paths() - _mentioned_paths([ADMIN_PAGES])
     assert not missing, (
-        f"Admin destinations the web guide never mentions: {sorted(missing)}. "
-        f"Add each to {SKILL_DIR}/references/admin-pages.md (backticked path "
-        "+ what the admin does there)."
+        f"Admin destinations {ADMIN_PAGES} never mentions: {sorted(missing)}. "
+        "Add each (backticked path + what the admin does there)."
     )
+
+
+def test_verb_prefixed_mentions_are_api_paths_only():
+    """`` `POST /api/...` `` is the sanctioned idiom for naming an API
+    endpoint — the leading verb keeps it out of the page sweeps on purpose.
+    It must not generalize: a verb-prefixed WEB path would be a page mention
+    both sweeps are blind to, reviving the exact drift this guard exists to
+    catch."""
+    for md in _guide_files():
+        for verb, path in _VERB_MENTION_RE.findall(md.read_text(encoding="utf-8")):
+            assert path.startswith("/api/"), (
+                f"{md}: `{verb} {path}` — verb-prefixed backtick mentions are "
+                "reserved for API endpoints; write a page path bare so the "
+                "coverage and liveness sweeps can see it"
+            )
 
 
 def test_the_guide_names_only_live_paths():

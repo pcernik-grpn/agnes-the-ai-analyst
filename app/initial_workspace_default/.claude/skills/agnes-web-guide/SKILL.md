@@ -23,9 +23,8 @@ The only chrome is the **left rail**:
 - **Agents** `/agents` — the agent builder.
 - **Admin** `/admin` — admins only; non-admins do not see this row.
 
-Plus a **global search** box (also Cmd/Ctrl-K command palette) and the
-**user menu** at the bottom: Profile, My connections, My activity, News,
-How Agnes works, Logout.
+Plus a **global search** box and the **user menu** at the bottom: Profile,
+Change password, My connections, My activity, News, How Agnes works, Logout.
 
 There are no other top-level menus. The old Catalog, Marketplace, My Stack,
 Corporate memory and Apps browse pages were folded into the Library — their
@@ -55,12 +54,13 @@ retired names.
 | The user asks | Send them to |
 |---|---|
 | "Where do I see what data I have?" | **Library** `/library` (tables also via `agnes catalog` here in chat) |
-| "How do I get more data / a package?" | `/library` with scope *Available* → subscribe; if it is not listed, an admin must grant it at `/admin/access` |
+| "How do I get more data / a package?" | `/library` — filter *Not in stack yet*, then the row's *Add* pill; if it is not listed at all, an admin must grant it at `/admin/access` |
 | "How do I register a new table?" (admin) | `/admin/tables`, sources at `/admin/data-sources` |
 | "How do I create an agent?" | `/agents` |
 | "Where do I get an API token?" | `/me/profile` |
 | "How do I connect Claude Code / an MCP client?" | `/how-it-works`, token flow at `/mcp-connect` |
-| "How do I install a skill or plugin?" | `/library` → *+ Add* menu |
+| "How do I install a skill or plugin?" | `/library` — the row's *Add* pill (the *+ Add* menu is for building/uploading your own) |
+| "How do I change my password?" | user menu → *Change password* (`/auth/password/change`; only with password sign-in enabled) |
 | "How do I write and publish my own skill?" | `/skills` (the Builder), upload at `/store/new` |
 | "What are the canonical metric definitions?" | `/semantic-layer` and `/catalog/semantics` (or `agnes catalog --metrics` here) |
 | "Who can see this table?" (admin) | `/admin/access`, try `/admin/access?lens=simulate` |
