@@ -639,3 +639,493 @@ class TestUploadCollectorRoundTrip:
 
         assert "admin@test.com" in found, found
         assert found["admin@test.com"].read_text(encoding="utf-8") == content
+
+
+# ---------------------------------------------------------------------------
+# Governance behavior tests (#1573) — approval_mode="threshold" must diverge
+# from "review_queue" based on a real confidence cutoff, and
+# notify_on_new_items must actually notify someone.
+# ---------------------------------------------------------------------------
+
+
+class TestApprovalModeThresholdBehavior:
+    _ITEM_RESPONSE = {
+        "items": [
+            {
+                "existing_id": None,
+                "title": "Use indexes",
+                "content": "Always add indexes for frequent query columns.",
+                "category": "performance",
+                "tags": ["sql", "indexes"],
+                "source_users": ["alice"],
+            }
+        ]
+    }
+
+    def _run_with_governance(self, tmp_path, monkeypatch, governance_config: dict):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, self._ITEM_RESPONSE)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": governance_config},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, mock_repo
+
+    def test_threshold_with_low_cutoff_auto_publishes(self, tmp_path, monkeypatch):
+        """A cutoff below claude_local_md's base confidence (0.50) must
+        auto-publish — this is the exact behavior #1573 reports missing."""
+        stats, mock_repo = self._run_with_governance(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "threshold", "auto_publish_min_confidence": 0.1, "notify_on_new_items": False},
+        )
+        assert stats["items_new"] == 1
+        assert stats["items_pending"] == 0
+        mock_repo.create.assert_called_once()
+        assert mock_repo.create.call_args.kwargs["status"] == "approved"
+
+    def test_threshold_with_high_cutoff_queues(self, tmp_path, monkeypatch):
+        """A cutoff above the base confidence must still queue — 'threshold'
+        is not a synonym for 'auto_publish'."""
+        stats, mock_repo = self._run_with_governance(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "threshold", "auto_publish_min_confidence": 0.99, "notify_on_new_items": False},
+        )
+        assert stats["items_pending"] == 1
+        mock_repo.create.assert_called_once()
+        assert mock_repo.create.call_args.kwargs["status"] == "pending"
+
+    def test_threshold_default_cutoff_differs_from_review_queue_result(self, tmp_path, monkeypatch):
+        """Same confidence, only approval_mode differs: review_queue always
+        queues; threshold with a permissive cutoff must not."""
+        _, permissive_repo = self._run_with_governance(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "threshold", "auto_publish_min_confidence": 0.05, "notify_on_new_items": False},
+        )
+        assert permissive_repo.create.call_args.kwargs["status"] == "approved"
+
+    def test_review_queue_still_always_pending(self, tmp_path, monkeypatch):
+        """review_queue is unaffected by the new cutoff knob — regression
+        guard for the mode this repo already got right."""
+        stats, mock_repo = self._run_with_governance(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "review_queue", "notify_on_new_items": False},
+        )
+        assert stats["items_pending"] == 1
+        assert mock_repo.create.call_args.kwargs["status"] == "pending"
+
+
+class TestNotifyOnNewItems:
+    _ITEM_RESPONSE = TestApprovalModeThresholdBehavior._ITEM_RESPONSE
+
+    def _run(self, tmp_path, monkeypatch, governance_config: dict, admin_members):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, self._ITEM_RESPONSE)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": governance_config},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = admin_members
+
+        published = []
+
+        def _fake_publish(user_id, payload):
+            published.append((user_id, payload))
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch("app.notifications.publish_notification", side_effect=_fake_publish),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, published
+
+    def test_notify_enabled_publishes_to_admin_members(self, tmp_path, monkeypatch):
+        stats, published = self._run(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "review_queue", "notify_on_new_items": True},
+            admin_members=[{"id": "admin-1", "active": True}, {"id": "admin-2", "active": True}],
+        )
+        assert stats["items_pending"] == 1
+        published_ids = {uid for uid, _ in published}
+        assert published_ids == {"admin-1", "admin-2"}
+        _, payload = published[0]
+        assert payload["kind"] == "corporate_memory_pending"
+        assert payload["new_pending_count"] == 1
+
+    def test_notify_disabled_publishes_nothing(self, tmp_path, monkeypatch):
+        stats, published = self._run(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "review_queue", "notify_on_new_items": False},
+            admin_members=[{"id": "admin-1", "active": True}],
+        )
+        assert stats["items_pending"] == 1
+        assert published == []
+
+    def test_notify_skips_inactive_admins(self, tmp_path, monkeypatch):
+        _, published = self._run(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "review_queue", "notify_on_new_items": True},
+            admin_members=[{"id": "admin-1", "active": False}, {"id": "admin-2", "active": True}],
+        )
+        assert {uid for uid, _ in published} == {"admin-2"}
+
+    def test_no_pending_items_no_notification(self, tmp_path, monkeypatch):
+        """auto_publish produces zero pending items — nothing to notify about."""
+        _, published = self._run(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "auto_publish", "notify_on_new_items": True},
+            admin_members=[{"id": "admin-1", "active": True}],
+        )
+        assert published == []
+
+    def test_notify_default_is_on(self, tmp_path, monkeypatch):
+        """notify_on_new_items defaults to True per the schema — omitting
+        the key must still notify."""
+        _, published = self._run(
+            tmp_path,
+            monkeypatch,
+            {"approval_mode": "review_queue"},
+            admin_members=[{"id": "admin-1", "active": True}],
+        )
+        assert len(published) == 1
+
+
+class TestNotifyCountsOnlyNewPendingItems:
+    """The knob is ``notify_on_new_items``, so the number admins receive must
+    be what *this run* queued — not the standing backlog.
+
+    The collector rebuilds the catalog by full refresh, and
+    ``_process_catalog_response`` copies ``status`` forward for every
+    preserved item via GOVERNANCE_FIELDS. So a queue that has been sitting
+    unreviewed for weeks reappears in ``final_items`` still marked
+    ``pending`` on every run. Counting all of it re-notified every admin
+    about the whole backlog whenever any watched file changed, and the
+    message called all of it "new".
+    """
+
+    # Three items already queued by earlier runs, plus one the LLM reports as
+    # genuinely new (existing_id is null).
+    _EXISTING_CATALOG = {
+        "items": {
+            f"old-{n}": {
+                "id": f"old-{n}",
+                "title": f"Old tip {n}",
+                "content": f"Something learned a while ago ({n}).",
+                "category": "conventions",
+                "tags": ["legacy"],
+                "source_users": ["alice"],
+                "extracted_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "status": "pending",
+                "confidence": 0.5,
+                "approved_by": None,
+                "approved_at": None,
+                "mandatory_reason": None,
+                "audience": "all",
+                "review_by": None,
+                "edited_by": None,
+                "edited_at": None,
+            }
+            for n in (1, 2, 3)
+        },
+        "metadata": {},
+    }
+
+    _RESPONSE_WITH_ONE_NEW = {
+        "items": [
+            {
+                "existing_id": f"old-{n}",
+                "title": f"Old tip {n}",
+                "content": f"Something learned a while ago ({n}).",
+                "category": "conventions",
+                "tags": ["legacy"],
+                "source_users": ["alice"],
+            }
+            for n in (1, 2, 3)
+        ]
+        + [
+            {
+                "existing_id": None,
+                "title": "Use indexes",
+                "content": "Always add indexes for frequent query columns.",
+                "category": "performance",
+                "tags": ["sql", "indexes"],
+                "source_users": ["alice"],
+            }
+        ]
+    }
+
+    _RESPONSE_ALL_PRESERVED = {"items": _RESPONSE_WITH_ONE_NEW["items"][:3]}
+
+    def _run(self, tmp_path, monkeypatch, llm_response: dict):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, llm_response)
+        # Seed the backlog the previous runs left behind. _make_collect_all_env
+        # points KNOWLEDGE_FILE here but never creates it.
+        _write_json(tmp_path / "knowledge.json", self._EXISTING_CATALOG)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        # The three `old-*` items were queued by earlier runs, so they are
+        # already rows in knowledge_items — only the LLM's new item is absent.
+        # (A blanket `return_value = None` claimed the DB was empty while the
+        # fixture said three items had been sitting in the queue for weeks;
+        # now that the alert counts inserts, that contradiction matters.)
+        mock_repo.get_by_id.side_effect = lambda item_id: (
+            {"id": item_id, "status": "pending"} if item_id.startswith("old-") else None
+        )
+
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, published
+
+    def test_backlog_plus_one_new_notifies_about_one(self, tmp_path, monkeypatch):
+        """Three preserved pending items + one newly queued must announce 1,
+        not 4. Without the fix the notification carried
+        ``stats["items_pending"]`` (== 4) and read "4 new knowledge items"."""
+        stats, published = self._run(tmp_path, monkeypatch, self._RESPONSE_WITH_ONE_NEW)
+
+        assert stats["items_preserved"] == 3
+        assert stats["items_new"] == 1
+        # The backlog gauge keeps its meaning — it is what the CLI prints and
+        # what POST /api/admin/run-corporate-memory returns.
+        assert stats["items_pending"] == 4
+        assert stats["items_pending_new"] == 1
+
+        assert len(published) == 1
+        _, payload = published[0]
+        assert payload["new_pending_count"] == 1
+        assert payload["message"] == "1 new knowledge item awaiting review"
+
+    def test_backlog_with_nothing_new_notifies_nobody(self, tmp_path, monkeypatch):
+        """A run that only carries the queue forward must stay silent. This is
+        the re-notification loop itself: files changed, the LLM returned no
+        new item, yet the old code still published "3 new knowledge items"."""
+        stats, published = self._run(tmp_path, monkeypatch, self._RESPONSE_ALL_PRESERVED)
+
+        assert stats["items_preserved"] == 3
+        assert stats["items_new"] == 0
+        assert stats["items_pending"] == 3
+        assert stats["items_pending_new"] == 0
+        assert published == []
+
+
+class TestNotifyFollowsTheDatabaseNotTheCatalog:
+    """The alert must count rows that reached ``knowledge_items``, not entries
+    in knowledge.json.
+
+    ``/admin/corporate-memory`` renders ``repo.list_items(statuses=
+    ["pending"])`` — the DB. The catalog file is written in step 10, before
+    the DB sync in step 11, and the sync swallows per-item exceptions into a
+    counter. Counting the catalog therefore breaks in both directions:
+
+    * a run whose insert failed still announces the item, sending every
+      admin to a queue that does not contain it, and
+    * the later run that finally lands the row sees the item as *preserved*
+      (it is in knowledge.json by then), so ``items_pending_new`` is 0 and
+      nobody is ever told the item arrived.
+
+    The two tests below are that pair. Both were green-by-accident before —
+    the first published a phantom alert, the second published nothing.
+    """
+
+    _NEW_ITEM = {
+        "existing_id": None,
+        "title": "Use indexes",
+        "content": "Always add indexes for frequent query columns.",
+        "category": "performance",
+        "tags": ["sql", "indexes"],
+        "source_users": ["alice"],
+    }
+
+    def _run(self, tmp_path, monkeypatch, *, seed_catalog: dict | None, create_raises: bool, in_db: set[str]):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, {"items": [self._NEW_ITEM]})
+        if seed_catalog is not None:
+            _write_json(tmp_path / "knowledge.json", seed_catalog)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.side_effect = lambda item_id: (
+            {"id": item_id, "status": "pending"} if item_id in in_db else None
+        )
+        if create_raises:
+            mock_repo.create.side_effect = RuntimeError("knowledge_items insert failed")
+
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, published
+
+    def test_failed_insert_does_not_announce_a_phantom_item(self, tmp_path, monkeypatch):
+        """The item is in the rebuilt catalog but its DB write blew up, so the
+        review queue is empty. Alerting here is the "point admins at an empty
+        queue" bug: the notification says 1 item awaits review and
+        /admin/corporate-memory shows none."""
+        stats, published = self._run(tmp_path, monkeypatch, seed_catalog=None, create_raises=True, in_db=set())
+
+        # The catalog-side numbers still see it — that is precisely why they
+        # are the wrong thing to notify on.
+        assert stats["items_new"] == 1
+        assert stats["items_pending_new"] == 1
+        assert stats["items_db_errors"] == 1
+        assert stats["items_db_inserted"] == 0
+
+        assert stats["items_pending_queued"] == 0
+        assert published == []
+
+    def test_retry_run_that_lands_the_row_finally_announces_it(self, tmp_path, monkeypatch):
+        """The run after the failure above. knowledge.json already carries the
+        item, so it is *preserved*, not new, and the catalog's new-item count
+        is 0 — yet this is the run on which the item actually joins the review
+        queue, so it is exactly the run that must alert."""
+        seeded = {
+            "items": {
+                "abc123": {
+                    "id": "abc123",
+                    "title": "Use indexes",
+                    "content": "Always add indexes for frequent query columns.",
+                    "category": "performance",
+                    "tags": ["sql", "indexes"],
+                    "source_users": ["alice"],
+                    "extracted_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "status": "pending",
+                    "confidence": 0.5,
+                    "approved_by": None,
+                    "approved_at": None,
+                    "mandatory_reason": None,
+                    "audience": "all",
+                    "review_by": None,
+                    "edited_by": None,
+                    "edited_at": None,
+                }
+            },
+            "metadata": {},
+        }
+        # The LLM reports it against its existing id, so it is preserved.
+        collector_response = {"items": [dict(self._NEW_ITEM, existing_id="abc123")]}
+        collector = _make_collect_all_env(tmp_path, monkeypatch, collector_response)
+        _write_json(tmp_path / "knowledge.json", seeded)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None  # the failed insert left the DB empty
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_preserved"] == 1
+        assert stats["items_pending_new"] == 0, "the catalog sees a preserved item, which is the whole point"
+        assert stats["items_db_inserted"] == 1
+        assert stats["items_pending_queued"] == 1
+
+        assert len(published) == 1
+        assert published[0][1]["new_pending_count"] == 1
+
+    def test_approved_insert_is_not_announced_as_pending(self, tmp_path, monkeypatch):
+        """auto_publish writes rows straight to ``approved`` — they never enter
+        the review queue, so counting inserts must not count them."""
+        collector = _make_collect_all_env(tmp_path, monkeypatch, {"items": [self._NEW_ITEM]})
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "auto_publish", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_db_inserted"] == 1
+        assert stats["items_pending_queued"] == 0
+        assert published == []

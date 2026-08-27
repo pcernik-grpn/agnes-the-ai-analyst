@@ -26,7 +26,6 @@ from app.instance_config import (
     get_instance_name,
     get_instance_subtitle,
     get_theme_css_overrides,
-    get_corporate_memory_config,
     get_home_route,
     get_home_automode_visibility,
     get_instance_brand,
@@ -3754,13 +3753,13 @@ async def semantic_layer_detail(
     """
     from app.web.semantic_layer_view import (
         agnes_extension_payload,
-        dialect_skipped_count,
         is_imported,
         model_constraints,
         model_glossary,
         model_of,
         object_counts,
         source_label,
+        warehouse_only_metric_count,
     )
 
     row = _readable_model_by_slug(slug, user, conn)
@@ -3878,7 +3877,7 @@ async def semantic_layer_detail(
         relationships=relationships,
         glossary=glossary,
         counts=object_counts(model),
-        dialect_skipped_count=dialect_skipped_count(model),
+        warehouse_only_metric_count=warehouse_only_metric_count(model),
     )
     return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
 
@@ -5240,7 +5239,6 @@ async def corporate_memory_admin(
             "contradictions": len(contradictions),
             "duplicates": duplicates_count,
         },
-        governance=get_corporate_memory_config(),
         groups=user_groups_for_ui,
         edit_categories=edit_categories,
         edit_tags=edit_tags,

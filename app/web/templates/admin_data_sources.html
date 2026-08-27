@@ -791,6 +791,17 @@
   .ds-wizard-error {
     display: none; font-size: 12px; color: var(--ds-accent-danger-ink); margin-top: 8px;
   }
+  /* #1616: step 2's "the connection itself is broken" banner — distinct from
+     `.ds-wizard-error`'s plain highlighted line, which read as ordinary help
+     copy rather than a stop sign. */
+  .ds-sf-conn-error {
+    display: none; align-items: center; gap: 10px;
+    background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line);
+    color: var(--ds-accent-danger-ink); border-radius: 8px; padding: 10px 12px;
+    font-size: 12px; margin-bottom: 14px;
+  }
+  .ds-sf-conn-error__icon { font-size: 15px; line-height: 1; flex-shrink: 0; }
+  .ds-sf-conn-error__msg { flex: 1; }
   /* The step-2 variant lives in the drawer's sticky foot, beside the button
      that refused, so it drops the stacked margin and rides the button row. */
   .ds-wizard-error--foot {
@@ -2843,6 +2854,21 @@ function _setWizSource(src) {
     connectBtn.style.display = "none";
   }
   document.getElementById("ds-wizard-error").style.display = "none";
+  // …and the Snowflake connection-error lock with it. That lock disables the
+  // two SHARED step-2 footer buttons ("Continue with selected tables" /
+  // "Register only & finish"), which the Keboola, BigQuery and Databricks
+  // step-2 panes reuse — but only `_loadSfCatalog` ever cleared it, and only
+  // on the Snowflake path. So one failed Snowflake listing left those two
+  // buttons dead for EVERY source, across reopens, until a full page reload:
+  // registration became impossible. Pointing the wizard at a source is the
+  // moment that lock is void, and it is the one funnel every entry goes
+  // through — `openWizard()` ends here, the connector picker calls here, and
+  // the steps-strip's return to step 1 calls here. Every caller is a step-1
+  // context (the picker lives there; "Fix connection" runs `_setWizStep(1)`
+  // first), so this can never clear a Snowflake error that is still on
+  // screen — and re-entering the Snowflake step re-runs the listing, which
+  // re-locks if the connection is still broken.
+  _setSfConnErrorState(false);
 }
 
 async function _loadBqCredStatus() {
@@ -3576,6 +3602,11 @@ function _renderSfRowsEditor() {
   document.getElementById("ds-wizard-connected-banner").innerHTML =
     "Pick the Snowflake tables to register — or name one by hand if it is not listed.";
   body.innerHTML = `
+    <div class="ds-sf-conn-error" id="ds-sf-conn-error" role="alert">
+      <span class="ds-sf-conn-error__icon" aria-hidden="true">{{ ico.icon('warning', 18) }}</span>
+      <span class="ds-sf-conn-error__msg"></span>
+      <button type="button" class="btn btn-secondary" id="ds-sf-conn-error-fix">Fix connection</button>
+    </div>
     <div class="ds-browse-actions" style="margin-bottom:10px; align-items:center;">
       <button type="button" class="btn btn-secondary" id="ds-sf-browse">Reload tables</button>
       <label style="display:inline-flex; align-items:center; gap:6px;">
@@ -3587,7 +3618,6 @@ function _renderSfRowsEditor() {
         ${_dropdownMarkupHtml("ds-sf-picker-mode-dd", "ds-sf-picker-mode", "register selected as",
           [{ value: "remote", label: "live" }, { value: "materialized", label: "materialized" }], "remote")}
       </label>
-      <span class="ds-browse-error" id="ds-sf-browse-error"></span>
     </div>
     <div id="ds-sf-picker"></div>
     <div style="margin-top:14px;">
@@ -3601,6 +3631,14 @@ function _renderSfRowsEditor() {
     </div>
     <div class="ds-browse-error" id="ds-sf-rows-error" style="display:block; margin-top:8px;"></div>`;
   if (window.dsDropdownInit) body.querySelectorAll(".ds-dropdown").forEach(window.dsDropdownInit);
+  // #1616: "Fix connection" jumps back to step 1 — no new page, the same
+  // navigation the steps-strip's own back button uses (see its click
+  // handler below) — rather than leaving the operator stranded on a step
+  // where nothing past step 1 can succeed until the credential is fixed.
+  body.querySelector("#ds-sf-conn-error-fix").addEventListener("click", () => {
+    _setWizStep(1);
+    _setWizSource(_wizardSource);
+  });
   body.querySelector("#ds-sfrow-add").addEventListener("click", () => {
     const rows = body.querySelector("#ds-sfrows");
     rows.insertAdjacentHTML("beforeend", _sfRowHtml());
@@ -3613,6 +3651,47 @@ function _renderSfRowsEditor() {
   _loadSfCatalog();
 }
 
+/* #1616: while the connection itself can't authenticate (or can't be
+   reached), Reload tables / the manual table-entry rows / "Continue with
+   selected tables" / "Register only & finish" can only ever fail the same
+   way the listing just did — leave them live and the operator discovers
+   that one dead click at a time. `_setSfConnErrorState(true, …)` shows the
+   banner + "Fix connection" and disables all of them in one place;
+   `_loadSfCatalog` clears it (`false`) at the top of every fresh attempt.
+   Two of the controls it disables — the register / register-only footer
+   buttons — are SHARED with the other sources' step 2, so the lock must also
+   be released whenever the wizard is pointed at a source at all: see the
+   `_setSfConnErrorState(false)` at the end of `_setWizSource`. */
+let _sfConnErrorActive = false;
+
+function _setSfConnErrorState(active, message) {
+  _sfConnErrorActive = active;
+  const banner = document.getElementById("ds-sf-conn-error");
+  if (banner) {
+    banner.style.display = active ? "flex" : "none";
+    const msgEl = banner.querySelector(".ds-sf-conn-error__msg");
+    if (msgEl) msgEl.textContent = message || "";
+  }
+  const browseBtn = document.getElementById("ds-sf-browse");
+  if (browseBtn) browseBtn.disabled = active;
+  const pickerMode = document.getElementById("ds-sf-picker-mode");
+  if (pickerMode) pickerMode.disabled = active;
+  // The branded dropdown button paired with the native select above (paper
+  // theme hides the real control and intercepts all interaction on its own
+  // button) — disabling the native select alone does not stop clicks on it.
+  const pickerModeBtn = document.getElementById("ds-sf-picker-mode-dd-btn");
+  if (pickerModeBtn) pickerModeBtn.disabled = active;
+  const addBtn = document.getElementById("ds-sfrow-add");
+  if (addBtn) addBtn.disabled = active;
+  const rowsHost = document.getElementById("ds-sfrows");
+  if (rowsHost) rowsHost.querySelectorAll("input, select, textarea, button").forEach((el) => { el.disabled = active; });
+  // Live outside `#ds-wizard-tables-body`, in the drawer's sticky foot.
+  const registerBtn = document.getElementById("ds-wizard-register-btn");
+  if (registerBtn) registerBtn.disabled = active;
+  const finishBtn = document.getElementById("ds-wizard-finish-early-btn");
+  if (finishBtn) finishBtn.disabled = active;
+}
+
 /* ── Snowflake table picker ───────────────────────────────────────────────
    Renders with the SAME classes + `data-bucket-group` hooks the Keboola picker
    uses, inside the same `#ds-wizard-tables-body` root, so the delegated
@@ -3621,10 +3700,9 @@ function _renderSfRowsEditor() {
 
 async function _loadSfCatalog() {
   const host = document.getElementById("ds-sf-picker");
-  const errEl = document.getElementById("ds-sf-browse-error");
   const btn = document.getElementById("ds-sf-browse");
   if (!host) return;
-  errEl.textContent = "";
+  _setSfConnErrorState(false);
   host.innerHTML = `<div class="ds-empty">Listing tables in the configured Snowflake account…</div>`;
   if (btn) btn.disabled = true;
   try {
@@ -3635,9 +3713,13 @@ async function _loadSfCatalog() {
       // Both keys, because the endpoint answers a misconfiguration under
       // `detail` while other admin endpoints use `message`; kept inline rather
       // than shared so this step does not depend on a helper landing first.
-      errEl.textContent = (typeof body.detail === "string" && body.detail)
+      // #1616: the server already classified this into an operator-readable
+      // sentence with no driver internals — render it as-is, in the banner,
+      // and stop the rest of the step from inviting a retry that can't work.
+      const msg = (typeof body.detail === "string" && body.detail)
         || (typeof body.message === "string" && body.message)
         || "listing failed";
+      _setSfConnErrorState(true, msg);
       return;
     }
     const schemas = body.schemas || [];
@@ -3649,9 +3731,12 @@ async function _loadSfCatalog() {
     _syncPicker(_pickerRoot(host));
   } catch (e) {
     host.innerHTML = "";
-    errEl.textContent = "could not reach the server";
+    _setSfConnErrorState(true, "Could not reach the server. Check your network connection and try again.");
   } finally {
-    if (btn) btn.disabled = false;
+    // `_setSfConnErrorState` above may have just disabled this same button
+    // (the connection-broken case) — defer to whatever it decided rather
+    // than unconditionally re-enabling here.
+    if (btn) btn.disabled = _sfConnErrorActive;
   }
 }
 
