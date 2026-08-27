@@ -52,6 +52,13 @@ SKILL_DIR = Path("app/initial_workspace_default/.claude/skills/agnes-web-guide")
 USER_PAGES = SKILL_DIR / "references" / "user-pages.md"
 ADMIN_PAGES = SKILL_DIR / "references" / "admin-pages.md"
 
+#: The laptop delivery path: the same guide, mirrored into the built-in
+#: marketplace's `agnes-analyst` plugin (granted to Everyone), which
+#: `agnes refresh-marketplace` distributes to analyst workspaces. The bundled
+#: copy above stays the ORIGINAL — it is the only path that reaches every
+#: chat sandbox unconditionally (marketplace bootstrap can be off).
+BUILTIN_COPY = Path("src/_builtin_marketplace/plugins/agnes-analyst/skills/agnes-web-guide")
+
 #: Paths the guide may mention that are neither user-facing template routes
 #: nor admin-nav entries. Each needs a reason; an entry without one is drift.
 ALLOWED_EXTRA_PATHS: dict[str, str] = {
@@ -166,3 +173,23 @@ def test_the_guide_names_only_live_paths():
 def test_every_extra_path_carries_a_reason():
     for path, reason in ALLOWED_EXTRA_PATHS.items():
         assert reason and len(reason) > 20, f"{path} needs a real reason, got {reason!r}"
+
+
+def test_builtin_marketplace_copy_is_byte_identical():
+    """Two delivery paths, one document. Chat sandboxes get the guide from the
+    bundled workspace template (unconditional); analyst laptops get it from
+    the built-in marketplace's `agnes-analyst` plugin. The marketplace copy is
+    a MIRROR, never a fork — edit the bundled original and copy it over:
+
+        cp -R app/initial_workspace_default/.claude/skills/agnes-web-guide/. \\
+              src/_builtin_marketplace/plugins/agnes-analyst/skills/agnes-web-guide/
+    """
+    for src in _guide_files():
+        twin = BUILTIN_COPY / src.relative_to(SKILL_DIR)
+        assert twin.is_file(), f"{twin} is missing — mirror {src} (see this test's docstring)"
+        assert twin.read_bytes() == src.read_bytes(), f"{twin} has drifted from {src} — re-copy the bundled original"
+    for twin in sorted(BUILTIN_COPY.rglob("*.md")):
+        rel = twin.relative_to(BUILTIN_COPY)
+        assert (SKILL_DIR / rel).is_file(), (
+            f"{twin} has no bundled original — the marketplace copy is a mirror, add the file under {SKILL_DIR} first"
+        )

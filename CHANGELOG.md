@@ -43,7 +43,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (`tests/test_web_guide_skill_sync.py`): every user-facing route and every
   admin-nav destination must be mentioned in the guide, and the guide may
   only mention live paths — so adding, renaming, or retiring a page without
-  updating the guide fails CI in both directions.
+  updating the guide fails CI in both directions. The guide also reaches
+  analyst laptops: it is mirrored into the built-in marketplace's
+  `agnes-analyst` plugin (granted to Everyone, distributed by
+  `agnes refresh-marketplace`), with the mirror pinned byte-identical to the
+  bundled original by the same guard.
 
 - **`chat_provider = "docker"` now provisions its own backing** in the
   `customer-instance` Terraform module, instead of only pinning the choice.
