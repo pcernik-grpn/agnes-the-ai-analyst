@@ -358,7 +358,7 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             {"label": "Audit log", "href": "/admin/activity", "match": ["/admin/activity"]},
             {"label": "Telemetry", "href": "/admin/telemetry", "match": ["/admin/telemetry", "/admin/usage"]},
             {"label": "Analyst sessions", "href": "/admin/sessions", "match": ["/admin/sessions"]},
-            {"label": "Chat sessions", "href": "/admin/chat", "match": ["/admin/chat"]},
+            {"label": "Chat runners", "href": "/admin/chat", "match": ["/admin/chat"]},
             {"label": "Adoption", "href": "/admin/adoption", "match": ["/admin/adoption"]},
         ],
     },

@@ -78,9 +78,15 @@ def test_builtin_plugin_skills_are_discoverable():
     from src.marketplace import _BUILTIN_CONTENT_DIR
     from src.marketplace_listing import list_inner_skills
 
-    for slug in ("agnes-analyst", "agnes-operator"):
+    expected = {
+        # agnes-web-guide is the marketplace mirror of the bundled chat skill;
+        # tests/test_web_guide_skill_sync.py pins it byte-identical.
+        "agnes-analyst": ["agnes-analyst", "agnes-web-guide"],
+        "agnes-operator": ["agnes-operator"],
+    }
+    for slug, skills in expected.items():
         plugin_dir = _BUILTIN_CONTENT_DIR / "plugins" / slug
-        assert list_inner_skills(plugin_dir) == [slug]
+        assert list_inner_skills(plugin_dir) == skills
 
 
 # ---------------------------------------------------------------------------
