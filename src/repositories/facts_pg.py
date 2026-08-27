@@ -29,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
@@ -43,6 +43,14 @@ MAX_NEIGHBORS_DEPTH = 2
 MAX_NEIGHBORS_FANOUT = 100
 MAX_NEIGHBORS_RESULT = 500
 MAX_SEARCH_FILTERS = 20
+
+# Ingest batch caps (spec §7.2): "≤500 documents, ≤5000 claims per request".
+# A single document's evidence count over MAX_INGEST_CLAIMS is a protocol
+# error (IngestDocumentExceedsClaimCap) rather than a batch-size error — the
+# caller cannot fix it by splitting the request, because §7.2 requires a
+# `full_documents`-listed document's COMPLETE claim set to arrive together.
+MAX_INGEST_DOCUMENTS = 500
+MAX_INGEST_CLAIMS = 5000
 
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
@@ -58,6 +66,37 @@ class FactNotFound(RuntimeError):
     def __init__(self, subject_id: str) -> None:
         self.subject_id = subject_id
         super().__init__(f"fact subject {subject_id!r} not found")
+
+
+class IngestBatchTooLarge(RuntimeError):
+    """A whole-batch size cap (§7.2: ≤500 documents / ≤5000 claims) was
+    exceeded. ``detail`` is the itemized reason the REST layer serializes
+    on a `413`."""
+
+    def __init__(self, detail: Dict[str, Any]) -> None:
+        self.detail = detail
+        super().__init__(str(detail))
+
+
+class IngestDocumentExceedsClaimCap(RuntimeError):
+    """A SINGLE document's evidence count exceeds ``MAX_INGEST_CLAIMS`` —
+    never split (§7.2): the caller must shrink that document's own claim
+    set, not merely paginate the batch. Translated to a `422`."""
+
+    def __init__(self, doc_id: str, count: int) -> None:
+        self.doc_id = doc_id
+        self.count = count
+        super().__init__(f"document {doc_id!r} carries {count} claims (cap {MAX_INGEST_CLAIMS})")
+
+
+class IngestUnresolvedDocIds(RuntimeError):
+    """``documents`` was omitted but not every referenced ``doc_id``
+    already resolves (§7.2) — the whole batch is rejected, itemized.
+    Translated to a `400`."""
+
+    def __init__(self, unresolved: List[str]) -> None:
+        self.unresolved = unresolved
+        super().__init__(f"unresolved doc_ids: {unresolved}")
 
 
 def _decode_jsonb(value: Any) -> Any:
@@ -160,13 +199,20 @@ class FactsPgRepository:
         quote: str,
         attrs: Optional[dict] = None,
         document_date: Optional[date] = None,
-    ) -> str:
+    ) -> Optional[str]:
+        """Insert a claim; ``ON CONFLICT ... DO NOTHING`` on the (subject,
+        corpus_file_id, quote_hash) functional unique index makes a replay
+        (spec §7.2's union-mode idempotency) a true no-op. Returns the new
+        claim id, or ``None`` when this exact triple already existed — the
+        ingest write path (build order step 4) uses that to count
+        ``claims_written`` accurately across a replayed batch; no other
+        caller (read-path fixtures) inspects the return value."""
         if (fact_id is None) == (edge_id is None):
             raise ValueError("add_claim requires exactly one of fact_id/edge_id")
         claim_id = "c_" + secrets.token_hex(8)
         quote_hash = hashlib.sha256(quote.encode("utf-8")).hexdigest()[:16]
         with self._engine.begin() as conn:
-            conn.execute(
+            result = conn.execute(
                 sa.text(
                     "INSERT INTO claims "
                     "(id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, attrs, quote, "
@@ -188,7 +234,7 @@ class FactsPgRepository:
                     "document_date": document_date,
                 },
             )
-        return claim_id
+        return claim_id if result.rowcount else None
 
     def upsert_correction(
         self,
@@ -230,6 +276,34 @@ class FactsPgRepository:
                 sa.text("DELETE FROM corrections WHERE subject_kind = :kind AND subject_id = :id"),
                 {"kind": subject_kind, "id": subject_id},
             )
+
+    def list_wrong_corrections(self) -> List[Dict[str, Any]]:
+        """The producer export (spec §7.4): every ``wrong`` subject with its
+        ``natural_keys`` snapshot, so a re-extraction pass can prune them
+        before re-asserting claims. Corrections are enforced at read time
+        regardless (§4) -- this is a courtesy, not the enforcement boundary."""
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT subject_kind, subject_id, natural_keys, reason, decided_by, decided_at "
+                        "FROM corrections WHERE verdict = 'wrong' ORDER BY decided_at"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [
+            {
+                "subject_kind": r["subject_kind"],
+                "subject_id": r["subject_id"],
+                "natural_keys": _decode_jsonb(r["natural_keys"]),
+                "reason": r["reason"],
+                "decided_by": r["decided_by"],
+                "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # shared visibility primitives (spec §5) — every read method below
@@ -704,4 +778,652 @@ class FactsPgRepository:
         row = conn.execute(sa.text("SELECT 1 FROM edges WHERE id = :id"), {"id": subject_id}).first()
         if row is not None:
             return "edge"
+        return None
+
+    # ------------------------------------------------------------------
+    # orphan sweep (spec §6) — deletes zero-claim subjects, counts them.
+    # ------------------------------------------------------------------
+
+    def sweep_orphans(self) -> int:
+        """Delete every subject (fact or edge) with zero claims; return the
+        count (spec §6: "subjects left with zero claims are deleted and
+        counted"). Edges are swept first — an edge with zero claims of its
+        OWN is removed before the fact sweep runs; deleting an orphaned
+        FACT afterwards can then cascade (``ON DELETE CASCADE``) any edge
+        still pointing at it even if THAT edge carried its own claims — an
+        edge to a subject this design has garbage-collected cannot outlive
+        it, so that knock-on cascade is not separately counted here. Safe
+        to call unconditionally (a no-op when nothing is orphaned); callers
+        decide when running it is warranted (post-ingest — replace mode can
+        orphan a subject a document no longer mentions — and post file
+        delete, spec §6's lifecycle table)."""
+        with self._engine.begin() as conn:
+            edge_ids = (
+                conn.execute(
+                    sa.text(
+                        "DELETE FROM edges e WHERE NOT EXISTS "
+                        "(SELECT 1 FROM claims c WHERE c.edge_id = e.id) RETURNING e.id"
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            fact_ids = (
+                conn.execute(
+                    sa.text(
+                        "DELETE FROM facts f WHERE NOT EXISTS "
+                        "(SELECT 1 FROM claims c WHERE c.fact_id = f.id) RETURNING f.id"
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return len(edge_ids) + len(fact_ids)
+
+    # ------------------------------------------------------------------
+    # corrections management support (spec §3/§4) — natural-key snapshots
+    # for admin CRUD, and re-attachment for a subject recreated after
+    # deletion (never a producer-writable path; see app/api/facts.py).
+    # ------------------------------------------------------------------
+
+    def natural_keys_for(self, subject_kind: str, subject_id: str) -> Any:
+        """Snapshot a LIVE subject's natural keys for ``corrections.
+        natural_keys`` (spec §3): for a fact, ``{"aliases": [...]}`` (every
+        alias currently pointing at it); for an edge, ``[src_key, type,
+        dst_key]`` using the first alias found for each endpoint (sorted,
+        so the choice is deterministic when an endpoint carries more than
+        one). Best-effort — an endpoint with no alias yet yields ``None``
+        in its slot rather than raising; the correction is still recorded,
+        it just cannot re-attach through that endpoint later."""
+        with self._engine.connect() as conn:
+            if subject_kind == "fact":
+                rows = (
+                    conn.execute(
+                        sa.text("SELECT natural_key FROM fact_aliases WHERE fact_id = :id ORDER BY natural_key"),
+                        {"id": subject_id},
+                    )
+                    .scalars()
+                    .all()
+                )
+                return {"aliases": list(rows)}
+            edge = (
+                conn.execute(sa.text("SELECT src, type, dst FROM edges WHERE id = :id"), {"id": subject_id})
+                .mappings()
+                .first()
+            )
+            if edge is None:
+                return [None, None, None]
+            src_key = conn.execute(
+                sa.text("SELECT natural_key FROM fact_aliases WHERE fact_id = :id ORDER BY natural_key LIMIT 1"),
+                {"id": edge["src"]},
+            ).scalar()
+            dst_key = conn.execute(
+                sa.text("SELECT natural_key FROM fact_aliases WHERE fact_id = :id ORDER BY natural_key LIMIT 1"),
+                {"id": edge["dst"]},
+            ).scalar()
+            return [src_key, edge["type"], dst_key]
+
+    def _reattach_correction(
+        self, conn, *, subject_kind: str, subject_id: str, natural_key_probe: Any
+    ) -> Optional[Dict[str, Any]]:
+        """A subject deleted (all claims cascaded away) and later re-created
+        under a NEW surrogate id re-attaches any orphaned correction whose
+        snapshot overlaps this subject's natural key (spec §3: "a legal
+        hold must not vanish because a document was briefly missing").
+        Matches only a correction whose OWN ``subject_id`` no longer names
+        a LIVE subject — never steals a correction still attached to a
+        different, currently-live subject. Returns the repointed row (for
+        the ingest run report's ``corrections_active``) or ``None``."""
+        if subject_kind == "fact":
+            probe_sql = "natural_keys @> CAST(:probe AS JSONB)"
+            probe = json.dumps({"aliases": [natural_key_probe]})
+            live_table = "facts"
+        else:
+            probe_sql = "natural_keys = CAST(:probe AS JSONB)"
+            probe = json.dumps(natural_key_probe)
+            live_table = "edges"
+
+        row = (
+            conn.execute(
+                sa.text(
+                    f"SELECT subject_id, verdict, reason FROM corrections "
+                    f"WHERE subject_kind = :kind AND {probe_sql} "
+                    f"AND subject_id != :new_id "
+                    f"AND NOT EXISTS (SELECT 1 FROM {live_table} WHERE id = corrections.subject_id) "
+                    f"LIMIT 1"
+                ),
+                {"kind": subject_kind, "probe": probe, "new_id": subject_id},
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return None
+        old_subject_id = row["subject_id"]
+        conn.execute(
+            sa.text("UPDATE corrections SET subject_id = :new_id WHERE subject_kind = :kind AND subject_id = :old_id"),
+            {"new_id": subject_id, "kind": subject_kind, "old_id": old_subject_id},
+        )
+        return {
+            "subject_kind": subject_kind,
+            "subject_id": subject_id,
+            "verdict": row["verdict"],
+            "reason": row["reason"],
+        }
+
+    def _resolve_alias(self, conn, node_id: str, declared_type: Optional[str]) -> Dict[str, Any]:
+        """Resolve a producer node id ``<type>:<slug>`` to a fact_id via
+        ``fact_aliases`` (spec §7.2): unknown -> new subject + alias (with
+        correction re-attachment, above); a TYPE disagreement against an
+        EXISTING alias for the same natural key is rejected, itemized
+        (``alias_type_conflict``) rather than hard-exiting like the
+        producer's own sandbox loader."""
+        parts = node_id.split(":", 1) if node_id else []
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return {"fact_id": None, "created": False, "error": "malformed_node_id", "reattached": None}
+        prefix_type = parts[0]
+        resolved_type = declared_type or prefix_type
+
+        existing = (
+            conn.execute(
+                sa.text("SELECT fact_id, type FROM fact_aliases WHERE natural_key = :nk"),
+                {"nk": node_id},
+            )
+            .mappings()
+            .first()
+        )
+        if existing is not None:
+            if existing["type"] != resolved_type:
+                return {"fact_id": None, "created": False, "error": "alias_type_conflict", "reattached": None}
+            return {"fact_id": existing["fact_id"], "created": False, "error": None, "reattached": None}
+
+        fact_id = self.create_fact(type=resolved_type, natural_key=node_id)
+        with self._engine.begin() as reconn:
+            reattached = self._reattach_correction(
+                reconn, subject_kind="fact", subject_id=fact_id, natural_key_probe=node_id
+            )
+        return {"fact_id": fact_id, "created": True, "error": None, "reattached": reattached}
+
+    # ------------------------------------------------------------------
+    # ingest (spec §7.2, build order step 4) — the write path's single
+    # entry point. Batch caps, doc_id resolution (§6), the verbatim gate
+    # (§8), union/replace modes, alias/edge resolution, correction
+    # re-attachment (§3), and the orphan sweep (§6) all happen here; the
+    # return value IS the run report (§7.2's response shape).
+    # ------------------------------------------------------------------
+
+    def ingest_batch(
+        self,
+        *,
+        documents: Optional[List[Dict[str, Any]]] = None,
+        full_documents: Optional[List[str]] = None,
+        nodes: Optional[List[Dict[str, Any]]] = None,
+        edges: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        documents = documents or []
+        full_documents = full_documents or []
+        nodes = nodes or []
+        edges = edges or []
+
+        if len(documents) > MAX_INGEST_DOCUMENTS:
+            raise IngestBatchTooLarge(
+                {"reason": "too_many_documents", "count": len(documents), "cap": MAX_INGEST_DOCUMENTS}
+            )
+
+        per_doc_claims: Dict[str, int] = {}
+        for node in nodes:
+            for ev in node.get("evidence") or []:
+                doc_id = ev.get("doc_id")
+                if doc_id:
+                    per_doc_claims[doc_id] = per_doc_claims.get(doc_id, 0) + 1
+        for edge in edges:
+            for ev in edge.get("evidence") or []:
+                doc_id = ev.get("doc_id")
+                if doc_id:
+                    per_doc_claims[doc_id] = per_doc_claims.get(doc_id, 0) + 1
+
+        for doc_id, count in per_doc_claims.items():
+            if count > MAX_INGEST_CLAIMS:
+                raise IngestDocumentExceedsClaimCap(doc_id, count)
+
+        total_claims = sum(per_doc_claims.values())
+        if total_claims > MAX_INGEST_CLAIMS:
+            raise IngestBatchTooLarge({"reason": "too_many_claims", "count": total_claims, "cap": MAX_INGEST_CLAIMS})
+
+        from src.repositories import corpus_chunks_repo, corpus_file_sources_repo, corpus_files_repo
+
+        cf_repo = corpus_files_repo()
+        sources_repo = corpus_file_sources_repo()
+        chunks_repo = corpus_chunks_repo()
+
+        # ---- documents[]: upsert through the §6 path (match stable_id then
+        # path, refresh the corpus_file_sources mapping only) — NEVER
+        # creates a new corpus_files row. This flow's content already
+        # landed through the normal upload endpoint (spec §7.2, "what the
+        # producer uploads"); a document row with no matching corpus_files
+        # row stays unresolved.
+        doc_id_resolution: Dict[str, str] = {}
+        doc_dates: Dict[str, date] = {}
+        with self._engine.connect() as doc_conn:
+            for raw_doc in documents:
+                doc = {k: v for k, v in raw_doc.items() if not k.startswith("_")}
+                doc_id = doc.get("doc_id")
+                corpus_id = doc.get("corpus_id")
+                if not doc_id or not corpus_id:
+                    continue
+                stable_id = doc.get("stable_id") or None
+                path = doc.get("path") or None
+
+                existing = None
+                if stable_id:
+                    existing_id = sources_repo.resolve(corpus_id, stable_id)
+                    if existing_id:
+                        existing = cf_repo.get(existing_id)
+                if existing is None and path:
+                    existing = cf_repo.get_by_path(corpus_id, path)
+
+                if existing is not None:
+                    file_id = existing["id"]
+                    if stable_id:
+                        sources_repo.upsert(
+                            corpus_file_id=file_id,
+                            corpus_id=corpus_id,
+                            source_stable_id=stable_id,
+                            source_doc_id=doc_id,
+                            source_sha256=doc.get("sha256") or None,
+                        )
+                    doc_id_resolution[doc_id] = file_id
+                else:
+                    # Neither stable_id nor path resolved a row directly —
+                    # fall back to an ALREADY-ESTABLISHED source_doc_id
+                    # mapping (a prior upload/ingest resolved this doc_id
+                    # once already) so `modified` still attaches even
+                    # though THIS row carries no fresh identity to match.
+                    row = doc_conn.execute(
+                        sa.text("SELECT corpus_file_id FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
+                        {"doc_id": doc_id},
+                    ).first()
+                    file_id = row[0] if row is not None else None
+                    if file_id is not None:
+                        doc_id_resolution[doc_id] = file_id
+
+                if file_id is not None:
+                    parsed = _parse_document_date(doc.get("modified"))
+                    if parsed is not None:
+                        doc_dates[file_id] = parsed
+
+        def _resolve_doc(doc_id: Optional[str], conn) -> Optional[str]:
+            if not doc_id:
+                return None
+            if doc_id in doc_id_resolution:
+                return doc_id_resolution[doc_id]
+            row = conn.execute(
+                sa.text("SELECT corpus_file_id FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
+                {"doc_id": doc_id},
+            ).first()
+            if row is None:
+                return None
+            doc_id_resolution[doc_id] = row[0]
+            return row[0]
+
+        with self._engine.connect() as ro_conn:
+            # Also resolve every `full_documents` id even when it carries NO
+            # evidence in this batch at all — a lone "clear this document's
+            # claims" replace-mode call (the deletion-driven cascade path,
+            # not just a re-extraction) must still be able to find its
+            # corpus_file_id.
+            to_resolve = set(per_doc_claims) | set(full_documents)
+            unresolved = {doc_id for doc_id in to_resolve if _resolve_doc(doc_id, ro_conn) is None}
+        # §7.2: "documents may be omitted only when every referenced doc_id
+        # already resolves; otherwise the batch is rejected with the
+        # unresolved ids itemized." When `documents` WAS supplied but a
+        # doc_id still doesn't resolve (content genuinely never uploaded),
+        # that is a per-claim rejection below, not a whole-batch reject —
+        # supplying the array is exactly the mechanism meant to establish
+        # resolution, and it may legitimately fail for a subset.
+        if not documents and unresolved:
+            raise IngestUnresolvedDocIds(sorted(unresolved))
+
+        # ---- full_documents replace mode: delete ALL existing claims for
+        # each listed document BEFORE any incoming claim is written, so a
+        # subject the re-extraction no longer mentions loses its stale
+        # claim (spec §7.2, test C2).
+        replaced_file_ids = {doc_id_resolution[d] for d in full_documents if d in doc_id_resolution}
+        if replaced_file_ids:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    sa.text("DELETE FROM claims WHERE corpus_file_id = ANY(:ids)"),
+                    {"ids": list(replaced_file_ids)},
+                )
+
+        file_row_cache: Dict[str, Optional[dict]] = {}
+
+        def _file_row(file_id: str) -> Optional[dict]:
+            if file_id not in file_row_cache:
+                file_row_cache[file_id] = cf_repo.get(file_id)
+            return file_row_cache[file_id]
+
+        chunk_cache: Dict[str, List[str]] = {}
+
+        def _chunk_texts(file_id: str) -> List[str]:
+            if file_id not in chunk_cache:
+                chunk_cache[file_id] = [c["text"] for c in chunks_repo.list_for_file(file_id) if c.get("text")]
+            return chunk_cache[file_id]
+
+        claims_written = 0
+        claims_rejected: List[Dict[str, Any]] = []
+        deferred: List[Dict[str, Any]] = []
+        subjects_created = 0
+        review_items: List[Dict[str, Any]] = []
+        corrections_active: List[Dict[str, Any]] = []
+        touched_fact_ids: set = set()
+
+        def _write_evidence(
+            *,
+            kind: str,
+            subject_id: str,
+            evidence: List[Dict[str, Any]],
+            row_ref: str,
+            row_attrs: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            nonlocal claims_written
+            with self._engine.connect() as conn:
+                for ev_idx, ev in enumerate(evidence):
+                    doc_id = ev.get("doc_id")
+                    quote = ev.get("quote") or ""
+                    item_ref = f"{row_ref}.evidence[{ev_idx}]"
+                    if not quote:
+                        claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
+                        continue
+                    file_id = _resolve_doc(doc_id, conn)
+                    frow = _file_row(file_id) if file_id else None
+                    if file_id is None or frow is None:
+                        claims_rejected.append({"row": item_ref, "reason": "unresolved_doc_id", "doc_id": doc_id})
+                        continue
+                    if frow.get("processing_status") != "indexed":
+                        deferred.append(
+                            {
+                                "row": item_ref,
+                                "doc_id": doc_id,
+                                "corpus_file_id": file_id,
+                                "reason": "not_indexed",
+                                "retry_after_seconds": 60,
+                            }
+                        )
+                        continue
+                    texts = _chunk_texts(file_id)
+                    if not any(quote in t for t in texts):
+                        claims_rejected.append({"row": item_ref, "reason": "verbatim_gate_failed", "doc_id": doc_id})
+                        continue
+                    written_id = self.add_claim(
+                        fact_id=subject_id if kind == "fact" else None,
+                        edge_id=subject_id if kind == "edge" else None,
+                        corpus_file_id=file_id,
+                        corpus_id=frow["corpus_id"],
+                        file_sha256=frow.get("sha256") or "",
+                        quote=quote,
+                        # Per-evidence `attrs` isn't part of the producer's
+                        # wire format (spec §7.0) — `attrs` sits on the
+                        # node/edge row itself ("what THIS document says",
+                        # §3), and the concatenated-per-document pipeline
+                        # output means one row object == one document's
+                        # occurrence, so the row's own attrs is what each
+                        # of its claims should carry. An evidence-level
+                        # `attrs` is honored first if a future producer
+                        # ever supplies one (forward-compatible, unused
+                        # today).
+                        attrs=ev.get("attrs") or row_attrs or {},
+                        document_date=doc_dates.get(file_id),
+                    )
+                    if written_id is not None:
+                        claims_written += 1
+                        if kind == "fact":
+                            touched_fact_ids.add(subject_id)
+
+        # ---- nodes: alias resolution + evidence.
+        node_fact_ids: Dict[str, str] = {}
+        for idx, node in enumerate(nodes):
+            node_id = node.get("id")
+            row_ref = f"nodes[{idx}]"
+            if not node_id:
+                claims_rejected.append({"row": row_ref, "reason": "missing_node_id"})
+                continue
+            with self._engine.connect() as conn:
+                resolution = self._resolve_alias(conn, node_id, node.get("type"))
+            if resolution["error"] is not None:
+                claims_rejected.append({"row": row_ref, "reason": resolution["error"], "node_id": node_id})
+                continue
+            if resolution["created"]:
+                subjects_created += 1
+                if resolution.get("reattached"):
+                    corrections_active.append(resolution["reattached"])
+            node_fact_ids[node_id] = resolution["fact_id"]
+            _write_evidence(
+                kind="fact",
+                subject_id=resolution["fact_id"],
+                evidence=node.get("evidence") or [],
+                row_ref=row_ref,
+                row_attrs=node.get("attrs") or {},
+            )
+
+        # ---- edges: endpoints resolve via the SAME alias mechanism (an
+        # edge's src/dst are themselves node ids, spec §7.0) + evidence.
+        # `possible_duplicate_of` is the one edge type exempt from
+        # requiring evidence (§7.0) -- accepted and surfaced as a review
+        # item (§7.2) regardless of whether it carries any.
+        def _endpoint(node_id: str, conn) -> Dict[str, Any]:
+            if node_id in node_fact_ids:
+                return {"fact_id": node_fact_ids[node_id], "created": False, "error": None, "reattached": None}
+            return self._resolve_alias(conn, node_id, None)
+
+        for idx, edge in enumerate(edges):
+            row_ref = f"edges[{idx}]"
+            src_id, edge_type, dst_id = edge.get("src"), edge.get("type"), edge.get("dst")
+            if not src_id or not edge_type or not dst_id:
+                claims_rejected.append({"row": row_ref, "reason": "malformed_edge"})
+                continue
+            with self._engine.connect() as conn:
+                src_res = _endpoint(src_id, conn)
+                dst_res = _endpoint(dst_id, conn)
+            if src_res.get("error") or dst_res.get("error"):
+                claims_rejected.append({"row": row_ref, "reason": "edge_endpoint_unresolved"})
+                continue
+            for endpoint_id, res in ((src_id, src_res), (dst_id, dst_res)):
+                if res.get("created"):
+                    subjects_created += 1
+                    node_fact_ids[endpoint_id] = res["fact_id"]
+                    if res.get("reattached"):
+                        corrections_active.append(res["reattached"])
+
+            edge_id = self.create_edge(src=src_res["fact_id"], type=edge_type, dst=dst_res["fact_id"])
+            with self._engine.begin() as conn:
+                reattached_edge = self._reattach_correction(
+                    conn, subject_kind="edge", subject_id=edge_id, natural_key_probe=[src_id, edge_type, dst_id]
+                )
+            if reattached_edge:
+                corrections_active.append(reattached_edge)
+
+            if edge_type == "possible_duplicate_of":
+                review_items.append({"type": "possible_duplicate_of", "edge_id": edge_id, "src": src_id, "dst": dst_id})
+            _write_evidence(
+                kind="edge",
+                subject_id=edge_id,
+                evidence=edge.get("evidence") or [],
+                row_ref=row_ref,
+                row_attrs=edge.get("attrs") or {},
+            )
+
+        # ---- same-date attribute conflicts introduced by THIS batch become
+        # review items (EQ4) -- different-date succession needs none (EQ5),
+        # already correct at READ time via search()'s projection; this is
+        # the write-side signal a human reviewer would want surfaced now.
+        if touched_fact_ids:
+            with self._engine.connect() as conn:
+                conflict_rows = (
+                    conn.execute(
+                        sa.text(
+                            """
+                            SELECT c.fact_id, kv.key, c.document_date, jsonb_agg(DISTINCT kv.value) AS values
+                            FROM claims c
+                            CROSS JOIN LATERAL jsonb_each(c.attrs) AS kv(key, value)
+                            WHERE c.fact_id = ANY(:ids) AND c.document_date IS NOT NULL
+                            GROUP BY c.fact_id, kv.key, c.document_date
+                            HAVING COUNT(DISTINCT kv.value) > 1
+                            """
+                        ),
+                        {"ids": list(touched_fact_ids)},
+                    )
+                    .mappings()
+                    .all()
+                )
+            for r in conflict_rows:
+                review_items.append(
+                    {
+                        "type": "attribute_conflict",
+                        "subject_id": r["fact_id"],
+                        "key": r["key"],
+                        "document_date": r["document_date"].isoformat(),
+                        "values": _decode_jsonb(r["values"]),
+                    }
+                )
+
+        subjects_deleted = self.sweep_orphans()
+
+        return {
+            "claims_written": claims_written,
+            "claims_rejected": claims_rejected,
+            "deferred": deferred,
+            "subjects_created": subjects_created,
+            "subjects_deleted": subjects_deleted,
+            "corrections_active": corrections_active,
+            "review_items": review_items,
+        }
+
+    # ------------------------------------------------------------------
+    # entity-resolution repair (spec §3: "a merge is adding an alias...
+    # repoint aliases + claims to the canonical subject, audit-logged; a
+    # split is the reverse") — EQ7's foundation. Not on the ingest write
+    # path itself (ingest never auto-merges); an admin/reconciliation
+    # caller invokes these directly.
+    # ------------------------------------------------------------------
+
+    def merge_facts(self, *, canonical_id: str, merged_id: str, merged_by: str) -> Dict[str, Any]:
+        """Merge ``merged_id`` INTO ``canonical_id``: repoint every alias
+        and claim, delete the now-empty ``merged_id`` row, audit-log the
+        action. Both facts must share a ``type`` (entity-resolution repair,
+        not a type change). Returns a snapshot — ``{canonical_id,
+        merged_id, aliases, claim_ids}`` — sufficient for :meth:`split_fact`
+        to reverse it (union of claims, both aliases, per spec EQ7)."""
+        with self._engine.begin() as conn:
+            canonical = (
+                conn.execute(sa.text("SELECT type FROM facts WHERE id = :id"), {"id": canonical_id}).mappings().first()
+            )
+            merged = (
+                conn.execute(sa.text("SELECT type FROM facts WHERE id = :id"), {"id": merged_id}).mappings().first()
+            )
+            if canonical is None:
+                raise FactNotFound(canonical_id)
+            if merged is None:
+                raise FactNotFound(merged_id)
+            if canonical["type"] != merged["type"]:
+                raise ValueError(
+                    f"merge_facts requires matching types, got {canonical['type']!r} vs {merged['type']!r}"
+                )
+            aliases = (
+                conn.execute(sa.text("SELECT natural_key FROM fact_aliases WHERE fact_id = :id"), {"id": merged_id})
+                .scalars()
+                .all()
+            )
+            claim_ids = (
+                conn.execute(sa.text("SELECT id FROM claims WHERE fact_id = :id"), {"id": merged_id}).scalars().all()
+            )
+            conn.execute(
+                sa.text("UPDATE fact_aliases SET fact_id = :canonical WHERE fact_id = :merged"),
+                {"canonical": canonical_id, "merged": merged_id},
+            )
+            conn.execute(
+                sa.text("UPDATE claims SET fact_id = :canonical WHERE fact_id = :merged"),
+                {"canonical": canonical_id, "merged": merged_id},
+            )
+            conn.execute(sa.text("DELETE FROM facts WHERE id = :id"), {"id": merged_id})
+
+        from src.repositories import audit_repo
+
+        snapshot = {
+            "canonical_id": canonical_id,
+            "merged_id": merged_id,
+            "aliases": list(aliases),
+            "claim_ids": list(claim_ids),
+        }
+        audit_repo().log(
+            user_id=merged_by,
+            action="facts.merge",
+            resource=f"fact/{canonical_id}",
+            params={"merged_id": merged_id, "aliases": snapshot["aliases"], "claim_ids": snapshot["claim_ids"]},
+        )
+        return snapshot
+
+    def split_fact(self, *, canonical_id: str, snapshot: Dict[str, Any], split_by: str) -> str:
+        """Reverse a prior :meth:`merge_facts` using its returned
+        ``snapshot``: mint a NEW fact of the canonical's type, repoint the
+        snapshotted aliases + claims back onto it. Returns the new fact id
+        — deliberately NOT the original ``merged_id``, since ids are opaque
+        and never reused (spec §3)."""
+        aliases = snapshot.get("aliases") or []
+        claim_ids = snapshot.get("claim_ids") or []
+        with self._engine.begin() as conn:
+            row = (
+                conn.execute(sa.text("SELECT type FROM facts WHERE id = :id"), {"id": canonical_id}).mappings().first()
+            )
+            if row is None:
+                raise FactNotFound(canonical_id)
+            new_id = "f_" + secrets.token_hex(8)
+            conn.execute(
+                sa.text("INSERT INTO facts (id, type) VALUES (:id, :type)"), {"id": new_id, "type": row["type"]}
+            )
+            if aliases:
+                conn.execute(
+                    sa.text(
+                        "UPDATE fact_aliases SET fact_id = :new "
+                        "WHERE natural_key = ANY(:aliases) AND fact_id = :canonical"
+                    ),
+                    {"new": new_id, "aliases": list(aliases), "canonical": canonical_id},
+                )
+            if claim_ids:
+                conn.execute(
+                    sa.text("UPDATE claims SET fact_id = :new WHERE id = ANY(:ids)"),
+                    {"new": new_id, "ids": list(claim_ids)},
+                )
+
+        from src.repositories import audit_repo
+
+        audit_repo().log(
+            user_id=split_by,
+            action="facts.split",
+            resource=f"fact/{canonical_id}",
+            params={"new_id": new_id, "aliases": aliases, "claim_ids": claim_ids},
+        )
+        return new_id
+
+
+def _parse_document_date(value: Any) -> Optional[date]:
+    """Best-effort parse of a producer-supplied date/datetime string (spec
+    §10: Graph's ``lastModifiedDateTime``, ISO-8601) into a plain
+    :class:`datetime.date`. Returns ``None`` for anything unparseable —
+    the caller treats a missing/invalid date exactly like an absent one
+    (§10's "null dates" rule), never raises on malformed producer input."""
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
         return None

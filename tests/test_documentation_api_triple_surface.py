@@ -1090,6 +1090,24 @@ _EXEMPT: dict[str, str] = {
         "fact graph read surface — CLI/MCP land in a follow-up task "
         "(build order step 6); REST-only for now, see spec §12"
     ),
+    # Build order step 4 (write path). Unlike the three read routes above,
+    # this IS a permanent exemption: the producer contract (ingest,
+    # corrections CRUD/export) is scheduler-token-or-admin surface, not an
+    # analyst command — spec §12's REST/CLI/MCP table covers only
+    # search/neighbors/claims, and ingest/corrections never appear there.
+    # Mirrors the run-knowledge-digests / run-corporate-memory / reap-idle
+    # exemptions above: a producer/admin maintenance op, no analyst CLI/MCP
+    # analogue by design.
+    "/api/facts/ingest": (
+        "fact graph producer contract (spec §7.2) — scheduler-token-or-admin "
+        "ingest endpoint, not an analyst command; no CLI/MCP analogue"
+    ),
+    "/api/facts/corrections/{subject_kind}/{subject_id}": (
+        "admin correction management (spec §4) — PUT/DELETE, no analyst CLI/MCP analogue"
+    ),
+    "/api/facts/corrections": (
+        "producer corrections export (spec §7.4) — scheduler-token-or-admin, no analyst CLI/MCP analogue"
+    ),
 }
 
 

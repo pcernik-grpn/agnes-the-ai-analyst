@@ -546,8 +546,9 @@ SWITCHES: tuple[Switch, ...] = (
             "Collections documents, each claim carrying its evidencing document, verbatim "
             "quote and date; visibility is enforced per-caller from readable collection "
             "grants. Postgres-only (A3 ratchet) — a DuckDB-backed instance answers a typed "
-            "501 regardless of this flag. Read surface only for now (search/neighbors/"
-            "claims); ingest is a separate follow-up. New feature — off by default."
+            "501 regardless of this flag. Read surface (search/neighbors/claims) and write "
+            "surface (ingest + corrections, scheduler-token-or-admin) both live behind this "
+            "flag. New feature — off by default."
         ),
     ),
     Switch(

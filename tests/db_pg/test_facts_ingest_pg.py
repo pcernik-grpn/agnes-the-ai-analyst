@@ -1,0 +1,838 @@
+"""Write-path tests for the fact graph over Collections (build order step 4
+of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
+
+PG-only, no DuckDB half to parametrize against (A3 ratchet) — see
+``docs/migrations.md`` -> "Adding a PG-only feature". Two layers:
+
+* Direct :class:`FactsPgRepository` calls, with ``corpus_files``/
+  ``corpus_chunks`` seeded through raw SQL (mirroring the seeding style
+  ``tests/db_pg/test_facts_read_pg.py`` uses for facts/claims) — precise,
+  fast, and the bulk of this file.
+* HTTP round-trips via ``build_seeded_client("pg", ...)`` (the bottom
+  section) — batch caps, corrections CRUD, the real upload -> ingest ->
+  search end-to-end path, and the collections-delete sweep hook, proving
+  the endpoint wiring itself. ``tests/test_api_facts_ingest.py`` covers the
+  DuckDB-backend auth/flag/validation-shape half of the same routes (no
+  ``pg_engine`` fixture reachable outside ``tests/db_pg/``).
+
+Every id below is the literal acceptance test named in the spec
+(§15.2 C-tests, §15.3 EQ-tests); docstrings restate the failure mode.
+"""
+
+from __future__ import annotations
+
+import io
+import secrets
+from pathlib import Path
+
+import pytest
+import sqlalchemy as sa
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CORPUS_A = "col_a"
+
+
+# ---------------------------------------------------------------------------
+# fixtures / seeding helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pg_env(tmp_path, monkeypatch, pg_engine):
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    from tests.db_pg._parity_sweep_util import _seed_pg_system_groups
+
+    _seed_pg_system_groups(pg_engine)
+
+    # `_admin()` below is a REAL Admin-group member, not a bare dict shape —
+    # `accessible_collection_ids` resolves admin status via an actual DB
+    # membership lookup (src.rbac.get_accessible_ids), so a fabricated
+    # {"id": "admin1"} with no membership row is an ordinary ungranted user
+    # and every search()/claims() call would silently see nothing.
+    from src.repositories import user_group_members_repo, users_repo
+
+    users_repo().create(id="admin1", email="admin@test.com", name="Admin")
+    with pg_engine.connect() as conn:
+        admin_gid = conn.execute(sa.text("SELECT id FROM user_groups WHERE name = 'Admin'")).scalar()
+    user_group_members_repo().add_member("admin1", admin_gid, source="system_seed")
+    return pg_engine
+
+
+@pytest.fixture
+def repo(pg_env):
+    from src.repositories.facts_pg import FactsPgRepository
+
+    import src.db_pg as db_pg
+
+    return FactsPgRepository(db_pg.get_engine())
+
+
+def _seed_collection(*, collection_id: str, created_by: str = "uploader1") -> str:
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("INSERT INTO file_corpora (id, slug, name, created_by) VALUES (:id, :slug, :name, :by)"),
+            {"id": collection_id, "slug": collection_id, "name": collection_id, "by": created_by},
+        )
+    return collection_id
+
+
+def _seed_corpus_file(
+    *,
+    corpus_id: str = CORPUS_A,
+    file_id: str,
+    sha256: str = "sha1",
+    status: str = "indexed",
+    path: str | None = None,
+    filename: str | None = None,
+) -> None:
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files (id, corpus_id, filename, sha256, processing_status, path) "
+                "VALUES (:id, :corpus_id, :filename, :sha256, :status, :path)"
+            ),
+            {
+                "id": file_id,
+                "corpus_id": corpus_id,
+                "filename": filename or f"{file_id}.md",
+                "sha256": sha256,
+                "status": status,
+                "path": path,
+            },
+        )
+
+
+def _seed_chunk(*, corpus_id: str = CORPUS_A, file_id: str, text: str, ordinal: int = 0) -> None:
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_chunks (id, corpus_id, file_id, ordinal, text) "
+                "VALUES (:id, :corpus_id, :file_id, :ordinal, :text)"
+            ),
+            {
+                "id": "ck_" + secrets.token_hex(8),
+                "corpus_id": corpus_id,
+                "file_id": file_id,
+                "ordinal": ordinal,
+                "text": text,
+            },
+        )
+
+
+def _seed_source_mapping(
+    *, corpus_id: str = CORPUS_A, file_id: str, source_doc_id: str, stable_id: str | None = None
+) -> None:
+    from src.repositories import corpus_file_sources_repo
+
+    corpus_file_sources_repo().upsert(
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        source_stable_id=stable_id or file_id,
+        source_doc_id=source_doc_id,
+    )
+
+
+def _seed_ready_doc(
+    repo_engine,
+    *,
+    file_id: str = "cf_a1",
+    doc_id: str = "doc1",
+    text: str = "The engagement is underway and on schedule.",
+) -> str:
+    """One indexed corpus_file with one chunk, mapped to ``doc_id`` — the
+    minimal fixture most write-path tests build on."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text=text)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+    return doc_id
+
+
+# ---------------------------------------------------------------------------
+# EQ1 — the verbatim gate rejects fabrication, non-zero rejection count.
+# ---------------------------------------------------------------------------
+
+
+def test_eq1_verbatim_gate_rejects_a_fabricated_quote(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "This sentence was never in the document."}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+    assert report["subjects_created"] == 1  # the node itself still resolves/creates
+
+
+def test_verbatim_gate_accepts_a_real_substring(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+
+# ---------------------------------------------------------------------------
+# C2 — full_documents replace mode drops a stale claim; union mode doesn't.
+# ---------------------------------------------------------------------------
+
+
+def _node(id_, doc_id, quote, attrs=None):
+    return {
+        "id": id_,
+        "type": id_.split(":", 1)[0],
+        "attrs": attrs or {},
+        "evidence": [{"doc_id": doc_id, "quote": quote}],
+    }
+
+
+def test_c2_full_documents_replace_drops_a_subject_the_reextraction_no_longer_mentions(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Acme Corp is the client. Beta Corp is a vendor.")
+    repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme Corp is the client."),
+            _node("engagement:beta", doc_id, "Beta Corp is a vendor."),
+        ]
+    )
+    r1 = repo.search(_admin(), type="engagement")
+    assert len(r1["subjects"]) == 2
+
+    # Re-extraction drops "beta" entirely; full_documents replace must
+    # remove its stale claim so the subject is orphaned and swept.
+    report = repo.ingest_batch(
+        documents=[],
+        full_documents=[doc_id],
+        nodes=[_node("engagement:acme", doc_id, "Acme Corp is the client.")],
+    )
+    assert report["subjects_deleted"] >= 1
+    remaining = repo.search(_admin(), type="engagement")
+    ids = {s["id"] for s in remaining["subjects"]}
+    assert len(ids) == 1
+
+
+def test_union_mode_default_keeps_a_subject_not_mentioned_in_the_new_batch(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Acme Corp is the client. Beta Corp is a vendor.")
+    repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme Corp is the client."),
+            _node("engagement:beta", doc_id, "Beta Corp is a vendor."),
+        ]
+    )
+    # Union-mode replay omitting "beta" must NOT delete it.
+    repo.ingest_batch(nodes=[_node("engagement:acme", doc_id, "Acme Corp is the client.")])
+    remaining = repo.search(_admin(), type="engagement")
+    assert len(remaining["subjects"]) == 2
+
+
+def _admin() -> dict:
+    return {"id": "admin1", "email": "admin@test.com"}
+
+
+# ---------------------------------------------------------------------------
+# replay idempotency.
+# ---------------------------------------------------------------------------
+
+
+def test_replaying_the_same_batch_is_a_no_op(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    batch = {"nodes": [_node("engagement:acme-rollout", doc_id, "engagement is underway")]}
+    r1 = repo.ingest_batch(**batch)
+    assert r1["claims_written"] == 1
+    assert r1["subjects_created"] == 1
+
+    r2 = repo.ingest_batch(**batch)
+    assert r2["claims_written"] == 0  # ON CONFLICT DO NOTHING — no new claim
+    assert r2["subjects_created"] == 0  # alias already resolved
+
+    result = repo.search(_admin(), type="engagement")
+    assert len(result["subjects"]) == 1
+    assert result["subjects"][0]["claim_count"] == 1  # not duplicated
+
+
+# ---------------------------------------------------------------------------
+# deferred on an unindexed file.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_on_an_unindexed_file_is_deferred_not_rejected(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_pending", status="processing")
+    _seed_chunk(file_id="cf_pending", text="Whatever text eventually lands here.")
+    _seed_source_mapping(file_id="cf_pending", source_doc_id="docp")
+
+    report = repo.ingest_batch(nodes=[_node("engagement:x", "docp", "Whatever text")])
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"] == []
+    assert len(report["deferred"]) == 1
+    assert report["deferred"][0]["doc_id"] == "docp"
+    assert "retry_after_seconds" in report["deferred"][0]
+
+
+# ---------------------------------------------------------------------------
+# unresolved doc_id itemization — documents omitted, doc_id never resolves.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_doc_id_with_documents_omitted_rejects_whole_batch(pg_env, repo):
+    from src.repositories.facts_pg import IngestUnresolvedDocIds
+
+    with pytest.raises(IngestUnresolvedDocIds) as exc:
+        repo.ingest_batch(nodes=[_node("engagement:x", "doc_never_seen", "anything")])
+    assert exc.value.unresolved == ["doc_never_seen"]
+
+
+def test_unresolved_doc_id_with_documents_present_is_itemized_not_whole_batch(pg_env, repo):
+    """When `documents[]` IS supplied but one entry still can't resolve
+    (content never uploaded), that single claim is itemized in
+    claims_rejected rather than failing the whole batch — see the
+    ingest_batch docstring in src/repositories/facts_pg.py."""
+    doc_id = _seed_ready_doc(pg_env)
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "phantom", "corpus_id": CORPUS_A, "path": "/nonexistent.md"}],
+        nodes=[
+            _node("engagement:real", doc_id, "engagement is underway"),
+            _node("engagement:ghost", "phantom", "anything"),
+        ],
+    )
+    assert report["claims_written"] == 1
+    assert any(r["reason"] == "unresolved_doc_id" for r in report["claims_rejected"])
+
+
+# ---------------------------------------------------------------------------
+# batch caps — never split.
+# ---------------------------------------------------------------------------
+
+
+def test_too_many_documents_raises_batch_too_large(pg_env, repo):
+    from src.repositories.facts_pg import MAX_INGEST_DOCUMENTS, IngestBatchTooLarge
+
+    docs = [{"doc_id": f"d{i}", "corpus_id": CORPUS_A, "path": f"/f{i}.md"} for i in range(MAX_INGEST_DOCUMENTS + 1)]
+    with pytest.raises(IngestBatchTooLarge) as exc:
+        repo.ingest_batch(documents=docs)
+    assert exc.value.detail["reason"] == "too_many_documents"
+
+
+def test_single_document_exceeding_claim_cap_is_a_protocol_error_never_split(pg_env, repo):
+    from src.repositories.facts_pg import MAX_INGEST_CLAIMS, IngestDocumentExceedsClaimCap
+
+    evidence = [{"doc_id": "hugedoc", "quote": f"q{i}"} for i in range(MAX_INGEST_CLAIMS + 1)]
+    with pytest.raises(IngestDocumentExceedsClaimCap) as exc:
+        repo.ingest_batch(nodes=[{"id": "engagement:x", "type": "engagement", "attrs": {}, "evidence": evidence}])
+    assert exc.value.doc_id == "hugedoc"
+    assert exc.value.count == MAX_INGEST_CLAIMS + 1
+
+
+def test_total_claims_over_cap_across_many_documents_raises_batch_too_large(pg_env, repo):
+    from src.repositories.facts_pg import MAX_INGEST_CLAIMS, IngestBatchTooLarge
+
+    # Spread evidence across many distinct doc_ids so no SINGLE document
+    # trips the per-document cap — only the batch total does.
+    evidence = [{"doc_id": f"doc{i}", "quote": "q"} for i in range(MAX_INGEST_CLAIMS + 1)]
+    with pytest.raises(IngestBatchTooLarge) as exc:
+        repo.ingest_batch(nodes=[{"id": "engagement:x", "type": "engagement", "attrs": {}, "evidence": evidence}])
+    assert exc.value.detail["reason"] == "too_many_claims"
+
+
+# ---------------------------------------------------------------------------
+# type-conflict rejection.
+# ---------------------------------------------------------------------------
+
+
+def test_type_conflict_on_an_existing_alias_is_rejected(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-rollout")
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme-rollout",
+                "type": "acquisition",  # disagrees with the existing alias's stored type
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "alias_type_conflict"
+
+
+# ---------------------------------------------------------------------------
+# EQ4 — same-date conflict: both claims kept, review item created.
+# ---------------------------------------------------------------------------
+
+
+def test_eq4_same_date_conflict_keeps_both_and_creates_a_review_item(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_a1")
+    _seed_corpus_file(file_id="cf_a2")
+    _seed_chunk(file_id="cf_a1", text="The sponsor is Alice Adams as of today.")
+    _seed_chunk(file_id="cf_a2", text="The sponsor is Bob Brown as of today.")
+    _seed_source_mapping(file_id="cf_a1", source_doc_id="doc1")
+    _seed_source_mapping(file_id="cf_a2", source_doc_id="doc2")
+
+    same_day = "2026-03-01T00:00:00Z"
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "doc1", "corpus_id": CORPUS_A, "modified": same_day},
+            {"doc_id": "doc2", "corpus_id": CORPUS_A, "modified": same_day},
+        ],
+        nodes=[
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "doc1", "quote": "The sponsor is Alice Adams"}],
+            },
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {"sponsor": "Bob Brown"},
+                "evidence": [{"doc_id": "doc2", "quote": "The sponsor is Bob Brown"}],
+            },
+        ],
+    )
+    assert report["claims_written"] == 2
+    assert any(ri["type"] == "attribute_conflict" and ri["key"] == "sponsor" for ri in report["review_items"])
+
+    subject = repo.search(_admin(), type="engagement")["subjects"][0]
+    assert subject["attrs"]["sponsor"]["conflicted"] is True
+
+
+# ---------------------------------------------------------------------------
+# EQ5 — different-date succession: later wins, no review item.
+# ---------------------------------------------------------------------------
+
+
+def test_eq5_different_date_succession_later_wins_no_review_item(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_a1")
+    _seed_corpus_file(file_id="cf_a2")
+    _seed_chunk(file_id="cf_a1", text="The status is planning.")
+    _seed_chunk(file_id="cf_a2", text="The status is active.")
+    _seed_source_mapping(file_id="cf_a1", source_doc_id="doc1")
+    _seed_source_mapping(file_id="cf_a2", source_doc_id="doc2")
+
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "doc1", "corpus_id": CORPUS_A, "modified": "2026-01-01T00:00:00Z"},
+            {"doc_id": "doc2", "corpus_id": CORPUS_A, "modified": "2026-06-01T00:00:00Z"},
+        ],
+        nodes=[
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {"status": "planning"},
+                "evidence": [{"doc_id": "doc1", "quote": "The status is planning."}],
+            },
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {"status": "active"},
+                "evidence": [{"doc_id": "doc2", "quote": "The status is active."}],
+            },
+        ],
+    )
+    assert report["claims_written"] == 2
+    assert not any(ri["type"] == "attribute_conflict" for ri in report["review_items"])
+
+    subject = repo.search(_admin(), type="engagement")["subjects"][0]
+    assert subject["attrs"]["status"] == {"value": "active", "document_date": "2026-06-01"}
+
+
+# ---------------------------------------------------------------------------
+# EQ6 / S8 (write-side) — a `wrong` correction survives re-ingest.
+# ---------------------------------------------------------------------------
+
+
+def test_eq6_wrong_correction_survives_reingest_of_the_same_claims(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    node = _node("engagement:acme-rollout", doc_id, "engagement is underway")
+    repo.ingest_batch(nodes=[node])
+
+    fact_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys=repo.natural_keys_for("fact", fact_id),
+        verdict="wrong",
+        reason="hallucinated",
+        decided_by="admin1",
+    )
+    assert repo.search(_admin(), type="engagement")["subjects"] == []
+
+    # Re-ingesting the SAME claims must not resurrect visibility.
+    repo.ingest_batch(nodes=[node])
+    assert repo.search(_admin(), type="engagement")["subjects"] == []
+
+
+def test_wrong_correction_reattaches_after_the_subject_is_deleted_and_recreated(pg_env, repo):
+    """The harder case: the subject is fully DELETED (orphan swept away,
+    not merely hidden) and a later ingest re-creates it under a NEW
+    surrogate id — the correction must re-attach via natural_keys (spec §3)."""
+    doc_id = _seed_ready_doc(pg_env)
+    node = _node("engagement:acme-rollout", doc_id, "engagement is underway")
+    report1 = repo.ingest_batch(nodes=[node])
+    old_fact_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=old_fact_id,
+        natural_keys=repo.natural_keys_for("fact", old_fact_id),
+        verdict="wrong",
+        reason="hallucinated",
+        decided_by="admin1",
+    )
+
+    # Full delete: replace mode with an empty node set orphans the subject.
+    repo.ingest_batch(documents=[], full_documents=[doc_id], nodes=[])
+    assert report1["subjects_created"] == 1
+
+    # Re-create the SAME alias under a fresh surrogate id.
+    report2 = repo.ingest_batch(nodes=[node])
+    assert report2["subjects_created"] == 1
+    new_fact_id = repo.search(_admin(), type="engagement")["subjects"]
+    # Still invisible — the reattached `wrong` correction hides it again.
+    assert new_fact_id == []
+    assert any(c["verdict"] == "wrong" for c in report2["corrections_active"])
+
+
+# ---------------------------------------------------------------------------
+# EQ7 foundation — merge_facts / split_fact reversibility.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_facts_unions_claims_and_aliases_then_split_reverses_it(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Myers Diligence work started. Myers-Diligence continued.")
+    repo.ingest_batch(
+        nodes=[
+            _node("engagement:myers-diligence", doc_id, "Myers Diligence work started."),
+        ]
+    )
+    duplicate_id = repo.create_fact(type="engagement", natural_key="engagement:myers-dilligence")  # misspelling
+    repo.add_claim(
+        fact_id=duplicate_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Myers-Diligence continued.",
+    )
+    canonical_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    if canonical_id == duplicate_id:
+        # search() ordering isn't guaranteed; find the OTHER one.
+        canonical_id = next(
+            s["id"] for s in repo.search(_admin(), type="engagement")["subjects"] if s["id"] != duplicate_id
+        )
+
+    snapshot = repo.merge_facts(canonical_id=canonical_id, merged_id=duplicate_id, merged_by="admin1")
+    merged = repo.search(_admin(), type="engagement")
+    assert len(merged["subjects"]) == 1
+    assert merged["subjects"][0]["claim_count"] == 2
+    assert set(merged["subjects"][0]["aliases"]) == {"engagement:myers-diligence", "engagement:myers-dilligence"}
+
+    new_id = repo.split_fact(canonical_id=canonical_id, snapshot=snapshot, split_by="admin1")
+    after_split = repo.search(_admin(), type="engagement")
+    ids = {s["id"] for s in after_split["subjects"]}
+    assert ids == {canonical_id, new_id}
+    for s in after_split["subjects"]:
+        assert s["claim_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# C5 — orphan sweep: counted, and a subject with another doc's claim survives.
+# ---------------------------------------------------------------------------
+
+
+def test_c5_orphan_sweep_counts_and_spares_a_subject_with_a_surviving_claim(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    repo.ingest_batch(nodes=[_node("engagement:acme-rollout", doc_id, "engagement is underway")])
+    fact_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+    _seed_chunk(file_id="cf_a2", text="Acme rollout continues into Q3.")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="sha1", quote="continues into Q3"
+    )
+
+    # Delete the FIRST claim's underlying corpus_file (cascades that claim).
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
+
+    deleted = repo.sweep_orphans()
+    assert deleted == 0  # the fact still has its cf_a2 claim
+    assert len(repo.claims(_admin(), fact_id)["claims"]) == 1
+
+
+def test_c5_orphan_sweep_deletes_a_subject_with_zero_remaining_claims(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env)
+    repo.ingest_batch(nodes=[_node("engagement:acme-rollout", doc_id, "engagement is underway")])
+
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
+
+    deleted = repo.sweep_orphans()
+    assert deleted == 1
+    assert repo.search(_admin(), type="engagement")["subjects"] == []
+
+
+# ---------------------------------------------------------------------------
+# possible_duplicate_of — accepted without evidence, surfaced as review item.
+# ---------------------------------------------------------------------------
+
+
+def test_possible_duplicate_of_edge_needs_no_evidence_and_is_a_review_item(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Acme Corp is a client. Acme Corporation is a client.")
+    report = repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme Corp is a client."),
+            _node("engagement:acme-corporation", doc_id, "Acme Corporation is a client."),
+        ],
+        edges=[{"src": "engagement:acme", "type": "possible_duplicate_of", "dst": "engagement:acme-corporation"}],
+    )
+    assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
+
+
+# ===========================================================================
+# HTTP round-trips — real Postgres backend via build_seeded_client("pg", ...).
+# ===========================================================================
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _pg_client(tmp_path, monkeypatch, pg_engine):
+    from tests.db_pg._parity_sweep_util import build_seeded_client
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    return client, admin_token
+
+
+def test_http_batch_caps_document_count_is_413(tmp_path, monkeypatch, pg_engine):
+    from src.repositories.facts_pg import MAX_INGEST_DOCUMENTS
+
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    docs = [{"doc_id": f"d{i}", "corpus_id": "col_x", "path": f"/f{i}.md"} for i in range(MAX_INGEST_DOCUMENTS + 1)]
+    r = client.post("/api/facts/ingest", json={"documents": docs}, headers=_auth(admin_token))
+    assert r.status_code == 413, r.text
+    assert r.json()["detail"]["reason"] == "too_many_documents"
+
+
+def test_http_single_document_exceeding_claim_cap_is_422_never_split(tmp_path, monkeypatch, pg_engine):
+    from src.repositories.facts_pg import MAX_INGEST_CLAIMS
+
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    evidence = [{"doc_id": "hugedoc", "quote": f"q{i}"} for i in range(MAX_INGEST_CLAIMS + 1)]
+    body = {"nodes": [{"id": "engagement:x", "type": "engagement", "attrs": {}, "evidence": evidence}]}
+    r = client.post("/api/facts/ingest", json=body, headers=_auth(admin_token))
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["reason"] == "document_exceeds_claim_cap"
+
+
+def test_http_unresolved_doc_id_without_documents_is_400_itemized(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    body = {
+        "nodes": [
+            {"id": "engagement:x", "type": "engagement", "attrs": {}, "evidence": [{"doc_id": "phantom", "quote": "q"}]}
+        ]
+    }
+    r = client.post("/api/facts/ingest", json=body, headers=_auth(admin_token))
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["doc_ids"] == ["phantom"]
+
+
+def test_http_corrections_put_then_export_then_delete(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    put = client.put(
+        "/api/facts/corrections/fact/f_doesnotexist",
+        json={"verdict": "wrong", "reason": "hallucinated engagement"},
+        headers=headers,
+    )
+    assert put.status_code == 200, put.text
+    body = put.json()
+    assert body["verdict"] == "wrong"
+    assert body["natural_keys"] == {"aliases": []}
+
+    exported = client.get("/api/facts/corrections", headers=headers)
+    assert exported.status_code == 200, exported.text
+    rows = exported.json()["corrections"]
+    assert any(r["subject_id"] == "f_doesnotexist" for r in rows)
+
+    deleted = client.delete("/api/facts/corrections/fact/f_doesnotexist", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+
+    exported_after = client.get("/api/facts/corrections", headers=headers)
+    assert not any(r["subject_id"] == "f_doesnotexist" for r in exported_after.json()["corrections"])
+
+
+# ---------------------------------------------------------------------------
+# happy path — real upload through Collections, real chunking, then ingest,
+# then a search that finds the resulting subject with a matching quote.
+# ---------------------------------------------------------------------------
+
+
+def test_http_happy_path_upload_then_ingest_then_search_finds_the_subject(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Facts E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams. Work started in March 2026."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+    file_id = up.json()[0]["file_id"]
+
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=headers)
+    assert listing.json()["files"][0]["processing_status"] == "indexed", (
+        "TestClient runs BackgroundTasks before POST returns"
+    )
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-1", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-1", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.status_code == 200, ingest_resp.text
+    report = ingest_resp.json()
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+    assert report["subjects_created"] == 1
+
+    search_resp = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+    assert search_resp.status_code == 200, search_resp.text
+    subjects = search_resp.json()["subjects"]
+    assert len(subjects) == 1
+    subject = subjects[0]
+    assert subject["claim_count"] == 1
+    assert subject["attrs"]["sponsor"]["value"] == "Alice Adams"
+
+    claims_resp = client.get(f"/api/facts/{subject['id']}/claims", headers=headers)
+    assert claims_resp.status_code == 200, claims_resp.text
+    claims = claims_resp.json()["claims"]
+    assert claims[0]["quote"] == "Acme Rollout is sponsored by Alice Adams."
+    assert claims[0]["corpus_file_id"] == file_id
+
+
+def test_http_verbatim_gate_rejects_a_fabricated_quote(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Facts Gate"}, headers=headers)
+    corpus_id = created.json()["id"]
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("doc.md", io.BytesIO(b"The weather was fine on launch day."), "text/markdown")},
+        data={"paths": ["doc.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "d1", "corpus_id": corpus_id, "path": "doc.md"}],
+        "nodes": [
+            {
+                "id": "engagement:fabricated",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": "d1", "quote": "This sentence never appeared anywhere."}],
+            }
+        ],
+    }
+    r = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert r.status_code == 200, r.text
+    report = r.json()
+    assert report["claims_written"] == 0
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+
+
+def test_http_deleting_a_file_via_collections_api_sweeps_orphaned_subjects(tmp_path, monkeypatch, pg_engine):
+    """The collections-delete sweep hook (app/api/collections.py::delete_file
+    -> _sweep_facts_orphans_after_delete): deleting the file cascades its
+    claim, and the subject it solely evidenced is swept."""
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Sweep Hook"}, headers=headers)
+    corpus_id = created.json()["id"]
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("d.md", io.BytesIO(b"Standalone Corp is a one-off client."), "text/markdown")},
+        data={"paths": ["d.md"]},
+        headers=headers,
+    )
+    file_id = up.json()[0]["file_id"]
+
+    ingest_body = {
+        "documents": [{"doc_id": "sd1", "corpus_id": corpus_id, "path": "d.md"}],
+        "nodes": [
+            {
+                "id": "engagement:standalone-corp",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": "sd1", "quote": "Standalone Corp is a one-off client."}],
+            }
+        ],
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.json()["claims_written"] == 1
+
+    before = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+    assert len(before.json()["subjects"]) == 1
+
+    delete_resp = client.delete(f"/api/collections/{corpus_id}/files/{file_id}", headers=headers)
+    assert delete_resp.status_code == 204, delete_resp.text
+
+    after = client.post("/api/facts/search", json={"type": "engagement"}, headers=headers)
+    assert after.json()["subjects"] == []
