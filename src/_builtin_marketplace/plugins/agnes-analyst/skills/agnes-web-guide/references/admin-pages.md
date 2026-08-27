@@ -28,8 +28,13 @@ who receives it:
   `POST /api/admin/register-table`).
 - `/admin/data-packages` — bundle tables into packages and grant them to
   groups; this is what fills analysts' stacks.
-- `/admin/semantic-layer` — the instance-wide metric/glossary registry and
-  semantic-model sources.
+- `/admin/semantic-layer` — the instance-wide metric/glossary registry, and
+  whether what was imported is complete and healthy: coverage, health
+  checks, mutes, feedback.
+- `/admin/semantic-sources` — where the semantic model comes FROM, upstream
+  of `/admin/semantic-layer`: register a git / upload / connection source
+  (any adapter — native, Keboola, Snowflake, Databricks), sync one now,
+  remove one.
 - `/admin/sync` — sync status dashboard: per-table extraction state and a
   manual trigger (reached from the SYNC cell on `/admin/data-sources`).
 
