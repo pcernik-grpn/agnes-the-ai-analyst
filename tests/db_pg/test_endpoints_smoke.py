@@ -3003,6 +3003,8 @@ class TestSemanticLayerSmoke:
         "GET /api/admin/semantic-models/{model_id}",
         "PUT /api/admin/semantic-models/{model_id}",
         "DELETE /api/admin/semantic-models/{model_id}",
+        "POST /api/admin/semantic-models/{model_id}/detach",
+        "POST /api/admin/semantic-models/{model_id}/reattach",
         "GET /api/admin/semantic-sources",
         "POST /api/admin/semantic-sources",
         "GET /api/admin/semantic-sources/{source_id}",
@@ -3017,6 +3019,34 @@ class TestSemanticLayerSmoke:
         "GET /api/semantic-models/bundle",
         "POST /api/semantic-models/apply",
     }
+
+    def test_detach_and_reattach_are_wired_on_both_backends(self, seeded_app_both):
+        """F3 detach/re-attach. A hand-authored model is the wrong subject for
+        both (nothing to detach FROM, nothing detached to return), which is
+        exactly what makes it a backend-independent smoke probe: the route is
+        reachable, admin-gated and answers its own typed refusal rather than
+        500ing. On DuckDB the PG-only guard fires first (A3 ratchet), so the
+        refusal is the typed 501 instead."""
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+        backend = seeded_app_both["backend"]
+
+        created = c.post("/api/admin/semantic-models", json={"document": _SEMANTIC_DOC}, headers=h)
+        assert created.status_code == 201
+        model_id = created.json()["id"]
+
+        detach = c.post(f"/api/admin/semantic-models/{model_id}/detach", json={"confirm_detach": True}, headers=h)
+        reattach = c.post(f"/api/admin/semantic-models/{model_id}/reattach", json={"confirm_reattach": True}, headers=h)
+
+        if backend == "duckdb":
+            assert detach.status_code == 501, detach.text
+            assert reattach.status_code == 501, reattach.text
+        else:
+            # `source='manual'` — no source to detach from, and not detached.
+            assert detach.status_code == 400, detach.text
+            assert detach.json()["detail"]["code"] == "not_source_owned"
+            assert reattach.status_code == 409, reattach.text
+            assert reattach.json()["detail"]["code"] == "not_detached"
 
     def test_model_crud_and_export(self, seeded_app_both):
         c = seeded_app_both["client"]

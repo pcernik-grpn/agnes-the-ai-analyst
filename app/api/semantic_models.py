@@ -222,11 +222,15 @@ def _check_apply(document: str, expected_content_hash: Optional[str] = None):
     Returns ``(slug, validation_result)``. Raises ``SemanticApplyError``:
 
     - ``invalid_document`` — schema errors, or no named ``semantic_model``.
-    - ``source_owned`` — the slug belongs to an imported model. Unlike the
-      raw admin POST (which would create a shadow ``manual/_/<slug>`` row
-      next to the imported one), apply refuses for admins and non-admins
-      alike — the next source sync would not revert the write, it would
-      coexist with it, and ``get_by_slug`` would resolve ambiguously.
+    - ``source_owned`` — the slug belongs to an imported model that hasn't
+      been detached (F3). Unlike the raw admin POST (which would create a
+      shadow ``manual/_/<slug>`` row next to the imported one), apply
+      refuses for admins and non-admins alike — the next source sync would
+      not revert the write, it would coexist with it, and ``get_by_slug``
+      would resolve ambiguously. A DETACHED source-owned model is exempt:
+      that's exactly the danger-flow escape hatch F3 exists for (see
+      ``POST .../detach``) — sync already refuses to touch a detached row,
+      so there is no second-writer ambiguity to guard against here.
     - ``stale_document`` — ``expected_content_hash`` no longer matches.
     """
     result = validate_document(document)
@@ -238,7 +242,7 @@ def _check_apply(document: str, expected_content_hash: Optional[str] = None):
         raise SemanticApplyError("invalid_document", "Document declares no semantic_model entry with a name")
 
     existing = semantic_model_repo().get_by_slug(slug)
-    if existing is not None and existing.get("source") != "manual":
+    if existing is not None and existing.get("source") != "manual" and existing.get("sync_mode") != "detached":
         raise SemanticApplyError(
             "source_owned",
             f"slug '{slug}' is owned by source '{existing['source']}'"
@@ -260,11 +264,38 @@ def apply_manual_model(
     description: Optional[str] = None,
     expected_content_hash: Optional[str] = None,
 ) -> dict:
-    """The one write pipeline for a hand-authored model: guards → upsert as
-    ``source='manual'`` → project. Used by the ``/apply`` admin branch AND
-    the moderation-queue replay, so the two paths cannot diverge. Raises
-    ``SemanticApplyError`` (a ``ValueError``)."""
+    """The one write pipeline for a hand-authored model: guards → write →
+    project. Used by the ``/apply`` admin branch AND the moderation-queue
+    replay, so the two paths cannot diverge. Raises ``SemanticApplyError``
+    (a ``ValueError``).
+
+    F3: editing an already-DETACHED model (``_check_apply`` let it through
+    on that basis, not ``source == 'manual'``) rewrites the existing row in
+    place — ``update_document``, not ``upsert`` — so it keeps its original
+    ``source``/``source_ref`` (the importer needs that provenance to
+    recognize the row as detached on the next sync) and its
+    ``sync_mode='detached'``/detach-tracking columns untouched. A brand-new
+    or already-``manual`` model is unaffected: same ``upsert`` path as
+    before, under ``source='manual'``.
+    """
     slug, result = _check_apply(document, expected_content_hash)
+    content_hash = hashlib.sha256(document.encode()).hexdigest()
+    existing = semantic_model_repo().get_by_slug(slug)
+    if existing is not None and existing.get("sync_mode") == "detached":
+        row = semantic_model_repo().update_document(
+            existing["id"],
+            name=slug,
+            description=description,
+            document=document,
+            document_json=result.parsed,
+            spec_version=result.spec_version,
+            content_hash=content_hash,
+            status="valid",
+            validation_errors=None,
+            validated_at=datetime.now(timezone.utc),
+        )
+        _project(result.parsed, source=existing["source"], source_ref=existing.get("source_ref"))
+        return row
     row = semantic_model_repo().upsert(
         id=f"manual/_/{slug}",
         slug=slug,
@@ -273,7 +304,7 @@ def apply_manual_model(
         document=document,
         document_json=result.parsed,
         spec_version=result.spec_version,
-        content_hash=hashlib.sha256(document.encode()).hexdigest(),
+        content_hash=content_hash,
         source="manual",
         source_ref=None,
         status="valid",
@@ -560,7 +591,7 @@ async def update_semantic_model(model_id: str, body: SemanticModelUpdate, user: 
     row = _resolve_model(model_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
-    if row["source"] != "manual":
+    if row["source"] != "manual" and row.get("sync_mode") != "detached":
         raise HTTPException(
             status_code=409,
             detail={
@@ -572,17 +603,18 @@ async def update_semantic_model(model_id: str, body: SemanticModelUpdate, user: 
                 ),
             },
         )
-    updated = semantic_model_repo().upsert(
-        id=row["id"],
-        slug=row["slug"],
+    # F3: `update_document`, not `upsert` — a detached row's provenance
+    # (source/source_ref) and sync_mode/detach-tracking must survive a
+    # name/description-only edit unchanged. Harmless on a manual row too
+    # (no detach state to preserve there).
+    updated = semantic_model_repo().update_document(
+        row["id"],
         name=body.name if body.name is not None else row["name"],
         description=body.description if body.description is not None else row["description"],
         document=row["document"],
         document_json=row["document_json"],
         spec_version=row["spec_version"],
         content_hash=row["content_hash"],
-        source=row["source"],
-        source_ref=row["source_ref"],
         status=row["status"],
         validation_errors=row["validation_errors"],
         validated_at=row["validated_at"],
@@ -592,6 +624,105 @@ async def update_semantic_model(model_id: str, body: SemanticModelUpdate, user: 
     # safety net that keeps the projected rows in sync should an earlier
     # write ever have failed to project.
     _project(updated["document_json"], source=updated["source"], source_ref=updated["source_ref"])
+    return updated
+
+
+class DetachRequest(BaseModel):
+    confirm_detach: bool = False
+
+
+class ReattachRequest(BaseModel):
+    confirm_reattach: bool = False
+
+
+@router.post("/api/admin/semantic-models/{model_id:path}/detach")
+async def detach_semantic_model(model_id: str, body: DetachRequest, user: dict = Depends(require_admin)):
+    """F3: danger-flow escape hatch out of the flat ``409 source_owned``
+    guard — copies nothing, flips ``sync_mode`` on the SAME row in place.
+    From here on, sync tracks drift (``source_content_hash``) instead of
+    overwriting; the admin edits freely through ``PUT``/``/apply``."""
+    if not use_pg():
+        raise RequiresPostgresBackend("semantic_model_detach")
+    row = _resolve_model(model_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
+    if row["source"] == "manual":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "not_source_owned", "message": "this model has no source to detach from"},
+        )
+    if row.get("sync_mode") == "detached":
+        # Idempotence guard, not a silent no-op: a second click must not
+        # overwrite detached_at/by and lose the original audit record.
+        raise HTTPException(status_code=409, detail={"code": "already_detached", "message": "already detached"})
+    if not body.confirm_detach:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "confirm_required", "message": "detach requires confirm_detach=true"},
+        )
+    updated = semantic_model_repo().detach(row["id"], by=user["email"], base_hash=row["content_hash"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.detach",
+        resource=row["id"],
+        params={"slug": row["slug"]},
+    )
+    return updated
+
+
+@router.post("/api/admin/semantic-models/{model_id:path}/reattach")
+async def reattach_semantic_model(model_id: str, body: ReattachRequest, user: dict = Depends(require_admin)):
+    """F3: return a detached model to the sync path. Without confirmation,
+    returns a staleness preview instead of acting — has the source changed
+    since detach, and when was it detached. Confirming flips
+    ``sync_mode='synced'``; the NEXT sync run is what actually rewrites
+    ``document`` back onto the model (this endpoint doesn't fabricate that
+    content itself — the importer is the only place that knows how to
+    assemble it)."""
+    if not use_pg():
+        raise RequiresPostgresBackend("semantic_model_detach")
+    row = _resolve_model(model_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Semantic model '{model_id}' not found")
+    if row.get("sync_mode") != "detached":
+        raise HTTPException(status_code=409, detail={"code": "not_detached", "message": "this model is not detached"})
+    if row.get("source_missing_since") is not None:
+        # The source stopped sending this slug entirely — "return to sync"
+        # has nothing to return to. See phase3.md §13 open question 1.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_gone",
+                "message": "the source no longer has this slug — re-attach would have nothing to sync from",
+            },
+        )
+    if not body.confirm_reattach:
+        detached_at = row.get("detached_at")
+        source_content_hash = row.get("source_content_hash")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "confirm_required",
+                "message": "reattach requires confirm_reattach=true",
+                # NULL source_content_hash means no sync has run since
+                # detach — "unknown yet", not "changed". A bare `!=` would
+                # misreport that as changed (None != "h1" is True in Python).
+                "source_changed_since_detach": source_content_hash is not None
+                and source_content_hash != row.get("detach_base_hash"),
+                # HTTPException.detail goes through a plain json.dumps, not
+                # FastAPI's jsonable_encoder — a raw datetime here 500s.
+                "detached_at": detached_at.isoformat() if detached_at else None,
+            },
+        )
+    updated = semantic_model_repo().reattach(row["id"])
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="semantic_model.reattach",
+        resource=row["id"],
+        params={"slug": row["slug"]},
+    )
     return updated
 
 

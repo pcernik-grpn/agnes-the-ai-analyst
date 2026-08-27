@@ -9,8 +9,8 @@ DuckDB app-state schema, so this column has no DuckDB counterpart —
 ``src/repositories/column_metadata.py``'s ``save()`` accepts ``source_ref``
 for signature parity with the Postgres repo but does not persist it.
 
-Revision ID: 0073_column_meta_source_ref_v125
-Revises: 0073_agent_scope_granted_by
+Revision ID: 0075_column_meta_source_ref
+Revises: 0074_llm_usage_caller_user_id
 Create Date: 2026-08-26
 
 """
@@ -25,8 +25,8 @@ from alembic import op
 # Kept to 32 chars — alembic_version.version_num is VARCHAR(32); a longer id
 # truncates and breaks every later revision's WHERE clause (verified live:
 # StringDataRightTruncation on this exact migration during development).
-revision: str = "0073_column_meta_source_ref_v125"
-down_revision: Union[str, None] = "0073_agent_scope_granted_by"
+revision: str = "0075_column_meta_source_ref"
+down_revision: Union[str, None] = "0074_llm_usage_caller_user_id"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

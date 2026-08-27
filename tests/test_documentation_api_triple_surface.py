@@ -891,6 +891,12 @@ _EXEMPT: dict[str, str] = {
     # _COHORT above.
     "/api/admin/semantic-models": _SEMANTIC_MODELS_ADMIN_REASON,
     "/api/admin/semantic-models/{model_id}": _SEMANTIC_MODELS_ADMIN_REASON,
+    # F3 detach/re-attach — the same admin registry-management surface, one
+    # step further: taking a source-owned model out of (and back into) the
+    # sync path. Reachable via `agnes admin semantic-model detach/reattach`;
+    # no MCP analogue for the same reason the rest of this row has none.
+    "/api/admin/semantic-models/{model_id}/detach": _SEMANTIC_MODELS_ADMIN_REASON,
+    "/api/admin/semantic-models/{model_id}/reattach": _SEMANTIC_MODELS_ADMIN_REASON,
     "/api/admin/semantic-sources": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,

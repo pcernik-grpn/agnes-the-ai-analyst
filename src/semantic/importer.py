@@ -101,6 +101,12 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
     keep_slugs: List[str] = []
     valid_documents: List[Dict[str, Any]] = []
     seen_slugs: set[str] = set()
+    # F3: set when this batch carried a document for a DETACHED model, whose
+    # source-side content is deliberately kept out of `valid_documents`. Forces
+    # the end-of-batch projection to prune narrowly (see the `partial` argument
+    # to `project_document`), because the merged list is then knowingly missing
+    # a model that belongs to this (source, source_ref).
+    detached_excluded = False
 
     for text in documents:
         result = validate_document(text)
@@ -131,7 +137,6 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             errors: Optional[List[str]] = None
             document_json: Optional[Dict[str, Any]] = result.parsed
             keep_slugs.append(slug_key)
-            valid_documents.append(document_json)  # type: ignore[arg-type]
         else:
             slug_key = content_hash
             name = slug_key
@@ -141,6 +146,33 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             report.invalid.append({"content_hash": content_hash, "errors": errors})
 
         existing = existing_by_slug.get(slug_key)
+        if existing is not None and existing.get("sync_mode") == "detached":
+            # F3: a detached row is never overwritten by sync — the admin's
+            # local edit stays authoritative. Park the latest hash seen from
+            # the source (cheap no-op write once it stops changing) so the
+            # "source changed since you detached" indicator and re-attach
+            # preview can read it without a live fetch.
+            #
+            # The source's version is also kept OUT of `valid_documents`, so
+            # the end-of-batch `project_document` never re-projects it. Both
+            # sides write the flat tables (`metric_definitions`,
+            # `glossary_terms`, `column_metadata`) under ids scoped to
+            # (source, source_ref) — which a detached row deliberately keeps —
+            # so leaving it in the batch would silently overwrite the admin's
+            # locally-edited projection with the source's content on EVERY
+            # sync, while the stored document kept the edit. The admin's edit
+            # path (`apply_manual_model` / `update_semantic_model`, both via
+            # `_project`) owns this model's projection from detach onward.
+            if content_hash != existing.get("source_content_hash"):
+                repo.update_source_content_hash(existing["id"], content_hash)
+            if status == "valid":
+                report.models_unchanged += 1
+                detached_excluded = True
+            continue
+
+        if status == "valid":
+            valid_documents.append(document_json)  # type: ignore[arg-type]
+
         if existing is not None and existing.get("content_hash") == content_hash:
             if status == "valid":
                 report.models_unchanged += 1
@@ -164,14 +196,34 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
         if status == "valid":
             report.models_written += 1
 
+    # F3: a detached row's slug not in `keep_slugs` means the source stopped
+    # sending it this run — track that as "missing", never delete it
+    # (`delete_missing` already excludes detached rows on its own). A slug
+    # that comes back after being missing gets the marker cleared.
+    for existing in existing_rows:
+        if existing.get("sync_mode") != "detached":
+            continue
+        if existing["slug"] in keep_slugs:
+            if existing.get("source_missing_since") is not None:
+                repo.clear_source_missing(existing["id"])
+        else:
+            repo.mark_source_missing(existing["id"])
+
     report.models_pruned = repo.delete_missing(source=src_name, source_ref=src_ref, keep_slugs=keep_slugs)
 
     if valid_documents:
         merged = {"semantic_model": [m for doc in valid_documents for m in (doc.get("semantic_model") or [])]}
-        # `partial` when a document failed validation and was recorded rather
-        # than projected: the merged list is then an incomplete picture of this
-        # (source, source_ref), and a full-scope prune would delete the invalid
-        # model's previously-written rows on the strength of that partial read.
-        report.projection = project_document(merged, source=src_name, source_ref=src_ref, partial=bool(report.invalid))
+        report.projection = project_document(
+            merged,
+            source=src_name,
+            source_ref=src_ref,
+            # `partial` when a document failed validation OR when a detached
+            # model was held back (F3): either way the merged list is an
+            # incomplete picture of this (source, source_ref), and a
+            # full-scope prune would delete the absent model's own rows —
+            # for a detached model, precisely the locally-edited projection
+            # this sync just took care not to overwrite.
+            partial=bool(report.invalid) or detached_excluded,
+        )
 
     return report

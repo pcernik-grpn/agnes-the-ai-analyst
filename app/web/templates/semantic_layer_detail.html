@@ -68,7 +68,7 @@
 {% set page_hero_subtitle = model_description %}
 
 {% block toolbar %}
-<div class="slb-meta">
+<div class="slb-meta" data-csrf="{{ csrf_token }}" data-model-slug="{{ slug }}">
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }}</span>
     {% else %}
@@ -79,6 +79,20 @@
     {% endif %}
     {% if dialect_skipped_count %}
     <span class="badge badge--warn">{{ dialect_skipped_count }} metric{{ 's' if dialect_skipped_count != 1 else '' }} skipped (unsupported dialect)</span>
+    {% endif %}
+    {% if sync_mode == 'detached' %}
+    <span class="badge badge--warn">
+        Detached
+        {%- if source_missing_since %} · source no longer has this model
+        {%- elif source_changed_since_detach %} · source changed since detach
+        {%- endif %}
+    </span>
+    <a href="/semantic-layer/{{ slug }}.yaml" class="slb-cross-link">Export detached version</a>
+    {% if user.is_admin and not source_missing_since %}
+    <button type="button" class="btn btn--sm" id="slb-reattach-btn">Re-attach</button>
+    {% endif %}
+    {% elif is_imported and user.is_admin %}
+    <button type="button" class="btn btn--sm" id="slb-detach-btn">Detach to edit</button>
     {% endif %}
 </div>
 {{ ds.tabs(items=tabs, aria_label='Semantic model object types') }}
@@ -217,4 +231,66 @@
     <div class="empty-state"><p class="empty-state__description">No glossary terms{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
     {% endif %}
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  // F3: detach/re-attach — minimal danger-flow buttons, no new UI layer.
+  // Editing a detached model happens through the existing chat-authoring
+  // /apply path, not here (see phase3.md §3 bod 4).
+  var meta = document.querySelector(".slb-meta");
+  if (!meta) return;
+  var csrf = meta.dataset.csrf || "";
+  var slug = meta.dataset.modelSlug || "";
+
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  async function handle(btn, path, body) {
+    btn.disabled = true;
+    try {
+      var r = await post(path, body);
+      var data = {};
+      try { data = await r.json(); } catch (e) { /* non-JSON error body */ }
+      if (!r.ok) {
+        var msg = (data && data.detail && (data.detail.message || data.detail)) || ("Failed: HTTP " + r.status);
+        alert(msg);
+        return;
+      }
+      window.location.reload();
+    } catch (e) {
+      alert("Network error — please try again.");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  var detachBtn = document.getElementById("slb-detach-btn");
+  if (detachBtn) {
+    detachBtn.addEventListener("click", function () {
+      if (!confirm("Detach this model? Sync will stop overwriting it until you re-attach.")) return;
+      handle(detachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/detach", {
+        confirm_detach: true,
+      });
+    });
+  }
+
+  var reattachBtn = document.getElementById("slb-reattach-btn");
+  if (reattachBtn) {
+    reattachBtn.addEventListener("click", function () {
+      if (!confirm("Re-attach this model? Your local edits will be replaced by the source's version at the next sync.")) return;
+      handle(reattachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/reattach", {
+        confirm_reattach: true,
+      });
+    });
+  }
+})();
+</script>
 {% endblock %}

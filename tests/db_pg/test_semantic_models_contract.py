@@ -160,6 +160,31 @@ def test_delete_missing_treats_a_null_source_ref_as_its_own_origin(repo):
     assert repo.get("m3") is not None, "a NULL-ref sync must not prune a non-NULL sibling"
 
 
+def test_update_document_rewrites_content_in_place(repo):
+    """F3: a plain UPDATE, not upsert()'s DELETE+INSERT — same id, same
+    source/source_ref (provenance untouched)."""
+    _upsert(repo, id="m1", slug="retail", source="keboola_metastore", source_ref="proj1")
+
+    updated = repo.update_document(
+        "m1",
+        name="Retail",
+        document="version: '0.2.0.dev0'\nsemantic_model:\n  - name: retail\n  - name: extra\n",
+        document_json={"semantic_model": [{"name": "retail"}, {"name": "extra"}]},
+        content_hash="new-hash",
+        description="edited",
+        spec_version="0.2.0.dev0",
+        validated_at=None,
+    )
+
+    assert updated["id"] == "m1"
+    assert updated["content_hash"] == "new-hash"
+    assert updated["description"] == "edited"
+    assert len(updated["document_json"]["semantic_model"]) == 2
+    assert updated["source"] == "keboola_metastore"
+    assert updated["source_ref"] == "proj1"
+    assert repo.get_by_slug("retail")["id"] == "m1", "still the only row at this slug, not a second one"
+
+
 def test_list_all_source_ref_none_means_unfiltered_on_both_engines(repo):
     """`source_ref=None` on list_all means "don't filter", NOT "match NULL".
 

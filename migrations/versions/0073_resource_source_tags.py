@@ -16,7 +16,7 @@ the true inverse — the table is new, so dropping it restores the previous
 schema exactly.
 
 Revision ID: 0073_resource_source_tags
-Revises: 0074_semantic_draft_pending
+Revises: 0076_semantic_draft_pending
 Create Date: 2026-08-26
 
 Re-chained (not renamed) TWICE, both times when this branch merged ``main``,
@@ -35,6 +35,15 @@ tip instead of guessing at another single parent, since a THIRD unrelated
 chain landing on the same parent again would only repeat the fork. The
 revision ID is unchanged so an instance that already applied this table
 does not re-run it; only its parent moved, twice.
+
+Third re-chain (F3 merge): the same two migrations this file's parent chain
+runs through were RENUMBERED — ``0073_column_metadata_source_ref_v125`` ->
+``0075_column_meta_source_ref`` and ``0074_semantic_draft_pending`` ->
+``0076_semantic_draft_pending`` — so that the semantic chain hangs off
+``0074_llm_usage_caller_user_id`` (the tip ``main`` actually landed) rather
+than forking from ``0073_agent_scope_granted_by`` a second time. Same
+migrations, same order, new ids; this file follows its parent to the new id.
+Revision ID still unchanged, for the same reason as the first two.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0073_resource_source_tags"
-down_revision: Union[str, None] = "0074_semantic_draft_pending"
+down_revision: Union[str, None] = "0076_semantic_draft_pending"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
