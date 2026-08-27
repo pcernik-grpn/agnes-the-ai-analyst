@@ -152,6 +152,9 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
     profile either way (spec §5 rule 2): this endpoint never lets a caller
     distinguish "nothing there" from "something you can't see".
     """
+    # authz: repository-enforced — a subject id names a fact/edge, not a
+    # collection, so no route-template gate can express the check; every
+    # repo read method filters by the caller (spec §5), tested S1-S6.
     try:
         return facts_repo().claims(user, subject_id)
     except FactNotFound:

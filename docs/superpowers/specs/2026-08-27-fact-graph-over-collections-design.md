@@ -281,7 +281,16 @@ more **within one grant snapshot**; it is not a general monotonic guarantee
   the instance**, regardless of collection grants and regardless of
   `visibility_mode`. That reach is deliberate; the UI labels it exactly that
   way. (The Agnes `Admin` group god-modes authorization anyway — an override
-  governs what everyone else sees.)
+  governs what everyone else sees.) Review tightening (2026-08-28): the
+  override reveals the *fact*, not the geography of its evidence — claim
+  metadata served under `revealed` hides the evidencing document's
+  name/path/URL for claims in collections outside the caller's grants
+  (opaque ids only); readable claims keep full document identity.
+
+  Corrections management is **API-only in v0** (admin PAT / scheduler token
+  on `PUT`/`DELETE /api/facts/corrections/*` + the export) — no web, CLI or
+  MCP surface yet, a conscious scope cut recorded here so the triple-surface
+  exemption is a decision, not an accident.
 
 ---
 

@@ -167,6 +167,58 @@ def test_resync_same_stable_id_rename_only_updates_path(pg_repos):
     assert row["processing_status"] == "indexed"
 
 
+def test_extension_only_rename_cleans_up_the_old_blob(pg_repos, tmp_path):
+    """Storage paths are content-addressed as ``{sha256}{ext}`` with the
+    extension taken from the FILENAME — so a rename that changes only the
+    extension keeps the sha yet allocates a NEW blob path. The old blob must
+    be unlinked even though ``content_changed`` is False; nesting the
+    cleanup under the content-changed branch leaked it on disk (found in
+    review — the replaced delete+insert path cleaned unconditionally)."""
+    from app.api.collections import _upsert_corpus_file
+
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+
+    old_blob = tmp_path / "same-sha.htm"
+    new_blob = tmp_path / "same-sha.html"
+    old_blob.write_text("same content")
+    new_blob.write_text("same content")
+
+    file_id, _ = _upsert_corpus_file(
+        CORPUS_ID,
+        path="site/page.htm",
+        stable_id="graph:ext-rename",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="page.htm",
+        sha256="same-sha",
+        file_type="htm",
+        size_bytes=12,
+        storage_path=str(old_blob),
+        sources_repo=sources_repo,
+    )
+
+    file_id2, needs_processing = _upsert_corpus_file(
+        CORPUS_ID,
+        path="site/page.html",
+        stable_id="graph:ext-rename",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="page.html",
+        sha256="same-sha",
+        file_type="html",
+        size_bytes=12,
+        storage_path=str(new_blob),
+        sources_repo=sources_repo,
+    )
+
+    assert file_id2 == file_id
+    assert needs_processing is False
+    assert cf_repo.get(file_id)["storage_path"] == str(new_blob)
+    assert not old_blob.exists(), "old blob leaked after extension-only rename"
+    assert new_blob.exists()
+
+
 def test_resync_same_stable_id_content_changed_resets_and_purges(pg_repos):
     """Content changed -> same row, new sha; status reset to 'pending' so a
     fresh extraction pass runs (old chunks purged)."""

@@ -587,6 +587,10 @@ const SECTION_META = {
     title: "Access policies",
     help: "Table access policies — lets an admin attach one row-filtering and column-masking SQL policy per non-distributed table, substituted in on every server-side read with the caller's identity bound.",
   },
+  facts: {
+    title: "Fact graph",
+    help: "Typed facts and edges extracted from Collections documents, each claim carrying its evidencing document and a verbatim quote. Postgres-only; visibility derives from collection grants. visibility_mode: any_evidence (default) shows a subject when any readable claim evidences it, all_evidence requires every claim to be readable.",
+  },
   mcp: {
     title: "MCP access",
     help: "Accept an MCP access token in the ?token= query string as well as the Authorization header. Convenient for clients that can't set headers, but a URL travels through proxy logs and browser history.",
@@ -1155,7 +1159,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in

@@ -760,8 +760,14 @@ def _upsert_corpus_file(
         )
         if content_changed:
             cf_repo.set_status(file_id, status="pending")
-            if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
-                delete_corpus_file(old_blob)
+        # The old blob is cleaned up whenever the row's storage_path moved,
+        # not only when content changed: storage paths are content-addressed
+        # as {sha256}{ext} with ext derived from the FILENAME, so an
+        # extension-only rename keeps the sha yet allocates a new blob —
+        # skipping cleanup there leaked the old file on disk (the replaced
+        # delete+insert path cleaned unconditionally).
+        if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
+            delete_corpus_file(old_blob)
     else:
         content_changed = True  # brand new row always needs processing
         file_id = cf_repo.add(
