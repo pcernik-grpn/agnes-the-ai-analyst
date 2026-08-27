@@ -9,6 +9,7 @@ from cli.commands.admin_activity import activity_app
 from cli.commands.admin_analytics import analytics_app as admin_analytics_app
 from cli.commands.admin_ask import app as admin_ask_app
 from cli.commands.admin_autodoc import autodoc_tables
+from cli.commands.admin_config import admin_config_app
 from cli.commands.admin_connection import admin_connection_app
 from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_data_semantics import admin_data_semantics_app
@@ -71,6 +72,9 @@ admin_app.add_typer(admin_semantic_model_app, name="semantic-model", help="Seman
 admin_app.add_typer(admin_semantic_source_app, name="semantic-source", help="Semantic-source sync configuration")
 admin_app.add_typer(
     admin_connection_app, name="connection", help="Named source-connection CRUD (multi-project Keboola)"
+)
+admin_app.add_typer(
+    admin_config_app, name="config", help="Export/apply the server-config overlay as reviewable YAML (Track D3)"
 )
 admin_app.add_typer(admin_skills_app, name="skill", help="Contributed skills management")
 admin_app.add_typer(admin_jobs_app, name="jobs", help="Job queue admin (wave-2B worker runtime)")

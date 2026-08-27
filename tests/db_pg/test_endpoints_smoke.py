@@ -870,6 +870,7 @@ class TestAdminRegistrySmoke:
         "GET /api/admin/registry",
         "GET /api/admin/server-config",
         "POST /api/admin/server-config",
+        "GET /api/admin/server-config/overlay",
         "POST /api/admin/register-table/precheck",
         "POST /api/admin/register-table",
         "PUT /api/admin/registry/{table_id}",
@@ -891,6 +892,19 @@ class TestAdminRegistrySmoke:
     def test_server_config(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/server-config", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200
+
+    def test_server_config_overlay(self, seeded_app_both):
+        h = _admin_headers(seeded_app_both)
+        r = seeded_app_both["client"].get("/api/admin/server-config/overlay", headers=h)
+        assert r.status_code == 200
+        body = r.json()
+        assert "sections" in body
+        assert "editable_sections" in body
+        # Admin-only, mirrors GET /api/admin/server-config.
+        r_analyst = seeded_app_both["client"].get(
+            "/api/admin/server-config/overlay", headers=_analyst_headers(seeded_app_both)
+        )
+        assert r_analyst.status_code == 403
 
     def test_config_surface(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/config-surface", headers=_admin_headers(seeded_app_both))

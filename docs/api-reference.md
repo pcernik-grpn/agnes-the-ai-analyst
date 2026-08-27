@@ -494,6 +494,7 @@ Platform-wide settings live here, including the data source connection configura
 |---|---|---|
 | `GET` | `/api/admin/server-config` | Return current config + `known_fields` self-documentation |
 | `POST` | `/api/admin/server-config` | **Partial-patch** (preferred) — only the sections you send are changed |
+| `GET` | `/api/admin/server-config/overlay` | Raw, editable-section-only instance.yaml overlay (unresolved, secrets stripped) — the `agnes admin config export`/`apply` round-trip projection |
 | `POST` | `/api/admin/configure` | Full wizard-style setup; missing fields get nulled. Prefer the partial-patch above. |
 
 `POST /api/admin/server-config` accepts a `sections` object keyed by section name
@@ -505,7 +506,29 @@ Sections `auth` and `server` are "danger zones" — mutating them requires sendi
 `confirm_danger: true` in the request body, since incorrect values can lock
 administrators out of the instance.
 
-### 5.2 BigQuery config shape
+### 5.2 Export/apply the overlay as reviewable YAML
+
+`GET /api/admin/server-config/overlay` returns the raw on-disk overlay
+(`${STATE_DIR}/instance.yaml`) filtered to the editable sections — not the
+merged, env-resolved config `GET /api/admin/server-config` serves. An
+unresolved `${VAR}` reference or an env-var NAME field (`token_env`) passes
+through unchanged; a literal never leaves the server in two cases: (a) the
+`connectors` section is free-form and admin-typed (per-connector keys with
+no static schema, e.g. a Slack webhook URL) so every literal there is
+omitted regardless of key name, and (b) a value that is unambiguously
+credential-shaped (a JWT, a PEM block, a URL carrying userinfo or a long
+opaque token segment) is omitted everywhere else too. The response's
+`omitted_keys` lists every dropped path — nothing is silently discarded.
+`agnes admin config export`/`apply` wrap this endpoint and the partial-patch
+POST above into a round-trip: export the overlay to a file (the CLI prints
+a comment header + stderr note listing anything `omitted_keys` reported),
+review/edit it, commit it, and `apply` it to a new or existing instance
+through the exact same validated path an admin's form save would use. This
+is the "onboard a new client via a reviewed PR" building block — REST+CLI
+only, never MCP-exposed (same reasoning as the sections above: it is a
+one-call dump of the instance's editable config surface).
+
+### 5.3 BigQuery config shape
 
 ```json
 {
@@ -729,6 +752,7 @@ checks against.
 ### `/api/admin/server-config` and `/api/admin/configure` — Instance configuration
 
 - /api/admin/server-config
+- /api/admin/server-config/overlay
 - /api/admin/configure
 
 ### `/api/admin/uploads` — File uploads
