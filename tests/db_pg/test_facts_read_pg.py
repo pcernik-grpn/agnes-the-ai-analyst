@@ -280,8 +280,13 @@ def test_s3_edge_with_only_unreadable_claim_is_never_returned(pg_env, repo):
 
 
 def test_s4_traversal_does_not_reveal_continuation_past_an_unreadable_node(pg_env, repo):
-    """S4. A->B->C with C unreadable returns A,B and does not reveal that a
-    path continues to C."""
+    """S4. A->B->C where C has GENUINELY no readable evidence anywhere — not
+    its own claim, and not any incident edge's claim either — returns A,B
+    and does not reveal that a path continues to C. (Refined per spec §4 rev
+    3.2: since an edge's readable claim now evidences its endpoints too, the
+    B-C edge's OWN claim must ALSO be unreadable here for this to still be a
+    genuine tunnel — see the companion test right below for the case where
+    it IS readable.)"""
     _seed_uploader("uploader1")
     _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
     _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
@@ -299,8 +304,9 @@ def test_s4_traversal_does_not_reveal_continuation_past_an_unreadable_node(pg_en
     edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
     repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
     edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
-    # Edge B-C IS readable, but C itself is not.
-    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B knows C.")
+    # Edge B-C's claim is ALSO in the unreadable collection — C has zero
+    # readable evidence anywhere, own or incident.
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="B knows C.")
 
     from src.repositories import users_repo
 
@@ -314,6 +320,146 @@ def test_s4_traversal_does_not_reveal_continuation_past_an_unreadable_node(pg_en
     assert edge_ids == {edge_ab}
     assert edge_bc not in edge_ids
     assert fact_c not in node_ids
+
+
+def test_s4_refined_endpoint_evidence_reveals_a_node_via_its_incident_edges_readable_claim(pg_env, repo):
+    """S4 refined (spec §4 rev 3.2, found by Run P): SAME A->B->C shape as
+    the test above, except the B-C edge's OWN claim IS readable this time —
+    C's own claim stays unreadable, but the edge now evidences C's existence
+    too, so C and the edge ARE revealed. This is not tunneling: the caller
+    can already read the exact claim ("B knows C.") that names C; hiding C
+    itself would be inconsistent, not safer."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    fact_c = repo.create_fact(type="person")
+    for f in (fact_a, fact_b):
+        repo.add_claim(fact_id=f, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=f"{f} exists.")
+    repo.add_claim(fact_id=fact_c, corpus_file_id="cf_b1", corpus_id=CORPUS_B, file_sha256="sha1", quote="C exists.")
+
+    edge_ab = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(edge_id=edge_ab, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A knows B.")
+    edge_bc = repo.create_edge(src=fact_b, type="knows", dst=fact_c)
+    # The B-C edge's OWN claim is readable — it evidences C's existence too.
+    repo.add_claim(edge_id=edge_bc, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B knows C.")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="bella", email="bella@test.com", name="Bella")
+    _make_group_with_grant(pg_env, group_name="group-bella", collection_id=CORPUS_A, member_user_id="bella")
+
+    result = repo.neighbors(_dict_user("bella"), fact_a, depth=2)
+    node_ids = {n["id"] for n in result["nodes"]}
+    edge_ids = {e["id"] for e in result["edges"]}
+    assert node_ids == {fact_a, fact_b, fact_c}
+    assert edge_ids == {edge_ab, edge_bc}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-only facts (spec §4 rev 3.2) — a fact with ZERO own claims,
+# visible only through a readable incident edge's claim (the exact shape of
+# the Run P live failure: nodes created purely to anchor an evidenced edge).
+# ---------------------------------------------------------------------------
+
+
+def _seed_endpoint_only_fixture(repo, *, readable_edge_claim: bool):
+    """A src fact with its own readable claim (CORPUS_A), an edge to a dst
+    fact that NEVER receives an own claim (the endpoint-only case), and the
+    edge's claim placed in CORPUS_A (readable) or CORPUS_B (unreadable) per
+    ``readable_edge_claim``."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    src = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=src, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+    dst = repo.create_fact(type="industry")
+    repo.add_alias(fact_id=dst, type="industry", natural_key="industry:saas")
+    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
+    corpus_id = CORPUS_A if readable_edge_claim else CORPUS_B
+    file_id = "cf_a1" if readable_edge_claim else "cf_b1"
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256="sha1",
+        quote="Acme is a SaaS company.",
+    )
+    return src, dst, edge_id
+
+
+def test_endpoint_only_fact_visible_in_search_via_readable_edge_claim(pg_env, repo):
+    """Bullet 1: an endpoint-only fact (never given its own claim) IS
+    visible in search() to a caller who can read the anchoring edge's claim,
+    and serves attrs: {} — attrs stay own-claims-only (S2's attribute-oracle
+    guarantee untouched)."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="jules", email="jules@test.com", name="Jules")
+    _make_group_with_grant(pg_env, group_name="group-jules", collection_id=CORPUS_A, member_user_id="jules")
+
+    result = repo.search(_dict_user("jules"), type="industry")
+    subjects = {s["id"]: s for s in result["subjects"]}
+    assert dst in subjects
+    assert subjects[dst]["attrs"] == {}
+    assert subjects[dst]["claim_count"] == 0  # own-claims-only, matching claims()
+
+
+def test_endpoint_only_fact_visible_in_neighbors_via_readable_edge_claim(pg_env, repo):
+    """Bullet 1: neighbors() from the src also reaches the endpoint-only
+    dst — this is exactly the shape of the live Run P failure."""
+    src, dst, edge_id = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="kara", email="kara@test.com", name="Kara")
+    _make_group_with_grant(pg_env, group_name="group-kara", collection_id=CORPUS_A, member_user_id="kara")
+
+    result = repo.neighbors(_dict_user("kara"), src)
+    assert {n["id"] for n in result["nodes"]} == {src, dst}
+    assert {e["id"] for e in result["edges"]} == {edge_id}
+
+
+def test_endpoint_only_fact_claims_returns_empty_list_not_404(pg_env, repo):
+    """Bullet 1: claims() on a VISIBLE endpoint-only fact is a 200 with an
+    empty claims list, not a 404 — the visibility GATE uses the union, the
+    list itself stays own-claims-only."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="liam", email="liam@test.com", name="Liam")
+    _make_group_with_grant(pg_env, group_name="group-liam", collection_id=CORPUS_A, member_user_id="liam")
+
+    result = repo.claims(_dict_user("liam"), dst)
+    assert result == {"claims": [], "revealed": False}
+
+
+def test_endpoint_only_fact_hidden_when_edge_claim_unreadable(pg_env, repo):
+    """Bullet 2: S3 discipline extended to endpoints — no existence leak.
+    When the anchoring edge's ONLY claim lives in an unreadable collection,
+    the endpoint-only fact stays invisible everywhere (search AND claims)."""
+    _src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=False)
+
+    from src.repositories import users_repo
+    from src.repositories.facts_pg import FactNotFound
+
+    users_repo().create(id="mona", email="mona@test.com", name="Mona")
+    _make_group_with_grant(pg_env, group_name="group-mona", collection_id=CORPUS_A, member_user_id="mona")
+
+    result = repo.search(_dict_user("mona"), type="industry")
+    assert result["subjects"] == []
+    with pytest.raises(FactNotFound):
+        repo.claims(_dict_user("mona"), dst)
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,25 @@ constrains the design.
     ([app/worker/registry.py:21](../../../app/worker/registry.py)) and
     per-process lane selection does not exist (§16 step 7).
 
+**Rev 3 → 3.2 (Run P proving run, 2026-08-28):**
+
+13. **Endpoint evidence.** The producer wire contract (§7.0) explicitly
+    permits a node with no evidence of its own to exist purely to anchor an
+    evidenced edge ("nodes without evidence are warnings, every edge carries
+    >=1 evidence"). The sweep and the visibility predicate did not honor
+    that: `sweep_orphans` deleted every endpoint-only node as soon as it was
+    written (`ingest_batch` sweeps at the end of the SAME batch that created
+    it), and `_subject_status` counted only a subject's OWN claims, so even a
+    surviving endpoint-only fact was invisible on every read path. Run P (a
+    planted-corpus proving run against real ingest) surfaced both: the sweep
+    deleted 15 endpoint-only facts and 27 of their 28 claimed edges cascaded
+    away with them, and the read path independently hid the rest via the
+    per-node check. Fixed structurally: an edge's claim now evidences the
+    relationship AND, implicitly, the existence of its two endpoints (§4,
+    §6) — `attrs` are UNCHANGED (still projected from a fact's own claims
+    only, so an endpoint-only fact serves `attrs: {}`), and EDGE visibility
+    is UNCHANGED (still its own claims only, §5 rule 3 / S3).
+
 One objection from the reviews is deliberately **not** fixed, because it is a
 question, not an error: **what facts buy over the retrieval Collections
 already does.** It is a measured gate (§14, Decision #2) — and the workbook
@@ -256,10 +275,13 @@ Load-bearing details:
 Given `readable` = the caller's readable collection set (§5):
 
 ```
-visible(subject) := ∃ claim ∈ subject.claims : claim.corpus_id ∈ readable
+visible(edge)    := ∃ claim ∈ edge.claims : claim.corpus_id ∈ readable
                     (all_evidence mode: ∀ instead of ∃)
-quotes(subject)  := { claim.quote | claim.corpus_id ∈ readable }     -- always ∃-filtered
-attrs(subject)   := per-key projection over readable claims only:
+visible(fact)    := ∃ claim ∈ (fact.claims ∪ incident_edge_claims(fact)) : claim.corpus_id ∈ readable
+                    (all_evidence mode: ∀ over that same union)
+incident_edge_claims(fact) := ⋃ { edge.claims | edge incident to fact, edge not withheld }
+quotes(subject)  := { claim.quote | claim.corpus_id ∈ readable }     -- always ∃-filtered, OWN claims only
+attrs(subject)   := per-key projection over the subject's OWN readable claims only:
                     – the value from the claim with the LATEST document_date wins;
                     – equal dates with differing values → the key is returned as
                       conflicted: {values: [...], claims: [...]} — never silently picked;
@@ -268,9 +290,14 @@ attrs(subject)   := per-key projection over readable claims only:
 
 Nothing a caller receives is ever computed from a claim they cannot read —
 which is what makes the attribute-filter oracle impossible rather than
-unlikely. Facts and edges use identical rules. `all_evidence` hides strictly
-more **within one grant snapshot**; it is not a general monotonic guarantee
-(grant drift, §13).
+unlikely. `quotes`/`attrs` use identical rules for facts and edges, and stay
+OWN-claims-only for both — the endpoint-evidence union (rev 3.2, §0) widens
+only a FACT's EXISTENCE gate, never its projections: an endpoint-only fact
+(visible purely because an incident edge carries a readable claim) serves
+`attrs: {}` and an empty `quotes`/claims list, not a 404. Edge visibility is
+unchanged — an edge's own claims only, never inferred from its endpoints
+(§5 rule 3 / S3). `all_evidence` hides strictly more **within one grant
+snapshot**; it is not a general monotonic guarantee (grant drift, §13).
 
 **Admin corrections** (each with reason → `audit_log`):
 
@@ -328,8 +355,8 @@ Three implementation rules, each answering a found hole:
    ([app/api/collections.py:27](../../../app/api/collections.py)); ids being
    opaque (§3) reduces but does not remove the probing surface.
 3. **Traversal re-evaluates at every hop.** `fact_neighbors` never walks from
-   a visible subject into one whose claims are unreadable, and never reveals
-   that a path continues. Caps live in §12 (one home): ships with depth
+   a visible subject into one that is not itself `visible(fact)` per §4's
+   endpoint-evidence union, and never reveals that a path continues. Caps live in §12 (one home): ships with depth
    default 1 / max 2, per-node fanout 100, result 500, statement timeout. The hub-node walk is the query that
    explodes and the one the benchmark never ran (§12).
 
@@ -392,14 +419,20 @@ Lifecycle:
 | re-sync, content unchanged | row kept, zero re-processing, claims untouched (test C3) |
 | rename / move | same `source_stable_id` → same row, path updated; claims untouched (C4). Note: the current crawler's ctag-skip leaves `path` stale on a pure rename — the port must refresh path/name on delta items even when content is unchanged |
 | content changed | same row, new sha; that document's claims **replaced** on next extraction (old quotes may no longer exist in the text) |
-| deleted in source / moved out of crawl scope | row deleted → claims cascade → subjects left with zero claims are deleted **and counted in the run report**; their `corrections` rows survive (§3) |
+| deleted in source / moved out of crawl scope | row deleted → claims cascade → an EDGE left with zero claims of its own is deleted first; a FACT is deleted only once it has NEITHER an own claim NOR an incident edge still carrying any claim (rev 3.2, §0 — an edge anchors its endpoints); deletions are **counted in the run report**; their `corrections` rows survive (§3) |
 
 The orphan-subject sweep runs as its own step **after any batch of
 `corpus_files` deletions** — ingest-driven or UI-driven (an admin deleting a
 file from a collection cascades claims exactly the same way) — never inside
 the deleting transaction. Its counts land in the run report or, for UI
 deletions, on the source card, attributed to the operation that triggered
-them.
+them. Edges sweep first, so by the time the fact sweep runs every surviving
+edge already carries >=1 claim — a fact with a live incident edge survives
+the sweep even when it carries no evidence of its own, exactly the
+endpoint-only node the producer wire contract (§7.0) permits. The sweep is
+correction-agnostic (raw claim existence, not a visibility check): a
+`wrong`/`restricted` edge with a live claim still anchors its endpoints here,
+same as any other edge — only the READ path (§4/§5) withholds it.
 
 ---
 

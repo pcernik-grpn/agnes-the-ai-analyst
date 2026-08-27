@@ -610,6 +610,113 @@ def test_c5_orphan_sweep_deletes_a_subject_with_zero_remaining_claims(pg_env, re
 
 
 # ---------------------------------------------------------------------------
+# C5 refined (spec §0 rev 3.2 / §6) — endpoint evidence: an edge anchors its
+# endpoints, so a fact with zero OWN claims survives the sweep as long as an
+# incident edge still carries a claim.
+# ---------------------------------------------------------------------------
+
+
+def test_c5_orphan_sweep_spares_a_fact_with_only_a_claimed_incident_edge(pg_env, repo):
+    """A fact with ZERO own claims, anchored purely by an incident edge that
+    still carries a claim, survives sweep_orphans() — the endpoint-only node
+    the producer wire contract (§7.0) explicitly permits."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_a1")
+
+    src = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=src, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+    dst = repo.create_fact(type="industry")  # endpoint-only — never given its own claim
+    edge_id = repo.create_edge(src=src, type="works_in_industry", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme is a SaaS company.",
+    )
+
+    deleted = repo.sweep_orphans()
+    assert deleted == 0
+    assert repo.claims(_admin(), dst) == {"claims": [], "revealed": False}
+
+
+def test_c5_orphan_sweep_deletes_a_fact_when_its_incident_edges_are_also_claimless(pg_env, repo):
+    """The refinement is narrower than "any incident edge survives": an edge
+    with zero claims of its own is still deleted first (unchanged), and a
+    fact anchored ONLY by that now-deleted edge is orphaned too — both
+    count."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_a1")
+
+    src = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=src, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme.")
+    dst = repo.create_fact(type="industry")
+    repo.create_edge(src=src, type="works_in_industry", dst=dst)  # no claim ever added
+
+    deleted = repo.sweep_orphans()
+    assert deleted == 2  # the claimless edge AND the now-orphaned dst fact
+
+    from src.repositories.facts_pg import FactNotFound
+
+    with pytest.raises(FactNotFound):
+        repo.claims(_admin(), dst)
+
+
+# ---------------------------------------------------------------------------
+# Ingest E2E regression — shaped exactly like the live Run P failure: edges
+# whose dst is NEVER listed in nodes[] (endpoint-only, spec §7.0) must
+# survive the automatic post-ingest sweep and be reachable via neighbors().
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_endpoint_only_edge_destinations_survive_sweep_and_are_reachable(pg_env, repo):
+    """Regression for the Run P proving-run finding (spec §0 rev 3.2): a
+    batch with a core subject (its own evidence) and several edges whose dst
+    is referenced ONLY as an edge endpoint — never in nodes[] — must NOT
+    have those dsts (or their edges) swept away by the automatic
+    post-ingest orphan sweep, and a depth-1 neighbors() walk from the core
+    subject must return every one of its evidenced edges."""
+    doc_id = _seed_ready_doc(
+        pg_env,
+        text=("Acme Corp operates in the SaaS industry. Alice Adams is the CEO. Acme Corp offers Cloud Analytics."),
+    )
+    report = repo.ingest_batch(
+        nodes=[_node("engagement:acme", doc_id, "Acme Corp operates in the SaaS industry.")],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "works_in_industry",
+                "dst": "industry:saas",
+                "evidence": [{"doc_id": doc_id, "quote": "Acme Corp operates in the SaaS industry."}],
+            },
+            {
+                "src": "engagement:acme",
+                "type": "has_ceo",
+                "dst": "person:alice-adams",
+                "evidence": [{"doc_id": doc_id, "quote": "Alice Adams is the CEO."}],
+            },
+            {
+                "src": "engagement:acme",
+                "type": "offers_service",
+                "dst": "service:cloud-analytics",
+                "evidence": [{"doc_id": doc_id, "quote": "Acme Corp offers Cloud Analytics."}],
+            },
+        ],
+    )
+    assert report["claims_written"] == 4  # 1 node claim + 3 edge claims
+    # None of the endpoint-only dsts, nor the edges naming them, were swept
+    # — this is the exact regression the Run P proving run surfaced.
+    assert report["subjects_deleted"] == 0
+
+    core_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    result = repo.neighbors(_admin(), core_id, depth=1)
+    assert len(result["edges"]) == 3
+    assert len(result["nodes"]) == 4  # core + 3 endpoint-only dsts
+    for edge in result["edges"]:
+        assert edge["src"] == core_id
+
+
+# ---------------------------------------------------------------------------
 # possible_duplicate_of — accepted without evidence, surfaced as review item.
 # ---------------------------------------------------------------------------
 

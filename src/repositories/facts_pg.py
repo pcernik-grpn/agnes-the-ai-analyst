@@ -22,6 +22,22 @@ A nonexistent subject id and a subject with zero readable claims are
 **indistinguishable** to every caller (§5 rule 2): both run the exact same
 query shape and raise :class:`FactNotFound`, translated to a `404` by the
 REST layer — never a `403`.
+
+**Endpoint evidence (spec §4, rev 3.2 — found by the Run P proving run):**
+the producer wire contract (§7.0) explicitly permits a node with no evidence
+of its own to exist purely to anchor an evidenced edge ("nodes without
+evidence are warnings, every edge carries >=1 evidence"). An edge's claim
+therefore evidences the relationship AND, implicitly, the existence of its
+two endpoints: a FACT subject's existence check runs over its OWN claims
+UNION the claims of every edge incident to it that is not itself withheld
+(`wrong`/`restricted`) — same corpus-readability predicate, same any/all
+`_visibility_mode()` semantics. This applies ONLY to existence — the attrs
+projection (`search()`, `collection_facts_summary()`) and the claims listing
+(`claims()`) stay OWN-claims-only, so an endpoint-only fact (no own claims
+at all) is visible with `attrs: {}` and an empty `claims` list rather than a
+`404`. EDGE visibility is unchanged (an edge's own claims only, spec S3);
+this is existence propagation for FACTS one hop out over their incident
+edges, not the reverse.
 """
 
 from __future__ import annotations
@@ -349,17 +365,44 @@ class FactsPgRepository:
         """One query, reused by every single-subject visibility check
         (``neighbors`` node expansion, ``claims``) — same shape and cost
         whether ``subject_id`` exists or not, so a nonexistent id and a
-        withheld/unreadable one cost the same (spec §5 rule 2)."""
-        kind_column = "fact_id" if subject_kind == "fact" else "edge_id"
-        vis = self._visibility_predicate("c.corpus_id", is_admin)
+        withheld/unreadable one cost the same (spec §5 rule 2).
+
+        For ``subject_kind='fact'`` the existence corpus (``relevant_claims``
+        below) is the subject's OWN claims UNION the claims of every
+        incident edge that is not itself withheld (module docstring,
+        "Endpoint evidence") — an endpoint-only fact (zero own claims) can
+        therefore be visible purely because an edge naming it carries a
+        readable claim. For ``subject_kind='edge'`` the corpus is unchanged:
+        the edge's own claims only (spec S3 — edge visibility is never
+        inferred from its endpoints)."""
+        vis = self._visibility_predicate("rc.corpus_id", is_admin)
+        if subject_kind == "fact":
+            relevant_claims_cte = """
+                relevant_claims AS (
+                    SELECT corpus_id FROM claims WHERE fact_id = :subject_id
+                    UNION ALL
+                    SELECT c.corpus_id
+                    FROM claims c
+                    JOIN edges e ON e.id = c.edge_id
+                    WHERE (e.src = :subject_id OR e.dst = :subject_id)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM corrections co
+                        WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                          AND co.verdict IN ('wrong', 'restricted')
+                      )
+                )
+            """
+        else:
+            relevant_claims_cte = "relevant_claims AS (SELECT corpus_id FROM claims WHERE edge_id = :subject_id)"
         if all_evidence:
             has_claim_visibility = (
-                f"EXISTS (SELECT 1 FROM claims c WHERE c.{kind_column} = :subject_id) "
-                f"AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.{kind_column} = :subject_id AND NOT ({vis}))"
+                "EXISTS (SELECT 1 FROM relevant_claims) "
+                f"AND NOT EXISTS (SELECT 1 FROM relevant_claims rc WHERE NOT ({vis}))"
             )
         else:
-            has_claim_visibility = f"EXISTS (SELECT 1 FROM claims c WHERE c.{kind_column} = :subject_id AND {vis})"
+            has_claim_visibility = f"EXISTS (SELECT 1 FROM relevant_claims rc WHERE {vis})"
         sql = sa.text(
+            f"WITH {relevant_claims_cte} "
             "SELECT "
             "EXISTS (SELECT 1 FROM corrections co WHERE co.subject_kind = :kind AND co.subject_id = :subject_id "
             "        AND co.verdict IN ('wrong', 'restricted')) AS withheld, "
@@ -391,6 +434,14 @@ class FactsPgRepository:
         filters: Optional[Dict[str, Any]] = None,
         limit: int = MAX_SEARCH_LIMIT,
     ) -> Dict[str, Any]:
+        """Type/filter search over visible FACT subjects (spec §5). A
+        subject's EXISTENCE gate is the endpoint-evidence union (module
+        docstring): its own claims OR the claims of a non-withheld incident
+        edge. ``attrs``, ``claim_count`` and ``quote_count`` stay OWN-claims
+        ONLY (via ``counted_claims``/``attr_kv`` below, never
+        ``endpoint_claims``) — an endpoint-only fact (visible purely via an
+        edge) always serves ``attrs: {}`` and a ``claim_count`` of 0, closing
+        the attribute oracle (S2) exactly as before this refinement."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
@@ -400,6 +451,7 @@ class FactsPgRepository:
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
         vis = self._visibility_predicate("c.corpus_id", is_admin)
+        vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
 
         filter_clauses = []
         params: Dict[str, Any] = {"type": type, "limit_plus_one": limit + 1}
@@ -435,6 +487,21 @@ class FactsPgRepository:
                 JOIN candidates cand ON cand.subject_id = c.fact_id
                 WHERE cand.subject_id IN (SELECT subject_id FROM revealed_ids) OR ({vis})
             ),
+            endpoint_claims AS (
+                -- Existence-only: claims of edges incident to a candidate,
+                -- via a non-withheld edge (module docstring, "Endpoint
+                -- evidence"). Never joined into attr_kv/counted_claims — the
+                -- attrs projection and claim_count stay OWN-claims-only.
+                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id
+                FROM candidates cand
+                JOIN edges e ON (e.src = cand.subject_id OR e.dst = cand.subject_id)
+                JOIN claims c ON c.edge_id = e.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM corrections co
+                    WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                      AND co.verdict IN ('wrong', 'restricted')
+                )
+            ),
             visible AS (
                 SELECT cand.subject_id, cand.subject_type,
                        (cand.subject_id IN (SELECT subject_id FROM revealed_ids)) AS is_revealed
@@ -442,14 +509,23 @@ class FactsPgRepository:
                 WHERE cand.subject_id IN (SELECT subject_id FROM revealed_ids)
                    OR (
                         NOT {str(all_evidence).upper()}
-                        AND EXISTS (SELECT 1 FROM counted_claims cc WHERE cc.subject_id = cand.subject_id)
+                        AND (
+                            EXISTS (SELECT 1 FROM counted_claims cc WHERE cc.subject_id = cand.subject_id)
+                            OR EXISTS (SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id AND {vis_ec})
+                        )
                    )
                    OR (
                         {str(all_evidence).upper()}
-                        AND EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id)
+                        AND (
+                            EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id)
+                            OR EXISTS (SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id)
+                        )
                         AND NOT EXISTS (
                             SELECT 1 FROM claims c3
                             WHERE c3.fact_id = cand.subject_id AND NOT ({self._visibility_predicate("c3.corpus_id", is_admin)})
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id AND NOT ({vis_ec})
                         )
                    )
             ),
@@ -730,6 +806,12 @@ class FactsPgRepository:
     # ------------------------------------------------------------------
 
     def claims(self, caller, subject_id: str) -> Dict[str, Any]:
+        """List a subject's OWN claims. The visibility GATE (below, via
+        `_subject_status`) uses the endpoint-evidence union for a fact
+        subject, so a visible endpoint-only fact (zero own claims, visible
+        only via an incident edge's claim) returns `{"claims": [], ...}`
+        (200) rather than a 404 — the claims LIST itself stays own-claims
+        only, same as `search()`'s attrs projection."""
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
@@ -819,17 +901,23 @@ class FactsPgRepository:
 
     def _visible_facts_for_corpus_cte(self, is_admin: bool, all_evidence: bool) -> str:
         """SQL for a ``visible(subject_id, is_revealed)`` CTE: facts with at
-        least one claim evidenced by ``:corpus_id`` (bound by the caller),
-        withheld ones (`wrong`/`restricted`) excluded, `revealed` ones
-        included unconditionally, and everything else gated by the SAME
+        least one OWN claim evidenced by ``:corpus_id`` (bound by the
+        caller — candidacy is deliberately still OWN-claims-only: "evidenced
+        by this collection" names a claim IN it, not a fact reachable only
+        via an edge whose claim happens to live elsewhere), withheld ones
+        (`wrong`/`restricted`) excluded, `revealed` ones included
+        unconditionally, and everything else gated by the SAME
         any_evidence/all_evidence rule `search()` applies — over the
-        subject's claims EVERYWHERE, not just this corpus, so a fact only
-        partly evidenced here still obeys `all_evidence` correctly. Returned
-        as a fragment (no leading ``WITH``) so callers can embed it beside
-        their own CTEs; every caller must bind ``:corpus_id`` and, when
+        subject's claims EVERYWHERE (own OR a non-withheld incident edge's,
+        module docstring "Endpoint evidence"), not just this corpus, so a
+        candidate whose only OWN claim here is itself unreadable can still
+        be revealed by a readable incident-edge claim. Returned as a
+        fragment (no leading ``WITH``) so callers can embed it beside their
+        own CTEs; every caller must bind ``:corpus_id`` and, when
         ``is_admin`` is False, ``:readable``."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
+        vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
         all_ev_sql = "TRUE" if all_evidence else "FALSE"
         return f"""
             candidates AS (
@@ -845,6 +933,17 @@ class FactsPgRepository:
             revealed_ids AS (
                 SELECT subject_id FROM corrections WHERE subject_kind = 'fact' AND verdict = 'revealed'
             ),
+            endpoint_claims AS (
+                SELECT DISTINCT cand.subject_id AS subject_id, c.corpus_id AS corpus_id
+                FROM candidates cand
+                JOIN edges e ON (e.src = cand.subject_id OR e.dst = cand.subject_id)
+                JOIN claims c ON c.edge_id = e.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM corrections co
+                    WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                      AND co.verdict IN ('wrong', 'restricted')
+                )
+            ),
             visible AS (
                 SELECT cand.subject_id,
                        (cand.subject_id IN (SELECT subject_id FROM revealed_ids)) AS is_revealed
@@ -852,14 +951,23 @@ class FactsPgRepository:
                 WHERE cand.subject_id IN (SELECT subject_id FROM revealed_ids)
                    OR (
                         NOT {all_ev_sql}
-                        AND EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id AND {vis})
+                        AND (
+                            EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id AND {vis})
+                            OR EXISTS (SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id AND {vis_ec})
+                        )
                    )
                    OR (
                         {all_ev_sql}
-                        AND EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id)
+                        AND (
+                            EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id = cand.subject_id)
+                            OR EXISTS (SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id)
+                        )
                         AND NOT EXISTS (
                             SELECT 1 FROM claims c3
                             WHERE c3.fact_id = cand.subject_id AND NOT ({vis3})
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM endpoint_claims ec WHERE ec.subject_id = cand.subject_id AND NOT ({vis_ec})
                         )
                    )
             )
@@ -1212,18 +1320,29 @@ class FactsPgRepository:
     # ------------------------------------------------------------------
 
     def sweep_orphans(self) -> int:
-        """Delete every subject (fact or edge) with zero claims; return the
-        count (spec §6: "subjects left with zero claims are deleted and
-        counted"). Edges are swept first — an edge with zero claims of its
-        OWN is removed before the fact sweep runs; deleting an orphaned
-        FACT afterwards can then cascade (``ON DELETE CASCADE``) any edge
-        still pointing at it even if THAT edge carried its own claims — an
-        edge to a subject this design has garbage-collected cannot outlive
-        it, so that knock-on cascade is not separately counted here. Safe
-        to call unconditionally (a no-op when nothing is orphaned); callers
-        decide when running it is warranted (post-ingest — replace mode can
-        orphan a subject a document no longer mentions — and post file
-        delete, spec §6's lifecycle table)."""
+        """Delete every orphaned subject (fact or edge); return the count
+        (spec §6, refined per the module docstring's "Endpoint evidence": an
+        edge anchors its endpoints, so a fact is orphaned only when it has
+        NEITHER an own claim NOR an incident edge carrying any claim).
+        Correction-agnostic throughout — this is raw data hygiene, not a
+        visibility check; a `wrong`/`restricted` edge with a live claim
+        still anchors its endpoints here exactly like any other edge.
+
+        Edges are swept FIRST: an edge with zero claims of its own is
+        removed before the fact sweep runs. That ordering is what makes the
+        fact predicate cheap — by the time the fact DELETE runs, every
+        surviving edge carries >=1 claim (the edge sweep just removed every
+        one that didn't), so "zero incident edges carrying any claims"
+        collapses to "zero incident edges, period": ``NOT EXISTS (SELECT 1
+        FROM edges e WHERE e.src = f.id OR e.dst = f.id)``. Deleting an
+        orphaned FACT afterwards can then cascade (``ON DELETE CASCADE``)
+        any edge still pointing at it even if THAT edge carried its own
+        claims — an edge to a subject this design has garbage-collected
+        cannot outlive it, so that knock-on cascade is not separately
+        counted here. Safe to call unconditionally (a no-op when nothing is
+        orphaned); callers decide when running it is warranted (post-ingest
+        — replace mode can orphan a subject a document no longer mentions —
+        and post file delete, spec §6's lifecycle table)."""
         with self._engine.begin() as conn:
             edge_ids = (
                 conn.execute(
@@ -1239,7 +1358,9 @@ class FactsPgRepository:
                 conn.execute(
                     sa.text(
                         "DELETE FROM facts f WHERE NOT EXISTS "
-                        "(SELECT 1 FROM claims c WHERE c.fact_id = f.id) RETURNING f.id"
+                        "(SELECT 1 FROM claims c WHERE c.fact_id = f.id) "
+                        "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = f.id OR e.dst = f.id) "
+                        "RETURNING f.id"
                     )
                 )
                 .scalars()
