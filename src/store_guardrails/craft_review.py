@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from connectors.llm.anthropic_provider import AnthropicExtractor
 from connectors.llm.exceptions import LLMError
+from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
 
 from .lint_corpus import CorpusDoc
 from .prompts import (
@@ -97,8 +98,13 @@ def _craft_review_or_raise(
         # Constructed inside the error boundary: the SDK import is deferred
         # to first use, so client construction must translate to
         # CraftUnavailable like any other LLM failure — craft_review()'s
-        # Never-raises contract depends on it.
-        extractor = AnthropicExtractor(api_key=api_key, model=model)
+        # Never-raises contract depends on it. An empty api_key is the
+        # documented vertex sentinel from default_api_key_loader.
+        extractor: AnthropicExtractor
+        if not api_key and vertex_config_or_none():
+            extractor = create_vertex_extractor(model)
+        else:
+            extractor = AnthropicExtractor(api_key=api_key, model=model)
         result = extractor.extract_json(
             prompt=prompt,
             system=CRAFT_REVIEW_PROMPT,
