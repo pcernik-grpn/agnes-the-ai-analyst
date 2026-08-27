@@ -141,6 +141,54 @@ def test_read_returns_duckdb_when_overlay_absent(tmp_path, monkeypatch):
     assert url is None
 
 
+def test_is_backend_explicitly_declared_false_when_overlay_absent(tmp_path, monkeypatch):
+    from src.db_state_machine import is_backend_explicitly_declared
+
+    overlay = tmp_path / "nonexistent.yaml"
+    monkeypatch.setattr("src.db_state_machine._OVERLAY_PATH", overlay)
+
+    assert is_backend_explicitly_declared() is False
+
+
+def test_is_backend_explicitly_declared_false_when_overlay_exists_without_database_key(tmp_path, monkeypatch):
+    """The PG-backend-revert conflation: an overlay that exists (e.g.
+    written by an unrelated /admin/server-config save) but never touches
+    the `database` section must NOT be reported as an explicit declaration
+    — even though ``read_backend_state()`` still (correctly, for its own
+    documented zero-config-fallback contract) resolves to DUCKDB."""
+    import yaml as _yaml
+
+    from src.db_state_machine import is_backend_explicitly_declared
+
+    overlay = tmp_path / "instance.yaml"
+    overlay.write_text(_yaml.safe_dump({"data_source": {"type": "bigquery"}}))
+    monkeypatch.setattr("src.db_state_machine._OVERLAY_PATH", overlay)
+
+    state, _url = read_backend_state()
+    assert state == BackendState.DUCKDB  # unchanged zero-config-fallback contract
+    assert is_backend_explicitly_declared() is False  # but NOT a declaration
+
+
+def test_is_backend_explicitly_declared_true_for_explicit_duckdb(tmp_path, monkeypatch):
+    from src.db_state_machine import is_backend_explicitly_declared, write_backend_state
+
+    overlay = tmp_path / "instance.yaml"
+    monkeypatch.setattr("src.db_state_machine._OVERLAY_PATH", overlay)
+
+    write_backend_state(BackendState.DUCKDB)
+    assert is_backend_explicitly_declared() is True
+
+
+def test_is_backend_explicitly_declared_true_for_side_car(tmp_path, monkeypatch):
+    from src.db_state_machine import is_backend_explicitly_declared, write_backend_state
+
+    overlay = tmp_path / "instance.yaml"
+    monkeypatch.setattr("src.db_state_machine._OVERLAY_PATH", overlay)
+
+    write_backend_state(BackendState.SIDE_CAR, url="postgresql://x")
+    assert is_backend_explicitly_declared() is True
+
+
 def test_write_is_atomic(tmp_path, monkeypatch):
     """Writes go through .tmp + os.replace; no .tmp left behind on success."""
     overlay = tmp_path / "instance.yaml"
