@@ -86,9 +86,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   required a session; the data-apps deploy/git-credential/draft/preview-grant
   mints are intentionally PAT-reachable (the CLI's `agnes app …` commands run
   under the caller's own PAT against their own app) and out of scope here —
-  see #1292. The MCP-OAuth consent route resolves its caller through its own
-  helper rather than a dependency and still accepts a PAT; that is tracked
-  separately, not fixed here.
+  see #1292. One sibling did have the same gap but was invisible to a
+  dependency-level audit — the MCP-OAuth consent bridge resolves its caller
+  through its own helper rather than a FastAPI dependency; it is fixed
+  separately, in the entry below.
 - **A stolen PAT can no longer be laundered into a 30-day MCP refresh token.**
   The MCP-OAuth consent bridge (`/api/mcp/oauth/consent`) resolved its
   `Authorization: Bearer` header through the generic token resolver, which
