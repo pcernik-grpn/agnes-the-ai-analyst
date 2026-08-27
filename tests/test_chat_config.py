@@ -119,7 +119,8 @@ def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
     (llm-agency-open-egress-5)."""
     y = tmp_path / "instance.yaml"
     y.write_text(
-        "chat:\n  enabled: true\n  provider:\n  harness:\n  docker_egress_mode:\n  on_detach:\n  llm:\n    auth:\n"
+        "chat:\n  enabled: true\n  provider:\n  harness:\n  docker_egress_mode:\n  on_detach:\n"
+        "  llm:\n    auth:\n    provider:\n    vertex:\n      project_id:\n      region:\n"
     )
     cfg = load_chat_config(y)
     assert cfg.provider == "kai-agent"
@@ -127,6 +128,40 @@ def test_blank_string_keys_fall_back_to_their_defaults(tmp_path: Path):
     assert cfg.docker_egress_mode == "none"
     assert cfg.on_detach == "pause"
     assert cfg.llm_auth == "api_key"
+    assert cfg.llm_provider == "anthropic"
+    assert cfg.vertex_project_id == ""
+    assert cfg.vertex_region == ""
+
+
+def test_llm_vertex_block_parses(tmp_path: Path):
+    y = tmp_path / "instance.yaml"
+    y.write_text(
+        "chat:\n  enabled: true\n  llm:\n    provider: Vertex\n    vertex:\n"
+        "      project_id: my-proj\n      region: Europe-West1\n"
+    )
+    cfg = load_chat_config(y)
+    assert cfg.llm_provider == "vertex"  # lowercased
+    assert cfg.vertex_project_id == "my-proj"
+    assert cfg.vertex_region == "europe-west1"  # lowercased
+
+
+def test_llm_provider_defaults_to_anthropic(tmp_path: Path):
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n")
+    cfg = load_chat_config(y)
+    assert cfg.llm_provider == "anthropic"
+    assert cfg.vertex_project_id == ""
+    assert cfg.vertex_region == ""
+
+
+def test_unknown_llm_provider_is_kept_for_boot_gate(tmp_path: Path):
+    """An unknown chat.llm.provider is deliberately NOT normalized back to
+    'anthropic' — a silent fallback would switch which credential spends
+    money. The boot gate refuses the value instead."""
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  enabled: true\n  llm:\n    provider: bedrock\n")
+    cfg = load_chat_config(y)
+    assert cfg.llm_provider == "bedrock"
 
 
 def test_blank_numeric_and_bool_keys_fall_back_to_their_defaults(tmp_path: Path, caplog):

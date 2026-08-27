@@ -29,7 +29,6 @@ from app.chat.types import Surface
 from app.chat.workdir import WorkdirManager
 from src.db import _ensure_schema
 
-
 # --- _strip_title ------------------------------------------------------------
 
 
@@ -430,7 +429,7 @@ def test_assistant_message_triggers_auto_title(tmp_path: Path, monkeypatch):
         handle.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         return manager, s.id, ws
 
@@ -474,7 +473,7 @@ def test_auto_title_fires_only_once(tmp_path: Path, monkeypatch):
         handle.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     asyncio.run(_run())
@@ -510,7 +509,7 @@ def test_auto_title_skipped_when_title_preset(tmp_path: Path, monkeypatch):
         handle.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         return manager._repo.get_session(s.id)
 
@@ -543,10 +542,70 @@ def test_auto_title_swallows_haiku_failure(tmp_path: Path, monkeypatch):
         handle.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         return manager._repo.get_session(s.id)
 
     persisted = asyncio.run(_run())
     assert persisted is not None
     assert persisted.title is None
+
+
+# --- vertex mode -------------------------------------------------------------
+
+
+def test_generate_title_vertex_uses_passed_project_region(monkeypatch):
+    """llm_provider="vertex" routes to the AnthropicVertex path with the
+    chat config's project/region — a stale static key must not win."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-static-key")
+    captured = {}
+
+    def fake_sync(user_message, **kwargs):
+        captured.update(kwargs)
+        return "Vertex title"
+
+    monkeypatch.setattr(auto_title, "_generate_title_sync", fake_sync)
+    out = asyncio.run(
+        auto_title.generate_title(
+            "Show me revenue last week",
+            llm_provider="vertex",
+            vertex=("proj-1", "europe-west1"),
+        )
+    )
+    assert out == "Vertex title"
+    assert captured == {"vertex": ("proj-1", "europe-west1")}
+
+
+def test_generate_title_vertex_unconfigured_returns_none(monkeypatch):
+    """Vertex mode with no resolvable project/region keeps the best-effort
+    contract: warn + None, never raise."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(auto_title, "_no_credential_warned", False)
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda: None)
+    out = asyncio.run(auto_title.generate_title("Show revenue", llm_provider="vertex", vertex=("", "")))
+    assert out is None
+
+
+def test_generate_title_sync_vertex_builds_vertex_client(monkeypatch):
+    """The sync helper constructs AnthropicVertex and translates the title
+    model to the Vertex id form."""
+    import anthropic
+
+    captured = {}
+
+    class _Msgs:
+        def create(self, **kw):
+            captured.update(kw)
+            return type("R", (), {"content": [type("B", (), {"text": "Weekly revenue"})()]})()
+
+    class _FakeVertex:
+        def __init__(self, **kw):
+            captured["ctor"] = kw
+            self.messages = _Msgs()
+
+    monkeypatch.setattr(anthropic, "AnthropicVertex", _FakeVertex, raising=False)
+    out = auto_title._generate_title_sync("Show me revenue", vertex=("proj-1", "europe-west1"))
+    assert out == "Weekly revenue"
+    assert captured["ctor"]["project_id"] == "proj-1"
+    assert captured["ctor"]["region"] == "europe-west1"
+    assert captured["model"] == "claude-haiku-4-5@20251001"
