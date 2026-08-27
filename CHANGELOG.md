@@ -473,6 +473,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- `GET /api/v1/agents/{id}/memories` is now owner/admin-only, matching the
+  memory notebook's approve/archive/delete routes: a user the agent is
+  merely SHARED with (a runnable grantee, C2.3) previously passed the same
+  read gate as `GET /api/v1/agents/{id}` and could read the owner's private
+  memory notebook verbatim. A grantee now gets `404` there, same
+  existence-hiding as every other owner-only agent route; the agent-list/
+  detail surface and the run path a grantee legitimately relies on are
+  unaffected.
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.
