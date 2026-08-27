@@ -1,7 +1,8 @@
 # Fact graph over Collections — design
 
 **Date:** 2026-08-27
-**Status:** draft, revised after three independent reviews (architecture, RBAC, product)
+**Status:** draft — revised after three independent reviews (architecture, RBAC,
+product), then against evaluation workbook v0.2 and the anonymisation services
 **Verified against:** worktree `zs/facts-scope-access`, base `d97e186a8`
 
 ## 0. What changed in this revision, and why
@@ -38,6 +39,18 @@ One review's central objection is *not* fixed here, because it is not a design
 error but a question this design cannot answer: **what facts buy over the
 retrieval Collections already does.** It is now stated as a gate in §11 rather
 than deferred to "open questions".
+
+Three later corrections, from material that arrived after those reviews:
+
+6. **The evaluation standard is workbook v0.2** (frozen 2026-08-27) — ten
+   prompts, five arms, 0/1/2 scoring — and the deciding comparison is Agnes
+   against Claude holding the same context, which nothing currently runs (§14.4).
+7. **Anonymisation belongs in front of ingestion**, not as a redaction on the
+   way out. Placed there, Agnes never holds the original at all, which retires
+   the objection that `/raw` and `/preview` do not redact (§9).
+8. **Entra is not connected**, so nothing is derived from SharePoint ACLs today.
+   Derivation is missing; enforcement is not — which is why the evaluation can
+   still run (§13.5).
 
 ## 1. What this is
 
@@ -296,31 +309,81 @@ With it:
 "Who is the sponsor *now*" has an answer. "Who was the sponsor in 2024" also
 has one. Neither did in the first draft.
 
-## 9. Anonymization — and a contradiction to resolve
+## 9. Anonymization — a service in front of ingestion
 
-A collection may be marked anonymized: names are substituted at ingest and
-Agnes serves only the substituted form. Substitution is deterministic (keyed
-hash → `Sponsor_7f3a`) so the same entity maps to the same token and the graph
-still joins — a free-form model rewrite would break that, which is a
-correctness argument for the dictionary approach independent of cost.
+Anonymization runs **before anything reaches Agnes**, as a service in the
+crawler's path:
 
-Three honest limits the first draft got wrong or omitted:
+```
+SharePoint  →  download  →  convert to markdown  →  anonymize  →  Agnes
+                            (our converter,        (doc_quantization,
+                             pypdfium2)             Apache-2.0)
+```
+
+The consequence is stronger than a redaction rule, and it is why this
+placement is right: **Agnes never holds the original at all.** For a collection
+marked anonymized there is nothing to redact on the way out, because nothing
+unredacted ever came in. That removes the objection that `/preview`, `/raw`
+and the chunk index do not redact — they serve what was ingested, and what was
+ingested is the anonymized form. The original stays in the source system under
+its own ACL, which is where it belongs.
+
+It also makes the verbatim gate consistent rather than awkward: claims are
+extracted from anonymized text, so a quote is verbatim against the text a
+reader will actually be shown.
+
+**The anonymiser.** `padak/doc_quantization` (Apache-2.0) is a
+decontextualisation pipeline — markdown split into 22-token chunks under random
+UUIDs, ordering kept locally, chunks sent shuffled and context-free mixed with
+honeytokens and chaff so no party ever sees a whole document, byte-exact
+reassembly, and a fully local detection mode where nothing leaves the machine.
+We run our own deployment of it.
+
+**The converter is ours, and permissively licensed.** The reference
+implementation (`padak/doc_converter`) uses PyMuPDF, which is AGPL — and Agnes
+ships under PolyForm Small Business, which AGPL cannot mix with. Rather than
+manage that boundary, we build the converter on **pypdfium2** (Apache-2.0 /
+BSD-3-Clause, wrapping BSD-licensed PDFium) and publish it as its own public
+repository under a permissive licence.
+
+This is worth stating as a decision rather than a detail: the AGPL route was
+available and would have worked behind a network boundary, but it costs a
+licence obligation on every deployment and a boundary that exists for legal
+rather than architectural reasons. Choosing a permissive converter removes
+both. The services stay separate for operational reasons — the anonymiser runs
+a batch pipeline with its own store and scales differently — not because a
+licence forces it.
+
+The trade is conversion quality, and it is a **correctness** dependency rather
+than a cosmetic one: quotes are verbatim against converted text, so a converter
+that mangles tables or drops structure silently degrades the verbatim gate.
+§14.5 tests it.
+
+**One blocking gap: the substitution is not a pseudonym.** The anonymiser
+replaces persons with `**PERSON**` and companies with `**COMPANY**` — fixed
+markers. Extract facts from that and every person collapses into one node,
+every company into another; the graph over an anonymized collection ceases to
+exist. Since we run our own deployment, the fix is ours to make and it is
+small: replace the fixed marker with `PERSON_<hmac(key, normalized_text)[:6]>`.
+The detector already returns exact entity substrings, so this is a
+service-layer substitution step, not a change to detection. The key is
+per-instance, which also means tokens never correlate across tenants.
+
+With stable pseudonyms the graph joins within one key domain.
+
+Limits to state rather than discover:
 
 - **The claim is "Agnes serves only the anonymized form", never "the document
-  is anonymous".** The original stays in the source system under its own ACL.
-- **`/preview` and `/raw` do not redact.** They serve the stored bytes and the
-  raw extracted text, and the existing chunk index is built from the same text.
-  Marking a collection anonymized does **not** retrofit them. Either this work
-  gates those two endpoints too, or the guarantee is false for anyone who calls
-  them. This is a required decision, not a footnote.
+  is anonymous".** The original is untouched in the source system.
+- **Across key domains the same entity is two nodes.** An anonymized and a
+  plain collection, or two anonymized sources with different keys, never join.
+  Key rotation rewrites every alias. This is a documented property, not a bug
+  to fix later.
 - **It contradicts the corpus-intake design**, which ingests *two* variants —
-  full into a restricted collection, redacted into a broad one — for the same
-  source type this spec names as its first producer. Same subsystem, three days
-  apart, opposite answers. Someone must reconcile them before either ships. On
-  the merits for the graph: pseudonyms join only within one key domain, so
-  across two anonymized sources with different keys, or an anonymized and a
-  plain one, the same entity is permanently two nodes, and key rotation
-  rewrites every alias.
+  full into a restricted collection, redacted into a broad one. Placing the
+  anonymiser in front of ingestion is incompatible with holding a full variant
+  at all, so one of the two designs has to give. This one is the safer of the
+  two, because a copy that does not exist cannot be granted by mistake.
 
 ## 10. Query and cost
 
@@ -672,15 +735,19 @@ present but whose assertion does not follow from it **passes**. This test
 exists to keep everyone honest about what the gate does: it validates quotes,
 not inferences.
 
-**Q0 — the eval set matches the frozen workbook.** The repository's question
-set was modelled on workbook v0.1 and has drifted: 12 questions where v0.2
-freezes **10**; two arms where v0.2 defines **five** (A0 Claude alone, A1
-Claude + SharePoint connector, A2 ChatGPT + SharePoint, A3 Claude + seed
-pack, A4 Agnes); a 0/0.5/1 scale where v0.2 rescored to **0/1/2**; and
-different weights. Most consequentially, **the deciding comparison is A4 vs
-A3** — Agnes against Claude *holding the same context*, by ≥10 points — and
-no arm in the repository tests it. Reconcile before the runs, or the effort
-measures something the customer does not grade.
+**Q0 — we validate against the frozen workbook, and only that.** Evaluation
+scoring workbook **v0.2**, frozen 2026-08-27, is the standard: ten prompts
+(X1, P1, P2, T1, T2, A1, L1, N1, G1, G2), five arms, three runs each, seven
+dimensions scored 0/1/2 with the weights in its Rubric sheet, and the five
+pre-registered decision thresholds. Nothing is graded against an internal
+variant — where earlier material disagrees, the workbook wins.
+
+The arm that matters most is one we do not currently run: **A4 versus A3** —
+Agnes against Claude *holding the same context* (the seed pack), by ≥10
+points. The workbook calls it "THE DECIDING TEST" and states the consequence
+plainly: if Agnes cannot beat Claude given the same context, the value is
+context engineering rather than the platform. Standing that arm up is part of
+the work, not a comparison to defer.
 
 **Q3 — recall against planted truth.** Precision and recall per fact type on
 the labelled corpus. Recorded per release, not asserted once.
@@ -703,27 +770,39 @@ full pass, verify it does not return. *Fails if* the producer overwrites
 two subjects; merge them; verify a single subject with both aliases and the
 union of claims, and that the merge is reversible.
 
-### 14.5 Anonymization — currently unspecifiable
+### 14.5 Anonymization
 
-**Blocked.** The service to integrate has not been identified: a search of the
-`keboola` org and of GitHub for anonymisation/redaction repositories found
-nothing matching. Until it is named, this section states only what any
-implementation must satisfy:
+The anonymiser runs in front of ingestion (§9), so these tests assert an
+absence in Agnes rather than a redaction on the way out.
 
-**A1 — the planted name appears nowhere.** Plant a unique token in a document
-in an anonymized collection. Assert its absence in: facts, claim attributes,
-quotes, `corpus_chunks.text`, `GET /files/{id}/raw`, `GET /files/{id}/preview`,
-search results, and the audit log. *The last three are where the current design
-fails* (§9) — the test is written to fail until they are handled, not adjusted
-to pass.
+**A1 — the planted name appears nowhere in Agnes.** Plant a unique token in a
+document destined for an anonymized collection. Assert its absence in facts,
+claim attributes, quotes, `corpus_chunks.text`, `GET /files/{id}/raw`, `GET
+/files/{id}/preview`, search results, and the audit log. Unlike the earlier
+draft, these should now pass by construction — the unredacted form never
+entered — so a failure means the pipeline order was broken, which is exactly
+what the test is for.
 
 **A2 — the graph still joins.** The same entity in two documents yields one
-subject. *Fails if* substitution is non-deterministic.
+subject. **Fails against the anonymiser as it stands today**, which substitutes
+fixed markers, and passes only once the stable-pseudonym change lands (§9).
+Written to fail now, deliberately: it is the gate on that work.
 
-**A3 — cross-collection reality.** The same entity in an anonymized and a plain
-collection is two subjects, permanently. This is a **documented limitation**
-with a test proving the documentation matches behaviour, not a bug to fix
-later.
+**A3 — cross-key reality is documented, not fixed.** The same entity in an
+anonymized and a plain collection is two subjects, permanently. The test
+asserts the documented behaviour so the documentation cannot drift from it.
+
+**A4 — the original never reaches Agnes.** Inspect the blob store and the
+extracted text for an anonymized collection after a full run: nothing
+unredacted is present, at any stage, including intermediates. This is the test
+that makes §9's guarantee checkable rather than architectural.
+
+**A5 — conversion fidelity, because the verbatim gate depends on it.** Convert
+a fixture set covering the corpus's real shapes — a table-heavy xlsx, a deck, a
+scan, a document with Czech diacritics — and assert that sentences a human
+would quote survive as contiguous substrings. A converter change is a change to
+what quotes are possible, so this test guards the switch to pypdfium2 and any
+future one.
 
 ### 14.6 The end-to-end run — what "done" actually means
 
@@ -775,15 +854,10 @@ its own design before it can have a test.
 - **Cross-language extraction** versus the verbatim gate (§7).
 - **`source_url`** — who builds it, since citations are half-blind without it.
 - Whether extraction runs as a scheduled agent, and who owns its token budget.
-- **The anonymiser substitutes `**PERSON**` / `**COMPANY**`, not stable
-  pseudonyms.** `padak/doc_quantization` (Apache-2.0) is a decontextualisation
-  pipeline — 22-token chunks under random UUIDs, shuffled and mixed with
-  honeytokens so no party sees a whole document, byte-exact reassembly, with a
-  fully local detection mode. File conversion is deliberately a separate
-  service (`padak/doc_converter`) because PyMuPDF is AGPL and would infect the
-  anonymiser's licence. **But a fixed replacement collapses every person into
-  one node and every company into another**, which falsifies §9's claim that
-  the graph still joins. Either the anonymiser gains a stable-pseudonym mode,
-  or an anonymised collection cannot carry facts and is retrieval-only. That
-  decision is not ours, and it must land before anonymisation is offered as
-  part of the graph.
+- **The anonymiser substitutes a fixed marker, not a stable pseudonym.** With
+  `**PERSON**` / `**COMPANY**` every person collapses into one node and every
+  company into another, so an anonymized collection cannot carry a graph. The
+  fix is ours to make in our own deployment — replace the marker with
+  `PERSON_<hmac(key, normalized_text)[:6]>`, a service-layer step, since
+  detection already returns exact entity substrings. Until it lands, an
+  anonymized collection is retrieval-only, and §14.5's A2 fails on purpose.
