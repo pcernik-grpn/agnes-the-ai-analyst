@@ -89,9 +89,7 @@ class TestOnlyAnAdminMayRunOne:
         assert r.status_code in (401, 403)
 
     def test_an_anonymous_caller_is_refused(self, shared_app):
-        r = TestClient(shared_app).post(
-            "/api/admin/data-packages/builder/turn", json={"message": "hi"}
-        )
+        r = TestClient(shared_app).post("/api/admin/data-packages/builder/turn", json={"message": "hi"})
         assert r.status_code in (401, 403)
 
 
@@ -120,9 +118,7 @@ class TestSanitizerIsTheTrustBoundary:
         assert out["groups"] == ["g-sales"]
 
     def test_unknown_fields_are_dropped(self):
-        out = _sanitize_patch(
-            {"name": "ok", "visibility": "public", "owner": "someone"}, **self.IDS
-        )
+        out = _sanitize_patch({"name": "ok", "visibility": "public", "owner": "someone"}, **self.IDS)
         assert out == {"name": "ok"}
 
     def test_slug_is_not_patchable(self):
@@ -156,3 +152,145 @@ class TestDegradingWithoutAModel:
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         assert _turn(client).status_code == 502
+
+
+class TestWhatTheModelIsToldAboutTheInstance:
+    """The candidate block is the builder's only knowledge of Agnes.
+
+    A turn is one LLM call with no tool loop, so whatever is NOT in this
+    block does not exist as far as the model is concerned. It used to be
+    ``id``, ``name`` and 160 characters of description, which left "the
+    opportunity tables for sales" answerable only by matching names.
+
+    These pin the facts that were added and, just as importantly, that the
+    block is still assembled server-side and still bounded.
+    """
+
+    def _prompt_for(self, tables, groups=()):
+        from app.api.package_builder import _prompt
+
+        return _prompt(message="sales pipeline", history=[], draft={}, tables=list(tables), groups=list(groups))
+
+    def test_source_and_query_mode_reach_the_prompt(self):
+        text = self._prompt_for(
+            [
+                {
+                    "id": "t1",
+                    "name": "opportunities",
+                    "description": "",
+                    "source_type": "keboola",
+                    "query_mode": "local",
+                    "distributable": True,
+                    "metrics": [],
+                }
+            ]
+        )
+        assert "source=keboola" in text
+        assert "mode=local" in text
+
+    def test_metrics_name_what_a_table_is_for(self):
+        """The signal that survives a missing description."""
+        text = self._prompt_for(
+            [
+                {
+                    "id": "t1",
+                    "name": "fct_deals",
+                    "description": "",
+                    "source_type": "keboola",
+                    "query_mode": "local",
+                    "distributable": True,
+                    "metrics": ["revenue/mrr", "sales/win_rate"],
+                }
+            ]
+        )
+        assert "metrics=revenue/mrr,sales/win_rate" in text
+
+    def test_a_server_only_table_is_flagged_not_forbidden(self):
+        """`data_packages.py` does not refuse a remote row, so the prompt must
+        not claim it is disallowed — only that analysts get no local copy."""
+        text = self._prompt_for(
+            [
+                {
+                    "id": "t1",
+                    "name": "web_sessions",
+                    "description": "",
+                    "source_type": "bigquery",
+                    "query_mode": "remote",
+                    "distributable": False,
+                    "metrics": [],
+                }
+            ]
+        )
+        assert "NOT-synced-to-laptops" in text
+        assert "packaging it is allowed" in text
+
+    def test_a_bare_candidate_still_renders(self):
+        """Enrichment is additive: a dict carrying only the three original
+        keys must not raise — the stub path and older callers build these."""
+        text = self._prompt_for([{"id": "t1", "name": "orders", "description": "all orders"}])
+        assert "id=t1" in text
+        assert "all orders" in text
+
+    def test_a_truncated_metric_list_says_so(self):
+        """A silently cut list reads to the model as "these are all of them" —
+        the same failure MAX_CANDIDATES announces its way out of."""
+        from app.api.package_builder import _MAX_METRICS_PER_TABLE
+
+        shown = [f"m{i}" for i in range(_MAX_METRICS_PER_TABLE)]
+        text = self._prompt_for(
+            [
+                {
+                    "id": "t1",
+                    "name": "fct_deals",
+                    "description": "",
+                    "metrics": shown,
+                    "metrics_total": _MAX_METRICS_PER_TABLE + 4,
+                }
+            ]
+        )
+        assert "(+4 more)" in text
+
+    def test_an_untruncated_metric_list_claims_no_remainder(self):
+        text = self._prompt_for(
+            [{"id": "t1", "name": "fct_deals", "description": "", "metrics": ["revenue"], "metrics_total": 1}]
+        )
+        assert "metrics=revenue" in text
+        assert "more)" not in text
+
+    def test_no_tables_means_no_advice_about_reading_them(self):
+        """On an empty instance the block would otherwise explain how to read
+        a list that is not there."""
+        text = self._prompt_for([])
+        assert "Read those facts" not in text
+
+    def test_the_block_stays_bounded(self):
+        from app.api.package_builder import MAX_CANDIDATES
+
+        many = [
+            {"id": f"t{i}", "name": f"table_{i}", "description": "", "metrics": []} for i in range(MAX_CANDIDATES + 25)
+        ]
+        text = self._prompt_for(many)
+        assert "…and 25 more not listed" in text
+        assert f"id=t{MAX_CANDIDATES + 5}" not in text
+
+
+class TestGroundingIsBestEffort:
+    """A failed metrics read must cost grounding, never the turn."""
+
+    def test_a_broken_metric_repo_still_answers(self, client, monkeypatch):
+        def boom():
+            raise RuntimeError("metric_definitions does not exist")
+
+        monkeypatch.setattr("src.repositories.metric_repo", boom)
+        r = _turn(client)
+        assert r.status_code == 200, r.text
+
+    def test_candidates_still_come_from_the_server(self, client):
+        """The invariant the whole module exists for: enrichment did not turn
+        the table list into something a caller can influence."""
+        from app.api.package_builder import _candidates
+
+        pool = _candidates()
+        assert set(pool) == {"tables", "groups"}
+        for row in pool["tables"]:
+            assert {"id", "name", "description", "query_mode", "distributable"} <= set(row)

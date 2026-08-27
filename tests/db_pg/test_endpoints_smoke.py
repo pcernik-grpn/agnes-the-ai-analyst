@@ -2742,8 +2742,9 @@ KNOWN_UNTESTED = {
     # tests/db_pg/test_agents_contract.py.
     "POST /api/store/entities/builder/preview-agent",
     # One data-package builder turn. Behaviourally covered by
-    # tests/test_package_builder_turns.py. Reads the registry and the group
-    # list to build its candidate sets; writes nothing.
+    # tests/test_package_builder_turns.py. Reads the registry, the group list
+    # and the metric definitions (all symmetric pairs) to build its candidate
+    # sets; writes nothing.
     "POST /api/admin/data-packages/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",

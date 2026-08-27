@@ -259,6 +259,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     the fold is not applied at all: the lists are not rendered there, so the row
     keeps its place at every width.
 
+- **The data-package builder is told what a table IS, not just what it is
+  called.** A turn's candidate block carried `id`, `name` and 160 characters
+  of description, so "the opportunity tables for sales" could only be
+  answered by matching names — a table whose name does not say what it holds
+  was invisible to the assistant, and the proposed package came out wrong or
+  empty. Each candidate now also carries `source_type`, `query_mode`, and the
+  names of the **metrics this instance already computes over it**, which is
+  the strongest signal available for what a table is for when its description
+  is thin. Metrics are one bulk read for the whole list, and a failed read
+  costs grounding rather than the turn. Candidates also carry whether the
+  table is *distributable* (`query_mode IN ('local','materialized')` and not
+  `server_only`, i.e. whether it reaches an analyst's laptop through
+  `agnes pull`): packaging a server-only table is still allowed —
+  `data_packages.py` does not refuse it — so the prompt states it as a fact to
+  weigh, never a prohibition, because encoding it as a rule would be wrong
+  about the API. Column-level detail is deliberately excluded: it is a read
+  per table against a list capped at 120, so schemas belong to a narrowing
+  step over a shortlist. The wire contract, the propose-never-apply rule and
+  `_sanitize_patch` as the trust boundary are unchanged.
+
 - **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
   It used to debounce-PATCH every keystroke, which meant there was never a
   moment at which the owner had *decided* the agent was right, and no honest
