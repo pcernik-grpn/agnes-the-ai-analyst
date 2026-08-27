@@ -111,6 +111,16 @@ def test_host_scripts_never_fetch_the_source_repo():
     egress to a repo that may be private), not any particular variable name
     someone might spell it with next time.
     """
+    # A glob resolved against the wrong cwd yields nothing, and the sweep
+    # below would then pass while checking zero files. Pin the corpus first
+    # so this can only go green by actually reading the scripts.
+    missing = [str(p) for p in HOST_SCRIPTS if not p.is_file()]
+    assert not missing, f"host scripts not found (wrong working directory?): {missing}"
+    assert len(HOST_SCRIPTS) >= 5, (
+        f"expected the ops-script corpus to be several files, found {len(HOST_SCRIPTS)} — "
+        "a shrunken glob would make this sweep vacuous"
+    )
+
     offenders: list[str] = []
     for script in HOST_SCRIPTS:
         text = script.read_text(encoding="utf-8")
