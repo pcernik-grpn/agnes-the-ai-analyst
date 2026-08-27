@@ -5567,7 +5567,7 @@ function renderCoPresence(host, participants) {
     setFilesStatus("Loading…");
     filesListEl.replaceChildren();
     const seq = ++_filesSeq;
-    const { files, truncated, supported } = await fetchSessionFiles(chatId);
+    const { files, truncated, supported, ok } = await fetchSessionFiles(chatId);
     // Third writer of the auto-open baseline, and it must claim the sequence
     // like the other two: an open-time seed still in flight would otherwise
     // land on top of what the user is looking at right now. The guard comes
@@ -5575,6 +5575,16 @@ function renderCoPresence(host, participants) {
     // for a conversation the user has since left puts that conversation's
     // download links under their cursor.
     if (seq !== _filesSeq || currentChatId !== chatId) return;
+    if (!ok) {
+      // A failed listing knows nothing, so it must not be written into the
+      // baseline: `files` is `[]` on failure, and adopting that would make
+      // the next turn re-report every pre-existing deliverable as fresh and
+      // pop the drawer over the reader. fetchSessionFiles has already
+      // surfaced the error banner (this path is not quiet); just retire the
+      // "Loading…" line and leave what we knew before intact.
+      setFilesStatus("");
+      return;
+    }
     renderFileList(chatId, files, truncated, supported);
     updateFilesBadge(files.length);
     _filesSessionId = chatId;

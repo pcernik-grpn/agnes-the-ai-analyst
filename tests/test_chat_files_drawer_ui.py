@@ -50,15 +50,20 @@ def _node_run(script: str) -> str:
 
 
 def _drawer_slice() -> str:
-    """The shipped auto-open block: the two event handlers plus their state.
+    """The shipped auto-open block: the two event handlers plus their state,
+    with the shipped ``loadSessionFiles`` (the manual open/refresh path, and
+    the third writer of the same baseline) appended.
 
-    Sliced from the constant that opens the block to the end of the IIFE, so
-    the test runs the real handlers rather than a copy that can drift.
+    Sliced from the source so the tests run the real handlers rather than a
+    copy that can drift. Declaration order does not matter — the harness only
+    calls into them after the whole script body has run.
     """
     js = _read(CHAT_JS)
     start = js.index('const OUTPUTS_PREFIX = "outputs/";')
-    end = js.index("})();", start)
-    return js[start:end]
+    block = js[start : js.index("})();", start)]
+    loader_start = js.index("async function loadSessionFiles")
+    loader = js[loader_start : js.index("// ── drawer open/close", loader_start)]
+    return block + "\n" + loader
 
 
 #: Stubs for everything the sliced block reaches out to. ``fetchSessionFiles``
@@ -78,16 +83,28 @@ const document = {
   addEventListener(name, fn) { (_handlers[name] = _handlers[name] || []).push(fn); },
 };
 const filesListEl = { replaceChildren() { listStatus.push("cleared"); } };
+const filesErrorEl = {};
+const errors = [];
 function setFilesStatus(s) { listStatus.push(s); }
+function clearDialogError() {}
+function showDialogError(el, msg) { errors.push(msg); }
 function updateFilesBadge(n) { badge.push(n); }
 function drawerOpen() { return _drawerIsOpen; }
 function renderFileList(chatId, files) { rendered.push([chatId, files.map((f) => f.path)]); }
 function openFilesDrawer() { opened += 1; _drawerIsOpen = true; }
-async function fetchSessionFiles(chatId) {
+let _failNext = false;
+async function fetchSessionFiles(chatId, { quiet = false } = {}) {
   const paths = _nextFiles(chatId);
   const d = _delayNext; _delayNext = 0;
+  const fail = _failNext; _failNext = false;
   if (d) await new Promise((r) => setTimeout(r, d));
-  return { files: paths.map((p) => ({ path: p })), truncated: false, ok: true };
+  if (fail) {
+    // Mirrors the shipped failure path: error surfaced unless quiet, empty
+    // result, ok:false.
+    if (!quiet) showDialogError(filesErrorEl, "Could not load session files");
+    return { files: [], truncated: false, supported: true, ok: false };
+  }
+  return { files: paths.map((p) => ({ path: p })), truncated: false, supported: true, ok: true };
 }
 """
 
@@ -200,6 +217,34 @@ def test_a_slow_open_seed_cannot_clobber_a_newer_turn_end_baseline():
         """
     )
     assert res["opened"] == 0, "the late seed must not reset the baseline the turn-end already advanced"
+
+
+def test_a_failed_refresh_does_not_wipe_the_auto_open_baseline():
+    """A listing that failed knows nothing — it must not be adopted as "these
+    are the deliverables I have seen".
+
+    `fetchSessionFiles` returns `files: []` with `ok: false`, so writing it
+    into the baseline empties it; the next turn then reads every pre-existing
+    file as brand new and pops the drawer over the reader, having been told
+    nothing new was produced. The two event handlers already checked `ok`;
+    `loadSessionFiles` — the manual open/Refresh path — did not.
+    """
+    res = _run_scenario(
+        """
+        currentChatId = "c1";
+        _nextFiles = () => ["outputs/report.docx"];
+        await fire("agnes:session-open", { chatId: "c1", switching: true });
+        _drawerIsOpen = true;
+        _failNext = true;                 // the user hits Refresh; it fails
+        await loadSessionFiles();
+        _drawerIsOpen = false; opened = 0;
+        await fire("agnes:turn-end");     // nothing new this turn
+        process.stdout.write(JSON.stringify({ opened, errors, badge }));
+        """
+    )
+    assert res["errors"], "the failure itself must still be surfaced to the user"
+    assert res["opened"] == 0, "a failed refresh must not turn a known file into a fresh one"
+    assert res["badge"][-1] != 0, "and must not report the count as zero either"
 
 
 def test_no_fetch_handler_paints_rows_for_a_conversation_the_user_has_left():
