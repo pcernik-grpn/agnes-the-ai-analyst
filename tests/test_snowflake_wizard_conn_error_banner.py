@@ -83,6 +83,39 @@ def test_conn_error_state_disables_reload_and_manual_entry_and_register():
     assert "ds-sf-picker-mode-dd-btn" in body
 
 
+def test_pointing_the_wizard_at_a_source_releases_the_conn_error_lock():
+    """Regression (Devin Review on #1635): two of the controls the lock
+    disables — `ds-wizard-register-btn` / `ds-wizard-finish-early-btn` — live
+    in the drawer's SHARED sticky foot, reused by the Keboola / BigQuery /
+    Databricks step 2. Only `_loadSfCatalog` ever cleared the lock, and only
+    on the Snowflake path, while `openWizard`/`closeWizard` reset neither the
+    buttons' `disabled` flags nor `_sfConnErrorActive` — so one failed
+    Snowflake listing left "Continue with selected tables" and "Register only
+    & finish" dead for every other source until a full page reload.
+
+    `_setWizSource` is the funnel every wizard entry goes through
+    (`openWizard` ends with it, the connector picker calls it, the
+    steps-strip's return to step 1 calls it), so releasing the lock there
+    covers reopen AND switching source inside an already-open wizard.
+    """
+    tpl = _template_text()
+    body = _function_body(tpl, "function _setWizSource(")
+    assert "_setSfConnErrorState(false)" in body, (
+        "_setWizSource must release the Snowflake connection-error lock — it "
+        "disables step-2 footer buttons shared with every other source"
+    )
+
+
+def test_open_wizard_routes_through_the_source_funnel_that_clears_the_lock():
+    """The release above is only load-bearing for a REOPEN because
+    `openWizard` ends by pointing the wizard at a source. Pin that call so a
+    refactor cannot drop it and silently restore the stuck-buttons bug.
+    """
+    tpl = _template_text()
+    body = _function_body(tpl, "function openWizard(")
+    assert "_setWizSource(" in body
+
+
 def test_conn_error_banner_reuses_the_design_system_danger_tokens():
     """Proper error styling, not the plain highlighted-line-of-text look the
     issue called out — same danger color tokens the rest of the page already

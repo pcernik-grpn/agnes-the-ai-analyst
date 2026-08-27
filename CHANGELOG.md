@@ -46,6 +46,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- The "Add data source" wizard's Snowflake table picker no longer renders a
+  raw, three-layer-wrapped driver exception when the connection itself can't
+  authenticate (e.g. an expired temporary password) — a routine first-connect
+  case, not an edge case. `GET /api/admin/data-sources/{source_type}/tables`
+  now classifies the failure into one short, human sentence (the full
+  exception still goes to the server log at WARNING for diagnosis); the
+  wizard renders it in a proper error banner with a "Fix connection" action
+  that jumps back to step 1, and disables Reload tables, the manual
+  schema/table entry, and "Continue with selected tables" while the
+  connection is in this state, since nothing past step 1 can succeed until
+  it's fixed. Two of those disabled controls ("Continue with selected
+  tables" and "Register only & finish") are the drawer's shared step-2
+  footer buttons, reused by the Keboola, BigQuery and Databricks steps, so
+  the lock is released whenever the wizard is pointed at a source — on
+  reopen and on switching connector — and not only by a fresh Snowflake
+  listing.
+
 ### Removed
 
 ### Internal
@@ -580,18 +597,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   admin-granted row to owner-granted.
 
 ### Fixed
-
-- The "Add data source" wizard's Snowflake table picker no longer renders a
-  raw, three-layer-wrapped driver exception when the connection itself can't
-  authenticate (e.g. an expired temporary password) — a routine first-connect
-  case, not an edge case. `GET /api/admin/data-sources/{source_type}/tables`
-  now classifies the failure into one short, human sentence (the full
-  exception still goes to the server log at WARNING for diagnosis); the
-  wizard renders it in a proper error banner with a "Fix connection" action
-  that jumps back to step 1, and disables Reload tables, the manual
-  schema/table entry, and "Continue with selected tables" while the
-  connection is in this state, since nothing past step 1 can succeed until
-  it's fixed.
 
 - `use_pg()` no longer reverts a Postgres instance running purely on the
   `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`

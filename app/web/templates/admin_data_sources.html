@@ -2838,6 +2838,21 @@ function _setWizSource(src) {
     connectBtn.style.display = "none";
   }
   document.getElementById("ds-wizard-error").style.display = "none";
+  // …and the Snowflake connection-error lock with it. That lock disables the
+  // two SHARED step-2 footer buttons ("Continue with selected tables" /
+  // "Register only & finish"), which the Keboola, BigQuery and Databricks
+  // step-2 panes reuse — but only `_loadSfCatalog` ever cleared it, and only
+  // on the Snowflake path. So one failed Snowflake listing left those two
+  // buttons dead for EVERY source, across reopens, until a full page reload:
+  // registration became impossible. Pointing the wizard at a source is the
+  // moment that lock is void, and it is the one funnel every entry goes
+  // through — `openWizard()` ends here, the connector picker calls here, and
+  // the steps-strip's return to step 1 calls here. Every caller is a step-1
+  // context (the picker lives there; "Fix connection" runs `_setWizStep(1)`
+  // first), so this can never clear a Snowflake error that is still on
+  // screen — and re-entering the Snowflake step re-runs the listing, which
+  // re-locks if the connection is still broken.
+  _setSfConnErrorState(false);
 }
 
 async function _loadBqCredStatus() {
@@ -3626,7 +3641,11 @@ function _renderSfRowsEditor() {
    way the listing just did — leave them live and the operator discovers
    that one dead click at a time. `_setSfConnErrorState(true, …)` shows the
    banner + "Fix connection" and disables all of them in one place;
-   `_loadSfCatalog` clears it (`false`) at the top of every fresh attempt. */
+   `_loadSfCatalog` clears it (`false`) at the top of every fresh attempt.
+   Two of the controls it disables — the register / register-only footer
+   buttons — are SHARED with the other sources' step 2, so the lock must also
+   be released whenever the wizard is pointed at a source at all: see the
+   `_setSfConnErrorState(false)` at the end of `_setWizSource`. */
 let _sfConnErrorActive = false;
 
 function _setSfConnErrorState(active, message) {
