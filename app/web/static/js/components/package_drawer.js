@@ -453,7 +453,15 @@
     var rows = selectedTables();
     var body;
     if (!rows.length) {
-      body = '<p class="ag-emptyrows">Nothing in it yet. Add the tables an analyst should receive.</p>';
+      // Same shape as the agent builder's empty slots (`emptySlot` in
+      // agents.html → .ag-slot): a bold line naming the state, one sentence
+      // on how to leave it, then the add row. A one-line grey sentence reads
+      // as a caption on a broken list rather than as an invitation.
+      body = '<div class="ag-slot">' +
+        '<p class="ag-slot-head">Nothing in it yet.</p>' +
+        '<p class="ag-slot-body">Say what it should carry — “our sales pipeline tables” — ' +
+        'and the builder proposes them. Or add them by hand.</p>' +
+      '</div>';
     } else {
       body = '<div class="ag-rows">' + rows.map(function (t) {
         // Dedupe: for an internal table the project, the source type and the
@@ -484,7 +492,9 @@
         count.className = 'pdw-count';
         els.tablesLabel.appendChild(count);
       }
-      count.textContent = rows.length ? '  ' + rows.length : '';
+      count.textContent = rows.length
+        ? rows.length + (rows.length === 1 ? ' table' : ' tables')
+        : 'none yet';
     }
     if (els.tablesReach) {
       var reach = reachCount(rows);

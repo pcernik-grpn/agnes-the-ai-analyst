@@ -152,6 +152,18 @@
   .sk-pvpane { flex: 1; overflow-y: auto; padding: 4px 22px 20px; }
   .sk-pvpane .sk-preview { position: static; }
   .sk-build-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 0 0 18px; }
+  /* What is being made, beside the title. Carries the kind accent so the
+     three types are told apart at a glance without a card to say so. */
+  .sk-typechip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650;
+    padding: 3px 10px 3px 8px; border-radius: var(--ds-radius-pill); white-space: nowrap; }
+  .sk-typechip-ico { display: inline-flex; width: 15px; height: 15px; }
+  .sk-typechip-ico svg { width: 15px; height: 15px; }
+  .sk-typechip--skill { color: var(--ds-kind-skill); background: var(--ds-kind-skill-soft); }
+  .sk-typechip--plugin { color: var(--ds-kind-plugin); background: var(--ds-kind-plugin-soft); }
+  .sk-typechip--agent { color: var(--ds-kind-agent); background: var(--ds-kind-agent-soft); }
+  .sk-typechip-change { font: inherit; font-size: 12px; padding: 2px 6px; border: none; background: none;
+    color: var(--ds-text-muted); text-decoration: underline; cursor: pointer; border-radius: 5px; }
+  .sk-typechip-change:hover, .sk-typechip-change:focus-visible { color: var(--ds-text-primary); }
   .sk-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-kind-skill); }
   .sk-build-kicker--skill { color: var(--ds-kind-skill); }
   .sk-build-kicker--plugin { color: var(--ds-kind-plugin); }
@@ -791,9 +803,9 @@
     if (cfg().source === 'bundle') {
       if (pluginSource() === 'library') {
         var n = componentIds().length;
-        return n ? n + ' item' + (n === 1 ? '' : 's') : '—';
+        return n ? n + ' item' + (n === 1 ? '' : 's') : 'none yet';
       }
-      return bundle ? fmtSize(bundle.size) : '—';
+      return bundle ? fmtSize(bundle.size) : 'no bundle yet';
     }
     var t = (draft.body || '').trim();
     if (!t) return '—';
@@ -1002,16 +1014,26 @@
 
   function contentsPanelHtml() {
     var picked = components();
+    // Empty reads like the agent builder's empty slots (`.ag-slot`): a bold
+    // line naming the state, one sentence on how to leave it. A single grey
+    // sentence reads as a caption on a broken list rather than an invitation.
     var rows = picked.length
       ? '<div class="ag-rows">' + picked.map(function (c) { return componentRowHtml(c, 'section'); }).join('') + '</div>'
-      : '<p class="ag-emptyrows">Nothing in it yet. Add the skills and agent templates this plugin should install.</p>';
+      : '<div class="ag-slot">' +
+          '<p class="ag-slot-head">Nothing in it yet.</p>' +
+          '<p class="ag-slot-body">Add the skills and agent templates this plugin should install. ' +
+          'They stay where they are — this copies them into one bundle.</p>' +
+        '</div>';
     return rows +
       '<button type="button" class="ag-addrow" data-sk-openpick>+ Add from the Library</button>' +
       // The sentence the builder was missing: someone who came here to ship a
       // skill they already saved is finished, and should be told so rather
-      // than left packaging something they do not need.
-      '<div class="sk-note">Each item you save to the Library already installs on its own — a plugin is for handing several over at once. ' +
-      'The items stay where they are; this copies them into one bundle.</div>';
+      // than left packaging something they do not need. Grey, like every other
+      // routine helper in the panel — the blue info treatment is for a NOTICE
+      // (see the engine one), and spending it on standing guidance is how a
+      // page ends up with three tinted blocks per section.
+      '<div class="ag-note">Each item you save to the Library already installs on its own — ' +
+      'a plugin is for handing several over at once.</div>';
   }
 
   function bundlePanelHtml() {
@@ -1187,6 +1209,7 @@
         backLabel: 'Library',
         title: draft.name || c.newTitle,
         titleId: 'sk-build-title',
+        badge: typeBadgeHtml(c),
         actionsId: 'sk-build-actions',
         actions: headActionsHtml(),
       }) +
@@ -1433,13 +1456,29 @@
 
   /* The configuration itself — the numbered sections, on the shell's own
      section component so they read identically to the agent builder's. */
+  /* What is being made, for the header. The type used to be section 1 of the
+     panel: a card with a ✓ where every other section has a number, spending
+     the most valuable slot in the column re-asking what "+ Add → Build a
+     skill" had already answered. It is identity, not configuration, so it
+     sits beside the title now and the sections start at Identity. Change is
+     still one click, and switching still parks the outgoing draft. */
+  function typeBadgeHtml(c) {
+    return '<span class="sk-typechip sk-typechip--' + type + '">' +
+        '<span class="sk-typechip-ico">' + ICONS[type] + '</span>' + esc(c.label) +
+      '</span>' +
+      '<button type="button" class="sk-typechip-change" data-sk-change>Change</button>';
+  }
+
   function stepsHtml(c, ns) {
-    return typeSectionHtml() +
-      // Section 2 — Identity. Same fields for every type, so switching
-      // type never moves the name field out from under the author.
-      BuilderShell.section({
+    // Section 1 — Identity. Same fields for every type, so switching type
+    // never moves the name field out from under the author.
+    //
+    // The comment goes ABOVE the return, not after it: `return` followed by a
+    // newline is a `return;` under automatic semicolon insertion, which is
+    // exactly how this rendered the word "undefined" into the panel once.
+    return BuilderShell.section({
         key: 'identity',
-        collapsed: !!collapsed['identity'], no: 2, title: 'Identity',
+        collapsed: !!collapsed['identity'], no: 1, title: 'Identity',
         sub: 'What it is called and when someone should reach for it.',
         summary: draft.name || 'Unnamed',
         body:
@@ -1454,22 +1493,21 @@
                 '<div class="sk-selectwrap"><select id="sk-category" data-sk-field="category" class="ds-dropdown-native">' + catOptions() + '</select>' + catDropdownHtml() + '</div></label>' +
           fieldErrHtml('category'),
       }) +
-      // Section 3 — the type's content: markdown body, or a .zip bundle.
+      // Section 2 — the type's content: markdown body, or a .zip bundle.
       BuilderShell.section({
         key: 'content',
-        collapsed: !!collapsed['content'], no: 3, title: c.secTitle, note: c.secNote, sub: c.secSub,
+        collapsed: !!collapsed['content'], no: 2, title: c.secTitle, note: c.secNote, sub: c.secSub,
         summary: bodyStats(),
         body: bodySectionHtml(),
       }) +
-          // Section 4 — Access. It used to sit ABOVE the sections as unnumbered
-          // preamble, which was fine while the sections started at Identity;
-          // once Type became step 1 that put an un-numbered decision in front
-          // of step 1 and broke the sequence. It is a publishing choice, so it
+          // Section 3 — Access. It used to sit ABOVE the sections as
+          // unnumbered preamble, which put an un-numbered decision in front of
+          // step 1 and broke the sequence. It is a publishing choice, so it
           // belongs last — pre-answered with the safe default, read right
           // before Save.
       BuilderShell.section({
         key: 'access',
-        collapsed: !!collapsed['access'], no: 4, title: 'Access',
+        collapsed: !!collapsed['access'], no: 3, title: 'Access',
         sub: 'Who can use this ' + c.label.toLowerCase() + ' once it is saved.',
         summary: draft.access === 'everyone' ? 'Everyone' : 'Private',
         body:

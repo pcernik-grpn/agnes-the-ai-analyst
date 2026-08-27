@@ -188,10 +188,17 @@
   /* The header strip: leave, identity, state, act. `actions` is pre-built —
      which verbs belong there depends on where the thing is in its life, and
      that is the host's call. */
+  /* `badge` is pre-built HTML shown between the back link and the title —
+     for what the thing IS, when that is fixed for the session rather than
+     configurable. /skills puts the entity type there: it is identity, not
+     configuration, and a whole panel section spent re-asking a question the
+     "+ Add" menu already answered was the least useful card in the most
+     valuable slot. Optional, so the agent builder is unaffected. */
   function head(o) {
     return (
       '<div class="ag-build-head">' +
         '<button type="button" class="ag-back" data-ag-back>← ' + esc(o.backLabel) + '</button>' +
+        (o.badge ? '<div class="ag-build-badge">' + o.badge + '</div>' : '') +
         '<div style="min-width:0;flex:1">' +
           '<h2 id="' + esc(o.titleId) + '">' + esc(o.title) + '</h2>' +
         '</div>' +
