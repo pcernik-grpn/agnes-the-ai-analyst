@@ -26,9 +26,9 @@ DEFAULT_STRUCTURED_OUTPUT = "auto"
 # pinning them to a specific dated model. Update here when bumping the
 # fleet to a newer model family — callers stay on the abstract tier.
 MODEL_TIERS: dict[str, str] = {
-    "haiku":  "claude-haiku-4-5-20251001",
+    "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
-    "opus":   "claude-opus-4-7",
+    "opus": "claude-opus-4-7",
 }
 
 
@@ -47,10 +47,7 @@ def resolve_model_tier(tier: str) -> str:
         return MODEL_TIERS[tier]
     if tier.startswith("claude-"):
         return tier
-    raise ValueError(
-        f"Unknown model tier {tier!r}. Use one of "
-        f"{sorted(MODEL_TIERS)} or a concrete claude-* model ID."
-    )
+    raise ValueError(f"Unknown model tier {tier!r}. Use one of {sorted(MODEL_TIERS)} or a concrete claude-* model ID.")
 
 
 def create_extractor(ai_config: dict) -> StructuredExtractor:
@@ -97,9 +94,7 @@ def create_extractor(ai_config: dict) -> StructuredExtractor:
         api_key = ai_config["anthropic_api_key"]
         _validate_api_key(api_key)
         model = ai_config.get("model", DEFAULT_MODEL)
-        logger.info(
-            "Creating AnthropicExtractor (legacy config), model=%s", model
-        )
+        logger.info("Creating AnthropicExtractor (legacy config), model=%s", model)
         return AnthropicExtractor(api_key=api_key, model=model)
 
     if not provider:
@@ -137,25 +132,24 @@ def create_extractor(ai_config: dict) -> StructuredExtractor:
         base_url = ai_config.get("base_url", "")
         if not base_url:
             raise ValueError(
-                "ai.base_url is required when provider is 'openai_compat'. "
-                "Example: base_url: https://api.openai.com/v1"
+                "ai.base_url is required when provider is 'openai_compat'. Example: base_url: https://api.openai.com/v1"
             )
         structured_output = ai_config.get(
-            "structured_output", DEFAULT_STRUCTURED_OUTPUT,
+            "structured_output",
+            DEFAULT_STRUCTURED_OUTPUT,
         )
         if structured_output not in ("strict", "json", "auto"):
-            raise ValueError(
-                f"ai.structured_output must be 'strict', 'json', or 'auto', "
-                f"got '{structured_output}'"
-            )
+            raise ValueError(f"ai.structured_output must be 'strict', 'json', or 'auto', got '{structured_output}'")
 
         verify_ssl = ai_config.get("verify_ssl", True)
 
         safe_url = _sanitize_url(base_url)
         logger.info(
-            "Creating OpenAICompatExtractor, url=%s, model=%s, "
-            "structured_output=%s, verify_ssl=%s",
-            safe_url, model, structured_output, verify_ssl,
+            "Creating OpenAICompatExtractor, url=%s, model=%s, structured_output=%s, verify_ssl=%s",
+            safe_url,
+            model,
+            structured_output,
+            verify_ssl,
         )
         return OpenAICompatExtractor(
             api_key=api_key,
@@ -199,15 +193,11 @@ def create_extractor_from_env_or_config(
     llm_key = os.environ.get("LLM_API_KEY", "").strip()
 
     if anthropic_key:
-        logger.info(
-            "No ai: block in instance.yaml; falling back to ANTHROPIC_API_KEY env var"
-        )
+        logger.info("No ai: block in instance.yaml; falling back to ANTHROPIC_API_KEY env var")
         return AnthropicExtractor(api_key=anthropic_key, model=DEFAULT_MODEL)
 
     if llm_key:
-        logger.info(
-            "No ai: block in instance.yaml; falling back to LLM_API_KEY env var"
-        )
+        logger.info("No ai: block in instance.yaml; falling back to LLM_API_KEY env var")
         return AnthropicExtractor(api_key=llm_key, model=DEFAULT_MODEL)
 
     vertex = vertex_config_or_none(None)
@@ -270,7 +260,12 @@ def vertex_config_or_none(ai_config: dict | None = None) -> tuple[str, str] | No
         return None
     try:
         return resolve_vertex_settings(None)
-    except ValueError:  # pragma: no cover - project id checked just above
+    except ValueError as e:
+        # Presence was checked just above, so this is the format check
+        # rejecting a malformed ANTHROPIC_VERTEX_PROJECT_ID / CLOUD_ML_REGION.
+        # Same posture as the ai-block branch: warn, report "not configured",
+        # and let the creation paths be the ones that raise.
+        logger.warning("Vertex env fallback is set but malformed: %s", e)
         return None
 
 
