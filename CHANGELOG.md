@@ -79,6 +79,160 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 
 - **Source-agnostic semantic-layer coverage check.** `GET /api/admin/semantic-coverage` (admin, CLI `agnes semantic-model coverage tables`, MCP `admin_semantic_coverage`) lists every registered table with NO valid semantic model describing it at all — reads what's already stored in `semantic_models` regardless of source (Keboola, git, manual, upload, connection), unlike the existing Keboola-only `GET /api/admin/semantic-layer/coverage`. Built on a new shared resolver, `resolve_dataset_table()`, which `project_document`'s metric binder now also uses so a Keboola dataset (bound via its raw Keboola tableId) is never misreported as uncovered by a naive text match.
+- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
+  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
+  collection an admin creates via the Library/API is granted to the `Everyone`
+  group at creation, so admin uploads are workspace-visible — in the Library,
+  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
+  without a manual share step. The grant is an ordinary revocable Everyone
+  grant; non-admin uploads and chat file drops stay private. The
+  `POST /api/collections` response now reports the resulting `visibility`
+  (`workspace`/`private`).
+- **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
+  (remediation-program Track C1.1, additive — the builder router is
+  unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
+  the builder's wire fields (`role`, `instructions` as an alias for the
+  existing `system_prompt`, `tone`, `greeting`, `knowledge`, `plugins`,
+  `surfaces`, `status`, `template_entity_id`); `slug` is now optional on
+  create and auto-derived from `name` when omitted. A `knowledge`/`plugins`
+  write goes through the SAME `_sync_builder_scope` mapping the builder
+  uses and forces any of the four `*_mode` columns the caller left unset to
+  `'selected'` on that same write — exactly like the builder's own PATCH —
+  so `agent_scope` enforcement is identical through either surface and an
+  agent sitting at `mode='all'` (e.g. the seeded default) cannot keep
+  passing its owner's whole stack through on an axis a `knowledge`/`plugins`
+  edit didn't mention. A draft agent's slug follows a rename exactly like
+  the builder's own PATCH does. `GET /api/v1/agents{,/{id}}` decode
+  `knowledge`/`plugins`/`surfaces` into structured JSON (previously opaque
+  text) and now include
+  agents shared into one of the caller's groups, not just owned ones — the
+  same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
+  also cleans up sharing grants on delete, closing a gap versus the
+  builder's own delete.
+- **`agent_scope` rows now record who granted them, and a non-admin writer
+  can no longer declare a data item they cannot themselves reach**
+  (remediation-program Track C2.1, staged agent-owned authority — no
+  behavior change for existing agents, a backfill attributes every
+  pre-existing row to its agent's owner). Every write to `PUT
+  /api/v1/agents/{id}/scope` and the builder-shape `knowledge` write
+  (`POST`/`PUT /api/v1/agents`) now records the authenticated caller as
+  `granted_by` (Postgres-only column — see Internal below), and refuses a
+  non-admin caller's `table`/`data_package`/`collection`/`connection` item
+  with `403 scope_item_not_accessible` when they do not currently hold it
+  themselves; an admin caller is unconditioned. `plugin`/`memory_domain`/
+  `slack_channel` items are unaffected. Runtime scope resolution is
+  unchanged by this step (still today's owner intersection) — a later task
+  uses `granted_by` to let an admin-shared agent reach items its owner
+  personally does not hold.
+
+### Changed
+
+- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
+  `none` (internal-only network, no route to the internet) instead of `open`.
+  The chat agent runs with bypassed tool permissions over a read-write
+  workspace, so an open default was a file-exfiltration surface. Operators who
+  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
+  with `chat.docker_egress_mode: open`, or `allowlist` +
+  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
+  or blank value now fails closed to `none`.
+
+### Fixed
+
+- **A failed auto-draft session no longer disables its table forever.** The
+  semantic auto-draft sweep stamps each table's `semantic_draft_pending_at`
+  before invoking its session, and only a concurrency-cap hit un-stamped it
+  again. Any other failure — a broker/LLM error, a session-spawn failure —
+  left the flag set with no `authoring_suggestions` row that could ever
+  clear it, so `tables_without_semantic_coverage` dropped that table from
+  every later tick and it was never drafted again, silently; the same
+  exception also 500'd the whole request, abandoning the rest of the batch.
+  Any session failure now clears the flag, is logged, is counted in a new
+  `errored` field on the response, and the sweep continues to the next
+  table. Un-stamping a session that may have survived can at worst cost a
+  duplicate draft (one extra queued suggestion an admin rejects) — bounded
+  and visible, unlike permanent silent exclusion (Devin review).
+
+- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
+  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
+  labels now render via `textContent`, keeping the static sort markup trusted.
+- Agent-session principals no longer crash (500) when reaching collection
+  authorization (`accessible_collection_ids`, `require_collection_access`);
+  an `AgentPrincipal` now resolves to its live scoped-collection intersection
+  or a clean 403, matching the existing co-session/agent-session seam and
+  never inheriting owner-owned collections.
+- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
+  the same canonical subpath used for policy and dispatcher classification, and
+  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
+  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
+  path like `/v1/./messages` that classified as a non-message call — skipping
+  its pinned-model allowlist and monthly token budget — while HTTPX
+  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
+  duplicate-slash message paths can likewise no longer route the destination
+  somewhere the authorization decision did not intend.
+- Token persistence refuses to write (instead of silently downgrading to
+  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
+  valid Fernet key; a genuinely unset key still uses the plaintext keyless
+  fallback as before. A previously-silent misconfigured production vault now
+  fails loudly on secret saves instead of writing the secret in cleartext.
+- `_run_materialized_pass` now calls `sync_state.set_error(...)` for a
+  `query_mode='materialized'` row whose connector is unconfigured — a
+  Snowflake/Databricks row with no resolvable connection settings, or a
+  Keboola row whose `connection_id` has no matching credential. These three
+  branches previously recorded the failure only in the run's in-memory
+  summary and `continue`d without touching `sync_state`, unlike every other
+  materialize failure path (budget-exceeded, generic exception): a table
+  stuck this way had no `sync_state` row at all, so `GET /api/admin/registry`
+  / `agnes admin list-tables` reported it as merely "never synced" with no
+  indication why.
+
+### Security
+
+- Knowledge-digest generation now frames corpus source chunks as untrusted
+  data — behind an explicit do-not-follow-instructions notice and a per-call
+  nonce-delimited fence — before they reach the LLM, so retrieved content can
+  no longer be elevated into persistent agent instructions through the
+  generated `.claude/rules/ka_<slug>.md` digest.
+
+### Internal
+
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
+
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
+### Added
+
+- **Source-agnostic semantic-layer coverage check.** `GET /api/admin/semantic-coverage` (admin, CLI `agnes semantic-model coverage`, MCP `admin_semantic_coverage`) lists every registered table with NO valid semantic model describing it at all — reads what's already stored in `semantic_models` regardless of source (Keboola, git, manual, upload, connection), unlike the existing Keboola-only `GET /api/admin/semantic-layer/coverage`. Built on a new shared resolver, `resolve_dataset_table()`, which `project_document`'s metric binder now also uses so a Keboola dataset (bound via its raw Keboola tableId) is never misreported as uncovered by a naive text match.
 - **`semantic-drafter` system identity**, provisioned via `app.auth.system_users.ensure_semantic_drafter_user()` — the non-human identity a headless semantic-model auto-drafting session authenticates as. Unlike the scheduler service user, it is deliberately never added to the Admin group, so its writes route through `POST /api/semantic-models/apply`'s non-admin moderation queue rather than landing directly.
 - **Semantic-layer auto-draft sweep, Postgres app-state only (post-A3).** `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every 55 minutes) drafts a semantic model for a bounded batch of tables with zero semantic-layer coverage via a headless `semantic-model-builder` chat session, authenticated as the non-admin `semantic-drafter` identity — every draft lands in the `authoring_suggestions` moderation queue exactly like a human-submitted proposal, never applied directly. Dedup bookkeeping (`table_registry.semantic_draft_pending_at`, PG-only per the A3 ratchet — no DuckDB migration step) is stamped before each session runs, so a concurrent sweep tick can never double-pick a table; the flag clears once an admin resolves the resulting suggestion, approve or reject alike. The resolve-hook clearing this flag runs on every semantic-layer suggestion's approve/reject regardless of backend — human-submitted or auto-drafted alike — but no-ops cleanly on the frozen DuckDB app-state backend, where there is no flag to clear. A session hitting the chat concurrency cap is counted and skipped, never a 500, and has its dedup flag cleared again on the way out — the cap is enforced before the session starts, so no suggestion would ever exist to clear it and the table would otherwise be excluded from every later sweep permanently. On an instance still running the frozen DuckDB app-state backend, the sweep endpoint itself fails clean with a typed `501`.
 - **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
