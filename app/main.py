@@ -564,6 +564,7 @@ from app.api.data_apps_proxy import router as data_apps_proxy_router
 from app.web.router import router as web_router
 from app.web.router import apps_web_router as data_apps_web_router
 from app.api.chat import router as chat_router
+from app.api.chat_session_files import router as chat_session_files_router
 from app.api.chat_uploads import router as chat_uploads_router
 from app.api.chat_copresence import router as chat_copresence_router
 from app.api.slack import router as slack_router
@@ -2964,6 +2965,7 @@ def create_app() -> FastAPI:
     app.include_router(marketplace_server_router)
     app.include_router(chat_router)
     app.include_router(chat_uploads_router)
+    app.include_router(chat_session_files_router)
     app.include_router(chat_copresence_router)
     app.include_router(slack_router)
     app.include_router(admin_chat_router)

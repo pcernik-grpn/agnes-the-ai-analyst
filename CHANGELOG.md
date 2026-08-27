@@ -45,6 +45,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   first time the app grows a surface. `agnes app set-description` and the
   `data_app_set_description` MCP tool drop their managed-only wording.
 
+- **Web chat can now deliver session-workspace files** (#1611). A "Files"
+  button in the conversation header lists the files in the session's
+  workspace, newest first — including deliverables a skill rendered into the
+  sandbox (a `.docx` SOW, a `.pptx` deck) that were previously unreachable
+  from the browser — with a download action and a "Save to Library" action
+  per file. Backed by three owner-scoped endpoints
+  (`GET /api/chat/sessions/{id}/files`, `GET …/files/download`,
+  `POST …/files/save-artefact`): every requested path is validated and
+  realpath-contained to the caller's own session dir/workspace (an
+  agent-written symlink escaping them 404s), downloads are always served
+  `attachment` + `nosniff` with active content types pinned to
+  `application/octet-stream`, and save-to-Library reuses the same
+  single-file-artefact bridge as the chat composer upload. Sessions run on
+  a remote turn engine list empty (their files live in the remote sandbox —
+  delivering those needs an engine-side channel).
+
 - **`agnes admin config export` / `agnes admin config apply`** round-trip the
   server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
   only) as reviewable YAML — the "onboard a new client via a reviewed PR"
@@ -386,8 +402,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   own infrastructure behind the same RBAC.
 
 ### Changed
+- **The bundled data-apps skill now tells agents to build figures from metric
+  definitions rather than hand-written SQL.** `agnes-data-apps-extras`'
+  data-reading reference sanctioned `runQuery(sql)` and said nothing about
+  metrics — the word did not appear in it once — so an app built by following it
+  computed its numbers with its own SQL and could quietly disagree with the rest
+  of the organization's reporting. It now leads with the two-call pattern
+  (`GET /api/metrics/<id>` for the canonical definition, then run *its* SQL),
+  which also means the app holds no copy of the SQL and picks up a central
+  correction on its next load. This is the rule the root workspace `CLAUDE.md`
+  already gives every other agent reading Agnes data ("never invent metric
+  calculations"); apps were the gap. Hand-written SQL stays correct where no
+  metric exists.
 
 - Admin sidebar's Activity entry for `/admin/chat` is now labelled "Chat runners", matching the page's own title, instead of "Chat sessions" — which read as a sibling of the adjacent "Analyst sessions" (uploaded Claude Code session files) rather than the runner dashboard it actually is.
+- **Auth emails (invite, password reset, magic link) are branded multipart
+  messages** instead of a bare one-line plaintext with a token URL — the shape
+  that commonly landed in spam. All three now share one email-safe HTML layout
+  (`app/auth/email_templates.py`): instance name as the `From:` display name
+  and in the subject, a sentence of context, one CTA button, the link's
+  validity (7 days / 24 hours / 1 hour, derived from the enforcing constants),
+  a plain-URL fallback, and a "didn't expect this? safely ignore" footer. A
+  plaintext part with the same copy is always included; no images or external
+  resources.
 
 - **BREAKING (infra pins): the `customer-instance` Terraform module's
   `data_source` variable stops rewriting a `DATA_SOURCE=...` line into

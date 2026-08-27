@@ -278,9 +278,10 @@ def _render_setup_form(request: Request, email: str, token: str, name: str = "",
     return templates.TemplateResponse(request, "password_setup.html", ctx)
 
 
-def _send_mail(to_email: str, subject: str, body_text: str) -> bool:
-    """Send a plaintext email via SMTP. Returns True on success, False when
-    no transport is configured or delivery failed (failures are logged).
+def _send_mail(to_email: str, subject: str, body_text: str, body_html: str | None = None) -> bool:
+    """Send an email via SMTP (multipart when ``body_html`` is given).
+    Returns True on success, False when no transport is configured or
+    delivery failed (failures are logged).
 
     SMTP relay is the only transport — SendGrid works through
     ``SMTP_HOST=smtp.sendgrid.net`` (see ``app.auth._common.send_smtp_email``
@@ -291,7 +292,7 @@ def _send_mail(to_email: str, subject: str, body_text: str) -> bool:
     if not _has_email_transport():
         return False
     try:
-        send_smtp_email(to_email, subject, body_text)
+        send_smtp_email(to_email, subject, body_text, body_html)
         return True
     except Exception:
         logger.exception("Failed to send mail to %s", to_email)
@@ -300,6 +301,8 @@ def _send_mail(to_email: str, subject: str, body_text: str) -> bool:
 
 def send_reset_email(request: Request, email: str, token: str) -> bool:
     """Deliver a password-reset link. In LOCAL_DEV_MODE logs the link as well."""
+    from app.auth.email_templates import reset_email
+
     link = build_reset_url(request, email, token)
     if is_local_dev_mode():
         logger.warning("=" * 60)
@@ -308,10 +311,13 @@ def send_reset_email(request: Request, email: str, token: str) -> bool:
         logger.warning("=" * 60)
     if not _has_email_transport():
         return False
-    return _send_mail(email, "Reset your password", f"Click to reset your password: {link}")
+    subject, body_text, body_html = reset_email(email, link, RESET_TOKEN_TTL)
+    return _send_mail(email, subject, body_text, body_html)
 
 
 def send_setup_email(request: Request, email: str, token: str) -> bool:
+    from app.auth.email_templates import invite_email
+
     link = build_setup_url(request, email, token)
     if is_local_dev_mode():
         logger.warning("=" * 60)
@@ -320,7 +326,8 @@ def send_setup_email(request: Request, email: str, token: str) -> bool:
         logger.warning("=" * 60)
     if not _has_email_transport():
         return False
-    return _send_mail(email, "Set up your account", f"Click to set up your password: {link}")
+    subject, body_text, body_html = invite_email(email, link, SETUP_TOKEN_TTL)
+    return _send_mail(email, subject, body_text, body_html)
 
 
 # ---- Existing flows ----

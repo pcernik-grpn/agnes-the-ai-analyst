@@ -5379,6 +5379,153 @@ function renderCoPresence(host, participants) {
     });
   }
 
+  // ── Session files (#1611) ─────────────────────────────────────────────────
+  // The way OUT for files the agent generated in the session workspace: the
+  // header "Files" button opens an overlay listing the session's files
+  // (GET .../files), each row with a download link (GET .../files/download —
+  // served attachment+nosniff) and a save-to-Library action
+  // (POST .../files/save-artefact). Rows are built with createElement +
+  // textContent — file names/paths are agent-chosen strings, never innerHTML.
+
+  const FILES_OVERLAY = "chat-files-overlay";
+  const filesListEl = $("chat-files-list");
+  const filesStatusEl = $("chat-files-status");
+  const filesErrorEl = $("chat-files-error");
+
+  function fmtWhen(iso) {
+    try { return new Date(iso).toLocaleString(); } catch (_) { return ""; }
+  }
+
+  function setFilesStatus(msg) {
+    if (!filesStatusEl) return;
+    filesStatusEl.textContent = msg || "";
+    filesStatusEl.hidden = !msg;
+  }
+
+  function renderFileRow(chatId, f) {
+    const li = document.createElement("li");
+    li.className = "cloud-chat-files-row";
+
+    const meta = document.createElement("div");
+    meta.className = "cloud-chat-files-meta";
+    const name = document.createElement("span");
+    name.className = "cloud-chat-files-name";
+    name.textContent = f.name;
+    name.title = f.path;
+    const hint = document.createElement("span");
+    hint.className = "cloud-chat-files-hint";
+    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    meta.appendChild(name);
+    meta.appendChild(hint);
+
+    const actions = document.createElement("div");
+    actions.className = "cloud-chat-files-actions";
+
+    const dl = document.createElement("a");
+    dl.className = "btn btn-secondary cloud-chat-files-btn";
+    dl.textContent = "Download";
+    dl.href =
+      "/api/chat/sessions/" + encodeURIComponent(chatId) +
+      "/files/download?path=" + encodeURIComponent(f.path);
+    dl.setAttribute("download", f.name);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn btn-secondary cloud-chat-files-btn";
+    save.textContent = "Save to Library";
+    save.title = "Keep a copy in your Library — it outlives this session";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      save.textContent = "Saving…";
+      clearDialogError(filesErrorEl);
+      try {
+        const res = await fetch(
+          "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files/save-artefact",
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: f.path }),
+          }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const link = document.createElement("a");
+          link.className = "btn btn-secondary cloud-chat-files-btn";
+          link.textContent = "In Library ↗";
+          link.href = data.library_url || "/library";
+          link.target = "_blank";
+          link.rel = "noopener";
+          save.replaceWith(link);
+          showToast("Saved to your Library", "ok");
+        } else {
+          let msg = "Could not save to Library.";
+          try {
+            const j = await res.json();
+            if (j && j.detail) msg = String(j.detail);
+          } catch (_) {}
+          showDialogError(filesErrorEl, msg);
+          save.disabled = false;
+          save.textContent = "Save to Library";
+        }
+      } catch (err) {
+        showDialogError(filesErrorEl, "Could not save to Library: " + String(err));
+        save.disabled = false;
+        save.textContent = "Save to Library";
+      }
+    });
+
+    actions.appendChild(dl);
+    actions.appendChild(save);
+    li.appendChild(meta);
+    li.appendChild(actions);
+    return li;
+  }
+
+  async function loadSessionFiles() {
+    if (!filesListEl) return;
+    const chatId = currentChatId;
+    if (!chatId) return;
+    clearDialogError(filesErrorEl);
+    setFilesStatus("Loading…");
+    filesListEl.replaceChildren();
+    try {
+      const res = await fetch(
+        "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files",
+        { credentials: "same-origin" }
+      );
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const files = data.files || [];
+      if (!files.length) {
+        setFilesStatus(
+          "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
+        );
+        return;
+      }
+      setFilesStatus(data.truncated ? "Showing the most recent files only." : "");
+      files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+    } catch (err) {
+      setFilesStatus("");
+      showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+    }
+  }
+
+  const filesBtn = $("chat-session-files");
+  if (filesBtn) {
+    filesBtn.addEventListener("click", () => {
+      if (!currentChatId) {
+        showToast("Open a conversation first", "error");
+        return;
+      }
+      openOverlay(FILES_OVERLAY);
+      loadSessionFiles();
+    });
+  }
+  const filesRefreshBtn = $("chat-files-refresh");
+  if (filesRefreshBtn) filesRefreshBtn.addEventListener("click", loadSessionFiles);
+  wireCloseButtons(FILES_OVERLAY);
+
 })();
 
 (async () => {
