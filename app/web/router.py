@@ -7644,6 +7644,24 @@ async def admin_semantic_layer_page(
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
 
 
+# Shell-only route — every dynamic bit (list/add/sync/delete) is client-fetched
+# against the existing /api/admin/semantic-sources* REST API
+# (app/api/semantic_models.py), same pattern as /admin/mcp-sources above. This
+# is upstream of /admin/semantic-layer: that page reports whether what was
+# IMPORTED is complete and healthy (cross-domain coverage/health/mute/
+# feedback); this one manages WHERE it comes from — `semantic_source` rows of
+# any kind (git/upload/connection) and any registered adapter (native/
+# keboola_metastore/snowflake_semantic/databricks_metric_views).
+@router.get("/admin/semantic-sources", response_class=HTMLResponse)
+async def admin_semantic_sources_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """List page for registered semantic sources."""
+    ctx = _build_context(request, user=user)
+    return templates.TemplateResponse(request, "admin_semantic_sources.html", ctx)
+
+
 @router.get("/admin/database", response_class=HTMLResponse)
 async def admin_database_page(
     request: Request,
