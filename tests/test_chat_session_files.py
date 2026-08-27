@@ -232,11 +232,28 @@ def test_list_empty_when_session_dir_missing(data_dir: Path) -> None:
 _KAI_CONFIG = SimpleNamespace(provider="kai-agent", kai_agent_url="http://engine.invalid:3000")
 
 
-def test_list_under_kai_agent_reports_unsupported_not_workspace_noise(data_dir: Path, session_dir: Path) -> None:
+def _engine_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the engine transport at a 404-everything engine (an engine
+    build without the sandbox-files routes / an unknown chat) and stub the
+    JWT mint. The full proxy behavior matrix lives in
+    tests/test_chat_kai_engine_files.py."""
+    import httpx
+
+    import app.api.chat_session_files as mod
+    from app.api import kai
+
+    monkeypatch.setattr(mod, "_ENGINE_TRANSPORT", httpx.MockTransport(lambda request: httpx.Response(404)))
+    monkeypatch.setattr(kai, "mint_engine_session_token", lambda email, chat_id: ("jwt", 0))
+
+
+def test_list_under_kai_agent_reports_unsupported_not_workspace_noise(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Under kai-agent the host session dir exists but holds only workspace
     template symlinks — listing it would surface hundreds of files that are
-    not session output. Until the engine proxy answers, the listing must be
-    an honest ``supported: false``, never the template noise."""
+    not session output. When the engine has no files channel, the listing
+    must be an honest ``supported: false``, never the template noise."""
+    _engine_gone(monkeypatch)
     noise = session_dir.resolve() / ".claude" / "skills" / "sales-proposal" / "SKILL.md"
     noise.write_bytes(b"template noise")
     app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG)
@@ -248,7 +265,13 @@ def test_list_under_kai_agent_reports_unsupported_not_workspace_noise(data_dir: 
     assert body["supported"] is False
 
 
-def test_download_and_save_artefact_404_under_kai_agent_without_engine(data_dir: Path, session_dir: Path) -> None:
+def test_download_and_save_artefact_404_under_kai_agent_without_engine(
+    data_dir: Path, session_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host files must be unreachable through an engine-backed session even
+    when they exist on disk — the engine (which 404s here) is the only
+    source of truth for what the session produced."""
+    _engine_gone(monkeypatch)
     (session_dir / "real.txt").write_bytes(b"host bytes the engine session must not serve")
     app = _make_app(data_dir=data_dir, chat_config=_KAI_CONFIG)
     client = TestClient(app)
