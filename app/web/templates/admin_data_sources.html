@@ -3572,7 +3572,7 @@ function _renderSfRowsEditor() {
     "Pick the Snowflake tables to register — or name one by hand if it is not listed.";
   body.innerHTML = `
     <div class="ds-sf-conn-error" id="ds-sf-conn-error" role="alert">
-      <span class="ds-sf-conn-error__icon" aria-hidden="true">⚠</span>
+      <span class="ds-sf-conn-error__icon" aria-hidden="true">{{ ico.icon('warning', 18) }}</span>
       <span class="ds-sf-conn-error__msg"></span>
       <button type="button" class="btn btn-secondary" id="ds-sf-conn-error-fix">Fix connection</button>
     </div>
