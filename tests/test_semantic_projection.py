@@ -58,15 +58,87 @@ DOC = {
 
 def test_projects_metrics_and_columns(system_db):
     report = project_document(DOC, source="git", source_ref="repo-a")
-    assert report.metrics_written == 1
+    # "revenue" (ANSI_SQL, locally runnable) and "wh_only" (SNOWFLAKE-only,
+    # not locally runnable) both project — a warehouse-specific dialect is no
+    # longer dropped, see test_warehouse_only_metric_projects_with_a_note.
+    assert report.metrics_written == 2
     assert report.columns_written == 1
 
 
-def test_unusable_metric_is_reported_not_written(system_db):
+def test_warehouse_only_metric_projects_with_a_note(system_db):
+    """A metric whose only declared expression dialect is warehouse-specific
+    (here SNOWFLAKE) still lands in `metric_definitions` — the raw expression
+    as its SQL, with a note naming the dialect and pointing at server-side
+    execution — rather than vanishing from the catalog."""
+    from src.repositories import metric_repo
+
     report = project_document(DOC, source="git", source_ref="repo-a")
-    skipped = [s for s in report.skipped if s["name"] == "wh_only"]
+
+    assert report.skipped == []
+    warehouse_only = [w for w in report.warehouse_only if w["name"] == "wh_only"]
+    assert len(warehouse_only) == 1
+    assert warehouse_only[0]["dialect"] == "SNOWFLAKE"
+
+    row = metric_repo().get("git/repo-a/retail/wh_only")
+    assert row is not None
+    assert row["sql"] == "TRY_CAST(x AS NUMBER)"
+    notes = row["notes"] or []
+    assert any("SNOWFLAKE" in n for n in notes)
+
+
+def test_no_expression_at_all_is_still_skipped(system_db):
+    """Distinct from the warehouse-only case: a metric that declares no
+    expression in ANY dialect is a genuinely incomplete document and is still
+    reported as skipped, never written."""
+    from src.repositories import metric_repo
+
+    doc = {
+        "semantic_model": [
+            {
+                "name": "core",
+                "datasets": [_stub_dataset()],
+                "metrics": [{"name": "no_expr", "expression": {"dialects": []}}],
+            }
+        ]
+    }
+    report = project_document(doc, source="git", source_ref="repo-c")
+    skipped = [s for s in report.skipped if s["name"] == "no_expr"]
     assert len(skipped) == 1
-    assert "SNOWFLAKE" in skipped[0]["reason"]
+    assert report.warehouse_only == []
+    assert metric_repo().get("git/repo-c/core/no_expr") is None
+
+
+def test_local_dialect_still_wins_over_a_warehouse_one(system_db):
+    """Regression: when a metric offers BOTH a local (DUCKDB/ANSI_SQL) and a
+    warehouse-specific dialect, the local one is used and it is NOT reported
+    as warehouse-only — unchanged behavior from before this fix."""
+    from src.repositories import metric_repo
+
+    doc = {
+        "semantic_model": [
+            {
+                "name": "core",
+                "datasets": [_stub_dataset()],
+                "metrics": [
+                    {
+                        "name": "both",
+                        "expression": {
+                            "dialects": [
+                                {"dialect": "SNOWFLAKE", "expression": "TRY_CAST(a AS NUMBER)"},
+                                {"dialect": "DUCKDB", "expression": "CAST(a AS DOUBLE)"},
+                            ]
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    report = project_document(doc, source="git", source_ref="repo-d")
+    assert report.skipped == []
+    assert report.warehouse_only == []
+    row = metric_repo().get("git/repo-d/core/both")
+    assert row is not None
+    assert row["sql"] == "CAST(a AS DOUBLE)"
 
 
 def _stub_dataset(name="orders"):
