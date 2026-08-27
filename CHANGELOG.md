@@ -338,6 +338,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   own infrastructure behind the same RBAC.
 
 ### Changed
+- **The bundled data-apps skill now tells agents to build figures from metric
+  definitions rather than hand-written SQL.** `agnes-data-apps-extras`'
+  data-reading reference sanctioned `runQuery(sql)` and said nothing about
+  metrics — the word did not appear in it once — so an app built by following it
+  computed its numbers with its own SQL and could quietly disagree with the rest
+  of the organization's reporting. It now leads with the two-call pattern
+  (`GET /api/metrics/<id>` for the canonical definition, then run *its* SQL),
+  which also means the app holds no copy of the SQL and picks up a central
+  correction on its next load. This is the rule the root workspace `CLAUDE.md`
+  already gives every other agent reading Agnes data ("never invent metric
+  calculations"); apps were the gap. Hand-written SQL stays correct where no
+  metric exists.
 
 - **BREAKING (infra pins): the `customer-instance` Terraform module's
   `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
