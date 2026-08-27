@@ -21,6 +21,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **The chat agent is now told where to leave a file it produces.** The
+  workspace prompt claimed the agent had "no way to hand the user a file" —
+  true when inline SVG was the only channel out, false since the session-files
+  panel shipped, and it actively steered the agent away from producing the
+  deliverable a user asked for. Replaced with a `Handing over a file` section
+  (sandbox surface only — on a laptop workspace the filesystem IS the user's
+  machine): write deliverables to `outputs/` under a descriptive filename,
+  never into `.claude/` or another dot-directory, name the file in the reply,
+  and don't promise a download control the agent cannot see. `outputs/` is the
+  one location all three collectors agree on — the agent-API harvest scans
+  `/work/outputs`, the engine's sandbox file browser lists the workspace tree
+  while filtering dot-directories, and the host walk lists the session dir —
+  so a skill that rendered into `.claude/skills/<name>/` produced a file no
+  surface could show. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
+
 ### Fixed
 
 ### Removed
