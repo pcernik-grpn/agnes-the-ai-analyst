@@ -45,6 +45,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **Dark theme: several light-hex backgrounds that never flipped now use
+  `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
+  `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),
+  `home.css` (the "setup script copied" confirmation modal), `admin.css`,
+  and `stack_card.css` (`.stack-card__btn--remove/--required`,
+  `.admin-only-hint`) previously pinned a light background under theme-aware
+  ink — the same invisible-text shape as #656 and #1193, now widened into a
+  guard (`tests/test_design_system_contract.py::test_no_raw_hex_light_background_outside_theme_scope`)
+  that scans every shipped stylesheet, not just the templates a past sweep
+  happened to touch. Part of #1625.
 
 ### Removed
 

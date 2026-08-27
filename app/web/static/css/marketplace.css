@@ -309,6 +309,12 @@
     box-shadow: 0 6px 20px color-mix(in srgb, var(--ds-primary) 12%, transparent);
     transform: translateY(-2px);
   }
+  /* #1625: the trailing #fce7f3 stays raw hex on purpose. `.mp-card` only
+     renders on the retired standalone marketplace browse page (no template
+     in this codebase builds it today — the comment below already documents
+     this gradient as the deliberate "unknown type" fallback, distinct by
+     design from the --ds-accent-* per-type tints two rules down); converting
+     it risks colliding with one of those named accents for no live benefit. */
   .mp-card .photo {
     width: 100%; height: 120px;
     display: flex; align-items: center; justify-content: center;

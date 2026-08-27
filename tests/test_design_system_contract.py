@@ -1106,6 +1106,181 @@ def test_light_only_tint_detector_flattens_media_queries() -> None:
     assert len(light_only_tint_offenders(nested, {"--ds-agnes-soft"})) == 1
 
 
+# ── Raw-hex dark-mode guard, widened to every shipped stylesheet ───────────
+# #1625: three bugs (#656, #1193, and the /admin/access report this issue
+# opens with) share one root cause — a `background`/`background-color`
+# written as a literal light hex instead of a --ds-* token, in a rule with no
+# `[data-theme]` scope. The theme-aware ink around it flips; the literal fill
+# does not; the two go illegible together. The two guards above this one
+# don't catch this shape: `light_only_tint_offenders` only looks at
+# `var(--ds-*-soft)` fills, and `test_legacy_selectors_use_no_raw_hex_literals`
+# / `test_swept_templates_use_no_raw_hex` only cover the specific selectors
+# and templates their respective sweeps (#400, #419) touched. This guard
+# covers every `*.css` file the app ships (vendor excluded) — the same sweep
+# that found 53 hits across six files (#1625's own audit).
+_RAW_HEX_BG_RE = re.compile(r"#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b")
+_BG_DECL_RE = re.compile(r"(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)")
+# `var(--token, #hex)` fallbacks are benign while the token exists (same
+# carve-out as test_no_legacy_primary_token_with_hex_fallback above) — only
+# fires once the compat shim is removed, which is a different, already-guarded
+# regression.
+_VAR_HEX_FALLBACK_RE = re.compile(r"var\([^)]*,\s*#[0-9a-fA-F]{3,6}\)")
+
+
+def _hex_luminance(hexval: str) -> float:
+    h = hexval.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return _relative_luminance((r, g, b))
+
+
+def raw_hex_light_background_offenders(css: str) -> list[tuple[str, str, float]]:
+    """`(selector, hex, luminance)` for every un-themed rule whose
+    background/background-color contains a light (luminance > 0.6) raw hex
+    literal — the exact shape of #656 / #1193 / #1625. Rules scoped to
+    `[data-theme="…"]` or `prefers-color-scheme` are exempt: they declare
+    their own per-theme value by construction, which is the fix, not the bug.
+    """
+    offenders: list[tuple[str, str, float]] = []
+    for selector, body in _css_rules(css):
+        if _THEME_SCOPED_RE.search(selector) or "prefers-color-scheme" in selector:
+            continue
+        for m in _BG_DECL_RE.finditer(body):
+            value = _VAR_HEX_FALLBACK_RE.sub("", m.group(1))
+            for hexval in _RAW_HEX_BG_RE.findall(value):
+                lum = _hex_luminance(hexval)
+                if lum > 0.6:
+                    offenders.append((selector, hexval, lum))
+    return offenders
+
+
+# File-level exception: every hex hit in the file is left alone. Keyed by
+# path relative to app/web/static/.
+_RAW_HEX_BG_ALLOWLIST_FILES: dict[str, str] = {
+    "css/metric_modal.css": (
+        "orphaned — no template loads metric_modal.css/.js; /catalog/semantics "
+        "is the only page that ever used this modal and explicitly builds its "
+        "own accordion instead (test_catalog_semantics_page.py asserts "
+        "metric_modal.css is NOT in that page's body). The dark-mode "
+        "invisible-text bug this guard targets cannot manifest because "
+        "nothing renders the file. A correct per-rule conversion would still "
+        "require touching ~20 non-flagged text-color declarations across "
+        "~700 lines for background/ink consistency — disproportionate to a "
+        "raw-hex sweep for a file with zero live call sites."
+    ),
+}
+
+# Selector-level exceptions: everything else in the file is swept; these
+# specific rules are not. Keyed by (path relative to app/web/static/, selector
+# exactly as `_css_rules` returns it).
+_RAW_HEX_BG_ALLOWLIST_SELECTORS: dict[tuple[str, str], str] = {
+    ("style-custom.css", ".notif-channel-icon.desktop"): (
+        "no --ds-* token represents a neutral violet without borrowing "
+        "--ds-kind-agent (entity-kind semantic) or --ds-readonly "
+        "(sharing-state semantic) — either would misattribute meaning; "
+        "dead code besides (no template renders .notif-channel-icon)."
+    ),
+    ("style-custom.css", ".group-chip"): (
+        "same violet-with-no-token gap as .notif-channel-icon.desktop above; "
+        "this is the base rule for /me/profile + /admin/users group chips."
+    ),
+    ("style-custom.css", ".group-chip.is-custom"): ("identical violet pairing to the .group-chip base rule above."),
+    ("css/home.css", ".home-mock .home-news-head"): (
+        "`.home-mock` is a rendered mockup (a static preview of what a set-up "
+        "instance looks like), not the app's own live chrome — #1625's own "
+        "audit calls this scope out as a deliberate exception."
+    ),
+    ("css/home.css", ".home-mock .surface-card.incomplete"): (
+        "same `.home-mock` mockup exception as .home-news-head above."
+    ),
+    ("css/home.css", ".home-mock .incomplete-callout"): (
+        "same `.home-mock` mockup exception as .home-news-head above."
+    ),
+    ("css/marketplace.css", ".mp-card .photo"): (
+        "dead code — no template renders `.mp-card` outside the retired "
+        "standalone marketplace browse page; the comment two rules below "
+        "this one already documents the pink gradient as the deliberate "
+        "'unknown type' fallback, distinct by design from the "
+        "--ds-accent-* per-type tints it sits beside."
+    ),
+}
+
+
+def test_no_raw_hex_light_background_outside_theme_scope() -> None:
+    """No `*.css` file the app ships (vendor excluded) may fill a
+    theme-unscoped rule's background with a raw light hex literal — see the
+    section banner above for why. Anything that can't take a --ds-* token
+    must be a documented allowlist entry, not a silent hex.
+    """
+    offenders: dict[str, list[str]] = {}
+    seen_files: set[str] = set()
+    seen_selectors: set[tuple[str, str]] = set()
+    for path in sorted(STATIC.rglob("*.css")):
+        if "vendor" in path.parts:
+            continue
+        rel = str(path.relative_to(STATIC))
+        found = raw_hex_light_background_offenders(path.read_text(encoding="utf-8"))
+        if not found:
+            continue
+        if rel in _RAW_HEX_BG_ALLOWLIST_FILES:
+            seen_files.add(rel)
+            continue
+        for selector, hexval, lum in found:
+            key = (rel, selector)
+            if key in _RAW_HEX_BG_ALLOWLIST_SELECTORS:
+                seen_selectors.add(key)
+                continue
+            offenders.setdefault(f"{rel}: {selector}", []).append(f"{hexval} (lum={lum:.2f})")
+    assert not offenders, (
+        "raw light-hex background found outside any [data-theme] scope — the "
+        "exact dark-mode invisible-text shape from #656 / #1193 / #1625. "
+        "Replace with a --ds-* token, or add a documented "
+        "_RAW_HEX_BG_ALLOWLIST_SELECTORS entry if none fits:\n" + "\n".join(f"  {k}: {v}" for k, v in offenders.items())
+    )
+    stale_files = set(_RAW_HEX_BG_ALLOWLIST_FILES) - seen_files
+    stale_selectors = set(_RAW_HEX_BG_ALLOWLIST_SELECTORS) - seen_selectors
+    assert not stale_files, (
+        f"stale _RAW_HEX_BG_ALLOWLIST_FILES entr(ies) — the flagged hex is gone, narrow the allowlist: {stale_files}"
+    )
+    assert not stale_selectors, (
+        "stale _RAW_HEX_BG_ALLOWLIST_SELECTORS entr(ies) — the flagged hex is gone, "
+        f"narrow the allowlist: {stale_selectors}"
+    )
+
+
+def test_raw_hex_light_background_detector_fires_on_a_synthetic_offender() -> None:
+    """The exact pre-#1625 shape (`.metric-modal { background: #FFFFFF; }`,
+    no theme scope) must be reported, or the guard above is vacuous."""
+    css = ".metric-modal { background: #FFFFFF; border-radius: 12px; }"
+    offenders = raw_hex_light_background_offenders(css)
+    assert len(offenders) == 1
+    assert offenders[0][0] == ".metric-modal"
+    assert offenders[0][1] == "#FFFFFF"
+
+
+def test_raw_hex_light_background_detector_accepts_a_theme_scoped_rule() -> None:
+    """A rule scoped to `[data-theme="dark"]` (or any other theme) declares
+    its own per-theme value on purpose — not the bug this guard targets."""
+    css = ':root[data-theme="dark"] .metric-modal { background: #101522; }'
+    assert raw_hex_light_background_offenders(css) == []
+
+
+def test_raw_hex_light_background_detector_ignores_var_fallback() -> None:
+    """`var(--surface, #fff)` stays clean until the compat shim is removed —
+    a different, already-guarded regression
+    (test_no_legacy_primary_token_with_hex_fallback)."""
+    css = ".app-header { background: var(--surface, #fff); }"
+    assert raw_hex_light_background_offenders(css) == []
+
+
+def test_raw_hex_light_background_detector_ignores_dark_literals() -> None:
+    """A deliberately-dark fill (luminance <= 0.6, e.g. a terminal-mock
+    background) is not the "light island" bug this guard targets."""
+    css = ".news-content pre { background: #0F172A; color: #FBBF24; }"
+    assert raw_hex_light_background_offenders(css) == []
+
+
 def test_plugin_detail_chip_icons_are_sized_wherever_the_chip_renders() -> None:
     """`buildInnerCardChip()` emits ONE chip into TWO structures — the legacy
     photo card's body and the redesigned object row's trailing meta slot — so its
