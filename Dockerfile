@@ -66,7 +66,9 @@ COPY . .
 #   shift if /app structure refactors. Stable contract for `docker cp`
 #   consumers.
 RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
-    cp /app/scripts/ops/agnes-compose-file.sh /opt/agnes-host/scripts/ops/ && \
+    cp /app/scripts/ops/agnes-compose-file.sh \
+       /app/scripts/ops/agnes-chat-sandbox-image.sh \
+       /opt/agnes-host/scripts/ops/ && \
     cp /app/scripts/ops/agnes-auto-upgrade.sh \
        /app/scripts/ops/agnes-tls-rotate.sh \
        /app/scripts/ops/agnes-state-applier.sh \
@@ -84,6 +86,7 @@ RUN mkdir -p /opt/agnes-host/static /opt/agnes-host/scripts/ops && \
        /app/Caddyfile /app/deploy/caddy/Caddyfile.apps-subdomain /opt/agnes-host/ && \
     cp /app/static/maintenance.html /opt/agnes-host/static/ && \
     chmod 0755 /opt/agnes-host/agnes-auto-upgrade.sh \
+              /opt/agnes-host/scripts/ops/agnes-chat-sandbox-image.sh \
               /opt/agnes-host/agnes-tls-rotate.sh \
               /opt/agnes-host/agnes-state-applier.sh \
               /opt/agnes-host/post-deploy-smoke-test.sh \

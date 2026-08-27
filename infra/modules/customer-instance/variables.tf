@@ -175,6 +175,11 @@ variable "prod_instance" {
     # "kai-agent" requires kai_agent_enabled on the same VM (validated below):
     # pinning web chat onto an engine this VM does not run refuses every
     # session at boot.
+    # "docker" is self-contained: the startup script mints APPS_RUNNER_TOKEN +
+    # DOCKER_GID, activates the `apps` compose profile for the sidecar that
+    # creates the sandboxes, and builds the sandbox image from the app image's
+    # own build context. It does NOT turn on hosted data apps — that stays
+    # data_apps_enabled, even though both features share the sidecar.
     chat_provider = optional(string, "")
 
     # --- Vendor-neutral per-instance branding (all OPTIONAL) ---
