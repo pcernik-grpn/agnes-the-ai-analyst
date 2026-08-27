@@ -45,6 +45,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **`agnes pull`, `agnes status`, `agnes diagnose` now name the workspace they
+  resolved, and flag it when it silently differs from the anchored
+  `workspace_root`** (issue #1312, remaining scope after #1331). `agnes pull`
+  prints a stderr note — and carries a `workspace_root` field in `--json` —
+  when the cwd-resolved workspace differs from the anchor that `agnes
+  update` and the Claude Code hooks converge on (suppressed when
+  `--workspace` is passed explicitly). `agnes status`'s `Pending uploads`
+  line, which counts sessions from the *different*, deliberately-anchor-first
+  `workspace_root` resolver while every other field reads the cwd-first
+  resolver, now labels itself with the anchor when the two disagree (`--json`
+  gains `session_anchor` / `session_anchor_differs_from_workspace`). `agnes
+  diagnose` gains a `Workspace:` line and a `workspace` `--json` field —
+  previously it resolved and inspected a workspace internally without ever
+  naming it. No command previously told an analyst which directory a pull
+  actually wrote to, so a pull into the wrong workspace looked identical to
+  a correct one.
 
 ### Removed
 

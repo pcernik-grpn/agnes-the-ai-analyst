@@ -515,3 +515,40 @@ class TestLocalDeliveryCheck:
         result = runner.invoke(app, ["diagnose"])
         assert result.exit_code == 0
         assert "degraded" in result.output.lower(), result.output
+
+
+class TestDiagnoseRevealsWorkspace:
+    """Issue #1312 (remaining scope, item 3): `agnes diagnose` never named
+    the workspace it resolved anywhere — neither on the human path nor in
+    `--json` — even though `_local_delivery_check` already resolves and
+    inspects one internally."""
+
+    def test_json_includes_resolved_workspace(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "server" / "parquet").mkdir(parents=True)
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+        with patch("cli.commands.diagnose.api_get", return_value=_resp(200, HEALTHY_HEALTH)):
+            result = runner.invoke(app, ["diagnose", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["workspace"] == str(ws.resolve())
+
+    def test_human_output_prints_workspace_line(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        (ws / "server" / "parquet").mkdir(parents=True)
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(ws))
+        with patch("cli.commands.diagnose.api_get", return_value=_resp(200, HEALTHY_HEALTH)):
+            result = runner.invoke(app, ["diagnose"])
+        assert result.exit_code == 0, result.output
+        assert f"Workspace: {ws.resolve()}" in result.output
+
+    def test_workspace_null_when_none_resolves(self, monkeypatch):
+        """No AGNES_LOCAL_DIR, no anchor, cwd not workspace-shaped (the
+        isolated `tmp_config` fixture already keeps this test off any real
+        `~/.config/agnes/config.yaml`) — `workspace` degrades to `None`, not
+        a bogus path."""
+        with patch("cli.commands.diagnose.api_get", return_value=_resp(200, HEALTHY_HEALTH)):
+            result = runner.invoke(app, ["diagnose", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["workspace"] is None
