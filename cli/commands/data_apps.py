@@ -160,14 +160,15 @@ def list_apps(
 @data_apps_app.command("set-description")
 def set_description(
     slug: str = typer.Argument(..., help="App slug"),
-    description: str = typer.Argument(..., help="Description (admin override for managed/linked apps)"),
+    description: str = typer.Argument(..., help="New description"),
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """Set the admin description override on a managed (linked) app.
+    """Set an app's description — hosted or linked.
 
-    The ingest sync refreshes a linked app's synced description; this pins a
-    human-authored one the sync won't clobber. Owner/Admin only; managed rows
-    only (hosted apps edit their description via the create/update flow).
+    For a linked app the ingest sync refreshes its synced description and this
+    pins a human-authored one the sync won't clobber. For a hosted app there is
+    no sync, so this is simply how you change the description after
+    ``agnes app create`` seeded it. Owner/Admin only.
     """
     resp = api_patch(f"/api/data-apps/{slug}", json={"description": description})
     if resp.status_code != 200:

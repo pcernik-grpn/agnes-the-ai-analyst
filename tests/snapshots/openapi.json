@@ -34104,7 +34104,7 @@
         ]
       },
       "patch": {
-        "description": "Set the admin description override on a managed (sync-owned) app.\n\nLinked apps are org resources whose ``description`` is refreshed by the\ningest sync; this override lets an owner/Admin pin a human-authored\ndescription the sync won't clobber. Only ``managed`` rows accept it \u2014\nhosted apps edit their description via the normal create/update flow.",
+        "description": "Set an app's description \u2014 hosted or linked.\n\nFor a **linked** app the stored ``description`` is refreshed by the ingest\nsync, and this writes an override the sync won't clobber. For a **hosted**\napp there is no sync, so the same column simply holds its current\ndescription: ``POST /api/data-apps`` seeds one at create time and this is\nthe only way to change it afterwards. (Hosted rows were refused here with\n``409 not_managed`` until this release, which made the description\nwrite-once \u2014 a typo could only be fixed by recreating the app.)\n\nOne column serves both because every data-app reader already resolves\nthrough ``effective_description`` (``description_override or description``)\n\u2014 ``_serialize`` here, and the library/RBAC projection in\n``app/resource_types.py``. The column keeps its ``_override`` name, which\nreads oddly for a hosted app with nothing to override; renaming it is a\nmigration for no behavioural gain, and the API surface exposes\n``effective_description`` rather than either raw column.\n\nOwner or Admin only, both cases.",
         "operationId": "set_data_app_description_api_data_apps__slug__patch",
         "parameters": [
           {

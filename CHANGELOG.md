@@ -11,6 +11,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **A hosted data app's description can be edited after it is created.**
+  `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
+  not_managed`, so a hosted app's description was write-once: `POST
+  /api/data-apps` seeded it and a typo could only be fixed by recreating the
+  app. Hosted rows now accept it too (Owner/Admin, unchanged). No new column —
+  every data-app reader already resolves through `effective_description`
+  (`description_override or description`), in `_serialize` and in the
+  library/RBAC projection alike, and a hosted row has no ingest sync to clobber
+  the value, so the existing override column simply holds its current
+  description. Matters more than a typo fix: an app's description is the one
+  place an agent can read what the app is and how to interrogate it **without
+  waking its container**, and a description frozen at creation goes stale the
+  first time the app grows a surface. `agnes app set-description` and the
+  `data_app_set_description` MCP tool drop their managed-only wording.
 
 - **Web chat can now deliver session-workspace files** (#1611). A "Files"
   button in the conversation header lists the files in the session's
