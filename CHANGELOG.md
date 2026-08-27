@@ -12,6 +12,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **Web chat can now deliver session-workspace files** (#1611). A "Files"
+  button in the conversation header lists the files in the session's
+  workspace, newest first — including deliverables a skill rendered into the
+  sandbox (a `.docx` SOW, a `.pptx` deck) that were previously unreachable
+  from the browser — with a download action and a "Save to Library" action
+  per file. Backed by three owner-scoped endpoints
+  (`GET /api/chat/sessions/{id}/files`, `GET …/files/download`,
+  `POST …/files/save-artefact`): every requested path is validated and
+  realpath-contained to the caller's own session dir/workspace (an
+  agent-written symlink escaping them 404s), downloads are always served
+  `attachment` + `nosniff` with active content types pinned to
+  `application/octet-stream`, and save-to-Library reuses the same
+  single-file-artefact bridge as the chat composer upload. Sessions run on
+  a remote turn engine list empty (their files live in the remote sandbox —
+  delivering those needs an engine-side channel).
+
 - **`agnes admin config export` / `agnes admin config apply`** round-trip the
   server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
   only) as reviewable YAML — the "onboard a new client via a reviewed PR"

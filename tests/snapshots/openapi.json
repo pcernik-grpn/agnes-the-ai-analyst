@@ -7838,6 +7838,37 @@
         "title": "SampleInteraction",
         "type": "object"
       },
+      "SaveArtefactBody": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "SaveArtefactBody",
+        "type": "object"
+      },
+      "SaveArtefactResponse": {
+        "properties": {
+          "artefact_slug": {
+            "title": "Artefact Slug",
+            "type": "string"
+          },
+          "library_url": {
+            "title": "Library Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artefact_slug",
+          "library_url"
+        ],
+        "title": "SaveArtefactResponse",
+        "type": "object"
+      },
       "ScopeItem": {
         "properties": {
           "item_id": {
@@ -8126,6 +8157,55 @@
           }
         },
         "title": "ServerConfigUpdateRequest",
+        "type": "object"
+      },
+      "SessionFileEntry": {
+        "properties": {
+          "modified_at": {
+            "title": "Modified At",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "size_bytes",
+          "modified_at"
+        ],
+        "title": "SessionFileEntry",
+        "type": "object"
+      },
+      "SessionFilesResponse": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/SessionFileEntry"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "files",
+          "truncated"
+        ],
+        "title": "SessionFilesResponse",
         "type": "object"
       },
       "SetDescriptionRequest": {
@@ -31697,6 +31777,220 @@
           }
         },
         "summary": "Set Session Archived",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files": {
+      "get": {
+        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. A session\nwhose sandbox ran remotely has no local files and lists empty.",
+        "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Files",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/download": {
+      "get": {
+        "description": "Download one file from this chat session's workspace.\n\nAlways served as an attachment with ``nosniff``; HTML/SVG/XML bodies are\nadditionally pinned to ``application/octet-stream`` so a generated file\ncan never render as same-origin active content. 404 for a missing path\nand for anything resolving outside your session dir / workspace alike.",
+        "operationId": "download_session_file_api_chat_sessions__chat_id__files_download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/save-artefact": {
+      "post": {
+        "description": "Save one session-workspace file as a private single-file artefact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
+        "operationId": "save_session_file_as_artefact_api_chat_sessions__chat_id__files_save_artefact_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveArtefactBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveArtefactResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Session File As Artefact",
         "tags": [
           "chat"
         ]

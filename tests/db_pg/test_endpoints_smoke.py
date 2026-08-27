@@ -2641,6 +2641,15 @@ KNOWN_UNTESTED = {
     # session repos (tests/db_pg/test_chat_pg.py), not parameter-free.
     "PUT /api/chat/sessions/{chat_id}/archived",
     "DELETE /api/chat/sessions/{chat_id}/permanent",
+    # Session-workspace file delivery (#1611) — owner-scoped reads over the
+    # caller's own session dir plus the save-to-Library bridge. No new repo
+    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # path reuses create_single_file_artefact — both already parity-proven);
+    # behaviour (ownership 404s, traversal/symlink containment, download
+    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    "GET /api/chat/sessions/{chat_id}/files",
+    "GET /api/chat/sessions/{chat_id}/files/download",
+    "POST /api/chat/sessions/{chat_id}/files/save-artefact",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",
     "POST /api/chat/{session_id}/invite",
