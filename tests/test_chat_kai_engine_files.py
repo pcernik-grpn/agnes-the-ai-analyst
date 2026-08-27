@@ -353,3 +353,33 @@ def test_source_guard_engine_calls_only_after_validation() -> None:
         validate_at = body.index("_validate_rel_path")
         engine_at = body.index("_files_source")
         assert validate_at < engine_at, f"{fn}: path validation must precede the engine branch"
+
+
+@pytest.mark.anyio
+async def test_mid_stream_cap_abort_closes_the_engine_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cap hit mid-stream raises while Starlette's cleanup BackgroundTask
+    never runs (it only fires after a normal finish) — the iterator itself
+    must close the upstream response + client, or the httpx connection leaks
+    (Devin review on #1628)."""
+    from app.chat.kai_engine_files import EngineFileTooLarge, open_engine_download
+
+    async def _body():
+        yield b"x" * 70_000
+        yield b"x" * 70_000
+
+    # Streamed body => no Content-Length, so the preflight cannot refuse it.
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=_body()))
+    opened = await open_engine_download(
+        base_url="http://engine.test",
+        chat_id=CHAT_ID,
+        path="huge.bin",
+        token="jwt",
+        max_bytes=100_000,
+        transport=transport,
+    )
+    assert opened is not None
+    iterator, handle = opened
+    with pytest.raises(EngineFileTooLarge):
+        async for _ in iterator:
+            pass
+    assert handle._client.is_closed

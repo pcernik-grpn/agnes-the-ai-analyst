@@ -222,13 +222,22 @@ async def open_engine_download(
 
     async def _iter() -> AsyncIterator[bytes]:
         sent = 0
-        async for chunk in resp.aiter_bytes(_CHUNK_BYTES):
-            sent += len(chunk)
-            if sent > max_bytes:
-                # Headers are already on the wire — aborting mid-stream is
-                # the only honest option left (never a silently cut file).
-                raise EngineFileTooLarge(sent)
-            yield chunk
+        try:
+            async for chunk in resp.aiter_bytes(_CHUNK_BYTES):
+                sent += len(chunk)
+                if sent > max_bytes:
+                    # Headers are already on the wire — aborting mid-stream is
+                    # the only honest option left (never a silently cut file).
+                    raise EngineFileTooLarge(sent)
+                yield chunk
+        except BaseException:
+            # Starlette runs the cleanup BackgroundTask only after a stream
+            # that finished normally — an abort (cap hit, engine error,
+            # client disconnect → GeneratorExit) must close the upstream
+            # response + client here or the httpx connection leaks. aclose()
+            # is idempotent, so the BackgroundTask's later call is harmless.
+            await handle.aclose()
+            raise
 
     return _iter(), handle
 
