@@ -217,7 +217,7 @@ def _ext(payload: dict) -> dict:
     return {"vendor_name": _AGNES, "data": json.dumps(payload)}
 
 
-def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
+def _register_table(source_type: str, bucket: str, source_table: str, name: str) -> None:
     from src.db import get_system_db
     from src.repositories.table_registry import TableRegistryRepository
 
@@ -226,13 +226,17 @@ def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
         TableRegistryRepository(conn).register(
             id=name,
             name=name,
-            source_type="keboola",
+            source_type=source_type,
             bucket=bucket,
             source_table=source_table,
             query_mode="local",
         )
     finally:
         conn.close()
+
+
+def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
+    _register_table("keboola", bucket, source_table, name)
 
 
 def _doc(*, metric_ext=None, dataset_ext=None, model_ext=None, table_id="in.c-shop.orders"):
@@ -320,6 +324,55 @@ class TestTableBinding:
         )
 
         assert [m for m in metric_repo().list() if m.get("source") == "keboola_metastore"] == []
+
+    def test_a_snowflake_shaped_binding_resolves_via_the_generic_path(self, system_db):
+        """A hand-authored/uploaded model's dataset references a
+        Snowflake/Databricks-style 3-segment identifier
+        (`DATABASE.SCHEMA.TABLE`). The Keboola-shaped path (last-dot split)
+        would misparse this as bucket='ESHOP_DEMO.RAW', table='ORDERS' and
+        never match; the generic last-TWO-segments path matches
+        bucket='RAW', table='ORDERS' against the registered row instead."""
+        _register_table("snowflake", "RAW", "ORDERS", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.ORDERS"}, table_id="ESHOP_DEMO.RAW.ORDERS"),
+            source="manual",
+            source_ref=None,
+        )
+
+        row = _only_metric(source="manual", source_ref=None)
+        assert row["table_name"] == "snowflake_orders"
+        assert row["sql"].startswith("SELECT ")
+        assert "SUM(amount)" in row["sql"]
+
+    def test_a_keboola_shaped_binding_still_resolves_when_other_tables_are_registered(self, system_db):
+        """Regression guard: registering a non-Keboola table alongside a
+        Keboola one must not change the Keboola path's own resolution."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+        _register_table("snowflake", "RAW", "ORDERS", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "in.c-shop.orders"}),
+            source="keboola_metastore",
+            source_ref="conn-1",
+        )
+
+        row = _only_metric()
+        assert row["table_name"] == "shop_orders"
+
+    def test_a_multi_segment_binding_to_an_unregistered_table_is_skipped(self, system_db):
+        """The "never raises, resolves to None" contract holds for the
+        generic path too: a 3-segment identifier matching nothing in the
+        registry is skipped, not crashed on or bound to the wrong row."""
+        from src.repositories import metric_repo
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.NOWHERE"}, table_id="ESHOP_DEMO.RAW.NOWHERE"),
+            source="manual",
+            source_ref=None,
+        )
+
+        assert [m for m in metric_repo().list() if m.get("source") == "manual"] == []
 
 
 class TestConstraints:

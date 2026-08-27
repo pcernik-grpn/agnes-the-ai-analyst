@@ -116,6 +116,59 @@ def _resolve_keboola_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
     return table_registry_repo().get_by_name(view_name)
 
 
+def _generic_table_lookup() -> dict[tuple[str, str], str]:
+    """``{(bucket, source_table): agnes_view_name}`` built from EVERY
+    registered table, any ``source_type`` — the generic, non-Keboola sibling
+    of :func:`connectors.keboola.semantic_layer.table_lookup_from_registry`
+    (which is scoped to ``source_type == "keboola"`` and normalizes
+    ``source_table`` against a Keboola-only wizard quirk).
+
+    ``--bucket``/``--source-table`` (``cli/commands/admin.py``) are already
+    source-type-agnostic labels: a Snowflake/Databricks row registered as
+    ``--bucket RAW --source-table ORDERS`` stores exactly that — a schema
+    name and a bare table name, no normalization needed. Built fresh once
+    per :func:`project_document` call, same cost posture as the Keboola
+    lookup it sits alongside.
+    """
+    from src.repositories import table_registry_repo
+
+    lookup: dict[tuple[str, str], str] = {}
+    for row in table_registry_repo().list_all():
+        bucket = row.get("bucket")
+        source_table = row.get("source_table")
+        name = row.get("name")
+        if bucket and source_table and name:
+            lookup.setdefault((bucket, source_table), name)
+    return lookup
+
+
+def _resolve_generic_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
+    """The ``table_registry`` row a table identifier resolves to via a
+    generic LAST-TWO-SEGMENTS split — the Snowflake/Databricks-shaped
+    sibling of :func:`_resolve_keboola_table_row`.
+
+    Unlike a Keboola tableId (``bucket.table``, where ``bucket`` itself may
+    contain dots and so must be split on the LAST dot only), a
+    Snowflake/Databricks identifier is ``database.schema.table`` (3+
+    segments, no embedded dots within a segment) — so the right split here
+    is the two segments closest to the table, not the first dot. E.g.
+    ``ESHOP_DEMO.RAW.ORDERS`` matches a row registered with
+    ``bucket="RAW"``, ``source_table="ORDERS"``, ignoring the leading
+    ``ESHOP_DEMO`` database/catalog segment. A 1-segment identifier (no dot
+    at all) never matches, mirroring :func:`resolve_table_name`'s own guard.
+    """
+    from src.repositories import table_registry_repo
+
+    parts = table_ref.split(".")
+    if len(parts) < 2:
+        return None
+    bucket, source_table = parts[-2], parts[-1]
+    name = lookup.get((bucket, source_table))
+    if not name:
+        return None
+    return table_registry_repo().get_by_name(name)
+
+
 def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str]:
     """The ``table_registry.id`` a dataset resolves to, or ``None`` when it
     can't be resolved — source-agnostic, used by both the metric-binding
@@ -166,37 +219,58 @@ def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str
 
 
 def _table_binder():
-    """Return ``resolve(table_id) -> view_name | None`` over the registered
-    Keboola tables, or ``None`` when nothing is registered.
+    """Return ``resolve(table_id) -> view_name | None`` over every registered
+    table this instance knows how to bind against, or ``None`` when nothing
+    is registered.
 
-    The binding path is Keboola-shaped today by construction: the metastore
-    adapter is the only one that writes a `dataset` key, and its value is a
-    Keboola tableId. Imported lazily and behind this one seam so the core
-    projector keeps no import-time dependency on a connector, and so a second
-    adapter can be given its own resolver here rather than at every callsite.
-    Never raises: an instance with no Keboola tables simply binds nothing.
+    Two identifier shapes, tried in order, so an existing Keboola binding
+    can never regress:
 
-    Delegates the actual Keboola-tableId -> row resolution to
-    :func:`_resolve_keboola_table_row` (the same primitive
-    :func:`resolve_dataset_table` uses) — the lookup dict is still built
-    ONCE here (not per metric), so a routine sync of a few hundred metrics
-    stays a single registry scan; each metric's ``resolve(table_id)`` call
-    then costs one extra indexed ``table_registry`` point-lookup (name ->
-    row) it did not pay before this refactor, in exchange for there being
-    exactly one Keboola resolution implementation.
+    1. **Keboola tableId** (``bucket.table``, ``bucket`` itself possibly
+       dotted — e.g. ``in.c-shop.orders``): resolved via
+       :func:`_resolve_keboola_table_row` against tables registered with
+       ``source_type='keboola'``, exactly as before this function grew a
+       second path. The metastore adapter is still the only writer that
+       composes a `dataset` key this way.
+    2. **Generic multi-segment identifier** (``schema.table`` or
+       ``database.schema.table`` — Snowflake/Databricks shape, e.g.
+       ``ESHOP_DEMO.RAW.ORDERS``): tried only when the Keboola path above
+       didn't resolve, via :func:`_resolve_generic_table_row` against EVERY
+       registered table regardless of ``source_type`` (a hand-authored/
+       uploaded model has no adapter-known provenance to route on ahead of
+       time).
+
+    Imported lazily and behind this one seam so the core projector keeps no
+    import-time dependency on a connector. Never raises: an instance with no
+    registered tables at all simply binds nothing.
+
+    Both lookup dicts are built ONCE here (not per metric), so a routine sync
+    of a few hundred metrics stays two registry scans, not hundreds; each
+    metric's ``resolve(table_id)`` call then costs at most one extra indexed
+    ``table_registry`` point-lookup (name -> row) per attempted shape.
     """
+    from src.repositories import table_registry_repo
+
+    kb_lookup = None
     try:
         from connectors.keboola.semantic_layer import table_lookup_from_registry
-        from src.repositories import table_registry_repo
 
-        lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola"))
+        kb_lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola")) or None
     except Exception:  # pragma: no cover - a registry read failure must not lose metrics
-        return None
-    if not lookup:
+        kb_lookup = None
+
+    try:
+        generic_lookup = _generic_table_lookup() or None
+    except Exception:  # pragma: no cover - a registry read failure must not lose metrics
+        generic_lookup = None
+
+    if not kb_lookup and not generic_lookup:
         return None
 
     def resolve(table_id: str) -> Optional[str]:
-        row = _resolve_keboola_table_row(table_id, lookup)
+        row = _resolve_keboola_table_row(table_id, kb_lookup) if kb_lookup else None
+        if row is None and generic_lookup:
+            row = _resolve_generic_table_row(table_id, generic_lookup)
         return row["name"] if row else None
 
     return resolve
