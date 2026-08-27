@@ -71,7 +71,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   warehouse-flavour SQL as-is, plus a note naming the dialect and pointing at
   server-side (remote/materialized) execution — no schema change, mirroring
   the notes-based marker `connectors/databricks/semantic_layer.py` already
-  uses for the same case.
+  uses for the same case. The `/semantic-layer/<slug>` model-detail badge is
+  updated to match: it no longer claims these metrics are "skipped
+  (unsupported dialect)" — it now reads "N metric(s) run server-side only
+  (warehouse dialect)".
 - `GET /api/v1/agents/{id}/memories` is now owner/admin-only, matching the
   memory notebook's approve/archive/delete routes: a user the agent is
   merely SHARED with (a runnable grantee, C2.3) previously passed the same

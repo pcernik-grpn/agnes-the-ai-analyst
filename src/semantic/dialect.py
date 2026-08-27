@@ -66,30 +66,29 @@ def resolve_expression_any(expression: dict) -> Tuple[Optional[str], Optional[st
     return None, None, False
 
 
-# The `resolve_expression` reason prefix that marks a metric which DID
-# declare an expression, just not in a dialect this instance can run —
-# distinct from "no expression in any usable dialect" (an incomplete
-# document, a different problem). Matched by `count_dialect_skipped_metrics`
-# below.
-_UNSUPPORTED_DIALECT_PREFIX = "only warehouse-specific dialects offered"
+def count_warehouse_only_metrics(metrics: list) -> int:
+    """How many of ``metrics`` project into ``metric_definitions``
+    (``src/semantic/projection.py::project_document``, via
+    :func:`resolve_expression_any`) with only a warehouse-specific dialect
+    (SNOWFLAKE, DATABRICKS, ...) rather than DUCKDB/ANSI_SQL.
 
-
-def count_dialect_skipped_metrics(metrics: list) -> int:
-    """How many of ``metrics`` were (or would be) silently dropped at
-    projection because every dialect they declare is warehouse-specific —
-    the same check ``src/semantic/projection.py`` runs per metric via
-    :func:`resolve_expression`.
+    These metrics DO appear in the metrics catalog — they are not skipped —
+    they just cannot run through a local DuckDB query and need server-side
+    (remote/materialized) execution instead, per the ``notes`` entry
+    ``project_document`` stamps on their row. Renamed from the earlier
+    ``count_dialect_skipped_metrics``: before the projector learned to
+    project a warehouse-only expression (rather than drop it), this count
+    genuinely meant "silently missing from the catalog"; it no longer does.
 
     A metric with no expression at all is a different, pre-existing problem
-    (an incomplete document) and is deliberately not counted — this counts
-    only the "had SQL, none of it runnable here" case the dialect skip is
-    about.
+    (an incomplete document, still a genuine skip — see
+    ``ProjectionReport.skipped``) and is deliberately not counted here.
     """
     count = 0
     for metric in metrics or []:
         if not isinstance(metric, dict):
             continue
-        sql, reason = resolve_expression(metric.get("expression") or {})
-        if sql is None and isinstance(reason, str) and reason.startswith(_UNSUPPORTED_DIALECT_PREFIX):
+        sql, _dialect, locally_runnable = resolve_expression_any(metric.get("expression") or {})
+        if sql is not None and not locally_runnable:
             count += 1
     return count

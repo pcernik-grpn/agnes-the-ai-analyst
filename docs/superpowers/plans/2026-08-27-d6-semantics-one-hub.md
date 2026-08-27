@@ -50,16 +50,16 @@ of `agnes catalog --metrics --show <id>` sees the caveat without a schema
 change, and Part B (Databricks-via-Ossie) can reuse the identical mechanism
 with zero new plumbing.
 
-## Scope note: the B3 "N metrics skipped" badge
+## The B3 "N metrics skipped" badge, reconciled
 
 `app/web/semantic_layer_view.py::dialect_skipped_count` (wired to the
 `/semantic-layer/<slug>` model-detail page, added under remediation-program
-Track B3) still recomputes independently via the unchanged
-`resolve_expression` and continues to report a warehouse-only metric as
-"skipped (unsupported dialect)". After Part A that metric DOES project — the
-badge's wording is now imprecise for that case, since the metric no longer
-vanishes, it just isn't locally runnable. Reconciling that badge (or
-retiring it once B3's observability and D6's projection agree on one story)
-is left as a deliberate follow-up rather than folded into this change, since
-it touches a different surface (the raw-document view, not the projection)
-and Part A's own test suite does not exercise it.
+Track B3) originally recomputed independently via `resolve_expression` and
+reported a warehouse-only metric as "skipped (unsupported dialect)". Once
+Part A made that metric project, the wording became false — the metric no
+longer vanishes, it just isn't locally runnable — so Part A folds the fix in:
+`count_dialect_skipped_metrics` → `count_warehouse_only_metrics` (now built
+on `resolve_expression_any`, the same resolution path the projector itself
+uses, rather than pattern-matching `resolve_expression`'s reason string);
+the view helper `dialect_skipped_count` → `warehouse_only_metric_count`; the
+badge text → "N metric(s) run server-side only (warehouse dialect)".
