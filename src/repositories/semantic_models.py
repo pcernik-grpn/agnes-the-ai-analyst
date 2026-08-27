@@ -94,6 +94,46 @@ class SemanticModelsRepository:
         )
         return self.get(id)  # type: ignore[return-value]
 
+    def update_document(
+        self,
+        model_id: str,
+        *,
+        name: str,
+        description,
+        document: str,
+        document_json,
+        spec_version: str,
+        content_hash: str,
+        status: str = "valid",
+        validation_errors=None,
+        validated_at,
+    ) -> Dict[str, Any]:
+        """Rewrite an existing row's mutable fields in place — a plain
+        UPDATE, not ``upsert``'s DELETE+INSERT. Preserves everything
+        ``upsert`` has no parameter for: ``id``/``source``/``source_ref``
+        (provenance) and, on Postgres, ``sync_mode``/detach-tracking. Used
+        by ``apply_manual_model`` and ``update_semantic_model`` when editing
+        an already-detached model (F3), so the edit doesn't silently reset
+        it to ``sync_mode='synced'``."""
+        self.conn.execute(
+            "UPDATE semantic_models SET name = ?, description = ?, document = ?, document_json = ?, "
+            "spec_version = ?, content_hash = ?, status = ?, validation_errors = ?, validated_at = ?, "
+            "updated_at = current_timestamp WHERE id = ?",
+            [
+                name,
+                description,
+                document,
+                json.dumps(document_json) if document_json is not None else None,
+                spec_version,
+                content_hash,
+                status,
+                json.dumps(validation_errors) if validation_errors is not None else None,
+                validated_at,
+                model_id,
+            ],
+        )
+        return self.get(model_id)  # type: ignore[return-value]
+
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(f"SELECT {self._SELECT} FROM semantic_models WHERE id = ?", [model_id]).fetchone()
         return self._decode(row)
@@ -136,6 +176,48 @@ class SemanticModelsRepository:
         for model_id in ids:
             self.delete(model_id)
         return ids
+
+    def detach(self, model_id: str, *, by: str, base_hash: str) -> Dict[str, Any]:
+        """F3 detach is Postgres-only (A3 ratchet — migrations/versions/
+        0077_semantic_models_detach.py has no DuckDB counterpart); this
+        DuckDB repo gains no capability that depends on it."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def reattach(self, model_id: str) -> Dict[str, Any]:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def update_source_content_hash(self, model_id: str, content_hash: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def mark_source_missing(self, model_id: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def clear_source_missing(self, model_id: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def list_detached_with_health_state(self) -> List[Dict[str, Any]]:
+        """Postgres-only sibling of :meth:`detach` — see that docstring.
+
+        The query it mirrors reads ``sync_mode``/``source_missing_since``/
+        ``source_content_hash``, none of which exist on this backend, so an
+        empty list would be a lie rather than a fail-clean answer."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
 
     def link_package(self, package_id: str, model_id: str) -> None:
         self.conn.execute(

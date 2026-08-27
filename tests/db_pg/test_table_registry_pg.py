@@ -5,7 +5,7 @@
 bookkeeping. ``table_registry.semantic_draft_pending_at`` is a Postgres-only
 column (A3 PG-first ratchet — the DuckDB app-state migration ladder is
 frozen at v124, see CLAUDE.md -> "Dual-backend discipline" and
-``migrations/versions/0074_semantic_draft_pending.py``), so there is no
+``migrations/versions/0076_semantic_draft_pending.py``), so there is no
 DuckDB half to parametrize against here — this exercises the PG repo
 directly, following the shape of ``tests/db_pg/test_recipes_pg.py``.
 """

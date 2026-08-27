@@ -3938,6 +3938,17 @@ async def semantic_layer_detail(
         source=row.get("source"),
         source_label=source_label(row.get("source")),
         is_imported=is_imported(row.get("source")),
+        # F3: detach/re-attach toolbar. `.get()` — these columns don't exist
+        # on a DuckDB-backed instance (A3 ratchet), so every row reads back
+        # as "synced" there, which is the correct fail-quiet UI state (the
+        # detach/reattach endpoints themselves 501 on that backend).
+        sync_mode=row.get("sync_mode") or "synced",
+        detached_at=row.get("detached_at"),
+        source_missing_since=row.get("source_missing_since"),
+        # NULL source_content_hash means no sync has run since detach yet —
+        # "unknown", not "changed" (a bare `!=` would misreport that).
+        source_changed_since_detach=row.get("source_content_hash") is not None
+        and row.get("source_content_hash") != row.get("detach_base_hash"),
         status=row.get("status"),
         validation_errors=row.get("validation_errors") or [],
         active_tab=active_tab,
@@ -3951,7 +3962,20 @@ async def semantic_layer_detail(
         counts=object_counts(model),
         dialect_skipped_count=dialect_skipped_count(model),
     )
-    return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
+    # F3: the detach/re-attach toolbar buttons POST via fetch(). Their
+    # targets are `/api/admin/**` JSON routes, so the CSRF defense that
+    # actually applies to them is the global `CsrfOriginMiddleware`
+    # (app/middleware/csrf_origin.py), which refuses a cookie-authenticated
+    # unsafe-method request that reports itself cross-origin — NOT the
+    # `_web_csrf_ok` double-submit check, which only the `/admin/**` Form
+    # handlers call. The token is minted and sent as `X-CSRF-Token` anyway so
+    # the pair keeps working if either button is ever re-pointed at a Form
+    # handler; nothing on the `/api` side reads it today.
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx["csrf_token"] = csrf_token
+    response = templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
 
 
 @router.get("/semantic-layer/{slug}/{object_id:path}", response_class=HTMLResponse)
