@@ -9,7 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-
 # Project root as seen from this worktree — needed so the subprocess can
 # import app.chat.runner when the editable install points at a different
 # checkout (e.g. running tests from a git worktree).
@@ -295,6 +294,65 @@ def test_mcp_env_has_no_token(monkeypatch):
     assert servers  # sanity: config was built
     for cfg in servers.values():
         assert "AGNES_TOKEN" not in (cfg.get("env") or {})
+
+
+class _FakeRelayForStart:
+    def __init__(self, server_url=""):
+        self.server_url = server_url
+
+    async def start(self):
+        return 45678
+
+
+def _run_start_relay(monkeypatch, extra_env: dict) -> dict:
+    """Run runner._start_relay() against a fake Relay on an isolated environ
+    copy; returns the resulting env dict."""
+    import os as _os
+
+    from app.chat import relay as relay_mod
+    from app.chat import runner
+
+    env_copy = dict(_os.environ)
+    env_copy.pop("CLAUDE_CODE_USE_VERTEX", None)
+    env_copy.pop("AGNES_LLM_PROVIDER", None)
+    env_copy.update(extra_env)
+    monkeypatch.setattr(_os, "environ", env_copy)
+    monkeypatch.setattr(relay_mod, "Relay", _FakeRelayForStart)
+    monkeypatch.setattr(runner, "_relay", None)
+    port = asyncio.run(runner._start_relay())
+    assert port == 45678
+    return env_copy
+
+
+def test_start_relay_vertex_mode_sets_cli_gateway_env(monkeypatch):
+    """AGNES_LLM_PROVIDER=vertex flips the CLI into Claude Code's Vertex
+    gateway mode: native Vertex request shapes, no local auth, all egress
+    still through the loopback relay."""
+    env = _run_start_relay(
+        monkeypatch,
+        {
+            "AGNES_LLM_PROVIDER": "vertex",
+            "AGNES_VERTEX_PROJECT_ID": "proj-1",
+            "AGNES_VERTEX_REGION": "europe-west1",
+        },
+    )
+    assert env["CLAUDE_CODE_USE_VERTEX"] == "1"
+    assert env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:45678/anthropic"
+    assert env["CLAUDE_CODE_SKIP_VERTEX_AUTH"] == "1"
+    assert env["ANTHROPIC_VERTEX_PROJECT_ID"] == "proj-1"
+    assert env["CLOUD_ML_REGION"] == "europe-west1"
+    # Defense in depth: the dummy-key relay rewrite stays in place too.
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:45678/anthropic"
+    assert env["ANTHROPIC_API_KEY"] == "sk-dummy-broker"
+
+
+def test_start_relay_default_mode_sets_no_vertex_env(monkeypatch):
+    env = _run_start_relay(monkeypatch, {"AGNES_LLM_PROVIDER": "anthropic"})
+    assert "CLAUDE_CODE_USE_VERTEX" not in env
+    assert "ANTHROPIC_VERTEX_BASE_URL" not in env
+    assert "CLAUDE_CODE_SKIP_VERTEX_AUTH" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:45678/anthropic"
+    assert env["ANTHROPIC_API_KEY"] == "sk-dummy-broker"
 
 
 def test_ticket_push_frame_not_enqueued(monkeypatch):

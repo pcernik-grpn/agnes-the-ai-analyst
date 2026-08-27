@@ -146,6 +146,21 @@ class ChatConfig:
     # SERVICE_ACCOUNT_ID / IDENTITY_TOKEN[_FILE]) must be configured for it. Any
     # value other than ``workload_identity`` falls back to ``api_key``.
     llm_auth: str = "api_key"
+    # Which LLM platform the chat broker forwards to. ``anthropic`` (default)
+    # is the first-party API; ``vertex`` runs Claude through Google Vertex AI —
+    # the sandbox CLI switches to its native Vertex mode (gateway pattern:
+    # CLAUDE_CODE_USE_VERTEX=1 + skip-auth, still egressing through the relay
+    # → broker), and the broker signs upstream requests with Google ADC.
+    # An unknown value is deliberately NOT mapped back to ``anthropic`` here —
+    # the boot gate in app/main.py refuses it (a silent fallback would switch
+    # which credential spends money).
+    llm_provider: str = "anthropic"
+    # Vertex-only settings (required when llm_provider == "vertex"): the GCP
+    # project that hosts the Claude models, and the Vertex region ("global",
+    # "us-east5", "europe-west1", ...). The broker pins these server-side —
+    # a sandbox can never point spend at another project/region.
+    vertex_project_id: str = ""
+    vertex_region: str = ""
     # Agent-as-API broker policy (Task 8, agent-profiles V1a): models a
     # brokered chat-completion request may use besides the calling agent's
     # own pinned model — e.g. a cheap utility model every agent is allowed
@@ -373,6 +388,13 @@ def _resolve_kai_agent_url(raw: dict) -> str:
     return _raw_str(raw, "kai_agent_url", "http://kai-agent:3000")
 
 
+def _raw_llm_vertex(raw: dict) -> dict:
+    """The ``chat.llm.vertex`` mapping, or {} for anything malformed/absent."""
+    llm = raw.get("llm")
+    vertex = llm.get("vertex") if isinstance(llm, dict) else None
+    return vertex if isinstance(vertex, dict) else {}
+
+
 def load_chat_config(instance_yaml: Path) -> ChatConfig:
     if not instance_yaml.exists():
         return ChatConfig(
@@ -425,6 +447,9 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         paused_ttl_seconds=_raw_int(raw, "paused_ttl_seconds", 7 * 24 * 3600),
         bootstrap_marketplace=_resolve_chat_bootstrap_marketplace(raw),
         llm_auth=_raw_str(raw.get("llm") or {}, "auth", "api_key").lower(),
+        llm_provider=_raw_str(raw.get("llm") or {}, "provider", "anthropic").lower(),
+        vertex_project_id=_raw_str(_raw_llm_vertex(raw), "project_id", ""),
+        vertex_region=_raw_str(_raw_llm_vertex(raw), "region", "").lower(),
         agent_api_utility_models=list(raw.get("agent_api_utility_models") or []),
         agent_api_budget_cache_ttl_s=_raw_int(raw, "agent_api_budget_cache_ttl_s", 60),
         agent_api_artifact_max_bytes=_raw_int(raw, "agent_api_artifact_max_bytes", 25 * 1024 * 1024),
@@ -498,9 +523,11 @@ def egress_compose_mismatches(cfg: "ChatConfig") -> list[str]:
                 else "sandboxes have no egress at all"
             )
             return [
-                f"chat.docker_egress_allow_hosts is set, but chat.docker_egress_mode is "
-                f"{cfg.docker_egress_mode!r}, so the allowlist is not enforced and "
-                f"{consequence} — set chat.docker_egress_mode: allowlist to enforce it"
+                (
+                    f"chat.docker_egress_allow_hosts is set, but chat.docker_egress_mode is "
+                    f"{cfg.docker_egress_mode!r}, so the allowlist is not enforced and "
+                    f"{consequence} — set chat.docker_egress_mode: allowlist to enforce it"
+                )
             ]
         return []
     out = []
