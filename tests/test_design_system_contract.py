@@ -948,31 +948,51 @@ _BACKGROUND_DECL_RE = re.compile(r"^\s*background(-color)?\s*:")
 _FLIPPING_INK_RE = re.compile(r"(?<![a-z-])color\s*:\s*var\(--ds-text-(?!inverse)")
 
 
-def _css_rules(css: str) -> list[tuple[str, str]]:
-    """Every declaration block as `(selector, body)`.
+def _css_rules_in_context(css: str) -> list[tuple[str, str, str]]:
+    """Every declaration block as `(at_rule_context, selector, body)`.
 
-    At-rule wrappers (`@media`, `@supports`) are transparent — their nested
-    rules are returned with their own selectors, so a rule inside a media
-    query is audited like any other. Comments are stripped first.
+    At-rule wrappers (`@media`, `@supports`) stay transparent for the
+    *selector* — a nested rule is returned under its own selector, so it is
+    audited like any other — but their preludes are no longer thrown away:
+    they are joined (outermost first, space-separated) into
+    `at_rule_context`, empty at top level.
+
+    Keeping the prelude matters because a condition can scope a rule to a
+    theme exactly the way a selector can: `@media (prefers-color-scheme:
+    dark)` is the media-query twin of `[data-theme="dark"]`, and a caller
+    that only ever sees `.panel` cannot tell the two situations apart.
+    Comments are stripped first.
     """
     css = _CSS_COMMENT_RE.sub("", css)
-    rules: list[tuple[str, str]] = []
-    stack: list[str | None] = []
+    rules: list[tuple[str, str, str]] = []
+    # `(is_at_rule, text)`: an at-rule's body holds rules, not declarations.
+    stack: list[tuple[bool, str]] = []
     buf = ""
     for ch in css:
         if ch == "{":
             selector = buf.strip()
             buf = ""
-            # `None` marks a wrapper whose body holds rules, not declarations.
-            stack.append(None if selector.startswith("@") else selector)
+            stack.append((selector.startswith("@"), selector))
         elif ch == "}":
-            closed = stack.pop() if stack else None
-            if closed is not None:
-                rules.append((closed, buf))
+            if stack:
+                is_at_rule, text = stack.pop()
+                if not is_at_rule:
+                    # Whatever wrappers remain open are this rule's context.
+                    rules.append((" ".join(t for at, t in stack if at), text, buf))
             buf = ""
         else:
             buf += ch
     return rules
+
+
+def _css_rules(css: str) -> list[tuple[str, str]]:
+    """Every declaration block as `(selector, body)`, at-rule context dropped.
+
+    The flattened view — a rule inside a media query is returned under its
+    own selector, so it is audited like any other. Callers that need to know
+    *which* at-rule a rule sits in use `_css_rules_in_context` instead.
+    """
+    return [(selector, body) for _, selector, body in _css_rules_in_context(css)]
 
 
 def _light_only_soft_tokens() -> set[str]:
@@ -1141,10 +1161,16 @@ def raw_hex_light_background_offenders(css: str) -> list[tuple[str, str, float]]
     literal — the exact shape of #656 / #1193 / #1625. Rules scoped to
     `[data-theme="…"]` or `prefers-color-scheme` are exempt: they declare
     their own per-theme value by construction, which is the fix, not the bug.
+
+    The `prefers-color-scheme` half of that exemption lives on the enclosing
+    `@media` prelude, never in the selector, so the scope tested here is the
+    at-rule context *plus* the selector — reading the selector alone made the
+    clause unreachable and flagged correctly-themed rules.
     """
     offenders: list[tuple[str, str, float]] = []
-    for selector, body in _css_rules(css):
-        if _THEME_SCOPED_RE.search(selector) or "prefers-color-scheme" in selector:
+    for at_rules, selector, body in _css_rules_in_context(css):
+        scope = f"{at_rules} {selector}" if at_rules else selector
+        if _THEME_SCOPED_RE.search(scope) or "prefers-color-scheme" in scope:
             continue
         for m in _BG_DECL_RE.finditer(body):
             value = _VAR_HEX_FALLBACK_RE.sub("", m.group(1))
@@ -1264,6 +1290,49 @@ def test_raw_hex_light_background_detector_accepts_a_theme_scoped_rule() -> None
     its own per-theme value on purpose — not the bug this guard targets."""
     css = ':root[data-theme="dark"] .metric-modal { background: #101522; }'
     assert raw_hex_light_background_offenders(css) == []
+
+
+def test_raw_hex_light_background_detector_accepts_a_prefers_color_scheme_block() -> None:
+    """The media-query twin of the theme-scoped exemption above.
+
+    Regression: the exemption read `"prefers-color-scheme" in selector`, but
+    `_css_rules` dropped at-rule preludes and returned the nested rule under
+    the bare `.panel`, so the clause could never be true and a correctly
+    dark-scoped fill was reported as an offender. Fixed by carrying the
+    enclosing at-rule context alongside each rule.
+    """
+    css = "@media (prefers-color-scheme: dark) { .panel { background: #FFFFFF; } }"
+    assert raw_hex_light_background_offenders(css) == []
+    # Nested wrappers must not lose the outer condition either.
+    nested = "@media (prefers-color-scheme: dark) { @supports (color: color-mix(in srgb, red, blue)) { .panel { background: #FFFFFF; } } }"
+    assert raw_hex_light_background_offenders(nested) == []
+
+
+def test_raw_hex_light_background_detector_still_fires_inside_a_plain_media_query() -> None:
+    """The other half of the exemption: only a *theme* condition exempts.
+
+    A width/print media query says nothing about the colour scheme, so a raw
+    light fill inside one is the same invisible-text bug as at top level.
+    This is what stops the fix above from degrading into "anything nested in
+    an at-rule is fine".
+    """
+    css = "@media (max-width: 620px) { .panel { background: #FFFFFF; } }"
+    offenders = raw_hex_light_background_offenders(css)
+    assert [(s, h) for s, h, _ in offenders] == [(".panel", "#FFFFFF")]
+    assert raw_hex_light_background_offenders("@media print { .panel { background: #FAFAFA; } }")
+
+
+def test_raw_hex_light_background_detector_pops_the_prefers_color_scheme_scope() -> None:
+    """The exemption must end with the block it came from.
+
+    Guards the at-rule stack itself: a rule *after* a
+    `prefers-color-scheme` block is top-level and must still be flagged — a
+    context list that never popped would silently exempt the rest of the
+    stylesheet.
+    """
+    css = "@media (prefers-color-scheme: dark) { .panel { background: #FFFFFF; } } .card { background: #FFFFFF; }"
+    offenders = raw_hex_light_background_offenders(css)
+    assert [(s, h) for s, h, _ in offenders] == [(".card", "#FFFFFF")]
 
 
 def test_raw_hex_light_background_detector_ignores_var_fallback() -> None:

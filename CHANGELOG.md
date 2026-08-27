@@ -89,7 +89,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ink — the same invisible-text shape as #656 and #1193, now widened into a
   guard (`tests/test_design_system_contract.py::test_no_raw_hex_light_background_outside_theme_scope`)
   that scans every shipped stylesheet, not just the templates a past sweep
-  happened to touch. Part of #1625.
+  happened to touch. The guard's documented exemption for rules that already
+  declare a per-theme value now actually covers the media-query half of it:
+  the CSS walker used to discard at-rule preludes, so a fill inside
+  `@media (prefers-color-scheme: dark)` reached the check as a bare selector
+  and was reported as an offender, while a plain `@media (max-width: …)`
+  still is. Part of #1625.
 - **A PAT could mint itself a fresh, longer-lived PAT through the Cowork setup
   bundle.** `POST /api/user/cowork-bundle` mints two durable follow-on
   credentials — a pre-baked PAT inline in the ZIP, and a setup token that
