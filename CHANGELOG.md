@@ -340,6 +340,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 - Admin sidebar's Activity entry for `/admin/chat` is now labelled "Chat runners", matching the page's own title, instead of "Chat sessions" — which read as a sibling of the adjacent "Analyst sessions" (uploaded Claude Code session files) rather than the runner dashboard it actually is.
+- **Auth emails (invite, password reset, magic link) are branded multipart
+  messages** instead of a bare one-line plaintext with a token URL — the shape
+  that commonly landed in spam. All three now share one email-safe HTML layout
+  (`app/auth/email_templates.py`): instance name as the `From:` display name
+  and in the subject, a sentence of context, one CTA button, the link's
+  validity (7 days / 24 hours / 1 hour, derived from the enforcing constants),
+  a plain-URL fallback, and a "didn't expect this? safely ignore" footer. A
+  plaintext part with the same copy is always included; no images or external
+  resources.
 
 - **BREAKING (infra pins): the `customer-instance` Terraform module's
   `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
