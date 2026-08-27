@@ -870,6 +870,7 @@ class TestAdminRegistrySmoke:
         "GET /api/admin/registry",
         "GET /api/admin/server-config",
         "POST /api/admin/server-config",
+        "GET /api/admin/server-config/overlay",
         "POST /api/admin/register-table/precheck",
         "POST /api/admin/register-table",
         "PUT /api/admin/registry/{table_id}",
@@ -891,6 +892,19 @@ class TestAdminRegistrySmoke:
     def test_server_config(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/server-config", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200
+
+    def test_server_config_overlay(self, seeded_app_both):
+        h = _admin_headers(seeded_app_both)
+        r = seeded_app_both["client"].get("/api/admin/server-config/overlay", headers=h)
+        assert r.status_code == 200
+        body = r.json()
+        assert "sections" in body
+        assert "editable_sections" in body
+        # Admin-only, mirrors GET /api/admin/server-config.
+        r_analyst = seeded_app_both["client"].get(
+            "/api/admin/server-config/overlay", headers=_analyst_headers(seeded_app_both)
+        )
+        assert r_analyst.status_code == 403
 
     def test_config_surface(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/config-surface", headers=_admin_headers(seeded_app_both))
@@ -2627,6 +2641,15 @@ KNOWN_UNTESTED = {
     # session repos (tests/db_pg/test_chat_pg.py), not parameter-free.
     "PUT /api/chat/sessions/{chat_id}/archived",
     "DELETE /api/chat/sessions/{chat_id}/permanent",
+    # Session-workspace file delivery (#1611) — owner-scoped reads over the
+    # caller's own session dir plus the save-to-Library bridge. No new repo
+    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # path reuses create_single_file_artefact — both already parity-proven);
+    # behaviour (ownership 404s, traversal/symlink containment, download
+    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    "GET /api/chat/sessions/{chat_id}/files",
+    "GET /api/chat/sessions/{chat_id}/files/download",
+    "POST /api/chat/sessions/{chat_id}/files/save-artefact",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",
     "POST /api/chat/{session_id}/invite",
@@ -2742,8 +2765,9 @@ KNOWN_UNTESTED = {
     # tests/db_pg/test_agents_contract.py.
     "POST /api/store/entities/builder/preview-agent",
     # One data-package builder turn. Behaviourally covered by
-    # tests/test_package_builder_turns.py. Reads the registry and the group
-    # list to build its candidate sets; writes nothing.
+    # tests/test_package_builder_turns.py. Reads the registry, the group list
+    # and the metric definitions (all symmetric pairs) to build its candidate
+    # sets; writes nothing.
     "POST /api/admin/data-packages/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",

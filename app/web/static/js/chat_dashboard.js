@@ -41,7 +41,13 @@ function fixGreeting() {
   const el = $("rdb-greeting-tod");
   if (!el) return;
   const h = new Date().getHours();
+  const evening = h < 5 || h >= 18;
   el.textContent = h >= 5 && h < 12 ? "Good morning" : h >= 12 && h < 18 ? "Good afternoon" : "Good evening";
+  // The sun/moon glyph rides the same correction — both are in the DOM and
+  // `data-tod` shows one (see `.cld-greet` in style-custom.css), so the words
+  // and the picture can never disagree about what time it is.
+  const greet = el.closest("[data-tod]");
+  if (greet) greet.setAttribute("data-tod", evening ? "night" : "day");
 }
 
 // ---- Guided task definitions ------------------------------------------------

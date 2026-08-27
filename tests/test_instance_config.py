@@ -274,6 +274,47 @@ class TestInstanceBrandShort:
         mod._instance_config = None
 
 
+class TestDataSourceType:
+    """get_data_source_type() — D1 residual precedence flip. Every other
+    knob in this module resolves env > instance.yaml > default; this one is
+    the deliberate exception: ``data_source.type`` (the overlay) wins over
+    ``DATA_SOURCE`` (env), so a UI edit can never be shadowed by a stale
+    Terraform-written env line. ``DATA_SOURCE`` remains a fallback for the
+    common local-dev case of no overlay at all."""
+
+    def _reload(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("TESTING", "1")
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-minimum-32-characters!!")
+        import importlib
+        import app.instance_config as mod
+
+        mod._instance_config = None
+        importlib.reload(mod)
+        return mod
+
+    def test_overlay_wins_over_env(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(exist_ok=True)
+        (state_dir / "instance.yaml").write_text("data_source:\n  type: bigquery\n")
+        monkeypatch.setenv("DATA_SOURCE", "keboola")
+        mod = self._reload(tmp_path, monkeypatch)
+        assert mod.get_data_source_type() == "bigquery"
+        mod._instance_config = None
+
+    def test_env_is_fallback_when_overlay_unset(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_SOURCE", "keboola")
+        mod = self._reload(tmp_path, monkeypatch)
+        assert mod.get_data_source_type() == "keboola"
+        mod._instance_config = None
+
+    def test_default_when_neither_set(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("DATA_SOURCE", raising=False)
+        mod = self._reload(tmp_path, monkeypatch)
+        assert mod.get_data_source_type() == "local"
+        mod._instance_config = None
+
+
 class TestInstanceFavicon:
     """instance.favicon / AGNES_INSTANCE_FAVICON — favicon href resolution:
     env > YAML > the built-in agnes-orb asset. A data-URI or absolute URL is

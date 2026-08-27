@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "agnes-analyst",
-      "description": "Analyst rails for working with Agnes data. Covers: discovering tables (catalog / schema / describe), choosing the right query path for local vs remote (BigQuery) data, taking estimate-first filtered snapshots of large remote tables, the per-source SQL flavour (DuckDB vs BigQuery), and looking up canonical business-metric definitions before computing them. Served to everyone.",
+      "description": "Analyst rails for working with Agnes data. Covers: discovering tables (catalog / schema / describe), choosing the right query path for local vs remote (BigQuery) data, taking estimate-first filtered snapshots of large remote tables, the per-source SQL flavour (DuckDB vs BigQuery), and looking up canonical business-metric definitions before computing them. Also ships the agnes-web-guide skill — a page-by-page map of the Agnes web UI for answering 'where do I ...?'. Served to everyone.",
       "version": "1.0.0",
       "source": "./plugins/agnes-analyst"
     },

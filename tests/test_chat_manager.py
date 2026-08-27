@@ -12,15 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import duckdb
 import pytest
 
-from src.db import _ensure_schema
-from tests.chat_fakes import FakeHandle, FakeWS, _wait_until
-
 from app.chat.config import ChatConfig
 from app.chat.manager import ChatManager, SinkEntry
 from app.chat.persistence import ChatRepository
 from app.chat.types import SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.factory import reset_coordination_for_tests
+from src.db import _ensure_schema
+from tests.chat_fakes import FakeHandle, FakeWS, _wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -672,7 +671,7 @@ def test_crash_respawn_does_not_accumulate_pump_tasks(manager: ChatManager):
             h.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             attach_task.cancel()
 
     asyncio.run(_run())
@@ -936,7 +935,7 @@ def test_double_crash_dies_after_three(manager: ChatManager):
             h.emit_eof()
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             attach_task.cancel()
 
     asyncio.run(go())
@@ -944,6 +943,7 @@ def test_double_crash_dies_after_three(manager: ChatManager):
 
 def test_active_count_for_user_matches_private(monkeypatch):
     from types import SimpleNamespace
+
     from app.chat.manager import ChatManager
     from app.chat.types import SessionState
 
@@ -968,6 +968,7 @@ def _attach_fake_live_with_fake_handle(
 ):
     """Insert a LiveSession with FakeHandle (has emit/readline) and one sink."""
     from datetime import datetime, timezone
+
     from app.chat.manager import LiveSession
 
     handle = FakeHandle()
@@ -1159,7 +1160,9 @@ def test_kill_between_turns_persists_nothing_extra(manager: ChatManager):
 # Task 8 tests: manager owns session lifecycle — detach/linger/pause/resume
 # ---------------------------------------------------------------------------
 
-from tests.chat_fakes import FakeProvider  # noqa: E402
+from datetime import UTC
+
+from tests.chat_fakes import FakeProvider
 
 
 def _make_pause_manager(tmp_path, linger_seconds=0):
@@ -1209,7 +1212,7 @@ def _make_kill_manager(tmp_path):
 
 def monkeypatch_workdir(mgr: ChatManager) -> None:
     """Bypass the real WorkdirManager filesystem operations for testing."""
-    import unittest.mock as mock
+    from unittest import mock
 
     mgr._workdir_mgr.ensure_user_workdir = mock.MagicMock()
     mgr._workdir_mgr.prepare_session_dir = mock.MagicMock(return_value=Path("/tmp/fake-session-dir"))
@@ -1648,9 +1651,10 @@ def test_idle_ttl_pauses_instead_of_kills(tmp_path):
         # Empty sinks without triggering linger
         live.sinks = []
         # Force last_activity into the past
-        from datetime import datetime as _dt, timedelta, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timedelta
 
-        live.last_activity = _dt.now(_tz.utc) - timedelta(seconds=1)
+        live.last_activity = _dt.now(UTC) - timedelta(seconds=1)
 
         # Patch config to use idle_ttl=0 for fast reap
         original_config = mgr._config
@@ -1694,11 +1698,12 @@ def test_paused_ttl_really_kills(tmp_path):
         assert provider.paused
 
         # Push sandbox_paused_at into the past past the TTL
-        from datetime import datetime as _dt, timedelta, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timedelta
 
         mgr._repo.set_sandbox_paused_at(
             s.id,
-            _dt.now(_tz.utc) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1),
+            _dt.now(UTC) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1),
         )
         # Clear _live so it tests the repo-row-only path
         mgr._live.clear()
@@ -1956,11 +1961,11 @@ def test_resume_from_row_reconnects_after_restart(manager: ChatManager, monkeypa
     monkeypatch.setattr(manager_mod, "ticket_repo", lambda: fake_tickets)
 
     async def _run():
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
 
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         manager._repo.set_sandbox_ref(s.id, sandbox_id="sbx-restart", runner_pid=555)
-        manager._repo.set_sandbox_paused_at(s.id, _dt.now(_tz.utc))
+        manager._repo.set_sandbox_paused_at(s.id, _dt.now(UTC))
         row = manager._repo.get_session(s.id)
         assert row is not None
         assert row.relay_protocol_version == RELAY_PROTOCOL_VERSION
@@ -2248,6 +2253,83 @@ def test_spawn_env_has_no_real_secret(manager: ChatManager, monkeypatch):
     assert "AGNES_TOKEN" not in env
 
 
+def test_spawn_env_default_llm_provider_is_anthropic(manager: ChatManager, monkeypatch):
+    monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
+    import app.chat.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "ticket_repo", lambda: _FakeTicketRepo())
+    captured = {}
+
+    async def fake_spawn(**kw):
+        captured.update(kw)
+        return FakeHandle()
+
+    manager._provider.spawn = fake_spawn
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        sess = manager._repo.get_session(s.id)
+        await manager._spawn_runner(sess, Path("/tmp"))
+
+    asyncio.run(_run())
+
+    env = captured["env"]
+    assert env["AGNES_LLM_PROVIDER"] == "anthropic"
+    assert env["AGNES_VERTEX_PROJECT_ID"] == ""
+    assert env["AGNES_VERTEX_REGION"] == ""
+
+
+def test_spawn_env_vertex_carries_routing_hints_but_no_credentials(tmp_path: Path, monkeypatch):
+    """Vertex mode passes ONLY project/region routing hints into the sandbox —
+    never Google credential material; the broker re-validates them
+    server-side (AC-F-nosecret extended)."""
+    monkeypatch.setattr("app.auth.access.mint_session_jwt", lambda *a, **k: "tok")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-must-not-leak")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/host/secret/sa.json")
+    import app.chat.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "ticket_repo", lambda: _FakeTicketRepo())
+
+    conn = duckdb.connect(":memory:")
+    _ensure_schema(conn)
+    repo = ChatRepository(conn)
+    mgr = ChatManager(
+        provider=MagicMock(),
+        workdir_mgr=_make_workdir_mgr(tmp_path, repo),
+        repo=repo,
+        config=ChatConfig(
+            enabled=True,
+            provider="docker",
+            llm_provider="vertex",
+            vertex_project_id="proj-1",
+            vertex_region="europe-west1",
+        ),
+    )
+    captured = {}
+
+    async def fake_spawn(**kw):
+        captured.update(kw)
+        return FakeHandle()
+
+    mgr._provider.spawn = fake_spawn
+
+    async def _run():
+        s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
+        sess = mgr._repo.get_session(s.id)
+        await mgr._spawn_runner(sess, Path("/tmp"))
+
+    asyncio.run(_run())
+
+    env = captured["env"]
+    assert env["AGNES_LLM_PROVIDER"] == "vertex"
+    assert env["AGNES_VERTEX_PROJECT_ID"] == "proj-1"
+    assert env["AGNES_VERTEX_REGION"] == "europe-west1"
+    # Credentials still never enter the sandbox env — in either mode.
+    assert env.get("ANTHROPIC_API_KEY") in (None, "", "sk-dummy-broker")
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+    assert not any("sa.json" in str(v) for v in env.values())
+
+
 def test_spawn_pushes_ticket_frame(manager: ChatManager, monkeypatch):
     """A fresh spawn must mint main+mcp tickets and push a ticket_push frame
     over stdin, under _stdin_lock, before the session is considered ready."""
@@ -2403,7 +2485,7 @@ def test_legacy_resume_destroys_old_sandbox_before_clearing(tmp_path):
     """Post-restart (legacy) resume must destroy the old paused sandbox BEFORE
     clearing its ref — clearing first NULLs sandbox_paused_at so the reaper can
     never reap it, leaking a billable microVM per session per restart (§11)."""
-    import unittest.mock as mock
+    from unittest import mock
 
     async def _run():
         mgr = _make_pause_manager(tmp_path)
@@ -2506,8 +2588,8 @@ def test_spawn_live_happy_path_does_not_kill_sandbox(manager: ChatManager):
 # Wave-2C task 3: paused-sandbox sweep leader lease
 # ---------------------------------------------------------------------------
 
-from app.chat.manager import _PAUSED_SWEEP_LEASE_NAME  # noqa: E402
-from app.coordination.factory import coordination  # noqa: E402
+from app.chat.manager import _PAUSED_SWEEP_LEASE_NAME
+from app.coordination.factory import coordination
 
 
 @pytest.fixture(autouse=True)
@@ -2520,13 +2602,14 @@ def _reset_coordination_for_sweep_tests():
 def _paused_expired_session(mgr):
     """Create a session whose sandbox_paused_at is already past the TTL —
     the exact repo-row shape _reap_once's paused sweep looks for."""
-    from datetime import datetime as _dt, timedelta, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timedelta
 
     session = mgr._repo.create_session(user_email="sweep@test.com", surface=Surface.WEB)
     mgr._repo.set_sandbox_ref(session.id, sandbox_id="sbx-sweep", runner_pid=123)
     mgr._repo.set_sandbox_paused_at(
         session.id,
-        _dt.now(_tz.utc) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1),
+        _dt.now(UTC) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1),
     )
     return session
 
@@ -2796,7 +2879,7 @@ def test_renew_outage_keeps_serving_but_genuine_steal_tears_down(manager: ChatMa
         handle.killed = True
         try:
             await asyncio.wait_for(attach_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             attach_task.cancel()
 
     asyncio.run(_run())
@@ -2818,7 +2901,7 @@ def test_routing_lease_calls_offloaded_to_thread(manager: ChatManager):
     """
     import time as _time
 
-    import app.coordination.factory as factory
+    from app.coordination import factory
     from app.coordination.memory import MemoryCoordinationBackend
 
     class _SlowLeaseBackend(MemoryCoordinationBackend):
@@ -2863,7 +2946,7 @@ def test_routing_lease_calls_offloaded_to_thread(manager: ChatManager):
 
             # Same proof for the reaper's per-tick renew path — needs a
             # live (non-DEAD) session in self._live to iterate over.
-            from datetime import datetime, timezone
+            from datetime import datetime
 
             from app.chat.manager import LiveSession
 
@@ -2872,8 +2955,8 @@ def test_routing_lease_calls_offloaded_to_thread(manager: ChatManager):
                 user_email="u@x",
                 state=SessionState.ACTIVE,
                 handle=None,
-                started_at=datetime.now(timezone.utc),
-                last_activity=datetime.now(timezone.utc),
+                started_at=datetime.now(UTC),
+                last_activity=datetime.now(UTC),
                 sinks=[],
             )
             ticks = 0
@@ -3139,7 +3222,8 @@ def test_reap_once_paused_sweep_runs_even_if_kill_raises(tmp_path):
     paused-TTL teardown still runs (per-phase/per-item guards)."""
 
     async def _run():
-        from datetime import datetime as _dt, timedelta, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timedelta
 
         mgr = _make_pause_manager(tmp_path)
         monkeypatch_workdir(mgr)
@@ -3148,7 +3232,7 @@ def test_reap_once_paused_sweep_runs_even_if_kill_raises(tmp_path):
         # An expired paused session (repo row only — no live entry needed).
         s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
         mgr._repo.set_sandbox_ref(s.id, sandbox_id="sbx-paused", runner_pid=1)
-        mgr._repo.set_sandbox_paused_at(s.id, _dt.now(_tz.utc) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1))
+        mgr._repo.set_sandbox_paused_at(s.id, _dt.now(UTC) - timedelta(seconds=mgr._config.paused_ttl_seconds + 1))
 
         # A DEAD live entry → reaper's to_kill (dead_gc); make kill blow up.
         s2 = await mgr.create_session(user_email="u2@x", surface=Surface.WEB)
@@ -3608,13 +3692,13 @@ def test_approval_decision_dropped_when_no_runner_and_no_owner(manager: ChatMana
 
 
 def test_orphan_sweep_skips_sessions_this_process_serves(manager: ChatManager):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.chat.manager import LiveSession
 
     async def _run():
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         manager._live[s.id] = LiveSession(
             chat_id=s.id,
             user_email="u@x",
@@ -3659,7 +3743,7 @@ def test_approval_decision_publish_failure_does_not_escape(manager: ChatManager)
     pending request, so the turn finishes either way. Mirrors the
     cross-gateway kill path, which already swallows this.
     """
-    import app.chat.inbound as inbound
+    from app.chat import inbound
 
     async def _run():
         with (

@@ -1393,3 +1393,126 @@ def test_the_subdomain_poll_falls_back_rather_than_guessing_a_host(monkeypatch):
         scope = {"agnes_data_app_subdomain": "s"}
 
     assert _readiness_poll_url(_Req(), "s") == "/api/data-apps/s/readiness"
+
+
+def test_logged_out_on_subdomain_redirects_to_the_main_host(proxy_client, running_app, proxy_env):
+    """A signed-out visitor opening an app URL must reach a login page.
+
+    `DataAppSubdomainMiddleware` rewrites EVERY path on `<slug>.<base>` to
+    `/apps/<slug>/…` with no carve-out, so the app-wide 401→`/login` redirect
+    (`app/main.py::_html_auth_redirect_handler`) — relative, resolved by the
+    browser against the app's own host — came straight back to the proxy as
+    `/apps/<slug>/login`, 401'd again and looped until the browser gave up.
+    Nobody caught it because every other subdomain test drives an already
+    authenticated, already granted client.
+    """
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    r = proxy_client.get("/", headers={"host": "s.apps.example.com"}, follow_redirects=False)
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    assert loc.startswith("http"), f"must be absolute or the browser resolves it back onto the app host: {loc!r}"
+    assert "//s.apps.example.com" not in loc, f"redirect must leave the app origin: {loc!r}"
+    assert "/login" in loc
+
+
+def test_logged_out_on_the_main_host_keeps_the_relative_redirect(proxy_client, running_app, proxy_env):
+    """The path-prefix form is unchanged — same-host `/login?next=…` as before."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    r = proxy_client.get("/apps/s/", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login?next=%2Fapps%2Fs%2F"
+
+
+# --- on-demand TLS `ask` endpoint -------------------------------------------
+# Caddy issues a certificate per app hostname instead of one wildcard, so it
+# needs to know whether a name is real before asking Let's Encrypt for it:
+# `on_demand_tls { ask <url> }` → `GET <url>?domain=<name>`, 2xx allows
+# issuance, anything else cancels it. Caddy's own docs steer callers to this
+# endpoint rather than the `interval`/`burst` knobs, so this IS the guard
+# against someone flooding ACME by hitting made-up hostnames.
+#
+# Unauthenticated by necessity — Caddy sends a plain GET with no credentials.
+# That leaks nothing new: `proxy_app` already resolves `_get_row_or_404` BEFORE
+# authenticating, so a stranger can distinguish a real slug (401) from a
+# made-up one (404) on the proxy itself.
+
+TLS_CHECK = "/api/data-apps-tls-check"
+
+
+def test_tls_check_allows_a_registered_app(proxy_client, running_app, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    r = proxy_client.get(TLS_CHECK, params={"domain": "s.apps.example.com"})
+    assert r.status_code == 200
+
+
+def test_tls_check_is_unauthenticated(proxy_client, running_app, proxy_env):
+    """`proxy_client` carries no credentials — Caddy cannot send any."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    assert "authorization" not in {k.lower() for k in proxy_client.headers}
+    assert proxy_client.get(TLS_CHECK, params={"domain": "s.apps.example.com"}).status_code == 200
+
+
+def test_tls_check_refuses_an_unknown_slug(proxy_client, running_app, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    r = proxy_client.get(TLS_CHECK, params={"domain": "nope.apps.example.com"})
+    assert r.status_code != 200
+
+
+def test_tls_check_refuses_a_foreign_domain(proxy_client, running_app, proxy_env):
+    """The whole point: never let Caddy request a cert for a name we don't serve."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    for domain in ("evil.test", "s.apps.evil.test", "apps.example.com.evil.test"):
+        assert proxy_client.get(TLS_CHECK, params={"domain": domain}).status_code != 200, domain
+
+
+def test_tls_check_refuses_the_bare_base(proxy_client, running_app, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    assert proxy_client.get(TLS_CHECK, params={"domain": "apps.example.com"}).status_code != 200
+
+
+def test_tls_check_refuses_a_multi_label_slug(proxy_client, running_app, proxy_env):
+    """Mirrors the middleware's `"." not in slug` rule — `a.s.apps.example.com`
+    is not a slug this deployment can route, so it gets no certificate."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    assert proxy_client.get(TLS_CHECK, params={"domain": "a.s.apps.example.com"}).status_code != 200
+
+
+def test_tls_check_is_case_insensitive(proxy_client, running_app, proxy_env):
+    """DNS names are case-insensitive and Caddy passes through what the client sent."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    assert proxy_client.get(TLS_CHECK, params={"domain": "S.Apps.Example.COM"}).status_code == 200
+
+
+def test_tls_check_refuses_when_no_base_configured(proxy_client, running_app, proxy_env):
+    """Path-prefix deployment: nothing should ever get an on-demand certificate."""
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="")
+    assert proxy_client.get(TLS_CHECK, params={"domain": "s.apps.example.com"}).status_code != 200
+
+
+def test_tls_check_refuses_a_hidden_linked_app(proxy_client, proxy_env):
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    _create_app_row(slug="gone", state="linked_hidden")
+    assert proxy_client.get(TLS_CHECK, params={"domain": "gone.apps.example.com"}).status_code != 200
+
+
+def test_logged_out_on_subdomain_carries_a_usable_return_url(proxy_client, running_app, proxy_env):
+    """The two halves must agree: the redirect hands `/login` a `next` pointing
+    back at the app, and `safe_next_path` — the guard that decides what login
+    will honour — actually accepts it. Asserted together, because either half
+    alone silently drops the caller on the dashboard."""
+    from urllib.parse import unquote
+
+    from app.auth._common import safe_next_path
+
+    _set_data_apps_config(proxy_env["data_dir"], subdomain_base="apps.example.com")
+    r = proxy_client.get("/dash?x=1", headers={"host": "s.apps.example.com"}, follow_redirects=False)
+    assert r.status_code == 302
+    loc = r.headers["location"]
+    assert "next=" in loc, loc
+    nxt = unquote(loc.split("next=", 1)[1])
+    # The ORIGINAL path the visitor asked for — not the `/apps/<slug>/…` form
+    # the subdomain middleware rewrote it into.
+    assert nxt.endswith("/dash?x=1"), nxt
+    assert "/apps/s" not in nxt, f"the rewritten path leaked into the return URL: {nxt}"
+    assert "//s.apps.example.com" in nxt, nxt
+    assert safe_next_path(nxt, default="/D") == nxt, "login would discard this target"

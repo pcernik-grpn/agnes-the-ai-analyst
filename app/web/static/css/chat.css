@@ -2045,8 +2045,42 @@ html[data-ui-layout="rail"] #chat-capabilities .rdb-ask-heading {
    ``margin-top: auto`` (which centers it in an active conversation) for the
    empty state so banner → greeting → composer flow from the top; the footer's
    own ``margin-top: auto`` still pins the credit to the bottom. */
+/* ── The empty state's vertical rhythm ────────────────────────────────────
+   FOUR steps, and the whole point is that they are ordered. Before this, the
+   gap between the composer and the suggestions (18px) was SMALLER than the gaps
+   inside the intro (25px, 28px) — so the page had no grouping the eye could
+   read: eight elements at roughly one distance apart, which is what made it
+   feel like a list of unrelated rows.
+
+   The page is TWO regions, not three. Everything down to the suggested
+   questions is "ask": the intro says what you can ask, the composer is where
+   you ask it, and the chips are ways to fill that composer — they are
+   suggestions FOR the input, so putting a section break between them said they
+   were a separate thing to consider. Below that, one break, then the ways out.
+
+   So: `tight`/`inner` inside one thought, `block` between the parts of the ask
+   region, and `section` — which must stay the largest value here — for the one
+   boundary that matters. Declared as tokens so the relationship is legible and
+   one change moves every surface sharing a step. */
+html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) {
+  /* ONE measure for everything secondary — the chips and the cards. They were
+     640px and 660px: close enough that their left edges landed 10px apart,
+     which reads as misalignment rather than as two different widths. Two
+     measures on this page, and only two: the composer's full column, and this. */
+  --cld-measure: 660px;
+  --cld-gap-tight: 5px;    /* two halves of one line (greeting → heading) */
+  --cld-gap-inner: 10px;   /* a label and the thing it labels */
+  --cld-gap-block: 26px;   /* end of a block, same region */
+  --cld-gap-section: 40px; /* between the page's three sections */
+}
 html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-form {
-  margin-top: 22px;
+  /* The page's one SECTION break, and it lands here now. Everything above is
+     orientation — what this is, what it answers from, the two doors, the promise
+     — and everything below is the act of asking. The composer is what the reader
+     crosses that boundary to reach, so the boundary belongs immediately before
+     it. (It was `block` while the cards sat at the foot and this gap only
+     separated the lede from the input.) */
+  margin-top: var(--cld-gap-section, 40px);
 }
 html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden])) > #chat-empty-extras {
   padding: 0;
@@ -2577,6 +2611,64 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   gap: var(--space-3);
   align-items: center;
   justify-content: flex-end;
+}
+
+/* Session-files dialog (#1611) — list of files the agent generated in this
+   session's workspace, each row with Download + Save-to-Library actions. */
+.cloud-chat-files-status {
+  font-size: var(--text-sm);
+  color: var(--ds-text-secondary);
+  line-height: 1.5;
+}
+.cloud-chat-files-status[hidden] { display: none; }
+.cloud-chat-files-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-md, 8px);
+}
+.cloud-chat-files-list:empty { display: none; }
+.cloud-chat-files-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+.cloud-chat-files-row + .cloud-chat-files-row {
+  border-top: 1px solid var(--ds-border);
+}
+.cloud-chat-files-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cloud-chat-files-name {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ds-text);
+  overflow-wrap: anywhere;
+}
+.cloud-chat-files-hint {
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
+  overflow-wrap: anywhere;
+}
+.cloud-chat-files-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+.cloud-chat-files-btn {
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-2);
+  white-space: nowrap;
 }
 
 /* Store dialog: type tiles (mirrors store_upload.html .type-tiles) */
@@ -3623,49 +3715,13 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after
   font-size: 0.85em;
 }
 
-/* ── Composer footer row ──────────────────────────────────────────────────
-   The strip UNDER the input, present in both states. Reads left to right as a
-   sentence about the conversation: the Stack context line (what it runs with,
-   dashboard only) leads, the agent (who it runs as) trails at the right edge,
-   under the send button.
-
-   The Stack line used to lead #chat-empty-extras and inherited that column's
-   centring (`align-self: center; width: var(--rdb-col-narrow)`). In this row
-   it is a flex item beside the picker, so those are unset below rather than
-   left to fight the row. */
-.cloud-chat-composer-foot {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  /* Matches the composer pill's own inset, so the leading text sits under the
-     input's text and the trailing agent lands under the send button rather
-     than past it. */
-  padding: 6px 8px 0;
-  min-width: 0;
-}
-/* The agent trails the row in every state — including the one where the Stack
-   line is hidden and it is the row's only occupant. `margin-left: auto` (not
-   `justify-content: flex-end`) is what makes both cases the same rule. */
-.cloud-chat-agent-wrap {
-  margin-left: auto;
-}
-html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
-  align-self: auto;
-  width: auto;
-  min-width: 0;
-  padding: 0;
-  /* The row already spaces its items; the line's own leading gap would double
-     the distance from the picker. */
-  flex: 0 1 auto;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-/* The context line belongs to the empty state — it hides with the dashboard,
-   leaving the picker alone on the row in a live conversation. #chat-form is a
-   later sibling of #chat-capabilities, which is what makes this reachable now
-   that the line no longer rides #chat-empty-extras. */
-#chat-capabilities[hidden] ~ #chat-form .rdb-context { display: none; }
+/* No `.cloud-chat-composer-foot` rules, and no row for them to style. It held
+   the agent picker — inside the composer pill now, beside Send — and then the
+   "Using N knowledge sources and M capabilities from your Stack" line, which is
+   retired: it spent a whole row under the input on a number nobody acts on, and
+   the space now belongs to the suggestions below. Nothing sits between the
+   composer and them. The rail override for that line and the two
+   `#chat-capabilities[hidden]` hide rules went with it. */
 
 /* ── Composer agent picker ────────────────────────────────────────────────
    Which agent the conversation runs AS. A low-emphasis text pill leading the
@@ -3689,15 +3745,37 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 12rem;
-  height: 30px;
-  padding: 0 var(--space-2);
+  /* A cap remains as a backstop — a very long single word has to stop
+     somewhere and the label ellipsizes past this — but it is no longer
+     load-bearing: on the trailing side of the textarea a wider pill takes its
+     width from the end of the field rather than from where the text begins.
+     Long names are abbreviated to initials in `_agentLabel` (chat.js), so this
+     rarely binds. */
+  max-width: 9rem;
+  flex: 0 0 auto;
+  /* Matched to the send button beside it (44px, see `.cloud-chat-send-btn`), so
+     the trailing cluster is one pair of controls at one height rather than a
+     short pill floating beside a tall circle. */
+  height: 44px;
+  padding: 0 var(--space-3);
+  /* Transparent, not `none`: the 1px stays in the box so the pill keeps its
+     height and the row does not shift by 2px on hover. The FILL is the whole
+     signal — an outline around a tinted pill is two devices saying one thing,
+     and at this size it closed the shape in and made a 30px control look like a
+     tag. */
   border: 1px solid transparent;
   border-radius: var(--ds-radius-pill, 999px);
+  /* No resting fill — the tint arrives on hover. What marks this as a control
+     rather than a label at rest is its INK and weight (accent, 600) plus the
+     caret; a standing fill on the one row under the composer competed with the
+     input for the eye, and the row's job at rest is to be read, not clicked.
+     The fill is still the whole hover signal, so nothing is lost: the shape is
+     the same size in both states (the border stays 1px transparent), so the row
+     cannot shift when it lights up. */
   background: transparent;
-  color: var(--ds-text-secondary);
+  color: var(--ds-primary-dark, var(--ds-primary));
   font-size: var(--text-xs);
-  font-weight: var(--font-medium);
+  font-weight: var(--font-semibold, 600);
   font-family: inherit;
   cursor: pointer;
   transition:
@@ -3706,9 +3784,9 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
     border-color var(--ds-motion-fast, 120ms);
 }
 .cloud-chat-agent-btn:hover:not(:disabled) {
-  background: var(--ds-surface-dim);
-  border-color: var(--ds-border);
-  color: var(--ds-text-primary);
+  /* The one device this control spends, and only on hover. No border here
+     either — an outline around a tinted pill is two devices saying one thing. */
+  background: color-mix(in srgb, var(--ds-primary) 12%, var(--ds-surface));
 }
 .cloud-chat-agent-btn.is-open {
   background: var(--ds-accent-info-bg);
@@ -3734,6 +3812,18 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
   color: var(--ds-text-muted);
 }
 .cloud-chat-agent-label[hidden] { display: none; }
+/* Inside the composer the wrap is a flex item of the pill, not of the footer
+   row — it must not stretch or shrink, and its popover still escapes because
+   the pill does not clip (see `.cloud-chat-composer`). */
+html[data-ui-layout="rail"] .cloud-chat-composer > .cloud-chat-agent-wrap {
+  flex: 0 0 auto;
+}
+/* The trailing pair sits tight: the pill reads as Send's partner, not as a
+   third thing between the text and the button. */
+html[data-ui-layout="rail"] .cloud-chat-composer > .cloud-chat-agent-wrap + .cloud-chat-form-actions {
+  margin-left: 2px;
+}
+
 .cloud-chat-agent-btn-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3747,10 +3837,13 @@ html[data-ui-layout="rail"] .cloud-chat-composer-foot .rdb-context {
 
 .cloud-chat-agent-menu {
   position: absolute;
-  /* Anchored to the wrap's RIGHT edge and growing leftward: the button sits at
-     the row's right end, so a left-anchored menu would run off the composer. */
-  right: 0;
-  left: auto;
+  /* Anchored to the wrap's LEFT edge and growing rightward, because the button
+     leads the row now. It used to anchor `right: 0` and grow leftward, which was
+     correct while the picker trailed the row — and became a bug the moment it
+     moved: from the left end of the composer a leftward menu ran back across the
+     rail and off the window, so the agent names were clipped by the sidebar. */
+  left: 0;
+  right: auto;
   bottom: calc(100% + var(--space-2));
   z-index: 20;
   min-width: 240px;
@@ -3798,6 +3891,32 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   border-color: var(--ds-accent-info-line);
   outline: none;
 }
+/* The create row — a different KIND of row from the agents above it (they
+   switch this conversation; this one leaves the page), so a rule separates them
+   rather than a gap alone. */
+.cloud-chat-agent-menu-create {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--ds-border);
+}
+.cloud-chat-agent-menu-create-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px var(--space-3);
+  border-radius: var(--ds-radius-md, 8px);
+  color: var(--ds-primary-dark, var(--ds-primary));
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold, 600);
+  text-decoration: none;
+}
+.cloud-chat-agent-menu-create-link:hover,
+.cloud-chat-agent-menu-create-link:focus-visible {
+  background: color-mix(in srgb, var(--ds-primary) 10%, var(--ds-surface));
+  outline: none;
+}
+.cloud-chat-agent-menu-create-ico { width: 15px; height: 15px; flex-shrink: 0; }
+
 .cloud-chat-agent-menu-item-text {
   flex: 1 1 auto;
   min-width: 0;

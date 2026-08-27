@@ -776,6 +776,32 @@ def _refresh_plugin_cache(slug: str, commit_sha: str | None = None) -> int:
     return count
 
 
+def _invalidate_served_caches() -> None:
+    """Drop the served-marketplace caches after a successful sync.
+
+    Both sync paths (``sync_one`` and ``sync_marketplaces``) must call this
+    on success — a sync that leaves these caches warm reports a fresh
+    commit while ``/marketplace.zip`` and the cowork bundle keep serving
+    pre-sync bytes until their TTL expires, which is the opposite of what
+    an on-demand sync is for. Both caches are global (keyed on the
+    resolved plugin set / prefixed name+version, not on marketplace id),
+    so there is no narrower scope to invalidate.
+
+    Best-effort — a late import failing during early startup must not fail
+    a sync that already succeeded. Late import: keeps this module decoupled
+    from the FastAPI app surface.
+    """
+    try:
+        from app.marketplace_server import packager as _packager
+
+        _packager.invalidate_etag_cache()
+        from app.marketplace_server import cowork_packager as _cowork
+
+        _cowork.invalidate_cache()
+    except ImportError:
+        pass
+
+
 def sync_one(marketplace_id: str) -> Dict[str, Any]:
     """Sync a single marketplace by id. Updates registry row with result.
 
@@ -804,6 +830,7 @@ def sync_one(marketplace_id: str) -> Dict[str, Any]:
                 marketplace_id,
                 commit_sha=result["commit"],
             )
+            _invalidate_served_caches()
             return result
         except (RuntimeError, ValueError) as e:
             repo.update_sync_status(
@@ -864,19 +891,8 @@ def sync_marketplaces() -> Dict[str, Any]:
                     error=str(e),
                 )
 
-    # Drop cached etags so the next /marketplace.zip request re-hashes against
-    # the freshly-synced content rather than waiting for TTL expiry. Late
-    # import: keeps src.marketplace decoupled from the FastAPI app surface.
     if synced:
-        try:
-            from app.marketplace_server import packager as _packager
-
-            _packager.invalidate_etag_cache()
-            from app.marketplace_server import cowork_packager as _cowork
-
-            _cowork.invalidate_cache()
-        except ImportError:
-            pass
+        _invalidate_served_caches()
 
     return {"synced": synced, "errors": errors}
 

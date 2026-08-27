@@ -1970,6 +1970,15 @@ class ChatManager:
             # wait for. The env key stays for runner protocol compat —
             # runner.py skips the wait when it's empty.
             "AGNES_WORKSPACE_SYNC_SENTINEL": "",
+            # LLM provider routing hints (chat.llm.provider: vertex). NOT
+            # credentials: the runner uses them to flip the CLI into its
+            # native Vertex gateway mode (skip-auth, still egressing through
+            # the relay → broker), and the broker re-validates project/region
+            # server-side by equality against instance config — tampering
+            # with these values earns a 403, never redirected spend.
+            "AGNES_LLM_PROVIDER": getattr(self._config, "llm_provider", "anthropic"),
+            "AGNES_VERTEX_PROJECT_ID": getattr(self._config, "vertex_project_id", ""),
+            "AGNES_VERTEX_REGION": getattr(self._config, "vertex_region", ""),
             # No ANTHROPIC_API_KEY / AGNES_TOKEN here (chat sandbox secret
             # broker hardening, 2026-07-14): the real Anthropic key never
             # enters the sandbox env. The runner's own ``_start_relay``
@@ -1978,6 +1987,8 @@ class ChatManager:
             # value — the relay is the only thing that ever holds a real
             # credential, fed in-memory via the ``ticket_push`` stdin frame
             # this manager pushes after spawn/resume (_push_ticket_frame).
+            # The same applies in vertex mode: no Google credential material
+            # here either — the broker signs upstream requests server-side.
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             # ``session_dir`` is an Agnes-host-side path; it doesn't exist
             # inside the sandbox. claude-agent-sdk's inner ``claude``
@@ -3547,7 +3558,15 @@ class ChatManager:
                 # user_msg was persisted — shouldn't happen in normal
                 # flow, but bail cleanly if it does.
                 return
-            title = await generate_title(first_user, llm_auth=self._config.llm_auth)
+            title = await generate_title(
+                first_user,
+                llm_auth=self._config.llm_auth,
+                llm_provider=getattr(self._config, "llm_provider", "anthropic"),
+                vertex=(
+                    getattr(self._config, "vertex_project_id", ""),
+                    getattr(self._config, "vertex_region", ""),
+                ),
+            )
             if not title:
                 return
             self._repo.set_title(live.chat_id, title)

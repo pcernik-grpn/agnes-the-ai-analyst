@@ -131,14 +131,35 @@ class TestBothVariantsAreTheSameCard:
         assert 'class="cld-door-btn cld-door-btn--quiet">Browse' in card
 
 
-class TestTheDoorsDoNotPoolSpaceAtTheTop:
-    def test_doors_centre_their_content(self):
-        """The grid stretches all three cards to the tallest, so top-aligned
-        content left a two-line card trailing a third of a card of nothing —
-        which reads as something that failed to load."""
+class TestTheDoorsAlignOnTheirTitles:
+    def test_doors_top_align_their_content(self):
+        """Top-aligned, so the two titles sit on ONE line as the eye crosses
+        between the cards.
+
+        Centring was right at THREE cards: the grid stretched all of them to the
+        tallest, and top-aligned content left a two-line card trailing a third of
+        a card of nothing, which read as something that failed to load. At two
+        cards of near-equal height that slack is a few pixels, and spending it
+        above the titles buys a misalignment instead — the reader's entry point
+        into each card is its title, and two titles at different heights is the
+        one thing a pair of cards must not do."""
         css = CSS.read_text(encoding="utf-8")
         rule = css.split(".cld-door {", 1)[1].split("}", 1)[0]
-        assert "justify-content: center" in rule, "the doors are top-aligned again"
+        assert "justify-content: flex-start" in rule
+        # …and the pair is held to a measure rather than stretched to the
+        # composer's full width, which at two cards would read as two banners.
+        doors = css.split(".cld-doors {", 1)[1].split("}", 1)[0]
+        assert "grid-template-columns: repeat(2," in doors
+        assert "max-width" in doors
+        # The step comes from the page's spacing scale, not a literal. The cards
+        # sit ABOVE the composer now, closing the intro block, so the gap above
+        # them is `block` — and it subtracts the intro column's own flex gap, or
+        # every margin in that column reads 5px larger than the token it names.
+        # The page's one `section` step moved to the gap below this block, before
+        # the composer (see `#chat-form` in chat.css).
+        assert "var(--cld-gap-block" in doors
+        assert "var(--cld-gap-tight" in doors, "the column's flex gap must be subtracted"
+        assert "auto 0" in doors, "…and the pair stays centred in its measure"
 
 
 class TestTheLeadTitleIsNotTheBannerGradient:
@@ -152,6 +173,9 @@ class TestTheLeadTitleIsNotTheBannerGradient:
 
     def test_the_title_is_solid_accent_ink(self):
         css = CSS.read_text(encoding="utf-8")
-        rule = css.split(".cld-door--lead .cld-door-t {", 1)[1].split("}", 1)[0]
+        # `--split` (the marker-column layout), not `--lead` (the tinted
+        # surface): the title treatment follows the layout so the pair reads as
+        # peers, and the tools card takes one without the other.
+        rule = css.split(".cld-door--split .cld-door-t {", 1)[1].split("}", 1)[0]
         assert "background-clip" not in rule, "gradient ink is back on a 14.5px title"
         assert "--ds-primary-dark" in rule

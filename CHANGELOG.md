@@ -10,252 +10,37 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
-### Changed
-
-- **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
-  It used to debounce-PATCH every keystroke, which meant there was never a
-  moment at which the owner had *decided* the agent was right, and no honest
-  way to offer "leave without saving". Edits — typed or made by the
-  conversation — now accumulate in an unsaved working copy and reach the
-  server only on **Save**. The header says which state you are in ("Unsaved
-  changes", Save disabled when clean).
-  - A **new** agent's header offers *Save as draft* and *Mark ready*, and no
-    Delete: the row exists server-side only because the conversation and the
-    preview address the agent by id, so it is a placeholder until saved, and
-    leaving via *← All agents* discards it (confirmation first, then a real
-    `DELETE`). A failed discard restores the row rather than leaving the list
-    denying an agent the server still has.
-  - An **existing** agent's header offers *Save*, *Revert to draft* /
-    *Mark ready*, and *Delete*. Leaving with unsaved changes asks first and
-    rolls the working copy back to the last saved state.
-  - `beforeunload` covers the ways out our own dialog cannot intercept (a nav
-    click, a reload, a closed tab).
-  - **Preview still commits.** The agent runs server-side, so it can only
-    answer as a configuration the server has; opening Preview performs the
-    same write Save does, baseline included, rather than previewing a persona
-    the agent does not have.
-- **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
-  `apply=false` runs the turn and returns the sanitized patch **without**
-  writing, which is what lets the page hold an unsaved working copy;
-  `config` carries that copy so the turn reasons about the configuration on
-  screen rather than the last-saved row. `config` is narrowed to the
-  `PATCHABLE` keys and only ever reaches the prompt — ids in the returned
-  patch are still gated against the caller's own RBAC-scoped candidate lists.
-  Both default to the previous behaviour (`apply=true`, no override), so
-  every existing caller is unaffected. Note the consequence for the page: the
-  panel now merges the patch client-side instead of re-rendering from the
-  applied row, so the enforced scope is re-derived at Save rather than at
-  each turn — an unsaved patch grants nothing, so nothing is enforced later
-  than it is shown.
-
-- **The `/agents` index separates ready agents from drafts, and a card's click
-  follows its state.** Ready agents render in a titled band above Drafts.
-  Clicking a ready card opens a conversation with that agent (what you came to
-  the page to do) and its footer carries **Edit** into the builder; clicking a
-  draft opens the builder (what you came to *it* to do) and its footer keeps
-  **Chat**. Neither route was lost in either state — marking an agent ready is
-  not a one-way door out of the builder, and a draft is still talk-to-able.
-- **The builder's two panes are an even 50/50 split.** The configuration was
-  previously capped at a third of the width, which left it a cramped sidebar
-  while the conversation had room to spare.
-
-
-- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
-  `none` (internal-only network, no route to the internet) instead of `open`.
-  The chat agent runs with bypassed tool permissions over a read-write
-  workspace, so an open default was a file-exfiltration surface. Operators who
-  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
-  with `chat.docker_egress_mode: open`, or `allowlist` +
-  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
-  or blank value now fails closed to `none`.
-
-
-- **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
-  Databricks panes now save the connection onto the `source_connections` ROW
-  (`POST`/`PUT /api/admin/source-connections*` + the row's own vault slot via
-  `.../secret`), not the `data_source.<type>` server-config yaml overlay** (D2
-  slice 2). The "restart the instance so the scheduler and workers pick up
-  connection settings" warning is gone from both panes — a row is read live
-  by every process, so there is nothing left to restart for; the Databricks
-  pane is a straight line to `/admin/tables` again (no held-open second
-  click). The connection-repoint confirmation (409
-  `connection_change_affects_registrations` / `confirm_connection_change`)
-  moves with it, onto `PUT /api/admin/source-connections/{id}` for Snowflake/
-  Databricks rows. **Operators who relied on the old flow**: a
-  `data_source.snowflake.*`/`data_source.databricks.*` yaml block hand-edited
-  via `/admin/server-config` is now IGNORED once a row of that type exists
-  (the row wins) — re-point the connection through `/admin/data-sources` or
-  `/admin/connections` instead. Multi-connection-per-type stays out of scope
-  for this slice — one Snowflake/Databricks connection per instance, as
-  before.
-- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
-  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
-  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
-  `instance.theme` / `instance.experience` / `instance.home_route` /
-  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
-  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
-  UI (`/admin/server-config`) owns them from day 2 onward instead of having
-  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
-  value and permanently shadow the operator's own change. **Existing VMs**:
-  on their next boot the old always-wins `.env` lines disappear; the value
-  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
-  relied on Terraform re-asserting one of these four knobs every boot must
-  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
-  by hand). No app-side precedence change — a hand-set env var still wins
-  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
-  is unaffected (it pins deployment-provisioned backing, not a presentation
-  choice, so it is out of scope). See the new "Config ownership map" in
-  `docs/CONFIGURATION.md`.
-- **A THIRD-PARTY admin-granted agent scope item now reaches its agent
-  unconditionally, instead of being silently narrowed to the owner's own
-  grants** (remediation-program Track C2.2, consuming C2.1's `granted_by`).
-  `src/agent_scope_intersection.py::resolve_agent_authority` replaces
-  `compute_agent_intersection`: a `'selected'`-mode `agent_scope` row whose
-  `granted_by` is a THIRD PARTY — distinct from the agent's own owner — who
-  is (currently) an admin resolves unconditionally — a `data_package` an
-  admin shared with an agent now expands to its member tables even when the
-  agent's OWNER holds no grant on it at all, closing the "package invisible
-  to an admin-built agent" bug class. Every other row — a non-admin
-  granter, OR a granter who IS the agent's own owner (including an admin
-  owner) — still narrows to `item ∩ that GRANTER's CURRENT access` —
-  today's owner-intersection shape, just keyed to whoever wrote the row
-  instead of hard-coded to the agent's owner, so it now also stops
-  resolving if the ORIGINAL GRANTER (not the owner, not any future caller)
-  later loses access. **On Postgres only** — DuckDB has no `granted_by`
-  column (C2.1), so every row there reads back with no granter and falls
-  back to the agent's owner, making this a no-op on DuckDB and a
-  byte-identical no-op on Postgres for every agent whose scope predates C2
-  (migration 0073 backfilled `granted_by := owner_user_id`) — including for
-  an agent whose owner is itself an admin, which always narrows rather than
-  taking the unconditioned branch.
-  `AgentPrincipal.intersection` (the broker/pat-resolver, chat spawn, and
-  every table/marketplace/MCP seam that reads it) is unaffected in shape —
-  only its computation changed. Also fixes a related gap found while
-  building this: `agent_scope.set_scope`'s full-replace (Postgres) now
-  preserves the EXISTING `granted_by` for a row that is re-declared
-  unchanged, so a later owner save (e.g. the `/agents` builder syncing an
-  unrelated `knowledge`/`plugins` edit, which reads back and re-submits
-  every governance-owned row) can no longer silently downgrade an
-  admin-granted row to owner-granted.
-
-### Fixed
-
-- **Collapsing or expanding a section in the builder's Configuration panel no
-  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
-  discarding its scroll position — so opening a section near the bottom
-  scrolled away from the thing you had just opened. Every section's body is
-  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
-  flips the class in place and re-renders nothing.
-
-- **The `/agents` builder's Configuration panel lists what the agent HAS, not
-  everything it could have.** Data & resources and Capabilities used to render
-  the caller's entire reachable pool — every data package, memory domain and
-  marketplace plugin — as a list of toggles, which made the panel a form to
-  fill in and buried the two or three things actually attached among the
-  dozens that were not. Both sections now show only what is connected (each
-  row's action is *Remove*), with the full pool one click behind a **+** in
-  the section header that opens a searchable picker over the shared
-  `.modal-backdrop` modal. The conversation stays the primary way to attach
-  things; the picker is the by-hand path. An attached id that has since left
-  the caller's scope is still listed, marked *Unavailable*, rather than
-  silently dropped — the panel must not disagree with the agent.
-- **The builder is full-bleed instead of a card inside the page column.** It
-  broke out of the index shell's centred `--width-wide` container (via a
-  `body.ag-building` class, cleared on the way back to the list, which is
-  still a document and keeps its column), so both panes get the screen. The
-  conversation keeps a 780px measure inside its pane so prose does not stretch
-  to 1200px lines. Each section's explanatory sentence moved from the header
-  into the body, where it is read when you open the section to act rather than
-  wrapping to four lines under all six collapsed titles.
-
-
-- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
-  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
-  labels now render via `textContent`, keeping the static sort markup trusted.
-- Agent-session principals no longer crash (500) when reaching collection
-  authorization (`accessible_collection_ids`, `require_collection_access`);
-  an `AgentPrincipal` now resolves to its live scoped-collection intersection
-  or a clean 403, matching the existing co-session/agent-session seam and
-  never inheriting owner-owned collections.
-- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
-  the same canonical subpath used for policy and dispatcher classification, and
-  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
-  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
-  path like `/v1/./messages` that classified as a non-message call — skipping
-  its pinned-model allowlist and monthly token budget — while HTTPX
-  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
-  duplicate-slash message paths can likewise no longer route the destination
-  somewhere the authorization decision did not intend.
-- Token persistence refuses to write (instead of silently downgrading to
-  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
-  valid Fernet key; a genuinely unset key still uses the plaintext keyless
-  fallback as before. A previously-silent misconfigured production vault now
-  fails loudly on secret saves instead of writing the secret in cleartext.
-
-
-- Web chat: a user message's hover actions (timestamp + copy) now hang
-  BELOW the bubble instead of renting an invisible second row inside it —
-  a one-line message no longer renders as a two-row-tall bubble. On touch
-  devices (no hover) the row stays visible and the turn reserves the space.
-- Web chat: on a history reload, a multi-part assistant turn (text → tool
-  card → text) now carries its sources chips, copy/actions row, "Ask again"
-  and collapse cap on the turn's LAST text segment — where the live stream
-  already put them — instead of stapling them after the first segment,
-  mid-turn. The reload timestamp also reads the row's real `created_at` on
-  every segment rather than "now" on continuations.
-- Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
-  The sessions/messages endpoints (incl. copresence) pre-stringified their
-  naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
-  that labels them `+00:00` — the browser then parsed the offset-less
-  string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
-  They now return raw datetimes and the encoder stamps the offset.
-- Web chat: the permanent "Connected." pill is gone — connected is the
-  normal state and reconnection is automatic, so the status surfaces only
-  when something is in progress or wrong ("Resuming session…", warnings,
-  errors), as a pill below the thread header. "Copy transcript" moves to
-  the header's right edge (the removed pill's spot) restyled as a quiet
-  ghost button, and a cleared status no longer leaves an empty dot-pill.
-- **The GCP Cloud Logging overlay can no longer take an instance down**
-  (#1557, #1558; observed live as a 9-minute full outage on a routine
-  auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
-  service account, but the `customer-instance` Terraform module granted it
-  no logging role while defaulting `enable_gcp_logging = true` — and Docker
-  refuses to START a container whose log driver cannot initialize, so the
-  first container recreate with the overlay armed turned into 502s. Two
-  halves: (1) the module now grants `roles/logging.logWriter` on the
-  project to the VM service account, gated on the same `enable_gcp_logging`
-  variable (the deploying identity must be able to modify project IAM
-  policy — documented on the variable; grant the role out-of-band or
-  disable the flag otherwise); (2) defense in depth — the overlay is
-  engaged only when the overlay file is present AND a driver probe
-  (`agnes_gcp_logging_probe`: a no-op container on `--log-driver=gcplogs`)
-  has armed the `/opt/agnes/.gcp-logging-ok` marker. The probe runs at boot
-  and on any auto-upgrade tick that finds the overlay marker-less, and the
-  single shared gate (`agnes_gcp_logging_active` in
-  `scripts/ops/agnes-compose-file.sh`) is used by the boot startup script,
-  the auto-upgrade tick, and the state applier alike — so the boot-time
-  `COMPOSE_FILE` and the recurring resolver can never disagree about the
-  overlay again, and a missing IAM role now degrades to "Cloud Logging off
-  + loud warning" instead of an outage.
-- **`config/loader.py` no longer raises on a static `instance.yaml` missing
-  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
-  `auth.webapp_secret_key`.** The check never actually gated anything: a
-  provisioned VM ships no static `instance.yaml` at all (the loader raises
-  `FileNotFoundError` first), and `app.instance_config` already caught the
-  `ValueError` and served built-in defaults regardless. It now logs a
-  warning naming the missing field(s) instead of raising, so a direct caller
-  of `config.loader.load_instance_config()` (e.g. a connector script) no
-  longer gets an exception on an otherwise-bootable config.
-- `POST`/`PUT /api/admin/source-connections` now validate `source_type` +
-  `config` via `src.connection_specs.validate_connection_config`: an unknown
-  `source_type` or a malformed config (e.g. a non-`https://` `stack_url`, a
-  BigQuery config missing `project`) is rejected with `400` naming the
-  offending field, instead of being stored unchecked and only surfacing
-  later as a confusing sync failure. An empty config at create/update still
-  succeeds — the "Add data source" wizard creates a connection row before
-  its config is complete.
-
 ### Added
+- **Claude can run through Google Vertex AI — chat and server-side, keyless.**
+  Two new provider switches, both authenticated by Google Application Default
+  Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
+  `chat.llm.vertex.project_id/region`) flips the chat sandbox CLI into Claude
+  Code's native Vertex gateway mode — requests still egress through the
+  loopback relay to the secret broker, which validates the path's
+  project/region by equality against instance config (a sandbox can never
+  redirect spend), signs upstream calls with a Google OAuth token, and keeps
+  model pinning, monthly token budgets, and the usage ledger working; the
+  kai-agent engine needs no change (the broker rewrites its first-party
+  Messages calls into the Vertex shape). `ai.provider: vertex` (+
+  `ai.vertex.project_id/region`) does the same for every server-side LLM
+  call-site — corporate memory, digests, guardrail reviews, usage-ask, vision
+  OCR, and chat auto-titles. Dated model ids interchange between the
+  first-party (`claude-…-YYYYMMDD`) and Vertex (`claude-…@YYYYMMDD`)
+  spellings everywhere they are compared. Boot refuses `vertex` combined with
+  `workload_identity` or `LLM_DISPATCHER_URL`, and refuses a `project_id` or
+  `region` outside the Google resource-id character set — both are
+  interpolated into the outbound Vertex URL (the region becomes part of the
+  hostname), so a crafted value would otherwise sign a request to a host that
+  is not Google's. The admin readiness page gains vertex rows plus a live
+  test-connection probe. See `docs/cloud-chat.md` → "LLM provider: Google
+  Vertex AI".
+
+- **Instances can opt into GCE deletion protection.** The `customer-instance`
+  module exposes `deletion_protection` on `prod_instance` and on each
+  `dev_instances[]` entry and passes it through to the `google_compute_instance`
+  resource, so a `terraform destroy` (or an accidental `-replace`) is refused by
+  the API until the flag is cleared. Defaults preserve today's behaviour — an
+  instance that does not set it is unprotected, exactly as before.
 
 - **A plugin can now be composed from items already in the Library** — the
   builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
@@ -305,6 +90,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
   works"), the middle one naming the direction the old CTA got backwards. Same
   page for admins and members.
+
 - **The chat landing page stops offering what it cannot do, and gives an admin
   one thing to do.** On an instance with no data reachable by the caller the
   page used to say "Ask Agnes anything", suggest four data starters ("Compare
@@ -343,6 +129,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   written, and `status` / the four `*_mode` columns are not writable from a
   conversation at all. With no AI credential configured the endpoint answers
   `503 builder_llm_unavailable` and the panel stays fully usable by hand.
+
 - **The builder's Preview is a live chat with the agent**, replacing the
   static mock card. It opens a real session bound to the draft agent's own
   slug (`POST /api/chat/sessions` with `agent_slug`) and streams the answer
@@ -352,6 +139,486 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   full chat* link to the same session for the full renderer. Engine failures
   are translated into what the reader can act on instead of surfacing the
   internal kind.
+
+### Changed
+- **A chat send that never started no longer eats the message.** The composer
+  is cleared synchronously on submit, for immediate feedback while the runner
+  boots — but when `ensureWsReady()` then failed (chat disabled, no live
+  ChatManager, session POST refused with 503) the error line appeared over an
+  empty composer and the typed prompt was gone. The failure path now puts the
+  text back, so a chat backend that is down costs a retry rather than the
+  message. Guarded by `tests/test_chat_failed_send_keeps_draft.py`.
+
+- **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
+  A ready agent's card used to start a conversation, which meant the one obvious
+  gesture on the page whose whole subject is the *configuration* went somewhere
+  else, and editing was left to a small `Edit` button in the card's footer. Cards
+  now behave the same in both bands — click to configure — and **Chat** is the
+  footer action on every card (draft ones already had it). Nothing became
+  unreachable: the composer's own agent picker still opens a session as any
+  agent.
+
+- **Fixed: the empty-instance chat landing told the reader something untrue.**
+  Its lede read "It knows nothing about your company yet, so it can answer
+  nothing", and that second clause is false — with no data registered {brand}
+  answers perfectly well from general knowledge. The same page proved it two
+  elements lower: the composer's placeholder is "Ask how to get {brand} set up…"
+  and the suggested questions are "How do I connect our data?" and "What will
+  people be able to ask?", all of which get real answers, so a reader who typed
+  one caught the page contradicting itself on their first attempt. What is
+  missing is the GROUNDING, not the answering, so the copy draws that line
+  instead: *"Nothing is connected yet, so {brand} answers from general knowledge
+  rather than your company's data. Connect where your data lives and it can
+  answer from your own numbers."* The setup card made the same overclaim
+  ("Nothing is registered yet, so nobody can ask anything") and now reads "No
+  data connected yet, so answers can't use your numbers". The guards assert the
+  scoped claim and refuse either old form.
+
+- **The admin zero state greets the reader like every other chat landing.** It
+  opened with an "{instance} · Admin" eyebrow where every other state opens with
+  "Good morning, {name}" — two different openers for no benefit to the reader,
+  since an admin arriving at an unconfigured instance is still a person arriving
+  at their tool. The greeting is now defined once and emitted in both intro
+  branches, so the only thing that differs between them is the heading and lede
+  that genuinely differ. The retired eyebrow's information is not lost: the
+  deployment is identified by the rail's wordmark and the footer's build stamp.
+
+- **The chat empty state has a vertical rhythm you can read.** Its spacing was
+  inverted: the gap between the composer block and the suggestions (18px) was
+  *smaller* than the gaps inside the intro above it (25px, 28px), so eight
+  elements sat at roughly one distance apart and the page read as a list of
+  unrelated rows rather than three sections. Spacing is now a named four-step
+  scale declared once on the empty state (`--cld-gap-tight` · `-inner` ·
+  `-block` · `-section`), with `section` the largest step by construction:
+  5px inside one line, 10px from a label to what it labels, 26px between the
+  parts of a region, 40px for the page's one real boundary. The page is TWO
+  regions rather than three sections — everything down to the suggested
+  questions is "ask" (the intro says what you can ask, the composer is where you
+  ask it, the chips are ways to fill it), then one break, then the ways out. The
+  measured result for an admin is 5 · 10 · 26 · 10 · **40** · 26 · 10, reading
+  greeting → heading → lede → cards → privacy line → *break* → composer → label →
+  chips; for a member the same steps run greeting → heading → lede → *break* →
+  composer → label → chips → **40** → cards → privacy line.
+  Three alignment faults went with it, all of the same kind — near-agreement,
+  which reads as error where either agreement or a clear difference would not:
+  - **The composer's footer row was the one left-aligned block** on a page whose
+    every other element shares one centre axis, and it sat at the midpoint with
+    540px of empty row after it. Centred.
+  - **Three near-equal measures** (composer 830px, cards 660px, chips 640px) are
+    now two. The chips and the cards share `--cld-measure`, so their left and
+    right edges land on the same pixels instead of 10px apart.
+  - **The two cards' text columns started at different insets** — one after a
+    46px progress ring, the other at its own padding — so their titles never sat
+    on a shared line and the ringed card read as the heavier of the pair. The
+    icon slot is the ring's exact size now (46px, was 40px), and the tools card
+    carries a leading mark of its own.
+
+- **`/agents` opens with a "New agent" card instead of a button above the
+  grid.** Making an agent lands in the same builder as opening one, so it is the
+  same kind of act and belongs in the same row — in the position the eye reaches
+  first — rather than floating over the collection as a toolbar. The dashed cell
+  is a peer of the cards beside it in size and radius and deliberately not in
+  fill, since a solid card would read as an agent that already exists. It leads
+  whichever band actually renders: Ready when there is one, Drafts otherwise, so
+  an instance whose every agent is still a draft does not lose it (an empty band
+  renders nothing at all). The zero state keeps its own "Build an agent" panel —
+  with no grid, there is no first cell for a card to be.
+
+- **The chat empty state is reordered, and the door-cards close the page.** The
+  three cards between the heading and the input are now two, and they sit BELOW
+  the composer and its suggested questions: greeting, heading, lede — then the
+  field, the suggestions, the two cards, the privacy line. Everything above the
+  input tells you what this is and what it answers from; the cards all navigate
+  away from it, so they come after the thing the reader came for. The page's
+  single `section` break lands between the suggestions and the cards.
+
+  The one inversion is an instance with **nothing registered**: there is nothing
+  to ground an answer in yet, so the cards (and the trust line that travels with
+  them) render above the composer, where "Add your first data" is the page's real
+  action rather than the fifth thing on it. Gated on the same condition as the
+  zero-state heading and lede, so the three cannot disagree about which state the
+  page is in. This replaces a by-AUDIENCE gate that put an admin's cards above
+  the input on every instance, configured or not.
+
+  The "Using N knowledge sources and M capabilities from your Stack" line that
+  sat under the composer is **removed** — it reported a count with no action
+  attached, in the one row between the input and its suggestions. Nothing else
+  consumed those counts, and they were not free: two `StackResolver` reads plus
+  an RBAC plugin resolve on every `/chat` render, so the helpers
+  (`_stack_knowledge_source_count` / `_stack_capability_count`) and their tests
+  went with them. Git history holds the "actual Stack, not the whole catalog"
+  reasoning if the line ever returns.
+  - **The suggestions are a row of chips**, not a four-item column: a stack of
+    full-width rows under a text field reads as results, where a wrapping row of
+    pills reads as things you could ask — and takes one line instead of four. The
+    group is held to a measure so it wraps into balanced rows. Its label reads
+    **"Suggested for you"**, which is the claim worth a line: they are derived
+    from what this caller can actually reach, not four static examples. (An
+    interim "Suggested to ask" was dropped for saying only what the chips already
+    looked like — the word that earns the line is "for you".)
+  - **An admin's setup card carries a progress ring** (`3/6`) instead of
+    reporting "3 of 6 steps done" in the text of its own link — the same fact,
+    read at a glance, with the number where the eye lands first. It is rendered
+    server-side from `admin_setup`, so unlike the rail's ring it cannot flash a
+    wrong count. On an instance with nothing registered there is no ring at all:
+    a meter reading 0/6 measures the wrong thing when the point is that there is
+    no data yet, so that state keeps its "Add your first data" button.
+  - **The member's card carries the brand orb**, not a `brain` line glyph — that
+    was a generic abstraction which at 17px read as an unrecognisable pair of
+    shapes, on the one card that speaks for {brand} itself. It renders the same
+    shared macro as the rail logo and the connect banner, so the mark still lives
+    in exactly one place, and drops the tinted chip and halo behind it: those
+    give a monochrome glyph a surface to sit on, and around a full-colour mark
+    they are a badge around a badge.
+  - **A member never sees a setup card** — they cannot set the instance up, so
+    offering them the ring would be a chore they are not allowed to finish. Their
+    slot holds the one move they do have ("See what {brand} knows" → the
+    Library), with the same anatomy rather than the admin's card with its
+    controls greyed out.
+  - **"How {brand} works" is a link beside the trust caption, not a card** — it
+    is reference reading, and a card of equal size said it was a choice
+    comparable to setting the instance up. The pair closes the page under the two
+    cards, which is what everything-consulted-rather-than-acted-on is for; the
+    gap above the cards stays the page's one section break. It is also centred at
+    last — it was a `<p>` wrapping a `<div>`,
+    so the parser closed the paragraph early, its children became block siblings
+    of the row around it, and the `justify-content: center` applied to an empty
+    element. The greeting
+    grows a time-of-day glyph, corrected from the browser clock alongside the
+    salutation so the sun and the words can never disagree.
+  - **Both cards are clickable end to end.** The setup card was the one card
+    that was not a link — a `<div>` holding an `<a>` — so it had to suppress the
+    hover its neighbours offer and left the reader a 13px line of text to aim
+    at. It is a whole-card link now, its action a `<span>`, with hover and
+    `:active` driven from the card.
+  - **Only the audience card carries the tinted surface.** That fill means "this
+    is {brand} itself"; on the tools card as well, the pair read as a band of
+    two panels with nothing distinguishing the card about your own instance from
+    the one pointing at your editor. The marker-column layout and type moved to
+    their own `.cld-door--split`, so the two stay peers in shape while differing
+    in surface.
+  - **The agent picker moved INSIDE the composer, into the trailing cluster with
+    Send**, with the Stack sentence on the row below it. Choosing an agent is
+    part of composing — the agent is bound at session creation, so the control
+    sets a property of the message about to be sent, not of the page — and the
+    trailing position is what makes that work: ahead of the "+" a longer agent
+    name moved where the placeholder began (a measured 58px jump between "Agnes"
+    and "Finance Proposals", reflowing any draft already typed), while after the
+    textarea a wider pill takes its width off the end of the field and the text
+    origin does not move at all. It matches Send's 44px height so the two read as
+    one pair, keeps its fill on hover only, and the footer row collapses entirely
+    in a live conversation now that the sentence is its only occupant.
+  - **The default agent is called "Default"**, not the brand. "Agnes" read more
+    naturally alone but was the odd one out beside the caller's own named agents,
+    and it disagreed with `/agents`, where the same row is Default. One name per
+    agent, everywhere.
+  - **A long agent name shows as initials in the pill** ("Finance Proposals" →
+    "FP") so its width is stable across agents. The full name stays reachable
+    without opening anything — the title attribute carries it, the menu spells it
+    out, and the in-conversation label is never abbreviated. A single long word
+    has no initials to take and falls back to an ellipsis.
+  - **The picker's menu offers "Create new agent"**, ruled off below the agents
+    (they switch this conversation; it leaves the page). This is where a caller
+    discovers their agents are not enough, so the next move belongs in reach
+    rather than back through the rail. It points at `/agents?new=1` — the SAME
+    create path the Agents page's own card uses, a second door to one flow rather
+    than a second flow. The menu already listed ready agents only.
+  - The Stack sentence is *about* the agent, so **its counts follow the
+    selection**: an agent whose
+    knowledge or plugins are `'selected'` is counted from the ids it actually
+    lists rather than from the owner's whole Stack, and an agent scoped to
+    nothing hides the line instead of claiming a capability it cannot reach.
+    Mixed scope modes fall to the explicit list, since overstating an agent's
+    reach is the worse error. The server still renders the owner's totals for
+    first paint, so a failed `/api/v1/agents` degrades to the old behaviour.
+    The pill also takes a **resting fill** — a light tint of the accent — since
+    at `background: transparent` with muted ink it read as a label that happened
+    to carry a caret, which is the opposite of what a control that changes the
+    answer should look like. The fill is its only device — no border, since an
+    outline around a tinted 30px pill is two devices saying one thing and closed
+    the shape into a tag. The decorative glyph before the sentence is
+    gone, because a second mark 8px from the pill made a two-item row look like
+    a toolbar of unrelated readouts. The **agent menu anchors to the picker's
+    left edge** to match, and the row **sits on the composer's own text inset**
+    rather than the page's centre axis — it describes the input, so it lines up
+    with the input's content. Its sentence starts lower case, so pill and phrase
+    read as one line ("Agnes · using 1 capability from your Stack") instead of
+    two statements side by side: it grew
+    leftward from a `right: 0` anchor, which was correct while the picker
+    trailed the row and clipped the agent names behind the sidebar the moment it
+    led it.
+  - **Hover is a lift, and only the card that needs an edge keeps one.** The
+    outline is replaced by a shadow that appears on hover — one channel, so both
+    cards answer the pointer identically whatever surface each has — and the
+    tinted card drops both its resting border and the resting shadow it had. The
+    plain card keeps a subtle border, because that is the actual rule rather than
+    a per-card choice: the tinted card is held off the page by its own fill, so
+    an outline there frames something already separated, while the plain card's
+    fill is nearly the page and without an edge it stops reading as a card. The
+    1px stays in the box as `transparent` on the tinted one, so nothing shifts
+    when either lifts. Fixes with it: the quiet
+    "Continue setup" link took the PRIMARY fill on card hover, because the
+    card-level rule outranked its own `background: none` by one class and painted
+    the text link as a dark blue blob.
+
+- **The chat list has one view, and the rail's conversation zone has one door.**
+  Three changes to the same surface, all rail-layout instances:
+  - **`/chats` drops the list ⇄ grid switch.** A conversation is a title you
+    read plus two facts you glance at (which agent, how long ago); a card spent
+    a whole tile saying that much, so the list is now the only projection. The
+    `.fbar-view` control, the `#ch-grid` container, the card builder in
+    `chats_page.js` and the card CSS are gone — the Library keeps its own
+    switch, where an asset has a thumbnail worth a tile.
+  - **The rail's conversation zone is ONE unlabelled list.** "Pinned" and
+    "Recent" are gone, along with the per-section disclosure — its caret, its
+    persisted open/closed flag (`agnes.rail.chatsec.*` in localStorage) and its
+    `is-collapsed` state. Two labels and three moving parts were chrome over a
+    list a handful of rows tall that already scrolls in its own box; a pinned
+    row is marked by its pin glyph, and that the feed is a slice is said by the
+    row that closes it. Pinned rows still lead, and a section still hides when
+    it is empty, which is the only conditional left in the region. The zone's
+    tab order is now New chat → the titles → View all chats. The list also moves
+    up under **New chat** (8px of air above it became 3px, the same step the nav
+    rows use between themselves): the 8px was there to let a "PINNED" label read
+    as a heading, and with no label it only detached the list from the row it
+    belongs to. The folded Chats row now cancels the flex `gap` it was still
+    charged for, in both the persisted-open and peeked states, so the two ways
+    of reaching an open rail no longer disagree by 3px.
+  - **"View all chats" is the last ROW of that list, and the Chats row is now
+    the COLLAPSED form of the zone.** The link takes the conversation row's own
+    box — same height, left edge and hover — because it is the end of the list
+    rather than a footer under it; only its ink and weight mark it apart. It
+    sits outside both `<ul>`s, since every renderer clears its list with
+    `innerHTML = ""` and would delete an `<li>` on the first fetch. The row was introduced because the
+    conversation region is text end to end and cannot survive the rail's 56px
+    glyph strip, which left an admin page with no path to `/chats` at all; but
+    at full width it sat above the very lists it led to. Both widths are now
+    served by one zone: expanded, the lists render and a quiet link closes them;
+    collapsed, `#nav-chats` stands in for the whole region and folds away again
+    (`.rail-i--collapsed-only` — height and opacity, timed off the same
+    `--rail-peek-text-*` tokens as the peek reveal, with a `prefers-reduced-motion`
+    swap) the moment the rail opens or is peeked, so the two are never on screen
+    together. The link is static markup rather than revealed by a render, which
+    is what left `/chats` unreachable on a first run last time. On an admin page
+    the fold is not applied at all: the lists are not rendered there, so the row
+    keeps its place at every width.
+
+- **The data-package builder is told what a table IS, not just what it is
+  called.** A turn's candidate block carried `id`, `name` and 160 characters
+  of description, so "the opportunity tables for sales" could only be
+  answered by matching names — a table whose name does not say what it holds
+  was invisible to the assistant, and the proposed package came out wrong or
+  empty. Each candidate now also carries `source_type`, `query_mode`, and the
+  names of the **metrics this instance already computes over it**, which is
+  the strongest signal available for what a table is for when its description
+  is thin. Metrics are one bulk read for the whole list, and a failed read
+  costs grounding rather than the turn. Candidates also carry whether the
+  table is *distributable* (`query_mode IN ('local','materialized')` and not
+  `server_only`, i.e. whether it reaches an analyst's laptop through
+  `agnes pull`): packaging a server-only table is still allowed —
+  `data_packages.py` does not refuse it — so the prompt states it as a fact to
+  weigh, never a prohibition, because encoding it as a rule would be wrong
+  about the API. Column-level detail is deliberately excluded: it is a read
+  per table against a list capped at 120, so schemas belong to a narrowing
+  step over a shortlist. The wire contract, the propose-never-apply rule and
+  `_sanitize_patch` as the trust boundary are unchanged.
+
+- **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
+  It used to debounce-PATCH every keystroke, which meant there was never a
+  moment at which the owner had *decided* the agent was right, and no honest
+  way to offer "leave without saving". Edits — typed or made by the
+  conversation — now accumulate in an unsaved working copy and reach the
+  server only on **Save**. The header says which state you are in ("Unsaved
+  changes", Save disabled when clean).
+  - A **new** agent's header offers *Save as draft* and *Mark ready*, and no
+    Delete: the row exists server-side only because the conversation and the
+    preview address the agent by id, so it is a placeholder until saved, and
+    leaving via *← All agents* discards it (confirmation first, then a real
+    `DELETE`). A failed discard restores the row rather than leaving the list
+    denying an agent the server still has.
+  - An **existing** agent's header offers *Save*, *Revert to draft* /
+    *Mark ready*, and *Delete*. Leaving with unsaved changes asks first and
+    rolls the working copy back to the last saved state.
+  - `beforeunload` covers the ways out our own dialog cannot intercept (a nav
+    click, a reload, a closed tab).
+  - **Preview still commits.** The agent runs server-side, so it can only
+    answer as a configuration the server has; opening Preview performs the
+    same write Save does, baseline included, rather than previewing a persona
+    the agent does not have.
+
+- **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
+  `apply=false` runs the turn and returns the sanitized patch **without**
+  writing, which is what lets the page hold an unsaved working copy;
+  `config` carries that copy so the turn reasons about the configuration on
+  screen rather than the last-saved row. `config` is narrowed to the
+  `PATCHABLE` keys and only ever reaches the prompt — ids in the returned
+  patch are still gated against the caller's own RBAC-scoped candidate lists.
+  Both default to the previous behaviour (`apply=true`, no override), so
+  every existing caller is unaffected. Note the consequence for the page: the
+  panel now merges the patch client-side instead of re-rendering from the
+  applied row, so the enforced scope is re-derived at Save rather than at
+  each turn — an unsaved patch grants nothing, so nothing is enforced later
+  than it is shown.
+
+- **The `/agents` index separates ready agents from drafts, and a card's click
+  follows its state.** Ready agents render in a titled band above Drafts.
+  Clicking a ready card opens a conversation with that agent (what you came to
+  the page to do) and its footer carries **Edit** into the builder; clicking a
+  draft opens the builder (what you came to *it* to do) and its footer keeps
+  **Chat**. Neither route was lost in either state — marking an agent ready is
+  not a one-way door out of the builder, and a draft is still talk-to-able.
+
+- **The builder's two panes are an even 50/50 split.** The configuration was
+  previously capped at a third of the width, which left it a cramped sidebar
+  while the conversation had room to spare.
+
+### Fixed
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
+
+### Removed
+
+### Internal
+- **Local-dev audience switch on the chat landing page.** Under
+  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
+  Admin | Admin, empty instance | Member" toggle for reviewing each landing
+  state without keeping a second account or mutating data — `?preview=member`
+  hides the admin notice, `?preview=empty` forces it on an instance that has
+  data. It fakes the render only: no repo read is bypassed, nothing is
+  written, and no authority or grant changes. Off the dev gate every value is
+  ignored outright and the toggle is not rendered, so it adds no surface to a
+  real deployment.
+
+## [0.90.0] - 2026-08-27
+
+### Added
+- **A hosted data app's description can be edited after it is created.**
+  `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
+  not_managed`, so a hosted app's description was write-once: `POST
+  /api/data-apps` seeded it and a typo could only be fixed by recreating the
+  app. Hosted rows now accept it too (Owner/Admin, unchanged). No new column —
+  every data-app reader already resolves through `effective_description`
+  (`description_override or description`), in `_serialize` and in the
+  library/RBAC projection alike, and a hosted row has no ingest sync to clobber
+  the value, so the existing override column simply holds its current
+  description. Matters more than a typo fix: an app's description is the one
+  place an agent can read what the app is and how to interrogate it **without
+  waking its container**, and a description frozen at creation goes stale the
+  first time the app grows a surface. `agnes app set-description` and the
+  `data_app_set_description` MCP tool drop their managed-only wording.
+
+- **Web chat can now deliver session-workspace files** (#1611). A "Files"
+  button in the conversation header lists the files in the session's
+  workspace, newest first — including deliverables a skill rendered into the
+  sandbox (a `.docx` SOW, a `.pptx` deck) that were previously unreachable
+  from the browser — with a download action and a "Save to Library" action
+  per file. Backed by three owner-scoped endpoints
+  (`GET /api/chat/sessions/{id}/files`, `GET …/files/download`,
+  `POST …/files/save-artefact`): every requested path is validated and
+  realpath-contained to the caller's own session dir/workspace (an
+  agent-written symlink escaping them 404s), downloads are always served
+  `attachment` + `nosniff` with active content types pinned to
+  `application/octet-stream`, and save-to-Library reuses the same
+  single-file-artefact bridge as the chat composer upload. Sessions run on
+  a remote turn engine list empty (their files live in the remote sandbox —
+  delivering those needs an engine-side channel).
+
+- **`agnes admin config export` / `agnes admin config apply`** round-trip the
+  server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
+  only) as reviewable YAML — the "onboard a new client via a reviewed PR"
+  building block. `export` reads the new `GET /api/admin/server-config/overlay`
+  endpoint, which serves the raw on-disk overlay (unresolved `${VAR}`
+  references, not the merged/env-resolved config `GET /api/admin/server-config`
+  serves); env-var NAME fields (`token_env`) and `${VAR}` references pass
+  through unchanged, but a literal credential never leaves the server —
+  the free-form `connectors` section (per-connector keys an admin types
+  directly, e.g. a Slack webhook URL, with no static schema to police by
+  key name) has every literal omitted, and a value that is unambiguously
+  credential-shaped (a JWT, a PEM block, a URL carrying userinfo or a long
+  opaque token segment) is omitted everywhere else too, regardless of its
+  key's name. Every omitted path is reported back (`omitted_keys`), not
+  silently dropped — `export` surfaces it as both a YAML comment header
+  and a stderr note so the operator knows what to set via env/`${VAR}` on
+  the target instance. `apply` posts the file through the same validated
+  `POST /api/admin/server-config` path an admin's form save uses — section
+  allowlisting, deep-merge, danger-zone confirmation, and audit logging all
+  apply unchanged — after filtering out any non-editable section or literal
+  secret client-side. Supports `--dry-run` (diff against the current
+  overlay, writes nothing).
+- **The chat agent now knows the web UI.** A new bundled workspace-template
+  skill, `agnes-web-guide`, gives every chat sandbox a page-by-page map of
+  the product — the rail, every user-facing page, the admin area, and a
+  "common questions → destinations" table — so when a user asks "where do I
+  ...?" the agent directs them to the same pages they actually see, instead
+  of denying a surface exists or inventing one. Kept honest by a new guard
+  (`tests/test_web_guide_skill_sync.py`): every user-facing route and every
+  admin-nav destination must be mentioned in the guide, and the guide may
+  only mention live paths — so adding, renaming, or retiring a page without
+  updating the guide fails CI in both directions. The guide also reaches
+  analyst laptops: it is mirrored into the built-in marketplace's
+  `agnes-analyst` plugin (granted to Everyone, distributed by
+  `agnes refresh-marketplace`), with the mirror pinned byte-identical to the
+  bundled original by the same guard.
+
+- **`chat_provider = "docker"` now provisions its own backing** in the
+  `customer-instance` Terraform module, instead of only pinning the choice.
+  Web chat's docker provider spawns each session through the apps-runner
+  sidecar and refuses the ChatManager at boot when that sidecar — or the
+  operator-built sandbox image — is missing; both hung off `data_apps_enabled`
+  alone, so a TF-pinned docker provider came up with every chat route 503ing.
+  The module now mints `APPS_RUNNER_TOKEN`/`DOCKER_GID` and activates the
+  `apps` compose profile for *either* feature (without enabling hosted data
+  apps for a chat-only VM), and builds the sandbox image on boot from the
+  build context that ships inside the app image — so the sandbox and the
+  server always come from one release, and a VM recreate no longer needs a
+  hand-run `docker build`. `agnes-auto-upgrade.sh` keeps the profile,
+  refreshes the image on the recreate tick when the context actually changed,
+  and — because the boot build is best-effort and must never abort a boot —
+  rebuilds a *missing* image on any tick, so a VM whose build failed once
+  recovers within five minutes instead of 503ing every chat route until an
+  unrelated upgrade (new helper `scripts/ops/agnes-chat-sandbox-image.sh`,
+  idempotent via an `agnes.chat-sandbox.source` label carrying the hash of
+  the whole build context).
+- **Alternate / private image registry support (`AGNES_IMAGE_REPO`).** The
+  app-image repository is now a single seam instead of a hardcoded
+  reference: the compose overlays interpolate
+  `${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}`, the
+  recurring host scripts (`agnes-auto-upgrade.sh`,
+  `agnes-state-applier.sh`) read the same key from `/opt/agnes/.env` and
+  export it for compose, and the Terraform module writes it from its
+  existing `image_repo` variable. For a GCP Artifact Registry repository
+  (`*-docker.pkg.dev` — `release.yml` can already mirror images there) the
+  startup script runs `gcloud auth configure-docker` before the first
+  pull, so the VM's own service account authenticates and the recurring
+  ticks inherit the credential helper — an instance can run entirely from
+  a private registry with no long-lived registry secret on the VM. Default
+  behavior is unchanged.
 
 - **Shared-agent runtime: a user an agent was shared with can now run it**
   (remediation program Track C, C2.3). Previously only an agent's OWNER
@@ -381,6 +648,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   MCP-exposed — issuing a setup token is credential provisioning, covered by
   the standing exemption in `CONTRIBUTING.md`.
 
+
+- **Per-caller usage attribution for shared agents** (remediation program
+  Track C, C2.4). A shared agent (C2.3) run by multiple callers now
+  records WHICH caller incurred each `llm_usage` row (`caller_user_id`,
+  Postgres-only column — see Internal below) rather than attributing every
+  call to the agent alone; the pre-existing `user_id` column keeps its old
+  meaning (the agent's owner). `GET /api/v1/agents/{slug}/usage` gains a
+  `by_caller` field — a per-caller token breakdown — visible to the
+  agent's owner or an admin only; a plain runnable grantee (C2.3) still
+  sees the aggregate total but never other callers' usage
+  (`by_caller: null`). Token-budget enforcement (`token_budget_monthly`)
+  is unchanged — still summed across the whole agent regardless of caller.
 - **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
   subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
   ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
@@ -407,6 +686,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   grant; non-admin uploads and chat file drops stay private. The
   `POST /api/collections` response now reports the resulting `visibility`
   (`workspace`/`private`).
+
 - **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
   (remediation-program Track C1.1, additive — the builder router is
   unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
@@ -428,6 +708,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
   also cleans up sharing grants on delete, closing a gap versus the
   builder's own delete.
+
 - **`agent_scope` rows now record who granted them, and a non-admin writer
   can no longer declare a data item they cannot themselves reach**
   (remediation-program Track C2.1, staged agent-owned authority — no
@@ -444,7 +725,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   uses `granted_by` to let an admin-shared agent reach items its owner
   personally does not hold.
 
-
 - **Google sign-in now warns at boot when `auth.allowed_domain` is unset**, mirroring
   the existing Microsoft Entra check (`app/auth/providers/microsoft.py`'s
   `startup_warnings()`) — unlike a Microsoft tenant, Google OAuth has no boundary
@@ -455,6 +735,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (a missing `auth.allowed_domain` discarded the whole static config with an
   ERROR log) and is now a passive warning, so the gap needed its own explicit
   check.
+
 - Snowflake connection spec in `src/connection_specs.py` (config keys
   `account`/`user`/`database`/`warehouse`/`role`/`auth_type`, mirroring
   `resolve_snowflake_settings`'s read set), and first-boot seeding
@@ -462,6 +743,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `source_connections` rows from `instance.yaml`, matching the existing
   Keboola/BigQuery seeding — see the connection-ownership table in
   `docs/DATA_SOURCES.md`.
+
 - **The Snowflake/BigQuery/Databricks `source_connections` row is now the
   live source of truth, resolved fresh on every call** (D2 slice 2):
   `resolve_snowflake_settings()`/`resolve_databricks_settings()` and
@@ -474,6 +756,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   materialized sync (and every other threaded call site — extract-init,
   discovery, v2 schema/scan, semantic syncs, card probes) now resolves
   against exactly the registered connection's coordinates and credential.
+
 - **Security: a connection's config-embedded `token_env`/`private_key_env`/
   `private_key_passphrase_env` (Snowflake/Databricks) is now allowlist-checked
   at write time** (`POST`/`PUT /api/admin/source-connections`), the same
@@ -501,6 +784,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   token-env allowlist alongside `SNOWFLAKE_PASSWORD`/`SNOWFLAKE_PRIVATE_KEY`
   so the module's own default key-pair passphrase path keeps working
   unconfigured.
+
 - **Security: the `source_connections` default/identity-repoint guard now
   covers every way to change WHICH connection (if any) a source_type
   resolves against — promote, demote, wipe, and delete.** Guarded from the
@@ -536,6 +820,372 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   a legacy-seeded row carries), so it is an identity leaf too, and
   `_guard_row_repoint` now compares it alongside `config`.
 
+- **`data_apps.subdomain_base` can now be set from the deployment, not only by
+  hand-editing `config/instance.yaml`.** New `AGNES_DATA_APPS_SUBDOMAIN_BASE`
+  env override plus a per-VM `data_apps_subdomain_base` field on the
+  `customer-instance` module (both instance object types, `optional(string,
+  "")`, written into that VM's `.env` only when non-empty). Serving apps from
+  their own origin is the supported answer to the 0.89.0 same-origin refusal,
+  but the key had no env override and its section is locked in the
+  server-config overlay — so the only way to set it on a deployed instance was
+  editing the yaml on disk, the same Terraform-says-one-thing-the-box-says-
+  another drift that already bit `data_apps.enabled`. Unlike the sibling
+  `AGNES_DATA_APPS_RUNTIME_IMAGE` pin, the override is keyed on the RESOLVED
+  `enabled` state rather than on the env-enable path, because
+  `session_cookie_domain()` reads it on every login and the value must not
+  depend on whether the operator switched data apps on via env or yaml. While
+  the feature resolves OFF, `subdomain_base` is now dropped entirely — from
+  instance.yaml as much as from `.env`, which also fixes the pre-existing case
+  where `AGNES_DATA_APPS_ENABLED=false` left a yaml base widening the session
+  cookie and routing `<slug>.<base>` hosts for a feature serving nothing. Both
+  readers (`session_cookie_domain()` and `DataAppSubdomainMiddleware`) take the
+  key unconditionally, so this single accessor is where "off" is made to mean
+  "no base". `instance.yaml.example`
+  and the module variable now both carry the base-selection warning: the value
+  widens the session cookie to the base's PARENT domain, so
+  `apps.<agnes-host>` is correct and `apps.<registrable-domain>` would post the
+  session cookie to every unrelated host under it.
+
+- **Hosted data apps can be served from their own origin without a wildcard
+  certificate.** The shipped `Caddyfile.apps-subdomain` vhost now issues ONE
+  certificate per app hostname on first request (Caddy on-demand TLS, HTTP-01)
+  and is wired up automatically: the Dockerfile bakes it into the host
+  artifacts, and the `customer-instance` startup script prepends the required
+  global `on_demand_tls` block and appends the vhost whenever
+  `data_apps_subdomain_base` is set (guarded on its own marker, since the
+  script runs on every boot and a duplicate block is a Caddyfile Caddy cannot
+  parse). `agnes-auto-upgrade.sh` re-applies the identical block on every
+  5-minute tick, right after it re-fetches the pristine `Caddyfile` from main
+  and before it hashes for config drift — without that, a VM lost its vhost and
+  its `on_demand_tls` block on the first tick after boot and hosted apps became
+  unreachable altogether, since same-origin serving is refused by default. The
+  two copies are asserted byte-identical, so the Caddy-parser test that runs one
+  of them covers both; the tick also refreshes the vhost fragment itself, so a
+  VM whose last boot predates it converges without a reboot. A wildcard
+  certificate was the obvious alternative and was rejected
+  on purpose: it can only be validated over DNS-01, which would put a DNS-zone
+  write credential on the very host that runs user-authored app code. Issuance
+  is gated by a new unauthenticated `GET /api/data-apps-tls-check?domain=…`
+  (Caddy's `ask` contract — 2xx allows, anything else cancels), which answers
+  2xx for exactly one shape: a registered, non-hidden slug directly under the
+  configured base. It leaks nothing new — `proxy_app` already resolves the row
+  before authenticating, so a real slug is already distinguishable from a
+  made-up one. Compose hands Caddy the base with an inert `apps.invalid`
+  default, mirroring the `DOMAIN_ALIAS` fix: an empty-but-set value would
+  render the site address `*.` and take the primary site down at config parse.
+
+- **Signing in from an app subdomain returns you to the app.** `safe_next_path`
+  now accepts one new shape besides a same-origin absolute path: an absolute
+  http(s) URL on `<single-label>.<data_apps.subdomain_base>`, and only while
+  data apps are enabled and a base is configured. The 401 redirect carries the
+  path the visitor actually asked for (the subdomain middleware now records it
+  before rewriting), so login lands them back where they started instead of on
+  the dashboard. Every classic open-redirect shape is still refused, plus the
+  near-misses that merely look like an app origin — userinfo (`https://evil.com@
+  s.apps.example.com/` and its inverse), backslashes (browsers normalize them,
+  `urlsplit` does not), suffix extension, multi-label names, and non-web
+  schemes. Not verified, deliberately: that the slug is a REAL app — that would
+  put a database lookup in a helper every login calls, to close something that
+  is not a general open redirect, since the target is always this deployment's
+  own infrastructure behind the same RBAC.
+
+### Changed
+- **The bundled data-apps skill now tells agents to build figures from metric
+  definitions rather than hand-written SQL.** `agnes-data-apps-extras`'
+  data-reading reference sanctioned `runQuery(sql)` and said nothing about
+  metrics — the word did not appear in it once — so an app built by following it
+  computed its numbers with its own SQL and could quietly disagree with the rest
+  of the organization's reporting. It now leads with the two-call pattern
+  (`GET /api/metrics/<id>` for the canonical definition, then run *its* SQL),
+  which also means the app holds no copy of the SQL and picks up a central
+  correction on its next load. This is the rule the root workspace `CLAUDE.md`
+  already gives every other agent reading Agnes data ("never invent metric
+  calculations"); apps were the gap. Hand-written SQL stays correct where no
+  metric exists.
+
+- Admin sidebar's Activity entry for `/admin/chat` is now labelled "Chat runners", matching the page's own title, instead of "Chat sessions" — which read as a sibling of the adjacent "Analyst sessions" (uploaded Claude Code session files) rather than the runner dashboard it actually is.
+- **Auth emails (invite, password reset, magic link) are branded multipart
+  messages** instead of a bare one-line plaintext with a token URL — the shape
+  that commonly landed in spam. All three now share one email-safe HTML layout
+  (`app/auth/email_templates.py`): instance name as the `From:` display name
+  and in the subject, a sentence of context, one CTA button, the link's
+  validity (7 days / 24 hours / 1 hour, derived from the enforcing constants),
+  a plain-URL fallback, and a "didn't expect this? safely ignore" footer. A
+  plaintext part with the same copy is always included; no images or external
+  resources.
+
+- **BREAKING (infra pins): the `customer-instance` Terraform module's
+  `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
+  `/opt/agnes/.env` on every boot** (D1 residual — the last knob still
+  clobbered this way after the theme/experience/home_route/studio_enabled
+  handoff). It now seeds `instance.yaml`'s `data_source.type` on a VM's
+  FIRST boot only, the same first-boot-seed pattern those four knobs already
+  use, so `/admin/server-config` owns it from day 2 onward. An
+  already-deployed VM (one that already has an `instance.yaml` and so never
+  sees that first-boot seed) is auto-migrated instead by a new unconditional,
+  idempotent boot-time backfill: on its first boot with the new startup
+  script, it writes `data_source.type` from the still-available `$DATA_SOURCE`
+  into the existing overlay if — and only if — the key is not already
+  present, so it can never overwrite a later admin edit. `get_data_source_type()`
+  also flips its own resolution order — `data_source.type` (the overlay) now
+  wins over the `DATA_SOURCE` env var, the one exception to this module's
+  usual env-wins rule — so a UI edit takes effect even on a VM whose
+  already-baked `.env`/running container still carries a stale `DATA_SOURCE`
+  from before this change. `DATA_SOURCE` remains a fallback when the overlay
+  has no value (local-dev convenience unaffected). `data_source.{keboola,
+  bigquery,snowflake,databricks}.*` connection settings (credentials, stack
+  URL) are unaffected — that consolidation is D2. The only VMs that still
+  need a manual `/admin/server-config` fix are downstream forks pinned to an
+  `infra-vX.Y.Z` tag predating this change — the backfill above only ships
+  once a VM's module version is bumped past it. See the updated "Config
+  ownership map" in `docs/CONFIGURATION.md`.
+
+- **VM auto-upgrade refreshes host artifacts from the release image, not
+  the repo's raw `main` branch.** The 5-minute tick
+  (`scripts/ops/agnes-auto-upgrade.sh`) now extracts the bind-mounted
+  config files (compose overlays, Caddyfile, the data-app subdomain vhost
+  fragment, maintenance page, the compose-file resolver) and its own
+  self-update from `/opt/agnes-host/` inside the pinned image — the same
+  artifact contract the boot startup script already uses — instead of
+  curling the public `raw.githubusercontent.com/.../main` URLs. Every
+  artifact, without exception: the vhost fragment's refresh was the last
+  raw-`main` fetch, and leaving it behind would have been worse than
+  cosmetic — its `$RAW_BASE` base URL no longer had a definition, so under
+  `set -euo pipefail` the expansion aborted the whole tick on any VM with
+  `APPS_SUBDOMAIN_BASE` set, stopping auto-upgrade there for good (the
+  self-update that would have shipped the repair never ran). Host config
+  now stays in lockstep with the image tag the VM actually runs (a config
+  change rides the release that ships it, instead of racing ahead of — or
+  outliving — the image), and the tick keeps working when the source
+  repository is private or the host's egress is restricted to the
+  container registry.
+  Failure posture is unchanged: a failed pull/extract keeps the existing
+  file and WARNs to syslog. Rollout note: a VM still running the previous
+  curl-based script picks this up on its next reboot/recreate (the boot
+  path extracts the script from the image); the old script's raw-fetch
+  self-update cannot deliver it while the repo is private.
+
+- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
+  `none` (internal-only network, no route to the internet) instead of `open`.
+  The chat agent runs with bypassed tool permissions over a read-write
+  workspace, so an open default was a file-exfiltration surface. Operators who
+  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
+  with `chat.docker_egress_mode: open`, or `allowlist` +
+  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
+  or blank value now fails closed to `none`.
+
+- **BREAKING-adjacent: the "Add data source" wizard's Snowflake and
+  Databricks panes now save the connection onto the `source_connections` ROW
+  (`POST`/`PUT /api/admin/source-connections*` + the row's own vault slot via
+  `.../secret`), not the `data_source.<type>` server-config yaml overlay** (D2
+  slice 2). The "restart the instance so the scheduler and workers pick up
+  connection settings" warning is gone from both panes — a row is read live
+  by every process, so there is nothing left to restart for; the Databricks
+  pane is a straight line to `/admin/tables` again (no held-open second
+  click). The connection-repoint confirmation (409
+  `connection_change_affects_registrations` / `confirm_connection_change`)
+  moves with it, onto `PUT /api/admin/source-connections/{id}` for Snowflake/
+  Databricks rows. **Operators who relied on the old flow**: a
+  `data_source.snowflake.*`/`data_source.databricks.*` yaml block hand-edited
+  via `/admin/server-config` is now IGNORED once a row of that type exists
+  (the row wins) — re-point the connection through `/admin/data-sources` or
+  `/admin/connections` instead. Multi-connection-per-type stays out of scope
+  for this slice — one Snowflake/Databricks connection per instance, as
+  before.
+
+- **BREAKING (infra pins): the `customer-instance` Terraform module's `theme`,
+  `experience`, `home_route` and `studio_enabled` knobs stop rewriting
+  `/opt/agnes/.env` on every boot.** They now seed `instance.yaml`'s
+  `instance.theme` / `instance.experience` / `instance.home_route` /
+  `studio.enabled` on a VM's FIRST boot only — the same pattern the branding
+  fields (logo/brand/subtitle/copyright/favicon) already use — so the admin
+  UI (`/admin/server-config`) owns them from day 2 onward instead of having
+  every recreate/apply/auto-upgrade tick silently re-assert the Terraform
+  value and permanently shadow the operator's own change. **Existing VMs**:
+  on their next boot the old always-wins `.env` lines disappear; the value
+  already seeded (or admin-set) in `instance.yaml` takes over. Operators who
+  relied on Terraform re-asserting one of these four knobs every boot must
+  now set it via `/admin/server-config` instead (or re-seed `instance.yaml`
+  by hand). No app-side precedence change — a hand-set env var still wins
+  over `instance.yaml`, same as before. `chat.provider`/`AGNES_CHAT_PROVIDER`
+  is unaffected (it pins deployment-provisioned backing, not a presentation
+  choice, so it is out of scope). See the new "Config ownership map" in
+  `docs/CONFIGURATION.md`.
+
+- **A THIRD-PARTY admin-granted agent scope item now reaches its agent
+  unconditionally, instead of being silently narrowed to the owner's own
+  grants** (remediation-program Track C2.2, consuming C2.1's `granted_by`).
+  `src/agent_scope_intersection.py::resolve_agent_authority` replaces
+  `compute_agent_intersection`: a `'selected'`-mode `agent_scope` row whose
+  `granted_by` is a THIRD PARTY — distinct from the agent's own owner — who
+  is (currently) an admin resolves unconditionally — a `data_package` an
+  admin shared with an agent now expands to its member tables even when the
+  agent's OWNER holds no grant on it at all, closing the "package invisible
+  to an admin-built agent" bug class. Every other row — a non-admin
+  granter, OR a granter who IS the agent's own owner (including an admin
+  owner) — still narrows to `item ∩ that GRANTER's CURRENT access` —
+  today's owner-intersection shape, just keyed to whoever wrote the row
+  instead of hard-coded to the agent's owner, so it now also stops
+  resolving if the ORIGINAL GRANTER (not the owner, not any future caller)
+  later loses access. **On Postgres only** — DuckDB has no `granted_by`
+  column (C2.1), so every row there reads back with no granter and falls
+  back to the agent's owner, making this a no-op on DuckDB and a
+  byte-identical no-op on Postgres for every agent whose scope predates C2
+  (migration 0073 backfilled `granted_by := owner_user_id`) — including for
+  an agent whose owner is itself an admin, which always narrows rather than
+  taking the unconditioned branch.
+  `AgentPrincipal.intersection` (the broker/pat-resolver, chat spawn, and
+  every table/marketplace/MCP seam that reads it) is unaffected in shape —
+  only its computation changed. Also fixes a related gap found while
+  building this: `agent_scope.set_scope`'s full-replace (Postgres) now
+  preserves the EXISTING `granted_by` for a row that is re-declared
+  unchanged, so a later owner save (e.g. the `/agents` builder syncing an
+  unrelated `knowledge`/`plugins` edit, which reads back and re-submits
+  every governance-owned row) can no longer silently downgrade an
+  admin-granted row to owner-granted.
+
+### Fixed
+
+- `POST /api/marketplaces/{id}/sync` ("Sync now") no longer blocks the
+  event loop (#1614). The handler was declared `async def` but called the
+  fully synchronous `sync_one()` (subprocess git clone, DuckDB writes, a
+  process-wide lock) directly, so it ran on the asyncio thread and froze
+  every other request — health checks, logins, unrelated API calls — for
+  the duration of the sync. Declared `def` now, matching the bulk
+  `POST /api/marketplaces/sync-all` sibling, which already runs in a
+  thread pool for the same reason.
+
+- A manual "Sync now" (`sync_one()`) now invalidates the marketplace ZIP
+  ETag and cowork bundle caches on success, matching the nightly bulk sync
+  (`sync_marketplaces()`) (#1615). Previously a manual sync reported a
+  fresh commit while `/marketplace.zip` and the cowork bundle kept serving
+  pre-sync bytes until their TTL expired (up to 5 minutes) — the opposite
+  of what an on-demand sync is for. Both paths now share one
+  `_invalidate_served_caches()` helper so they cannot drift apart again; a
+  failed sync still leaves the caches untouched.
+
+- `use_pg()` no longer reverts a Postgres instance running purely on the
+  `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`
+  declaration) to an empty DuckDB backend the first time an admin saves an
+  unrelated `/admin/server-config` section. The overlay editor writes only
+  the touched section, so the resulting file — created for the first time,
+  with no `database` key — was indistinguishable from an explicit
+  `backend: duckdb` declaration; on the next restart every repository
+  factory silently switched to a fresh DuckDB, orphaning the Postgres data
+  and returning `401 User not found` for real users until manually
+  repointed. `read_backend_state()` / `is_backend_explicitly_declared()`
+  now tell "declared DuckDB" apart from "overlay exists but never mentions
+  the database backend", and only the former short-circuits `use_pg()`.
+
+- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
+  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
+  labels now render via `textContent`, keeping the static sort markup trusted.
+
+- Agent-session principals no longer crash (500) when reaching collection
+  authorization (`accessible_collection_ids`, `require_collection_access`);
+  an `AgentPrincipal` now resolves to its live scoped-collection intersection
+  or a clean 403, matching the existing co-session/agent-session seam and
+  never inheriting owner-owned collections.
+
+- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
+  the same canonical subpath used for policy and dispatcher classification, and
+  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
+  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
+  path like `/v1/./messages` that classified as a non-message call — skipping
+  its pinned-model allowlist and monthly token budget — while HTTPX
+  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
+  duplicate-slash message paths can likewise no longer route the destination
+  somewhere the authorization decision did not intend.
+
+- Token persistence refuses to write (instead of silently downgrading to
+  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
+  valid Fernet key; a genuinely unset key still uses the plaintext keyless
+  fallback as before. A previously-silent misconfigured production vault now
+  fails loudly on secret saves instead of writing the secret in cleartext.
+
+- Web chat: a user message's hover actions (timestamp + copy) now hang
+  BELOW the bubble instead of renting an invisible second row inside it —
+  a one-line message no longer renders as a two-row-tall bubble. On touch
+  devices (no hover) the row stays visible and the turn reserves the space.
+
+- Web chat: on a history reload, a multi-part assistant turn (text → tool
+  card → text) now carries its sources chips, copy/actions row, "Ask again"
+  and collapse cap on the turn's LAST text segment — where the live stream
+  already put them — instead of stapling them after the first segment,
+  mid-turn. The reload timestamp also reads the row's real `created_at` on
+  every segment rather than "now" on continuations.
+
+- Web chat: reloaded timestamps no longer shift by the viewer's UTC offset.
+  The sessions/messages endpoints (incl. copresence) pre-stringified their
+  naive-UTC datetimes with `.isoformat()`, bypassing the app-wide encoder
+  that labels them `+00:00` — the browser then parsed the offset-less
+  string as local time, so a message sent at 14:21 CEST reloaded as 12:21.
+  They now return raw datetimes and the encoder stamps the offset.
+
+- Web chat: the permanent "Connected." pill is gone — connected is the
+  normal state and reconnection is automatic, so the status surfaces only
+  when something is in progress or wrong ("Resuming session…", warnings,
+  errors), as a pill below the thread header. "Copy transcript" moves to
+  the header's right edge (the removed pill's spot) restyled as a quiet
+  ghost button, and a cleared status no longer leaves an empty dot-pill.
+
+- **The GCP Cloud Logging overlay can no longer take an instance down**
+  (#1557, #1558; observed live as a 9-minute full outage on a routine
+  auto-upgrade tick). The gcplogs docker log driver authenticates as the VM
+  service account, but the `customer-instance` Terraform module granted it
+  no logging role while defaulting `enable_gcp_logging = true` — and Docker
+  refuses to START a container whose log driver cannot initialize, so the
+  first container recreate with the overlay armed turned into 502s. Two
+  halves: (1) the module now grants `roles/logging.logWriter` on the
+  project to the VM service account, gated on the same `enable_gcp_logging`
+  variable (the deploying identity must be able to modify project IAM
+  policy — documented on the variable; grant the role out-of-band or
+  disable the flag otherwise); (2) defense in depth — the overlay is
+  engaged only when the overlay file is present AND a driver probe
+  (`agnes_gcp_logging_probe`: a no-op container on `--log-driver=gcplogs`)
+  has armed the `/opt/agnes/.gcp-logging-ok` marker. The probe runs at boot
+  and on any auto-upgrade tick that finds the overlay marker-less, and the
+  single shared gate (`agnes_gcp_logging_active` in
+  `scripts/ops/agnes-compose-file.sh`) is used by the boot startup script,
+  the auto-upgrade tick, and the state applier alike — so the boot-time
+  `COMPOSE_FILE` and the recurring resolver can never disagree about the
+  overlay again, and a missing IAM role now degrades to "Cloud Logging off
+  + loud warning" instead of an outage.
+
+- **`config/loader.py` no longer raises on a static `instance.yaml` missing
+  `instance.name`/`auth.allowed_domain`/`server.host`/`server.hostname`/
+  `auth.webapp_secret_key`.** The check never actually gated anything: a
+  provisioned VM ships no static `instance.yaml` at all (the loader raises
+  `FileNotFoundError` first), and `app.instance_config` already caught the
+  `ValueError` and served built-in defaults regardless. It now logs a
+  warning naming the missing field(s) instead of raising, so a direct caller
+  of `config.loader.load_instance_config()` (e.g. a connector script) no
+  longer gets an exception on an otherwise-bootable config.
+
+- `POST`/`PUT /api/admin/source-connections` now validate `source_type` +
+  `config` via `src.connection_specs.validate_connection_config`: an unknown
+  `source_type` or a malformed config (e.g. a non-`https://` `stack_url`, a
+  BigQuery config missing `project`) is rejected with `400` naming the
+  offending field, instead of being stored unchecked and only surfacing
+  later as a confusing sync failure. An empty config at create/update still
+  succeeds — the "Add data source" wizard creates a connection row before
+  its config is complete.
+
+- **A signed-out visitor opening a data-app URL on an app subdomain no longer
+  hits an infinite redirect loop.** `DataAppSubdomainMiddleware` rewrites EVERY
+  path on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the app-wide
+  401→`/login` redirect — relative, and therefore resolved by the browser
+  against the app's own host — came back as `/apps/<slug>/login`, 401'd again,
+  and looped until the browser gave up (`ERR_TOO_MANY_REDIRECTS`). The handler
+  now sends a subdomain-origin caller to the MAIN host's login absolutely
+  (`SERVER_URL` / `PUBLIC_URL` / the session cookie's parent domain, in that
+  order). Anyone already signed in was unaffected — the session cookie is
+  scoped to cover both origins — which is why every existing subdomain test,
+  all of which drive an already-authenticated client, stayed green. The return
+  URL is carried across in `next` — see the `safe_next_path` entry under
+  **Added**, which is the separate, deliberate edit to that open-redirect guard
+  that makes carrying it safe.
+
 ### Security
 
 - Knowledge-digest generation now frames corpus source chunks as untrusted
@@ -565,6 +1215,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   create that never did. Direct callers of `/api/agents*` (there were none
   outside this repo's own web UI) must move to `/api/v1/agents*`; see
   `docs/api-reference.md`.
+
 - **Deleted dead config surfaces flagged by the 2026-08 audit.** The
   `jira:` section is gone from both the `/admin/server-config` UI (it never
   had any `instance.yaml` wiring — `connectors/jira/service.py` reads
@@ -579,34 +1230,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
-- **Local-dev audience switch on the chat landing page.** Under
-  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
-  Admin | Admin, empty instance | Member" toggle for reviewing each landing
-  state without keeping a second account or mutating data — `?preview=member`
-  hides the admin notice, `?preview=empty` forces it on an instance that has
-  data. It fakes the render only: no repo read is bypassed, nothing is
-  written, and no authority or grant changes. Off the dev gate every value is
-  ignored outright and the toggle is not rendered, so it adds no surface to a
-  real deployment.
-- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
-  A fast, pure-file-parse test that catches the recurring silent-rebase
-  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
-  into an already-released section — sometimes duplicating a version heading —
-  while reporting zero conflicts; it struck four times during the 2026-08
-  remediation program). Asserts exactly one `## [Unreleased]` heading, no
-  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
-  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
-  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
-  passes the first three. Reuses `assert_no_duplicate_headings` /
-  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
-  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
-  carrying that fourth corruption at the time this guard was written — `###
-  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
-  `### Internal` block — so this change also repairs it: each group is
-  consolidated into its first occurrence and `### Internal` moves last. All
-  3489 bullets and all 15513 lines of released history are byte-identical; the
-  only lines removed are the three duplicate group headings. No behavior
-  change.
 - **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
   genuine schema change on an existing DuckDB↔Postgres pair under the A3
   PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
@@ -642,6 +1265,63 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
+
+- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
+  A fast, pure-file-parse test that catches the recurring silent-rebase
+  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
+  into an already-released section — sometimes duplicating a version heading —
+  while reporting zero conflicts; it struck four times during the 2026-08
+  remediation program). Asserts exactly one `## [Unreleased]` heading, no
+  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
+  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
+  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
+  passes the first three. Reuses `assert_no_duplicate_headings` /
+  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
+  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
+  carrying that fourth corruption at the time this guard was written — `###
+  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
+  `### Internal` block — so this change also repairs it: each group is
+  consolidated into its first occurrence and `### Internal` moves last. All
+  3489 bullets and all 15513 lines of released history are byte-identical; the
+  only lines removed are the three duplicate group headings. No behavior
+  change.
+
+- **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
+  second genuine schema change on an existing DuckDB↔Postgres pair under
+  the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
+  "Adding a PG-only feature".** No DuckDB `_vN_to_v(N+1)` step, no
+  `SCHEMA_VERSION` bump; `LlmUsageRepository.insert_batch` (DuckDB) accepts
+  the same `caller_user_id` row key for call-site symmetry but has no
+  column to persist it into, and its new
+  `usage_breakdown_by_caller_for_month` degrades to a single, honestly
+  unattributed (`caller_user_id=None`) bucket there, while the Postgres
+  sibling groups by the real column. `migrations/versions/
+  0074_llm_usage_caller_user_id.py` adds the column with NO backfill — a
+  pre-existing row's actual caller is genuinely unknown, unlike
+  `granted_by`'s owner backfill (every pre-C2.1 write path was
+  ownership-gated; no equivalent fact exists for who was driving a past
+  turn).
+
+- **The CHANGELOG integrity guard now rejects a duplicated *bullet* under
+  `[Unreleased]`, not just a duplicated group heading.** The guard's fourth
+  check catches `### Added` … `### Added`, and the tempting repair for that is
+  to concatenate the two groups' bodies under one heading — which merges the
+  headings while keeping *both* copies of every bullet the groups had in
+  common. That is what a consolidation commit did during #1588: headings
+  merged, bullets doubled, all four checks green, and the doubled release
+  notes were caught by eye rather than by CI. A fifth check
+  (`assert_no_duplicate_unreleased_bullets`) compares whole bullet *blocks* —
+  the marker line plus its hanging-indented continuations, second paragraph
+  included, whitespace collapsed so a re-wrap is not a new bullet. Whole
+  blocks rather than first lines because released history holds bullets whose
+  opening line is identical and whose bodies genuinely differ (one revised in
+  place, both revisions surviving), and a first-line check would reject those.
+  Scoped to `[Unreleased]` for the same reason the heading check is: 30
+  bullets in shipped sections are already exact duplicates within their own
+  section, and no merge of pending bullets can reach them. Replayed over all
+  1,367 historical revisions of `CHANGELOG.md` (17,840 parsed `[Unreleased]`
+  bullets) it flags 12 commits, every one of them a real duplication — three
+  separate corruption windows, two of which shipped — and nothing else.
 
 ## [0.89.1] - 2026-08-26
 

@@ -23,6 +23,8 @@ Three things worth pinning beyond "it works":
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 
@@ -401,18 +403,90 @@ class TestTheComposerCanChooseAnAgent:
         html = Path("app/web/templates/chat.html").read_text(encoding="utf-8")
         assert 'id="chat-agent-btn"' in html, "no way to choose an agent from the composer"
         assert 'id="chat-agent-menu"' in html
-        # In the footer strip UNDER the input, sharing that line with the Stack
-        # context line — not inside the composer pill and not floating loose on
-        # the page.
-        assert html.index('id="chat-agent-btn"') > html.index('id="chat-input"')
-        assert html.index('id="chat-agent-btn"') > html.index('class="cloud-chat-composer-foot"')
-        # Trailing the row, not leading it: the Stack line reads first and the
-        # agent lands at the right edge, under the send button.
-        assert html.index('class="rdb-context"') < html.index('id="chat-agent-btn"')
-        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
-        assert ".cloud-chat-agent-wrap {\n  margin-left: auto;\n}" in css, (
-            "the agent element no longer trails the footer row"
+        # INSIDE the composer and AFTER the textarea, in the trailing cluster
+        # with Send. Choosing an agent is part of composing (the agent is bound
+        # at session creation, so this sets a property of the message about to be
+        # sent), which is why it is in the pill and not in a strip beneath it.
+        #
+        # After the textarea, specifically: ahead of the "+" a longer agent name
+        # moved where the placeholder began — a measured 58px jump between
+        # "Agnes" and "Finance Proposals", reflowing any draft already typed.
+        # Trailing, a wider pill takes its width off the end of the field and the
+        # text origin does not move at all.
+        composer_at = html.index('class="cloud-chat-composer"')
+        assert composer_at < html.index('id="chat-input"') < html.index('id="chat-agent-btn"')
+        assert html.index('id="chat-plus-btn"') < html.index('id="chat-agent-btn"')
+        assert html.index('id="chat-agent-btn"') < html.index('class="cloud-chat-form-actions"'), (
+            "the pill pairs with Send, ahead of it"
         )
+        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
+        assert ".cloud-chat-agent-wrap {\n  margin-left: auto;\n}" not in css, (
+            "the agent element must not be pushed to the far end of a row"
+        )
+        btn_rule = css.split(".cloud-chat-agent-btn {", 1)[1].split("}", 1)[0]
+        # One height across the trailing pair, so the pill reads as Send's
+        # partner rather than a short thing floating beside a tall circle.
+        assert "height: 44px" in btn_rule
+        # A cap remains as a backstop for a long single word (which has no
+        # initials to take — see `_agentPillLabel`).
+        assert "max-width" in btn_rule
+
+    def test_the_pill_abbreviates_a_long_name_but_never_hides_it(self):
+        """The pill shows initials past `AGENT_LABEL_MAX` so its width is stable
+        across agents. That trades legibility for stability — two names sharing
+        initials look alike in the pill — so the full name must remain reachable
+        without opening anything: the title attribute carries it, the menu spells
+        it out, and the in-conversation label is never abbreviated."""
+        js = self._js()
+        assert "function _agentPillLabel" in js
+        # The menu and the label use the FULL name (`_agentLabel`); only the
+        # button text goes through the pill form.
+        assert "btnLabel.textContent = pill" in js
+        assert "_agentPillLabel(name)" in js
+        # Hovering an abbreviated pill must say what it stands for.
+        assert "choose which agent to chat with" in js
+        # A single long word has no initials to take and falls back to the name
+        # (CSS ellipsis), rather than rendering one lonely letter.
+        assert "words.length < 2" in js
+
+    def test_the_menu_offers_the_way_to_make_another_agent(self):
+        """The picker is where a caller discovers their agents are not enough, so
+        the next move belongs in reach rather than back through the rail.
+
+        `?new=1` is the SAME create path the Agents page's own card uses — a
+        second door to one flow, not a second flow."""
+        js = self._js()
+        from pathlib import Path
+
+        assert '"/agents?new=1"' in js
+        assert "Create new agent" in js
+        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
+        # Ruled off from the agents above it: they switch this conversation,
+        # this one leaves the page.
+        create = css.split(".cloud-chat-agent-menu-create {", 1)[1].split("}", 1)[0]
+        assert "border-top" in create
+        # It must read as a CONTROL, not a label that happens to carry a caret —
+        # which agent answers a question changes the answer. What carries that at
+        # rest is ink and weight, not a fill: a standing tint on the one row under
+        # the composer competed with the input for the eye. The fill is the hover
+        # signal instead, so this asserts the pair rather than either alone.
+        #
+        # Comments stripped first: these rules explain what they replaced, and the
+        # prose mentions the very declarations being asserted about — a raw
+        # substring check matched the explanation instead of the CSS.
+        import re as _re
+
+        def _decls(selector: str) -> str:
+            body = css.split(selector, 1)[1].split("}", 1)[0]
+            return _re.sub(r"/\*.*?\*/", "", body, flags=_re.S)
+
+        btn = _decls(".cloud-chat-agent-btn {")
+        assert "var(--ds-primary)" in btn, "the resting state must carry accent ink"
+        assert "background: transparent" in btn, "no standing fill under the composer"
+        hover = _decls(".cloud-chat-agent-btn:hover:not(:disabled) {")
+        assert "background: color-mix" in hover, "hover is where the fill happens"
+        # One device, not two: no outline drawn around the tinted pill.
+        assert "border-color" not in hover
 
     def test_a_live_conversation_shows_a_label_not_a_control(self):
         """Mid-conversation the agent is fixed, so the button is swapped for a
@@ -442,10 +516,13 @@ class TestTheComposerCanChooseAnAgent:
         html = Path("app/web/templates/chat.html").read_text(encoding="utf-8")
         assert html.index('id="chat-agent-btn"') < html.index('id="chat-empty-extras"')
         assert html.index('id="chat-agent-btn"') > html.index('id="chat-form"')
-        # ...while the Stack line it shares the row with keeps hiding with the
-        # dashboard, by its own rule now that it no longer rides that container.
+        # It is INSIDE the composer pill now, which is inside the form — so it
+        # survives for the same reason, and there is no longer a row under the
+        # input for it to share (the Stack line that occupied it is retired).
+        assert html.index('id="chat-agent-btn"') < html.index("</form>")
         css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
-        assert "#chat-capabilities[hidden] ~ #chat-form .rdb-context" in css
+        assert ".cloud-chat-composer-foot {" not in css, "the footer row is retired"
+        assert ".rdb-context {" not in re.sub(r"/\*.*?\*/", "", css, flags=re.S)
 
     def test_the_picker_offers_only_agents_the_caller_owns(self):
         """``GET /api/v1/agents`` also returns agents merely SHARED with the caller,

@@ -53,6 +53,9 @@ MAX_NAME_CHARS = 120
 #: Candidate lists sent to the model, capped so the prompt stays bounded. A
 #: large instance can have thousands of registered tables.
 MAX_CANDIDATES = 120
+#: Metric names carried per candidate table. A warehouse table can back dozens;
+#: a handful is enough to say what it is for, and the count travels with them.
+_MAX_METRICS_PER_TABLE = 6
 
 
 class BuilderMessage(BaseModel):
@@ -92,29 +95,86 @@ guessing. Widening access is the one mistake here that is expensive to undo.
 """
 
 
-def _candidates() -> Dict[str, List[Dict[str, str]]]:
+def _candidates() -> Dict[str, List[Dict[str, Any]]]:
     """The tables and groups this instance actually has.
 
     Fetched server-side on purpose — see the module docstring. A caller
     cannot enlarge the set of groups a turn is allowed to propose.
-    """
-    from src.repositories import table_registry_repo, user_groups_repo
 
-    tables = [
-        {
-            "id": str(row.get("id") or ""),
-            "name": str(row.get("name") or row.get("id") or ""),
-            "description": str(row.get("description") or "")[:160],
-        }
-        for row in table_registry_repo().list_all()
-    ]
-    groups = [
+    Each table carries the few facts that decide whether it BELONGS in a
+    package rather than merely whether its name matches the ask. Before this,
+    a candidate was `id`, `name` and 160 characters of description, so a
+    request like "the opportunity tables for sales" could only ever be
+    answered by string-matching names — a table whose name does not say what
+    it holds was invisible, and the package came out wrong or empty.
+
+    What is added is what costs nothing extra to know:
+
+    - `source_type` / `query_mode` come free off the registry row.
+    - `distributable` folds the manifest rule into one boolean (below).
+    - `metrics` names what this instance already computes over the table.
+      That is the strongest signal available for what a table is actually
+      about when its description is thin, and it is one bulk read for the
+      whole list rather than one per table.
+
+    Column-level detail is deliberately NOT here: it is a read per table and
+    the list is capped at ``MAX_CANDIDATES``, so schemas belong to a
+    narrowing step that asks about a shortlist, not to this bulk block.
+    """
+    from src.repositories import metric_repo, table_registry_repo, user_groups_repo
+
+    # Metric rows key on the registry NAME, via `table_name` or the `tables`
+    # list. Best-effort: an instance whose metric_definitions table does not
+    # exist yet (or whose read fails) must still get a turn — grounding is an
+    # accelerator here, never a precondition.
+    metrics_by_table: Dict[str, List[str]] = {}
+    try:
+        for m in metric_repo().list():
+            metric_name = str(m.get("name") or "").strip()
+            if not metric_name:
+                continue
+            for target in [m.get("table_name"), *(m.get("tables") or [])]:
+                if target:
+                    metrics_by_table.setdefault(str(target), []).append(metric_name)
+    except Exception:
+        logger.debug("package builder: metrics unavailable for grounding", exc_info=True)
+
+    tables: List[Dict[str, Any]] = []
+    for row in table_registry_repo().list_all():
+        table_id = str(row.get("id") or "")
+        table_name = str(row.get("name") or table_id)
+        query_mode = str(row.get("query_mode") or "local")
+        table_metrics = sorted(set(metrics_by_table.get(table_name) or metrics_by_table.get(table_id) or []))
+        tables.append(
+            {
+                "id": table_id,
+                "name": table_name,
+                "description": str(row.get("description") or "")[:160],
+                "source_type": str(row.get("source_type") or ""),
+                "query_mode": query_mode,
+                # A package is how governed data reaches an analyst's laptop,
+                # and only these modes appear in the manifest `agnes pull`
+                # reads (``app/api/data.py::_DISTRIBUTABLE_QUERY_MODES``).
+                # Packaging a remote/server_only row is still ALLOWED —
+                # data_packages.py does not refuse it — so this is a fact for
+                # the model to weigh, never a rule it must obey. Encoding it
+                # as a prohibition would be wrong about the API.
+                "distributable": query_mode in ("local", "materialized") and not bool(row.get("server_only")),
+                # Capped for prompt size, but the cap announces itself in the
+                # rendered block via `metrics_total` — a silently truncated
+                # list would read to the model as "these are all of them",
+                # which is the same failure MAX_CANDIDATES already avoids.
+                "metrics": table_metrics[:_MAX_METRICS_PER_TABLE],
+                "metrics_total": len(table_metrics),
+            }
+        )
+    groups: List[Dict[str, Any]] = [
         {"id": str(row.get("id") or ""), "name": str(row.get("name") or "")} for row in user_groups_repo().list_all()
     ]
     return {"tables": tables, "groups": groups}
 
 
-def _schema(tables: List[Dict[str, str]], groups: List[Dict[str, str]]) -> Dict[str, Any]:
+def _schema(tables: List[Dict[str, Any]], groups: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "type": "object",
         "properties": {
@@ -158,8 +218,8 @@ def _prompt(
     message: str,
     history: List[BuilderMessage],
     draft: Dict[str, Any],
-    tables: List[Dict[str, str]],
-    groups: List[Dict[str, str]],
+    tables: List[Dict[str, Any]],
+    groups: List[Dict[str, Any]],
 ) -> str:
     lines = ["The drawer currently reads:"]
     lines.append(f"- name: {(draft.get('name') or '').strip() or '(empty)'}")
@@ -169,9 +229,30 @@ def _prompt(
     lines.append("")
     lines.append("Registered tables you may include:")
     for t in tables[:MAX_CANDIDATES]:
-        lines.append(f"- id={t['id']} name={t['name']} — {t['description'] or 'no description'}")
+        facts = [f"id={t['id']}", f"name={t['name']}"]
+        if t.get("source_type"):
+            facts.append(f"source={t['source_type']}")
+        facts.append(f"mode={t.get('query_mode') or 'local'}")
+        if not t.get("distributable", True):
+            facts.append("NOT-synced-to-laptops")
+        if t.get("metrics"):
+            shown = ",".join(t["metrics"])
+            hidden = int(t.get("metrics_total") or len(t["metrics"])) - len(t["metrics"])
+            facts.append(f"metrics={shown}" + (f"(+{hidden} more)" if hidden > 0 else ""))
+        lines.append("- " + " ".join(facts) + f" — {t['description'] or 'no description'}")
     if len(tables) > MAX_CANDIDATES:
         lines.append(f"…and {len(tables) - MAX_CANDIDATES} more not listed. Ask rather than guessing.")
+    if tables:
+        # Only advise about facts that are actually above this line: on an
+        # instance with nothing registered the block would otherwise explain
+        # how to read a list that is not there.
+        lines.append(
+            "Read those facts before matching on the name: `metrics=` says what this "
+            "instance already computes over a table, which is often what the table is "
+            "for. A table marked NOT-synced-to-laptops lives only on the server — "
+            "packaging it is allowed, but analysts get no local copy of it, so prefer "
+            "a synced table unless the admin asked for that one."
+        )
     lines.append("")
     lines.append("Groups you may grant to:")
     for g in groups[:MAX_CANDIDATES]:
@@ -221,7 +302,7 @@ def _stub_enabled() -> bool:
     return os.getenv("LOCAL_DEV_MODE") == "1" or os.getenv("TESTING") == "1"
 
 
-def _stub_turn(message: str, draft: Dict[str, Any], tables: List[Dict[str, str]]) -> Dict[str, Any]:
+def _stub_turn(message: str, draft: Dict[str, Any], tables: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A deterministic stand-in so the whole path can be exercised with no
     credential and no network. Deliberately proposes NO groups: the scripted
     engine must not be the thing that teaches this flow to hand out access."""

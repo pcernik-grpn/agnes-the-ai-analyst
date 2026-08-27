@@ -1,14 +1,14 @@
 """SQL validator unit tests + endpoint integration tests (with mocked LLM)."""
+
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
 
 # ---- Unit tests for validator ----
-
 from src.usage_ask import validate_select_only
 
 
@@ -179,7 +179,7 @@ def test_ask_endpoint_returns_503_when_no_api_key(seeded_app, admin_user, monkey
 def test_ask_endpoint_executes_valid_sql(seeded_app, admin_user, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
     # Seed a couple events
-    from src.db import get_system_db, close_system_db
+    from src.db import close_system_db, get_system_db
 
     conn = get_system_db()
     conn.execute(
@@ -188,7 +188,7 @@ def test_ask_endpoint_executes_valid_sql(seeded_app, admin_user, monkeypatch):
          is_error, source, occurred_at, processor_version)
         VALUES (?, 'sess-1', 'alice/x.jsonl', 'alice', 'tool_use', 'Bash',
                 false, 'builtin', ?, 1)""",
-        ["e1", datetime(2026, 5, 12, tzinfo=timezone.utc)],
+        ["e1", datetime(2026, 5, 12, tzinfo=UTC)],
     )
     conn.close()
     close_system_db()
@@ -242,7 +242,7 @@ def test_ask_endpoint_writes_audit_log_on_success(seeded_app, admin_user, monkey
             json={"question": "test"},
             headers=admin_user,
         )
-    from src.db import get_system_db, close_system_db
+    from src.db import close_system_db, get_system_db
 
     conn = get_system_db()
     n = conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='usage.ask'").fetchone()[0]
@@ -272,7 +272,7 @@ def test_ask_endpoint_writes_audit_log_on_rejection(seeded_app, admin_user, monk
     assert resp.status_code == 200
     assert resp.json().get("rejected")
 
-    from src.db import get_system_db, close_system_db
+    from src.db import close_system_db, get_system_db
 
     conn = get_system_db()
     row = conn.execute(
@@ -404,3 +404,36 @@ def test_ask_endpoint_maps_client_construction_failure_to_502(seeded_app, admin_
         )
     assert resp.status_code == 502
     assert "LLM call failed" in resp.json()["detail"]
+
+
+def test_ask_endpoint_uses_vertex_when_configured(seeded_app, admin_user, monkeypatch):
+    """ai.provider: vertex — no ANTHROPIC_API_KEY needed; the endpoint builds
+    a VertexExtractor instead of 503ing."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with (
+        patch("app.api.admin_usage.vertex_config_or_none", return_value=("proj-1", "global")),
+        patch("app.api.admin_usage.create_vertex_extractor") as mock_factory,
+    ):
+        mock_factory.return_value.extract_json.return_value = {
+            "sql": "SELECT COUNT(*) AS n FROM usage_events",
+            "rationale": "Counts all events.",
+        }
+        resp = seeded_app["client"].post(
+            "/api/admin/telemetry/ask",
+            json={"question": "how many events"},
+            headers=admin_user,
+        )
+    assert resp.status_code == 200
+    mock_factory.assert_called_once()
+
+
+def test_ask_endpoint_503_mentions_vertex_option(seeded_app, admin_user, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with patch("app.api.admin_usage.vertex_config_or_none", return_value=None):
+        resp = seeded_app["client"].post(
+            "/api/admin/telemetry/ask",
+            json={"question": "how many events today"},
+            headers=admin_user,
+        )
+    assert resp.status_code == 503
+    assert "ai.provider: vertex" in resp.json()["detail"]

@@ -41,8 +41,17 @@ from app.api.broker_agent_policy import (
     cached_month_total,
     check_budget,
     check_model,
+    check_model_value,
     parse_usage,
     usage_accumulator,
+)
+from app.api.broker_vertex import (
+    COUNT_TOKENS_MODEL,
+    count_tokens_to_vertex,
+    messages_to_vertex,
+    parse_vertex_path,
+    validate_vertex_target,
+    vertex_upstream_base,
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
@@ -407,26 +416,51 @@ def _to_response(resp: httpx.Response, extra_headers: Optional[Dict[str, str]] =
     return response
 
 
-def _agent_for_ticket(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Resolve the ticket's chat session → ``agent_id`` → agent row, or
-    ``None`` when there is nothing to resolve (Slack/legacy sessions with no
-    ``agent_id``, or a session that no longer exists). Callers must treat
-    ``None`` as "behave exactly as before this feature existed" — no
-    policy/ledger/budget enforcement runs for those sessions.
+def _agent_and_caller_for_ticket(row: Dict[str, Any]) -> "tuple[Optional[Dict[str, Any]], Optional[str]]":
+    """Resolve the ticket's chat session once and return ``(agent_row,
+    caller_user_id)``.
 
-    Caches nothing beyond the single caller's request — each call is one
-    DB round-trip (session lookup + agent lookup), matching the per-request
-    caching note in the task brief (``anthropic_proxy`` calls this once and
-    reuses the result for both the pre-forward checks and the post-response
-    usage recording)."""
+    ``agent_row`` is ``None`` when there is nothing to resolve
+    (Slack/legacy sessions with no ``agent_id``, or a session that no
+    longer exists). Callers must treat that as "behave exactly as before
+    this feature existed" — no policy/ledger/budget enforcement runs for
+    those sessions.
+
+    ``caller_user_id`` (C2.4, per-caller usage attribution) is the session's
+    own ``user_email`` — set SERVER-SIDE at session-creation time
+    (``ChatManager.create_session`` for native chat/agent sessions,
+    ``app.api.kai._create_session_and_credential`` for the embedded turn
+    engine's ``llm``-scoped ticket) — resolved to a user id. It is never
+    re-derived from anything the ticket-holder (sandbox relay or engine)
+    could shape, so it cannot be spoofed by the caller's own request. For a
+    session running a SHARED agent (C2.3) this is the grantee actually
+    driving the turn, not the agent's owner — the whole point of
+    attributing usage to the caller rather than the agent. ``None`` when
+    the session's named user no longer resolves to a live account.
+
+    Caches nothing beyond the single caller's request — one DB round-trip
+    (session lookup, shared by both halves) plus, when there IS a bound
+    agent, one more for the agent row and one for the caller's user row —
+    matching the per-request caching note in the task brief
+    (``anthropic_proxy`` calls this once and reuses the result for both the
+    pre-forward checks and the post-response usage recording)."""
     session_id = row.get("session_id")
     if not session_id:
-        return None
+        return None, None
     session = chat_session_repo().get_session(session_id)
-    agent_id = getattr(session, "agent_id", None) if session is not None else None
-    if not agent_id:
-        return None
-    return agents_repo().get_by_id(agent_id)
+    if session is None:
+        return None, None
+    agent_id = getattr(session, "agent_id", None)
+    agent_row = agents_repo().get_by_id(agent_id) if agent_id else None
+    if agent_row is None:
+        # No bound agent → both halves of the result are unused downstream
+        # (every `caller_user_id` consumer sits behind `agent_row is not
+        # None`). Return before the user lookup so an agent-less session
+        # costs exactly what it did before this feature existed.
+        return None, None
+    caller = users_repo().get_by_email(session.user_email)
+    caller_user_id = caller["id"] if caller else None
+    return agent_row, caller_user_id
 
 
 @router.post("/agnes-api")
@@ -770,18 +804,69 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # `_normalize_upstream_path`'s docstring).
     normalized_upstream_path = _normalize_upstream_path(upstream_path)
     is_messages_post = request.method == "POST" and normalized_upstream_path == "/v1/messages"
+    is_count_tokens_post = request.method == "POST" and normalized_upstream_path == "/v1/messages/count_tokens"
+
+    chat_cfg = getattr(request.app.state, "chat_config", None)
+    # Vertex mode (chat.llm.provider: vertex): the sandbox CLI runs in native
+    # Vertex gateway mode and sends Vertex-shaped model paths; Messages-format
+    # clients (the kai-agent engine) keep sending /v1/messages and get
+    # rewritten below. Unlike anthropic mode's open forward, vertex mode is
+    # FAIL CLOSED on subpaths: anything that is neither a valid Vertex model
+    # invocation nor a known Messages endpoint is refused, never forwarded.
+    vertex_mode = getattr(chat_cfg, "llm_provider", "anthropic") == "vertex"
+    vertex_target = parse_vertex_path(normalized_upstream_path) if vertex_mode else None
+    if vertex_mode:
+        if vertex_target is not None:
+            target_err = validate_vertex_target(
+                vertex_target,
+                getattr(chat_cfg, "vertex_project_id", ""),
+                getattr(chat_cfg, "vertex_region", ""),
+            )
+            if target_err:
+                # The sandbox's env only carries routing hints; THIS equality
+                # check against instance config is what pins where spend lands.
+                try:
+                    audit_repo().log(
+                        action="broker_vertex_target_rejected",
+                        params={
+                            "raw_path": str(upstream_path)[:200],
+                            "session_id": row.get("session_id"),
+                        },
+                        result="denied",
+                        client_kind="broker",
+                    )
+                except Exception:  # noqa: BLE001, S110 — audit logging must never break the deny path
+                    pass
+                raise HTTPException(status_code=403, detail={"code": target_err})
+        elif not (is_messages_post or is_count_tokens_post):
+            try:
+                audit_repo().log(
+                    action="broker_vertex_path_rejected",
+                    params={
+                        "raw_path": str(upstream_path)[:200],
+                        "session_id": row.get("session_id"),
+                    },
+                    result="denied",
+                    client_kind="broker",
+                )
+            except Exception:  # noqa: BLE001, S110 — audit logging must never break the deny path
+                pass
+            raise HTTPException(status_code=404, detail={"code": "vertex_path_not_supported"})
+
+    # A completion spends tokens; count_tokens (either spelling) does not.
+    is_completion = is_messages_post or (vertex_target is not None and vertex_target.model != COUNT_TOKENS_MODEL)
 
     # Agent-as-API policy: per-agent model allowlist + monthly token budget
     # (Task 8, agent-profiles V1a). Sits BEFORE the credential fork below so
-    # it covers all three upstream modes (static key / WIF / dispatcher), and
-    # raises BEFORE any token is spent. Sessions with no bound agent (Slack,
-    # legacy, or a session predating this feature) resolve `agent_row` to
-    # `None` and skip all of it — behavior is unchanged for them.
-    agent_row: Optional[Dict[str, Any]] = None
-    budget_headers: Dict[str, str] = {}
-    chat_cfg = getattr(request.app.state, "chat_config", None)
-    if is_messages_post:
-        agent_row = _agent_for_ticket(row)
+    # it covers all upstream modes (static key / WIF / dispatcher / vertex),
+    # and raises BEFORE any token is spent. Sessions with no bound agent
+    # (Slack, legacy, or a session predating this feature) resolve `agent_row`
+    # to `None` and skip all of it — behavior is unchanged for them.
+    agent_row: dict[str, Any] | None = None
+    caller_user_id: str | None = None
+    budget_headers: dict[str, str] = {}
+    if is_completion:
+        agent_row, caller_user_id = _agent_and_caller_for_ticket(row)
     if agent_row is not None:
         utility_models = getattr(chat_cfg, "agent_api_utility_models", []) or []
         budget_ttl_s = getattr(chat_cfg, "agent_api_budget_cache_ttl_s", 60)
@@ -793,7 +878,12 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                 "x-agnes-budget-limit": str(budget),
                 "x-agnes-budget-used": str(month_total),
             }
-        model_err = check_model(raw_body, agent_row, utility_models)
+        # Vertex native paths carry the model in the URL, not the body; both
+        # forms compare canonically, so pinned models in either spelling work.
+        if vertex_target is not None:
+            model_err = check_model_value(vertex_target.model, agent_row, utility_models)
+        else:
+            model_err = check_model(raw_body, agent_row, utility_models)
         if model_err:
             raise HTTPException(status_code=403, detail={"code": model_err}, headers=budget_headers or None)
         if month_total is not None:
@@ -816,18 +906,46 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # dispatcher failure: silently bypassing the cost-routing PoC would
     # corrupt its measurements; the sandbox sees the ordinary upstream error.
     dispatcher_url = os.environ.get("LLM_DISPATCHER_URL", "").strip().rstrip("/")
-    use_dispatcher = bool(dispatcher_url) and is_messages_post
+    # Never in vertex mode: the dispatcher speaks the first-party Messages
+    # API. The boot gate refuses the combination; this guard is belt-and-braces.
+    use_dispatcher = bool(dispatcher_url) and is_messages_post and not vertex_mode
+    if dispatcher_url and vertex_mode:
+        logger.warning("LLM_DISPATCHER_URL is set but chat.llm.provider=vertex — dispatcher ignored")
 
     # Credential injection is the ONE thing that differs between auth modes; the
     # sandbox never carries either credential (it's added here, server-side).
+    #   vertex                 → Authorization: Bearer <Google OAuth token from
+    #                            ADC>; NO Anthropic credential exists at all.
     #   dispatcher opt-in      → x-api-key: <LLM_DISPATCHER_API_KEY>
     #   api_key (default)      → x-api-key: <static ANTHROPIC_API_KEY>
     #   workload_identity      → Authorization: Bearer <short-lived federated
     #                            token> + the oauth beta header OAuth-style
     #                            tokens require; NO static key exists.
     llm_auth = getattr(getattr(request.app.state, "chat_config", None), "llm_auth", "api_key")
-    wif_mode = llm_auth == "workload_identity" and not use_dispatcher
-    if use_dispatcher:
+    wif_mode = llm_auth == "workload_identity" and not use_dispatcher and not vertex_mode
+    if vertex_mode:
+        from app.auth.vertex_gcp import VertexAuthError, get_vertex_access_token
+
+        try:
+            # Offload the (synchronous, possibly network-bound) token
+            # resolution/refresh so it can't stall the chat event loop.
+            google_token = await asyncio.to_thread(get_vertex_access_token)
+        except VertexAuthError as exc:
+            # Full detail goes to the audit trail (server-side only); the
+            # sandbox-facing caller gets a GENERIC message — never echo
+            # credential-chain detail across the isolation boundary.
+            try:
+                audit_repo().log(
+                    action="broker_vertex_token_failed",
+                    params={"error": str(exc)[:500], "session_id": row.get("session_id")},
+                    result="error",
+                    client_kind="broker",
+                )
+            except Exception:  # noqa: BLE001, S110 — audit logging must never break the request path
+                pass
+            raise HTTPException(status_code=502, detail="vertex credential resolution failed") from exc
+        headers["Authorization"] = f"Bearer {google_token}"
+    elif use_dispatcher:
         # strip() guards against trailing newlines/spaces from secret managers
         # (same normalization the URL gets above) — an invisible \n in the key
         # is a hard-to-debug dispatcher 401.
@@ -875,7 +993,32 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     else:
         headers["x-api-key"] = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    upstream_base = dispatcher_url if use_dispatcher else _ANTHROPIC_BASE_URL
+    # Outbound path/body: identical to the inbound pair everywhere except
+    # vertex mode. A native Vertex path is REBUILT from its parsed, validated
+    # groups (never the raw string); a Messages-format call is rewritten into
+    # the Vertex shape (model body→URL, anthropic_version injected) so the
+    # kai-agent engine and other Messages clients need no change.
+    outbound_path = normalized_upstream_path
+    outbound_body = raw_body
+    if vertex_mode:
+        if vertex_target is not None:
+            outbound_path = vertex_target.upstream_path
+        else:
+            project_id = getattr(chat_cfg, "vertex_project_id", "")
+            region = getattr(chat_cfg, "vertex_region", "")
+            try:
+                if is_messages_post:
+                    outbound_path, outbound_body, _model = messages_to_vertex(raw_body, project_id, region)
+                else:  # is_count_tokens_post — the only other path allowed above
+                    outbound_path, outbound_body = count_tokens_to_vertex(raw_body, project_id, region)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail={"code": "vertex_body_invalid"}) from exc
+
+    upstream_base = (
+        dispatcher_url
+        if use_dispatcher
+        else (vertex_upstream_base(getattr(chat_cfg, "vertex_region", "")) if vertex_mode else _ANTHROPIC_BASE_URL)
+    )
     # Stream-open the upstream call: status + headers arrive immediately, the
     # body stays unread. A 2xx SSE completion is then forwarded chunk-by-chunk
     # (StreamingResponse below) instead of buffered whole — buffering here
@@ -887,12 +1030,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     try:
         upstream_req = client.build_request(
             request.method,
-            # `normalized_upstream_path` — the SAME canonical value the policy /
-            # budget / dispatcher gates classified on above — so the guard and
-            # the real destination can never disagree (dot-segments already
-            # refused, trailing/duplicate slashes already collapsed).
-            f"{upstream_base}{normalized_upstream_path}",
-            content=raw_body,
+            # `outbound_path` — either the SAME canonical value the policy /
+            # budget / dispatcher gates classified on above, or (vertex mode)
+            # a path rebuilt from that value's parsed+validated groups — so
+            # the guard and the real destination can never disagree
+            # (dot-segments already refused, slashes already collapsed).
+            f"{upstream_base}{outbound_path}",
+            content=outbound_body,
             headers=headers,
             params=request.query_params,
         )
@@ -900,6 +1044,12 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     except BaseException:
         await client.aclose()
         raise
+    # A 401 in vertex mode means the cached Google token was revoked before
+    # its declared expiry — drop it so the next request re-resolves.
+    if vertex_mode and resp.status_code == 401:
+        from app.auth.vertex_gcp import clear_token_cache as clear_vertex_token_cache
+
+        clear_vertex_token_cache()
     # A 401 in WIF mode means the cached token was revoked before its declared
     # expiry — drop it so the next request re-mints.
     if wif_mode and resp.status_code == 401:
@@ -965,6 +1115,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                                         "id": str(uuid.uuid4()),
                                         "agent_id": agent_row["id"],
                                         "user_id": agent_row.get("owner_user_id"),
+                                        "caller_user_id": caller_user_id,
                                         "session_id": row.get("session_id"),
                                     },
                                     budget_ttl_s=budget_ttl_s,
@@ -1013,6 +1164,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                         "id": str(uuid.uuid4()),
                         "agent_id": agent_row["id"],
                         "user_id": agent_row.get("owner_user_id"),
+                        "caller_user_id": caller_user_id,
                         "session_id": row.get("session_id"),
                     },
                     budget_ttl_s=budget_ttl_s,

@@ -157,11 +157,20 @@ locals {
   # app's own default, so a non-customized instance's seed stays
   # byte-for-byte identical to before this change.
   instance_studio_map = var.studio_enabled ? {} : { enabled = false }
+  # D1 residual (2026-08): `data_source.type` — the last knob still rewritten
+  # by an always-wins `.env` line (`DATA_SOURCE=...`) on every boot, which
+  # permanently shadowed the admin UI's `/admin/server-config` control of the
+  # same knob (app/instance_config.py::get_data_source_type() now also flips
+  # its own precedence to prefer this overlay over a stale env var). Same
+  # first-boot-seed handoff as studio_enabled above — module-wide, one value
+  # for every VM, mirroring its historical `var.data_source` env behavior.
+  instance_data_source_map = var.data_source != "" ? { type = var.data_source } : {}
   # Assemble the top-level YAML map, dropping empty sub-blocks: `instance:` gets
   # the scalar branding keys plus custom_scripts (verbatim); `theme:` gets the
-  # set colours; `studio:` gets the toggle above. base64(yamlencode(...)) — but
-  # only when the map is non-empty, so a no-branding VM resolves to "" and the
-  # startup script appends nothing.
+  # set colours; `studio:` gets the toggle above; `data_source:` gets the
+  # connector type. base64(yamlencode(...)) — but only when the map is
+  # non-empty, so a no-branding VM resolves to "" and the startup script
+  # appends nothing.
   instance_branding_map = {
     for inst in local.all_instances : inst.name => merge(
       (length(local.instance_brand_scalars[inst.name]) > 0 || length(try(inst.custom_scripts, [])) > 0) ? {
@@ -171,7 +180,8 @@ locals {
         )
       } : {},
       length(local.instance_theme_colors[inst.name]) > 0 ? { theme = local.instance_theme_colors[inst.name] } : {},
-      length(local.instance_studio_map) > 0 ? { studio = local.instance_studio_map } : {}
+      length(local.instance_studio_map) > 0 ? { studio = local.instance_studio_map } : {},
+      length(local.instance_data_source_map) > 0 ? { data_source = local.instance_data_source_map } : {}
     )
   }
   instance_branding_b64 = {
@@ -508,6 +518,12 @@ resource "google_compute_instance" "vm" {
   # running deployment actually wants.
   allow_stopping_for_update = true
 
+  # Opt-in per VM. Until this was wired, a deployment could only set the flag
+  # out of band, and the provider's own `false` default silently reverted it on
+  # the next apply — the module never sent the attribute, so every plan
+  # proposed turning the protection back off.
+  deletion_protection = each.value.deletion_protection
+
   boot_disk {
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
@@ -563,8 +579,14 @@ resource "google_compute_instance" "vm" {
     # Vendor-neutral branding for the FIRST-boot instance.yaml (logo/brand/
     # theme colours/custom_scripts), pre-rendered to a base64'd YAML fragment —
     # "" when the caller set no branding on this VM.
-    instance_branding_b64           = local.instance_branding_b64[each.value.name]
-    acme_email                      = var.acme_email != "" ? var.acme_email : var.seed_admin_email
+    instance_branding_b64 = local.instance_branding_b64[each.value.name]
+    acme_email            = var.acme_email != "" ? var.acme_email : var.seed_admin_email
+    # `data_source` still reaches the startup script (used ONLY for the
+    # boot-time "do we need the keboola-storage-token secret?" gate) but no
+    # longer writes a `DATA_SOURCE=...` line into `.env` (D1 residual,
+    # 2026-08) — the app-visible value rides `instance_branding_b64`'s
+    # `data_source.type` first-boot seed instead. See
+    # `instance_data_source_map` above.
     data_source                     = var.data_source
     keboola_stack_url               = var.keboola_stack_url
     seed_admin_email                = var.seed_admin_email
@@ -577,6 +599,7 @@ resource "google_compute_instance" "vm" {
     # template vars (D1, 2026-08) — see the theme/experience note above; both
     # ride instance_branding_b64 now.
     data_apps_enabled            = each.value.data_apps_enabled
+    data_apps_subdomain_base     = each.value.data_apps_subdomain_base
     data_apps_runtime_image      = var.data_apps_runtime_image
     enable_watchdog              = var.enable_watchdog
     enable_gcp_logging           = var.enable_gcp_logging

@@ -54,7 +54,7 @@ import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator
 
-from app.auth.access import can_access, require_agent_profiles_enabled
+from app.auth.access import can_access, is_user_admin, require_agent_profiles_enabled
 from app.auth.dependencies import _get_db, get_current_user
 from app.auth.pat_resolver import agent_id_from_request
 from app.auth.session_principal import PRINCIPAL_TYPES
@@ -191,6 +191,51 @@ def require_agent_runtime_principal(
     # route with — copying the call (not the mechanism), per the task
     # brief, since this dependency already needs its own composite
     # 404/403 ordering that `require_resource_access` doesn't expose.
+    if not can_access(user["id"], ResourceType.CHAT.value, "chat", conn):
+        raise HTTPException(status_code=403, detail={"code": "chat_access_denied"})
+
+    return AgentRuntimePrincipal(user=user, agent=agent)
+
+
+def require_agent_usage_principal(
+    slug: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+) -> AgentRuntimePrincipal:
+    """Auth dependency for `GET /agents/{slug}/usage` ONLY (C2.4).
+
+    Same owned-or-runnable chain as `require_agent_runtime_principal`,
+    PLUS an admin READ fallback: an admin with no run grant on the agent
+    may still view its usage totals. Deliberately NOT folded into
+    `require_agent_runtime_principal` itself — that dependency also gates
+    `/responses` (which actually RUNS the agent), and
+    `agents_repo().get_runnable_by_slug` withholds admin god-mode there on
+    purpose (its own docstring: "never an implicit run-any-agent grant").
+    Viewing usage is a read, not a run, so it does not reopen that
+    exclusion — the per-caller BREAKDOWN this principal unlocks is gated
+    separately, in `get_agent_usage` itself, to owner-or-admin only (a
+    plain runnable grantee still sees only the agent-level totals).
+    """
+    if isinstance(user, PRINCIPAL_TYPES):
+        raise HTTPException(status_code=403, detail={"code": "agent_runtime_requires_owner_credential"})
+
+    agent = agents_repo().get_runnable_by_slug(user["id"], slug)
+    if agent is None and is_user_admin(user["id"], conn):
+        # Admin inspection fallback, by id only -- `slug` is only unique
+        # within its OWNER's namespace (see `get_runnable_by_slug`'s
+        # docstring), so an admin addressing a foreign agent by its bare
+        # slug name would be guessing across owners; `get_by_id` is the
+        # same unambiguous lookup the runnable path already uses for a
+        # grantee.
+        agent = agents_repo().get_by_id(slug)
+    if agent is None or agent.get("deleted_at") is not None:
+        raise HTTPException(status_code=404, detail={"code": "agent_not_found"})
+
+    pat_agent_id = agent_id_from_request(request)
+    if pat_agent_id is not None and pat_agent_id != agent["id"]:
+        raise HTTPException(status_code=403, detail={"code": "agent_pat_wrong_agent"})
+
     if not can_access(user["id"], ResourceType.CHAT.value, "chat", conn):
         raise HTTPException(status_code=403, detail={"code": "chat_access_denied"})
 
@@ -472,15 +517,19 @@ def _current_year_month() -> str:
 async def get_agent_usage(
     slug: str,
     period: Optional[str] = None,
-    principal: AgentRuntimePrincipal = Depends(require_agent_runtime_principal),
+    principal: AgentRuntimePrincipal = Depends(require_agent_usage_principal),
 ) -> dict:
     """Per-agent monthly token usage against its budget (Task 8, `agnes
-    agent usage` / MCP `agent_usage`).
+    agent usage` / MCP `agent_usage`), plus a per-caller breakdown for the
+    agent's owner or an admin (C2.4, per-caller usage attribution).
 
     `period` defaults to the current UTC month (`YYYY-MM`); an explicitly
     passed value that doesn't match that shape is `400
-    {"code": "invalid_period"}`. Same owner/agent-PAT auth as every other
-    `/api/v1/agents/{slug}/...` runtime route.
+    {"code": "invalid_period"}`. Auth is `require_agent_usage_principal`:
+    owner-or-runnable-grantee (same chain every other
+    `/api/v1/agents/{slug}/...` runtime route uses) PLUS an admin
+    inspection fallback that the other routes deliberately do NOT have (see
+    that dependency's docstring).
 
     The usage-shaped fields (`input_tokens`/`output_tokens`/
     `cache_read_tokens`/`cache_creation_tokens`) mirror Anthropic's own
@@ -490,7 +539,21 @@ async def get_agent_usage(
     against `token_budget_monthly`, so `budget_remaining` (`budget_limit -
     total_tokens`, floored at 0, `None` for an unbounded agent) lines up
     with when a call against this agent would actually start 429ing with
-    `budget_exhausted`.
+    `budget_exhausted`. These AGGREGATE fields are visible to anyone this
+    principal admits (owner, runnable grantee, or admin) — they say nothing
+    about who spent the tokens, only how much the AGENT (budget's own unit)
+    has spent.
+
+    `by_caller` is the new field: a list of `{caller_user_id, input_tokens,
+    output_tokens, cache_read_tokens, cache_creation_tokens, total_tokens}`
+    — one entry per distinct caller who ran this agent that month
+    (`caller_user_id` is `None` for a row with no recorded caller: pre-C2.4
+    rows, or the DuckDB backend, which has no column to distinguish callers
+    at all — see `LlmUsageRepository.usage_breakdown_by_caller_for_month`).
+    Present ONLY for the agent's owner or an admin — a plain runnable
+    grantee (shared the agent, C2.3, but not its owner) gets `by_caller:
+    null`: they may see how much the agent as a whole has spent, never a
+    breakdown that would reveal OTHER callers' usage.
 
     Flushes the broker's batched usage ledger first (best-effort — see
     `usage_accumulator_flush`) so a just-finished call's rows aren't
@@ -509,6 +572,11 @@ async def get_agent_usage(
     budget_limit = agent.get("token_budget_monthly")
     budget_remaining = max(0, budget_limit - breakdown["total_tokens"]) if budget_limit is not None else None
 
+    is_owner_or_admin = principal.user["id"] == agent.get("owner_user_id") or is_user_admin(principal.user["id"])
+    by_caller = (
+        llm_usage_repo().usage_breakdown_by_caller_for_month(agent["id"], year_month) if is_owner_or_admin else None
+    )
+
     return {
         "period": year_month,
         "agent_slug": slug,
@@ -519,6 +587,7 @@ async def get_agent_usage(
         "total_tokens": breakdown["total_tokens"],
         "budget_limit": budget_limit,
         "budget_remaining": budget_remaining,
+        "by_caller": by_caller,
     }
 
 

@@ -1250,10 +1250,41 @@ function _markConversationNotStarted() {
  * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
  * answer to "who am I talking to?" — show the instance brand there instead.
  * A default the owner has since RENAMED keeps its own name. */
+/** How long a name may be before the pill abbreviates it. Sized to the widest
+ *  name that fits the 9rem cap at the button's weight without ellipsis. */
+const AGENT_LABEL_MAX = 14;
+
+/** The FULL name, for the menu, the in-conversation label and the title
+ *  attribute — everywhere there is room to say it.
+ *
+ *  The default agent is "Default", not the brand. It used to render as "Agnes",
+ *  which read more naturally on its own but was the odd one out once the caller
+ *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
+ *  different kind of thing), and it disagreed with the /agents page, where the
+ *  same row is called Default. One name per agent, everywhere. */
 function _agentLabel(a, brand) {
   if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return brand;
+  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
   return a.name || "Untitled agent";
+}
+
+/** The label as the PILL shows it: initials once a name is long enough to crowd
+ *  the composer ("Finance Proposals" → "FP").
+ *
+ *  Initials, not an ellipsis, so the pill's width is stable across agents rather
+ *  than growing to the cap — the trade is that two names sharing initials look
+ *  alike in the pill. The full name is always one hover (title) or one click
+ *  (the menu, which ticks the current row) away, and the in-conversation label
+ *  spells it out, so nothing depends on reading the pill alone.
+ *
+ *  Single long word has no initials to take, so it falls back to the CSS
+ *  ellipsis rather than rendering one lonely letter. */
+function _agentPillLabel(name) {
+  const full = String(name || "").trim();
+  if (full.length <= AGENT_LABEL_MAX) return full;
+  const words = full.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return full;
+  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1285,8 +1316,13 @@ function _syncAgentPicker() {
   }
   const agent = _agentById(_currentAgentId) || _defaultAgent();
   const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  if (btnLabel) btnLabel.textContent = name;
-  btn.title = "Choose which agent to chat with";
+  const pill = _agentPillLabel(name);
+  if (btnLabel) btnLabel.textContent = pill;
+  // When the pill abbreviates, the title is the only place the full name shows
+  // on hover — so say it there rather than repeating the generic instruction.
+  btn.title = pill === name
+    ? "Choose which agent to chat with"
+    : `${name} — choose which agent to chat with`;
   btn.hidden = _sessionHasTurns;
   if (staticLabel) {
     staticLabel.textContent = name;
@@ -1312,12 +1348,13 @@ function _renderAgentMenu() {
   if (!_agentsCache.length) {
     const note = document.createElement("li");
     note.className = "cloud-chat-agent-menu-note";
-    note.textContent = "No agents yet — build one on the Agents page.";
+    // No "build one on the Agents page" instruction any more: the create row
+    // below IS that path, so the note only has to state the fact.
+    note.textContent = "No agents yet.";
     menu.appendChild(note);
-    return;
   }
   const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of _agentsCache) {
+  for (const a of (_agentsCache.length ? _agentsCache : [])) {
     const li = document.createElement("li");
     li.className = "cloud-chat-agent-menu-item";
     if (a.id === currentId) li.classList.add("is-current");
@@ -1374,6 +1411,47 @@ function _renderAgentMenu() {
     });
     menu.appendChild(li);
   }
+
+  /* …and one row that is not an agent: the way to make another.
+   *
+   * It belongs here because this menu is where the caller finds out their
+   * agents are not enough — you go looking for the one that answers this
+   * question, do not find it, and the next move should be in reach rather than
+   * back through the rail to /agents. Standard account-switcher shape: the set,
+   * then "add one".
+   *
+   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
+   * (agents.html strips the param and calls createAgent, so the server mints
+   * the row) — not a second way to create an agent, just a second door to the
+   * one that exists. An <a>, so it is a real link: middle-click and
+   * open-in-new-tab work, and it needs no JS to function.
+   *
+   * Separated from the list by a rule, because it is a different KIND of row:
+   * every item above it switches this conversation, this one leaves the page. */
+  const create = document.createElement("li");
+  create.className = "cloud-chat-agent-menu-create";
+  create.setAttribute("role", "none");
+  const link = document.createElement("a");
+  link.href = "/agents?new=1";
+  link.setAttribute("role", "menuitem");
+  link.className = "cloud-chat-agent-menu-create-link";
+  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
+  plus.setAttribute("viewBox", "0 0 24 24");
+  plus.setAttribute("fill", "none");
+  plus.setAttribute("aria-hidden", "true");
+  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  pp.setAttribute("d", "M12 5v14M5 12h14");
+  pp.setAttribute("stroke", "currentColor");
+  pp.setAttribute("stroke-width", "2");
+  pp.setAttribute("stroke-linecap", "round");
+  plus.appendChild(pp);
+  link.appendChild(plus);
+  const ctext = document.createElement("span");
+  ctext.textContent = "Create new agent";
+  link.appendChild(ctext);
+  create.appendChild(link);
+  menu.appendChild(create);
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
@@ -4111,6 +4189,15 @@ async function submitUserMessage(text) {
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
+    // Step 1 cleared the composer optimistically, but no turn ever started:
+    // give the text back rather than destroying what they typed. A chat
+    // backend that is down must cost a retry, not the message — otherwise
+    // the only record of a long prompt is the user's memory of it.
+    const taFailed = $("chat-input");
+    if (taFailed && !taFailed.value) {
+      taFailed.value = text;
+      autosizeComposer();
+    }
     // The turn never started, so nothing is settled — hand the picker back
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
@@ -5426,6 +5513,153 @@ function renderCoPresence(host, participants) {
       });
     });
   }
+
+  // ── Session files (#1611) ─────────────────────────────────────────────────
+  // The way OUT for files the agent generated in the session workspace: the
+  // header "Files" button opens an overlay listing the session's files
+  // (GET .../files), each row with a download link (GET .../files/download —
+  // served attachment+nosniff) and a save-to-Library action
+  // (POST .../files/save-artefact). Rows are built with createElement +
+  // textContent — file names/paths are agent-chosen strings, never innerHTML.
+
+  const FILES_OVERLAY = "chat-files-overlay";
+  const filesListEl = $("chat-files-list");
+  const filesStatusEl = $("chat-files-status");
+  const filesErrorEl = $("chat-files-error");
+
+  function fmtWhen(iso) {
+    try { return new Date(iso).toLocaleString(); } catch (_) { return ""; }
+  }
+
+  function setFilesStatus(msg) {
+    if (!filesStatusEl) return;
+    filesStatusEl.textContent = msg || "";
+    filesStatusEl.hidden = !msg;
+  }
+
+  function renderFileRow(chatId, f) {
+    const li = document.createElement("li");
+    li.className = "cloud-chat-files-row";
+
+    const meta = document.createElement("div");
+    meta.className = "cloud-chat-files-meta";
+    const name = document.createElement("span");
+    name.className = "cloud-chat-files-name";
+    name.textContent = f.name;
+    name.title = f.path;
+    const hint = document.createElement("span");
+    hint.className = "cloud-chat-files-hint";
+    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    meta.appendChild(name);
+    meta.appendChild(hint);
+
+    const actions = document.createElement("div");
+    actions.className = "cloud-chat-files-actions";
+
+    const dl = document.createElement("a");
+    dl.className = "btn btn-secondary cloud-chat-files-btn";
+    dl.textContent = "Download";
+    dl.href =
+      "/api/chat/sessions/" + encodeURIComponent(chatId) +
+      "/files/download?path=" + encodeURIComponent(f.path);
+    dl.setAttribute("download", f.name);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn btn-secondary cloud-chat-files-btn";
+    save.textContent = "Save to Library";
+    save.title = "Keep a copy in your Library — it outlives this session";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      save.textContent = "Saving…";
+      clearDialogError(filesErrorEl);
+      try {
+        const res = await fetch(
+          "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files/save-artefact",
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: f.path }),
+          }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const link = document.createElement("a");
+          link.className = "btn btn-secondary cloud-chat-files-btn";
+          link.textContent = "In Library ↗";
+          link.href = data.library_url || "/library";
+          link.target = "_blank";
+          link.rel = "noopener";
+          save.replaceWith(link);
+          showToast("Saved to your Library", "ok");
+        } else {
+          let msg = "Could not save to Library.";
+          try {
+            const j = await res.json();
+            if (j && j.detail) msg = String(j.detail);
+          } catch (_) {}
+          showDialogError(filesErrorEl, msg);
+          save.disabled = false;
+          save.textContent = "Save to Library";
+        }
+      } catch (err) {
+        showDialogError(filesErrorEl, "Could not save to Library: " + String(err));
+        save.disabled = false;
+        save.textContent = "Save to Library";
+      }
+    });
+
+    actions.appendChild(dl);
+    actions.appendChild(save);
+    li.appendChild(meta);
+    li.appendChild(actions);
+    return li;
+  }
+
+  async function loadSessionFiles() {
+    if (!filesListEl) return;
+    const chatId = currentChatId;
+    if (!chatId) return;
+    clearDialogError(filesErrorEl);
+    setFilesStatus("Loading…");
+    filesListEl.replaceChildren();
+    try {
+      const res = await fetch(
+        "/api/chat/sessions/" + encodeURIComponent(chatId) + "/files",
+        { credentials: "same-origin" }
+      );
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const files = data.files || [];
+      if (!files.length) {
+        setFilesStatus(
+          "No files here yet — when the assistant generates a document in this conversation, it shows up in this list."
+        );
+        return;
+      }
+      setFilesStatus(data.truncated ? "Showing the most recent files only." : "");
+      files.forEach((f) => filesListEl.appendChild(renderFileRow(chatId, f)));
+    } catch (err) {
+      setFilesStatus("");
+      showDialogError(filesErrorEl, "Could not load session files: " + String(err));
+    }
+  }
+
+  const filesBtn = $("chat-session-files");
+  if (filesBtn) {
+    filesBtn.addEventListener("click", () => {
+      if (!currentChatId) {
+        showToast("Open a conversation first", "error");
+        return;
+      }
+      openOverlay(FILES_OVERLAY);
+      loadSessionFiles();
+    });
+  }
+  const filesRefreshBtn = $("chat-files-refresh");
+  if (filesRefreshBtn) filesRefreshBtn.addEventListener("click", loadSessionFiles);
+  wireCloseButtons(FILES_OVERLAY);
 
 })();
 

@@ -54,19 +54,18 @@
   /* ── List view ── */
   /* The list is two bands — ready first, drafts under — because a card's
      click does a different thing in each, and the heading is what says so. */
-  .ag-listbar { display: flex; justify-content: flex-end; margin-bottom: 18px; }
+  /* No `.ag-listbar`: the "+ New agent" button it held is a card in the grid
+     now (`.ag-new`), so there is no toolbar row above the collection. */
   .ag-group + .ag-group { margin-top: 30px; }
   .ag-group-h { margin-bottom: 12px; }
   .ag-group-h h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; }
   .ag-group-n { font-size: 12px; font-weight: 600; color: var(--ds-text-muted); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: var(--ds-radius-pill); padding: 0 8px; }
   .ag-group-h p { margin: 3px 0 0; font-size: 12.5px; color: var(--ds-text-secondary); }
   .ag-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
-  /* A ready card is the thing you click to talk to — say so on hover. */
-  .ag-card--ready:hover { border-color: var(--ds-primary); }
-  .ag-cardbtn { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; font-size: 13px; font-weight: 600; padding: 3px 10px; border-radius: 8px; font-family: inherit; }
-  .ag-cardbtn:hover, .ag-cardbtn:focus-visible { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+  /* Every card opens the builder, ready or draft, so there is one hover
+     treatment (on `.ag-card` below) rather than a state-dependent one. */
   .ag-card { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; cursor: pointer; transition: border-color var(--ds-motion-fast) var(--ds-ease-standard), box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
-  .ag-card:hover { border-color: var(--ds-border); box-shadow: var(--ds-shadow-md); }
+  .ag-card:hover { border-color: var(--ds-primary); box-shadow: var(--ds-shadow-md); }
   .ag-card-top { display: flex; align-items: center; gap: 11px; }
   .ag-ava { width: 38px; height: 38px; border-radius: 10px; background: var(--ds-agnes-soft); color: var(--ds-agnes); display: grid; place-items: center; flex-shrink: 0; }
   .ag-ava svg { width: 21px; height: 21px; }
@@ -88,6 +87,10 @@
   .ag-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
   .ag-new { border: 1.5px dashed var(--ds-border); background: var(--ds-surface-sunken); color: var(--ds-text-secondary); border-radius: 14px; padding: 16px 18px; display: flex; align-items: center; justify-content: center; gap: 9px; font-size: 14px; font-weight: 600; cursor: pointer; min-height: 158px; font-family: inherit; transition: color var(--ds-motion-fast) var(--ds-ease-standard), border-color var(--ds-motion-fast) var(--ds-ease-standard); }
   .ag-new:hover { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+  .ag-new:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  /* The plus at the weight of the cards' avatar tile, so the first cell has a
+     mark where its neighbours have one and the row's rhythm survives. */
+  .ag-new-plus { font-size: 19px; font-weight: 500; line-height: 1; }
   /* Template picker — the first step of "New agent" once the caller has any
      Agent Template installed. */
   /* No --ds-* scrim token exists (every modal in the codebase hard-codes its
@@ -125,7 +128,7 @@
   </div>
 </div>
 {# The "not wired to the surfaces yet" caveat is gone: agents run from here now
-   (the Chat button on each card opens a session as that agent). The other
+   (each card's Chat action opens a session as that agent). The other
    surfaces are still a per-surface rollout, but "you cannot use what you
    built" — the thing this notice was apologising for — is no longer true. #}
 {% endblock %}
@@ -373,51 +376,79 @@
         '</div>';
       return;
     }
-    /* Ready and draft agents are different objects to their owner, so the
-       card's primary action follows its state: a READY agent is something you
-       use, and clicking it starts a conversation; a DRAFT is something you are
-       still making, and clicking it reopens the builder. Each keeps the other
-       route as a footer action, so nothing became unreachable — an agent can
-       always be edited, and a draft can always be tried. */
+    /* Ready and draft agents are different objects to their owner — one is a
+       thing you use, the other a thing you are still making — so the list says
+       so in two titled bands, ready first.
+
+       What a CARD does is the same in both: it opens the builder. This page is
+       where an agent is configured, and the card is the thing that stands for
+       the configuration; a click that started a conversation instead meant the
+       one obvious gesture on a ready agent could not reach the thing the page
+       is for, and an owner who wanted to change a prompt had to find the small
+       footer button. Chatting keeps a footer action on every card, so nothing
+       became unreachable — /chat's own agent picker is the other route to it. */
     var ready = agents.filter(function (a) { return a.status === 'ready'; });
     var drafts = agents.filter(function (a) { return a.status !== 'ready'; });
 
-    listView.innerHTML =
-      '<div class="ag-listbar">' +
-        '<button type="button" class="cc-btn cc-btn--primary" data-ag-new>+ New agent</button>' +
-      '</div>' +
-      group('Ready', 'Click one to start a conversation with it.', ready) +
-      group('Drafts', 'Still being built — click one to keep going.', drafts);
+    /* "New agent" is the FIRST CARD, not a button above the grid. Making a new
+       agent is the same kind of act as opening an existing one — you land in the
+       same builder — so it belongs in the same row, in the position the eye
+       reaches first, rather than floating over the collection as a toolbar.
+
+       It leads whichever group actually renders: Ready when there is one, else
+       Drafts. `group()` drops an empty group entirely, so handing the card to
+       Ready unconditionally would lose it on an instance whose every agent is
+       still a draft. */
+    var readyHtml = group('Ready', 'Click one to open its builder — Chat starts a conversation.', ready, newCard());
+    listView.innerHTML = readyHtml +
+      group('Drafts', 'Still being built — click one to keep going.', drafts,
+            readyHtml ? '' : newCard());
+  }
+
+  /* The dashed "add one here" affordance — a peer of the cards beside it in
+     size and radius, and deliberately NOT one in fill: a solid card would read
+     as an agent that exists. */
+  function newCard() {
+    return '<button type="button" class="ag-new" data-ag-new>' +
+      '<span class="ag-new-plus" aria-hidden="true">+</span>' +
+      '<span>New agent</span>' +
+    '</button>';
   }
 
   /* One titled band of cards. An empty group renders nothing rather than an
-     empty heading — a "Drafts" header over no drafts reads like a bug. */
-  function group(title, sub, list) {
+     empty heading — a "Drafts" header over no drafts reads like a bug.
+
+     `lead` is optional markup for a first cell that is not an agent (the
+     "New agent" card). It rides INSIDE the grid so it shares the row's track
+     sizing and gap; placed outside it would need its own width rules and would
+     drift from the cards the moment the grid's columns changed. It does not
+     count toward the group's badge, which counts agents. */
+  function group(title, sub, list, lead) {
     if (!list.length) return '';
     return '<section class="ag-group">' +
       '<div class="ag-group-h"><h2>' + title + '<span class="ag-group-n">' + list.length + '</span></h2>' +
         '<p>' + sub + '</p></div>' +
-      '<div class="ag-grid">' + list.map(agentCard).join('') + '</div>' +
+      '<div class="ag-grid">' + (lead || '') + list.map(agentCard).join('') + '</div>' +
     '</section>';
   }
 
   function agentCard(a) {
-    var isReady = a.status === 'ready';
-    // A ready agent's card IS the chat affordance. Without a slug there is no
-    // session to open, so it falls back to the builder rather than to nothing.
-    var open = isReady && a.slug
-      ? 'data-ag-chatcard="' + esc(a.slug) + '"'
-      : 'data-ag-open="' + esc(a.id) + '"';
-    /* The counterpart action. On a ready card that is Edit (the card itself
-       chats); on a draft it is Chat — every agent stays talk-to-able,
-       `draft` included and regardless of `surfaces.web`, because that field
-       is descriptive today (the agent-as-API surface and Slack/Telegram
-       routing read the same JSON blob and act on it just as little), so
-       gating only this button would be partial enforcement, not real. */
-    var alt = isReady
-      ? '<button type="button" class="ag-cardbtn" data-ag-open="' + esc(a.id) + '">Edit</button>'
-      : (a.slug ? '<a class="ag-chat" href="/chat?agent=' + encodeURIComponent(a.slug) + '">Chat</a>' : '');
-    return '<div class="ag-card' + (isReady ? ' ag-card--ready' : '') + '" ' + open + ' role="button" tabindex="0">' +
+    // The card IS the builder affordance, in both states: this page configures
+    // agents, and the card stands for the configuration. (`statusPill` below is
+    // what says WHICH state it is in — the card's behaviour no longer differs,
+    // so nothing here reads the status itself.)
+    var open = 'data-ag-open="' + esc(a.id) + '"';
+    /* The counterpart action, on every card: Chat — every agent stays
+       talk-to-able, `draft` included and regardless of `surfaces.web`, because
+       that field is descriptive today (the agent-as-API surface and
+       Slack/Telegram routing read the same JSON blob and act on it just as
+       little), so gating only this button would be partial enforcement, not
+       real. Without a slug there is no session to open, so the card carries no
+       Chat action rather than a dead one. */
+    var alt = a.slug
+      ? '<a class="ag-chat" href="/chat?agent=' + encodeURIComponent(a.slug) + '">Chat</a>'
+      : '';
+    return '<div class="ag-card" ' + open + ' role="button" tabindex="0">' +
       '<div class="ag-card-top">' +
         '<span class="ag-ava">' + AVA_SVG + '</span>' +
         '<div style="min-width:0;flex:1"><h3>' + (esc(a.name) || 'Untitled') + '</h3></div>' +
@@ -1512,7 +1543,7 @@
     // backdrop, not on the card inside it (which is a descendant, so a plain
     // closest() would swallow every click in the modal as a dismissal).
     if (picker && e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) { closePicker(); return; }
-    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-chatcard],[data-ag-del],[data-ag-back],[data-ag-save],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-add],[data-ag-pick-close],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create],[data-ag-tab],[data-ag-chip],[data-ag-send]');
+    var t = e.target.closest('[data-ag-new],[data-ag-open],[data-ag-del],[data-ag-back],[data-ag-save],[data-ag-status],[data-ag-toggle-sec],[data-ag-tone],[data-ag-kn],[data-ag-cap],[data-ag-surf],[data-ag-add],[data-ag-pick-close],[data-ag-tpl],[data-ag-tpl-close],[data-ag-sch-toggle],[data-ag-sch-del],[data-ag-sch-create],[data-ag-tab],[data-ag-chip],[data-ag-send]');
     if (!t) return;
     var a = current();
     if (t.hasAttribute('data-ag-tab')) {
@@ -1584,10 +1615,6 @@
       });
     } else if (t.hasAttribute('data-ag-open')) {
       openBuilder(t.getAttribute('data-ag-open'));
-    } else if (t.hasAttribute('data-ag-chatcard')) {
-      // A ready agent's card opens a session running AS that agent. Same
-      // destination the footer Chat link uses on a draft.
-      window.location.href = '/chat?agent=' + encodeURIComponent(t.getAttribute('data-ag-chatcard'));
     } else if (t.hasAttribute('data-ag-back')) {
       leaveBuilder();
     } else if (t.hasAttribute('data-ag-save') && a) {
@@ -1849,7 +1876,7 @@
     if (e.target.closest && e.target.closest('.ag-chat')) return;
     // Space in the picker's search box is a space, not a section toggle.
     if (e.target.matches && e.target.matches('input,textarea')) return;
-    var t = e.target.closest && e.target.closest('[data-ag-open],[data-ag-chatcard],[data-ag-toggle-sec]');
+    var t = e.target.closest && e.target.closest('[data-ag-open],[data-ag-toggle-sec]');
     if (t) { e.preventDefault(); t.click(); }
   });
 

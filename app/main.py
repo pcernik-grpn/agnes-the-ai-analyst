@@ -119,6 +119,96 @@ def _chat_jwt_secret_ok(chat_config) -> bool:
     return True
 
 
+def _chat_llm_provider_ok(chat_config) -> bool:
+    """Validate ``chat.llm.provider`` — refuse unknown values and a
+    misconfigured vertex mode at boot.
+
+    Wired into the lifespan elif chain BEFORE ``_chat_anthropic_key_ok`` so
+    its message wins over a misleading "ANTHROPIC_API_KEY missing" log. An
+    unknown provider is refused rather than silently mapped to ``anthropic``
+    (a fallback would switch which credential spends money). Config-shape
+    conflicts are checked before the TESTING bypass (mirroring
+    ``_chat_kai_agent_ok``); only the ADC credential probe is bypassed under
+    tests.
+    """
+    if not chat_config.enabled:
+        return True
+    log = logging.getLogger("app.main")
+    provider = getattr(chat_config, "llm_provider", "anthropic") or "anthropic"
+    if provider == "anthropic":
+        return True
+    if provider != "vertex":
+        log.error(
+            "chat.llm.provider=%r is not a known provider (allowed: anthropic, vertex); refusing to spawn ChatManager",
+            provider,
+        )
+        return False
+    if getattr(chat_config, "llm_auth", "api_key") == "workload_identity":
+        log.error(
+            "chat.llm.provider=vertex conflicts with chat.llm.auth=workload_identity — "
+            "vertex signs upstream requests with Google ADC, workload_identity federates "
+            "to the first-party Anthropic API; pick one. Refusing to spawn ChatManager",
+        )
+        return False
+    if os.environ.get("LLM_DISPATCHER_URL", "").strip():
+        log.error(
+            "LLM_DISPATCHER_URL is set but chat.llm.provider=vertex — the dispatcher "
+            "only speaks the first-party Messages API; unset one of the two. "
+            "Refusing to spawn ChatManager",
+        )
+        return False
+    missing = [
+        key
+        for key, value in (
+            ("chat.llm.vertex.project_id", getattr(chat_config, "vertex_project_id", "")),
+            ("chat.llm.vertex.region", getattr(chat_config, "vertex_region", "")),
+        )
+        if not value
+    ]
+    if missing:
+        log.error(
+            "chat.llm.provider=vertex requires %s to be set in instance.yaml; refusing to spawn ChatManager",
+            " and ".join(missing),
+        )
+        return False
+    # Both values are interpolated into the outbound Vertex URL — the region
+    # into the HOSTNAME — and are compared for equality against the project /
+    # location a sandbox request's path parses to. A value outside the Google
+    # resource-id character set would therefore either 403 every request with
+    # no boot-time signal, or send the server-side Google OAuth token to a
+    # host that is not Google's. Refuse it here instead.
+    from connectors.llm.vertex_provider import invalid_vertex_setting
+
+    bad = invalid_vertex_setting(
+        getattr(chat_config, "vertex_project_id", ""),
+        getattr(chat_config, "vertex_region", ""),
+    )
+    if bad:
+        log.error(
+            "chat.llm.vertex.%s is malformed — it is interpolated into the Vertex API "
+            "URL (the region becomes part of the hostname) and matched against the "
+            "project/location of every sandbox request, so it is held to the Google "
+            "resource-id character set. Refusing to spawn ChatManager",
+            bad,
+        )
+        return False
+    if os.environ.get("TESTING", "").lower() in ("1", "true"):
+        return True
+    from app.auth.vertex_gcp import credentials_resolvable
+
+    ok, detail = credentials_resolvable()
+    if not ok:
+        log.error(
+            "chat.llm.provider=vertex but Google credentials are not resolvable: %s. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth application-default "
+            "login`, or attach a service account to the workload. Refusing to spawn "
+            "ChatManager",
+            detail,
+        )
+        return False
+    return True
+
+
 def _chat_anthropic_key_ok(chat_config) -> bool:
     """Refuse ``chat.enabled=true`` deployments that lack ``ANTHROPIC_API_KEY``.
 
@@ -132,6 +222,11 @@ def _chat_anthropic_key_ok(chat_config) -> bool:
     ``ANTHROPIC_API_KEY`` is set to a non-empty value; False otherwise.
     """
     if not chat_config.enabled:
+        return True
+    # Vertex mode needs no Anthropic credential at all — its own gate
+    # (_chat_llm_provider_ok, ordered before this one) validated the Google
+    # credential chain instead.
+    if getattr(chat_config, "llm_provider", "anthropic") == "vertex":
         return True
     # Bypass for TESTING=1 — pytest-driven sessions don't need a real key.
     if os.environ.get("TESTING", "").lower() in ("1", "true"):
@@ -496,6 +591,7 @@ from app.api.data_apps_proxy import router as data_apps_proxy_router
 from app.web.router import router as web_router
 from app.web.router import apps_web_router as data_apps_web_router
 from app.api.chat import router as chat_router
+from app.api.chat_session_files import router as chat_session_files_router
 from app.api.chat_uploads import router as chat_uploads_router
 from app.api.chat_copresence import router as chat_copresence_router
 from app.api.slack import router as slack_router
@@ -1617,6 +1713,11 @@ async def lifespan(app):
             elif not _chat_jwt_secret_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.  Disable chat so the
                 # runner never spawns with a public-constant secret.
+                app.state.chat_manager = None
+            elif not _chat_llm_provider_ok(app.state.chat_config):
+                # Fatal already logged inside the helper. Ordered BEFORE the
+                # anthropic-key gate so a vertex misconfiguration reports its
+                # own cause, not a misleading missing-key message.
                 app.state.chat_manager = None
             elif not _chat_anthropic_key_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.  No key → no runner.
@@ -2894,6 +2995,7 @@ def create_app() -> FastAPI:
     app.include_router(marketplace_server_router)
     app.include_router(chat_router)
     app.include_router(chat_uploads_router)
+    app.include_router(chat_session_files_router)
     app.include_router(chat_copresence_router)
     app.include_router(slack_router)
     app.include_router(admin_chat_router)
@@ -3157,6 +3259,25 @@ def create_app() -> FastAPI:
             },
         )
 
+    def _main_host_base_url(request) -> str:
+        """Absolute ``scheme://host`` of the MAIN Agnes origin, for redirecting
+        a caller off a data-app subdomain.
+
+        ``SERVER_URL`` is what the customer-instance module actually writes;
+        ``get_public_url()`` covers the ``PUBLIC_URL`` / ``server.public_url``
+        configurations. When neither is set, fall back to the parent domain the
+        session cookie is scoped to — not a guess: the cookie is scoped there
+        precisely so a login on the main host is valid on the app subdomains,
+        which only holds when the main host sits under that parent.
+        """
+        from app.instance_config import get_public_url, session_cookie_domain
+
+        url = get_public_url() or (os.environ.get("SERVER_URL") or "").strip().rstrip("/")
+        if url:
+            return url
+        parent = (session_cookie_domain() or "").lstrip(".")
+        return f"{request.url.scheme}://{parent}" if parent else ""
+
     @app.exception_handler(StarletteHTTPException)
     async def _html_auth_redirect_handler(request, exc: StarletteHTTPException):
         """Browser-friendly error rendering for HTML routes; JSON for API routes.
@@ -3173,6 +3294,31 @@ def create_app() -> FastAPI:
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
 
         if exc.status_code == 401 and request.method == "GET" and not path_is_api:
+            # A request that arrived on a data-app subdomain cannot be sent to a
+            # RELATIVE `/login`: `DataAppSubdomainMiddleware` rewrites EVERY path
+            # on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the
+            # browser would resolve `/login` against the app's own host, land back
+            # on the proxy as `/apps/<slug>/login`, 401 again — an infinite
+            # redirect loop for anyone not already signed in. Send them to the
+            # main host, whose login sets a cookie scoped to cover both.
+            #
+            # The return URL rides along in `next`. That is only safe because
+            # `safe_next_path` (`app/auth/_common.py`) was taught, in this same
+            # change and deliberately as its own reviewed edit to that guard,
+            # to accept exactly one cross-host shape: an absolute http(s) URL on
+            # THIS deployment's own `<slug>.<data_apps.subdomain_base>`. Every
+            # other cross-host target is still discarded at the far end.
+            if request.scope.get("agnes_data_app_subdomain"):
+                main_host = _main_host_base_url(request)
+                if main_host:
+                    # Absolute return URL in the VISITOR's terms — the app
+                    # origin plus the path they actually asked for, not the
+                    # `/apps/<slug>/…` form the middleware rewrote it into.
+                    # `safe_next_path` accepts exactly this shape (see
+                    # `app/auth/_common.py`); anything else login discards.
+                    original = request.scope.get("agnes_data_app_original_path") or "/"
+                    back = quote(str(request.url.replace(path=original)), safe="")
+                    return RedirectResponse(url=f"{main_host}/login?next={back}", status_code=302)
             next_param = quote(request.url.path, safe="")
             return RedirectResponse(url=f"/login?next={next_param}", status_code=302)
 
