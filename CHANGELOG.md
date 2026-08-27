@@ -355,6 +355,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- Admin sidebar's Activity entry for `/admin/chat` is now labelled "Chat runners", matching the page's own title, instead of "Chat sessions" — which read as a sibling of the adjacent "Analyst sessions" (uploaded Claude Code session files) rather than the runner dashboard it actually is.
+
 - **BREAKING (infra pins): the `customer-instance` Terraform module's
   `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
   `/opt/agnes/.env` on every boot** (D1 residual — the last knob still
