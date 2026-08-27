@@ -626,6 +626,144 @@ def test_possible_duplicate_of_edge_needs_no_evidence_and_is_a_review_item(pg_en
     assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
 
 
+# ---------------------------------------------------------------------------
+# §7.3 — functionally single-valued edges (`owned_by`/`for_client` by
+# default, `facts.single_valued_edges`): >1 distinct dst with a live claim
+# becomes a `single_valued_conflict` review item.
+# ---------------------------------------------------------------------------
+
+
+def test_single_valued_conflict_second_dst_in_same_batch_flags(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Acme is owned by Alice. Acme is owned by Bob.")
+    report = repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme is owned by Alice."),
+            _node("person:alice", doc_id, "owned by Alice"),
+            _node("person:bob", doc_id, "owned by Bob"),
+        ],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:alice",
+                "evidence": [{"doc_id": doc_id, "quote": "owned by Alice"}],
+            },
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:bob",
+                "evidence": [{"doc_id": doc_id, "quote": "owned by Bob"}],
+            },
+        ],
+    )
+    conflicts = [ri for ri in report["review_items"] if ri["kind"] == "single_valued_conflict"]
+    assert len(conflicts) == 1
+    item = conflicts[0]
+    assert item["type"] == "owned_by"
+    src_fact_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    assert item["src"] == src_fact_id
+    assert len(item["dsts"]) == 2
+
+
+def test_single_valued_conflict_second_dst_in_a_later_batch_flags(pg_env, repo):
+    doc1 = _seed_ready_doc(pg_env, file_id="cf_a1", doc_id="doc1", text="Acme is owned by Alice.")
+    report1 = repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc1, "Acme is owned by Alice."),
+            _node("person:alice", doc1, "owned by Alice"),
+        ],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:alice",
+                "evidence": [{"doc_id": doc1, "quote": "owned by Alice"}],
+            }
+        ],
+    )
+    assert not any(ri["kind"] == "single_valued_conflict" for ri in report1["review_items"])
+
+    _seed_corpus_file(file_id="cf_a2")
+    _seed_chunk(file_id="cf_a2", text="Acme is owned by Bob.")
+    _seed_source_mapping(file_id="cf_a2", source_doc_id="doc2")
+    report2 = repo.ingest_batch(
+        nodes=[_node("person:bob", "doc2", "owned by Bob")],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:bob",
+                "evidence": [{"doc_id": "doc2", "quote": "owned by Bob"}],
+            }
+        ],
+    )
+    conflicts = [ri for ri in report2["review_items"] if ri["kind"] == "single_valued_conflict"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["type"] == "owned_by"
+    assert len(conflicts[0]["dsts"]) == 2
+
+
+def test_single_valued_conflict_non_listed_edge_type_does_not_flag(pg_env, repo):
+    doc_id = _seed_ready_doc(pg_env, text="Acme mentions Alice. Acme mentions Bob.")
+    report = repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme mentions Alice."),
+            _node("person:alice", doc_id, "mentions Alice"),
+            _node("person:bob", doc_id, "mentions Bob"),
+        ],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "mentions",
+                "dst": "person:alice",
+                "evidence": [{"doc_id": doc_id, "quote": "mentions Alice"}],
+            },
+            {
+                "src": "engagement:acme",
+                "type": "mentions",
+                "dst": "person:bob",
+                "evidence": [{"doc_id": doc_id, "quote": "mentions Bob"}],
+            },
+        ],
+    )
+    assert not any(ri["kind"] == "single_valued_conflict" for ri in report["review_items"])
+
+
+def test_single_valued_edges_config_override_narrows_the_default_set(pg_env, repo, monkeypatch):
+    """`facts.single_valued_edges` (instance.yaml) overrides the built-in
+    `owned_by`/`for_client` default — an instance that narrows it to an
+    empty list stops flagging `owned_by` entirely."""
+
+    def fake_get_value(*keys, default=None):
+        return [] if keys == ("facts", "single_valued_edges") else default
+
+    monkeypatch.setattr("app.instance_config.get_value", fake_get_value)
+
+    doc_id = _seed_ready_doc(pg_env, text="Acme is owned by Alice. Acme is owned by Bob.")
+    report = repo.ingest_batch(
+        nodes=[
+            _node("engagement:acme", doc_id, "Acme is owned by Alice."),
+            _node("person:alice", doc_id, "owned by Alice"),
+            _node("person:bob", doc_id, "owned by Bob"),
+        ],
+        edges=[
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:alice",
+                "evidence": [{"doc_id": doc_id, "quote": "owned by Alice"}],
+            },
+            {
+                "src": "engagement:acme",
+                "type": "owned_by",
+                "dst": "person:bob",
+                "evidence": [{"doc_id": doc_id, "quote": "owned by Bob"}],
+            },
+        ],
+    )
+    assert not any(ri["kind"] == "single_valued_conflict" for ri in report["review_items"])
+
+
 # ===========================================================================
 # HTTP round-trips — real Postgres backend via build_seeded_client("pg", ...).
 # ===========================================================================

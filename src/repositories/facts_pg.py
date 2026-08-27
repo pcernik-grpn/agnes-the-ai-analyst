@@ -133,6 +133,23 @@ def _readable_ids(caller) -> Optional[frozenset]:
     return frozenset(ids)
 
 
+def _single_valued_edge_types() -> frozenset:
+    """Edge types a src fact should carry exactly one LIVE dst for (spec
+    §7.3) — a second distinct dst is a reconciliation problem, not a fact.
+    Configurable via ``facts.single_valued_edges`` in instance.yaml (plain
+    data, not a bool/select toggle, so this is an ordinary ``get_value``
+    read rather than a switch registry entry); default ``["owned_by",
+    "for_client"]``. A malformed (non-list) override falls back to the
+    default rather than silently disabling detection."""
+    from app.instance_config import get_value
+
+    default = ["owned_by", "for_client"]
+    configured = get_value("facts", "single_valued_edges", default=default)
+    if not isinstance(configured, (list, tuple)):
+        configured = default
+    return frozenset(str(t) for t in configured)
+
+
 class FactsPgRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -873,7 +890,11 @@ class FactsPgRepository:
         `possible_duplicate_of` review-item edges whose own claim AND both
         endpoints are independently visible to the caller (the same rule
         `neighbors()` applies to every edge — never inferred from an
-        endpoint).
+        endpoint), and `single_valued_conflict` review items (spec §7.3) for
+        a functionally single-valued edge type (`facts.single_valued_edges`)
+        whose src fact carries >1 distinct dst with an independently
+        visible claim — every item in ``review_items`` carries a ``kind``
+        discriminator so the two shapes coexist in one list.
 
         Honesty note on "conflict": this is a SIMPLER definition than
         `search()`'s attrs projection (which shows a conflict only when the
@@ -992,6 +1013,9 @@ class FactsPgRepository:
                 review_items = self._review_items_for_corpus(
                     conn, corpus_id=corpus_id, is_admin=is_admin, all_evidence=all_evidence, readable=readable
                 )
+                review_items += self._single_valued_review_items_for_corpus(
+                    conn, corpus_id=corpus_id, is_admin=is_admin, all_evidence=all_evidence, readable=readable
+                )
 
         return {
             "total": total,
@@ -1059,7 +1083,103 @@ class FactsPgRepository:
             )
             if not (self._is_visible(a_status) and self._is_visible(b_status)):
                 continue
-            out.append({"edge_id": eid, "a": self._subject_label(conn, src), "b": self._subject_label(conn, dst)})
+            out.append(
+                {
+                    "kind": "possible_duplicate_of",
+                    "edge_id": eid,
+                    "a": self._subject_label(conn, src),
+                    "b": self._subject_label(conn, dst),
+                }
+            )
+        return out
+
+    def _single_valued_review_items_for_corpus(
+        self, conn, *, corpus_id: str, is_admin: bool, all_evidence: bool, readable: Optional[frozenset]
+    ) -> List[Dict[str, Any]]:
+        """Functionally single-valued edges (spec §7.3) whose src fact is
+        evidenced by ``corpus_id``: >1 distinct dst, each carrying its OWN
+        independently-visible claim (the exact discipline
+        `_review_items_for_corpus` applies to `possible_duplicate_of` — an
+        edge's own claim AND its dst endpoint must each pass
+        `_subject_status`/`_is_visible`), for an edge type this instance
+        configured as single-valued (`facts.single_valued_edges`). A dst
+        the caller cannot independently see is dropped from the group
+        rather than hiding the whole conflict — but if that drops the
+        group back to <=1 visible dst, the item disappears entirely (never
+        announces a conflict whose second edge the caller cannot read).
+        Recomputed on every call from live edges/claims, nothing persisted,
+        so it clears the moment a dst's claims are gone. Candidate (src,
+        type) pairs capped at 50 — a review surface, not a full scan."""
+        types = _single_valued_edge_types()
+        if not types:
+            return []
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
+        vis_params: Dict[str, Any] = {"corpus_id": corpus_id, "types": list(types)}
+        if not is_admin:
+            vis_params["readable"] = list(readable)
+        # Step 1: candidate (src, type) pairs with RAW distinct-dst count >1
+        # among live (>=1 claim) edges — cheap pre-filter before the
+        # per-edge visibility walk below.
+        candidate_sql = sa.text(
+            f"""
+            WITH {cte}
+            SELECT e.src, e.type
+            FROM edges e
+            WHERE e.type = ANY(:types)
+              AND e.src IN (SELECT subject_id FROM visible)
+              AND EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id)
+            GROUP BY e.src, e.type
+            HAVING COUNT(DISTINCT e.dst) > 1
+            ORDER BY e.src, e.type
+            LIMIT 50
+            """
+        )
+        candidates = conn.execute(candidate_sql, vis_params).mappings().all()
+        out: List[Dict[str, Any]] = []
+        for cand in candidates:
+            src, etype = cand["src"], cand["type"]
+            edge_rows = (
+                conn.execute(
+                    sa.text("SELECT id, dst FROM edges WHERE src = :src AND type = :type"),
+                    {"src": src, "type": etype},
+                )
+                .mappings()
+                .all()
+            )
+            visible_dsts: set = set()
+            for erow in edge_rows:
+                eid, dst = erow["id"], erow["dst"]
+                edge_status = self._subject_status(
+                    conn,
+                    subject_kind="edge",
+                    subject_id=eid,
+                    is_admin=is_admin,
+                    all_evidence=all_evidence,
+                    readable=readable,
+                )
+                if not self._is_visible(edge_status):
+                    continue
+                dst_status = self._subject_status(
+                    conn,
+                    subject_kind="fact",
+                    subject_id=dst,
+                    is_admin=is_admin,
+                    all_evidence=all_evidence,
+                    readable=readable,
+                )
+                if not self._is_visible(dst_status):
+                    continue
+                visible_dsts.add(dst)
+            if len(visible_dsts) < 2:
+                continue
+            out.append(
+                {
+                    "kind": "single_valued_conflict",
+                    "type": etype,
+                    "src": self._subject_label(conn, src),
+                    "dsts": [self._subject_label(conn, dst) for dst in sorted(visible_dsts)],
+                }
+            )
         return out
 
     def _subject_label(self, conn, fact_id: str) -> Dict[str, Any]:
@@ -1415,6 +1535,8 @@ class FactsPgRepository:
         review_items: List[Dict[str, Any]] = []
         corrections_active: List[Dict[str, Any]] = []
         touched_fact_ids: set = set()
+        touched_edge_pairs: set = set()
+        single_valued_types = _single_valued_edge_types()
 
         def _write_evidence(
             *,
@@ -1543,6 +1665,8 @@ class FactsPgRepository:
 
             if edge_type == "possible_duplicate_of":
                 review_items.append({"type": "possible_duplicate_of", "edge_id": edge_id, "src": src_id, "dst": dst_id})
+            if edge_type in single_valued_types:
+                touched_edge_pairs.add((src_res["fact_id"], edge_type))
             _write_evidence(
                 kind="edge",
                 subject_id=edge_id,
@@ -1550,6 +1674,50 @@ class FactsPgRepository:
                 row_ref=row_ref,
                 row_attrs=edge.get("attrs") or {},
             )
+
+        # ---- functionally single-valued edges (spec §7.3): a (src, type)
+        # pair TOUCHED by this batch (an edge of a configured type was just
+        # written for it) with >1 distinct dst carrying a LIVE claim becomes
+        # a review item. The query hits `edges`/`claims` directly rather
+        # than this batch's rows, so a dst written by an EARLIER batch is
+        # picked up the moment a second one arrives now (never persisted —
+        # recomputed here, and again at read time in
+        # `collection_facts_summary`, so it clears the instant a dst's
+        # claims are gone).
+        if touched_edge_pairs:
+            srcs = list({pair[0] for pair in touched_edge_pairs})
+            types_ = list({pair[1] for pair in touched_edge_pairs})
+            with self._engine.connect() as conn:
+                sv_rows = (
+                    conn.execute(
+                        sa.text(
+                            """
+                            SELECT e.src, e.type, e.dst
+                            FROM edges e
+                            WHERE e.src = ANY(:srcs) AND e.type = ANY(:types)
+                              AND EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id)
+                            """
+                        ),
+                        {"srcs": srcs, "types": types_},
+                    )
+                    .mappings()
+                    .all()
+                )
+            dsts_by_pair: Dict[tuple, set] = {}
+            for r in sv_rows:
+                pair = (r["src"], r["type"])
+                if pair in touched_edge_pairs:
+                    dsts_by_pair.setdefault(pair, set()).add(r["dst"])
+            for (src_fact_id, edge_type_), dsts in dsts_by_pair.items():
+                if len(dsts) > 1:
+                    review_items.append(
+                        {
+                            "kind": "single_valued_conflict",
+                            "src": src_fact_id,
+                            "type": edge_type_,
+                            "dsts": sorted(dsts),
+                        }
+                    )
 
         # ---- same-date attribute conflicts introduced by THIS batch become
         # review items (EQ4) -- different-date succession needs none (EQ5),
