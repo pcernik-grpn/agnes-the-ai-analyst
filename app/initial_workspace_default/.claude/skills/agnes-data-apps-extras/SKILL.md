@@ -135,6 +135,10 @@ The scaffold's `server/agnesQuery.ts` wraps the app's injected
 way the app reads Agnes data — never hardcode credentials, never bypass the
 owner-scoped token.
 
+Where a figure corresponds to a defined business metric, read the metric's
+definition and run *its* SQL instead of writing your own — see the
+"Metrics before hand-written SQL" section of that reference.
+
 ## References
 
 - `references/path-d.md` — how Agnes shows up as a deployment path in the
