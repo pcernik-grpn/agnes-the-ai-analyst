@@ -28,10 +28,17 @@ Scope and posture:
   ``application/octet-stream`` so a crafted file cannot become same-origin
   markup. Mirrors the collections raw-file posture
   (``app/api/collections.py``).
-- **Remote engines degrade to empty, not errors.** A session whose sandbox
-  ran on a remote turn engine has no local files; the listing is empty
-  rather than a failure (the files live in the remote sandbox, which is a
-  provider-side gap, not a caller error).
+- **Provider-gated.** The host walk above is only correct for providers
+  whose sandbox works directly on the host session dir (``docker``). Under
+  ``chat.provider: kai-agent`` — the default — the agent runs in the
+  engine's own remote sandbox and its files never land on this host, while
+  the host session dir still exists and holds nothing but workspace-template
+  symlinks (``prepare_session_dir`` runs for every provider). Walking it
+  would list hundreds of template files that are not session output, so
+  engine-backed sessions never touch the host walk: they answer with
+  ``source="engine"`` and either the engine's actual sandbox files (proxied
+  via ``app.chat.kai_engine_files``) or ``supported=false`` when the engine
+  exposes no files channel for the chat.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -94,6 +101,36 @@ _ACTIVE_CONTENT_TYPES = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Provider gating
+# ---------------------------------------------------------------------------
+
+#: Providers whose sessions run in a remote engine sandbox: their files are
+#: never on this host, so the routes below must not walk the host session dir
+#: for them. Mirrors the provider-branching resolver pattern of
+#: ``app.chat.skills_catalog.marketplace_delivery``.
+_ENGINE_SANDBOX_PROVIDERS = frozenset({"kai-agent"})
+
+
+def _files_source(chat_config: object) -> str:
+    """``"host"`` or ``"engine"`` — where this instance's session files live.
+
+    Defensive ``getattr`` on purpose: a config double without ``provider``
+    (and a MagicMock-style object) must resolve to the local, no-outbound-HTTP
+    host path — the same duck-typed-double rule the provider capability flags
+    follow (see tests/test_kai_engine_provider.py).
+    """
+    provider = str(getattr(chat_config, "provider", "") or "").strip().lower()
+    return "engine" if provider in _ENGINE_SANDBOX_PROVIDERS else "host"
+
+
+def _chat_config(request: Request):
+    """One definition of "the chat config", shared with the skills catalog."""
+    from app.api.chat import _chat_config_for_delivery
+
+    return _chat_config_for_delivery(request)
+
+
+# ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------
 
@@ -102,12 +139,19 @@ class SessionFileEntry(BaseModel):
     path: str
     name: str
     size_bytes: int
-    modified_at: str
+    # Engine listings carry no mtime, so the field is optional there.
+    modified_at: str | None = None
 
 
 class SessionFilesResponse(BaseModel):
     files: list[SessionFileEntry]
     truncated: bool
+    #: Where the listing came from: "host" (docker session dir) or "engine"
+    #: (the kai-agent engine's remote sandbox).
+    source: str = "host"
+    #: False when the session's files live in an engine sandbox the connected
+    #: engine does not expose (no files channel for this chat).
+    supported: bool = True
 
 
 class SaveArtefactBody(BaseModel):
@@ -242,7 +286,7 @@ def _walk_session_files(email: str, chat_id: str) -> tuple[list[dict], bool]:
                         "path": rel.replace(os.sep, "/"),
                         "name": fname,
                         "size_bytes": st.st_size,
-                        "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                        "modified_at": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
                     },
                 )
             )
@@ -293,10 +337,13 @@ async def list_session_files(
     into your workspace, where skills write their deliverables), skipping
     machine noise (``.git``, ``__pycache__``, …) and anything resolving
     outside your own session/workspace. Returns at most 300 entries sorted
-    by modification time; ``truncated`` reports when more existed. A session
-    whose sandbox ran remotely has no local files and lists empty.
+    by modification time; ``truncated`` reports when more existed. Sessions
+    on an engine-sandbox provider (``kai-agent``) never walk the host dir —
+    see the module docstring; they report ``source="engine"``.
     """
     user = _owned_session_or_404(request, chat_id, user)
+    if _files_source(_chat_config(request)) == "engine":
+        return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     files, truncated = _walk_session_files(user["email"], chat_id)
     return SessionFilesResponse(files=[SessionFileEntry(**f) for f in files], truncated=truncated)
 
@@ -317,6 +364,10 @@ async def download_session_file(
     """
     user = _owned_session_or_404(request, chat_id, user)
     rel = _validate_rel_path(path)
+    if _files_source(_chat_config(request)) == "engine":
+        # Same 400-before-404 ordering as the host path; the engine proxy
+        # lands in the next change, until then engine files are unreachable.
+        raise HTTPException(status_code=404, detail="file not found")
     resolved = _resolve_file_or_404(user["email"], chat_id, rel)
 
     media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
@@ -350,6 +401,8 @@ async def save_session_file_as_artefact(
 
     user = _owned_session_or_404(request, chat_id, user)
     rel = _validate_rel_path(body.path)
+    if _files_source(_chat_config(request)) == "engine":
+        raise HTTPException(status_code=404, detail="file not found")
     resolved = _resolve_file_or_404(user["email"], chat_id, rel)
 
     if classify(resolved.name) is None:
