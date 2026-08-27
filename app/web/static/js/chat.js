@@ -5568,11 +5568,14 @@ function renderCoPresence(host, participants) {
     filesListEl.replaceChildren();
     const seq = ++_filesSeq;
     const { files, truncated, supported } = await fetchSessionFiles(chatId);
-    renderFileList(chatId, files, truncated, supported);
     // Third writer of the auto-open baseline, and it must claim the sequence
     // like the other two: an open-time seed still in flight would otherwise
-    // land on top of what the user is looking at right now.
+    // land on top of what the user is looking at right now. The guard comes
+    // BEFORE the render, not just before the baseline write — painting rows
+    // for a conversation the user has since left puts that conversation's
+    // download links under their cursor.
     if (seq !== _filesSeq || currentChatId !== chatId) return;
+    renderFileList(chatId, files, truncated, supported);
     updateFilesBadge(files.length);
     _filesSessionId = chatId;
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));

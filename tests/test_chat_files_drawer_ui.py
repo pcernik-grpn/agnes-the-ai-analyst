@@ -202,6 +202,37 @@ def test_a_slow_open_seed_cannot_clobber_a_newer_turn_end_baseline():
     assert res["opened"] == 0, "the late seed must not reset the baseline the turn-end already advanced"
 
 
+def test_no_fetch_handler_paints_rows_for_a_conversation_the_user_has_left():
+    """Every listing is a round-trip, and the user can switch during it. A
+    late response must not paint its rows into the drawer: the rows carry
+    that conversation's chat id in their download and save links, so a stale
+    render puts the wrong conversation's files under the reader's cursor.
+
+    The guard has to sit *before* the render, not merely before the baseline
+    write — `loadSessionFiles` (the manual open/refresh path) had it after,
+    so it repainted while the other two handlers correctly bailed.
+    """
+    js = _read(CHAT_JS)
+    block = js[js.index("async function loadSessionFiles") : js.index("// ── drawer open/close")]
+    guard = block.index("if (seq !== _filesSeq || currentChatId !== chatId) return;")
+    assert guard < block.index("renderFileList("), "loadSessionFiles must bail before it repaints"
+
+    # And the same ordering in the two event handlers, so this cannot be
+    # re-introduced in one of them alone.
+    tail = js[js.index('document.addEventListener("agnes:session-open"') :]
+    for handler in ("agnes:session-open", "agnes:turn-end"):
+        start = tail.index(f'document.addEventListener("{handler}"')
+        end = (
+            tail.index('document.addEventListener("agnes:turn-end"', start + 1)
+            if handler == "agnes:session-open"
+            else len(tail)
+        )
+        body = tail[start:end]
+        assert body.index("seq !== _filesSeq || currentChatId !== chatId") < body.index("renderFileList("), (
+            f"the {handler} handler renders before checking it still owns the conversation"
+        )
+
+
 def test_an_engine_without_a_files_channel_still_says_so_in_the_drawer():
     """``supported: false`` (an engine-backed session whose engine exposes no
     files channel) must reach the reader as the honest notice, not as an empty
