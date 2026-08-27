@@ -523,6 +523,7 @@ def _run_materialized_pass(
                         sc_url, sc_token = _resolve_keboola_credentials(conn_id)
                     except _KeboolaCredentialError as cred_err:
                         summary["errors"].append({"table": ref_name, "error": str(cred_err)})
+                        state.set_error(sync_key, str(cred_err))
                         continue
                     keboola_clients[conn_id] = KeboolaStorageClient(
                         url=sc_url,
@@ -595,6 +596,7 @@ def _run_materialized_pass(
                             databricks_client_error = f"Databricks client init failed: {e}"
                 if databricks_client is None:
                     summary["errors"].append({"table": ref_name, "error": databricks_client_error})
+                    state.set_error(sync_key, databricks_client_error)
                     continue
                 stats = _materialize_databricks_table(
                     table_id=ref_name,
@@ -617,6 +619,7 @@ def _run_materialized_pass(
                         )
                 if sf_settings is None:
                     summary["errors"].append({"table": ref_name, "error": sf_settings_error})
+                    state.set_error(sync_key, sf_settings_error)
                     continue
                 from connectors.snowflake.extractor import materialize_query as sf_materialize_query
 

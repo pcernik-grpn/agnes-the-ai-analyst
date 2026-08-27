@@ -128,6 +128,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   valid Fernet key; a genuinely unset key still uses the plaintext keyless
   fallback as before. A previously-silent misconfigured production vault now
   fails loudly on secret saves instead of writing the secret in cleartext.
+- `_run_materialized_pass` now calls `sync_state.set_error(...)` for a
+  `query_mode='materialized'` row whose connector is unconfigured — a
+  Snowflake/Databricks row with no resolvable connection settings, or a
+  Keboola row whose `connection_id` has no matching credential. These three
+  branches previously recorded the failure only in the run's in-memory
+  summary and `continue`d without touching `sync_state`, unlike every other
+  materialize failure path (budget-exceeded, generic exception): a table
+  stuck this way had no `sync_state` row at all, so `GET /api/admin/registry`
+  / `agnes admin list-tables` reported it as merely "never synced" with no
+  indication why.
 
 ### Security
 
