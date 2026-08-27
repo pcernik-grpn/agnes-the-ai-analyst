@@ -171,7 +171,7 @@ def _data_refresh_lease_seconds() -> int:
         return _DEFAULT_DATA_REFRESH_LEASE_S
 
 
-def _run_data_refresh(payload: dict) -> None:
+def _run_data_refresh(payload: dict) -> Optional[dict]:
     """Wrap ``app.api.sync._run_sync`` — same defaults as the HTTP trigger
     path (``tables=None`` syncs every registered table). ``payload`` may
     carry ``tables`` (list[str]) and/or ``source`` (source_type filter),
@@ -207,10 +207,25 @@ def _run_data_refresh(payload: dict) -> None:
     uncaught exception into ``jobs_repo().fail(..., retry_in_seconds=...)``,
     so this is the sole mechanism needed for the job to record `failed`
     and retry.
+
+    Result exposure (#1620): passes a sink dict into ``_run_sync``'s
+    ``result_sink`` kwarg and returns it (the ``JobKind.handler`` contract
+    already supports an ``Optional[dict]`` return — see ``app/worker/
+    registry.py``'s ``JobKind`` docstring; ``agent_response`` was the
+    first kind to use it) so ``GET /api/jobs/{id}``'s stored
+    ``payload_json["result"]`` shows exactly which tables were
+    materialized/skipped (and why — e.g. ``due_check``, ``not_in_target``)
+    vs. errored on THIS run. Only reaches ``JobsRepository.complete(...,
+    result=...)`` on the success path below — a raised ``RuntimeError``
+    (the ``ok is False`` branch) still fails the job via ``.fail(...)``,
+    which has no equivalent result slot; the per-table detail for a
+    failed run remains visible in server logs and ``sync_state`` as
+    before this change.
     """
     from app.api.sync import _run_sync
 
-    ok = _run_sync(payload.get("tables"), payload.get("source"))
+    result: dict = {}
+    ok = _run_sync(payload.get("tables"), payload.get("source"), result_sink=result)
     if ok is False:
         raise RuntimeError("data-refresh sync failed — see server logs and sync_state for per-table errors")
     if ok:
@@ -221,6 +236,7 @@ def _run_data_refresh(payload: dict) -> None:
         # sync may still be in flight elsewhere, and mirroring now could
         # read a half-written parquet.
         _maybe_enqueue_distribution_mirror()
+    return result or None
 
 
 def _run_analytics_rebuild(payload: dict) -> None:

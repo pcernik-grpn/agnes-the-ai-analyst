@@ -343,6 +343,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   duplicate draft (one extra queued suggestion an admin rejects) — bounded
   and visible, unlike permanent silent exclusion (Devin review).
 
+- `agnes admin sync <table>` (and `POST /api/sync/trigger` with an explicit
+  `tables=[...]` body) no longer silently no-ops on a `query_mode='materialized'`
+  table whose `sync_state` was already stamped inside its `sync_schedule`
+  window — the routine `due_check` cadence gate previously applied even to
+  an explicitly-targeted request, so a Snowflake/BigQuery/Databricks/Keboola
+  table could be re-triggered indefinitely without ever reaching the
+  materialize dispatch, while the job still reported `status: done, error:
+  null`. An explicitly-targeted table now bypasses `due_check` and is always
+  dispatched; an untargeted sweep (scheduler tick / unscoped trigger) is
+  unaffected. The `data-refresh` job's stored result now also surfaces the
+  materialized pass's per-table `materialized`/`skipped` (with reason)/`errors`
+  detail via `GET /api/jobs/{id}` (`payload_json["result"]`, reusing
+  `JobsRepository.complete(..., result=...)` — no schema change), so a
+  "done" run that skipped everything is diagnosable without reading server
+  logs.
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.
