@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -2006,6 +2007,86 @@ def _public_view(config: dict) -> dict:
     return _redact(copy.deepcopy(config))
 
 
+# --- Overlay export/apply (agnes admin config export / apply, Track D3) -----
+#
+# `_public_view` above (used by GET /server-config) masks EVERY secret-shaped
+# key to `***`/`<empty>` for on-screen display — including keys like
+# `token_env`/`private_key_env` that hold an env-var NAME, not a credential
+# (see the docstring on `_is_secret_key`'s callers). That over-redaction is
+# fine for a settings form nobody round-trips, but it is wrong for
+# `agnes admin config export`: a NAME reference is not a secret and must
+# survive so a fresh instance can be onboarded from the exported YAML.
+#
+# `_export_scrub` instead OMITS a secret-shaped leaf only when its value is
+# a literal (neither an env-var-name key nor an unresolved `${VAR}`
+# reference) — the one shape that could actually leak a credential into a
+# git-reviewed file.
+_ENV_REF_RE = re.compile(r"^\$\{[A-Za-z0-9_]+\}$")
+
+
+def _is_env_name_key(key: str) -> bool:
+    """True for the `*_env` naming convention (`token_env`, `private_key_env`,
+    …) that stores an env-var NAME, never the credential itself — see
+    `config/instance.yaml.example`'s "never YAML" comments on these fields."""
+    return key.lower().endswith("_env")
+
+
+def _looks_like_env_ref(value: Any) -> bool:
+    """True if `value` is an unresolved `${VAR}` placeholder — a pointer to
+    an env var, not a cleartext secret."""
+    return isinstance(value, str) and bool(_ENV_REF_RE.match(value))
+
+
+def _export_scrub(value: Any) -> Any:
+    """Recursively drop literal secret-shaped values from an overlay subtree.
+
+    Mirrors `_redact`'s key-matching (`_is_secret_key`) but OMITS the leaf
+    entirely instead of masking it, and carves out the two shapes that are
+    not actually secrets: a `*_env` key (an env-var name) and a `${VAR}`
+    reference under any key. Used only by the export/apply overlay endpoint
+    below — GET /server-config's on-screen redaction is unaffected.
+    """
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if _is_secret_key(k) and not _is_env_name_key(k):
+                if _looks_like_env_ref(v):
+                    out[k] = v
+                # else: literal secret-shaped value — omit.
+                continue
+            out[k] = _export_scrub(v)
+        return out
+    if isinstance(value, list):
+        return [_export_scrub(item) for item in value]
+    return value
+
+
+def _load_raw_overlay() -> dict:
+    """Read `instance.yaml` straight off disk — no static-config merge, no
+    `${VAR}` resolution. This is the literal file `POST /server-config`
+    writes and `agnes admin config apply` re-produces; `_load_current_
+    instance_yaml()` (used by GET /server-config) is the wrong source here
+    because it merges in the static file's defaults and resolves every env
+    reference to its runtime value.
+    """
+    import yaml
+
+    from app.secrets import _state_dir
+
+    overlay_path = _state_dir() / "instance.yaml"
+    if not overlay_path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(overlay_path.read_text())
+    except Exception as e:
+        logger.exception("server-config/overlay: refusing to read corrupt overlay at %s", overlay_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"cannot read the instance.yaml overlay at {overlay_path}: {e}",
+        ) from e
+    return data if isinstance(data, dict) else {}
+
+
 _REPOINT_SAMPLE_SIZE = 5
 
 
@@ -2450,6 +2531,47 @@ async def get_server_config(
         # value, and where it resolved from. Toggling still happens through
         # the per-section editors above (or an env var); this is display-only.
         "feature_flags": _feature_flags_inventory(),
+    }
+
+
+@router.get("/server-config/overlay")
+async def get_server_config_overlay(
+    user: dict = Depends(require_admin),
+):
+    """Return the raw, editable-section-only instance.yaml OVERLAY.
+
+    The export projection behind ``agnes admin config export`` /
+    ``agnes admin config apply`` — a small, reviewable slice of the config
+    an operator can commit to a PR to onboard a new client from a known-good
+    baseline (Track D3). Distinct from ``GET /server-config`` above:
+
+    - This reads the overlay file directly — no merge with the static
+      config, no ``${VAR}`` resolution — so an unresolved env reference
+      round-trips as the reference, never the cleartext value it resolves
+      to at runtime.
+    - Only sections that actually exist in the overlay are returned (an
+      admin who never touched a section shouldn't see it materialize in
+      their exported YAML); every returned section is still one of
+      ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.
+    - Secret-shaped LITERAL values are omitted, not masked — an env-var
+      NAME (``token_env``) or a ``${VAR}`` reference passes through
+      unchanged (see ``_export_scrub``), but a real cleartext credential
+      never leaves the server. There is no DB config table — the overlay
+      IS the writable state POST /server-config maintains.
+
+    Deliberately REST+CLI only, never MCP-exposed — see CONTRIBUTING.md's
+    "operator security-posture diagnostics" standing exemption: a one-call
+    dump of the instance's entire editable config surface (which upstream
+    it points at, what auth is configured) is reconnaissance in a
+    prompt-injected chat session, not an agent affordance.
+    """
+    raw = _load_raw_overlay()
+    sections = {
+        section: _export_scrub(raw[section]) for section in _EDITABLE_SECTIONS if isinstance(raw.get(section), dict)
+    }
+    return {
+        "sections": sections,
+        "editable_sections": list(_EDITABLE_SECTIONS),
     }
 
 

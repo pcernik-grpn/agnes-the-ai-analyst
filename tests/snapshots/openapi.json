@@ -26342,6 +26342,60 @@
         ]
       }
     },
+    "/api/admin/server-config/overlay": {
+      "get": {
+        "description": "Return the raw, editable-section-only instance.yaml OVERLAY.\n\nThe export projection behind ``agnes admin config export`` /\n``agnes admin config apply`` \u2014 a small, reviewable slice of the config\nan operator can commit to a PR to onboard a new client from a known-good\nbaseline (Track D3). Distinct from ``GET /server-config`` above:\n\n- This reads the overlay file directly \u2014 no merge with the static\n  config, no ``${VAR}`` resolution \u2014 so an unresolved env reference\n  round-trips as the reference, never the cleartext value it resolves\n  to at runtime.\n- Only sections that actually exist in the overlay are returned (an\n  admin who never touched a section shouldn't see it materialize in\n  their exported YAML); every returned section is still one of\n  ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.\n- Secret-shaped LITERAL values are omitted, not masked \u2014 an env-var\n  NAME (``token_env``) or a ``${VAR}`` reference passes through\n  unchanged (see ``_export_scrub``), but a real cleartext credential\n  never leaves the server. There is no DB config table \u2014 the overlay\n  IS the writable state POST /server-config maintains.\n\nDeliberately REST+CLI only, never MCP-exposed \u2014 see CONTRIBUTING.md's\n\"operator security-posture diagnostics\" standing exemption: a one-call\ndump of the instance's entire editable config surface (which upstream\nit points at, what auth is configured) is reconnaissance in a\nprompt-injected chat session, not an agent affordance.",
+        "operationId": "get_server_config_overlay_api_admin_server_config_overlay_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Server Config Overlay",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sessions/facets": {
       "get": {
         "operationId": "facets_api_admin_sessions_facets_get",

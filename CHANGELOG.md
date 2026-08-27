@@ -12,6 +12,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **`agnes admin config export` / `agnes admin config apply`** round-trip the
+  server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
+  only) as reviewable YAML — the "onboard a new client via a reviewed PR"
+  building block. `export` reads the new `GET /api/admin/server-config/overlay`
+  endpoint, which serves the raw on-disk overlay (unresolved `${VAR}`
+  references, not the merged/env-resolved config `GET /api/admin/server-config`
+  serves) with secret-shaped literal values omitted; env-var NAME fields
+  (`token_env`) and `${VAR}` references pass through unchanged. `apply` posts
+  the file through the same validated `POST /api/admin/server-config` path an
+  admin's form save uses — section allowlisting, deep-merge, danger-zone
+  confirmation, and audit logging all apply unchanged — after filtering out
+  any non-editable section or literal secret client-side. Supports
+  `--dry-run` (diff against the current overlay, writes nothing).
 - **`chat_provider = "docker"` now provisions its own backing** in the
   `customer-instance` Terraform module, instead of only pinning the choice.
   Web chat's docker provider spawns each session through the apps-runner
