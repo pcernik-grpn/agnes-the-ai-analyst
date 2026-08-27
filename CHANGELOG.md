@@ -257,6 +257,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **A plugin can now be composed from items already in the Library** — the
+  builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
+  and `POST /api/store/entities/from-components` assembles the bundle
+  server-side from the selected skills and agent templates. Previously the
+  plugin type accepted nothing but a `.zip` packaged elsewhere, and there was
+  no way to get an authored skill back out of the Library to put in one — so
+  bundling was reachable only for authors who kept their skills on disk.
+  - Each component's baked subtree is merged (minus its own
+    `.claude-plugin/`, since the composite gets one synthesized manifest),
+    zipped in memory, and handed to the same `POST /entities` path — a composed
+    plugin is indistinguishable downstream from an uploaded one and pays the
+    same guardrail review. Component directory names keep their
+    `-by-<username>` suffix, which is what their own frontmatter says and what
+    lets two owners' same-named skills coexist in one composite.
+  - `dry_run: true` returns the same preview shape the `.zip` route's
+    *Check bundle* uses, so both routes report their contents identically.
+  - A component the caller cannot see is **404, never 403** — a composite must
+    not become a probe for someone else's private item. A plugin component is
+    refused by name (`component_type_unsupported`): merging two manifests is a
+    separate feature with its own conflict rules.
+  - Unlike a `.zip` — a `File`, which cannot be persisted — a composed draft is
+    only ids, so it survives a reload whole, and the "re-attach the .zip"
+    prompt is now scoped to the upload route.
+  - Copy throughout the type now says the thing the builder never did: a skill
+    saved to the Library **already installs on its own**, so a plugin is never
+    a prerequisite for shipping one — only for shipping several at once.
+
 - **The builder's configuration sections are cards again.** They were flattened
   onto the panel with only a hairline between them, on the argument that six
   white cards inside a panel that is itself a surface is two levels of

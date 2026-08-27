@@ -1870,12 +1870,40 @@ The scratch agent inherits none of the author's own knowledge or plugins: a
 template carries no data access, and a preview that quietly ran with theirs
 would flatter it.
 
+`POST /api/store/entities/from-components` composes a **plugin** out of store
+entities the caller can already see, instead of out of an uploaded `.zip`.
+Every entity is baked into a one-plugin tree on save, so a published skill is
+already served to Claude Code as a single-skill plugin — this endpoint exists
+for the case that shape cannot express: one install handing someone several
+skills and agent templates at once.
+
+Body: `{name, description?, category?, components: [entity_id, …], access?,
+publisher_kind?, dry_run?}`. Each component's baked subtree is merged (minus
+its own `.claude-plugin/`, since the composite gets one synthesized manifest),
+zipped in memory, and handed to the same `POST /entities` path — so a composed
+plugin is indistinguishable downstream from an uploaded one and pays the same
+guardrail review. Component directory names keep their `-by-<username>`
+suffix: it is what the component's own frontmatter says, and it is what lets
+two owners' same-named skills coexist in one composite.
+
+`dry_run: true` returns the `PreviewResponse` shape (200) that the `.zip`
+route's `POST /entities/preview` returns, and writes nothing.
+
+Refusals, all typed under `detail.code`: `no_components`,
+`too_many_components` (cap: `MAX_COMPONENTS`), `duplicate_component`,
+`component_not_found` (**404 for an entity the caller cannot see, never 403** —
+a composite must not be a probe for someone's private item),
+`component_type_unsupported` (a plugin cannot contain a plugin — that would
+mean merging two manifests), `component_bundle_missing`,
+`component_path_conflict`, `components_too_large`.
+
 - /api/store/bundle.zip
 - /api/store/categories
 - /api/store/entities
 - /api/store/entities/builder/turn
 - /api/store/entities/builder/preview-agent
 - /api/store/entities/dryrun
+- /api/store/entities/from-components
 - /api/store/entities/from-markdown
 - /api/store/entities/preview
 - /api/store/entities/{entity_id}
