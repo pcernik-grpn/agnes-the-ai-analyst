@@ -108,10 +108,11 @@ Return the document text **as produced**, never re-serialized through a YAML
 dumper. Export hands that exact text back out, so a round-trip through
 parse-and-dump would silently reorder keys and strip comments.
 
-Three adapters ship today: `native` (the source already publishes Ossie),
+Four adapters ship today: `native` (the source already publishes Ossie),
 `keboola_metastore` (composes a document from a Keboola project's metastore
-objects), and `snowflake_semantic` (composes one document per Snowflake
-semantic view).
+objects), `snowflake_semantic` (composes one document per Snowflake semantic
+view), and `databricks_semantic` (composes one document per Unity Catalog
+metric view).
 
 An adapter name that nothing is registered under is refused at registration
 (`400`, naming the adapters that do exist) rather than at the first sync.
@@ -156,6 +157,38 @@ outcome: importing gives you the catalog, the metric SQL, the lineage and
 Snowflake's own AI instructions; it does not give you local execution. Facts and
 metrics marked `PRIVATE` upstream carry that label in `custom_extensions` rather
 than being presented as ordinary public surface.
+
+### `databricks_semantic`
+
+Composes one document per Unity Catalog **metric view** — Databricks's
+semantic layer — discovered via `information_schema.tables`
+(`table_type='METRIC_VIEW'`) per configured catalog, with each view's YAML
+definition read through `SHOW CREATE TABLE`. Register it the same way as the
+Snowflake adapter:
+
+```bash
+agnes admin semantic-source add --kind connection --name "Databricks metric views" \
+    --adapter databricks_semantic
+```
+
+The scheduled refresh (`POST /api/admin/run-databricks-semantic-layer-refresh`,
+see [`DATA_SOURCES.md`](DATA_SOURCES.md#semantic-layer-sync-unity-catalog-metric-views))
+registers this source automatically under a fixed id (`databricks_default`) —
+manual registration is only needed for a second, differently-scoped source
+(e.g. a narrower `config.catalogs`). Credentials resolve from the instance's
+Databricks connection exactly like every other Databricks code path; the
+optional `config.catalogs` scope key defaults to
+`data_source.databricks.semantic_layer_catalogs` / `catalog`.
+
+A declared measure becomes a metric and a declared dimension becomes a
+dataset field, both tagged dialect `DATABRICKS`. Unlike Snowflake's bare
+`EXPRESSION`, a metric's dialect expression is the *composed*, actionable
+statement — `SELECT MEASURE(\`name\`) FROM \`catalog\`.\`schema\`.\`view\``
+— because `MEASURE()` only evaluates against its owning metric view; a bare
+aggregation fragment (the measure's own `expr`) would not be runnable
+anywhere on its own and rides along instead in `custom_extensions`. The
+model name is the fully qualified `catalog.schema.view`, for the same
+name-collision reason as Snowflake's `DB.SCHEMA.VIEW`.
 
 ## Ownership: imported models are read-only
 
