@@ -13543,6 +13543,56 @@
         ]
       }
     },
+    "/admin/linked-apps/new": {
+      "get": {
+        "description": "Publish externally-hosted apps into the Library, in the builder shell.\n\n/admin/linked-apps stays as the wizard for now; this is the path the\nLibrary's \"+ Add\" reaches. What it fixes is the two things that made the\nwizard an operator-hostile surface: step 1 asked which MCP source to read\napps from, with a dead end under it (\"Not registered yet? Register one\nfirst, then come back\"), and step 2 asked for a projection map \u2014 which\nresponse field is the app's name, which is its URL.\n\nA projection map is an integration author's artifact. The adapter already\nfalls back to alias guesses (src/data_apps/keboola_adapter.py), so the\nmapping is an escape hatch shown only when a row came back that the aliases\ncould not read, and the source and its lister tool are detected rather than\nchosen.",
+        "operationId": "admin_linked_apps_builder_admin_linked_apps_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Linked Apps Builder",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/marketplaces": {
       "get": {
         "description": "Admin page for marketplace git repositories (register / sync / delete).",
