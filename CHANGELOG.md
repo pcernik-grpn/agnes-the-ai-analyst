@@ -12,6 +12,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **`chat_provider = "docker"` now provisions its own backing** in the
+  `customer-instance` Terraform module, instead of only pinning the choice.
+  Web chat's docker provider spawns each session through the apps-runner
+  sidecar and refuses the ChatManager at boot when that sidecar — or the
+  operator-built sandbox image — is missing; both hung off `data_apps_enabled`
+  alone, so a TF-pinned docker provider came up with every chat route 503ing.
+  The module now mints `APPS_RUNNER_TOKEN`/`DOCKER_GID` and activates the
+  `apps` compose profile for *either* feature (without enabling hosted data
+  apps for a chat-only VM), and builds the sandbox image on boot from the
+  build context that ships inside the app image — so the sandbox and the
+  server always come from one release, and a VM recreate no longer needs a
+  hand-run `docker build`. `agnes-auto-upgrade.sh` keeps the profile,
+  refreshes the image on the recreate tick when the context actually changed,
+  and — because the boot build is best-effort and must never abort a boot —
+  rebuilds a *missing* image on any tick, so a VM whose build failed once
+  recovers within five minutes instead of 503ing every chat route until an
+  unrelated upgrade (new helper `scripts/ops/agnes-chat-sandbox-image.sh`,
+  idempotent via an `agnes.chat-sandbox.source` label carrying the hash of
+  the whole build context).
 - **Alternate / private image registry support (`AGNES_IMAGE_REPO`).** The
   app-image repository is now a single seam instead of a hardcoded
   reference: the compose overlays interpolate
