@@ -394,8 +394,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   own infrastructure behind the same RBAC.
 
 ### Changed
+- **The bundled data-apps skill now tells agents to build figures from metric
+  definitions rather than hand-written SQL.** `agnes-data-apps-extras`'
+  data-reading reference sanctioned `runQuery(sql)` and said nothing about
+  metrics — the word did not appear in it once — so an app built by following it
+  computed its numbers with its own SQL and could quietly disagree with the rest
+  of the organization's reporting. It now leads with the two-call pattern
+  (`GET /api/metrics/<id>` for the canonical definition, then run *its* SQL),
+  which also means the app holds no copy of the SQL and picks up a central
+  correction on its next load. This is the rule the root workspace `CLAUDE.md`
+  already gives every other agent reading Agnes data ("never invent metric
+  calculations"); apps were the gap. Hand-written SQL stays correct where no
+  metric exists.
 
 - Admin sidebar's Activity entry for `/admin/chat` is now labelled "Chat runners", matching the page's own title, instead of "Chat sessions" — which read as a sibling of the adjacent "Analyst sessions" (uploaded Claude Code session files) rather than the runner dashboard it actually is.
+- **Auth emails (invite, password reset, magic link) are branded multipart
+  messages** instead of a bare one-line plaintext with a token URL — the shape
+  that commonly landed in spam. All three now share one email-safe HTML layout
+  (`app/auth/email_templates.py`): instance name as the `From:` display name
+  and in the subject, a sentence of context, one CTA button, the link's
+  validity (7 days / 24 hours / 1 hour, derived from the enforcing constants),
+  a plain-URL fallback, and a "didn't expect this? safely ignore" footer. A
+  plaintext part with the same copy is always included; no images or external
+  resources.
 
 - **BREAKING (infra pins): the `customer-instance` Terraform module's
   `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
@@ -528,6 +549,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   admin-granted row to owner-granted.
 
 ### Fixed
+
+- `use_pg()` no longer reverts a Postgres instance running purely on the
+  `DATABASE_URL` env fallback (no explicit `instance.yaml::database.backend`
+  declaration) to an empty DuckDB backend the first time an admin saves an
+  unrelated `/admin/server-config` section. The overlay editor writes only
+  the touched section, so the resulting file — created for the first time,
+  with no `database` key — was indistinguishable from an explicit
+  `backend: duckdb` declaration; on the next restart every repository
+  factory silently switched to a fresh DuckDB, orphaning the Postgres data
+  and returning `401 User not found` for real users until manually
+  repointed. `read_backend_state()` / `is_backend_explicitly_declared()`
+  now tell "declared DuckDB" apart from "overlay exists but never mentions
+  the database backend", and only the former short-circuits `use_pg()`.
 
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header

@@ -255,18 +255,42 @@ def test_no_duplicate_unreleased_bullets(changelog_text: str) -> None:
     assert_no_duplicate_unreleased_bullets(changelog_text)
 
 
-def test_unreleased_bullets_are_parsed_at_all(changelog_text: str) -> None:
+def test_block_extractor_finds_bullets_in_a_known_fixture() -> None:
     """The duplicate-bullet guard is only as real as its parse.
 
     A block extractor that silently found nothing would make
     :func:`assert_no_duplicate_unreleased_bullets` vacuously true on every
     file forever — the same false-green this module exists to prevent, one
-    level down. Assert the real file yields bullets, and that each carries
-    a plausible line number inside ``[Unreleased]``.
+    level down.
+
+    The anti-vacuity check runs against a fixture, not the live file,
+    because ``[Unreleased]`` is legitimately EMPTY on a release-cut branch:
+    ``scripts/release_cut.py`` renames the section to the new version and
+    opens a fresh empty one, so asserting the real file always yields
+    bullets would fail every cut PR the daily-cut workflow (#1567) opens —
+    turning the guard into a release blocker rather than a corruption
+    detector.
     """
-    blocks = _unreleased_bullet_blocks(changelog_text)
-    assert blocks, "parsed zero bullets from '## [Unreleased]' — the block extractor is broken"
+    blocks = _unreleased_bullet_blocks(_GOOD)
+    assert blocks, "parsed zero bullets from a fixture that has one — the block extractor is broken"
+
+
+def test_live_unreleased_bullets_are_parsed_where_they_exist(changelog_text: str) -> None:
+    """Whatever the live file does hold under ``[Unreleased]`` must parse.
+
+    Empty is allowed (a fresh cut); silently dropping bullets that ARE
+    there is not. Line numbers must land inside the section.
+    """
     start, end = _unreleased_bounds(changelog_text)
+    raw_bullet_lines = [
+        line for line in changelog_text.splitlines()[start:end] if line.startswith("- ") or line.startswith("* ")
+    ]
+    blocks = _unreleased_bullet_blocks(changelog_text)
+    if raw_bullet_lines:
+        assert blocks, (
+            f"'## [Unreleased]' holds {len(raw_bullet_lines)} bullet line(s) but the "
+            "block extractor parsed none — the extractor is broken"
+        )
     for line_number, bullet in blocks:
         assert start + 1 < line_number <= end, f"bullet at line {line_number} is outside [Unreleased]"
         assert bullet.strip(), f"empty bullet parsed at line {line_number}"

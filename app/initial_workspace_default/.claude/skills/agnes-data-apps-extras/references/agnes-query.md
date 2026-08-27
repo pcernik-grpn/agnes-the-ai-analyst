@@ -39,6 +39,38 @@ Catalog/table lookups (what tables/columns exist, before writing a query)
 go against the same base URL's catalog endpoints, with the same bearer
 token — mirror `runQuery`'s error handling.
 
+## Metrics before hand-written SQL
+
+If a figure the app shows corresponds to a business metric, **fetch that
+metric's definition and run its SQL** rather than writing your own query for
+it. Two calls, both through the same helper:
+
+```typescript
+const def  = await agnesFetch(`/api/metrics/${id}`);  // definition, incl. `sql`
+const rows = await runQuery(def.sql);                 // the value
+```
+
+`GET /api/metrics` lists what is defined. The lookup is RBAC-gated on the
+metric's own tables, so it obeys the same owner-scoped boundary as any other
+query the app runs.
+
+Why it matters:
+
+- The app's number then *means* what the same number means everywhere else in
+  the organization — a dashboard quietly disagreeing with the rest of the
+  business is the failure this prevents.
+- The app holds no copy of the SQL. It reads the canonical definition at
+  runtime, so a central correction to a metric reaches the app on its next
+  load, with no redeploy and nobody having to remember.
+- It is the same rule the root workspace `CLAUDE.md` already gives every agent
+  reading Agnes data: look up the canonical definition, use that SQL, never
+  invent metric calculations. An app is not an exception.
+
+Where no metric exists, write the query — but consider whether the figure is
+one others would want too, in which case defining the metric in Agnes serves
+more than this app. Cache definitions briefly rather than re-fetching them on
+every page load.
+
 ## Rules for the query itself
 
 - Every query the app runs is subject to the owner's own RBAC grants — the

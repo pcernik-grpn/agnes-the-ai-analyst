@@ -393,6 +393,8 @@ def _send_email(email: str, token: str, next_path: str = "", base_url: str | Non
     for why the SDK branch is gone).
     """
     from app.auth._common import send_smtp_email
+    from app.auth.email_templates import magic_link_email
 
     link = _build_magic_link(email, token, next_path, base_url)
-    send_smtp_email(email, "Login Link", f"Login link: {link}")
+    subject, body_text, body_html = magic_link_email(email, link, timedelta(seconds=MAGIC_LINK_EXPIRY))
+    send_smtp_email(email, subject, body_text, body_html)
