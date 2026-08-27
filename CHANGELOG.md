@@ -11,6 +11,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Claude can run through Google Vertex AI — chat and server-side, keyless.**
+  Two new provider switches, both authenticated by Google Application Default
+  Credentials (no Anthropic key anywhere): `chat.llm.provider: vertex` (+
+  `chat.llm.vertex.project_id/region`) flips the chat sandbox CLI into Claude
+  Code's native Vertex gateway mode — requests still egress through the
+  loopback relay to the secret broker, which validates the path's
+  project/region by equality against instance config (a sandbox can never
+  redirect spend), signs upstream calls with a Google OAuth token, and keeps
+  model pinning, monthly token budgets, and the usage ledger working; the
+  kai-agent engine needs no change (the broker rewrites its first-party
+  Messages calls into the Vertex shape). `ai.provider: vertex` (+
+  `ai.vertex.project_id/region`) does the same for every server-side LLM
+  call-site — corporate memory, digests, guardrail reviews, usage-ask, vision
+  OCR, and chat auto-titles. Dated model ids interchange between the
+  first-party (`claude-…-YYYYMMDD`) and Vertex (`claude-…@YYYYMMDD`)
+  spellings everywhere they are compared. Boot refuses `vertex` combined with
+  `workload_identity` or `LLM_DISPATCHER_URL`, and the admin readiness page
+  gains vertex rows plus a live test-connection probe. See
+  `docs/cloud-chat.md` → "LLM provider: Google Vertex AI".
 - **A hosted data app's description can be edited after it is created.**
   `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
   not_managed`, so a hosted app's description was write-once: `POST

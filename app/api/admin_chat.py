@@ -20,6 +20,7 @@ from app.chat.readiness import (
     secret_status,
     test_anthropic_key,
     test_docker_sandbox,
+    test_vertex_credentials,
     test_wif_credentials,
 )
 from app.coordination.base import CoordinationUnavailable
@@ -169,10 +170,13 @@ async def set_chat_secrets(
 async def test_chat_secrets(request: Request, _admin: dict = Depends(require_admin)):
     """Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.
 
-    The ``anthropic_api_key`` slot probes whatever the LLM auth mode actually
-    uses: the static key in ``api_key`` mode, or the workload-identity federation
-    (mint a token + confirm the API accepts it) in ``workload_identity`` mode —
-    so the admin "test connection" surface works in both modes.
+    The ``anthropic_api_key`` slot probes whatever the LLM provider/auth mode
+    actually uses: the static key in ``api_key`` mode, the workload-identity
+    federation (mint a token + confirm the API accepts it) in
+    ``workload_identity`` mode, or Google ADC + a Vertex completion when
+    ``chat.llm.provider`` is ``vertex`` — so the admin "test connection"
+    surface works in every mode. The slot name stays ``anthropic_api_key``
+    for UI compatibility; the detail string identifies which probe ran.
 
     The sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +
     image, via the apps-runner probe) on a docker deployment; a kai-agent
@@ -182,7 +186,13 @@ async def test_chat_secrets(request: Request, _admin: dict = Depends(require_adm
     """
     chat_config = getattr(request.app.state, "chat_config", None)
     llm_auth = getattr(chat_config, "llm_auth", "api_key")
-    if llm_auth == "workload_identity":
+    llm_provider = getattr(chat_config, "llm_provider", "anthropic")
+    if llm_provider == "vertex":
+        anthropic_probe = await test_vertex_credentials(
+            getattr(chat_config, "vertex_project_id", ""),
+            getattr(chat_config, "vertex_region", ""),
+        )
+    elif llm_auth == "workload_identity":
         anthropic_probe = await test_wif_credentials()
     else:
         anthropic_probe = await test_anthropic_key()

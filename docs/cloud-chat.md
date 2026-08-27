@@ -693,6 +693,60 @@ agent profiles/memories, Agnes-side token metering, operator-controlled
 egress — and are prepared to operate the daemon, sidecar and sandbox
 image yourself.
 
+## LLM provider: Google Vertex AI
+
+Independent of the sandbox provider above, `chat.llm.provider` selects which
+LLM platform the broker forwards chat traffic to. The default (`anthropic`)
+is the first-party Anthropic API; `vertex` runs Claude through Google
+Vertex AI with **no Anthropic credential at all**:
+
+```yaml
+chat:
+  llm:
+    provider: vertex
+    vertex:
+      project_id: my-gcp-project
+      region: europe-west1   # or "global"
+```
+
+How it works:
+
+- **Docker provider:** the sandbox CLI switches to Claude Code's native
+  Vertex gateway mode (`CLAUDE_CODE_USE_VERTEX=1` +
+  `CLAUDE_CODE_SKIP_VERTEX_AUTH=1`, with `ANTHROPIC_VERTEX_BASE_URL` pointed
+  at the in-sandbox loopback relay). The CLI emits native Vertex request
+  shapes but sends no credentials; traffic egresses through the relay to the
+  broker exactly as before.
+- **Broker:** validates that the request's project/location equal the
+  instance config (the sandbox's env values are routing hints only —
+  tampering earns a 403, never redirected spend), signs the upstream request
+  with a Google OAuth token from Application Default Credentials
+  (`GOOGLE_APPLICATION_CREDENTIALS` → gcloud ADC → GCE/GKE attached service
+  account), and forwards to `…aiplatform.googleapis.com`. Model pinning,
+  monthly token budgets, and the usage ledger all keep working. Unknown
+  subpaths are refused (fail closed).
+- **kai-agent provider:** needs no change — the engine keeps speaking the
+  first-party Messages format and the broker rewrites those calls into the
+  Vertex shape (model moves from body to URL, `anthropic_version` injected).
+
+Operator prerequisites:
+
+- Enable the Claude models in **Vertex AI Model Garden** for the project and
+  region.
+- Grant the server's identity **`roles/aiplatform.user`** on the project
+  (Terraform automation of this grant is a deployment concern, not shipped
+  here).
+- Do not combine with `chat.llm.auth: workload_identity` or
+  `LLM_DISPATCHER_URL` — boot refuses both combinations with an explicit
+  message.
+
+Model ids: operators may write either spelling of a dated snapshot —
+`claude-…-YYYYMMDD` (first-party) or `claude-…@YYYYMMDD` (Vertex) — in
+`agents.model` and `chat.agent_api_utility_models`; the broker compares them
+canonically. Cost note: `daily_anthropic_spend_usd` estimates spend with the
+hard-coded Sonnet prices in `app/chat/manager.py` — under Vertex this stays
+the same approximation it is on the first-party API.
+
 ## Operator setup details
 
 ### Keep the sandbox image fresh (docker provider)

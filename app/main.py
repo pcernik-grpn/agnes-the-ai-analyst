@@ -119,6 +119,75 @@ def _chat_jwt_secret_ok(chat_config) -> bool:
     return True
 
 
+def _chat_llm_provider_ok(chat_config) -> bool:
+    """Validate ``chat.llm.provider`` — refuse unknown values and a
+    misconfigured vertex mode at boot.
+
+    Wired into the lifespan elif chain BEFORE ``_chat_anthropic_key_ok`` so
+    its message wins over a misleading "ANTHROPIC_API_KEY missing" log. An
+    unknown provider is refused rather than silently mapped to ``anthropic``
+    (a fallback would switch which credential spends money). Config-shape
+    conflicts are checked before the TESTING bypass (mirroring
+    ``_chat_kai_agent_ok``); only the ADC credential probe is bypassed under
+    tests.
+    """
+    if not chat_config.enabled:
+        return True
+    log = logging.getLogger("app.main")
+    provider = getattr(chat_config, "llm_provider", "anthropic") or "anthropic"
+    if provider == "anthropic":
+        return True
+    if provider != "vertex":
+        log.error(
+            "chat.llm.provider=%r is not a known provider (allowed: anthropic, vertex); refusing to spawn ChatManager",
+            provider,
+        )
+        return False
+    if getattr(chat_config, "llm_auth", "api_key") == "workload_identity":
+        log.error(
+            "chat.llm.provider=vertex conflicts with chat.llm.auth=workload_identity — "
+            "vertex signs upstream requests with Google ADC, workload_identity federates "
+            "to the first-party Anthropic API; pick one. Refusing to spawn ChatManager",
+        )
+        return False
+    if os.environ.get("LLM_DISPATCHER_URL", "").strip():
+        log.error(
+            "LLM_DISPATCHER_URL is set but chat.llm.provider=vertex — the dispatcher "
+            "only speaks the first-party Messages API; unset one of the two. "
+            "Refusing to spawn ChatManager",
+        )
+        return False
+    missing = [
+        key
+        for key, value in (
+            ("chat.llm.vertex.project_id", getattr(chat_config, "vertex_project_id", "")),
+            ("chat.llm.vertex.region", getattr(chat_config, "vertex_region", "")),
+        )
+        if not value
+    ]
+    if missing:
+        log.error(
+            "chat.llm.provider=vertex requires %s to be set in instance.yaml; refusing to spawn ChatManager",
+            " and ".join(missing),
+        )
+        return False
+    if os.environ.get("TESTING", "").lower() in ("1", "true"):
+        return True
+    from app.auth.vertex_gcp import credentials_resolvable
+
+    ok, detail = credentials_resolvable()
+    if not ok:
+        log.error(
+            "chat.llm.provider=vertex but Google credentials are not resolvable: %s. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth application-default "
+            "login`, or attach a service account to the workload. Refusing to spawn "
+            "ChatManager",
+            detail,
+        )
+        return False
+    return True
+
+
 def _chat_anthropic_key_ok(chat_config) -> bool:
     """Refuse ``chat.enabled=true`` deployments that lack ``ANTHROPIC_API_KEY``.
 
@@ -132,6 +201,11 @@ def _chat_anthropic_key_ok(chat_config) -> bool:
     ``ANTHROPIC_API_KEY`` is set to a non-empty value; False otherwise.
     """
     if not chat_config.enabled:
+        return True
+    # Vertex mode needs no Anthropic credential at all — its own gate
+    # (_chat_llm_provider_ok, ordered before this one) validated the Google
+    # credential chain instead.
+    if getattr(chat_config, "llm_provider", "anthropic") == "vertex":
         return True
     # Bypass for TESTING=1 — pytest-driven sessions don't need a real key.
     if os.environ.get("TESTING", "").lower() in ("1", "true"):
@@ -1611,6 +1685,11 @@ async def lifespan(app):
             elif not _chat_jwt_secret_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.  Disable chat so the
                 # runner never spawns with a public-constant secret.
+                app.state.chat_manager = None
+            elif not _chat_llm_provider_ok(app.state.chat_config):
+                # Fatal already logged inside the helper. Ordered BEFORE the
+                # anthropic-key gate so a vertex misconfiguration reports its
+                # own cause, not a misleading missing-key message.
                 app.state.chat_manager = None
             elif not _chat_anthropic_key_ok(app.state.chat_config):
                 # Fatal already logged inside the helper.  No key → no runner.

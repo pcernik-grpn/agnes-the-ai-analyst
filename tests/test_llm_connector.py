@@ -11,7 +11,6 @@ Covers:
 
 import json
 import logging
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import anthropic
@@ -24,7 +23,6 @@ from connectors.llm.exceptions import (
     LLMFormatError,
     LLMRateLimitError,
     LLMRefusalError,
-    LLMTimeoutError,
     LLMUnsupportedError,
 )
 from connectors.llm.factory import DEFAULT_MODEL, create_extractor
@@ -33,7 +31,6 @@ from connectors.llm.openai_compat import (
     _extract_json_from_text,
     _sanitize_url,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers: mock response builders
@@ -118,18 +115,22 @@ class TestCreateExtractor:
     def test_openai_compat_missing_base_url_raises(self):
         """openai_compat without base_url raises ValueError."""
         with pytest.raises(ValueError, match="base_url is required"):
-            create_extractor({
-                "provider": "openai_compat",
-                "api_key": "sk-test",
-            })
+            create_extractor(
+                {
+                    "provider": "openai_compat",
+                    "api_key": "sk-test",
+                }
+            )
 
     def test_unknown_provider_raises(self):
         """Unknown provider string raises ValueError."""
         with pytest.raises(ValueError, match="Unknown ai.provider"):
-            create_extractor({
-                "provider": "gemini",
-                "api_key": "sk-test",
-            })
+            create_extractor(
+                {
+                    "provider": "gemini",
+                    "api_key": "sk-test",
+                }
+            )
 
     @patch("connectors.llm.anthropic_provider.anthropic.Anthropic")
     def test_default_model(self, mock_client_cls):
@@ -153,12 +154,14 @@ class TestCreateExtractor:
     def test_invalid_structured_output_raises(self):
         """Invalid structured_output value raises ValueError."""
         with pytest.raises(ValueError, match="strict.*json.*auto"):
-            create_extractor({
-                "provider": "openai_compat",
-                "api_key": "sk-test",
-                "base_url": "https://api.example.com/v1",
-                "structured_output": "whatever",
-            })
+            create_extractor(
+                {
+                    "provider": "openai_compat",
+                    "api_key": "sk-test",
+                    "base_url": "https://api.example.com/v1",
+                    "structured_output": "whatever",
+                }
+            )
 
 
 # ===================================================================
@@ -235,9 +238,7 @@ class TestAnthropicExtractor:
         mock_client_cls.return_value = mock_client
 
         payload = {"items": [{"name": "test"}]}
-        mock_client.messages.create.return_value = _anthropic_response(
-            json.dumps(payload)
-        )
+        mock_client.messages.create.return_value = _anthropic_response(json.dumps(payload))
 
         ext = AnthropicExtractor(api_key="sk-ant-test", model="claude-haiku-4-5-20251001")
         result = ext.extract_json(
@@ -375,9 +376,7 @@ class TestAnthropicExtractor:
         """Non-JSON response raises LLMFormatError."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.messages.create.return_value = _anthropic_response(
-            "This is not JSON at all"
-        )
+        mock_client.messages.create.return_value = _anthropic_response("This is not JSON at all")
 
         ext = AnthropicExtractor(api_key="sk-ant-test", model="claude-haiku-4-5-20251001")
         with pytest.raises(LLMFormatError, match="Failed to parse"):
@@ -438,13 +437,13 @@ class TestOpenAICompatExtractor:
         mock_client_cls.return_value = mock_client
 
         payload = {"items": [{"id": 1}]}
-        mock_client.chat.completions.create.return_value = _openai_response(
-            json.dumps(payload)
-        )
+        mock_client.chat.completions.create.return_value = _openai_response(json.dumps(payload))
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         result = ext.extract_json("Extract", 1024, self.SCHEMA, "test")
 
@@ -470,8 +469,10 @@ class TestOpenAICompatExtractor:
         ]
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="local-model", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="local-model",
+            structured_output="auto",
         )
         result = ext.extract_json("Extract", 1024, self.SCHEMA, "test")
 
@@ -504,8 +505,10 @@ class TestOpenAICompatExtractor:
         ]
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="local-model", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="local-model",
+            structured_output="auto",
         )
         result = ext.extract_json("Extract", 1024, self.SCHEMA, "test")
 
@@ -528,8 +531,10 @@ class TestOpenAICompatExtractor:
         )
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="local-model", structured_output="strict",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="local-model",
+            structured_output="strict",
         )
         with pytest.raises(LLMUnsupportedError, match="No supported structured output"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -546,8 +551,10 @@ class TestOpenAICompatExtractor:
         )
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="local-model", structured_output="json",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="local-model",
+            structured_output="json",
         )
         with pytest.raises(LLMUnsupportedError, match="No supported structured output"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -579,8 +586,10 @@ class TestOpenAICompatExtractor:
         ]
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="local-model", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="local-model",
+            structured_output="auto",
         )
         result = ext.extract_json("Extract", 1024, self.SCHEMA, "test")
 
@@ -598,8 +607,10 @@ class TestOpenAICompatExtractor:
         )
 
         ext = OpenAICompatExtractor(
-            api_key="sk-bad", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-bad",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         with pytest.raises(LLMAuthError, match="authentication failed"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -613,12 +624,15 @@ class TestOpenAICompatExtractor:
         mock_client_cls.return_value = mock_client
 
         mock_client.chat.completions.create.return_value = _openai_response(
-            '{"items": [', finish_reason="length",
+            '{"items": [',
+            finish_reason="length",
         )
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         with pytest.raises(LLMFormatError, match="truncated"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -629,13 +643,13 @@ class TestOpenAICompatExtractor:
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
 
-        mock_client.chat.completions.create.return_value = _openai_response(
-            None, finish_reason="stop"
-        )
+        mock_client.chat.completions.create.return_value = _openai_response(None, finish_reason="stop")
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         with pytest.raises(LLMRefusalError, match="refused"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -658,8 +672,10 @@ class TestOpenAICompatExtractor:
         ]
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         result = ext.extract_json("Extract", 1024, self.SCHEMA, "test")
 
@@ -678,8 +694,10 @@ class TestOpenAICompatExtractor:
         )
 
         ext = OpenAICompatExtractor(
-            api_key="sk-test", base_url=self.BASE_URL,
-            model="gpt-4o", structured_output="auto",
+            api_key="sk-test",
+            base_url=self.BASE_URL,
+            model="gpt-4o",
+            structured_output="auto",
         )
         with pytest.raises(LLMFormatError, match="Bad request"):
             ext.extract_json("Extract", 1024, self.SCHEMA, "test")
@@ -773,8 +791,10 @@ class TestSecurity:
         ext = AnthropicExtractor(api_key=self.SECRET_KEY, model="claude-haiku-4-5-20251001")
         with caplog.at_level(logging.DEBUG, logger="connectors.llm"):
             ext.extract_json(
-                self.PROMPT_TEXT, 1024,
-                {"type": "object"}, "test_schema",
+                self.PROMPT_TEXT,
+                1024,
+                {"type": "object"},
+                "test_schema",
             )
 
         full_log = caplog.text
@@ -790,8 +810,10 @@ class TestSecurity:
         ext = AnthropicExtractor(api_key=self.SECRET_KEY, model="claude-haiku-4-5-20251001")
         with caplog.at_level(logging.DEBUG, logger="connectors.llm"):
             ext.extract_json(
-                self.PROMPT_TEXT, 1024,
-                {"type": "object"}, "test_schema",
+                self.PROMPT_TEXT,
+                1024,
+                {"type": "object"},
+                "test_schema",
             )
 
         full_log = caplog.text
@@ -807,8 +829,10 @@ class TestSecurity:
         ext = AnthropicExtractor(api_key=self.SECRET_KEY, model="claude-haiku-4-5-20251001")
         with caplog.at_level(logging.DEBUG, logger="connectors.llm"):
             ext.extract_json(
-                self.PROMPT_TEXT, 1024,
-                {"type": "object"}, "test_schema",
+                self.PROMPT_TEXT,
+                1024,
+                {"type": "object"},
+                "test_schema",
             )
 
         full_log = caplog.text
@@ -820,9 +844,7 @@ class TestSecurity:
         """OpenAI-compat API key must never appear in log messages."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.chat.completions.create.return_value = _openai_response(
-            self.RESPONSE_TEXT
-        )
+        mock_client.chat.completions.create.return_value = _openai_response(self.RESPONSE_TEXT)
 
         ext = OpenAICompatExtractor(
             api_key=self.SECRET_KEY,
@@ -832,8 +854,10 @@ class TestSecurity:
         )
         with caplog.at_level(logging.DEBUG, logger="connectors.llm"):
             ext.extract_json(
-                self.PROMPT_TEXT, 1024,
-                {"type": "object"}, "test_schema",
+                self.PROMPT_TEXT,
+                1024,
+                {"type": "object"},
+                "test_schema",
             )
 
         full_log = caplog.text
@@ -844,9 +868,7 @@ class TestSecurity:
         """URL paths (may contain tokens) must not appear in logs."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.chat.completions.create.return_value = _openai_response(
-            '{"ok": true}'
-        )
+        mock_client.chat.completions.create.return_value = _openai_response('{"ok": true}')
 
         sensitive_url = "https://api.example.com/v1/secret-path?token=abc123"
         ext = OpenAICompatExtractor(
@@ -901,7 +923,7 @@ class TestCorporateMemoryCollector:
         claude_file = user_dir / "CLAUDE.local.md"
         claude_file.write_text("Some knowledge content")
 
-        content_hash = hl.md5("Some knowledge content".encode()).hexdigest()
+        content_hash = hl.md5(b"Some knowledge content").hexdigest()
 
         # Stored hashes match current hashes -> no changes
         with (
@@ -1155,7 +1177,9 @@ class TestCorporateMemoryCollector:
         monkeypatch.delenv("LLM_API_KEY", raising=False)
         monkeypatch.setattr(cm, "CORPORATE_MEMORY_DIR", tmp_path / "cm")
         monkeypatch.setattr(cm, "COLLECTION_LOG", tmp_path / "cm" / "log")
-        monkeypatch.setattr(cm, "collect_all", lambda dry_run=False: (_ for _ in ()).throw(ValueError("LLM not configured")))
+        monkeypatch.setattr(
+            cm, "collect_all", lambda dry_run=False: (_ for _ in ()).throw(ValueError("LLM not configured"))
+        )
 
         rc = cm.main()
         assert rc == 1
@@ -1452,3 +1476,173 @@ class TestCollectorExtractorIntegration:
             pytest.raises(ValueError, match="must not be empty"),
         ):
             collect_all(dry_run=True)
+
+
+class TestVertexProvider:
+    """provider: vertex — Claude through Google Vertex AI (ADC, no API key)."""
+
+    def test_to_vertex_model_id_table(self):
+        from connectors.llm.vertex_provider import to_vertex_model_id
+
+        cases = {
+            "claude-haiku-4-5-20251001": "claude-haiku-4-5@20251001",
+            "claude-3-5-sonnet-20241022": "claude-3-5-sonnet@20241022",
+            "claude-sonnet-4-6": "claude-sonnet-4-6",  # bare current-gen id
+            "claude-haiku-4-5@20251001": "claude-haiku-4-5@20251001",  # idempotent
+            "": "",
+            "  claude-opus-4-7  ": "claude-opus-4-7",
+        }
+        for given, expected in cases.items():
+            assert to_vertex_model_id(given) == expected, given
+
+    @patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex")
+    def test_factory_builds_vertex_extractor(self, mock_vertex_cls):
+        from connectors.llm.vertex_provider import VertexExtractor
+
+        ext = create_extractor(
+            {
+                "provider": "vertex",
+                "vertex": {"project_id": "proj-1", "region": "Europe-West1"},
+                "model": "claude-haiku-4-5-20251001",
+            }
+        )
+        assert isinstance(ext, VertexExtractor)
+        assert ext._model == "claude-haiku-4-5@20251001"
+        assert ext._TRACE_PROVIDER == "vertex"
+        ctor = mock_vertex_cls.call_args.kwargs
+        assert ctor == {"project_id": "proj-1", "region": "europe-west1"}
+
+    @patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex")
+    def test_vertex_needs_no_api_key(self, mock_vertex_cls):
+        """No api_key in the config is fine — auth is Google ADC in the SDK."""
+        ext = create_extractor({"provider": "vertex", "vertex": {"project_id": "p"}})
+        assert ext._model == DEFAULT_MODEL.replace("-20251001", "@20251001")
+
+    def test_vertex_missing_project_id_raises(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+        with pytest.raises(ValueError, match="project id"):
+            create_extractor({"provider": "vertex"})
+
+    def test_vertex_region_defaults_to_global(self, monkeypatch):
+        from connectors.llm.vertex_provider import resolve_vertex_settings
+
+        monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+        assert resolve_vertex_settings({"project_id": "p"}) == ("p", "global")
+
+    def test_vertex_settings_env_fallback(self, monkeypatch):
+        from connectors.llm.vertex_provider import resolve_vertex_settings
+
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        monkeypatch.setenv("CLOUD_ML_REGION", "US-EAST5")
+        assert resolve_vertex_settings(None) == ("env-proj", "us-east5")
+
+    def test_vertex_missing_google_auth_fails_fast(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _no_google(name, *a, **k):
+            if name == "google.auth" or name.startswith("google.auth"):
+                raise ImportError("No module named 'google'")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", _no_google)
+        with pytest.raises(ValueError, match=r"anthropic\[vertex\]"):
+            create_extractor({"provider": "vertex", "vertex": {"project_id": "p"}})
+
+    @patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex")
+    def test_vertex_extract_json_happy_path(self, mock_vertex_cls):
+        from connectors.llm.factory import create_vertex_extractor
+
+        mock_client = MagicMock()
+        mock_vertex_cls.return_value = mock_client
+        resp = MagicMock()
+        resp.stop_reason = "end_turn"
+        resp.content = [MagicMock(text='{"answer": 42}')]
+        mock_client.messages.create.return_value = resp
+
+        ext = create_vertex_extractor("claude-haiku-4-5-20251001", {"vertex": {"project_id": "p", "region": "global"}})
+        out = ext.extract_json(
+            prompt="q",
+            max_tokens=64,
+            json_schema={"type": "object", "properties": {"answer": {"type": "integer"}}},
+            schema_name="t",
+        )
+        assert out == {"answer": 42}
+        assert mock_client.messages.create.call_args.kwargs["model"] == "claude-haiku-4-5@20251001"
+
+    def test_vertex_permission_denied_maps_to_auth_error(self):
+        """403 (API not enabled / missing aiplatform permission) is an
+        auth-shaped, non-retryable failure."""
+        from connectors.llm.vertex_provider import VertexExtractor
+
+        class _PermErr(anthropic.PermissionDeniedError):
+            def __init__(self):
+                Exception.__init__(self, "permission denied")
+
+        ext = VertexExtractor.__new__(VertexExtractor)
+        ext._model = "m"
+        client = MagicMock()
+        client.messages.create.side_effect = _PermErr()
+        ext._client = client
+        with pytest.raises(LLMAuthError, match="permission denied"):
+            ext.extract_json(prompt="q", max_tokens=8, json_schema={"type": "object"}, schema_name="t")
+
+    def test_vertex_google_auth_exception_maps_to_auth_error(self):
+        from google.auth.exceptions import DefaultCredentialsError
+
+        from connectors.llm.vertex_provider import VertexExtractor
+
+        ext = VertexExtractor.__new__(VertexExtractor)
+        ext._model = "m"
+        client = MagicMock()
+        client.messages.create.side_effect = DefaultCredentialsError("no ADC")
+        ext._client = client
+        with pytest.raises(LLMAuthError, match="GOOGLE_APPLICATION_CREDENTIALS"):
+            ext.extract_json(prompt="q", max_tokens=8, json_schema={"type": "object"}, schema_name="t")
+
+    @patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex")
+    def test_factory_log_carries_no_secrets(self, mock_vertex_cls, caplog):
+        """project/region are not secrets and may be logged; nothing else is."""
+        with caplog.at_level(logging.INFO, logger="connectors.llm.factory"):
+            create_extractor({"provider": "vertex", "vertex": {"project_id": "proj-1", "region": "global"}})
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "proj-1" in joined
+        assert "sk-" not in joined
+
+
+class TestVertexConfigOrNone:
+    def test_explicit_vertex_config_wins(self):
+        from connectors.llm.factory import vertex_config_or_none
+
+        assert vertex_config_or_none({"provider": "vertex", "vertex": {"project_id": "p", "region": "eu"}}) == (
+            "p",
+            "eu",
+        )
+
+    def test_other_provider_returns_none(self, monkeypatch):
+        from connectors.llm.factory import vertex_config_or_none
+
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        assert vertex_config_or_none({"provider": "anthropic", "api_key": "sk-x"}) is None
+
+    def test_incomplete_vertex_block_warns_and_returns_none(self, monkeypatch, caplog):
+        from connectors.llm.factory import vertex_config_or_none
+
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+        with caplog.at_level(logging.WARNING, logger="connectors.llm.factory"):
+            assert vertex_config_or_none({"provider": "vertex"}) is None
+        assert "incomplete" in caplog.text
+
+    def test_env_pair_counts_only_without_static_keys(self, monkeypatch):
+        from connectors.llm import factory
+
+        monkeypatch.setattr(factory, "_load_ai_config_or_none", lambda: None)
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "env-proj")
+        monkeypatch.setenv("CLOUD_ML_REGION", "global")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        assert factory.vertex_config_or_none(None) == ("env-proj", "global")
+        # A static key wins — existing deployments are unchanged.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-x")
+        assert factory.vertex_config_or_none(None) is None

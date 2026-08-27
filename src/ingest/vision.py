@@ -39,9 +39,20 @@ def _api_key() -> Optional[str]:
     return os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
 
 
+def _vertex() -> tuple | None:
+    """(project, region) when the instance runs LLM calls through Vertex."""
+    try:
+        from connectors.llm.factory import vertex_config_or_none
+
+        return vertex_config_or_none()
+    except Exception:  # noqa: BLE001 — best-effort gate; unavailable config means "no vertex"
+        return None
+
+
 def vision_available() -> bool:
-    """True when both the anthropic SDK and an API key are present."""
-    if _api_key() is None:
+    """True when the anthropic SDK plus a credential path (static key or
+    Vertex config) are present."""
+    if _api_key() is None and _vertex() is None:
         return False
     try:
         import anthropic  # noqa: F401
@@ -65,7 +76,8 @@ def extract_image_text(path: str, *, ext: str) -> Optional[str]:
     if media_type is None:
         return None
     key = _api_key()
-    if key is None:
+    vertex = _vertex() if key is None else None
+    if key is None and vertex is None:
         return None
     try:
         import anthropic
@@ -74,9 +86,17 @@ def extract_image_text(path: str, *, ext: str) -> Optional[str]:
     try:
         with open(path, "rb") as f:
             data = base64.standard_b64encode(f.read()).decode("ascii")
-        client = anthropic.Anthropic(api_key=key)
+        model = _MODEL
+        if vertex is not None:
+            # Static-key path preferred; Vertex is the keyless fallback.
+            from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
+
+            client = create_vertex_client(project_id=vertex[0], region=vertex[1])
+            model = to_vertex_model_id(_MODEL)
+        else:
+            client = anthropic.Anthropic(api_key=key)
         resp = client.messages.create(
-            model=_MODEL,
+            model=model,
             max_tokens=4096,
             messages=[
                 {

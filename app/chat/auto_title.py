@@ -163,25 +163,38 @@ def _strip_title(raw: str) -> Optional[str]:
 
 
 def _generate_title_sync(
-    user_message: str, *, api_key: Optional[str] = None, auth_token: Optional[str] = None
-) -> Optional[str]:
+    user_message: str,
+    *,
+    api_key: str | None = None,
+    auth_token: str | None = None,
+    vertex: tuple[str, str] | None = None,
+) -> str | None:
     """Synchronous Haiku call. Returns the trimmed title or ``None``.
 
     Lives in its own function so :func:`generate_title` can dispatch it
     onto a worker thread without dragging anthropic SDK init into the
     event loop on every call.
 
-    Authenticates with a static ``api_key`` (``x-api-key``) or, in keyless
-    (workload_identity) mode, a short-lived federated ``auth_token``
-    (``Authorization: Bearer`` + the oauth beta header OAuth-style tokens need).
+    Authenticates with a static ``api_key`` (``x-api-key``); in keyless
+    (workload_identity) mode with a short-lived federated ``auth_token``
+    (``Authorization: Bearer`` + the oauth beta header OAuth-style tokens
+    need); or, when ``vertex=(project_id, region)`` is passed, through
+    ``anthropic.AnthropicVertex`` with Google ADC and the Vertex spelling of
+    the title model.
     """
     try:
         import anthropic  # local import keeps test envs without the SDK clean
     except ImportError:  # pragma: no cover - SDK is a hard dep for chat
         logger.debug("anthropic SDK missing; skipping auto-title")
         return None
+    model = _TITLE_MODEL
     try:
-        if auth_token:
+        if vertex is not None:
+            from connectors.llm.vertex_provider import to_vertex_model_id
+
+            client = anthropic.AnthropicVertex(project_id=vertex[0], region=vertex[1], timeout=8.0)
+            model = to_vertex_model_id(_TITLE_MODEL)
+        elif auth_token:
             client = anthropic.Anthropic(
                 auth_token=auth_token,
                 default_headers={"anthropic-beta": "oauth-2025-04-20"},
@@ -190,7 +203,7 @@ def _generate_title_sync(
         else:
             client = anthropic.Anthropic(api_key=api_key, timeout=8.0)
         resp = client.messages.create(
-            model=_TITLE_MODEL,
+            model=model,
             max_tokens=_TITLE_MAX_TOKENS,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message[:_MESSAGE_CLIP_CHARS]}],
@@ -206,14 +219,22 @@ def _generate_title_sync(
     return _strip_title("".join(parts))
 
 
-async def generate_title(user_message: str, *, llm_auth: str = "api_key") -> Optional[str]:
+async def generate_title(
+    user_message: str,
+    *,
+    llm_auth: str = "api_key",
+    llm_provider: str = "anthropic",
+    vertex: tuple[str, str] | None = None,
+) -> str | None:
     """Ask Haiku for a short title for a conversation. Best-effort.
 
-    ``llm_auth`` mirrors the broker's decision (``chat_config.llm_auth``,
+    ``llm_auth`` / ``llm_provider`` mirror the broker's decision
+    (``chat_config.llm_auth`` / ``chat_config.llm_provider``,
     ``app/api/broker.py``) rather than only checking for a static key's
     presence — otherwise a stale ``ANTHROPIC_API_KEY`` left set in
-    ``workload_identity`` mode would silently authenticate auto-title with
-    the wrong credential while the broker correctly uses WIF.
+    ``workload_identity`` or ``vertex`` mode would silently authenticate
+    auto-title with the wrong credential while the broker correctly uses
+    the keyless path.
 
     Returns the cleaned title string, or ``None`` if the API key is
     missing, the SDK isn't installed, the call fails, or the reply is
@@ -223,6 +244,23 @@ async def generate_title(user_message: str, *, llm_auth: str = "api_key") -> Opt
     if not user_message or not user_message.strip():
         return None
     import asyncio
+
+    if llm_provider == "vertex":
+        # The caller (manager) passes chat.llm.vertex.* directly; fall back
+        # to the server-side ai.vertex/env resolution for other callers.
+        if vertex is not None and not all(vertex):
+            vertex = None
+        if vertex is None:
+            try:
+                from connectors.llm.factory import vertex_config_or_none
+
+                vertex = vertex_config_or_none()
+            except Exception:  # noqa: BLE001 — best-effort; config trouble => skip
+                vertex = None
+        if vertex is None:
+            _warn_no_credential(RuntimeError("chat.llm.provider=vertex but no vertex project/region resolvable"))
+            return None
+        return await asyncio.to_thread(_generate_title_sync, user_message, vertex=vertex)
 
     if llm_auth != "workload_identity":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
