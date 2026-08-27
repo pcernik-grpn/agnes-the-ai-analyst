@@ -490,15 +490,26 @@ def _notify_admins_of_pending_items(new_pending_count: int) -> None:
     """Best-effort desktop notification to every Admin-group member when a
     collection run leaves new items awaiting review (#1573 finding 2).
 
-    ``new_pending_count`` is the number of items *this run* added to the
-    review queue — never the size of the whole queue. The catalog is
-    rebuilt by full refresh on every run, so items an earlier run queued
-    are carried over into ``final_items`` still marked ``pending``;
-    counting those too would re-notify every admin about the entire
-    backlog whenever any watched file changed, and call all of it "new"
-    (which is exactly what the message below says). The backlog gauge
-    lives in ``stats["items_pending"]`` and is deliberately not what gets
-    published here.
+    ``new_pending_count`` is the number of ``pending`` rows *this run*
+    inserted into ``knowledge_items`` — never the size of the whole queue,
+    and never a count taken off the catalog file. Two reasons, in that
+    order:
+
+    * The catalog is rebuilt by full refresh on every run, so items an
+      earlier run queued are carried over into ``final_items`` still marked
+      ``pending``; counting those too would re-notify every admin about the
+      entire backlog whenever any watched file changed, and call all of it
+      "new" (which is exactly what the message below says).
+    * The queue admins actually open is ``repo.list_items(statuses=
+      ["pending"])`` on ``/admin/corporate-memory``, i.e. the DB. A count
+      taken off ``final_items`` announces items whose insert failed —
+      sending admins to a queue that does not contain them — and then goes
+      silent on the retry run that finally lands the row, because by then
+      the item is a *preserved* catalog entry rather than a new one.
+
+    The backlog gauge lives in ``stats["items_pending"]`` and the catalog's
+    own new-item count in ``stats["items_pending_new"]``; neither is what
+    gets published here.
 
     Mirrors ``app.services.sync_notifier.notify_sync_completed``'s fan-out
     pattern: ``publish_notification`` only reaches a member with a live
@@ -570,6 +581,7 @@ def collect_all(dry_run: bool = False) -> dict:
         "items_new": 0,
         "items_pending": 0,
         "items_pending_new": 0,
+        "items_pending_queued": 0,
         "skipped": False,
         "errors": [],
         "items_db_inserted": 0,
@@ -693,7 +705,9 @@ def collect_all(dry_run: bool = False) -> dict:
     # prints and POST /api/admin/run-corporate-memory returns);
     # ``items_pending_new`` is what *this run* added to it — preserved items
     # keep their old status through GOVERNANCE_FIELDS, so the two only
-    # coincide on a first run. Only the latter is notification-worthy.
+    # coincide on a first run. Both describe the catalog file; what admins
+    # actually review is the DB, so a third number, ``items_pending_queued``,
+    # is counted during the sync below and is the one that gets notified.
     stats["items_pending"] = sum(1 for item in final_items.values() if item.get("status") == "pending")
     stats["items_pending_new"] = sum(
         1 for item_id, item in final_items.items() if item_id not in existing_ids and item.get("status") == "pending"
@@ -743,6 +757,14 @@ def collect_all(dry_run: bool = False) -> dict:
 
         repo = _knowledge_repo()
         inserted = updated_count = errors = 0
+        # What the admin alert must count. ``/admin/corporate-memory`` renders
+        # ``repo.list_items(statuses=["pending"])`` — the DB, never
+        # knowledge.json — so an item only joins the review queue on the run
+        # whose ``create()`` actually succeeds. Counting the catalog instead
+        # got both ends of that wrong: a failed insert still alerted (queue
+        # shows nothing), and the retry that finally landed the row was by
+        # then a *preserved* catalog item, so it alerted nobody, ever.
+        pending_queued = 0
         for item_id, item in final_items.items():
             try:
                 existing = repo.get_by_id(item_id)
@@ -773,6 +795,8 @@ def collect_all(dry_run: bool = False) -> dict:
                         is_personal=item.get("is_personal", False),
                     )
                     inserted += 1
+                    if item.get("status", "pending") == "pending":
+                        pending_queued += 1
             except Exception as exc:
                 logger.warning("DB sync error for item %s: %s", item_id, exc)
                 errors += 1
@@ -785,14 +809,18 @@ def collect_all(dry_run: bool = False) -> dict:
         stats["items_db_inserted"] = inserted
         stats["items_db_updated"] = updated_count
         stats["items_db_errors"] = errors
+        stats["items_pending_queued"] = pending_queued
 
         # #1573: notify admins that this run queued something new to triage,
         # unless the instance opted out. Defaults on to match the schema
-        # default. Deliberately items_pending_new, not items_pending — the
+        # default. Deliberately items_pending_queued, not items_pending — the
         # knob is named notify_on_new_items, and re-announcing the standing
-        # backlog on every run is how a notification channel gets muted.
+        # backlog on every run is how a notification channel gets muted. An
+        # item is announced exactly once, on the run that inserts its row:
+        # every later run takes the ``update()`` branch and cannot re-count
+        # it, so the muting loop cannot come back through this path either.
         if governance_config.get("notify_on_new_items", True):
-            _notify_admins_of_pending_items(stats["items_pending_new"])
+            _notify_admins_of_pending_items(pending_queued)
 
         # Save user hashes only after DB sync — if every item failed to sync,
         # skip the hash write so the next scheduled run retries rather than

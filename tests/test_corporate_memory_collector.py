@@ -891,7 +891,14 @@ class TestNotifyCountsOnlyNewPendingItems:
             raising=False,
         )
         mock_repo = MagicMock()
-        mock_repo.get_by_id.return_value = None
+        # The three `old-*` items were queued by earlier runs, so they are
+        # already rows in knowledge_items — only the LLM's new item is absent.
+        # (A blanket `return_value = None` claimed the DB was empty while the
+        # fixture said three items had been sitting in the queue for weeks;
+        # now that the alert counts inserts, that contradiction matters.)
+        mock_repo.get_by_id.side_effect = lambda item_id: (
+            {"id": item_id, "status": "pending"} if item_id.startswith("old-") else None
+        )
 
         mock_group_repo = MagicMock()
         mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
@@ -941,4 +948,184 @@ class TestNotifyCountsOnlyNewPendingItems:
         assert stats["items_new"] == 0
         assert stats["items_pending"] == 3
         assert stats["items_pending_new"] == 0
+        assert published == []
+
+
+class TestNotifyFollowsTheDatabaseNotTheCatalog:
+    """The alert must count rows that reached ``knowledge_items``, not entries
+    in knowledge.json.
+
+    ``/admin/corporate-memory`` renders ``repo.list_items(statuses=
+    ["pending"])`` — the DB. The catalog file is written in step 10, before
+    the DB sync in step 11, and the sync swallows per-item exceptions into a
+    counter. Counting the catalog therefore breaks in both directions:
+
+    * a run whose insert failed still announces the item, sending every
+      admin to a queue that does not contain it, and
+    * the later run that finally lands the row sees the item as *preserved*
+      (it is in knowledge.json by then), so ``items_pending_new`` is 0 and
+      nobody is ever told the item arrived.
+
+    The two tests below are that pair. Both were green-by-accident before —
+    the first published a phantom alert, the second published nothing.
+    """
+
+    _NEW_ITEM = {
+        "existing_id": None,
+        "title": "Use indexes",
+        "content": "Always add indexes for frequent query columns.",
+        "category": "performance",
+        "tags": ["sql", "indexes"],
+        "source_users": ["alice"],
+    }
+
+    def _run(self, tmp_path, monkeypatch, *, seed_catalog: dict | None, create_raises: bool, in_db: set[str]):
+        collector = _make_collect_all_env(tmp_path, monkeypatch, {"items": [self._NEW_ITEM]})
+        if seed_catalog is not None:
+            _write_json(tmp_path / "knowledge.json", seed_catalog)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.side_effect = lambda item_id: (
+            {"id": item_id, "status": "pending"} if item_id in in_db else None
+        )
+        if create_raises:
+            mock_repo.create.side_effect = RuntimeError("knowledge_items insert failed")
+
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+        return stats, published
+
+    def test_failed_insert_does_not_announce_a_phantom_item(self, tmp_path, monkeypatch):
+        """The item is in the rebuilt catalog but its DB write blew up, so the
+        review queue is empty. Alerting here is the "point admins at an empty
+        queue" bug: the notification says 1 item awaits review and
+        /admin/corporate-memory shows none."""
+        stats, published = self._run(tmp_path, monkeypatch, seed_catalog=None, create_raises=True, in_db=set())
+
+        # The catalog-side numbers still see it — that is precisely why they
+        # are the wrong thing to notify on.
+        assert stats["items_new"] == 1
+        assert stats["items_pending_new"] == 1
+        assert stats["items_db_errors"] == 1
+        assert stats["items_db_inserted"] == 0
+
+        assert stats["items_pending_queued"] == 0
+        assert published == []
+
+    def test_retry_run_that_lands_the_row_finally_announces_it(self, tmp_path, monkeypatch):
+        """The run after the failure above. knowledge.json already carries the
+        item, so it is *preserved*, not new, and the catalog's new-item count
+        is 0 — yet this is the run on which the item actually joins the review
+        queue, so it is exactly the run that must alert."""
+        seeded = {
+            "items": {
+                "abc123": {
+                    "id": "abc123",
+                    "title": "Use indexes",
+                    "content": "Always add indexes for frequent query columns.",
+                    "category": "performance",
+                    "tags": ["sql", "indexes"],
+                    "source_users": ["alice"],
+                    "extracted_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "status": "pending",
+                    "confidence": 0.5,
+                    "approved_by": None,
+                    "approved_at": None,
+                    "mandatory_reason": None,
+                    "audience": "all",
+                    "review_by": None,
+                    "edited_by": None,
+                    "edited_at": None,
+                }
+            },
+            "metadata": {},
+        }
+        # The LLM reports it against its existing id, so it is preserved.
+        collector_response = {"items": [dict(self._NEW_ITEM, existing_id="abc123")]}
+        collector = _make_collect_all_env(tmp_path, monkeypatch, collector_response)
+        _write_json(tmp_path / "knowledge.json", seeded)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "review_queue", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None  # the failed insert left the DB empty
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_preserved"] == 1
+        assert stats["items_pending_new"] == 0, "the catalog sees a preserved item, which is the whole point"
+        assert stats["items_db_inserted"] == 1
+        assert stats["items_pending_queued"] == 1
+
+        assert len(published) == 1
+        assert published[0][1]["new_pending_count"] == 1
+
+    def test_approved_insert_is_not_announced_as_pending(self, tmp_path, monkeypatch):
+        """auto_publish writes rows straight to ``approved`` — they never enter
+        the review queue, so counting inserts must not count them."""
+        collector = _make_collect_all_env(tmp_path, monkeypatch, {"items": [self._NEW_ITEM]})
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"approval_mode": "auto_publish", "notify_on_new_items": True}},
+            raising=False,
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_id.return_value = None
+        mock_group_repo = MagicMock()
+        mock_group_repo.get_by_name.return_value = {"id": "admin-group-id"}
+        mock_member_repo = MagicMock()
+        mock_member_repo.list_members_for_group.return_value = [{"id": "admin-1", "active": True}]
+        published: list[tuple] = []
+
+        with (
+            patch.object(collector, "check_sensitivity", return_value=True),
+            patch("src.repositories.knowledge_repo", return_value=mock_repo),
+            patch("src.repositories.user_groups_repo", return_value=mock_group_repo),
+            patch("src.repositories.user_group_members_repo", return_value=mock_member_repo),
+            patch(
+                "app.notifications.publish_notification",
+                side_effect=lambda uid, payload: published.append((uid, payload)),
+            ),
+        ):
+            stats = collector.collect_all(dry_run=False)
+
+        assert stats["items_db_inserted"] == 1
+        assert stats["items_pending_queued"] == 0
         assert published == []

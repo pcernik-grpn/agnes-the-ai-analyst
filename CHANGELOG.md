@@ -147,9 +147,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   for review. The count is what *that run* added, never the standing backlog:
   the catalog is rebuilt by full refresh and preserved items keep their old
   `pending` status, so counting the whole queue would re-announce it (as
-  "new") on every run where any watched file changed. The run stats now carry
-  both numbers — `items_pending` (queue size) and `items_pending_new` (this
-  run's additions). `POST /api/memory` (the "add what you know" button)
+  "new") on every run where any watched file changed. It is also what
+  actually reached the review queue: the queue admins open is the
+  `knowledge_items` table, not `knowledge.json`, so the count comes from the
+  rows this run inserted. Counting the rebuilt catalog instead announced
+  items whose DB write had failed — sending admins to a queue that did not
+  contain them — and then went silent on the retry run that finally landed
+  the row, because by then the item was a *preserved* catalog entry rather
+  than a new one. The run stats now carry all three numbers —
+  `items_pending` (queue size), `items_pending_new` (this run's catalog
+  additions) and `items_pending_queued` (rows actually inserted as pending,
+  the one that is notified). `POST /api/memory` (the "add what you know" button)
   used to hardcode `status="pending"` regardless of configuration; it now
   respects `approval_mode` the same way the CLAUDE.local.md collector does —
   **on an instance with no `corporate_memory:` block at all** (the documented
