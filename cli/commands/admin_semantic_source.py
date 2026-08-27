@@ -44,7 +44,7 @@ def add_source(
     adapter: str = typer.Option(
         "native",
         "--adapter",
-        help="Adapter: native | keboola_metastore | snowflake_semantic (default: native)",
+        help="Adapter: native | keboola_metastore | snowflake_semantic | databricks_semantic (default: native)",
     ),
     repo_url: Optional[str] = typer.Option(None, "--repo-url", help="git: repository URL"),
     ref: Optional[str] = typer.Option(None, "--ref", help="git: branch/tag (default: repo default)"),

@@ -122,8 +122,9 @@ class TestClientOverTheWire:
 
 class TestSemanticLayerOverTheWire:
     def test_metric_views_land_in_metric_definitions(self, warehouse, e2e_env, monkeypatch):
-        from connectors.databricks.semantic_layer import sync_semantic_layer
+        from connectors.databricks.semantic_ossie import DatabricksSemanticAdapter
         from src.repositories import metric_repo
+        from src.semantic.importer import import_documents
 
         monkeypatch.setattr(
             "connectors.databricks.semantic_layer.resolve_databricks_settings",
@@ -135,30 +136,33 @@ class TestSemanticLayerOverTheWire:
                 "token": "tok-secret",
             },
         )
-        result = sync_semantic_layer(client=_client(warehouse))
+        monkeypatch.setattr(DatabricksSemanticAdapter, "_client", lambda self, settings: _client(warehouse))
 
-        assert result["status"] == "ok"
-        assert result["metric_views_seen"] == 1
-        assert result["created_or_updated"] == 1
+        documents = DatabricksSemanticAdapter().extract({})
+        assert len(documents) == 1
 
-        row = metric_repo().get("databricks/main.sales.orders_metrics/order_count")
+        report = import_documents({"source": "ossie_connection", "source_ref": "databricks_default"}, documents)
+        assert report.projection is not None
+        assert report.projection.metrics_written == 1
+
+        row = metric_repo().get("ossie_connection/databricks_default/main.sales.orders_metrics/order_count")
         assert row is not None
         assert row["sql"] == "SELECT MEASURE(`order_count`) FROM `main`.`sales`.`orders_metrics`"
-        assert row["source"] == "databricks_semantic_layer"
-        assert row["source_ref"] == "localhost"
+        assert row["source"] == "ossie_connection"
+        assert row["source_ref"] == "databricks_default"
 
     def test_discovery_sql_accepts_both_table_type_spellings(self, warehouse):
         """Vocabulary hardening: the emitted predicate must cover the
         underscore AND space spellings, mirroring the BigQuery extractor's
         MATERIALIZED VIEW / MATERIALIZED_VIEW normalisation."""
-        from connectors.databricks.semantic_layer import _list_metric_views
+        from connectors.databricks.semantic_ossie import _list_metric_views
 
         _list_metric_views(_client(warehouse), "main")
         submitted = [r for r in warehouse.requests if r.method == "POST"]
         assert submitted, "no statement was submitted"
         # The statement body is not recorded, so assert on the constant the
         # query is built from plus a round-trip through the live server.
-        from connectors.databricks.semantic_layer import _METRIC_VIEW_TABLE_TYPES
+        from connectors.databricks.semantic_ossie import _METRIC_VIEW_TABLE_TYPES
 
         assert "METRIC_VIEW" in _METRIC_VIEW_TABLE_TYPES
         assert "METRIC VIEW" in _METRIC_VIEW_TABLE_TYPES
