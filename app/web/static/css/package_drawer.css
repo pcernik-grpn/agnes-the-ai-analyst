@@ -79,17 +79,17 @@
  * for. Capped in height so the fields under it stay reachable without
  * scrolling the drawer body past them.
  */
-.pdw-tables__search {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 7px 11px;
-  font: inherit;
-  font-size: 13px;
-  border: 1px solid var(--ds-border);
-  border-radius: var(--ds-radius-btn);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  margin-bottom: 8px;
+/* The tables picker opens FROM the drawer, so it has to sit above it:
+   `.modal-backdrop` is z-index 1000 and `.ds-drawer` is 1200. Scoped to the
+   drawer's own host so no other modal on the page is affected. */
+#pdw-picker .modal-backdrop { z-index: 1300; }
+
+/* The member count, appended to the field label by renderTables. */
+.pdw-count {
+  margin-left: 6px;
+  font-weight: 400;
+  color: var(--ds-text-muted);
+  font-variant-numeric: tabular-nums;
 }
 .pdw-tables {
   max-height: 260px;

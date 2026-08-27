@@ -157,13 +157,19 @@
       // answers, so "no id yet" was never the obstacle it looked like. A
       // create that cannot choose tables makes an empty package and sends the
       // admin to a second surface to fill it.
+      // The panel shows THE PACKAGE, not the warehouse. It used to render the
+      // whole registry — ~500 rows in a project › bucket tree with tri-state
+      // boxes — with the members ticked somewhere inside it, so the five
+      // tables you had chosen were five ticks scattered through a hundred
+      // collapsed groups, and a table the conversation PROPOSED landed
+      // somewhere you would never see it. The tree itself is good and is kept
+      // verbatim — it moved inside the picker, where browsing belongs.
       '      <div class="ds-drawer__field" id="pdw-tables-field">' +
-      '        <label for="pdw-tables-search" id="pdw-tables-label">Tables in this package</label>' +
-      '        <p class="ds-drawer__hint" style="margin:0 0 8px;">Tick a table to include it.' +
+      '        <label id="pdw-tables-label">Tables in this package</label>' +
+      '        <p class="ds-drawer__hint" style="margin:0 0 8px;">What an analyst receives.' +
       '          <strong>Buckets</strong> come from the source project — they are not Agnes containers.</p>' +
-      '        <input type="text" id="pdw-tables-search" class="pdw-tables__search"' +
-      '               autocomplete="off" placeholder="Search tables…">' +
       '        <div id="pdw-tables" class="pdw-tables"></div>' +
+      '        <p class="ds-drawer__hint" id="pdw-tables-reach" hidden></p>' +
       '      </div>' +
       '      <details class="ds-drawer__disclose" id="pdw-access">' +
       '        <summary>Who gets it <span class="ds-drawer__opt">(optional)</span></summary>' +
@@ -176,6 +182,7 @@
       '      <div class="ds-drawer__err" id="pdw-err" hidden></div>' +
       '    </section>' +
       '  </div>' +
+      '  <div id="pdw-picker"></div>' +
       '  <div class="ds-drawer__foot">' +
       '    <span class="ds-drawer__foot-gap"></span>' +
       '    <button type="button" class="btn btn-secondary" data-pdw-close>Cancel</button>' +
@@ -204,8 +211,9 @@
       groups: root.querySelector('#pdw-groups'),
       tablesField: root.querySelector('#pdw-tables-field'),
       tablesLabel: root.querySelector('#pdw-tables-label'),
-      tablesSearch: root.querySelector('#pdw-tables-search'),
       tables: root.querySelector('#pdw-tables'),
+      tablesReach: root.querySelector('#pdw-tables-reach'),
+      picker: root.querySelector('#pdw-picker'),
       err: root.querySelector('#pdw-err'),
       submit: root.querySelector('#pdw-submit'),
       foot: root.querySelector('.ds-drawer__foot'),
@@ -266,10 +274,17 @@
         });
       }
     });
-    // Re-render on search rather than filtering the DOM: the list is
-    // re-sorted (members first) as ticks change, so one renderer owns both.
-    els.tablesSearch.addEventListener('input', function () { if (st) renderTables(); });
-    els.tables.addEventListener('change', function (e) {
+    // The search lives in the picker now, so it is delegated: the modal is
+    // re-rendered on every tick and a listener bound to the input would die
+    // with it.
+    els.picker.addEventListener('input', function (e) {
+      if (!st) return;
+      if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'pdw-tables') {
+        pickerQuery = e.target.value;
+        renderPickerRows();
+      }
+    });
+    els.picker.addEventListener('change', function (e) {
       if (!st) return;
       var box = e.target.closest('input[type="checkbox"]');
       if (!box) return;
@@ -278,7 +293,7 @@
         if (box.checked) st.tablesSelected.add(id); else st.tablesSelected.delete(id);
         // Re-render so the group boxes above it re-tally — a bucket that reads
         // "all" after one of its tables was unticked is worse than no summary.
-        renderTables();
+        renderPickerRows();
         return;
       }
       if (!box.classList.contains('pdw-grp__box')) return;
@@ -289,12 +304,25 @@
       tablesUnder(box.getAttribute('data-project'), box.getAttribute('data-bucket')).forEach(function (t) {
         if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
       });
-      renderTables();
+      renderPickerRows();
     });
-    // A click on the group's checkbox must not also open/close the <details>
-    // it lives in the <summary> of.
+    els.picker.addEventListener('click', function (e) {
+      // A click on the group's checkbox must not also open/close the <details>
+      // it lives in the <summary> of.
+      if (e.target.closest('.pdw-grp__box')) { e.stopPropagation(); return; }
+      if (e.target.closest('[data-ag-pick-close]')) { closePicker(); return; }
+      // Outside the card but inside the overlay — the standard way out.
+      if (e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
+    });
+    // Remove, and the way back in, both live on the panel.
     els.tables.addEventListener('click', function (e) {
-      if (e.target.closest('.pdw-grp__box')) e.stopPropagation();
+      if (!st) return;
+      if (e.target.closest('[data-pdw-openpick]')) { openPicker(); return; }
+      var rm = e.target.closest('[data-pdw-unpick]');
+      if (rm) {
+        st.tablesSelected.delete(rm.getAttribute('data-pdw-unpick'));
+        renderTables();
+      }
     });
     els.submit.addEventListener('click', submit);
     return els;
@@ -330,9 +358,10 @@
       ? 'Permanent — it is in this package’s URL and in every grant written against it.'
       : 'URL-safe identifier; follows the name until you edit it.';
     els.access.hidden = false;
-    // Both modes carry the list; only the label differs, because on a create
-    // there is no existing membership for "in this package" to refer to.
-    els.tablesLabel.textContent = editing ? 'Tables in this package' : 'Tables to include';
+    // One label for both modes now. It used to read "Tables to include" on a
+    // create, which was a instruction to go ticking; the panel shows what IS
+    // in the package in either mode, so the noun is the same either way.
+    els.tablesLabel.textContent = 'Tables in this package';
     els.submit.textContent = editing ? 'Save changes' : 'Create package';
   }
 
@@ -355,7 +384,7 @@
      is unticked. */
 
   function tableGroups() {
-    var q = (els.tablesSearch.value || '').trim().toLowerCase();
+    var q = (pickerQuery || '').trim().toLowerCase();
     var projects = [];
     var byProject = {};
     st.registry.forEach(function (t) {
@@ -395,25 +424,108 @@
     return (state === 'all' ? ' checked' : '') + (state === 'some' ? ' data-indeterminate="1"' : '');
   }
 
+  /* Panel state: only what is in the package. */
+  var pickerQuery = '', pickerOpen = false;
+
+  function selectedTables() {
+    if (!st) return [];
+    var byId = {};
+    st.registry.forEach(function (t) { byId[t.id] = t; });
+    var out = [];
+    st.tablesSelected.forEach(function (id) {
+      out.push(byId[id] || { id: id, name: id, source_type: '', query_mode: '', project: '' });
+    });
+    out.sort(function (a, b) { return String(a.name || a.id).localeCompare(String(b.name || b.id)); });
+    return out;
+  }
+
+  /* An admin has to know `query_mode IN ('local','materialized') AND NOT
+     server_only` to predict what a package actually delivers — see
+     app/api/data.py::_DISTRIBUTABLE_QUERY_MODES. Say it instead. */
+  function reachCount(rows) {
+    return rows.filter(function (t) {
+      return !t.server_only && (t.query_mode === 'local' || t.query_mode === 'materialized');
+    }).length;
+  }
+
   function renderTables() {
+    if (!st) return;
+    var rows = selectedTables();
+    var body;
+    if (!rows.length) {
+      body = '<p class="ag-emptyrows">Nothing in it yet. Add the tables an analyst should receive.</p>';
+    } else {
+      body = '<div class="ag-rows">' + rows.map(function (t) {
+        // Dedupe: for an internal table the project, the source type and the
+        // query mode are all the same word, and "internal · internal ·
+        // internal" reads as a rendering bug.
+        var seen = {};
+        var sub = [t.project, t.source_type, t.query_mode].filter(function (v) {
+          var k = String(v || '').toLowerCase();
+          if (!k || seen[k]) return false;
+          seen[k] = 1;
+          return true;
+        }).map(esc).join(' · ');
+        return '<div class="ag-row">' +
+          '<div class="ag-row-body">' +
+            '<div class="ag-row-name">' + esc(t.name || t.id) + '</div>' +
+            (sub ? '<div class="ag-row-desc">' + sub + '</div>' : '') +
+          '</div>' +
+          '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-pdw-unpick="' + esc(t.id) + '">Remove</button>' +
+        '</div>';
+      }).join('') + '</div>';
+    }
+    els.tables.innerHTML = body +
+      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>';
+    if (els.tablesLabel) {
+      var count = els.tablesLabel.querySelector('.pdw-count');
+      if (!count) {
+        count = document.createElement('span');
+        count.className = 'pdw-count';
+        els.tablesLabel.appendChild(count);
+      }
+      count.textContent = rows.length ? '  ' + rows.length : '';
+    }
+    if (els.tablesReach) {
+      var reach = reachCount(rows);
+      els.tablesReach.hidden = !rows.length;
+      els.tablesReach.textContent = rows.length
+        ? (reach === rows.length
+            ? (reach === 1 ? 'This table reaches an analyst’s laptop through agnes pull.'
+                           : 'All ' + reach + ' reach an analyst’s laptop through agnes pull.')
+            : reach + ' of ' + rows.length + ' reach an analyst’s laptop through agnes pull; the rest stay server-side.')
+        : '';
+    }
+    renderPicker();
+  }
+
+  /* ── The picker ──
+     The project › bucket tree, unchanged, behind a `+`. Browsing a registry is
+     a detour from describing a package, and it should end by returning you to
+     what you were describing — the same reason /agents' ingredient picker and
+     the plugin builder's contents picker are modals. */
+  function pickerRowsHtml() {
     var projects = tableGroups();
     if (!projects.length) {
-      els.tables.innerHTML = '<p class="ds-drawer__hint">No table matches that.</p>';
-      return;
+      return '<p class="ag-emptyrows">No table matches that.</p>';
     }
-    var searching = !!(els.tablesSearch.value || '').trim();
+    var searching = !!(pickerQuery || '').trim();
     var html = projects.map(function (p) {
       var pTables = [];
       p.order.forEach(function (bk) { pTables = pTables.concat(p.buckets[bk].tables); });
       var pState = tallyState(pTables);
       // Open when searching (the match is the point), or when the group
       // already contributes to the package — a member you cannot see is a
-      // member you cannot remove.
-      var pOpen = searching || pState !== 'none';
+      // member you cannot remove. Also when it is the ONLY project: now that
+      // the tree lives behind a `+`, an instance with one source would open
+      // the picker onto a single collapsed heading and nothing to add.
+      var pOpen = searching || pState !== 'none' || projects.length === 1;
       var buckets = p.order.map(function (bk) {
         var b = p.buckets[bk];
         var bState = tallyState(b.tables);
-        var bOpen = searching || bState !== 'none';
+        // Same reasoning one level down: one project with one bucket is a flat
+        // list, and two clicks to reach it is two clicks of nothing.
+        var bOpen = searching || bState !== 'none' || (projects.length === 1 && p.order.length === 1);
         var rows = b.tables.map(function (t) {
           var on = st.tablesSelected.has(t.id);
           var sub = [t.source_type, t.query_mode].filter(Boolean).map(esc).join(' · ');
@@ -441,12 +553,68 @@
         '<span class="pdw-grp__n">' + pTables.length + '</span>' +
         '</summary>' + buckets + '</details>';
     }).join('');
-    els.tables.innerHTML = html;
+    return html;
+  }
+
+  function pickerHtml() {
+    if (!pickerOpen) return '';
+    var shown = 0, total = 0;
+    (st ? st.registry : []).forEach(function () { total++; });
+    tableGroups().forEach(function (p) {
+      p.order.forEach(function (bk) { shown += p.buckets[bk].tables.length; });
+    });
+    return BuilderShell.picker({
+      key: 'pdw-tables',
+      title: 'Add tables to this package',
+      sub: 'Everything registered on this instance. A bucket or a project ticks everything under it.',
+      searchPlaceholder: 'Search tables…',
+      query: pickerQuery,
+      shown: shown,
+      total: total,
+      rows: pickerRowsHtml(),
+      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a> first.',
+    });
+  }
+
+  function renderPicker() {
+    if (!els || !els.picker) return;
+    els.picker.innerHTML = pickerHtml();
     // `indeterminate` is a PROPERTY with no HTML attribute, so it cannot ride
     // the markup above and has to be set after the paint.
-    els.tables.querySelectorAll('[data-indeterminate]').forEach(function (b) {
+    els.picker.querySelectorAll('[data-indeterminate]').forEach(function (b) {
       b.indeterminate = true;
     });
+  }
+
+  /* Rows + count only, so the search box keeps its focus and caret. */
+  function renderPickerRows() {
+    if (!els || !els.picker) return;
+    var host = els.picker.querySelector('[data-rows="pdw-tables"]');
+    if (!host) { renderPicker(); return; }
+    host.innerHTML = pickerRowsHtml();
+    host.querySelectorAll('[data-indeterminate]').forEach(function (b) { b.indeterminate = true; });
+    var shown = 0;
+    tableGroups().forEach(function (p) {
+      p.order.forEach(function (bk) { shown += p.buckets[bk].tables.length; });
+    });
+    var cnt = els.picker.querySelector('[data-count="pdw-tables"]');
+    if (cnt) cnt.textContent = shown + ' of ' + (st ? st.registry.length : 0);
+  }
+
+  function openPicker() {
+    pickerOpen = true;
+    pickerQuery = '';
+    renderPicker();
+    var box = els.picker.querySelector('[data-ag-search="pdw-tables"]');
+    if (box) box.focus();
+  }
+
+  function closePicker() {
+    if (!pickerOpen) return;
+    pickerOpen = false;
+    // renderTables repaints the panel with whatever was picked and clears the
+    // modal host on its way through renderPicker.
+    renderTables();
   }
 
   /* Every table under a group, honouring the current search — ticking a group
@@ -488,6 +656,7 @@
         return {
           id: t.id, name: t.name || t.id, bucket: t.bucket || '',
           source_type: t.source_type || '', query_mode: t.query_mode || '',
+          server_only: !!t.server_only,
           // Project = the source connection this table came through. Tables
           // with no connection (internal, and the derived sources) fall back
           // to the source's own name, which is the truthful grouping for them.
@@ -503,7 +672,7 @@
       members.forEach(function (id) {
         if (!known.has(id)) {
           st.registry.push({ id: id, name: id, bucket: 'Ungrouped', source_type: '',
-                             query_mode: '', project: 'Other' });
+                             query_mode: '', server_only: false, project: 'Other' });
         }
       });
       renderTables();
@@ -722,7 +891,11 @@
       document.body.style.overflow = 'hidden';
     }
     els.body.scrollTop = 0;
-    els.tablesSearch.value = '';
+    // The picker's own state belongs to the drawer session, not the page: a
+    // second open must not inherit the last search or a left-open modal.
+    pickerQuery = '';
+    pickerOpen = false;
+    if (els.picker) els.picker.innerHTML = '';
     els.tables.innerHTML = '<p class="ds-drawer__hint">Loading…</p>';
     if (mode === 'edit') {
       hydratePackage(opts.pkgId);
