@@ -95,6 +95,76 @@ def _agnes_payload(obj: dict) -> dict:
     return merged
 
 
+def _resolve_keboola_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
+    """The ``table_registry`` row a raw Keboola tableId (``bucket.table``)
+    resolves to, via the ``(bucket, table) -> view name`` ``lookup``
+    (:func:`connectors.keboola.semantic_layer.table_lookup_from_registry`).
+
+    The one place that turns a Keboola tableId match into the row a caller
+    needs — shared by :func:`resolve_dataset_table` (a one-off caller, which
+    builds ``lookup`` fresh per call) and :func:`_table_binder`'s per-metric
+    closure (which builds ``lookup`` ONCE for the whole
+    :func:`project_document` call and reuses it here), so there is exactly
+    one Keboola dataset-resolution implementation, not two.
+    """
+    from connectors.keboola.semantic_layer import resolve_table_name
+    from src.repositories import table_registry_repo
+
+    view_name = resolve_table_name(table_ref, lookup)
+    if not view_name:
+        return None
+    return table_registry_repo().get_by_name(view_name)
+
+
+def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str]:
+    """The ``table_registry.id`` a dataset resolves to, or ``None`` when it
+    can't be resolved — source-agnostic, used by both the metric-binding
+    leg of :func:`project_document` (via :func:`_table_binder`) and
+    :func:`src.semantic_coverage.tables_without_semantic_coverage`.
+
+    ``source`` is the document's own provenance (``semantic_models.source``,
+    e.g. ``"keboola_metastore"``, ``"manual"``, ``"ossie_git"``):
+
+    - ``source == "keboola_metastore"``: the Keboola metastore adapter
+      composes a dataset's ``source`` field as the raw Keboola tableId
+      (``bucket.table`` — see ``connectors/keboola/semantic_ossie.py::
+      _compose_dataset``), never the registered Agnes name. Resolved via
+      the existing ``table_lookup_from_registry()`` ->
+      ``resolve_table_name()`` chain (see :func:`_resolve_keboola_table_row`).
+    - every other source: ``dataset.source`` (falling back to
+      ``dataset.name``) is matched literally against ``table_registry.id``
+      then ``table_registry.name`` — confirmed correct for non-Keboola
+      sources (see the module docstring note near ``_MANUAL_DOCUMENT_
+      SOURCE``: a manual dataset's ``source`` IS an Agnes table id).
+
+    ``conn`` is accepted for signature stability (mirrors
+    ``app.auth.scheduler_token.ensure_scheduler_user``) — actual repo access
+    goes through the ``*_repo()`` factory, never a raw connection, so a
+    Postgres-backed instance resolves correctly too.
+    """
+    del conn
+    table_ref = dataset.get("source") or dataset.get("name") or ""
+    if not table_ref:
+        return None
+
+    from src.repositories import table_registry_repo
+
+    if source == "keboola_metastore":
+        try:
+            from connectors.keboola.semantic_layer import table_lookup_from_registry
+
+            lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola"))
+        except Exception:  # pragma: no cover - a registry read failure must not raise
+            return None
+        if not lookup:
+            return None
+        row = _resolve_keboola_table_row(table_ref, lookup)
+        return row["id"] if row else None
+
+    row = table_registry_repo().get(table_ref) or table_registry_repo().get_by_name(table_ref)
+    return row["id"] if row else None
+
+
 def _table_binder():
     """Return ``resolve(table_id) -> view_name | None`` over the registered
     Keboola tables, or ``None`` when nothing is registered.
@@ -105,9 +175,18 @@ def _table_binder():
     projector keeps no import-time dependency on a connector, and so a second
     adapter can be given its own resolver here rather than at every callsite.
     Never raises: an instance with no Keboola tables simply binds nothing.
+
+    Delegates the actual Keboola-tableId -> row resolution to
+    :func:`_resolve_keboola_table_row` (the same primitive
+    :func:`resolve_dataset_table` uses) — the lookup dict is still built
+    ONCE here (not per metric), so a routine sync of a few hundred metrics
+    stays a single registry scan; each metric's ``resolve(table_id)`` call
+    then costs one extra indexed ``table_registry`` point-lookup (name ->
+    row) it did not pay before this refactor, in exchange for there being
+    exactly one Keboola resolution implementation.
     """
     try:
-        from connectors.keboola.semantic_layer import resolve_table_name, table_lookup_from_registry
+        from connectors.keboola.semantic_layer import table_lookup_from_registry
         from src.repositories import table_registry_repo
 
         lookup = table_lookup_from_registry(table_registry_repo().list_by_source("keboola"))
@@ -115,7 +194,12 @@ def _table_binder():
         return None
     if not lookup:
         return None
-    return lambda table_id: resolve_table_name(table_id, lookup)
+
+    def resolve(table_id: str) -> Optional[str]:
+        row = _resolve_keboola_table_row(table_id, lookup)
+        return row["name"] if row else None
+
+    return resolve
 
 
 def _keboola_lookups():
@@ -222,6 +306,45 @@ def _constraints_for(metric_name: str, constraints: list) -> Optional[dict]:
     return {"rules": rules} if rules else None
 
 
+def _check_name_collision(metric_name: str, metric_id: str, source: str, source_ref: Optional[str]) -> bool:
+    """True when ``metric_name`` is already held by a DIFFERENT metric id
+    from a DIFFERENT (source, source_ref) scope — logged as a WARN, never a
+    skip.
+
+    ``metric_definitions.name`` has no unique constraint (unlike ``id``, its
+    primary key): two writers describing a metric with the same display name
+    both get their own row. That is a pre-existing gap this projector does
+    not close (closing it needs a product decision — which writer wins, or
+    whether both should even be allowed — out of scope here); this is the
+    "don't over-build it" minimum: a same-transaction check that surfaces the
+    collision instead of the write silently proceeding unremarked, so an
+    operator investigating an ambiguous `agnes catalog --metrics` lookup by
+    name has a log line pointing at both ids involved. Scoped on
+    ``(source, source_ref)``, not ``source`` alone: two source_refs of the
+    SAME source (e.g. two Keboola projects) are two independent writers too —
+    each owns its own prune scope and its own metric id — so a name they both
+    happen to use is exactly as ambiguous as one shared across sources.
+    """
+    existing = metric_repo().find_by_name(metric_name)
+    if existing is None or existing.get("id") == metric_id:
+        return False
+    if (existing.get("source") or "") == source and (existing.get("source_ref") or "") == (source_ref or ""):
+        return False
+    logger.warning(
+        "Semantic projection (%s/%s): metric name %r is already used by metric id %r from source %r "
+        "(source_ref=%r); writing %r as a separate row — metric_definitions.name has no uniqueness "
+        "constraint, so both rows will exist and a name-only lookup may be ambiguous.",
+        source,
+        source_ref,
+        metric_name,
+        existing["id"],
+        existing.get("source"),
+        existing.get("source_ref"),
+        metric_id,
+    )
+    return True
+
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -273,6 +396,13 @@ class ProjectionReport:
     columns_written: int = 0
     metrics_pruned: int = 0
     glossary_pruned: int = 0
+    # A written metric's NAME already belonged to a different id under a
+    # different source (see `_check_name_collision`) — `metric_definitions
+    # .name` has no uniqueness constraint (Task: "don't over-build this"), so
+    # this is a same-transaction, non-blocking check: the metric is still
+    # written under its own id, both rows exist, and this only counts how
+    # often that happened this pass.
+    name_collisions: int = 0
     skipped: list[dict] = field(default_factory=list)
 
 
@@ -462,6 +592,8 @@ def project_document(
             grain = grain_by_table.get(table_id)
             notes = [f"dataset grain: {grain}"] if grain else None
             metric_id = _scoped_id(source, source_ref, model_key, metric_name)
+            if _check_name_collision(metric_name, metric_id, source, source_ref):
+                report.name_collisions += 1
             metric_repo().create(
                 id=metric_id,
                 name=metric_name,
@@ -520,6 +652,11 @@ def project_document(
                     basetype=column.get("datatype"),
                     description=column.get("description"),
                     source=column_source,
+                    # Recorded, not yet scoped on: `_prune_columns` still
+                    # prunes on `(table_id, source)` alone (see its
+                    # docstring) — this is the "small housekeeping" of
+                    # capturing the value, not a prune-scope change.
+                    source_ref=source_ref,
                 )
                 field_names.add(column_name)
                 report.columns_written += 1

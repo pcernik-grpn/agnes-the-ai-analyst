@@ -80,6 +80,10 @@ _COHORT: dict[str, tuple[str, str]] = {
         "admin semantic-layer coverage",
         "admin_semantic_layer_coverage",
     ),
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # source — distinct from the Keboola-only endpoint above.
+    "/api/admin/semantic-coverage": ("semantic-model coverage tables", "admin_semantic_coverage"),
     # Cross-domain, cross-source completeness (F4.1) — deliberately a
     # DIFFERENT path from the Keboola-only report above, which it aggregates
     # rather than replaces. The tag/untag mutations are in the cohort, not
@@ -879,6 +883,15 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,
     "/api/semantic-models/search": _SEMANTIC_MODELS_SEARCH_REASON,
+    "/api/semantic-models/bundle": (
+        "Fáze 1 physical-distribution cache — RBAC-scoped semantic-model "
+        "bundle consumed by `agnes pull` (renders the read-only local cache "
+        "under `<workspace>/semantic/<slug>/…`, `src/semantic/"
+        "cache_render.py`); no MCP/interactive analogue, mirrors the "
+        "/api/memory/bundle and /api/knowledge/digests/{digest_id}/content "
+        "delivery channels — an agent's live read path is already "
+        "`get_semantic_context`/`get_semantic_schema` (in _COHORT above)."
+    ),
     "/api/attachments/{source}/{attachment_id}/download": (
         "connector-catalogued attachment binary download (Jira first) — one-shot "
         "fetch by id consumed by `agnes attachment get`; binary byte-stream with "
@@ -1078,6 +1091,12 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven idle-app reaper trigger (data-apps platform Task 9) — "
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/semantic-auto-draft-sweep": (
+        "scheduler-driven semantic-layer auto-draft sweep trigger "
+        "(semantic-phase5 wave 2) — admin/scheduler maintenance op, mirrors "
+        "the run-keboola-semantic-layer-refresh / run-audit-prune "
+        "exemptions; no analyst CLI/MCP analogue"
     ),
 }
 

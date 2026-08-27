@@ -63,12 +63,22 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     ),
     "POST /api/semantic-feedback": "filing feedback writes `semantic_feedback`, a PG-only table (F4.5)",
     "POST /api/admin/semantic-layer/mutes": ("muting a check writes `semantic_health_mutes`, a PG-only table (F4.3)"),
+    "POST /api/admin/semantic-auto-draft-sweep": (
+        "the sweep's dedup flag (table_registry.mark_semantic_draft_pending / "
+        "clear_semantic_draft_pending) is a Postgres-only column (semantic-"
+        "phase5 wave 2, A3 PG-first ratchet) — no DuckDB implementation exists"
+    ),
 }
 
 
 def test_mutation_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods=_METHODS, skip_substr=_SKIP_SUBSTR)
+    # Must run here, before `build_seeded_client("pg", ...)` below repoints
+    # AGNES_DB_URL — the repo factory reads the backend live on every call,
+    # so re-querying `duck_client` after that point would silently exercise
+    # Postgres repos through DuckDB-configured routes.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
 
     # The fail-clean check MUST run before the pg client is built:
     # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it

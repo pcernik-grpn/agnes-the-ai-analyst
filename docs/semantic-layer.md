@@ -385,6 +385,7 @@ agnes semantic-model validate-query "<SQL>"  # see "Query validation" above
 agnes semantic-model coverage [--source <id>] [--json]   # see "Coverage" above
 agnes semantic-model coverage tag <type> <resource-id> <source-id>
 agnes semantic-model coverage untag <tag-id>
+agnes semantic-model coverage tables [--limit N] [--json]   # source-agnostic: tables with NO model at all
 
 agnes semantic-model health [--json]   # admin, see "Health" above
 

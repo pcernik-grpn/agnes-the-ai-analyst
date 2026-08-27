@@ -5698,6 +5698,11 @@ async def update_table(
             "access_policy_updated_at",
             "access_policy_updated_by",
             "policy_mapping",
+            # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
+            # bookkeeping, not a human-editable PUT field. register() doesn't
+            # accept it; it has its own setters
+            # (mark_semantic_draft_pending / clear_semantic_draft_pending).
+            "semantic_draft_pending_at",
         ):
             merged.pop(_policy_key, None)
 

@@ -69,6 +69,20 @@ def test_admin_queue_and_approve_flow(seeded_app):
     assert a2.status_code == 409
 
 
+def test_reject_flow_for_a_domain_without_a_side_effect(seeded_app):
+    """`_SIDE_EFFECTS` is domain-keyed and most domains have no entry — a
+    reject for one of those must resolve normally rather than error."""
+    c = seeded_app["client"]
+    sid = _submit(c, seeded_app["analyst_token"]).json()["id"]
+    r = c.post(
+        f"/api/admin/authoring-suggestions/{sid}/reject",
+        headers=_auth(seeded_app["admin_token"]),
+        json={"note": "no thanks"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
 def test_admin_endpoints_require_admin(seeded_app):
     c = seeded_app["client"]
     r = c.get("/api/admin/authoring-suggestions", headers=_auth(seeded_app["analyst_token"]))
@@ -196,9 +210,7 @@ def test_an_approved_corporate_memory_submission_keeps_the_knowledge(seeded_app)
     assert a.status_code == 200, a.text
 
     conn = get_system_db()
-    items = [
-        it for it in KnowledgeRepository(conn).list_items(limit=200) if it.get("domain") == "month-end-close"
-    ]
+    items = [it for it in KnowledgeRepository(conn).list_items(limit=200) if it.get("domain") == "month-end-close"]
     conn.close()
     assert items, "the knowledge the author wrote did not survive approval"
     assert items[0]["content"] == content

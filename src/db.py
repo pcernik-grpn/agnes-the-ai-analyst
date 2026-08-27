@@ -574,6 +574,12 @@ CREATE TABLE IF NOT EXISTS table_profiles (
 -- resource_grants (ResourceType.TABLE). Access requests flow removed —
 -- users contact admin out-of-band; admin grants via /admin/access.
 
+-- `name` is DELIBERATELY not unique: several independent writers (manual,
+-- keboola_metastore, snowflake_semantic, databricks_metrics, ...) can each
+-- describe a metric with the same display name, and `id` (the real key) is
+-- scoped per-writer. src/semantic/projection.py::_check_name_collision logs
+-- (not blocks) a same-name write from a different source — see that
+-- function's docstring for why a hard uniqueness constraint is not the fix.
 CREATE TABLE IF NOT EXISTS metric_definitions (
     id              VARCHAR PRIMARY KEY,
     name            VARCHAR NOT NULL,
@@ -9011,6 +9017,12 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
             # version stamp, which on this branch is what leaves the DB at
             # SCHEMA_VERSION.
             _v123_to_v124(conn)
+            # A3 PG-first ratchet: the ladder is frozen at v124
+            # (FROZEN_DUCKDB_SCHEMA_VERSION) — no further _vN_to_v(N+1) step
+            # is added here. New app-state schema work lands as an
+            # Alembic-only revision; see CLAUDE.md -> "Dual-backend
+            # discipline" and docs/migrations.md -> "Adding a PG-only
+            # feature".
             # Fresh-install seed is handled by the unconditional
             # _seed_core_roles call at the bottom of _ensure_schema —
             # left as a no-op branch here so the migration ladder still

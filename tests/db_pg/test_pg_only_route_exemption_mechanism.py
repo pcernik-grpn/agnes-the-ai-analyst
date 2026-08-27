@@ -12,9 +12,13 @@ either a false-positive failure or a silent blind spot that could hide a real
 ``_parity_sweep_util.diff_statuses(..., exempt=...)`` +
 ``assert_pg_only_exemptions_fail_clean`` are that mechanism. These are unit
 tests against the mechanism itself (the "error path directly", per the A3
-work-package acceptance); the live routes that use it are
-``/api/admin/semantic-model/coverage*`` (F4.1), listed in both production
-sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS``.
+work-package acceptance), driven with fakes so they stay independent of
+whichever route is the current example. Live production users: the GET
+sweep's ``_PG_ONLY_ROUTE_EXEMPTIONS`` (``tests/db_pg/
+test_get_status_parity_sweep.py``) lists every read-only F4.x semantic-layer
+route backed by a PG-only table (coverage, health, mutes — F4.1–F4.3); the
+mutation sweep's own list (``tests/db_pg/test_mutation_status_parity_sweep.py``)
+carries ``POST /api/admin/semantic-auto-draft-sweep`` (semantic-phase5 wave 2).
 
 The fail-clean check is intentionally narrow: TYPED 501
 (``body["error"] == "requires_postgres_backend"``), not "any 4xx/501" — a
@@ -257,9 +261,10 @@ def test_post_reload_raise_still_translates_to_typed_501(tmp_path, monkeypatch):
 
 
 def test_production_pg_only_exemptions_all_have_reasons():
-    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` are ``dict[str, str]``,
-    so an exemption can never be added without a stated reason a reviewer can
-    weigh."""
+    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` must be dicts, and
+    every entry (the mutation sweep now carries one — the semantic-layer
+    auto-draft sweep, semantic-phase5 wave 2) must carry a non-empty
+    reason, so an exemption can never be added silently."""
     import tests.db_pg.test_get_status_parity_sweep as get_sweep
     import tests.db_pg.test_mutation_status_parity_sweep as mutation_sweep
 

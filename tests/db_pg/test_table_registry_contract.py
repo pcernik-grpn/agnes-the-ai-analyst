@@ -158,3 +158,11 @@ class TestDeleteInternalExcept:
         assert removed == 0
         assert repos["registry"].get("agnes_sessions") is not None
         assert repos["registry"].get("agnes_telemetry") is not None
+
+
+# NOTE: mark_semantic_draft_pending / clear_semantic_draft_pending
+# (semantic-phase5 wave 2's auto-draft sweep dedup flag) are PG-only (A3
+# PG-first ratchet — table_registry.semantic_draft_pending_at is a
+# Postgres-only column with no DuckDB sibling), so they are not part of
+# this dual-backend contract. See tests/db_pg/test_table_registry_pg.py
+# for their PG-only-shaped coverage.

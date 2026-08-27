@@ -25600,6 +25600,114 @@
         ]
       }
     },
+    "/api/admin/semantic-auto-draft-sweep": {
+      "post": {
+        "description": "Draft a semantic model for tables with zero semantic-layer coverage.\n\nScheduler-triggered every 55 minutes (``services/scheduler/__main__.py``)\n\u2014 admins can also fire it on demand. For up to ``_SWEEP_BATCH_SIZE``\nuncovered, not-already-pending tables (``tables_without_semantic_\ncoverage``, filtered on ``semantic_draft_pending_at IS NULL``), runs a\nheadless ``semantic-model-builder`` chat session (``app.chat.headless.\nrun_one_shot``) authenticated as the non-admin ``semantic-drafter``\nsystem identity (``app.auth.system_users``) \u2014 so every draft it\nproduces lands in the ``authoring_suggestions`` moderation queue\nexactly like a human-submitted proposal, never applied directly.\n\nDedup: each selected table's ``semantic_draft_pending_at`` is stamped\nBEFORE its session is invoked, not after \u2014 a concurrent or overlapping\nsweep tick can then never pick up the same table twice. The flag\nclears when an admin resolves the resulting suggestion, approve or\nreject alike (``app/api/authoring_suggestions.py``).\n\nA session hitting the chat manager's per-user concurrency cap\n(``ConcurrencyCapHit``) is counted and skipped, never raised as a\n500 \u2014 and its dedup flag is cleared again on the way out, so the\ntable stays eligible for a later tick. That un-stamping matters: the\ncap is enforced inside ``ChatManager.create_session``, before the\nprompt is ever sent, so a capped table's session never started and no\nsuggestion will ever exist to clear the flag on resolution. Left set,\nthe flag would exclude the table from every future sweep permanently.\n\nANY other failure from a table's session is treated the same way and\nfor the same reason (counted in ``errored``): the table is un-stamped,\nlogged, and the sweep moves on to the next one rather than letting one\ntransient broker/LLM/spawn error 500 the whole tick and abandon the\nrest of the batch. Un-stamping on an error the session may have\nsurvived can at worst cost a duplicate draft \u2014 one extra queued\nsuggestion an admin rejects \u2014 whereas leaving it stamped costs the\ntable its eligibility forever, silently. The bounded, visible failure\nis the right one to choose.\n\nReturns ``{\"triggered\": N, \"applied\": A, \"no_apply_call\": X,\n\"skipped_cap\": M, \"errored\": E, \"remaining\": R}`` \u2014 ``applied`` counts a table whose\nsession produced a NEW ``authoring_suggestions`` row before this\ncall's wait ended, detected by diffing the semantic-drafter's pending\nsuggestion count immediately before and after each session (sessions\nrun strictly in order, one at a time, so the diff cannot be confused\nby another table's suggestion); ``no_apply_call`` is everything else\nthe session actually ran for. ``remaining`` is how many eligible\ntables were left over after this tick's batch.\n\nA3 PG-first ratchet: the dedup flag this sweep relies on\n(``table_registry.mark_semantic_draft_pending`` /\n``clear_semantic_draft_pending``) is a Postgres-only capability \u2014 the\nDuckDB app-state ladder is frozen at v124 and never gained the backing\ncolumn. On a DuckDB-backend instance this raises\n:class:`~src.repositories.RequiresPostgresBackend`, translated by the\napp-wide handler in ``app/main.py`` into a clean ``501`` naming the\nfeature, before any real work (no chat session, no table scan) runs.",
+        "operationId": "semantic_auto_draft_sweep_api_admin_semantic_auto_draft_sweep_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Auto Draft Sweep",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/admin/semantic-coverage": {
+      "get": {
+        "description": "Registered tables with NO valid semantic model describing them.\n\nSource-agnostic \u2014 unlike ``GET /api/admin/semantic-layer/coverage``\n(Keboola-only, predicts live against one connected project's Metastore),\nthis reads what is already stored in ``semantic_models`` regardless of\nsource (Keboola, git, manual, upload, connection) and answers a\nnarrower question: does a registered table appear in ANY valid model's\ndatasets at all. See ``src.semantic_coverage.tables_without_semantic_\ncoverage`` for the resolution rules.\n\nReturns ``{\"tables\": [...]}`` \u2014 full ``table_registry`` rows.",
+        "operationId": "get_semantic_coverage_api_admin_semantic_coverage_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Semantic Coverage",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/admin/semantic-feedback": {
       "get": {
         "description": "The report queue, newest first (admin only).\n\n``?status=open`` is the working view. An unrecognized status is a 400\nrather than an empty list: \"nothing to do\" is the opposite of the truth\nwhen the filter itself was a typo.",
@@ -43362,9 +43470,63 @@
         ]
       }
     },
+    "/api/semantic-models/bundle": {
+      "get": {
+        "description": "RBAC-scoped bundle of every accessible ``status='valid'`` semantic\nmodel, consumed by ``agnes pull`` to render the read-only local cache\nunder ``<workspace>/semantic/<slug>/\u2026`` (F\u00e1ze 1 \u2014 \"distribuce jako\nfyzick\u00e1 cache s TTL\"; ``src/semantic/cache_render.py`` does the actual\nrendering, client-side, from this response).\n\nSame delivery-channel shape and same non-interactive posture as\n``/api/memory/bundle`` and ``/api/knowledge/digests/{digest_id}/\ncontent`` \u2014 one GET the CLI calls on every pull, never an agent tool\n(see the triple-surface ``_EXEMPT`` entry). Same RBAC tier as search/\nexport/context (``_can_read_model``): admin, a grant on the model\nitself, or a grant on a Data Package it's linked to.\n\nEach model entry carries its own ``content_hash`` (the same\n``semantic_models.content_hash`` every other surface reads \u2014 never\nrecomputed) and the full ``document_json`` the renderer needs; the\ntop-level ``ttl_seconds`` is the value the CLI stamps into every\nrendered file's header and the TTL an agent's local-cache trust policy\n(``config/claude_md_template.txt``) is written against.",
+        "operationId": "semantic_models_bundle_api_semantic_models_bundle_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Models Bundle",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/semantic-models/context": {
       "get": {
-        "description": "Typed context lookup over the caller's accessible semantic models \u2014\nthe ``get_semantic_context`` parity tool.\n\nWraps the pure ``src.semantic_context.get_semantic_context`` over the\nsame ``_accessible_valid_documents`` RBAC tier as search/export/\nvalidate-query. An empty result (no accessible model, or no object of\nthe requested type/id) is not an error \u2014 this endpoint has no\nmisleading \"all clear\" to gate against, unlike ``validate-query``.",
+        "description": "Typed context lookup over the caller's accessible semantic models \u2014\nthe ``get_semantic_context`` parity tool.\n\nWraps the pure ``src.semantic_context.get_semantic_context`` over the\nsame ``_accessible_valid_documents`` RBAC tier as search/export/\nvalidate-query. An empty result (no accessible model, or no object of\nthe requested type/id) is not an error \u2014 this endpoint has no\nmisleading \"all clear\" to gate against, unlike ``validate-query``.\n\nThe response also carries ``model_hashes`` \u2014 ``{slug: content_hash}``\nfor every accessible model (not narrowed by ``model_ids``, unlike\n``results``) \u2014 so a caller re-verifying an expired local semantic cache\n(F\u00e1ze 1 physical distribution, ``config/claude_md_template.txt``'s TTL\npolicy) can compare the cache file's own header ``content_hash`` against\nthe live value without a second round trip.",
         "operationId": "get_semantic_context_endpoint_api_semantic_models_context_get",
         "parameters": [
           {

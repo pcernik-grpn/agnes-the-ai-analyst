@@ -52,6 +52,11 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
 def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
+    # Must run here, before `build_seeded_client("pg", ...)` below repoints
+    # AGNES_DB_URL — the repo factory reads the backend live on every call,
+    # so re-querying `duck_client` after that point would silently exercise
+    # Postgres repos through DuckDB-configured routes.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
 
     # The fail-clean check MUST run before the pg client is built:
     # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it

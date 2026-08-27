@@ -312,6 +312,11 @@ class TestToolRegistration:
             # Triple-surface with GET /api/admin/semantic-layer/coverage +
             # `agnes admin semantic-layer coverage`.
             "admin_semantic_layer_coverage",
+            # Source-agnostic zero-coverage check — which registered tables
+            # have NO valid semantic model at all, across every source.
+            # Triple-surface with GET /api/admin/semantic-coverage +
+            # `agnes semantic-model coverage tables`.
+            "admin_semantic_coverage",
             # What each connected source still lacks across all six domains
             # (F4.1), and the tags the report cannot derive. Triple-surface
             # with /api/admin/semantic-model/coverage* + `agnes semantic-model

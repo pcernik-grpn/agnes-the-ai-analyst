@@ -549,6 +549,79 @@ class TestSemanticLayerSection:
         out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
         assert "glossary" not in out.lower()
 
+    def test_models_catalog_carries_slug_name_and_description(self, conn):
+        """Fáze 1 physical-distribution plan, item 4 — a one-line model
+        catalog (name + description) alongside the existing prose."""
+        from src.repositories import semantic_model_repo
+
+        row = _seed_semantic_model(conn)
+        semantic_model_repo().upsert(
+            id=row["id"],
+            slug=row["slug"],
+            name=row["slug"],
+            description="Retail orders and revenue.",
+            document=row["document"],
+            document_json=row["document_json"],
+            spec_version=row["spec_version"],
+            content_hash=row["content_hash"],
+            source=row["source"],
+            source_ref=row["source_ref"],
+            status=row["status"],
+            validation_errors=None,
+            validated_at=None,
+        )
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"] == [
+            {"slug": "retail", "name": "retail", "description": "Retail orders and revenue."}
+        ]
+
+    def test_models_catalog_empty_without_any_semantic_model(self, conn):
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"] == []
+
+    def test_models_catalog_rbac_scoped_same_as_has_models(self, conn):
+        _seed_semantic_model(conn)
+        _make_user(conn, user_id="ua", email="alice@example.com")
+        user = {"id": "ua", "email": "alice@example.com", "name": "Alice", "is_admin": False, "groups": []}
+        ctx = build_claude_md_context(conn, user=user, server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"] == []
+
+    def test_cache_ttl_hours_matches_the_pull_bundle_default(self, conn):
+        from src.semantic.cache_render import DEFAULT_TTL_SECONDS
+
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["cache_ttl_hours"] == DEFAULT_TTL_SECONDS // 3600
+
+    def test_rendered_section_lists_the_model_catalog(self, conn):
+        from src.repositories import semantic_model_repo
+
+        row = _seed_semantic_model(conn)
+        semantic_model_repo().upsert(
+            id=row["id"],
+            slug=row["slug"],
+            name=row["slug"],
+            description="Retail orders and revenue.",
+            document=row["document"],
+            document_json=row["document_json"],
+            spec_version=row["spec_version"],
+            content_hash=row["content_hash"],
+            source=row["source"],
+            source_ref=row["source_ref"],
+            status=row["status"],
+            validation_errors=None,
+            validated_at=None,
+        )
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "`retail`" in out
+        assert "Retail orders and revenue." in out
+
+    def test_rendered_section_mentions_the_physical_cache_and_ttl(self, conn):
+        _seed_semantic_model(conn)
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "semantic/<slug>/" in out
+        assert "content_hash" in out
+        assert "ttl_seconds" in out
+
 
 # ---------------------------------------------------------------------------
 # Vendor-neutral "Remote Queries" — BigQuery/Databricks content is gated on

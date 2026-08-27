@@ -336,6 +336,41 @@ class TableRegistryPgRepository:
                 },
             )
 
+    def mark_semantic_draft_pending(self, table_id: str) -> None:
+        """Stamp ``semantic_draft_pending_at`` to now.
+
+        Postgres-only (A3 PG-first ratchet): ``semantic_draft_pending_at``
+        is a PG-only column
+        (``migrations/versions/0074_semantic_draft_pending.py``), so this
+        method has no DuckDB sibling — the DuckDB
+        app-state backend simply does not gain this capability. Set BEFORE a
+        headless auto-draft session is invoked for this table
+        (semantic-phase5 wave 2's auto-draft sweep) — never after — so a
+        concurrent or overlapping sweep tick's own coverage read (which
+        already excludes rows with this flag set) can never pick the same
+        table twice.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE table_registry SET semantic_draft_pending_at = :ts WHERE id = :id"),
+                {"ts": datetime.now(timezone.utc), "id": table_id},
+            )
+
+    def clear_semantic_draft_pending(self, table_id: str) -> None:
+        """Clear the dedup flag ``mark_semantic_draft_pending`` set.
+
+        Postgres-only (A3 PG-first ratchet) — see
+        ``mark_semantic_draft_pending`` above. Called once the
+        ``authoring_suggestions`` row covering this table's draft is
+        resolved — approved or rejected — so a later sweep can draft again
+        if the table is still uncovered.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE table_registry SET semantic_draft_pending_at = NULL WHERE id = :id"),
+                {"id": table_id},
+            )
+
     def set_policy_mapping(self, table_id: str, value: bool) -> None:
         """Postgres mirror of ``TableRegistryRepository.set_policy_mapping``."""
         with self._engine.begin() as conn:

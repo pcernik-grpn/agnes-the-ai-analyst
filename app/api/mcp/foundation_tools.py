@@ -120,6 +120,11 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # semantic layer against the table registry. Triple-surface with
     # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
     "admin_semantic_layer_coverage",
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # which source wrote it. Triple-surface with
+    # /api/admin/semantic-coverage + `agnes semantic-model coverage tables`.
+    "admin_semantic_coverage",
     # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
     # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
     # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
@@ -587,8 +592,12 @@ def register_foundation_tools(
                 case-insensitively). Omit for every model you can access.
 
         Returns ``{"results": [{"semantic_type", "mode", "objects": [...]}],
-        "unknown_types": [...]}``. Each object carries ``"model"`` (which
-        semantic model it came from) alongside its own attributes.
+        "unknown_types": [...], "model_hashes": {slug: content_hash}}``. Each
+        object carries ``"model"`` (which semantic model it came from)
+        alongside its own attributes. ``model_hashes`` covers every model you
+        can access (not narrowed by ``model_ids``) — use it to check whether
+        a local `semantic/<slug>/…` cache file `agnes pull` wrote (header
+        `content_hash`) is still current once its `ttl_seconds` has elapsed.
         """
         params: dict[str, Any] = {"selections": json.dumps([{"semantic_type": semantic_type, "ids": ids or None}])}
         if model_ids:
@@ -1602,6 +1611,32 @@ def register_foundation_tools(
         async with httpx.AsyncClient() as c:
             r = await c.get(
                 f"{base_url}/api/admin/semantic-layer/coverage",
+                headers=headers_fn(),
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_semantic_coverage() -> dict:
+        """List registered tables with NO valid semantic model at all (admin only).
+
+        Source-agnostic — unlike ``admin_semantic_layer_coverage`` (Keboola
+        metric importability, predicted live against one project's
+        Metastore), this reads what is already stored in the semantic-model
+        registry regardless of source (Keboola, git, manual, upload,
+        connection) and answers a narrower question: does a registered
+        table appear in ANY valid model's datasets at all.
+
+        Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
+        ``GET /api/admin/semantic-coverage`` and `agnes semantic-model
+        coverage tables`.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-coverage",
                 headers=headers_fn(),
                 timeout=60,
             )

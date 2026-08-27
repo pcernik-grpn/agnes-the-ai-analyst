@@ -1866,6 +1866,16 @@ class TestPrivacyPageSmoke:
 # ---------------------------------------------------------------------------
 
 KNOWN_UNTESTED = {
+    # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
+    # admin-gated, behaviorally covered outside this parameter-free smoke
+    # sweep: GET /api/admin/semantic-coverage in tests/test_semantic_coverage.py
+    # (source-agnostic zero-coverage check, RBAC gate); POST /api/admin/
+    # semantic-auto-draft-sweep in tests/test_semantic_autodraft_sweep.py
+    # (admin gate, DuckDB-backend 501 fail-clean per the A3 ratchet) plus
+    # the PG-only sweep-logic tests in tests/db_pg/test_semantic_autodraft_
+    # sweep_pg.py (dedup, batch limit, concurrency-cap degradation).
+    "GET /api/admin/semantic-coverage",
+    "POST /api/admin/semantic-auto-draft-sweep",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
@@ -2953,6 +2963,7 @@ class TestSemanticLayerSmoke:
         "POST /api/semantic-models/validate-query",
         "GET /api/semantic-models/context",
         "GET /api/semantic-models/schema",
+        "GET /api/semantic-models/bundle",
         "POST /api/semantic-models/apply",
     }
 
@@ -3006,6 +3017,20 @@ class TestSemanticLayerSmoke:
         )
         assert schema.status_code == 200
         assert "Dataset" in schema.json()["$defs"]
+
+        # The `agnes pull` delivery channel for the local semantic cache:
+        # RBAC-scoped bundle of every accessible status='valid' model.
+        bundle = c.get("/api/semantic-models/bundle", headers=h)
+        assert bundle.status_code == 200
+        body = bundle.json()
+        assert body["ttl_seconds"] > 0
+        assert body["generated_at"]
+        bundled = {m["slug"]: m for m in body["models"]}
+        assert "smoke_model" in bundled
+        # The renderer needs the document and the hash it caches against —
+        # both must actually be carried, not just the row's identity.
+        assert bundled["smoke_model"]["document_json"]
+        assert bundled["smoke_model"]["content_hash"]
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
 

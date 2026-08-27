@@ -97,6 +97,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "admin_config_surface": "Get Config Surface",
     "admin_register_table": "Register Source Table",
     "admin_semantic_layer_coverage": "Get Semantic Layer Coverage",
+    "admin_semantic_coverage": "List Uncovered Semantic Tables",
     "semantic_model_coverage": "Get Cross-Domain Coverage",
     "semantic_model_coverage_tag": "Add Resource Source Tag",
     "semantic_model_coverage_untag": "Remove Resource Source Tag",
