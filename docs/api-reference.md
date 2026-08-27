@@ -1431,6 +1431,8 @@ so comments and key order survive.
 
 - /api/admin/semantic-models
 - /api/admin/semantic-models/{model_id}
+- /api/admin/semantic-models/{model_id}/detach
+- /api/admin/semantic-models/{model_id}/reattach
 - /api/admin/semantic-sources
 - /api/admin/semantic-sources/{source_id}
 - /api/admin/semantic-sources/{source_id}/sync
@@ -1452,6 +1454,23 @@ would otherwise silently revert the change. `POST
 .../semantic-sources/{id}/sync` fetches and imports one source now; a
 failed fetch imports nothing and is recorded on the source, never mistaken
 for "upstream went empty".
+
+`POST /api/admin/semantic-models/{model_id}/detach` is the escape hatch out
+of that flat `409 source_owned` guard, for a source-owned model that is
+wrong at the source. It flips `sync_mode` to `detached` on the same row
+(same id, same provenance) — from then on the admin edits it freely through
+`PUT`/`apply`, and sync stops overwriting it while still tracking drift:
+`source_content_hash` parks the latest hash seen from the source, and
+`source_missing_since` records the source dropping the slug entirely (a
+detached row is never pruned). Requires `confirm_detach=true`; a second
+detach is `409 already_detached`, and a `source='manual'` model is `400
+not_source_owned`. `POST .../reattach` returns the model to the sync path —
+without `confirm_reattach=true` it answers `400 confirm_required` carrying a
+staleness preview (`source_changed_since_detach`, `detached_at`) instead of
+acting, and it is `409 source_gone` when the source no longer has the slug
+at all. Both are Postgres-only (the DuckDB app-state ladder is frozen) and
+answer `501 requires_postgres_backend` on a DuckDB-backed instance. CLI:
+`agnes admin semantic-model detach|reattach <id>`.
 
 `GET /api/semantic-models/{slug}.yaml` (export) and `GET
 /api/semantic-models/search` are any-authenticated-user, gated instead on

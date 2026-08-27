@@ -27,8 +27,16 @@ def repo():
         lambda r: r.update_source_content_hash("x", "h"),
         lambda r: r.mark_source_missing("x"),
         lambda r: r.clear_source_missing("x"),
+        lambda r: r.list_detached_with_health_state(),
     ],
-    ids=["detach", "reattach", "update_source_content_hash", "mark_source_missing", "clear_source_missing"],
+    ids=[
+        "detach",
+        "reattach",
+        "update_source_content_hash",
+        "mark_source_missing",
+        "clear_source_missing",
+        "list_detached_with_health_state",
+    ],
 )
 def test_raises_requires_postgres_backend(repo, call):
     with pytest.raises(RequiresPostgresBackend) as exc_info:

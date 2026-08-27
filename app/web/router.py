@@ -3962,9 +3962,15 @@ async def semantic_layer_detail(
         counts=object_counts(model),
         dialect_skipped_count=dialect_skipped_count(model),
     )
-    # F3: the detach/re-attach toolbar buttons POST via fetch(), so they
-    # need a CSRF token minted for this page the same way
-    # admin_contribute_skill_page does.
+    # F3: the detach/re-attach toolbar buttons POST via fetch(). Their
+    # targets are `/api/admin/**` JSON routes, so the CSRF defense that
+    # actually applies to them is the global `CsrfOriginMiddleware`
+    # (app/middleware/csrf_origin.py), which refuses a cookie-authenticated
+    # unsafe-method request that reports itself cross-origin — NOT the
+    # `_web_csrf_ok` double-submit check, which only the `/admin/**` Form
+    # handlers call. The token is minted and sent as `X-CSRF-Token` anyway so
+    # the pair keeps working if either button is ever re-pointed at a Form
+    # handler; nothing on the `/api` side reads it today.
     csrf_token = _get_or_mint_web_csrf(request)
     ctx["csrf_token"] = csrf_token
     response = templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)

@@ -209,6 +209,16 @@ class SemanticModelsRepository:
 
         raise RequiresPostgresBackend("semantic_model_detach")
 
+    def list_detached_with_health_state(self) -> List[Dict[str, Any]]:
+        """Postgres-only sibling of :meth:`detach` — see that docstring.
+
+        The query it mirrors reads ``sync_mode``/``source_missing_since``/
+        ``source_content_hash``, none of which exist on this backend, so an
+        empty list would be a lie rather than a fail-clean answer."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
     def link_package(self, package_id: str, model_id: str) -> None:
         self.conn.execute(
             "DELETE FROM data_package_semantic_models WHERE package_id = ? AND model_id = ?",
