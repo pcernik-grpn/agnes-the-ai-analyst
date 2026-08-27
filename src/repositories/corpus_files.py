@@ -103,8 +103,7 @@ class CorpusFilesRepository:
         if path is None:
             return None
         row = self.conn.execute(
-            f"SELECT {self._SELECT} FROM corpus_files "
-            "WHERE corpus_id = ? AND path = ? ORDER BY created_at LIMIT 1",
+            f"SELECT {self._SELECT} FROM corpus_files WHERE corpus_id = ? AND path = ? ORDER BY created_at LIMIT 1",
             [corpus_id, path],
         ).fetchone()
         if not row:
@@ -174,9 +173,7 @@ class CorpusFilesRepository:
         if row is None:
             return False
         self.conn.execute(
-            "UPDATE corpus_files "
-            "SET corpus_id = ?, path = NULL, updated_at = current_timestamp "
-            "WHERE id = ?",
+            "UPDATE corpus_files SET corpus_id = ?, path = NULL, updated_at = current_timestamp WHERE id = ?",
             [target_corpus_id, file_id],
         )
         return True
@@ -184,3 +181,33 @@ class CorpusFilesRepository:
     def delete(self, file_id: str) -> None:
         """Hard-delete a file row (individual files are not soft-deleted)."""
         self.conn.execute("DELETE FROM corpus_files WHERE id = ?", [file_id])
+
+    def update_in_place(
+        self,
+        file_id: str,
+        *,
+        filename: str,
+        sha256: str,
+        file_type: Optional[str],
+        size_bytes: Optional[int],
+        storage_path: Optional[str],
+        path: Optional[str],
+    ) -> None:
+        """Upsert-in-place: refresh identity/content fields on an EXISTING
+        row, preserving its id (fact-graph-over-Collections §6 prerequisite —
+        see ``app/api/collections.py::_upsert_corpus_file``).
+
+        Used when an upload matches an existing row via ``source_stable_id``
+        or ``path``: a rename/move refreshes ``filename``/``path``/
+        ``storage_path`` without disturbing ``processing_status``; the caller
+        resets that separately (via ``set_status``) only when content
+        actually changed, so an unchanged-content match can skip
+        re-chunking entirely.
+        """
+        self.conn.execute(
+            "UPDATE corpus_files "
+            "SET filename = ?, sha256 = ?, file_type = ?, size_bytes = ?, "
+            "    storage_path = ?, path = ?, updated_at = current_timestamp "
+            "WHERE id = ?",
+            [filename, sha256, file_type, size_bytes, storage_path, path, file_id],
+        )

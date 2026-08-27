@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -58,6 +58,7 @@ from src.file_storage import delete_corpus_file, store_corpus_file
 from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
+    corpus_file_sources_repo,
     corpus_files_repo,
     file_corpora_repo,
     table_registry_repo,
@@ -625,18 +626,131 @@ def _purge_file_row(collection_id: str, row: dict, *, keep_blob_path: str | None
             delete_corpus_file(blob)
 
 
-def _replace_existing_by_path(collection_id: str, path: str | None, *, keep_blob_path: str | None) -> None:
-    """Upsert helper: purge any existing file sharing ``(collection_id, path)``.
+def _purge_children_and_content(collection_id: str, row: dict) -> None:
+    """Purge a matched row's zip-bundle children (fully — they are
+    regenerated on the next ingest) plus the row's OWN chunks and derived
+    tables, ahead of an in-place content update that reuses ``row``'s id.
 
-    No-op when ``path`` is None (plain-insert upload) or nothing matches.
-    Called only AFTER the replacement blob is safely stored, so a failed
-    re-upload never destroys the existing file.
+    ``row`` itself, and its own blob, are left for the caller
+    (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
+    at this point, so cleaning up that blob must happen AFTER
+    ``update_in_place`` repoints the row at the new one — otherwise the row
+    would still count as a live reference to its own old blob and the
+    refcount check would wrongly skip deleting it.
     """
-    if not path:
-        return
-    existing = corpus_files_repo().get_by_path(collection_id, path)
-    if existing:
-        _purge_file_row(collection_id, existing, keep_blob_path=keep_blob_path)
+    cf_repo = corpus_files_repo()
+    chunks_repo = corpus_chunks_repo()
+
+    children: list[dict] = []
+    stack = [row["id"]]
+    while stack:
+        for child in cf_repo.list_children(stack.pop()):
+            children.append(child)
+            stack.append(child["id"])
+
+    child_blob_paths = {c.get("storage_path") for c in children if c.get("storage_path")}
+    for child in children:
+        _schedule_derived_purge(collection_id, child["id"])
+        chunks_repo.delete_for_file(child["id"])
+        cf_repo.delete(child["id"])
+    for blob in child_blob_paths:
+        if cf_repo.count_by_storage_path(collection_id, blob) == 0:
+            delete_corpus_file(blob)
+
+    _schedule_derived_purge(collection_id, row["id"])
+    chunks_repo.delete_for_file(row["id"])
+
+
+def _upsert_corpus_file(
+    collection_id: str,
+    *,
+    path: str | None,
+    stable_id: str | None,
+    source_doc_id: str | None,
+    source_sha256_meta: str | None,
+    filename: str,
+    sha256: str,
+    file_type: str | None,
+    size_bytes: int | None,
+    storage_path: str | None,
+    sources_repo: Any,
+) -> tuple[str, bool]:
+    """Match-then-insert-or-update-in-place for one uploaded file.
+
+    Match order (fact-graph-over-Collections design §6, "Prerequisite change
+    to Collections"): ``(collection_id, stable_id)`` via
+    ``corpus_file_sources`` first, then ``(collection_id, path)``. ANY match
+    through this code path preserves the existing ``corpus_files.id`` —
+    including a manual path re-upload of a file the crawler anchored, so a
+    hand upload can no longer cascade a document's (future) claims away.
+
+    An unchanged-``sha256`` match only refreshes ``filename``/``path``/
+    ``storage_path`` (rename/move) — chunks and ``processing_status`` are
+    left untouched, skipping re-chunking entirely. A changed-``sha256``
+    match purges chunks/children and resets ``processing_status`` to
+    'pending' on the SAME row. No match inserts a new row.
+
+    ``sources_repo`` is the already-resolved ``corpus_file_sources`` repo
+    (``None`` when this request never supplied ``source_stable_ids`` at
+    all — see ``upload_files``, which resolves it once up front so a
+    DuckDB-backed instance fails clean with a 501 before any file is
+    touched, never partway through a batch).
+
+    Returns ``(file_id, needs_processing)`` — ``needs_processing`` is False
+    only for the unchanged-content short-circuit, so the caller knows
+    whether to (re)schedule ingestion.
+    """
+    cf_repo = corpus_files_repo()
+
+    existing = None
+    if stable_id and sources_repo is not None:
+        existing_id = sources_repo.resolve(collection_id, stable_id)
+        if existing_id:
+            existing = cf_repo.get(existing_id)
+    if existing is None and path:
+        existing = cf_repo.get_by_path(collection_id, path)
+
+    if existing is not None:
+        file_id = existing["id"]
+        content_changed = existing.get("sha256") != sha256
+        old_blob = existing.get("storage_path")
+        if content_changed:
+            _purge_children_and_content(collection_id, existing)
+        cf_repo.update_in_place(
+            file_id,
+            filename=filename,
+            sha256=sha256,
+            file_type=file_type,
+            size_bytes=size_bytes,
+            storage_path=storage_path,
+            path=path,
+        )
+        if content_changed:
+            cf_repo.set_status(file_id, status="pending")
+            if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
+                delete_corpus_file(old_blob)
+    else:
+        content_changed = True  # brand new row always needs processing
+        file_id = cf_repo.add(
+            corpus_id=collection_id,
+            filename=filename,
+            sha256=sha256,
+            file_type=file_type,
+            size_bytes=size_bytes,
+            storage_path=storage_path,
+            path=path,
+        )
+
+    if stable_id and sources_repo is not None:
+        sources_repo.upsert(
+            corpus_file_id=file_id,
+            corpus_id=collection_id,
+            source_stable_id=stable_id,
+            source_doc_id=source_doc_id,
+            source_sha256=source_sha256_meta,
+        )
+
+    return file_id, content_changed
 
 
 @router.post("/{collection_id}/files", status_code=201)
@@ -645,6 +759,10 @@ async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     paths: Optional[List[str]] = Form(None),
+    source_stable_ids: Optional[List[str]] = Form(None),
+    source_doc_ids: Optional[List[str]] = Form(None),
+    source_sha256s: Optional[List[str]] = Form(None),
+    document_dates: Optional[List[str]] = Form(None),
     user=Depends(require_collection_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
@@ -666,15 +784,33 @@ async def upload_files(
 
     **Upsert:** an optional ``paths`` form field (repeated, paired positionally
     with ``files``) gives each file a caller-supplied logical identity. When a
-    file with the same ``(collection_id, path)`` already exists, it is REPLACED
-    (old blob/chunks/derived tables purged) instead of inserting a duplicate —
-    so a doc-sync client can re-upload idempotently. Files without a ``path``
-    keep the legacy plain-insert behavior. The purge runs only after the
-    replacement is safely stored, so a failed re-upload never destroys the
-    existing file. When ``paths`` is supplied it MUST have exactly one entry
-    per file (positional pairing), else the request is rejected with **400** —
-    a short/misaligned list would silently assign paths to the wrong files.
-    The ``(corpus_id, path)`` invariant is also enforced by a unique index.
+    file with the same ``(collection_id, path)`` already exists, its row is
+    updated IN PLACE (id preserved) — chunks/derived tables purged and
+    ``processing_status`` reset only when the content actually changed;
+    unchanged content just refreshes filename/path (a rename/move) and skips
+    re-chunking entirely. Files without a ``path`` keep the legacy
+    plain-insert behavior. The update runs only after the replacement blob is
+    safely stored, so a failed re-upload never destroys the existing file.
+    When ``paths`` is supplied it MUST have exactly one entry per file
+    (positional pairing), else the request is rejected with **400** — a
+    short/misaligned list would silently assign paths to the wrong files. The
+    ``(corpus_id, path)`` invariant is also enforced by a unique index.
+
+    **Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+
+    optional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,
+    each paired positionally with ``files`` exactly like ``paths``) lets a
+    doc-sync client supply the producer's own delta key (e.g.
+    ``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``
+    is tried FIRST, before the ``path`` match — and, like a path match, ANY
+    match preserves the row's id, including a manual (no-``source_stable_ids``)
+    path re-upload of a file a crawler previously anchored, so a hand upload
+    can no longer cascade a document's derived data away. The mapping table
+    is Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed
+    instance answers **501** before any file is touched; omitting the field
+    keeps this endpoint byte-identical to the plain ``paths`` behavior above.
+    ``document_dates`` is accepted and pairing-validated for forward
+    compatibility with the doc-sync wire format but is not yet persisted
+    here — it belongs to a claim, written by the (future) fact-ingest API.
 
     Returns a list of ``{file_id, filename, path, processing_status, …}`` for
     every uploaded file (in upload order).
@@ -690,18 +826,35 @@ async def upload_files(
             status_code=400,
             detail=f"paths_length_mismatch: {len(paths)} paths for {len(files)} files",
         )
+    for field_name, values in (
+        ("source_stable_ids", source_stable_ids),
+        ("source_doc_ids", source_doc_ids),
+        ("source_sha256s", source_sha256s),
+        ("document_dates", document_dates),
+    ):
+        if values is not None and len(values) != len(files):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name}_length_mismatch: {len(values)} entries for {len(files)} files",
+            )
 
     # A duplicate non-blank path within the same batch would replace an
     # earlier file in this same request with a later one — the earlier
-    # file's row (and blob) get purged by `_replace_existing_by_path`
-    # after its `_file_out` entry and ingest task were already queued, so
-    # the response would reference a file_id that no longer exists and
-    # schedule a no-op ingest. Reject up front instead of silently
-    # dropping a file.
+    # file's row (and blob) get purged by `_upsert_corpus_file` after its
+    # `_file_out` entry and ingest task were already queued, so the response
+    # would reference a file_id that no longer exists and schedule a no-op
+    # ingest. Reject up front instead of silently dropping a file.
     if paths is not None:
         non_blank = [p.strip() for p in paths if p and p.strip()]
         if len(non_blank) != len(set(non_blank)):
             raise HTTPException(status_code=400, detail="duplicate_path_in_batch")
+
+    # Resolve the (PG-only) source-mapping repo ONCE, up front, when this
+    # request actually uses it — so a DuckDB-backed instance fails clean
+    # with a 501 before any file is stored, never partway through a batch.
+    # Omitting `source_stable_ids` entirely never touches this repo at all,
+    # which is what keeps the plain-`paths` flow byte-identical on DuckDB.
+    sources_repo = corpus_file_sources_repo() if source_stable_ids is not None else None
 
     cf_repo = corpus_files_repo()
     results = []
@@ -715,6 +868,26 @@ async def upload_files(
         # with `files`. Blank/missing → None (legacy plain-insert).
         path = paths[idx].strip() if (paths and idx < len(paths) and paths[idx]) else None
         path = path or None
+        stable_id = (
+            source_stable_ids[idx].strip()
+            if (source_stable_ids and idx < len(source_stable_ids) and source_stable_ids[idx])
+            else None
+        )
+        stable_id = stable_id or None
+        source_doc_id = (
+            source_doc_ids[idx].strip()
+            if (source_doc_ids and idx < len(source_doc_ids) and source_doc_ids[idx])
+            else None
+        )
+        source_doc_id = source_doc_id or None
+        source_sha256_meta = (
+            source_sha256s[idx].strip()
+            if (source_sha256s and idx < len(source_sha256s) and source_sha256s[idx])
+            else None
+        )
+        source_sha256_meta = source_sha256_meta or None
+        # document_dates[idx] is validated for pairing above but not read
+        # here — see the docstring's "Source-anchored upsert" paragraph.
 
         if tier is None:
             # Unsupported type — store raw bytes but record as rejected.
@@ -734,17 +907,22 @@ async def upload_files(
                 ext = fname.rsplit(".", 1)[-1] if "." in fname else ""
 
             # Upsert only when the blob was actually stored; a failed store
-            # must not destroy an existing file, and its row carries no path.
+            # must not destroy an existing file, and its row carries no
+            # path/source anchor.
             effective_path = path if storage_path is not None else None
-            _replace_existing_by_path(collection_id, effective_path, keep_blob_path=storage_path)
-            file_id = cf_repo.add(
-                corpus_id=collection_id,
+            effective_stable_id = stable_id if storage_path is not None else None
+            file_id, _ = _upsert_corpus_file(
+                collection_id,
+                path=effective_path,
+                stable_id=effective_stable_id,
+                source_doc_id=source_doc_id,
+                source_sha256_meta=source_sha256_meta,
                 filename=fname,
                 sha256=sha,
                 file_type=ext or None,
                 size_bytes=size or None,
                 storage_path=storage_path,
-                path=effective_path,
+                sources_repo=sources_repo,
             )
             cf_repo.set_status(
                 file_id,
@@ -780,23 +958,26 @@ async def upload_files(
                 any_rejected = True
                 continue
 
-            # Replace any existing file sharing this logical path (no-op when
-            # path is None). keep_blob_path guards the content-addressed blob
-            # we just stored in case the replacement is byte-identical.
-            _replace_existing_by_path(collection_id, path, keep_blob_path=stored.storage_path)
-            file_id = cf_repo.add(
-                corpus_id=collection_id,
+            # Match-then-insert-or-update-in-place. `needs_processing` is
+            # False only for the unchanged-content short-circuit (rename/
+            # move) — that row keeps whatever chunks/status it already had.
+            file_id, needs_processing = _upsert_corpus_file(
+                collection_id,
+                path=path,
+                stable_id=stable_id,
+                source_doc_id=source_doc_id,
+                source_sha256_meta=source_sha256_meta,
                 filename=fname,
                 sha256=stored.sha256,
                 file_type=stored.ext.lstrip(".") or None,
                 size_bytes=stored.size_bytes,
                 storage_path=stored.storage_path,
-                path=path,
+                sources_repo=sources_repo,
             )
-            # Default status is 'pending' (set by the repo on insert).
             row = cf_repo.get(file_id)
             results.append(_file_out(row))
-            _to_ingest.append(file_id)
+            if needs_processing:
+                _to_ingest.append(file_id)
             logger.info(
                 "corpus_file uploaded collection=%s file_id=%s sha=%s tier=%s",
                 collection_id,

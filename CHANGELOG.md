@@ -45,6 +45,46 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   instance that does not set it is unprotected, exactly as before.
 
 ### Changed
+- **BREAKING: Databricks Unity Catalog metric views now flow through the
+  semantic-source adapter contract, like Snowflake — no more direct
+  `metric_definitions` writer.** A new `databricks_semantic` adapter
+  (`connectors/databricks/semantic_ossie.py`) composes one Apache Ossie
+  document per metric view (measures → metrics, dimensions → dataset
+  fields, every expression tagged dialect `DATABRICKS`); a metric's
+  dialect expression is the full `SELECT MEASURE(...) FROM <metric view>`
+  statement (not the bare `expr` fragment, which is not runnable on its
+  own), and it projects into `metric_definitions` as a warehouse-only row
+  with a "run server-side" note — Task A's projector, now exercised by a
+  second connector. `POST /api/admin/run-databricks-semantic-layer-refresh`
+  keeps its path, scheduler cadence and single-flight guard, but now
+  registers the workspace as a `connection`-kind semantic source (fixed id
+  `databricks_default`) and syncs it via `src.semantic.transports.
+  import_source` — its response shape changed from the old counters
+  (`created_or_updated`/`pruned`/...) to the generic import report
+  (`models_written`/`models_pruned`/`projection`/...). Rows land stamped
+  `source='ossie_connection'` + `source_ref='databricks_default'` instead
+  of `source='databricks_semantic_layer'` + the workspace host; every
+  refresh reconciles any rows still carrying the old stamp (one-time,
+  idempotent — a no-op once they're gone), so an upgrading instance loses
+  nothing. This was the last connector writing `metric_definitions`
+  directly — every source (native, git, upload, Keboola, Snowflake,
+  Databricks) now goes through the same document → projector pipeline.
+- **Collections file upload now preserves a matched file's id on every
+  re-upload, instead of delete+insert.** `POST /api/collections/{id}/files`
+  gains optional positionally-paired form fields — `source_stable_ids` (+
+  `source_doc_ids`, `source_sha256s`, `document_dates`) — so a doc-sync
+  client can supply a producer's own stable id (e.g. a crawler's delta key)
+  alongside the existing `paths` field. A match is tried on
+  `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
+  as before; either way, the existing `corpus_files` row is now updated IN
+  PLACE — a content-unchanged match (a rename/move) only refreshes
+  filename/path and skips re-chunking entirely, while a changed-content
+  match purges chunks/derived tables and resets `processing_status` on the
+  SAME row. A manual `paths`-only re-upload of a file previously anchored by
+  a stable id now also preserves that row's id, so a hand upload can no
+  longer orphan anything referencing it. The stable-id mapping table is
+  Postgres-only: supplying `source_stable_ids` on a DuckDB-backed instance
+  returns `501`; omitting the field keeps today's flow unchanged.
 
 ### Fixed
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
