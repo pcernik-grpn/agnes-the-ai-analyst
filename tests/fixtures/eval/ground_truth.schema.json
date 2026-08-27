@@ -2,97 +2,217 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agnes.example.com/schemas/eval/ground_truth.schema.json",
   "title": "Fact-graph planted ground-truth manifest",
-  "description": "Schema for the ground-truth manifest that scripts/eval/metrics.py (EQ3/EQ9) grades a fact-graph extraction run against. A conforming manifest describes facts and edges DELIBERATELY PLANTED in a corpus (spec Sec. 15.5, Run P), so precision/recall, entity-resolution cluster purity, conflict rate, and orphan rate can be computed against a known-correct answer instead of eyeballed. Field names follow the facts/edges/claims schema in docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md Sec. 3 (facts.type, fact_aliases.natural_key, edges.type). A sibling corpus-generator task emits conforming instances; this repository only defines the contract.",
+  "description": "Schema for the ground-truth manifest scripts/eval/corpus_gen.py writes and scripts/eval/metrics.py (EQ3/EQ9) grades a fact-graph extraction run against. A conforming manifest describes every fact/edge DELIBERATELY PLANTED in a filesystem corpus (spec Sec. 15.5, Run P) -- plus every S1-S4 security fixture, trap, and AN1/AN2 anonymization fixture -- so precision/recall, entity-resolution cluster purity, conflict rate, and orphan rate can be computed against a known-correct answer instead of eyeballed. `nodes[]`/`edges[]` mirror the producer wire format the ingest endpoint accepts as-is (design spec Sec. 7.0: node row `{id, type, attrs, evidence}`, edge row `{src, type, dst, attrs, evidence}`, merge key src+type+dst) -- this manifest is both the ground truth AND valid ingest input, plus a generator-only `claim_key` per row for cross-referencing `planted_elements`. One claim (one evidence-bearing observation) is one `nodes[]`/`edges[]` entry, so the SAME planted fact/edge -- e.g. one revisited by a later document, or the AN2 Czech-inflection pair -- appears as multiple rows sharing one `id` (or `src`+`type`+`dst`); a grader dedupes by that key. `documents[]` rows are the crawler's 17-field `make_row` contract (Sec. 7.0) plus generator extension fields. This file is written by the corpus-generator task and consumed by the eval-harness task; `tests/fixtures/eval/planted_corpus_small/ground_truth.json` is the reference instance both keep in sync with.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["corpus_id", "generated_at", "document_count", "facts"],
+  "required": [
+    "generator",
+    "groups",
+    "sites",
+    "documents",
+    "nodes",
+    "edges",
+    "prepared_false_claims",
+    "planted_elements",
+    "counts"
+  ],
   "properties": {
-    "corpus_id": {
-      "type": "string",
-      "minLength": 1,
-      "description": "The collection/corpus this manifest was planted into (matches claims.corpus_id in the live schema)."
-    },
-    "generated_at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "UTC timestamp the manifest was generated, ISO 8601."
-    },
-    "document_count": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total documents in the planted corpus (the denominator for the EQ9 conflict-rate-per-1000-documents metric)."
-    },
-    "facts": {
-      "type": "array",
-      "description": "Every fact (ontology node) deliberately planted in the corpus.",
-      "items": { "$ref": "#/$defs/plantedFact" }
-    },
-    "edges": {
-      "type": "array",
-      "description": "Every edge (ontology relationship) deliberately planted in the corpus. Optional -- a manifest testing fact extraction alone may omit it.",
-      "items": { "$ref": "#/$defs/plantedEdge" }
-    }
-  },
-  "$defs": {
-    "plantedFact": {
+    "generator": {
       "type": "object",
+      "description": "Provenance of the tool that wrote this manifest -- not part of the ingest wire format.",
       "additionalProperties": false,
-      "required": ["natural_key", "type", "source_doc_ids"],
+      "required": ["name", "version", "seed", "mode", "generated_at"],
       "properties": {
-        "natural_key": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "seed": { "type": "integer" },
+        "mode": { "type": "string", "enum": ["small", "full"] },
+        "generated_at": {
           "type": "string",
-          "minLength": 1,
-          "description": "The canonical producer slug for this fact (fact_aliases.natural_key in the live schema), e.g. 'myers-emergency-power-systems'."
-        },
-        "type": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Ontology node type (facts.type in the live schema), e.g. 'engagement', 'client', 'sponsor'."
-        },
-        "aliases": {
-          "type": "array",
-          "description": "Additional natural-key spellings/variants planted in the corpus that a correct extraction must resolve into this SAME fact (entity-resolution challenge). Used for both precision/recall matching (any alias counts as a hit) and EQ9 cluster-purity scoring (the full set -- natural_key plus aliases -- is one expected cluster).",
-          "items": { "type": "string", "minLength": 1 },
-          "default": []
-        },
-        "expected_attrs": {
-          "type": "object",
-          "description": "Attribute key/value pairs a correct extraction should record for this fact, evaluated against the live API's per-key projected value (design spec Sec. 4). Optional -- some manifests test presence/resolution only, not attribute accuracy.",
-          "additionalProperties": true
-        },
-        "source_doc_ids": {
-          "type": "array",
-          "description": "Corpus document ids (source_doc_id / a generator-assigned stable id) this fact was planted into -- at least one.",
-          "items": { "type": "string", "minLength": 1 },
-          "minItems": 1
+          "format": "date-time",
+          "description": "UTC timestamp the manifest was generated, ISO 8601."
         }
       }
     },
-    "plantedEdge": {
+    "groups": {
+      "type": "array",
+      "description": "Every Agnes group name referenced by sites[*].libraries[*].groups.",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "sites": {
+      "type": "object",
+      "description": "site name -> libraries -> the Agnes groups that library would be shared with.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["libraries"],
+        "properties": {
+          "libraries": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["groups"],
+              "properties": {
+                "groups": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "documents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/documentRow" }
+    },
+    "nodes": {
+      "type": "array",
+      "description": "Every planted claim about a node (ontology fact) -- one row per evidence-bearing observation. Dedupe by `id` for the set of distinct planted facts.",
+      "items": { "$ref": "#/$defs/nodeRow" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Every planted claim about an edge (ontology relationship) -- one row per evidence-bearing observation. Dedupe by (`src`, `type`, `dst`) for the set of distinct planted edges.",
+      "items": { "$ref": "#/$defs/edgeRow" }
+    },
+    "prepared_false_claims": {
+      "type": "array",
+      "description": "Adversarial fabrication fixtures (EQ1): quotes that are NOT a substring of their document -- a correct extraction must reject them, so these are never mixed into `nodes`/`edges`.",
+      "items": { "$ref": "#/$defs/preparedFalseClaim" }
+    },
+    "planted_elements": {
+      "type": "object",
+      "description": "Descriptive cross-reference for the S1-S4 security fixtures, the six traps (scan/duplicate/succession/contradiction/entity_resolution/fabrication), and the AN1/AN2 anonymization fixtures -- each entry's shape varies by fixture id, so it is intentionally not deeply typed here; consumers key off the fixture id documented in scripts/eval/corpus_gen.py's module docstring.",
+      "additionalProperties": false,
+      "required": ["s_fixtures", "traps", "anonymization"],
+      "properties": {
+        "s_fixtures": { "type": "object" },
+        "traps": { "type": "object" },
+        "anonymization": { "type": "object" }
+      }
+    },
+    "counts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["src_natural_key", "type", "dst_natural_key", "source_doc_ids"],
+      "required": ["documents", "planted_documents", "filler_documents", "sites", "nodes", "edges"],
       "properties": {
-        "src_natural_key": {
-          "type": "string",
-          "minLength": 1,
-          "description": "natural_key of the source fact (must match a facts[].natural_key or one of its aliases)."
+        "documents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total documents in the planted corpus (the denominator for the EQ9 conflict-rate-per-1000-documents metric)."
         },
-        "type": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Ontology edge type (edges.type in the live schema), e.g. 'sponsored_by', 'subsidiary_of'."
-        },
-        "dst_natural_key": {
-          "type": "string",
-          "minLength": 1,
-          "description": "natural_key of the destination fact (must match a facts[].natural_key or one of its aliases)."
-        },
-        "source_doc_ids": {
+        "planted_documents": { "type": "integer", "minimum": 0 },
+        "filler_documents": { "type": "integer", "minimum": 0 },
+        "sites": { "type": "integer", "minimum": 0 },
+        "nodes": { "type": "integer", "minimum": 0 },
+        "edges": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "evidenceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["doc_id", "quote"],
+      "properties": {
+        "doc_id": { "type": "string", "minLength": 1 },
+        "quote": { "type": "string", "minLength": 1, "description": "Verbatim substring of the source document's extracted text (EQ1)." }
+      }
+    },
+    "nodeRow": {
+      "type": "object",
+      "description": "Wire-format node claim (design spec Sec. 7.0) plus a generator-only claim_key. additionalProperties is false because this shape is consumed as-is by the ingest endpoint -- an unrecognized key here is a producer bug, not a valid extension point.",
+      "additionalProperties": false,
+      "required": ["id", "type", "attrs", "evidence"],
+      "properties": {
+        "claim_key": { "type": "string", "minLength": 1 },
+        "id": { "type": "string", "pattern": "^[a-z_]+:[a-z0-9][a-z0-9-]*$" },
+        "type": { "type": "string", "minLength": 1 },
+        "attrs": { "type": "object" },
+        "evidence": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "minItems": 1
+          "items": { "$ref": "#/$defs/evidenceEntry" },
+          "minItems": 1,
+          "maxItems": 1
         }
+      }
+    },
+    "edgeRow": {
+      "type": "object",
+      "description": "Wire-format edge claim (design spec Sec. 7.0) plus a generator-only claim_key. additionalProperties is false for the same reason as nodeRow.",
+      "additionalProperties": false,
+      "required": ["src", "type", "dst", "attrs", "evidence"],
+      "properties": {
+        "claim_key": { "type": "string", "minLength": 1 },
+        "src": { "type": "string", "pattern": "^[a-z_]+:[a-z0-9][a-z0-9-]*$" },
+        "type": { "type": "string", "minLength": 1 },
+        "dst": { "type": "string", "pattern": "^[a-z_]+:[a-z0-9][a-z0-9-]*$" },
+        "attrs": { "type": "object" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceEntry" },
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "documentRow": {
+      "type": "object",
+      "description": "The crawler's 17-field make_row contract (design spec Sec. 7.0) -- required -- plus generator extension fields (document_date, doc_type, groups, format, format_fallback, format_shape, trap, doc_key, ...) -- optional, and additionalProperties stays true so a different producer's own extensions still validate.",
+      "additionalProperties": true,
+      "required": [
+        "doc_id", "stable_id", "name", "path", "site", "drive", "source",
+        "mime", "size", "created", "modified", "author", "last_editor",
+        "sha256", "extracted_path", "extract_status", "crawled_at"
+      ],
+      "properties": {
+        "doc_id": { "type": "string", "minLength": 1 },
+        "stable_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "site": { "type": "string", "minLength": 1 },
+        "drive": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "enum": ["local", "graph"] },
+        "mime": { "type": "string", "minLength": 1 },
+        "size": { "type": "integer", "minimum": 0 },
+        "created": { "type": "string", "format": "date-time" },
+        "modified": { "type": "string", "format": "date-time" },
+        "author": { "type": "string" },
+        "last_editor": { "type": "string" },
+        "sha256": { "type": "string", "minLength": 1 },
+        "extracted_path": { "type": ["string", "null"] },
+        "extract_status": { "type": "string", "minLength": 1 },
+        "crawled_at": { "type": ["string", "null"] },
+        "document_date": { "type": "string" },
+        "doc_type": { "type": "string" },
+        "groups": { "type": "array", "items": { "type": "string" } },
+        "format": { "type": "string" },
+        "format_fallback": { "type": "boolean" },
+        "format_shape": { "type": ["string", "null"] },
+        "trap": { "type": ["string", "null"] },
+        "doc_key": { "type": "string" }
+      }
+    },
+    "preparedFalseClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_key", "subject_kind", "subject_id", "attrs", "doc_id", "quote", "reason"],
+      "properties": {
+        "claim_key": { "type": "string", "minLength": 1 },
+        "subject_kind": { "type": "string", "minLength": 1 },
+        "subject_id": { "type": "string", "minLength": 1 },
+        "attrs": { "type": "object" },
+        "doc_id": { "type": "string", "minLength": 1 },
+        "quote": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Deliberately NOT a verbatim substring of the document -- the EQ1 verbatim gate must reject it."
+        },
+        "reason": { "type": "string", "minLength": 1 }
       }
     }
   }

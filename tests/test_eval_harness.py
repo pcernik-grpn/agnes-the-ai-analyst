@@ -429,18 +429,28 @@ def test_overall_verdict_incomplete_when_a_threshold_has_no_actual_yet():
 
 # ---------------------------------------------------------------------------
 # EQ3/EQ9 metrics math -- tiny synthetic ground-truth manifest
+#
+# The canonical ground-truth shape is the corpus generator's (see
+# scripts/eval/corpus_gen.py's module docstring and
+# tests/fixtures/eval/planted_corpus_small/ground_truth.json): `nodes[]`/
+# `edges[]` producer wire rows, one row per evidence-bearing claim, no
+# top-level `facts`/`document_count`/`corpus_id`. The pure math functions
+# below (`precision_recall_by_type`, `cluster_purity`) are unchanged --
+# they still take a plain `{natural_key, type, aliases, ...}` list, which is
+# what `metrics.expected_facts_from_manifest` derives from `nodes[]`.
 # ---------------------------------------------------------------------------
 
 
-_SYNTHETIC_GROUND_TRUTH = {
-    "corpus_id": "test-corpus",
-    "generated_at": "2026-08-27T00:00:00Z",
-    "document_count": 500,
-    "facts": [
-        {"natural_key": "myers", "type": "client", "aliases": ["myers-eps"], "source_doc_ids": ["d1"]},
-        {"natural_key": "acme", "type": "client", "source_doc_ids": ["d2"]},
-    ],
-}
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SMALL_FIXTURE_PATH = _REPO_ROOT / "tests" / "fixtures" / "eval" / "planted_corpus_small" / "ground_truth.json"
+
+# Directly-constructed input for the pure math functions -- independent of
+# the manifest/loader adapters, same shape and values as before reconciling
+# the two ground-truth tasks.
+_SYNTHETIC_FACTS = [
+    {"natural_key": "myers", "type": "client", "aliases": ["myers-eps"], "source_doc_ids": ["document:d1"]},
+    {"natural_key": "acme", "type": "client", "source_doc_ids": ["document:d2"]},
+]
 
 _SYNTHETIC_ACTUAL_SUBJECTS = [
     {"id": "f1", "type": "client", "aliases": ["myers"], "attrs": {}, "claim_count": 1, "quote_count": 1},
@@ -455,6 +465,93 @@ _SYNTHETIC_ACTUAL_SUBJECTS = [
 ]
 
 
+def _synthetic_document(doc_id: str, name: str) -> dict:
+    return {
+        "doc_id": doc_id,
+        "stable_id": f"local:{name}",
+        "name": name,
+        "path": f"site-a/lib-a/{name}",
+        "site": "site-a",
+        "drive": "lib-a",
+        "source": "local",
+        "mime": "text/markdown",
+        "size": 100,
+        "created": "2026-01-01T00:00:00+00:00",
+        "modified": "2026-01-01T00:00:00+00:00",
+        "author": "a@example.com",
+        "last_editor": "a@example.com",
+        "sha256": "0" * 64,
+        "extracted_path": None,
+        "extract_status": "ok",
+        "crawled_at": None,
+    }
+
+
+# Canonical-shaped manifest -- the same two planted facts as _SYNTHETIC_FACTS,
+# but expressed as producer wire rows: "myers" is revisited by a second claim
+# from a different document (dedupe-by-id), and one edge is planted twice
+# from two documents (dedupe-by src+type+dst).
+_SYNTHETIC_GROUND_TRUTH = {
+    "generator": {
+        "name": "test-generator",
+        "version": "0.0.0",
+        "seed": 1,
+        "mode": "small",
+        "generated_at": "2026-08-27T00:00:00+00:00",
+    },
+    "groups": ["principal"],
+    "sites": {"site-a": {"libraries": {"lib-a": {"groups": ["principal"]}}}},
+    "documents": [
+        _synthetic_document("document:d1", "d1.md"),
+        _synthetic_document("document:d2", "d2.md"),
+    ],
+    "nodes": [
+        {
+            "claim_key": "n1",
+            "id": "client:myers",
+            "type": "client",
+            "attrs": {},
+            "evidence": [{"doc_id": "document:d1", "quote": "Myers Corp is a client."}],
+        },
+        {
+            "claim_key": "n1b",
+            "id": "client:myers",
+            "type": "client",
+            "attrs": {"industry": "manufacturing"},
+            "evidence": [{"doc_id": "document:d2", "quote": "Myers Corp operates in manufacturing."}],
+        },
+        {
+            "claim_key": "n2",
+            "id": "client:acme",
+            "type": "client",
+            "attrs": {},
+            "evidence": [{"doc_id": "document:d2", "quote": "Acme Inc is a client."}],
+        },
+    ],
+    "edges": [
+        {
+            "claim_key": "e1",
+            "src": "client:myers",
+            "type": "owned_by",
+            "dst": "org:acme-holding",
+            "attrs": {},
+            "evidence": [{"doc_id": "document:d1", "quote": "Myers is owned by Acme Holding."}],
+        },
+        {
+            "claim_key": "e1b",
+            "src": "client:myers",
+            "type": "owned_by",
+            "dst": "org:acme-holding",
+            "attrs": {},
+            "evidence": [{"doc_id": "document:d2", "quote": "Myers Corp, owned by Acme Holding."}],
+        },
+    ],
+    "prepared_false_claims": [],
+    "planted_elements": {"s_fixtures": {}, "traps": {}, "anonymization": {}},
+    "counts": {"documents": 2, "planted_documents": 2, "filler_documents": 0, "sites": 1, "nodes": 3, "edges": 2},
+}
+
+
 def test_ground_truth_schema_is_valid_json_schema():
     schema = json.loads(metrics.GROUND_TRUTH_SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
@@ -463,7 +560,7 @@ def test_ground_truth_schema_is_valid_json_schema():
 
 def test_ground_truth_schema_rejects_missing_required_field():
     schema = json.loads(metrics.GROUND_TRUTH_SCHEMA_PATH.read_text(encoding="utf-8"))
-    bad = {"corpus_id": "x", "generated_at": "2026-08-27T00:00:00Z", "facts": []}  # missing document_count
+    bad = {k: v for k, v in _SYNTHETIC_GROUND_TRUTH.items() if k != "nodes"}  # missing required "nodes"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=bad, schema=schema)
 
@@ -472,12 +569,53 @@ def test_load_ground_truth_validates_a_file(tmp_path):
     path = tmp_path / "gt.json"
     path.write_text(json.dumps(_SYNTHETIC_GROUND_TRUTH), encoding="utf-8")
     loaded = metrics.load_ground_truth(path)
-    assert loaded["corpus_id"] == "test-corpus"
+    assert loaded["counts"]["documents"] == 2
+
+
+def test_real_planted_corpus_small_validates_against_schema():
+    """The corpus generator's own committed fixture is the reference
+    instance of this schema (per the schema's own `description`) -- a
+    drift between the two means one of the two tasks changed shape without
+    telling the other."""
+    ground_truth = metrics.load_ground_truth(_SMALL_FIXTURE_PATH)  # raises jsonschema.ValidationError on drift
+    assert ground_truth["counts"]["nodes"] > 0
+    assert ground_truth["counts"]["edges"] > 0
+
+
+def test_expected_facts_from_manifest_dedupes_by_id():
+    facts = metrics.expected_facts_from_manifest(_SYNTHETIC_GROUND_TRUTH)
+    by_key = {f["natural_key"]: f for f in facts}
+    assert set(by_key) == {"client:myers", "client:acme"}
+    # the two "myers" claims (from d1 and d2) collapse into one expected fact
+    assert sorted(by_key["client:myers"]["source_doc_ids"]) == ["document:d1", "document:d2"]
+    assert by_key["client:myers"]["type"] == "client"
+
+
+def test_expected_edges_from_manifest_dedupes_by_src_type_dst():
+    edges = metrics.expected_edges_from_manifest(_SYNTHETIC_GROUND_TRUTH)
+    assert len(edges) == 1  # e1/e1b share (src, type, dst)
+    edge = edges[0]
+    assert (edge["src_natural_key"], edge["type"], edge["dst_natural_key"]) == (
+        "client:myers",
+        "owned_by",
+        "org:acme-holding",
+    )
+    assert sorted(edge["source_doc_ids"]) == ["document:d1", "document:d2"]
+
+
+def test_expected_facts_and_edges_dedupe_the_real_fixture():
+    ground_truth = metrics.load_ground_truth(_SMALL_FIXTURE_PATH)
+    facts = metrics.expected_facts_from_manifest(ground_truth)
+    edges = metrics.expected_edges_from_manifest(ground_truth)
+    # 19 planted node claims collapse onto 14 distinct ids (some facts are
+    # revisited by a second claim/document, e.g. the AN2 Czech-inflection
+    # pair); every planted edge already has a distinct (src, type, dst).
+    assert len(facts) == 14
+    assert len(edges) == 28
 
 
 def test_precision_recall_by_type_on_synthetic_manifest():
-    facts = _SYNTHETIC_GROUND_TRUTH["facts"]
-    results = metrics.precision_recall_by_type(facts, _SYNTHETIC_ACTUAL_SUBJECTS)
+    results = metrics.precision_recall_by_type(_SYNTHETIC_FACTS, _SYNTHETIC_ACTUAL_SUBJECTS)
     client = results["client"]
     assert client.true_positives == 1  # f1 matched myers via alias overlap
     assert client.false_positives == 1  # f2 matched nothing planted
@@ -487,8 +625,7 @@ def test_precision_recall_by_type_on_synthetic_manifest():
 
 
 def test_cluster_purity_on_synthetic_manifest():
-    facts = _SYNTHETIC_GROUND_TRUTH["facts"]
-    purity = metrics.cluster_purity(facts, _SYNTHETIC_ACTUAL_SUBJECTS)
+    purity = metrics.cluster_purity(_SYNTHETIC_FACTS, _SYNTHETIC_ACTUAL_SUBJECTS)
     # planted alias-instance total = |{myers,myers-eps}| + |{acme}| = 3
     # best overlap: myers cluster vs f1 = 1, acme cluster vs anything = 0
     assert purity == pytest.approx(1 / 3)
@@ -532,6 +669,7 @@ def test_fetch_and_score_release_against_a_live_server():
         os.environ.get("AGNES_EVAL_TOKEN", ""),
         _SYNTHETIC_GROUND_TRUTH,
         release_id="test",
+        corpus_id="test-corpus",
     )
     assert "cluster_purity" in record
 

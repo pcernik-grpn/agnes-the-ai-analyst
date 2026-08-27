@@ -42,7 +42,7 @@ metrics without defining the exact match rule:
   - "conflict rate per 1000 documents": count of attribute keys the API
     returned as `{"conflicted": true, ...}` (design spec Sec 12/4) across
     all fetched subjects, normalized per 1000 documents in the manifest's
-    `document_count`.
+    `counts.documents`.
   - "orphan rate": fraction of returned subjects with zero edges (neither
     src nor dst of any edge) -- a disconnected graph node. Not to be
     confused with a zero-claim subject, which is structurally impossible
@@ -77,6 +77,57 @@ def load_ground_truth(path: Path) -> dict[str, Any]:
     schema = json.loads(GROUND_TRUTH_SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.validate(instance=data, schema=schema)
     return data
+
+
+def expected_facts_from_manifest(ground_truth: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive the EQ3/EQ9 "planted fact" list (`{natural_key, type, aliases,
+    source_doc_ids}` -- what `precision_recall_by_type`/`cluster_purity`
+    expect) from the manifest's `nodes[]` (producer wire rows -- one row per
+    evidence-bearing claim, design spec Sec. 7.0). The same planted fact can
+    appear as multiple rows sharing one `id` (e.g. revisited by a later
+    document, or the AN2 Czech-inflection pair); dedupe by `id` so it counts
+    once. `natural_key` is the node id itself -- this manifest shape has no
+    separate alias field, unlike the older ground-truth shape this replaces.
+    An entity-resolution challenge is instead expressed as two DISTINCT ids
+    (e.g. `client:corundum-foods` vs. `client:corundum-foods-inc`, the
+    `entity_resolution` trap) -- the extraction is expected to resolve them,
+    not the ground truth to alias them."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for node in ground_truth.get("nodes", []):
+        entry = by_id.setdefault(
+            node["id"],
+            {"natural_key": node["id"], "type": node["type"], "aliases": [], "source_doc_ids": []},
+        )
+        for ev in node.get("evidence", []):
+            doc_id = ev.get("doc_id")
+            if doc_id and doc_id not in entry["source_doc_ids"]:
+                entry["source_doc_ids"].append(doc_id)
+    return list(by_id.values())
+
+
+def expected_edges_from_manifest(ground_truth: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive the expected-edge list (`{src_natural_key, type, dst_natural_key,
+    source_doc_ids}`) from the manifest's `edges[]` (producer wire rows).
+    Dedupe by (`src`, `type`, `dst`) -- the same merge key the ingest
+    endpoint uses (design spec Sec. 7.0) -- so a planted edge revisited by
+    more than one document still counts once."""
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for edge in ground_truth.get("edges", []):
+        key = (edge["src"], edge["type"], edge["dst"])
+        entry = by_key.setdefault(
+            key,
+            {
+                "src_natural_key": edge["src"],
+                "type": edge["type"],
+                "dst_natural_key": edge["dst"],
+                "source_doc_ids": [],
+            },
+        )
+        for ev in edge.get("evidence", []):
+            doc_id = ev.get("doc_id")
+            if doc_id and doc_id not in entry["source_doc_ids"]:
+                entry["source_doc_ids"].append(doc_id)
+    return list(by_key.values())
 
 
 def _fact_cluster(fact: dict[str, Any]) -> set[str]:
@@ -228,15 +279,21 @@ def fetch_and_score_release(
     ground_truth: dict[str, Any],
     *,
     release_id: str,
+    corpus_id: str,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     """Fetch every fact type present in `ground_truth` from a live Agnes
     instance and compute EQ3+EQ9. Returns the exact dict `write_metrics_
     record` persists -- callers that want the raw API responses too should
-    fetch separately and call the pure functions above directly."""
-    facts = ground_truth.get("facts", [])
+    fetch separately and call the pure functions above directly.
+
+    `corpus_id` is the Collection this manifest's corpus was ingested into
+    (`claims.corpus_id` in the live schema) -- an ingest-time id the
+    generator's manifest itself has no way to know, so the caller (who did
+    the ingest) supplies it."""
+    facts = expected_facts_from_manifest(ground_truth)
     fact_types = sorted({f["type"] for f in facts})
-    document_count = ground_truth["document_count"]
+    document_count = ground_truth["counts"]["documents"]
 
     actual_subjects: list[dict[str, Any]] = []
     with httpx.Client(
@@ -256,7 +313,7 @@ def fetch_and_score_release(
     pr_by_type = precision_recall_by_type(facts, actual_subjects)
     return {
         "release_id": release_id,
-        "corpus_id": ground_truth["corpus_id"],
+        "corpus_id": corpus_id,
         "document_count": document_count,
         "subjects_fetched": len(actual_subjects),
         "precision_recall_by_type": {
