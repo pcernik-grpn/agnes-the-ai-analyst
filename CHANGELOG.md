@@ -62,6 +62,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   data-apps deploy/git-credential/draft/preview-grant mints are intentionally
   PAT-reachable (the CLI's `agnes app …` commands run under the caller's own
   PAT against their own app) and out of scope here — see #1292.
+- **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
 - The "Add data source" wizard's Snowflake table picker no longer renders a
   raw, three-layer-wrapped driver exception when the connection itself can't
