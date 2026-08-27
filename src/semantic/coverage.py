@@ -209,7 +209,12 @@ def _keboola_semantic_status(conn: Dict[str, Any], entry: Optional[Dict[str, Any
     )
 
 
-def _native_semantic_status(conn: Dict[str, Any], adapter: str) -> Dict[str, Any]:
+def _native_semantic_status(
+    conn: Dict[str, Any],
+    adapter: str,
+    semantic_sources: List[Dict[str, Any]],
+    semantic_models: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     """Semantic status for a source type served by a first-party adapter.
 
     Read straight off ``semantic_sources`` / ``semantic_models`` — no
@@ -219,12 +224,14 @@ def _native_semantic_status(conn: Dict[str, Any], adapter: str) -> Dict[str, Any
     connection is intentionally attributed to NO connection rather than to
     every one of that type, which would credit one project's model to its
     neighbour.
-    """
-    from src.repositories import semantic_model_repo, semantic_source_repo
 
+    Both lists are read ONCE by the caller and passed in: this runs per
+    connection, and re-listing every source and every model inside the loop
+    made the report O(connections x models).
+    """
     linked = [
         s
-        for s in semantic_source_repo().list_all()
+        for s in semantic_sources
         if (s.get("adapter") or "") == adapter and ((s.get("config") or {}).get("connection_id")) == conn["id"]
     ]
     raw: Dict[str, Any] = {"semantic_sources": [{"id": s["id"], "name": s.get("name")} for s in linked]}
@@ -236,7 +243,7 @@ def _native_semantic_status(conn: Dict[str, Any], adapter: str) -> Dict[str, Any
         )
 
     refs = {s["id"] for s in linked}
-    models = [m for m in semantic_model_repo().list_all() if m.get("source_ref") in refs]
+    models = [m for m in semantic_models if m.get("source_ref") in refs]
     raw["models"] = len(models)
     if not models:
         errors = [s.get("last_sync_error") for s in linked if s.get("last_sync_error")]
@@ -252,6 +259,8 @@ def _native_semantic_status(conn: Dict[str, Any], adapter: str) -> Dict[str, Any
 def _semantic_status(
     conn: Dict[str, Any],
     keboola_coverage: Dict[str, Dict[str, Any]],
+    semantic_sources: List[Dict[str, Any]],
+    semantic_models: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     source_type = (conn.get("source_type") or "").strip()
     adapter = SEMANTIC_ADAPTER_BY_SOURCE_TYPE.get(source_type)
@@ -262,7 +271,7 @@ def _semantic_status(
         )
     if adapter == "keboola_metastore":
         return _keboola_semantic_status(conn, keboola_coverage.get(conn["id"]))
-    return _native_semantic_status(conn, adapter)
+    return _native_semantic_status(conn, adapter, semantic_sources, semantic_models)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +311,25 @@ def _metrics_status(tables: List[Dict[str, Any]], bound_tables: set[str]) -> Dic
             action={"label": "Add a metric", "href": _BUILDER_HREF},
         )
     return _domain_result(STATUS_OK, f"every one of the {len(tables)} registered table(s) has a metric")
+
+
+def _semantic_source_ids_by_connection(
+    semantic_sources: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """``source_connections.id`` -> the ``semantic_sources.id``s linked to it.
+
+    Deliberately NOT filtered by adapter, unlike :func:`_native_semantic_status`:
+    that function answers "does this connection have a model its own adapter
+    imported", while this map answers "which provenance refs can carry rows
+    belonging to this connection" — and a row's provenance does not stop being
+    this connection's because it arrived through some other adapter.
+    """
+    by_connection: Dict[str, List[str]] = {}
+    for source in semantic_sources:
+        connection_id = (source.get("config") or {}).get("connection_id")
+        if connection_id:
+            by_connection.setdefault(connection_id, []).append(source["id"])
+    return by_connection
 
 
 def _glossary_status(term_count: int) -> Dict[str, Any]:
@@ -364,6 +392,7 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
         metric_repo,
         resource_source_tags_repo,
         semantic_model_repo,
+        semantic_source_repo,
         source_connections_repo,
         table_registry_repo,
     )
@@ -380,10 +409,24 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     for table in tables:
         tables_by_connection.setdefault(table.get("connection_id"), []).append(table)
 
+    # `glossary_terms.source_ref` carries TWO namespaces, and reading it as one
+    # made this column lie. The Keboola metastore sync stamps the
+    # `source_connections.id` itself, but `src/semantic/importer.py` stamps the
+    # `semantic_sources.id` of the registered source the document came through
+    # (`import_source()` -> `"source_ref": source_id`). Looking the connection
+    # id up alone therefore reported `missing` for every source fed by a
+    # registered semantic source — a Snowflake connection with an imported
+    # glossary read as having none — and those terms were counted in NO bucket
+    # at all, since the synthetic local row only claims `source_ref IS NULL`.
+    # Resolving both namespaces per connection is what makes the column true.
     terms_by_ref: Dict[Optional[str], int] = {}
     for term in terms:
         ref = term.get("source_ref")
         terms_by_ref[ref] = terms_by_ref.get(ref, 0) + 1
+
+    semantic_sources = semantic_source_repo().list_all()
+    semantic_models = semantic_model_repo().list_all()
+    source_ids_by_connection = _semantic_source_ids_by_connection(semantic_sources)
 
     # Only pay for the Keboola provider's upstream round-trips when a Keboola
     # connection actually exists.
@@ -395,15 +438,16 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     for conn in connections:
         conn_id = conn["id"]
         tags = tags_repo.list_for_source(conn_id)
+        glossary_refs = [conn_id, *source_ids_by_connection.get(conn_id, [])]
         sources.append(
             {
                 "source_id": conn_id,
                 "source_type": conn.get("source_type") or "",
                 "name": conn.get("name") or conn_id,
                 "domains": {
-                    "semantic": _semantic_status(conn, keboola_coverage),
+                    "semantic": _semantic_status(conn, keboola_coverage, semantic_sources, semantic_models),
                     "metrics": _metrics_status(tables_by_connection.get(conn_id, []), bound_tables),
-                    "glossary": _glossary_status(terms_by_ref.get(conn_id, 0)),
+                    "glossary": _glossary_status(sum(terms_by_ref.get(ref, 0) for ref in glossary_refs)),
                     "skill": _tag_status(conn_id, "skill", tags),
                     "agent": _tag_status(conn_id, "agent", tags),
                     "knowledge_base": _tag_status(conn_id, "knowledge_base", tags),
@@ -414,7 +458,7 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     local_tables = tables_by_connection.get(None, [])
     local_terms = terms_by_ref.get(None, 0)
     if local_tables or local_terms:
-        sources.append(_local_bucket(local_tables, local_terms, bound_tables, semantic_model_repo()))
+        sources.append(_local_bucket(local_tables, local_terms, bound_tables, semantic_models))
 
     if source_id is not None:
         sources = [s for s in sources if s["source_id"] == source_id]
@@ -626,7 +670,7 @@ def _local_bucket(
     local_tables: List[Dict[str, Any]],
     local_terms: int,
     bound_tables: set[str],
-    model_repo: Any,
+    semantic_models: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """The synthetic row for everything attached to no connection.
 
@@ -635,7 +679,7 @@ def _local_bucket(
     is by definition the rows that have none — offering "tag a skill" would
     link to a form that cannot be submitted.
     """
-    manual_models = [m for m in model_repo.list_all() if (m.get("source") or "") == "manual"]
+    manual_models = [m for m in semantic_models if (m.get("source") or "") == "manual"]
     if manual_models:
         semantic = _domain_result(STATUS_OK, f"{len(manual_models)} hand-authored model(s)")
     else:

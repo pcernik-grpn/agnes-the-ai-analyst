@@ -27,7 +27,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `semantic_model_coverage_tag` / `semantic_model_coverage_untag`. The
   existing Keboola binding-coverage report (`GET /api/admin/semantic-layer/
   coverage`) is unchanged — it is now one provider inside this wider one,
-  surfaced per-source as `domains.semantic.raw`.
+  surfaced per-source as `domains.semantic.raw`. The glossary column resolves
+  both of the namespaces `glossary_terms.source_ref` carries — the
+  `source_connections.id` the Keboola metastore sync stamps, and the
+  `semantic_sources.id` the document importer stamps — so a source fed by a
+  registered semantic source is credited with the terms it actually has.
 
 - **Semantic-layer health: is what exists broken, stale, or inconsistent.**
   `GET /api/admin/semantic-layer/health` (`agnes semantic-model health`, MCP

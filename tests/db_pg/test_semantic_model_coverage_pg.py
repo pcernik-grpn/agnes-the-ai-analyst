@@ -292,6 +292,83 @@ class TestGlossary:
         assert glossary["status"] == "missing"
         assert glossary["action"]["href"]
 
+    def test_terms_stamped_with_a_linked_semantic_source_count_for_its_connection(self, pg_state):
+        """``glossary_terms.source_ref`` carries two namespaces.
+
+        The Keboola metastore sync stamps the ``source_connections.id``
+        (covered above), but ``src/semantic/importer.py`` stamps the
+        ``semantic_sources.id`` the document arrived through
+        (``import_source()`` -> ``"source_ref": source_id``). Reading only the
+        first namespace reported ``missing`` for every source fed by a
+        registered semantic source, next to an "Add glossary terms" link, while
+        the terms sat in the database.
+        """
+        from src.repositories import glossary_repo, semantic_source_repo
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-sf", source_type="snowflake", name="Snowflake")
+        semantic_source_repo().create(
+            id="ss_1",
+            kind="connection",
+            name="Snowflake semantic views",
+            adapter="snowflake_semantic",
+            config={"connection_id": "conn-sf"},
+        )
+        glossary_repo().create(id="g1", term="MRR", definition="…", source_ref="ss_1")
+
+        glossary = _domains(compute_cross_domain_coverage(), "conn-sf")["glossary"]
+        assert glossary["status"] == "ok"
+        assert "1 term" in glossary["detail"]
+
+    def test_terms_from_a_linked_source_are_not_also_counted_in_the_local_bucket(self, pg_state):
+        """The other half of the same bug: those terms were counted NOWHERE.
+
+        The synthetic bucket claims only ``source_ref IS NULL``, so a term
+        stamped with a semantic-source id fell out of its connection's column
+        AND out of the bucket — the exact "counted nowhere" hole the bucket
+        exists to close.
+        """
+        from src.repositories import glossary_repo, semantic_source_repo
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-sf", source_type="snowflake", name="Snowflake")
+        semantic_source_repo().create(
+            id="ss_1",
+            kind="connection",
+            name="Snowflake semantic views",
+            adapter="snowflake_semantic",
+            config={"connection_id": "conn-sf"},
+        )
+        _table("t1", connection_id=None, source_type="local")
+        glossary_repo().create(id="g1", term="MRR", definition="…", source_ref="ss_1")
+
+        report = compute_cross_domain_coverage()
+        assert _domains(report, "conn-sf")["glossary"]["status"] == "ok"
+        # the bucket exists (an unattributed table put it there) but claims no
+        # glossary term of its own
+        assert _domains(report, "__local__")["glossary"]["status"] == "missing"
+
+    def test_a_semantic_source_linked_to_another_connection_does_not_leak(self, pg_state):
+        """Resolving the second namespace must not over-credit: a term owned by
+        one connection's semantic source stays out of its neighbour's column."""
+        from src.repositories import glossary_repo, semantic_source_repo
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-a", source_type="snowflake", name="A")
+        _connection("conn-b", source_type="snowflake", name="B")
+        semantic_source_repo().create(
+            id="ss_a",
+            kind="connection",
+            name="A's views",
+            adapter="snowflake_semantic",
+            config={"connection_id": "conn-a"},
+        )
+        glossary_repo().create(id="g1", term="MRR", definition="…", source_ref="ss_a")
+
+        report = compute_cross_domain_coverage()
+        assert _domains(report, "conn-a")["glossary"]["status"] == "ok"
+        assert _domains(report, "conn-b")["glossary"]["status"] == "missing"
+
 
 class TestTagBackedDomains:
     def test_an_untagged_source_is_missing_in_all_three(self, pg_state):
