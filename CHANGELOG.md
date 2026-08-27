@@ -62,6 +62,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
+- **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
 - The "Add data source" wizard's Snowflake table picker no longer renders a
   raw, three-layer-wrapped driver exception when the connection itself can't
@@ -80,6 +81,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   reopen and on switching connector — and not only by a fresh Snowflake
   listing.
 
+- **Imported semantic-view metrics whose only expression dialect is
+  warehouse-specific (Snowflake today, Databricks next) now appear in the
+  metrics catalog.** `src/semantic/projection.py` previously dropped such a
+  metric entirely — it never reached `metric_definitions`, even though the
+  document itself was stored fine. It now projects with the raw
+  warehouse-flavour SQL as-is, plus a note naming the dialect and pointing at
+  server-side (remote/materialized) execution — no schema change, mirroring
+  the notes-based marker `connectors/databricks/semantic_layer.py` already
+  uses for the same case. The `/semantic-layer/<slug>` model-detail badge is
+  updated to match: it no longer claims these metrics are "skipped
+  (unsupported dialect)" — it now reads "N metric(s) run server-side only
+  (warehouse dialect)".
 - `GET /api/v1/agents/{id}/memories` is now owner/admin-only, matching the
   memory notebook's approve/archive/delete routes: a user the agent is
   merely SHARED with (a runnable grantee, C2.3) previously passed the same
@@ -90,6 +103,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unaffected.
 
 ### Removed
+
+- Removed the unused OpenMetadata catalog export (`src/catalog_export.py`,
+  `connectors/openmetadata/`) and its `openmetadata:` config section —
+  zero non-test runtime callers, orphaned since the metrics/tables YAML
+  pipeline moved to `docs/metrics/*.yaml` + `agnes admin metrics import`.
+  A `POST /api/admin/server-config` with an `openmetadata:` section is now
+  rejected with 400, same as any other unknown section.
 
 ### Internal
 
