@@ -49,13 +49,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   models referencing a Snowflake/Databricks-style identifier
   (`DATABASE.SCHEMA.TABLE`) now resolve too — matched against the LAST two
   segments (`SCHEMA.TABLE`) across every registered table, not only
-  Keboola's. Previously such metrics were silently skipped as unbound
   because the binder only ever looked at Keboola-registered tables. This
   also fixes `resolve_dataset_table` (`src/semantic_coverage.py::tables_
-  without_semantic_coverage`, `agnes semantic-model coverage`) the same way
-  — a hand-authored/uploaded model's Snowflake/Databricks-shaped dataset
-  `source:` now resolves via the same generic fallback instead of only a
-  literal `table_registry.id`/`.name` match.
+  without_semantic_coverage`, `agnes semantic-model coverage`, and
+  `src/semantic_autodraft.py`) the same way — a hand-authored/uploaded
+  model's Snowflake/Databricks-shaped dataset `source:` now resolves via
+  the same generic fallback instead of only a literal
+  `table_registry.id`/`.name` match.
 
 - **`agnes admin config export` / `agnes admin config apply`** round-trip the
   server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections

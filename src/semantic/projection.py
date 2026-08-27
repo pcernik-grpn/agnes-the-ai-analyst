@@ -184,11 +184,25 @@ def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str
       _compose_dataset``), never the registered Agnes name. Resolved via
       the existing ``table_lookup_from_registry()`` ->
       ``resolve_table_name()`` chain (see :func:`_resolve_keboola_table_row`).
-    - every other source: ``dataset.source`` (falling back to
-      ``dataset.name``) is matched literally against ``table_registry.id``
-      then ``table_registry.name`` — confirmed correct for non-Keboola
-      sources (see the module docstring note near ``_MANUAL_DOCUMENT_
-      SOURCE``: a manual dataset's ``source`` IS an Agnes table id).
+    - every other source: tried in order —
+
+      1. ``dataset.source`` (falling back to ``dataset.name``) matched
+         LITERALLY against ``table_registry.id`` then ``table_registry.name``
+         — correct for a genuinely-Agnes-native identifier (see the module
+         docstring note near ``_MANUAL_DOCUMENT_SOURCE``: a manual dataset's
+         ``source`` IS an Agnes table id in that case).
+      2. When step 1 misses: the same generic multi-segment fallback
+         :func:`_table_binder` uses (:func:`_generic_table_lookup` +
+         :func:`_resolve_generic_table_row`) — a Snowflake/Databricks-shaped
+         identifier (``schema.table`` or ``database.schema.table``) matched
+         against EVERY registered table's ``(bucket, source_table)``,
+         regardless of ``source_type``. This is what lets a hand-authored/
+         uploaded model's dataset (e.g. ``ESHOP_DEMO.RAW.ORDERS``) resolve to
+         a table registered via ``agnes admin register-table --bucket RAW
+         --source-table ORDERS``.
+
+      The Keboola path above and the ``dataset.source``-before-``.name``
+      priority are both unchanged by this fallback.
 
     ``conn`` is accepted for signature stability (mirrors
     ``app.auth.scheduler_token.ensure_scheduler_user``) — actual repo access
@@ -215,6 +229,24 @@ def resolve_dataset_table(dataset: dict, source: str, conn=None) -> Optional[str
         return row["id"] if row else None
 
     row = table_registry_repo().get(table_ref) or table_registry_repo().get_by_name(table_ref)
+    if row:
+        return row["id"]
+
+    # Generic fallback: this is a one-off, single-dataset call (unlike
+    # _table_binder's per-metric closure reusing one lookup across a whole
+    # project_document() call), so the lookup is built fresh here, on miss
+    # only — the same cost posture the keboola_metastore branch above
+    # already has (it also builds its lookup fresh per call). Callers of
+    # resolve_dataset_table walk one dataset at a time (per model, per
+    # coverage/autodraft pass), not a routine per-row sync, so an extra
+    # registry scan per unresolved dataset is an acceptable cost here.
+    try:
+        generic_lookup = _generic_table_lookup()
+    except Exception:  # pragma: no cover - a registry read failure must not raise
+        return None
+    if not generic_lookup:
+        return None
+    row = _resolve_generic_table_row(table_ref, generic_lookup)
     return row["id"] if row else None
 
 
