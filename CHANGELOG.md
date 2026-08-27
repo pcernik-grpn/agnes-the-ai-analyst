@@ -317,6 +317,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **BREAKING (infra pins): the `customer-instance` Terraform module's
+  `data_source` variable stops rewriting a `DATA_SOURCE=...` line into
+  `/opt/agnes/.env` on every boot** (D1 residual — the last knob still
+  clobbered this way after the theme/experience/home_route/studio_enabled
+  handoff). It now seeds `instance.yaml`'s `data_source.type` on a VM's
+  FIRST boot only, the same first-boot-seed pattern those four knobs already
+  use, so `/admin/server-config` owns it from day 2 onward. `get_data_source_type()`
+  also flips its own resolution order — `data_source.type` (the overlay) now
+  wins over the `DATA_SOURCE` env var, the one exception to this module's
+  usual env-wins rule — so a UI edit takes effect even on a VM whose
+  already-baked `.env`/running container still carries a stale `DATA_SOURCE`
+  from before this change. `DATA_SOURCE` remains a fallback when the overlay
+  has no value (local-dev convenience unaffected). `data_source.{keboola,
+  bigquery,snowflake,databricks}.*` connection settings (credentials, stack
+  URL) are unaffected — that consolidation is D2. See the updated "Config
+  ownership map" in `docs/CONFIGURATION.md`.
+
 - **VM auto-upgrade refreshes host artifacts from the release image, not
   the repo's raw `main` branch.** The 5-minute tick
   (`scripts/ops/agnes-auto-upgrade.sh`) now extracts the bind-mounted

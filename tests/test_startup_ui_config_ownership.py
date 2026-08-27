@@ -17,6 +17,15 @@ supersedes for the `.env`-line assertions
 (``test_startup_studio_toggle.py``, ``test_startup_experience_toggle.py``,
 ``test_startup_ui_layout_theme_toggle.py`` — updated alongside this file to
 drop their now-wrong "the tpl writes an env line" assertions).
+
+D1 residual (2026-08): `data_source.type` gets the same handoff, added here
+rather than a new file since it's the same slice of work. Unlike the four
+knobs above, the `data_source` template var itself keeps flowing into
+startup-script.sh.tpl — it still gates the boot-time keboola-storage-token
+secret fetch — only the `.env` line it used to grow is gone. This is also
+the one knob where the app-side precedence flips (overlay wins over
+`DATA_SOURCE` env, not just "env still wins if hand-set") — see
+app/instance_config.py::get_data_source_type() and tests/test_instance_config.py.
 """
 
 import re
@@ -25,6 +34,16 @@ from pathlib import Path
 MODULE = Path("infra/modules/customer-instance")
 TPL_TEXT = (MODULE / "startup-script.sh.tpl").read_text()
 MAIN_TF_TEXT = (MODULE / "main.tf").read_text()
+
+
+def _env_heredoc_block() -> str:
+    """The body of `cat > "$APP_DIR/.env" <<ENVEOF ... ENVEOF` — isolated so
+    a check for "is DATA_SOURCE written to .env" can't be fooled by
+    `$DATA_SOURCE` uses elsewhere in the script (the bash variable itself,
+    the boot-time keboola-token gate)."""
+    m = re.search(r'cat > "\$APP_DIR/\.env" <<ENVEOF\n(.*?)\nENVEOF\n', TPL_TEXT, re.DOTALL)
+    assert m, "the .env heredoc was not found in startup-script.sh.tpl"
+    return m.group(1)
 
 
 class TestEnvLinesRemoved:
@@ -53,6 +72,17 @@ class TestEnvLinesRemoved:
             r'%\{\s*if\s+chat_provider\s*!=\s*""\s*~?\}\s*\nAGNES_CHAT_PROVIDER=\$\{chat_provider\}\s*\n%\{\s*endif\s*~?\}',
             TPL_TEXT,
         ), "chat_provider must keep writing its env line — it is not part of this slice"
+
+    def test_no_data_source_env_line(self):
+        """D1 residual: the `.env` heredoc must not assign DATA_SOURCE=...
+        anymore. The bash variable `$DATA_SOURCE` itself is allowed to
+        survive elsewhere in the script (it still gates the boot-time
+        keboola-storage-token secret fetch) — only the env-line write is
+        gone."""
+        heredoc = _env_heredoc_block()
+        assert "DATA_SOURCE=" not in heredoc
+        # The gating use further up the script is unaffected.
+        assert 'if [ "$DATA_SOURCE" = "keboola" ]' in TPL_TEXT
 
 
 def _templatefile_call_block() -> str:
@@ -118,6 +148,21 @@ class TestFirstBootSeedCarriesTheKnobs:
         assert m, "instance_branding_map local not found"
         assert "instance_studio_map" in m.group(0)
 
+    def test_instance_data_source_map_local_exists(self):
+        """D1 residual: same conditional shape as instance_studio_map —
+        omit the block entirely when var.data_source is empty (never true
+        given the "keboola" default, but mirrors the other locals' guard
+        style) so an unset knob doesn't grow the seed."""
+        assert re.search(
+            r'instance_data_source_map\s*=\s*var\.data_source\s*!=\s*""\s*\?\s*\{\s*type\s*=\s*var\.data_source\s*\}\s*:\s*\{\}',
+            MAIN_TF_TEXT,
+        ), "instance_data_source_map local not found or has an unexpected shape"
+
+    def test_instance_branding_map_merges_in_the_data_source_block(self):
+        m = re.search(r"instance_branding_map\s*=\s*\{.*?\n  \}\n", MAIN_TF_TEXT, re.DOTALL)
+        assert m, "instance_branding_map local not found"
+        assert "instance_data_source_map" in m.group(0)
+
 
 class TestVariableDescriptionsNameTheOwnershipHandoff:
     """variables.tf descriptions must stop implying these are re-asserted
@@ -135,3 +180,11 @@ class TestVariableDescriptionsNameTheOwnershipHandoff:
         m = re.search(r'variable\s+"studio_enabled"\s*\{(.*?)\n\}', vars_text, re.DOTALL)
         assert m
         assert "first-boot seed" in m.group(1).lower()
+
+    def test_data_source_description_mentions_first_boot_seed_and_breaking(self):
+        vars_text = (MODULE / "variables.tf").read_text()
+        m = re.search(r'variable\s+"data_source"\s*\{(.*?)\n\}', vars_text, re.DOTALL)
+        assert m
+        description = m.group(1).lower()
+        assert "first-boot seed" in description
+        assert "breaking" in description

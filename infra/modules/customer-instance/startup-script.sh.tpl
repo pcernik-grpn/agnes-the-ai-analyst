@@ -158,9 +158,11 @@ YAML
     # copyright / favicon / theme colours / custom_scripts) PLUS — since D1,
     # 2026-08 — the presentation knobs that used to be always-wins `.env`
     # lines: `instance.theme` (palette name), `instance.experience`,
-    # `instance.home_route` and `studio.enabled`. All of it comes from the
-    # Terraform variables, pre-rendered to a base64'd top-level
-    # `instance:` + `theme:` + `studio:` YAML fragment. Appended ONLY here,
+    # `instance.home_route`, `studio.enabled` and — D1 residual —
+    # `data_source.type` (the connector type: keboola/bigquery/local). All
+    # of it comes from the Terraform variables, pre-rendered to a base64'd
+    # top-level `instance:` + `theme:` + `studio:` + `data_source:` YAML
+    # fragment. Appended ONLY here,
     # inside the "file absent" branch, so it seeds a fresh instance without
     # ever clobbering an operator's later edits or a migrated
     # database.backend — from day 2 onward, `/admin/server-config` (or a
@@ -1116,7 +1118,6 @@ JWT_SECRET_KEY=$JWT_KEY
 SESSION_SECRET=$SESSION_KEY
 $SERVER_URL_LINE
 DATA_DIR=$DATA_MNT
-DATA_SOURCE=$DATA_SOURCE
 KEBOOLA_STORAGE_TOKEN=$KEBOOLA_TOKEN
 KEBOOLA_STACK_URL=$KEBOOLA_STACK_URL
 SEED_ADMIN_EMAIL=$SEED_ADMIN_EMAIL
@@ -1131,13 +1132,18 @@ AGNES_APP_MEM_LIMIT=${app_mem_limit}
 AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
-# home_route / studio_enabled / theme / experience do NOT write env lines
-# here (D1, 2026-08): an always-wins line rewritten into this file on EVERY
-# boot permanently shadowed the admin UI's `/admin/server-config` control of
-# the same knob. They ride the instance_branding_b64 first-boot-only seed
-# instead — see section 2's INSTANCE_YAML block above. chat_provider is the
-# one exception: it pins deployment-provisioned backing (the kai-agent
-# sidecar / apps-runner), not a pure presentation choice.
+# home_route / studio_enabled / theme / experience / data_source.type do NOT
+# write env lines here (D1, 2026-08 + residual): an always-wins line
+# rewritten into this file on EVERY boot permanently shadowed the admin UI's
+# `/admin/server-config` control of the same knob. They ride the
+# instance_branding_b64 first-boot-only seed instead — see section 2's
+# INSTANCE_YAML block above. $DATA_SOURCE (the bash var, not an env line) is
+# still used further up in this script to decide whether to fetch the
+# keboola-storage-token secret — that boot-time decision is unrelated to what
+# the running app reads back as its config. chat_provider is the one
+# exception that still writes an env line: it pins deployment-provisioned
+# backing (the kai-agent sidecar / apps-runner), not a pure presentation
+# choice.
 %{ if chat_provider != "" ~}
 AGNES_CHAT_PROVIDER=${chat_provider}
 %{ endif ~}

@@ -411,7 +411,29 @@ from app.switches import Switch as FeatureFlag  # noqa: E402,F401
 
 
 def get_data_source_type() -> str:
-    return os.environ.get("DATA_SOURCE", get_value("data_source", "type", default="local"))
+    """Primary connector type for this instance (``keboola``/``bigquery``/``local``).
+
+    Resolution order: ``data_source.type`` in ``instance.yaml`` (the overlay
+    ``/admin/server-config`` writes) > ``DATA_SOURCE`` env var > default
+    ``"local"``. This is the ONE deliberate exception to this module's usual
+    env-wins-everything rule (see docs/CONFIGURATION.md) — D1 residual
+    (2026-08): the customer-instance Terraform module used to write an
+    always-wins ``DATA_SOURCE=...`` line into ``.env`` on every boot, which
+    permanently shadowed an admin's UI edit of the same knob. Provisioning no
+    longer writes that line (it seeds ``data_source.type`` into the
+    first-boot-only ``instance.yaml`` instead — see
+    ``infra/modules/customer-instance``), but flipping precedence here is
+    what makes a UI edit take effect even on a VM whose on-disk ``.env`` (or
+    a running container's already-baked env) still carries a stale
+    ``DATA_SOURCE`` line from before this change. ``DATA_SOURCE`` remains
+    consulted when the overlay has no value at all, so the local-dev
+    convenience of setting it in a laptop ``.env`` with no instance.yaml
+    overlay keeps working.
+    """
+    overlay = get_value("data_source", "type", default="")
+    if overlay:
+        return str(overlay)
+    return os.environ.get("DATA_SOURCE") or "local"
 
 
 def get_slack_transport() -> str:

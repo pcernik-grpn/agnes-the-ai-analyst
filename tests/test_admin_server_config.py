@@ -272,6 +272,22 @@ class TestPostServerConfigAPI:
         assert resp.status_code == 400
         assert "thmee" in resp.json()["detail"]
 
+    def test_post_jira_section_rejected(self, seeded_app):
+        """Regression guard: `jira:` was a dead editable-config section — the
+        Jira connector reads `JIRA_*` env directly and never consulted
+        `get_value("jira", ...)` — deleted from `_STATIC_EDITABLE_SECTIONS` /
+        `_SECTION_BASELINE_EFFECT` (D1 slice 1). A `jira:` patch must be
+        rejected loudly, not silently accepted-and-ignored."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/server-config",
+            json={"sections": {"jira": {"anything": "value"}}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 400
+        assert "jira" in resp.json()["detail"]
+
     def test_post_danger_section_without_confirmation_rejected(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
