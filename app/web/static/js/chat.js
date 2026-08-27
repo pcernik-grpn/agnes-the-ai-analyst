@@ -5414,7 +5414,10 @@ function renderCoPresence(host, participants) {
     name.title = f.path;
     const hint = document.createElement("span");
     hint.className = "cloud-chat-files-hint";
-    hint.textContent = f.path + " · " + fmtSize(f.size_bytes) + " · " + fmtWhen(f.modified_at);
+    // Engine listings carry no mtime (modified_at is null) — skip the segment
+    // rather than render the epoch.
+    hint.textContent =
+      f.path + " · " + fmtSize(f.size_bytes) + (f.modified_at ? " · " + fmtWhen(f.modified_at) : "");
     meta.appendChild(name);
     meta.appendChild(hint);
 
