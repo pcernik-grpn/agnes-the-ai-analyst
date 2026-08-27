@@ -54,7 +54,6 @@ class ResourceType(StrEnum):
     AGENT = "agent"
     CORPUS_FILE = "corpus_file"
     STORE_ENTITY = "store_entity"
-    DOCUMENT_SCOPE = "document_scope"
 
 
 # Shape returned by ``list_blocks`` delegates. Kept as plain ``dict`` to keep
@@ -72,12 +71,6 @@ ListBlocksFn = Callable[[], List[Block]]
 # entity types we pass an effectively-unbounded cap so nothing is silently
 # hidden (table_registry / marketplace use their unbounded ``list_all()``).
 _GRANT_PROJECTION_LIMIT = 100_000
-
-# Connection source types whose output is documents rather than tables, and
-# which therefore contribute DOCUMENT_SCOPE grants. One list rather than a
-# literal inside the projection, so adding a Drive or an S3 prefix is a
-# one-line change with an obvious home.
-_FILE_SOURCE_TYPES: tuple[str, ...] = ("sharepoint",)
 
 
 @dataclass(frozen=True)
@@ -659,72 +652,6 @@ def _store_entity_blocks() -> List[Block]:
     return [blocks[k] for k in ("skill", "agent", "plugin") if k in blocks]
 
 
-def _file_source_connections() -> List[dict]:
-    """Connection rows for sources that crawl documents rather than tables.
-
-    Split out from the projection below so a test can stand in for the
-    repository, and so "which source types are file sources" has one home as
-    more of them arrive (a Drive, an S3 prefix) rather than a literal inside a
-    loop.
-    """
-    from src.repositories import source_connections_repo
-
-    rows: List[dict] = []
-    for source_type in _FILE_SOURCE_TYPES:
-        rows.extend(source_connections_repo().list(source_type=source_type) or [])
-    return rows
-
-
-def _document_scope_blocks() -> List[Block]:
-    """Project each file source's selected crawl scopes into grantable items.
-
-    A scope — a site, a library, a folder — is what an admin actually hands to
-    a group: documents carry the scope they were crawled from, and a fact
-    inherits from the documents evidencing it, so this grant is what decides
-    whether a caller ever sees that fact in an answer.
-
-    The list is read from each connection's ``config.scopes`` rather than from
-    a table of its own. The connector has to hold the selection anyway to know
-    what to crawl, and a second copy in app-state would be a Postgres-only
-    repository plus an Alembic revision (the A3 ratchet) to store a list that
-    would then need keeping in sync with the one that matters.
-
-    Blocked per connection, because "which SharePoint" is the question an admin
-    asks first when two are connected. Excluded scopes are left out: they never
-    produce a document, so granting one would promise access to nothing. A
-    malformed entry is skipped rather than raised — this config is admin-
-    writable and hand-editable, and one bad line must not take down the page
-    that every other resource type is also rendered on.
-    """
-    blocks: List[Block] = []
-    for connection in _file_source_connections():
-        config = connection.get("config") or {}
-        items = []
-        for scope in config.get("scopes") or []:
-            if not isinstance(scope, dict):
-                continue
-            scope_id = str(scope.get("id") or "").strip()
-            if not scope_id or scope.get("excluded"):
-                continue
-            documents = scope.get("documents")
-            items.append(
-                {
-                    "resource_id": scope_id,
-                    "name": scope.get("label") or scope_id,
-                    "description": (f"{documents} documents" if isinstance(documents, int) else "not crawled yet"),
-                }
-            )
-        if items:
-            blocks.append(
-                {
-                    "id": f"document_scope_{connection.get('id') or connection.get('name')}",
-                    "name": connection.get("name") or connection.get("id") or "",
-                    "items": items,
-                }
-            )
-    return blocks
-
-
 def _collection_blocks() -> List[Block]:
     """Project ``file_corpora`` into the (block → items) shape rendered by
     the admin /access page.
@@ -952,19 +879,6 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         ),
         id_format="<store_entity_id>",
         list_blocks=_store_entity_blocks,
-    ),
-    ResourceType.DOCUMENT_SCOPE: ResourceTypeSpec(
-        key=ResourceType.DOCUMENT_SCOPE,
-        display_name="Document scopes",
-        description=(
-            "A site, library or folder an admin chose to crawl from a file "
-            "source. Grant a group access to a scope and its members can reach "
-            "the documents crawled from it — and the facts those documents "
-            "evidence. This is the unit that decides what a person sees in an "
-            "answer, so a scope left ungranted is indexed but invisible."
-        ),
-        id_format="<source_type>:<connection>:<path>",
-        list_blocks=_document_scope_blocks,
     ),
 }
 

@@ -1061,9 +1061,13 @@ half and you miss leaks.
 
 - **R0** — "Before Agnes has any content … Run A1, A2, and A0. **Run this
   before building anything — once Agnes has content, the pre-build baseline
-  is unrecoverable.**" The only irreversible ordering constraint in the
-  whole programme: R0 **gates the crawler's first production run** and needs
-  scheduling this week. The Scoring sheet pre-lays all 150 R0 rows including
+  is unrecoverable.**" **Owner decision 2026-08-27: ingestion proceeds
+  without R0.** Recorded honestly: arms A0–A2 never touch Agnes, so the
+  baselines can still be run later against the then-current corpus — what is
+  sacrificed is the *pre-build* label (the corpus gets cleaned and the team
+  learns the questions in the meantime), and Decision #1's control is
+  correspondingly weaker. This waiver should be communicated to the
+  workbook's owner before R1 is graded. The Scoring sheet pre-lays all 150 R0 rows including
   A3/A4: A4 rows stay blank at R0 by definition; **A3 runs at R0 iff the
   seed pack exists by then, else at R1** — decided here so the sheet and the
   plan agree.
@@ -1337,19 +1341,22 @@ overclaim).
 
 ## 17. Open items (owners to assign — first question, not last)
 
-- **O1 — the producer end-to-end**: who runs crawl → convert → anonymize →
-  extract → ingest against the real tenant (the hardening backlog of §7.1 is
-  part of this). A store with no producer holds nothing.
+- **O1 — RESOLVED (owner decision 2026-08-27): we run the producer
+  end-to-end** — crawl → convert → anonymize → extract → ingest, including
+  the §7.1 hardening backlog, the §9.1 converter service and the §9.2
+  anonymizer driver. This widens the build scope: those items are tasks in
+  this plan now, not an external dependency.
 - **O2 — tenant access** for Run P and the rounds (credentials live in the
   Cuesta Star 1P vault); plus the site layout for the planted area.
 - **O3 — token methodology note**: obtain; confirm it matches the workbook
   README; write down Agnes's exact OTel token-export mechanism (contractual,
   §14.6).
-- **O4 — seed-pack packaging owner** (§11): assemble
-  ontology/taxonomies/ER-rules as Claude project context before the first
-  A3 round; plus **Leonard's persona confirmation before R0** (§14.4) and a
-  **Kantata integration owner** (X1 per §14.5's cadence, AC2 per §14.4 — a
-  structured-lane dependency of the eval, not of this design).
+- **O4 — seed-pack packaging owner** (§11): deliberately **deferred**
+  (owner, 2026-08-27) — must be assigned before the first A3 round runs.
+  **Leonard's persona confirmation and the Kantata integration are likewise
+  deferred** (same decision): the substrate build is unblocked, but the
+  evaluation cannot complete without them — AC2/X1 have no answer and
+  Decision #5 cannot be scored until both land.
 - **O5 — reconcile the two anonymization designs** (§9.2 vs the 2026-08-24
   corpus-intake spec).
 - **O6 — cross-language extraction vs the verbatim gate** (§8).

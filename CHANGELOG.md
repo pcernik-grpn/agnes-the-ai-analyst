@@ -812,6 +812,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **A SharePoint connection resolves its certificate from the vault or from
+  the deployment.** Microsoft Graph refuses client secrets for app-only
+  access, so the certificate is the credential: an admin either uploads their
+  own (held encrypted in the connection's vault slot, and preferred when both
+  exist) or points at one the deployment already injects, named by
+  `config.cert_private_key_env` and defaulting to
+  `SHAREPOINT_CERT_PRIVATE_KEY`. That name is admin-writable, so it is checked
+  against the shared credential-variable allowlist — a connection cannot name
+  an unrelated secret and have its value handed out as the certificate.
+  Groundwork for the file-source crawler (no user-facing surface yet).
 - **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
   genuine schema change on an existing DuckDB↔Postgres pair under the A3
   PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
