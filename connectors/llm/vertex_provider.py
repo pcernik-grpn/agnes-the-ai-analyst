@@ -41,6 +41,36 @@ _DATED_ID = re.compile(r"^(.*)-(\d{8})$")
 
 _DEFAULT_REGION = "global"
 
+# The exact character classes ``app/api/broker_vertex.py``'s path parser
+# enforces for the project and location segments. Configured values are held
+# to them too, for two reasons:
+#
+# 1. A configured project/region outside these classes can never equal the
+#    groups a native Vertex path parses to, so every sandbox request would be
+#    refused with an opaque 403 and no boot-time signal.
+# 2. Both are interpolated straight into the outbound URL for Messages-format
+#    callers — and the region becomes part of the HOSTNAME
+#    (``{region}-aiplatform.googleapis.com``). A region carrying ``/``, ``.``
+#    or ``@`` would point the server-side Google OAuth token at a host that is
+#    not Google's; a project id carrying ``/`` or ``?`` would walk the signed
+#    request off its intended path. Validating where the value is read keeps
+#    credential egress pinned, per the security playbook.
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def invalid_vertex_setting(project_id: str, region: str) -> str | None:
+    """Name of the first malformed setting, or ``None`` when both are sane.
+
+    Returns ``"project_id"`` / ``"region"`` so callers can name the offending
+    key in an operator-facing message.
+    """
+    if not _PROJECT_ID_RE.match((project_id or "").strip()):
+        return "project_id"
+    if not _REGION_RE.match((region or "").strip().lower()):
+        return "region"
+    return None
+
 
 def to_vertex_model_id(model: str) -> str:
     """Translate a first-party model id into its Vertex AI form.
@@ -76,6 +106,14 @@ def resolve_vertex_settings(vertex_cfg: dict | None) -> tuple[str, str]:
         raise ValueError(
             "Vertex provider needs a GCP project id — set ai.vertex.project_id "
             "in instance.yaml or the ANTHROPIC_VERTEX_PROJECT_ID env var"
+        )
+    bad = invalid_vertex_setting(project_id, region)
+    if bad:
+        raise ValueError(
+            f"Vertex {bad} is malformed — the value is interpolated into the "
+            f"Vertex API URL (the region becomes part of the hostname), so it "
+            f"is held to the Google resource-id character set: "
+            f"{'letters, digits, dot, dash, underscore' if bad == 'project_id' else 'lowercase letters, digits, dash'}"
         )
     return project_id, region
 

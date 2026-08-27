@@ -171,6 +171,27 @@ def _chat_llm_provider_ok(chat_config) -> bool:
             " and ".join(missing),
         )
         return False
+    # Both values are interpolated into the outbound Vertex URL — the region
+    # into the HOSTNAME — and are compared for equality against the project /
+    # location a sandbox request's path parses to. A value outside the Google
+    # resource-id character set would therefore either 403 every request with
+    # no boot-time signal, or send the server-side Google OAuth token to a
+    # host that is not Google's. Refuse it here instead.
+    from connectors.llm.vertex_provider import invalid_vertex_setting
+
+    bad = invalid_vertex_setting(
+        getattr(chat_config, "vertex_project_id", ""),
+        getattr(chat_config, "vertex_region", ""),
+    )
+    if bad:
+        log.error(
+            "chat.llm.vertex.%s is malformed — it is interpolated into the Vertex API "
+            "URL (the region becomes part of the hostname) and matched against the "
+            "project/location of every sandbox request, so it is held to the Google "
+            "resource-id character set. Refusing to spawn ChatManager",
+            bad,
+        )
+        return False
     if os.environ.get("TESTING", "").lower() in ("1", "true"):
         return True
     from app.auth.vertex_gcp import credentials_resolvable

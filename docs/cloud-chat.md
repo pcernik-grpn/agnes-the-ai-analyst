@@ -739,6 +739,11 @@ Operator prerequisites:
 - Do not combine with `chat.llm.auth: workload_identity` or
   `LLM_DISPATCHER_URL` — boot refuses both combinations with an explicit
   message.
+- `project_id` and `region` are held to the Google resource-id character set
+  (`region` must be lowercase letters, digits and dashes). Both are
+  interpolated into the outbound Vertex URL — the region becomes part of the
+  hostname — so boot refuses anything else rather than signing a request to a
+  host that is not Google's. `ai.vertex.*` is validated the same way.
 
 Model ids: operators may write either spelling of a dated snapshot —
 `claude-…-YYYYMMDD` (first-party) or `claude-…@YYYYMMDD` (Vertex) — in

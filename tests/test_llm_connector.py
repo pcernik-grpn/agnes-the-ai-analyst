@@ -1536,6 +1536,25 @@ class TestVertexProvider:
         monkeypatch.setenv("CLOUD_ML_REGION", "US-EAST5")
         assert resolve_vertex_settings(None) == ("env-proj", "us-east5")
 
+    def test_vertex_malformed_settings_raise(self, monkeypatch):
+        """The region is interpolated into the Vertex HOSTNAME and the project
+        into the path, so both are held to the Google resource-id character
+        set — otherwise `ai.provider: vertex` with a crafted region would send
+        the server-side Google OAuth token to a non-Google host."""
+        from connectors.llm.vertex_provider import resolve_vertex_settings
+
+        monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+
+        for region in ("evil.com/x", "us-east5.evil.com", "eu@west", "-eu"):
+            with pytest.raises(ValueError, match="region is malformed"):
+                resolve_vertex_settings({"project_id": "p", "region": region})
+        for project in ("proj/../x", "proj?a=b", "-proj"):
+            with pytest.raises(ValueError, match="project_id is malformed"):
+                resolve_vertex_settings({"project_id": project, "region": "us-east5"})
+
+        assert resolve_vertex_settings({"project_id": "my-proj", "region": "us-east5"}) == ("my-proj", "us-east5")
+
     def test_vertex_missing_google_auth_fails_fast(self, monkeypatch):
         import builtins
 

@@ -285,6 +285,32 @@ def test_chat_vertex_requires_project_and_region(monkeypatch):
     assert _chat_llm_provider_ok(_vertex_cfg(vertex_region="")) is False
 
 
+def test_chat_vertex_refuses_malformed_project_and_region(monkeypatch):
+    """A project/region outside the Google resource-id character set is refused
+    at boot.
+
+    Both values are interpolated into the outbound Vertex URL — the region into
+    the HOSTNAME — so a value carrying '/', '.', '@' or ':' would either send
+    the server-side Google OAuth token somewhere that is not Google, or walk
+    the signed request off its path. It also could never equal the project /
+    location a native Vertex path parses to, so without this gate every sandbox
+    request 403s with no boot-time signal.
+    """
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")  # config-shape checks run before the bypass
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+
+    for region in ("evil.com/x", "europe-west1.evil.com", "eu@west", "eu/../x", "-eu"):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_region=region)) is False, region
+    for project in ("proj/../x", "proj?a=b", "proj#x", "-proj", "a" * 65):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_project_id=project)) is False, project
+
+    # The shapes operators actually write still pass.
+    for region in ("global", "us-east5", "europe-west1"):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_region=region)) is True, region
+
+
 def test_chat_vertex_happy_path_under_testing(monkeypatch):
     from app.main import _chat_llm_provider_ok
 

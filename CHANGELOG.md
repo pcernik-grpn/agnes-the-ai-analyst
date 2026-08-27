@@ -27,9 +27,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   OCR, and chat auto-titles. Dated model ids interchange between the
   first-party (`claude-…-YYYYMMDD`) and Vertex (`claude-…@YYYYMMDD`)
   spellings everywhere they are compared. Boot refuses `vertex` combined with
-  `workload_identity` or `LLM_DISPATCHER_URL`, and the admin readiness page
-  gains vertex rows plus a live test-connection probe. See
-  `docs/cloud-chat.md` → "LLM provider: Google Vertex AI".
+  `workload_identity` or `LLM_DISPATCHER_URL`, and refuses a `project_id` or
+  `region` outside the Google resource-id character set — both are
+  interpolated into the outbound Vertex URL (the region becomes part of the
+  hostname), so a crafted value would otherwise sign a request to a host that
+  is not Google's. The admin readiness page gains vertex rows plus a live
+  test-connection probe. See `docs/cloud-chat.md` → "LLM provider: Google
+  Vertex AI".
 
 ### Changed
 
