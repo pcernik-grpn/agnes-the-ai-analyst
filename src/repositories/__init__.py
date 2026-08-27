@@ -148,6 +148,7 @@ __all__ = [
     "file_corpora_repo",
     "corpus_files_repo",
     "corpus_chunks_repo",
+    "corpus_file_sources_repo",
     # Agent registry (v103) — the Library's agent items
     "agents_repo",
     # Maintained digests (K4, #799)
@@ -539,6 +540,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
         DUCKDB: ("src.repositories.corpus_chunks", "CorpusChunksRepository"),
         PG: ("src.repositories.corpus_chunks_pg", "CorpusChunksPgRepository"),
     },
+    # Crawler-anchor mapping (fact-graph-over-Collections §6 prerequisite) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "corpus_file_sources": {
+        PG: ("src.repositories.corpus_file_sources_pg", "CorpusFileSourcesPgRepository"),
+    },
     # agent registry (v103)
     "agents": {
         DUCKDB: ("src.repositories.agents", "AgentsRepository"),
@@ -887,6 +893,12 @@ def agents_repo() -> Any:
 
 def corpus_chunks_repo() -> Any:
     return _build("corpus_chunks")
+
+
+def corpus_file_sources_repo() -> Any:
+    """Crawler-anchor mapping (fact-graph-over-Collections §6). PG-only —
+    raises ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
+    return _build("corpus_file_sources")
 
 
 # Maintained digests (K4, #799)
