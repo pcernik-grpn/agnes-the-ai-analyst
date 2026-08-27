@@ -37920,6 +37920,7 @@
     },
     "/api/marketplaces/{marketplace_id}/sync": {
       "post": {
+        "description": "Sync one marketplace on demand (\"Sync now\" in the admin UI).\n\nDeclared ``def`` (not ``async def``) for the same reason as\n:func:`trigger_sync_all` below \u2014 ``sync_one`` does blocking I/O\n(subprocess git clone/fetch, DuckDB writes, the module-wide sync lock)\nand would freeze the event loop for the duration of the sync if it ran\non the asyncio thread.",
         "operationId": "trigger_sync_api_marketplaces__marketplace_id__sync_post",
         "parameters": [
           {
