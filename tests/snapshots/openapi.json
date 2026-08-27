@@ -53631,6 +53631,16 @@
             }
           },
           {
+            "in": "query",
+            "name": "facts_page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Facts Page",
+              "type": "integer"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
