@@ -231,6 +231,118 @@ def test_chat_workload_identity_refused_when_federation_env_incomplete(monkeypat
     assert _chat_anthropic_key_ok(ChatConfig(enabled=True, llm_auth="workload_identity")) is False
 
 
+def _vertex_cfg(**overrides):
+    from app.chat.config import ChatConfig
+
+    kwargs = {
+        "enabled": True,
+        "llm_provider": "vertex",
+        "vertex_project_id": "proj-1",
+        "vertex_region": "europe-west1",
+    }
+    kwargs.update(overrides)
+    return ChatConfig(**kwargs)
+
+
+def test_chat_llm_provider_anthropic_passes(monkeypatch):
+    from app.chat.config import ChatConfig
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.delenv("TESTING", raising=False)
+    assert _chat_llm_provider_ok(ChatConfig(enabled=True)) is True
+
+
+def test_chat_llm_provider_unknown_refused(monkeypatch):
+    """An unknown chat.llm.provider refuses at boot — never silently falls
+    back to anthropic (a fallback would switch which credential spends money)."""
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")  # even the test bypass must not save it
+    assert _chat_llm_provider_ok(_vertex_cfg(llm_provider="bedrock")) is False
+
+
+def test_chat_vertex_conflicts_with_workload_identity(monkeypatch):
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")  # config-shape checks run before the bypass
+    assert _chat_llm_provider_ok(_vertex_cfg(llm_auth="workload_identity")) is False
+
+
+def test_chat_vertex_conflicts_with_dispatcher(monkeypatch):
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")
+    monkeypatch.setenv("LLM_DISPATCHER_URL", "http://127.0.0.1:8600")
+    assert _chat_llm_provider_ok(_vertex_cfg()) is False
+
+
+def test_chat_vertex_requires_project_and_region(monkeypatch):
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+    assert _chat_llm_provider_ok(_vertex_cfg(vertex_project_id="")) is False
+    assert _chat_llm_provider_ok(_vertex_cfg(vertex_region="")) is False
+
+
+def test_chat_vertex_refuses_malformed_project_and_region(monkeypatch):
+    """A project/region outside the Google resource-id character set is refused
+    at boot.
+
+    Both values are interpolated into the outbound Vertex URL — the region into
+    the HOSTNAME — so a value carrying '/', '.', '@' or ':' would either send
+    the server-side Google OAuth token somewhere that is not Google, or walk
+    the signed request off its path. It also could never equal the project /
+    location a native Vertex path parses to, so without this gate every sandbox
+    request 403s with no boot-time signal.
+    """
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")  # config-shape checks run before the bypass
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+
+    for region in ("evil.com/x", "europe-west1.evil.com", "eu@west", "eu/../x", "-eu"):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_region=region)) is False, region
+    for project in ("proj/../x", "proj?a=b", "proj#x", "-proj", "a" * 65):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_project_id=project)) is False, project
+
+    # The shapes operators actually write still pass.
+    for region in ("global", "us-east5", "europe-west1"):
+        assert _chat_llm_provider_ok(_vertex_cfg(vertex_region=region)) is True, region
+
+
+def test_chat_vertex_happy_path_under_testing(monkeypatch):
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.setenv("TESTING", "1")
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+    assert _chat_llm_provider_ok(_vertex_cfg()) is True
+
+
+def test_chat_vertex_probes_google_credentials_outside_testing(monkeypatch):
+    from app.auth import vertex_gcp
+    from app.main import _chat_llm_provider_ok
+
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.delenv("LLM_DISPATCHER_URL", raising=False)
+
+    monkeypatch.setattr(vertex_gcp, "credentials_resolvable", lambda: (False, "no ADC"))
+    assert _chat_llm_provider_ok(_vertex_cfg()) is False
+
+    monkeypatch.setattr(vertex_gcp, "credentials_resolvable", lambda: (True, "ok"))
+    assert _chat_llm_provider_ok(_vertex_cfg()) is True
+
+
+def test_chat_vertex_needs_no_anthropic_key(monkeypatch):
+    """Under vertex the anthropic-key gate passes with no key at all — the
+    Google credential chain was validated by _chat_llm_provider_ok instead."""
+    from app.main import _chat_anthropic_key_ok
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("TESTING", raising=False)
+    assert _chat_anthropic_key_ok(_vertex_cfg()) is True
+
+
 def test_secret_status_anthropic_not_required_in_wif_mode():
     """readiness.secret_status must not flag anthropic_api_key as required in WIF mode."""
     from app.chat.config import ChatConfig

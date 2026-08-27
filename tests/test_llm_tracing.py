@@ -13,6 +13,7 @@ def enabled_posthog(monkeypatch):
     monkeypatch.setenv("POSTHOG_API_KEY", "phc_x")
     monkeypatch.delenv("POSTHOG_LLM_PAYLOADS", raising=False)
     from src.observability import reset_posthog
+
     reset_posthog()
     yield
     reset_posthog()
@@ -48,6 +49,7 @@ def test_success_emits_ai_generation_with_token_counts(enabled_posthog):
 def test_payloads_flag_enables_prompt_and_completion(enabled_posthog, monkeypatch):
     monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
     from src.observability import reset_posthog
+
     reset_posthog()
     sdk = MagicMock()
     with patch("posthog.Posthog", return_value=sdk):
@@ -111,6 +113,7 @@ def test_payload_truncation_under_default_cap(enabled_posthog, monkeypatch):
     """
     monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
     from src.observability import reset_posthog
+
     reset_posthog()
 
     big_prompt = "P" * 50_000
@@ -118,6 +121,7 @@ def test_payload_truncation_under_default_cap(enabled_posthog, monkeypatch):
     sdk = MagicMock()
     with patch("posthog.Posthog", return_value=sdk):
         from src.observability import trace_generation
+
         with trace_generation(provider="anthropic", model="claude-x") as t:
             t.set_input(big_prompt)
             t.set_output(big_output)
@@ -138,11 +142,13 @@ def test_payload_truncation_respects_env_override(enabled_posthog, monkeypatch):
     monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
     monkeypatch.setenv("POSTHOG_LLM_PAYLOAD_MAX_CHARS", "100")
     from src.observability import reset_posthog
+
     reset_posthog()
 
     sdk = MagicMock()
     with patch("posthog.Posthog", return_value=sdk):
         from src.observability import trace_generation
+
         with trace_generation(provider="anthropic", model="claude-x") as t:
             t.set_input("X" * 500)
             t.set_output("Y" * 500)
@@ -156,11 +162,13 @@ def test_payload_truncation_respects_env_override(enabled_posthog, monkeypatch):
 def test_payload_under_cap_is_passed_through_unchanged(enabled_posthog, monkeypatch):
     monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
     from src.observability import reset_posthog
+
     reset_posthog()
 
     sdk = MagicMock()
     with patch("posthog.Posthog", return_value=sdk):
         from src.observability import trace_generation
+
         small = "tiny prompt"
         with trace_generation(provider="anthropic", model="claude-x") as t:
             t.set_input(small)
@@ -190,3 +198,28 @@ def test_set_output_from_openai_extracts_tokens(enabled_posthog):
         props = sdk.capture.call_args.kwargs["properties"]
         assert props["$ai_input_tokens"] == 3
         assert props["$ai_output_tokens"] == 7
+
+
+def test_vertex_extractor_traces_provider_vertex(enabled_posthog):
+    """VertexExtractor inherits AnthropicExtractor's extraction loop but must
+    label its traces provider="vertex" (via the _TRACE_PROVIDER hook)."""
+    sdk = MagicMock()
+    with (
+        patch("posthog.Posthog", return_value=sdk),
+        patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex") as mock_vertex_cls,
+    ):
+        from connectors.llm.vertex_provider import VertexExtractor
+
+        client = MagicMock()
+        mock_vertex_cls.return_value = client
+        client.messages.create.return_value = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(text="{}", type="text")],
+        )
+        ext = VertexExtractor(project_id="p", region="global", model="claude-haiku-4-5-20251001")
+        ext.extract_json(prompt="q", max_tokens=8, json_schema={"type": "object"}, schema_name="t")
+
+        sdk.capture.assert_called_once()
+        props = sdk.capture.call_args.kwargs["properties"]
+        assert props["$ai_provider"] == "vertex"
+        assert props["$ai_model"] == "claude-haiku-4-5@20251001"

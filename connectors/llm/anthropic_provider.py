@@ -71,6 +71,10 @@ class AnthropicExtractor:
     exponential backoff.
     """
 
+    # Provider label recorded on observability traces; subclasses backed by
+    # a different transport (e.g. Vertex) override this.
+    _TRACE_PROVIDER = "anthropic"
+
     def __init__(self, api_key: str, model: str) -> None:
         """Initialize the Anthropic extractor.
 
@@ -193,7 +197,7 @@ class AnthropicExtractor:
         from src.observability import trace_generation
 
         try:
-            with trace_generation(provider="anthropic", model=self._model) as _trace:
+            with trace_generation(provider=self._TRACE_PROVIDER, model=self._model) as _trace:
                 _trace.set_input(prompt)
                 create_kwargs = {
                     "model": self._model,
@@ -212,6 +216,10 @@ class AnthropicExtractor:
                 _trace.set_output_from_anthropic(response)
         except anthropic.AuthenticationError as e:
             raise LLMAuthError("Anthropic authentication failed (check API key)") from e
+        except anthropic.PermissionDeniedError as e:
+            # 403: key lacks access, or (on Vertex) the API/model isn't
+            # enabled for the project — an auth-shaped, non-retryable error.
+            raise LLMAuthError("Anthropic permission denied (check credentials / model access)") from e
         except anthropic.RateLimitError as e:
             raise LLMRateLimitError("Anthropic rate limited") from e
         except (anthropic.APITimeoutError, anthropic.APIConnectionError) as e:
