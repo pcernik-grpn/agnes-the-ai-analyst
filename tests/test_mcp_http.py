@@ -341,6 +341,7 @@ class TestToolRegistration:
             # Triple-surface with POST /api/store/entities/from-markdown +
             # `agnes store publish-md`.
             "store_publish_markdown",
+            "store_compose_plugin",
             # Maintained digests (K4, #799) — admin CRUD over LLM-regenerated
             # digest documents. Triple-surface with the
             # /api/admin/knowledge-digests* REST surface + `agnes admin digest`.

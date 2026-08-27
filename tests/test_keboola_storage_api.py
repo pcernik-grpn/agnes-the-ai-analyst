@@ -916,6 +916,18 @@ class TestParquetPath:
         monkeypatch.setenv("AGNES_TEMP_DIR", str(target))
         assert get_temp_root() == str(target)
 
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason=(
+            "root can create /nonexistent/, so the helper succeeds and there is "
+            "no unwritable path to test. Worse, the failing run LEAVES the "
+            "directory behind — and tests/test_chat_config.py uses /nonexistent "
+            "as its stand-in for a path that does not exist, so three unrelated "
+            "tests start failing too. Skipped rather than rewritten: the "
+            "behaviour under test is real and holds for the non-root user CI "
+            "runs as."
+        ),
+    )
     def test_get_temp_root_unwritable_falls_back(self, monkeypatch, tmp_path, caplog):
         """Sandboxes / read-only mounts make the target uncreatable; the
         helper logs a warning and returns None so tempfile falls back
