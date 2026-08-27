@@ -8162,8 +8162,15 @@
       "SessionFileEntry": {
         "properties": {
           "modified_at": {
-            "title": "Modified At",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At"
           },
           "name": {
             "title": "Name",
@@ -8181,8 +8188,7 @@
         "required": [
           "path",
           "name",
-          "size_bytes",
-          "modified_at"
+          "size_bytes"
         ],
         "title": "SessionFileEntry",
         "type": "object"
@@ -8195,6 +8201,16 @@
             },
             "title": "Files",
             "type": "array"
+          },
+          "source": {
+            "default": "host",
+            "title": "Source",
+            "type": "string"
+          },
+          "supported": {
+            "default": true,
+            "title": "Supported",
+            "type": "boolean"
           },
           "truncated": {
             "title": "Truncated",
@@ -31784,7 +31800,7 @@
     },
     "/api/chat/sessions/{chat_id}/files": {
       "get": {
-        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. A session\nwhose sandbox ran remotely has no local files and lists empty.",
+        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. Sessions\non an engine-sandbox provider (``kai-agent``) never walk the host dir \u2014\nsee the module docstring; they report ``source=\"engine\"``.",
         "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
         "parameters": [
           {
@@ -46972,7 +46988,7 @@
     },
     "/api/user/cowork-bundle": {
       "post": {
-        "description": "Generate a Cowork Setup Bundle ZIP for the calling user.\n\nReturns a ``application/zip`` file containing a setup script, a\n``README.txt``, and a ```.agnes-bundle.json`` with a short-lived setup\ntoken embedded. The analyst unzips and runs ``./setup.sh``, which calls\n``agnes init --bundle .`` to exchange the setup token for a PAT and\nbootstrap their workspace in one step.\n\nRate-limited: max 5 active (unexpired, unused) setup tokens per user.",
+        "description": "Generate a Cowork Setup Bundle ZIP for the calling user.\n\nReturns a ``application/zip`` file containing a setup script, a\n``README.txt``, and a ```.agnes-bundle.json`` with a short-lived setup\ntoken embedded. The analyst unzips and runs ``./setup.sh``, which calls\n``agnes init --bundle .`` to exchange the setup token for a PAT and\nbootstrap their workspace in one step.\n\nRate-limited: max 5 active (unexpired, unused) setup tokens per user.\n\nSession-only (``require_session_token``, #1292): this route mints two\ndurable follow-on credentials \u2014 a pre-baked PAT inline in the ZIP, and a\nsetup token that ``POST /api/auth/exchange-setup-token`` (unauthenticated\nby design \u2014 the setup token IS the credential) trades for a fresh 90-day\nPAT. Gating it on ``get_current_user`` alone let a caller holding only a\nPAT mint a new 90-day one that outlives revoking the original \u2014 the same\nclass of hole ``require_session_token`` already closes for ``POST\n/auth/tokens`` and agent-PAT issuance. ``require_session_token`` also\nrejects the ``X-StorageApi-Token`` header credential (PR #1288's narrower\nfix, now subsumed), the scheduler shared secret, and an agent PAT.",
         "operationId": "generate_bundle_api_user_cowork_bundle_post",
         "parameters": [
           {

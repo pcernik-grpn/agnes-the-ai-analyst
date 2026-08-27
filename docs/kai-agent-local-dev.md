@@ -91,11 +91,22 @@ default turn, which names the others.
 | `approval`         | a `tool-approval-request`; the turn blocks until you Allow or Deny |
 | `error`            | a mid-turn engine `error` event after partial text             |
 | `markdown`         | a tool returning a markdown table, rendered as a real table    |
+| `deliverable`      | a turn that registers `outputs/report.docx` + `outputs/deck.pptx` in the stub's sandbox file store — for the **Files** overlay |
 
 Knobs: `KAI_STUB_STEP_DELAY` (seconds between SSE records, default `0.35` so
 the interleaving is visible to a human), `KAI_STUB_APPROVAL_TIMEOUT`,
 `KAI_STUB_REQUIRE_AUTH=0` to accept any bearer while debugging the transport
-itself.
+itself, `KAI_STUB_FILES_ROUTES=0` to make the sandbox file routes answer 404
+(an engine build that predates them — the chat's Files overlay must show the
+"engine doesn't expose session files" notice instead of erroring).
+
+### Verify the Files overlay
+
+Type `deliverable`, then open **Files** in the thread header: the two rendered
+documents must list (proxied from the stub's sandbox store, not from any host
+directory) and download with `Content-Disposition: attachment`. Restart the
+stub with `KAI_STUB_FILES_ROUTES=0` and the same overlay must degrade to the
+honest unsupported notice.
 
 ## Automated coverage
 
