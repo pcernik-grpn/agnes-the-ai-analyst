@@ -6223,7 +6223,9 @@ details.section-card > summary {
    needs a banner to explain it. Bordered, not filled — the composer is the
    page's action and these must not compete with it.
 
-   TWO, not three, and BELOW the suggestions rather than above the composer.
+   TWO, not three, and BELOW the suggestions rather than above the composer
+   (except on an instance with nothing registered — see the two position blocks
+   below).
    Three cards between the heading and the input made the reader's first
    decision on an "ask something" page a choice of which way to leave; and the
    third card ("How {brand} works") was reference reading given the same weight
@@ -6237,12 +6239,12 @@ details.section-card > summary {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
-    /* The ADMIN position: end of the intro block, above the composer. That
-       column's own 5px flex gap is subtracted so the visible step lands on
+    /* The EMPTY-INSTANCE position: end of the intro block, above the composer.
+       That column's own 5px flex gap is subtracted so the visible step lands on
        `block` exactly — without the calc every margin in there reads 5px larger
        than the token it names, which is how a scale quietly stops being one.
-       (The member position is overridden below; it sits in a container with no
-       gap, so it needs no subtraction.) */
+       (The ordinary position is overridden below; it sits in a container with
+       no gap, so it needs no subtraction.) */
     margin: calc(var(--cld-gap-block, 26px) - var(--cld-gap-tight, 5px)) auto 0;
     /* The shared secondary measure — same edges as the chip row above. */
     max-width: var(--cld-measure, 660px);
@@ -6546,7 +6548,7 @@ details.section-card > summary {
     /* Closes the block under the cards, so `inner` — it belongs to them rather
        than standing as a region of its own, and it travels with them between the
        two positions. Same flex-gap subtraction as `.cld-doors` above for the
-       admin position; overridden below for the member one. */
+       empty-instance position; overridden below for the ordinary one. */
     margin: calc(var(--cld-gap-inner, 10px) - var(--cld-gap-tight, 5px)) 0 0;
 }
 .cld-trust .klb-hub-caption { justify-content: center; }
@@ -6563,12 +6565,14 @@ details.section-card > summary {
 }
 .cld-trust-link:hover { color: var(--ds-primary); text-decoration: underline; }
 
-/* ---- The MEMBER position ----
+/* ---- The ORDINARY position ----
    Same two cards and the same trust line, rendered after the suggestions
-   instead of before the composer (see chat.html). `#chat-empty-extras` has no
-   flex gap of its own, so these take the tokens straight: a full `section` step
-   above the cards — the page's one real boundary, here between asking and the
-   ways out — and `inner` under them for the line that closes the block. */
+   instead of before the composer — where they sit for admin and member alike
+   on any instance that has data (see chat.html; the empty instance is the one
+   exception). `#chat-empty-extras` has no flex gap of its own, so these take
+   the tokens straight: a full `section` step above the cards — the page's one
+   real boundary, here between asking and the ways out — and `inner` under them
+   for the line that closes the block. */
 #chat-empty-extras .cld-doors {
     margin-top: var(--cld-gap-section, 40px);
 }

@@ -78,23 +78,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   renders nothing at all). The zero state keeps its own "Build an agent" panel —
   with no grid, there is no first cell for a card to be.
 
-- **The chat empty state is reordered, and says different things to admins and
-  members.** The three door-cards between the heading and the input are now two,
-  and the page reads as orientation-then-action: greeting, heading, lede, the two
-  cards, the privacy line — then the composer, then the suggestions. Everything
-  above the input tells you what this is and what it answers from; everything
-  below is the act of asking. The page's single `section` break lands immediately
-  before the composer, which is the boundary the reader crosses.
+- **The chat empty state is reordered, and the door-cards close the page.** The
+  three cards between the heading and the input are now two, and they sit BELOW
+  the composer and its suggested questions: greeting, heading, lede — then the
+  field, the suggestions, the two cards, the privacy line. Everything above the
+  input tells you what this is and what it answers from; the cards all navigate
+  away from it, so they come after the thing the reader came for. The page's
+  single `section` break lands between the suggestions and the cards.
 
-  The cards sit by AUDIENCE. An **admin** gets them above the composer — their
-  lead card is a job (set the instance up, with its progress on it) and a job does
-  not belong below four suggested questions. A **member** gets them after the
-  suggestions — theirs is "see what {brand} knows", genuinely secondary to
-  asking, so the ways to go browsing sit past the thing they came for. The trust
-  line travels with the cards either way. Gated on the same flag that decides
-  which lead card renders, so audience and position cannot disagree — and
-  deliberately not on whether the instance is empty, which was tried and meant
-  the layout reflowed the moment a first table landed.
+  The one inversion is an instance with **nothing registered**: there is nothing
+  to ground an answer in yet, so the cards (and the trust line that travels with
+  them) render above the composer, where "Add your first data" is the page's real
+  action rather than the fifth thing on it. Gated on the same condition as the
+  zero-state heading and lede, so the three cannot disagree about which state the
+  page is in. This replaces a by-AUDIENCE gate that put an admin's cards above
+  the input on every instance, configured or not.
 
   The "Using N knowledge sources and M capabilities from your Stack" line that
   sat under the composer is **removed** — it reported a count with no action

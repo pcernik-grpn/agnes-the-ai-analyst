@@ -177,31 +177,35 @@ class TestChatEmptyStatePill:
         composer = body[body.index('class="cloud-chat-composer"') : body.index("</form>")]
         assert 'id="chat-agent-btn"' in composer
 
-    def test_the_cards_sit_by_AUDIENCE_not_by_instance_state(self, seeded_app, monkeypatch):
-        """An ADMIN gets the two cards above the composer; a MEMBER gets them
-        after the suggestions.
+    def test_the_cards_sit_by_INSTANCE_STATE_not_by_audience(self, seeded_app, monkeypatch):
+        """The two cards close the page — after the composer and after the
+        suggestions — for admin and member alike. The reader came to ask
+        something and every card navigates away from the composer, so the ways
+        out belong past the thing they came for.
 
-        The difference is what the lead card IS. An admin's is a job — set the
-        instance up, with its progress on it — and a job does not belong below
-        four suggested questions. A member's is "see what {brand} knows", which is
-        genuinely secondary to asking: they came to ask something, and the ways to
-        go browsing belong past the thing they came for.
+        The one inversion is an instance with NOTHING REGISTERED: there is
+        nothing to ground an answer in, so "Add your first data" is the page's
+        real action and leads it (covered by the admin-notice tests in
+        tests/test_ui_layout_theme.py, which render that state).
 
-        Gated on `admin_setup`, the same flag that decides WHICH lead card
-        renders, so the audience and the position cannot disagree. Deliberately
-        NOT on `admin_notice` (an empty instance) — that was tried, and it meant
-        the layout reflowed the moment a first table landed. Audience is stable;
-        data is not.
+        This was gated on AUDIENCE for one release (`admin_setup`) so that an
+        admin's lead card — a job, with setup progress on it — led the page on
+        every instance. The cost was that a fully configured instance still put
+        a setup card between an admin and the input. The gate is instance state
+        now, the same condition the heading and lede read.
 
         The trust line travels with the cards either way.
         """
         _enable_rail_chat(seeded_app, monkeypatch)
         c = seeded_app["client"]
 
+        # The seeded instance has a registered table (see _enable_rail_chat), so
+        # this is the ordinary state for both readers.
         admin = c.get("/chat", headers=_auth(seeded_app["admin_token"])).text
-        assert admin.index('class="cld-doors"') < admin.index('id="chat-form"'), (
-            "an admin's cards belong above the composer"
+        assert admin.index('id="chat-form"') < admin.index('class="cld-doors"'), (
+            "an admin's cards belong after the suggestions on an instance with data"
         )
+        assert admin.index('id="rdb-actions"') < admin.index('class="cld-doors"')
         assert admin.index('class="cld-doors"') < admin.index('class="cld-trust"')
 
         _grant("Everyone", "chat", "chat", users=["analyst1"])

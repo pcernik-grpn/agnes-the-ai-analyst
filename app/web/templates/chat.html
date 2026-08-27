@@ -434,8 +434,10 @@
         {{ _tool_door }}
       </nav>
 {% endset %}
-      {# The doors used to sit HERE, above the composer. They are BELOW the
-         suggestions now (in #chat-empty-extras) — see `.cld-doors` there.
+      {# The doors used to sit HERE unconditionally, above the composer. They
+         are BELOW the suggestions now (in #chat-empty-extras) in every state
+         but one — see `.cld-doors` there, and the slot further down this block
+         for the empty instance that keeps them up here.
 
          What moved them: every one of them navigates AWAY from the composer,
          and putting them between the heading and the input meant the reader's
@@ -453,8 +455,9 @@
          from search (both of which can say how many definitions there are);
          citing it inside the answer that used it is issue #1134. #}
 
-      {# The trust line is NOT here. It closes the page under the two cards —
-         see `.cld-trust` in #chat-empty-extras. #}
+      {# The trust line has no slot of its own: it travels with the two cards,
+         closing whichever block holds them — this one on an empty instance,
+         #chat-empty-extras everywhere else. #}
 
       {# ---- The two doors ----
          Defined here, rendered in ONE of two places depending on whether the
@@ -473,27 +476,28 @@
          `admin_notice` is the gate, so it is one condition for all three — the
          heading, the lede and this — and they cannot disagree about which state
          the page is in. #}
-      {# ADMINS get the cards here, above the composer. An admin's lead card is
-         a JOB — set the instance up, with its progress on it — and a job does
-         not belong below four suggested questions. Up here the page reads as
-         orientation then action: what this is, what it answers from, what you
-         still have to do, the promise about your data — then the field.
+      {# THE EMPTY INSTANCE gets the cards here, above the composer — and only
+         it. Nothing is registered, so there is nothing to ground an answer in;
+         "Add your first data" is the one move that changes that, and it must
+         not sit below four suggested questions. Up here the page reads as
+         orientation then action: what this is, what is missing, what to do
+         about it, the promise about your data — then the field.
 
-         Members get them after the suggestions instead (see #chat-empty-extras).
-         Their lead card is "see what {brand} knows", which is genuinely
-         secondary to asking: a member arrives to ask something, and the ways to
-         go browsing belong past the thing they came for.
+         Everyone else — admin or member, on an instance that has data — gets
+         them after the suggestions (see #chat-empty-extras). The composer is
+         the page's point for both, and every card navigates away from it.
 
-         Gated on `admin_setup`, the same flag that decides WHICH lead card
-         renders — so the audience and the position cannot disagree. Deliberately
-         NOT on `admin_notice` (an empty instance): that was tried and it meant
-         the layout reflowed the moment a first table landed, which is a strange
-         thing to happen to a page an admin had just learned. Audience is stable;
-         data is not.
+         This was gated on AUDIENCE for one release (`admin_setup`: an admin's
+         lead card is a job, so it led the page whether or not the instance had
+         data). The gate is instance STATE now, which is the condition the
+         heading and lede already read — so the three cannot disagree about
+         which state the page is in. The known cost is that the row moves the
+         first time a table lands; the alternative was every admin, forever,
+         meeting a setup card before the input on a fully configured instance.
 
          The trust line travels with the cards, closing whichever block holds
          them. #}
-      {% if admin_setup %}{{ _doors }}{{ _trust_line }}{% endif %}
+      {% if admin_notice %}{{ _doors }}{{ _trust_line }}{% endif %}
     </aside>
 
     <div id="chat-messages" class="cloud-chat-messages" aria-live="polite"></div>
@@ -835,11 +839,12 @@
         </section>
 
 
-        {# MEMBERS get the cards here, after the suggestions — see the note in
-           #chat-capabilities for why the two audiences differ. For an admin this
-           renders nothing and the region below the input is the suggestions
-           alone. #}
-        {% if not admin_setup %}{{ _doors }}{{ _trust_line }}{% endif %}
+        {# The cards' ORDINARY slot: after the suggestions, for admin and member
+           alike. On an instance with nothing registered they render above the
+           composer instead — see the note in #chat-capabilities for why that
+           one state inverts, and note this is the same condition, negated, so
+           the row can never appear twice or not at all. #}
+        {% if not admin_notice %}{{ _doors }}{{ _trust_line }}{% endif %}
 
       </div>
     </div>
