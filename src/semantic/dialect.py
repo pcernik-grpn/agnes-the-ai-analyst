@@ -30,6 +30,42 @@ def resolve_expression(expression: dict) -> Tuple[Optional[str], Optional[str]]:
     return None, f"only warehouse-specific dialects offered ({offered}); no DUCKDB or ANSI_SQL"
 
 
+def resolve_expression_any(expression: dict) -> Tuple[Optional[str], Optional[str], bool]:
+    """Resolve one metric expression the way :func:`resolve_expression` does,
+    but instead of reporting a warehouse-only expression as unusable, fall
+    back to it — so a caller (the projector) can still store the raw SQL
+    rather than dropping the metric.
+
+    Returns ``(sql, dialect, locally_runnable)``:
+
+    - a local dialect (DUCKDB, then ANSI_SQL) is offered: its SQL, its name,
+      ``True`` — identical precedence and value to :func:`resolve_expression`.
+    - only warehouse-specific dialect(s) offered: the first one declared (by
+      document order — not alphabetical, not arbitrary dict order), its name,
+      ``False``. The raw expression is warehouse-flavour SQL, not something
+      this instance can run locally; the caller is responsible for saying so.
+    - no expression in any dialect: ``(None, None, False)``.
+    """
+    dialects = (expression or {}).get("dialects") or []
+    by_name = {
+        d.get("dialect"): d.get("expression")
+        for d in dialects
+        if d.get("expression") and isinstance(d.get("dialect"), str)
+    }
+
+    for name in _PREFERRED:
+        if by_name.get(name):
+            return by_name[name], name, True
+
+    for d in dialects:
+        name = d.get("dialect")
+        sql = d.get("expression")
+        if sql and isinstance(name, str):
+            return sql, name, False
+
+    return None, None, False
+
+
 # The `resolve_expression` reason prefix that marks a metric which DID
 # declare an expression, just not in a dialect this instance can run —
 # distinct from "no expression in any usable dialect" (an incomplete
