@@ -3825,13 +3825,13 @@ async def semantic_layer_detail(
     """
     from app.web.semantic_layer_view import (
         agnes_extension_payload,
-        dialect_skipped_count,
         is_imported,
         model_constraints,
         model_glossary,
         model_of,
         object_counts,
         source_label,
+        warehouse_only_metric_count,
     )
 
     row = _readable_model_by_slug(slug, user, conn)
@@ -3949,7 +3949,7 @@ async def semantic_layer_detail(
         relationships=relationships,
         glossary=glossary,
         counts=object_counts(model),
-        dialect_skipped_count=dialect_skipped_count(model),
+        warehouse_only_metric_count=warehouse_only_metric_count(model),
     )
     return templates.TemplateResponse(request, "semantic_layer_detail.html", ctx)
 
