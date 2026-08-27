@@ -618,7 +618,7 @@ class TestInviteEmailDelivery:
 
         sent: list[tuple] = []
 
-        def fake_send(to_email, subject, body):
+        def fake_send(to_email, subject, body, body_html=None):
             sent.append((to_email, subject, body))
             return True
 

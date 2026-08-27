@@ -42,8 +42,31 @@ def smtp_from_address() -> str:
     return "noreply@example.com"
 
 
-def send_smtp_email(to_email: str, subject: str, body_text: str) -> None:
-    """Deliver a plaintext mail via the configured SMTP relay; raises on failure.
+def _smtp_from_header() -> str:
+    """``From:`` header value — the instance name as display name when one is
+    configured, so recipients see "Acme Analyst" instead of a bare relay
+    address. ``formataddr`` RFC2047-encodes a non-ASCII name itself.
+
+    Lazy import for the same reason as :func:`smtp_from_address`.
+    """
+    from email.utils import formataddr
+
+    address = smtp_from_address()
+    try:
+        from app.instance_config import get_instance_name
+
+        name = get_instance_name()
+    except Exception:
+        name = ""
+    return formataddr((name, address)) if name else address
+
+
+def send_smtp_email(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None) -> None:
+    """Deliver a mail via the configured SMTP relay; raises on failure.
+
+    Plaintext by default; with ``body_html`` the message goes out as
+    ``multipart/alternative`` (plaintext part first, per RFC 2046 — clients
+    render the last part they support).
 
     SMTP is the only mail transport. Providers with an HTTP API (SendGrid,
     Mailgun, …) are used through their SMTP relay (e.g.
@@ -52,14 +75,17 @@ def send_smtp_email(to_email: str, subject: str, body_text: str) -> None:
     path always died on import — while the endpoint still answered success.
     """
     import smtplib
-    from email.mime.text import MIMEText
+    from email.message import EmailMessage
 
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         raise RuntimeError("SMTP_HOST is not configured")
-    msg = MIMEText(body_text)
+    msg = EmailMessage()
+    msg.set_content(body_text)
+    if body_html is not None:
+        msg.add_alternative(body_html, subtype="html")
     msg["Subject"] = subject
-    msg["From"] = smtp_from_address()
+    msg["From"] = _smtp_from_header()
     msg["To"] = to_email
     with smtplib.SMTP(smtp_host, int(os.environ.get("SMTP_PORT", "587"))) as s:
         if os.environ.get("SMTP_USE_TLS", "true").lower() == "true":
