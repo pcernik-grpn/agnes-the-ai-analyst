@@ -443,7 +443,17 @@ a persona that cannot reach tables but can reach a fact *derived from* a table
 would be a leak the collection-side tests would never catch, and it is one more
 reason facts stay document-derived only (§14.7).
 
-§14.1's S1–S7 are the implementation of Decision Test 5. They should be
+§14.1's S1–S7 are the implementation of Decision Test 5.
+
+The workbook's own Access sheet defines three rows, and AC2 and AC3 are
+sharper than a leak count suggests. **AC2**: an Associate asked a structured
+question must be *correctly denied* — "inventing a plausible-looking number
+here is scored the same as a Tier 0/1 leak: any fabricated structured figure
+= FAIL, no partial credit". **AC3**: on a mixed question an Associate must
+answer from unstructured sources *and say the structured part was withheld* —
+a silent omission is a completeness failure, a fabricated stand-in is a leak.
+So the tests are not only "did anything leak" but "did it refuse in the right
+way", which is a behaviour our security tests do not currently assert. They should be
 renamed to the personas so results map onto the customer's sheet without
 translation, and the run must record a leak count of exactly zero rather than
 "no failures observed".
@@ -476,6 +486,51 @@ described in a meeting; and the workbook references a separate **token
 measurement methodology** note that has not reached us. Until it does, our
 numbers and theirs may not be measuring the same thing — which is the kind of
 disagreement that surfaces at the worst moment. Ask for it now.
+
+### 13.5 Entra is not connected — what that means today
+
+**Agnes does not derive permissions from SharePoint.** The Microsoft provider
+authenticates and nothing more: it matches accounts by email, drops the Entra
+`oid`/`tid`, and `/me/memberOf` group sync is deferred in code. So every
+statement in §4 about ACLs, inheritance and `HasUniqueRoleAssignments`
+describes a **later** capability, not a current one.
+
+What holds today, and what does not:
+
+| | today | after Entra |
+|---|---|---|
+| who may read a collection | **admin sets it by hand** | derived from the source ACL, admin overrides |
+| person ↔ SharePoint identity | matched by email | matched by `oid` |
+| Agnes group ↔ Entra group | none | synced |
+| a file's sharing changes | Agnes does not notice | picked up by the periodic ACL read |
+| enforcement of what a caller sees | **already correct** | unchanged |
+
+The last row is the one that matters: **enforcement and derivation are
+different problems, and only derivation is missing.** A grant assigned by hand
+is enforced exactly as strictly as a grant derived from a source ACL — same
+`accessible_collection_ids`, same repository filter, same tests. Nothing about
+§14.1's security tests depends on Entra.
+
+**So the evaluation can run without it**, and the workbook's Principal /
+Associate personas are two Agnes users in two Agnes groups with grants an admin
+assigned. AC1–AC3 test whether the split is *enforced*, which is precisely the
+half we have.
+
+Two obligations follow, and both are about not overclaiming:
+
+- **Do not say "Agnes mirrors your SharePoint permissions."** It does not yet.
+  The true sentence is "an admin decides who sees which collection, and Agnes
+  enforces that decision" — which is a weaker promise and an honest one.
+- **Manual grants must be visibly manual.** A collection whose audience was
+  hand-assigned should say so, so nobody later assumes it tracks the source.
+  The same UI row that will one day read *inherited from SharePoint* reads
+  *set by an admin* today.
+
+The risk of the gap is not a leak — hand-assigned grants fail closed. It is
+**drift**: someone loses access in SharePoint, keeps it in Agnes, and nobody
+notices because nothing was ever watching. Until Entra lands, that is a
+process control (re-check on a cadence someone owns), not a technical one, and
+it belongs in the customer material rather than in a footnote.
 
 ## 14. Acceptance — the tests that define "done"
 
@@ -617,6 +672,16 @@ present but whose assertion does not follow from it **passes**. This test
 exists to keep everyone honest about what the gate does: it validates quotes,
 not inferences.
 
+**Q0 — the eval set matches the frozen workbook.** The repository's question
+set was modelled on workbook v0.1 and has drifted: 12 questions where v0.2
+freezes **10**; two arms where v0.2 defines **five** (A0 Claude alone, A1
+Claude + SharePoint connector, A2 ChatGPT + SharePoint, A3 Claude + seed
+pack, A4 Agnes); a 0/0.5/1 scale where v0.2 rescored to **0/1/2**; and
+different weights. Most consequentially, **the deciding comparison is A4 vs
+A3** — Agnes against Claude *holding the same context*, by ≥10 points — and
+no arm in the repository tests it. Reconcile before the runs, or the effort
+measures something the customer does not grade.
+
 **Q3 — recall against planted truth.** Precision and recall per fact type on
 the labelled corpus. Recorded per release, not asserted once.
 
@@ -710,7 +775,15 @@ its own design before it can have a test.
 - **Cross-language extraction** versus the verbatim gate (§7).
 - **`source_url`** — who builds it, since citations are half-blind without it.
 - Whether extraction runs as a scheduled agent, and who owns its token budget.
-- **The anonymisation service to integrate has not been identified.** A search
-  of the `keboola` org and of GitHub found no matching repository. Section
-  13.5 cannot be written until someone names it, and §9's guarantee cannot be
-  claimed until it is.
+- **The anonymiser substitutes `**PERSON**` / `**COMPANY**`, not stable
+  pseudonyms.** `padak/doc_quantization` (Apache-2.0) is a decontextualisation
+  pipeline — 22-token chunks under random UUIDs, shuffled and mixed with
+  honeytokens so no party sees a whole document, byte-exact reassembly, with a
+  fully local detection mode. File conversion is deliberately a separate
+  service (`padak/doc_converter`) because PyMuPDF is AGPL and would infect the
+  anonymiser's licence. **But a fixed replacement collapses every person into
+  one node and every company into another**, which falsifies §9's claim that
+  the graph still joins. Either the anonymiser gains a stable-pseudonym mode,
+  or an anonymised collection cannot carry facts and is retrieval-only. That
+  decision is not ours, and it must land before anonymisation is offered as
+  part of the graph.
