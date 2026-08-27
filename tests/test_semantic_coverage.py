@@ -101,6 +101,33 @@ class TestResolveDatasetTable:
     def test_keboola_dataset_with_no_matching_registration_returns_none(self, system_db):
         assert resolve_dataset_table({"source": "in.c-ghost.nowhere"}, "keboola_metastore") is None
 
+    def test_snowflake_shaped_source_resolves_via_generic_fallback(self, system_db):
+        """The bug this task fixes: a manual/uploaded document's dataset
+        `source` is a Snowflake/Databricks-shaped multi-segment identifier
+        (`DATABASE.SCHEMA.TABLE`), which never equals a registered
+        `table_registry.id`/`.name` literally. It must fall back to the same
+        generic bucket/source_table split `_table_binder()` already uses."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="RAW", source_table="ORDERS")
+        resolved = resolve_dataset_table({"source": "ESHOP_DEMO.RAW.ORDERS"}, "manual")
+        assert resolved == "raw_orders"
+
+    def test_snowflake_shaped_source_resolves_via_generic_fallback_two_segments(self, system_db):
+        """Same generic fallback, but with a bare `SCHEMA.TABLE` (2-segment)
+        identifier rather than the 3-segment `DATABASE.SCHEMA.TABLE` form."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="RAW", source_table="ORDERS")
+        resolved = resolve_dataset_table({"source": "RAW.ORDERS"}, "manual")
+        assert resolved == "raw_orders"
+
+    def test_literal_match_still_wins_over_generic_fallback(self, system_db):
+        """Regression guard: an existing Agnes-native `dataset.source` that
+        already matches a `table_registry.id`/`.name` literally must resolve
+        via that path first, unaffected by the new generic fallback."""
+        _register("orders_view", "orders_view", source_type="snowflake", bucket="RAW", source_table="ORDERS_OTHER")
+        assert resolve_dataset_table({"source": "orders_view"}, "manual") == "orders_view"
+
+    def test_unresolvable_multi_segment_source_returns_none(self, system_db):
+        assert resolve_dataset_table({"source": "ESHOP_DEMO.RAW.NOWHERE"}, "manual") is None
+
 
 class TestTablesWithoutSemanticCoverage:
     def test_table_with_native_model_dataset_is_covered(self, system_db):
@@ -180,6 +207,29 @@ class TestTablesWithoutSemanticCoverage:
         _register("lonely", "lonely")
         rows = tables_without_semantic_coverage()
         assert rows and rows[0]["name"] == "lonely"
+
+    def test_table_with_snowflake_shaped_manual_dataset_is_covered(self, system_db):
+        """The critical case this task exists to prevent: a manual document's
+        dataset referencing a Snowflake/Databricks-shaped identifier
+        (`DATABASE.SCHEMA.TABLE`) must be recognized as covering the table
+        registered with the matching `(bucket, source_table)`, not reported
+        as uncovered forever."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="RAW", source_table="ORDERS")
+        _upsert_model(
+            slug="eshop",
+            source="manual",
+            source_ref=None,
+            document={
+                "semantic_model": [
+                    {
+                        "name": "eshop",
+                        "datasets": [{"name": "orders", "source": "ESHOP_DEMO.RAW.ORDERS", "fields": []}],
+                    }
+                ]
+            },
+        )
+        ids = {r["id"] for r in tables_without_semantic_coverage()}
+        assert "raw_orders" not in ids
 
 
 def _auth(token: str) -> dict:
