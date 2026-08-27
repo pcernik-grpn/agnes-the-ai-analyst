@@ -33,6 +33,36 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `semantic_sources.id` the document importer stamps — so a source fed by a
   registered semantic source is credited with the terms it actually has.
 
+- **Semantic sources reachable from the UI, plus a connect-time nudge for
+  Snowflake and Databricks.** `/admin/semantic-sources` is a new admin page
+  (Data section) to list/add/sync/delete `semantic_source` rows of any kind
+  (git/upload/connection) and any registered adapter — previously CLI/REST
+  only. The Snowflake and Databricks connect wizards on `/admin/data-sources`
+  now offer an "Also sync semantic views" opt-in, mirroring Keboola's
+  existing one: checked, it creates (or reuses) a `connection` source for
+  that connector's adapter (`snowflake_semantic` / `databricks_metric_views`)
+  and syncs it immediately. Non-fatal either way — skipped or failed, the new
+  page is where to set it up or retry.
+
+- **Shared-agent runtime: a user an agent was shared with can now run it**
+  (remediation program Track C, C2.3). Previously only an agent's OWNER
+  could open a session against it — a `ResourceType.AGENT` grant (the
+  Library's "Share" action) only conveyed builder-read. The runtime
+  resolution sites (`POST /api/v1/agents/{slug|id}/responses`,
+  `.../sessions`, the web chat route's `agent_slug`) now resolve
+  owned-OR-shared (`agents_repo().get_runnable_by_slug` — new dual-backend
+  repo method), addressed by the agent's id for a non-owner since a slug is
+  only unique per-owner. Row-level table access policies
+  (`src/access_policy.py`) now bind `$user_email`/`$user_id`/`$user_groups`
+  to the CALLER of an `AgentPrincipal` turn, not the agent's owner — a
+  shared agent's rows are filtered per grantee, threaded from the chat
+  session's own server-side `user_email` (never a client-suppliable JWT
+  claim). Memory notebooks, PAT issuance, and all agent mutation (scope/
+  config/delete) remain owner-only — a runnable grant is run+read, never
+  manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
+  source for a future runtime agent picker).
+>>>>>>> 2267962e0 (Add semantic sources admin page + Snowflake/Databricks sync opt-in)
+
 - **Semantic-layer health: is what exists broken, stale, or inconsistent.**
   `GET /api/admin/semantic-layer/health` (`agnes semantic-model health`, MCP
   `semantic_layer_health`) rolls up: per-source sync failures; models whose
