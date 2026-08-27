@@ -10556,6 +10556,7 @@
     "tests/test_design_system_contract.py::test_classes_helper_multiline_attr": 0.001991859999634471,
     "tests/test_design_system_contract.py::test_classes_helper_skips_jinja_tokens": 0.0016762259997449291,
     "tests/test_design_system_contract.py::test_component_macros_emit_only_classes_with_css_rules": 0.036820430000261695,
+    "tests/test_design_system_contract.py::test_legacy_primary_token_family_shimmed_in_dark_theme": 0.0016,
     "tests/test_design_system_contract.py::test_legacy_selectors_use_no_bare_rem_literals": 0.0082577549992493,
     "tests/test_design_system_contract.py::test_legacy_selectors_use_no_raw_hex_literals": 0.009847222999724181,
     "tests/test_design_system_contract.py::test_legacy_token_aliases_defined_in_root": 0.0020578759995260043,

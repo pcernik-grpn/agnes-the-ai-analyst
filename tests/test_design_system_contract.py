@@ -208,6 +208,36 @@ def test_no_legacy_primary_token_with_hex_fallback() -> None:
     )
 
 
+def test_legacy_primary_token_family_shimmed_in_dark_theme() -> None:
+    """The dark-theme block's "Legacy compat shims" section flips
+    `--background`/`--surface`/`--text-*`/etc. (the style-custom.css family)
+    so components still reading legacy tokens re-skin along with everything
+    on `--ds-*`. The `--primary` / `--primary-dark` / `--primary-light` trio
+    (style-custom.css:11-13) was missing from that list — #1625: any rule
+    that reads the legacy tokens directly (e.g. `.app-user-menu-item.is-active`
+    in style-custom.css, `background: var(--primary-light); color: var(--primary)`)
+    keeps its light-theme value under dark, at 3.27:1 contrast (below WCAG AA's
+    4.5:1) instead of flipping like `--ds-primary-light` already does.
+
+    Reuse the existing `var(--ds-primary*)` aliasing idiom already used here for
+    the other legacy families — don't hand-roll a second dark value."""
+    css = (STATIC / "css" / "design-tokens.css").read_text(encoding="utf-8")
+    blocks = list(re.finditer(r':root\[data-theme="dark"\]\s*\{', css))
+    assert blocks, 'no `:root[data-theme="dark"]` block found — did the token file move?'
+    merged = "\n".join(css[m.end() : css.index("\n}", m.end())] for m in blocks)
+    for legacy, ds in (
+        ("--primary", "--ds-primary"),
+        ("--primary-dark", "--ds-primary-dark"),
+        ("--primary-light", "--ds-primary-light"),
+    ):
+        pattern = re.compile(rf"{re.escape(legacy)}\s*:\s*var\({re.escape(ds)}\)")
+        assert pattern.search(merged), (
+            f'{legacy} is not shimmed to var({ds}) inside `:root[data-theme="dark"]` — '
+            "a component still reading the legacy token keeps its light-theme value "
+            "in dark mode (#1625)"
+        )
+
+
 _NO_RAW_HEX_TEMPLATES = (
     "profile.html",
     "setup.html",

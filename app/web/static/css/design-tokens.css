@@ -761,7 +761,16 @@
     /* Legacy compat shims — these live in style-custom.css and are
        referenced by the app header, footer, and pages that haven't
        moved onto ``--ds-*`` yet. Override them here so the chrome
-       flips alongside the design-token surfaces. */
+       flips alongside the design-token surfaces.
+
+       `--primary` / `--primary-dark` / `--primary-light` (#1625) were
+       missing from this list: a rule that reads them directly instead of
+       `--ds-primary*` — e.g. `.app-user-menu-item.is-active` in
+       style-custom.css — kept the light-theme blue in dark mode, which
+       measures ~3.3:1 against the dark surface (below WCAG AA's 4.5:1). */
+    --primary: var(--ds-primary);
+    --primary-dark: var(--ds-primary-dark);
+    --primary-light: var(--ds-primary-light);
     --background: var(--ds-bg);
     --surface: var(--ds-surface);
     --surface-dim: var(--ds-surface-dim);
