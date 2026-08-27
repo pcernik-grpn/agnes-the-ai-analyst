@@ -12,6 +12,28 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **`agnes admin config export` / `agnes admin config apply`** round-trip the
+  server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
+  only) as reviewable YAML — the "onboard a new client via a reviewed PR"
+  building block. `export` reads the new `GET /api/admin/server-config/overlay`
+  endpoint, which serves the raw on-disk overlay (unresolved `${VAR}`
+  references, not the merged/env-resolved config `GET /api/admin/server-config`
+  serves); env-var NAME fields (`token_env`) and `${VAR}` references pass
+  through unchanged, but a literal credential never leaves the server —
+  the free-form `connectors` section (per-connector keys an admin types
+  directly, e.g. a Slack webhook URL, with no static schema to police by
+  key name) has every literal omitted, and a value that is unambiguously
+  credential-shaped (a JWT, a PEM block, a URL carrying userinfo or a long
+  opaque token segment) is omitted everywhere else too, regardless of its
+  key's name. Every omitted path is reported back (`omitted_keys`), not
+  silently dropped — `export` surfaces it as both a YAML comment header
+  and a stderr note so the operator knows what to set via env/`${VAR}` on
+  the target instance. `apply` posts the file through the same validated
+  `POST /api/admin/server-config` path an admin's form save uses — section
+  allowlisting, deep-merge, danger-zone confirmation, and audit logging all
+  apply unchanged — after filtering out any non-editable section or literal
+  secret client-side. Supports `--dry-run` (diff against the current
+  overlay, writes nothing).
 - **`chat_provider = "docker"` now provisions its own backing** in the
   `customer-instance` Terraform module, instead of only pinning the choice.
   Web chat's docker provider spawns each session through the apps-runner

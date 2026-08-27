@@ -600,6 +600,18 @@ _EXEMPT: dict[str, str] = {
         "join its cohort rather than stay exempt"
     ),
     "/api/auth/keboola/projects": _KEBOOLA_LOGIN_PROJECTS_REASON,
+    "/api/admin/server-config/overlay": (
+        "raw editable-section-only instance.yaml overlay — the export "
+        "projection behind `agnes admin config export`/`apply` (Track D3), "
+        "CLI-reachable via both subcommands but deliberately never "
+        "MCP-exposed per the 'operator security-posture diagnostics' "
+        "standing exemption in CONTRIBUTING.md: a one-call dump of the "
+        "instance's entire editable config surface (which upstream it "
+        "points at, what auth is configured) is reconnaissance in a "
+        "prompt-injected chat session, not an agent affordance. Mirrors "
+        "the existing grandfathered GET/POST /api/admin/server-config, "
+        "which the same reasoning already covers"
+    ),
     "/api/admin/doctor/new-instance": (
         "deployment-gate doctor (post-deploy smoke checks) — CLI-reachable via "
         "`agnes admin doctor --new-instance` and called by "
