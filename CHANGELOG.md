@@ -85,6 +85,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   naming it. No command previously told an analyst which directory a pull
   actually wrote to, so a pull into the wrong workspace looked identical to
   a correct one.
+- **A stolen PAT can no longer be laundered into a 30-day MCP refresh token.**
+  The MCP-OAuth consent bridge (`/api/mcp/oauth/consent`) resolved its
+  `Authorization: Bearer` header through the generic token resolver, which
+  accepts a plain personal access token — so a caller holding only a PAT could
+  drive the consent POST, mint an authorization code, and exchange it for an
+  access token *plus* a 30-day refresh token that outlived revoking the PAT it
+  came from. The bridge's existing cross-origin gate did not cover this: it is
+  a CSRF control against a tricked browser, and a programmatic caller simply
+  sends the matching `Origin`. Consent now requires a genuine interactive
+  session, applying the same classification `require_session_token` already
+  enforces on `POST /auth/tokens` and MCP connect — PATs, agent PATs, the
+  scheduler secret, and `X-StorageApi-Token` are refused, as are agent-surface
+  session JWTs (the web-chat sandbox token, and an MCP-OAuth connector token
+  re-consenting itself an endless chain of fresh refresh tokens). The browser
+  consent flow, which authenticates by the `access_token` cookie, is unchanged.
+
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
 - The "Add data source" wizard's Snowflake table picker no longer renders a
