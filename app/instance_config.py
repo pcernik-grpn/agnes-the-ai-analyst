@@ -164,7 +164,7 @@ def load_instance_config(*, strict: bool = False) -> dict:
     Resolution:
     1. Static base: ``CONFIG_DIR/instance.yaml`` via ``config.loader``
        (the source of truth for sections the editor doesn't expose —
-       ``datasets``, ``corporate_memory``, ``openmetadata``, etc.).
+       ``datasets``, ``corporate_memory``, etc.).
     2. Overlay patch: ``DATA_DIR/state/instance.yaml`` (written by
        ``/api/admin/configure`` and ``/api/admin/server-config``;
        contains only the sections those endpoints accept).
@@ -176,7 +176,7 @@ def load_instance_config(*, strict: bool = False) -> dict:
     silent footgun: the moment someone saved any section through the
     new editor (which writes a narrow overlay by design), every
     consumer of static-only sections (corporate memory page, dataset
-    list, OpenMetadata client) saw empty defaults. See PR #107.
+    list) saw empty defaults. See PR #107.
     """
     global _instance_config, _loaded_once, _last_good_config, _static_config_error
     if _instance_config is not None:
@@ -1810,7 +1810,8 @@ def get_store_verification_enabled() -> bool:
 
 def get_guardrails_llm_provider_ready() -> bool:
     """Whether the LLM provider has credentials present in the
-    environment.
+    environment (or the instance is configured for Vertex, which needs no
+    static key — Google ADC signs its calls).
 
     Independent from :func:`get_guardrails_enabled` (operator intent).
     A False return here when intent is True is a misconfiguration —
@@ -1821,6 +1822,13 @@ def get_guardrails_llm_provider_ready() -> bool:
         return True
     if os.environ.get("LLM_API_KEY", "").strip():
         return True
+    try:
+        from connectors.llm.factory import vertex_config_or_none
+
+        if vertex_config_or_none():
+            return True
+    except Exception:  # noqa: BLE001 — readiness probe; a broken import means "not ready"
+        pass
     return False
 
 

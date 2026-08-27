@@ -464,6 +464,10 @@ def default_api_key_loader() -> str:
 
     The same env var the corporate-memory service uses; keeping a single
     convention so operators don't juggle multiple keys.
+
+    Returns ``""`` (a documented sentinel, not an error) when the instance
+    is configured for Vertex — that mode has no static key at all; the
+    review call-sites build a VertexExtractor when they see it.
     """
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
@@ -471,10 +475,15 @@ def default_api_key_loader() -> str:
         # backward-compat resolution path.
         key = os.environ.get("LLM_API_KEY", "").strip()
     if not key:
+        from connectors.llm.factory import vertex_config_or_none
+
+        if vertex_config_or_none():
+            return ""
         raise RuntimeError(
             "Guardrail LLM review requires ANTHROPIC_API_KEY (or LLM_API_KEY) "
-            "in the environment. Set it on the FastAPI container, or disable "
-            "guardrails via instance.yaml: guardrails.enabled: false"
+            "in the environment — or ai.provider: vertex in instance.yaml. "
+            "Set one on the FastAPI container, or disable guardrails via "
+            "instance.yaml: guardrails.enabled: false"
         )
     return key
 

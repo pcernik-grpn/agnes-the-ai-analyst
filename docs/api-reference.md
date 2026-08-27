@@ -499,7 +499,7 @@ Platform-wide settings live here, including the data source connection configura
 
 `POST /api/admin/server-config` accepts a `sections` object keyed by section name
 (`instance`, `data_source`, `email`, `telegram`, `jira`, `theme`, `server`, `auth`,
-`ai`, `openmetadata`, `desktop`, `corporate_memory`, `materialize`, `guardrails`,
+`ai`, `desktop`, `corporate_memory`, `materialize`, `guardrails`,
 `marketplace`). Sections outside this allowlist are rejected with 400.
 
 Sections `auth` and `server` are "danger zones" — mutating them requires sending

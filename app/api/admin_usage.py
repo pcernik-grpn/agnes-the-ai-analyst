@@ -30,7 +30,7 @@ from connectors.llm.exceptions import (
     LLMRefusalError,
     LLMTimeoutError,
 )
-
+from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
 from src.repositories import (
     audit_repo,
     usage_repo,
@@ -211,11 +211,15 @@ def ask_usage(
     if len(question) > 1000:
         raise HTTPException(status_code=400, detail="question too long (>1000 chars)")
 
+    vertex = vertex_config_or_none()
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
+    if not api_key and not vertex:
         raise HTTPException(
             status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured on the server. Set it in instance env / .env_overlay.",
+            detail=(
+                "ANTHROPIC_API_KEY is not configured on the server. Set it in "
+                "instance env / .env_overlay, or configure ai.provider: vertex."
+            ),
         )
 
     dialect = "postgresql" if use_pg() else "duckdb"
@@ -225,7 +229,11 @@ def ask_usage(
         # escaped exception here would surface as an unhandled 500 instead
         # of this endpoint's documented LLM-failure response. t0 is taken
         # after construction so the reported llm_ms stays the API call.
-        extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
+        extractor: AnthropicExtractor
+        if vertex:
+            extractor = create_vertex_extractor(_ASK_MODEL)
+        else:
+            extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
         t0 = time.monotonic()
         llm_out = extractor.extract_json(
             prompt=build_prompt(question),
