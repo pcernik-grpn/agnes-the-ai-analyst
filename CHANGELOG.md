@@ -77,212 +77,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   still running DuckDB app-state answers a typed `501
   requires_postgres_backend` on every one of these surfaces.
 
-### Changed
-
-- **`/admin/semantic-layer` is rebuilt on tabs** (Coverage · Health · Mute ·
-  Feedback). A Keboola connection with no owner token is now an ordinary row
-  in the coverage report instead of a separate footnote — it used to be
-  invisible to the old page's coverage engine entirely.
-
-### Removed
-
-- **The old page's Keboola-specific "orphaned rows" count, "also connected
-  but not syncing" list, and "legacy / unattributed" bucket are gone.** All
-  three measured the flat `metric_definitions` / `glossary_terms`
-  projections rather than the canonical document they are derived from, and
-  only for Keboola. Their successors, all cross-source: the "also
-  connected" list is now a row in Coverage; "orphaned" is Health's
-  `orphaned_models`, computed over the canonical document; "legacy /
-  unattributed" is Coverage's synthetic `__local__` bucket.
-
-### Internal
-
-- `RequiresPostgresBackend` moved out of `src/repositories/__init__.py`
-  into its own import-free `src/repository_errors.py`. A PG-side test
-  fixture's `importlib.reload(src.repositories)` was rebinding the
-  exception to a new class object, which silently broke `app/main.py`'s
-  exception-handler match (a clean `501` degrading to an unhandled `500`)
-  the first time this session's work exercised the reload path against a
-  genuinely PG-only route.
-
-- **Shared-agent runtime: a user an agent was shared with can now run it**
-  (remediation program Track C, C2.3). Previously only an agent's OWNER
-  could open a session against it — a `ResourceType.AGENT` grant (the
-  Library's "Share" action) only conveyed builder-read. The runtime
-  resolution sites (`POST /api/v1/agents/{slug|id}/responses`,
-  `.../sessions`, the web chat route's `agent_slug`) now resolve
-  owned-OR-shared (`agents_repo().get_runnable_by_slug` — new dual-backend
-  repo method), addressed by the agent's id for a non-owner since a slug is
-  only unique per-owner. Row-level table access policies
-  (`src/access_policy.py`) now bind `$user_email`/`$user_id`/`$user_groups`
-  to the CALLER of an `AgentPrincipal` turn, not the agent's owner — a
-  shared agent's rows are filtered per grantee, threaded from the chat
-  session's own server-side `user_email` (never a client-suppliable JWT
-  claim). Memory notebooks, PAT issuance, and all agent mutation (scope/
-  config/delete) remain owner-only — a runnable grant is run+read, never
-  manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
-  source for a future runtime agent picker).
-
-- **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
-  subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
-  ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
-  `iconEl(name)` JS helper (`chat_icons.js`). Assistant answers can now use
-  an inline icon vocabulary: `` `icon:<name>` `` tokens render as sprite
-  icons (allowlist-only — an unknown name stays plain text, and the pass
-  runs after the markdown sanitizer, building nodes itself, so it can never
-  introduce markup). The chat system prompt — both the native-sandbox
-  CLAUDE.md render and the embedded-engine workspace tarball, plus the
-  static fallback workspace — now forbids emoji outright and offers exactly
-  the names the UI renders (`chat_icons` template variable;
-  `tests/test_chat_icons.py` keeps sprite, JS allowlist and both prompts in
-  sync). Tool-call cards swap their emoji/text glyphs (⏳ ✓ ⚠ 🛡 › ✕) for
-  sprite icons tinted to the card's status accent, and the tool name drops
-  the monospace face — the header reads as the action it names, not a
-  terminal id.
-
-- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
-  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
-  collection an admin creates via the Library/API is granted to the `Everyone`
-  group at creation, so admin uploads are workspace-visible — in the Library,
-  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
-  without a manual share step. The grant is an ordinary revocable Everyone
-  grant; non-admin uploads and chat file drops stay private. The
-  `POST /api/collections` response now reports the resulting `visibility`
-  (`workspace`/`private`).
-- **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
-  (remediation-program Track C1.1, additive — the builder router is
-  unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
-  the builder's wire fields (`role`, `instructions` as an alias for the
-  existing `system_prompt`, `tone`, `greeting`, `knowledge`, `plugins`,
-  `surfaces`, `status`, `template_entity_id`); `slug` is now optional on
-  create and auto-derived from `name` when omitted. A `knowledge`/`plugins`
-  write goes through the SAME `_sync_builder_scope` mapping the builder
-  uses and forces any of the four `*_mode` columns the caller left unset to
-  `'selected'` on that same write — exactly like the builder's own PATCH —
-  so `agent_scope` enforcement is identical through either surface and an
-  agent sitting at `mode='all'` (e.g. the seeded default) cannot keep
-  passing its owner's whole stack through on an axis a `knowledge`/`plugins`
-  edit didn't mention. A draft agent's slug follows a rename exactly like
-  the builder's own PATCH does. `GET /api/v1/agents{,/{id}}` decode
-  `knowledge`/`plugins`/`surfaces` into structured JSON (previously opaque
-  text) and now include
-  agents shared into one of the caller's groups, not just owned ones — the
-  same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
-  also cleans up sharing grants on delete, closing a gap versus the
-  builder's own delete.
-- **`agent_scope` rows now record who granted them, and a non-admin writer
-  can no longer declare a data item they cannot themselves reach**
-  (remediation-program Track C2.1, staged agent-owned authority — no
-  behavior change for existing agents, a backfill attributes every
-  pre-existing row to its agent's owner). Every write to `PUT
-  /api/v1/agents/{id}/scope` and the builder-shape `knowledge` write
-  (`POST`/`PUT /api/v1/agents`) now records the authenticated caller as
-  `granted_by` (Postgres-only column — see Internal below), and refuses a
-  non-admin caller's `table`/`data_package`/`collection`/`connection` item
-  with `403 scope_item_not_accessible` when they do not currently hold it
-  themselves; an admin caller is unconditioned. `plugin`/`memory_domain`/
-  `slack_channel` items are unaffected. Runtime scope resolution is
-  unchanged by this step (still today's owner intersection) — a later task
-  uses `granted_by` to let an admin-shared agent reach items its owner
-  personally does not hold.
-
-### Changed
-
-- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
-  `none` (internal-only network, no route to the internet) instead of `open`.
-  The chat agent runs with bypassed tool permissions over a read-write
-  workspace, so an open default was a file-exfiltration surface. Operators who
-  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
-  with `chat.docker_egress_mode: open`, or `allowlist` +
-  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
-  or blank value now fails closed to `none`.
-
-### Fixed
-
-- **A failed auto-draft session no longer disables its table forever.** The
-  semantic auto-draft sweep stamps each table's `semantic_draft_pending_at`
-  before invoking its session, and only a concurrency-cap hit un-stamped it
-  again. Any other failure — a broker/LLM error, a session-spawn failure —
-  left the flag set with no `authoring_suggestions` row that could ever
-  clear it, so `tables_without_semantic_coverage` dropped that table from
-  every later tick and it was never drafted again, silently; the same
-  exception also 500'd the whole request, abandoning the rest of the batch.
-  Any session failure now clears the flag, is logged, is counted in a new
-  `errored` field on the response, and the sweep continues to the next
-  table. Un-stamping a session that may have survived can at worst cost a
-  duplicate draft (one extra queued suggestion an admin rejects) — bounded
-  and visible, unlike permanent silent exclusion (Devin review).
-
-- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
-  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
-  labels now render via `textContent`, keeping the static sort markup trusted.
-- Agent-session principals no longer crash (500) when reaching collection
-  authorization (`accessible_collection_ids`, `require_collection_access`);
-  an `AgentPrincipal` now resolves to its live scoped-collection intersection
-  or a clean 403, matching the existing co-session/agent-session seam and
-  never inheriting owner-owned collections.
-- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
-  the same canonical subpath used for policy and dispatcher classification, and
-  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
-  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
-  path like `/v1/./messages` that classified as a non-message call — skipping
-  its pinned-model allowlist and monthly token budget — while HTTPX
-  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
-  duplicate-slash message paths can likewise no longer route the destination
-  somewhere the authorization decision did not intend.
-- Token persistence refuses to write (instead of silently downgrading to
-  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
-  valid Fernet key; a genuinely unset key still uses the plaintext keyless
-  fallback as before. A previously-silent misconfigured production vault now
-  fails loudly on secret saves instead of writing the secret in cleartext.
-
-### Security
-
-- Knowledge-digest generation now frames corpus source chunks as untrusted
-  data — behind an explicit do-not-follow-instructions notice and a per-call
-  nonce-delimited fence — before they reach the LLM, so retrieved content can
-  no longer be elevated into persistent agent instructions through the
-  generated `.claude/rules/ka_<slug>.md` digest.
-
-### Internal
-
-- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
-  genuine schema change on an existing DuckDB↔Postgres pair under the A3
-  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
-  schema change on an existing pair's table … follows 'Adding a PG-only
-  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
-  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
-  an identical call shape (accepts the same `granted_by` keyword) but has no
-  column to persist it into. `migrations/versions/
-  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
-  agent's `owner_user_id`.
-
-- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
-
-- **PG-first development rule (remediation-program Track A3): the DuckDB
-  app-state backend is frozen.** No user-visible change. Development-rule
-  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
-  app-state repositories/schema changes to be Postgres-only (a
-  `src/repositories/<name>_pg.py` module registered `PG`-only in the
-  `_REGISTRY` factory table, an Alembic-only migration) — no new
-  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
-  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
-  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
-  Resolving a Postgres-only repository on an instance still running the
-  frozen DuckDB app-state backend now raises a typed
-  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
-  handler into a clean `501` instead of an unhandled `500`. New ratchets:
-  `tests/test_repository_registry_pg_first_ratchet.py`,
-  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
-  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
-  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
-  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
-  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
-  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
-  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
-  dev-kit agents are updated to match.
-
-### Added
 
 - **Source-agnostic semantic-layer coverage check.** `GET /api/admin/semantic-coverage` (admin, CLI `agnes semantic-model coverage tables`, MCP `admin_semantic_coverage`) lists every registered table with NO valid semantic model describing it at all — reads what's already stored in `semantic_models` regardless of source (Keboola, git, manual, upload, connection), unlike the existing Keboola-only `GET /api/admin/semantic-layer/coverage`. Built on a new shared resolver, `resolve_dataset_table()`, which `project_document`'s metric binder now also uses so a Keboola dataset (bound via its raw Keboola tableId) is never misreported as uncovered by a naive text match.
 - **`semantic-drafter` system identity**, provisioned via `app.auth.system_users.ensure_semantic_drafter_user()` — the non-human identity a headless semantic-model auto-drafting session authenticates as. Unlike the scheduler service user, it is deliberately never added to the Admin group, so its writes route through `POST /api/semantic-models/apply`'s non-admin moderation queue rather than landing directly.
@@ -380,7 +174,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **Semantic layer physically distributed to the workspace, with a TTL (semantic-layer Phase 2, "fyzická cache s TTL").** `agnes pull` now writes every semantic model you can read into a read-only local cache under `<workspace>/semantic/<slug>/` — `_brief.md`, `tables/<dataset>.yml`, `metrics/<metric>.yml`, and `glossary.md` when the model declares glossary terms (`src/semantic/cache_render.py`, rendered from the same document-store rows the live `get_semantic_context`/`get_semantic_schema`/`validate_semantic_query` trio already reads — not from the legacy flat-table scaffold). Every file's header carries `generated_at`, `content_hash` (the model's own `semantic_models.content_hash`), `source_slug`, and `ttl_seconds` (24h default); files are chmod'd read-only since the server, not the local edit, is the source of truth. Sourced from a new `GET /api/semantic-models/bundle` (same RBAC tier as search/export/context: admin, a direct model grant, or a grant on a linked Data Package), best-effort like the corporate-memory bundle — a fetch failure or a pre-this-feature server (404) never fails the pull, and a model directory or file that fell out of the caller's accessible set is pruned on the next pull. `GET /api/semantic-models/context`'s response gains a `model_hashes` map (`{slug: content_hash}`, also exposed to the MCP `get_semantic_context` tool) so an agent can verify a locally cached file against the live hash once its TTL has elapsed, without re-fetching the whole document. The CLAUDE.md workspace prompt's existing "Semantic layer" section now enumerates the registered models (name + description) and tells the agent the TTL policy: trust the local file until `ttl_seconds` has elapsed, then verify via `get_semantic_context`/`model_hashes` before relying on it further — `validate_semantic_query` stays live against the server regardless of cache age.
 
+
 ### Changed
+
+- **`/admin/semantic-layer` is rebuilt on tabs** (Coverage · Health · Mute ·
+  Feedback). A Keboola connection with no owner token is now an ordinary row
+  in the coverage report instead of a separate footnote — it used to be
+  invisible to the old page's coverage engine entirely.
+
+
+- **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
+  `none` (internal-only network, no route to the internet) instead of `open`.
+  The chat agent runs with bypassed tool permissions over a read-write
+  workspace, so an open default was a file-exfiltration surface. Operators who
+  need in-sandbox internet access (e.g. `pip install`) must opt in explicitly
+  with `chat.docker_egress_mode: open`, or `allowlist` +
+  `docker_egress_allow_hosts` for a scoped set, in `instance.yaml`. An unknown
+  or blank value now fails closed to `none`.
+
 
 - **BREAKING** Docker chat sandboxes now default `chat.docker_egress_mode` to
   `none` (internal-only network, no route to the internet) instead of `open`.
@@ -462,7 +273,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **Databricks semantic layer moved onto the Ossie document path (semantic-layer Phase 1 cutover).** `connectors/databricks/semantic_layer.py::sync_semantic_layer` no longer writes flat `metric_definitions` rows directly; it now composes one Ossie document per Unity Catalog metric view (`connectors/databricks/semantic_ossie.py`, registered as the `databricks_metric_views` adapter), stores it under `source='databricks_metrics'` in `semantic_models`, and runs it through `src.semantic.projection.project_document` — the single writer of the flat query tables, same as the Keboola and Snowflake sources. Every measure is composed as the full runnable `SELECT MEASURE(...) FROM <metric view>` statement and tagged with the `DATABRICKS` Ossie dialect only (never `DUCKDB`/`ANSI_SQL`, since `MEASURE()` isn't valid DuckDB syntax) — the same choice the Snowflake adapter already made for its own warehouse-only metrics — so these metrics are discoverable through the semantic-model document surfaces (browse, export, `validate_semantic_query`, which now correctly reports a query using one as not locally executable) rather than the `metric_definitions` flat listing. Any row still stamped with the retired `source='databricks_semantic_layer'` label is purged once a sync stores real output. `metric_definitions.name` (no uniqueness constraint) now logs and counts a same-name collision from a different `(source, source_ref)` writer instead of silently overwriting or shadowing it (`src/semantic/projection.py`). `column_metadata` gains a nullable `source_ref` column on Postgres only (Alembic revision `0073`, no DuckDB schema change per the A3 PG-first ratchet), mirroring `metric_definitions`/`glossary_terms`.
 
+
 ### Removed
+
+- **The old page's Keboola-specific "orphaned rows" count, "also connected
+  but not syncing" list, and "legacy / unattributed" bucket are gone.** All
+  three measured the flat `metric_definitions` / `glossary_terms`
+  projections rather than the canonical document they are derived from, and
+  only for Keboola. Their successors, all cross-source: the "also
+  connected" list is now a row in Coverage; "orphaned" is Health's
+  `orphaned_models`, computed over the canonical document; "legacy /
+  unattributed" is Coverage's synthetic `__local__` bucket.
+
 
 - **BREAKING: the `/api/agents` builder-CRUD router is deleted**
   (remediation-program Track C1.2 — "one agent model"). `/api/v1/agents*`
@@ -495,7 +317,263 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   (zero readers — found during a sweep for other dead keys in the same
   section). `deployment.role` is unaffected.
 
+
+- **BREAKING: the `/api/agents` builder-CRUD router is deleted**
+  (remediation-program Track C1.2 — "one agent model"). `/api/v1/agents*`
+  is now the ONLY agent API; it absorbed every operation the router served
+  in the previous release (Track C1.1). The Agent builder page (`/agents`)
+  is re-pointed at v1 and behaves the same, with two intentional
+  deviations: `POST /api/v1/agents` requires a non-blank `name` (v1's
+  pre-existing rule), so the builder's "New agent" now sends a placeholder
+  (`"Untitled"`) instead of minting a fully blank draft; and a client
+  supplying an explicit `slug` on `PUT /api/v1/agents/{id}` gets a flat 400
+  `slug_immutable` rather than having it silently dropped, closing that gap
+  a notch tighter than the deleted router's own PATCH did. New agent ids
+  are plain UUIDs — the deleted router's `agt_`-prefixed convention (used
+  only to distinguish builder-created rows in one now-completed one-time
+  migration) is retired; existing `agt_`-prefixed rows are unaffected.
+  `POST /api/v1/agents` now also marks the "Create your first agent"
+  onboarding step, closing a gap versus a plain (non-builder-shape) v1
+  create that never did. Direct callers of `/api/agents*` (there were none
+  outside this repo's own web UI) must move to `/api/v1/agents*`; see
+  `docs/api-reference.md`.
+- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
+  `jira:` section is gone from both the `/admin/server-config` UI (it never
+  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
+  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
+  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
+  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
+  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
+  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
+  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
+  (zero readers — found during a sweep for other dead keys in the same
+  section). `deployment.role` is unaffected.
+
+
+### Internal
+
+- `RequiresPostgresBackend` moved out of `src/repositories/__init__.py`
+  into its own import-free `src/repository_errors.py`. A PG-side test
+  fixture's `importlib.reload(src.repositories)` was rebinding the
+  exception to a new class object, which silently broke `app/main.py`'s
+  exception-handler match (a clean `501` degrading to an unhandled `500`)
+  the first time this session's work exercised the reload path against a
+  genuinely PG-only route.
+
+- **Shared-agent runtime: a user an agent was shared with can now run it**
+  (remediation program Track C, C2.3). Previously only an agent's OWNER
+  could open a session against it — a `ResourceType.AGENT` grant (the
+  Library's "Share" action) only conveyed builder-read. The runtime
+  resolution sites (`POST /api/v1/agents/{slug|id}/responses`,
+  `.../sessions`, the web chat route's `agent_slug`) now resolve
+  owned-OR-shared (`agents_repo().get_runnable_by_slug` — new dual-backend
+  repo method), addressed by the agent's id for a non-owner since a slug is
+  only unique per-owner. Row-level table access policies
+  (`src/access_policy.py`) now bind `$user_email`/`$user_id`/`$user_groups`
+  to the CALLER of an `AgentPrincipal` turn, not the agent's owner — a
+  shared agent's rows are filtered per grantee, threaded from the chat
+  session's own server-side `user_email` (never a client-suppliable JWT
+  claim). Memory notebooks, PAT issuance, and all agent mutation (scope/
+  config/delete) remain owner-only — a runnable grant is run+read, never
+  manage. `GET /api/v1/agents` gains a `runnable=true` filter (the data
+  source for a future runtime agent picker).
+
+- **Web chat: real SVG icons instead of emoji** (#1503). A curated Lucide
+  subset ships as an SVG sprite (`app/web/static/vendor/lucide-sprite.svg`,
+  ISC) behind one icon seam — the `ds.icon(name)` Jinja macro and the
+  `iconEl(name)` JS helper (`chat_icons.js`). Assistant answers can now use
+  an inline icon vocabulary: `` `icon:<name>` `` tokens render as sprite
+  icons (allowlist-only — an unknown name stays plain text, and the pass
+  runs after the markdown sanitizer, building nodes itself, so it can never
+  introduce markup). The chat system prompt — both the native-sandbox
+  CLAUDE.md render and the embedded-engine workspace tarball, plus the
+  static fallback workspace — now forbids emoji outright and offers exactly
+  the names the UI renders (`chat_icons` template variable;
+  `tests/test_chat_icons.py` keeps sprite, JS allowlist and both prompts in
+  sync). Tool-call cards swap their emoji/text glyphs (⏳ ✓ ⚠ 🛡 › ✕) for
+  sprite icons tinted to the card's status accent, and the tool name drops
+  the monospace face — the header reads as the action it names, not a
+  terminal id.
+
+- **Opt-in auto-share for admin Library uploads** (`library.auto_share_admin_uploads`,
+  env `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`, default off). When enabled, a
+  collection an admin creates via the Library/API is granted to the `Everyone`
+  group at creation, so admin uploads are workspace-visible — in the Library,
+  the chat agent's collection tools, and `agnes pull` knowledge artifacts —
+  without a manual share step. The grant is an ordinary revocable Everyone
+  grant; non-admin uploads and chat file drops stay private. The
+  `POST /api/collections` response now reports the resulting `visibility`
+  (`workspace`/`private`).
+- **`/api/v1/agents*` absorbs the `/agents` builder's own operations**
+  (remediation-program Track C1.1, additive — the builder router is
+  unchanged and still works). `POST`/`PUT /api/v1/agents{,/{id}}` now accept
+  the builder's wire fields (`role`, `instructions` as an alias for the
+  existing `system_prompt`, `tone`, `greeting`, `knowledge`, `plugins`,
+  `surfaces`, `status`, `template_entity_id`); `slug` is now optional on
+  create and auto-derived from `name` when omitted. A `knowledge`/`plugins`
+  write goes through the SAME `_sync_builder_scope` mapping the builder
+  uses and forces any of the four `*_mode` columns the caller left unset to
+  `'selected'` on that same write — exactly like the builder's own PATCH —
+  so `agent_scope` enforcement is identical through either surface and an
+  agent sitting at `mode='all'` (e.g. the seeded default) cannot keep
+  passing its owner's whole stack through on an axis a `knowledge`/`plugins`
+  edit didn't mention. A draft agent's slug follows a rename exactly like
+  the builder's own PATCH does. `GET /api/v1/agents{,/{id}}` decode
+  `knowledge`/`plugins`/`surfaces` into structured JSON (previously opaque
+  text) and now include
+  agents shared into one of the caller's groups, not just owned ones — the
+  same reach `/api/agents` already had. `DELETE /api/v1/agents/{id}` now
+  also cleans up sharing grants on delete, closing a gap versus the
+  builder's own delete.
+- **`agent_scope` rows now record who granted them, and a non-admin writer
+  can no longer declare a data item they cannot themselves reach**
+  (remediation-program Track C2.1, staged agent-owned authority — no
+  behavior change for existing agents, a backfill attributes every
+  pre-existing row to its agent's owner). Every write to `PUT
+  /api/v1/agents/{id}/scope` and the builder-shape `knowledge` write
+  (`POST`/`PUT /api/v1/agents`) now records the authenticated caller as
+  `granted_by` (Postgres-only column — see Internal below), and refuses a
+  non-admin caller's `table`/`data_package`/`collection`/`connection` item
+  with `403 scope_item_not_accessible` when they do not currently hold it
+  themselves; an admin caller is unconditioned. `plugin`/`memory_domain`/
+  `slack_channel` items are unaffected. Runtime scope resolution is
+  unchanged by this step (still today's owner intersection) — a later task
+  uses `granted_by` to let an admin-shared agent reach items its owner
+  personally does not hold.
+
+
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
+
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
+
+
+- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
+  A fast, pure-file-parse test that catches the recurring silent-rebase
+  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
+  into an already-released section — sometimes duplicating a version heading —
+  while reporting zero conflicts; it struck four times during the 2026-08
+  remediation program). Asserts exactly one `## [Unreleased]` heading, no
+  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
+  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
+  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
+  passes the first three. Reuses `assert_no_duplicate_headings` /
+  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
+  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
+  carrying that fourth corruption at the time this guard was written — `###
+  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
+  `### Internal` block — so this change also repairs it: each group is
+  consolidated into its first occurrence and `### Internal` moves last. All
+  3489 bullets and all 15513 lines of released history are byte-identical; the
+  only lines removed are the three duplicate group headings. No behavior
+  change.
+- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
+  genuine schema change on an existing DuckDB↔Postgres pair under the A3
+  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
+  schema change on an existing pair's table … follows 'Adding a PG-only
+  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
+  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
+  an identical call shape (accepts the same `granted_by` keyword) but has no
+  column to persist it into. `migrations/versions/
+  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
+  agent's `owner_user_id`.
+
+- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
+
+- **PG-first development rule (remediation-program Track A3): the DuckDB
+  app-state backend is frozen.** No user-visible change. Development-rule
+  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
+  app-state repositories/schema changes to be Postgres-only (a
+  `src/repositories/<name>_pg.py` module registered `PG`-only in the
+  `_REGISTRY` factory table, an Alembic-only migration) — no new
+  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
+  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
+  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
+  Resolving a Postgres-only repository on an instance still running the
+  frozen DuckDB app-state backend now raises a typed
+  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
+  handler into a clean `501` instead of an unhandled `500`. New ratchets:
+  `tests/test_repository_registry_pg_first_ratchet.py`,
+  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
+  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
+  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
+  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
+  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
+  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
+  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
+  dev-kit agents are updated to match.
+
+
 ### Fixed
+
+- **A failed auto-draft session no longer disables its table forever.** The
+  semantic auto-draft sweep stamps each table's `semantic_draft_pending_at`
+  before invoking its session, and only a concurrency-cap hit un-stamped it
+  again. Any other failure — a broker/LLM error, a session-spawn failure —
+  left the flag set with no `authoring_suggestions` row that could ever
+  clear it, so `tables_without_semantic_coverage` dropped that table from
+  every later tick and it was never drafted again, silently; the same
+  exception also 500'd the whole request, abandoning the rest of the batch.
+  Any session failure now clears the flag, is logged, is counted in a new
+  `errored` field on the response, and the sweep continues to the next
+  table. Un-stamping a session that may have survived can at worst cost a
+  duplicate draft (one extra queued suggestion an admin rejects) — bounded
+  and visible, unlike permanent silent exclusion (Devin review).
+
+- Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
+  table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
+  labels now render via `textContent`, keeping the static sort markup trusted.
+- Agent-session principals no longer crash (500) when reaching collection
+  authorization (`accessible_collection_ids`, `require_collection_access`);
+  an `AgentPrincipal` now resolves to its live scoped-collection intersection
+  or a clean 403, matching the existing co-session/agent-session seam and
+  never inheriting owner-owned collections.
+- Broker (`/api/broker/anthropic/*`) now builds the outbound upstream URL from
+  the same canonical subpath used for policy and dispatcher classification, and
+  rejects dot-segment (`.`/`..`) and backslash smuggling in that subpath with
+  `400 broker_upstream_path_invalid`. A bound agent could previously craft a
+  path like `/v1/./messages` that classified as a non-message call — skipping
+  its pinned-model allowlist and monthly token budget — while HTTPX
+  canonicalized the outbound URL to the real `/v1/messages`. Trailing- and
+  duplicate-slash message paths can likewise no longer route the destination
+  somewhere the authorization decision did not intend.
+- Token persistence refuses to write (instead of silently downgrading to
+  plaintext `.env_overlay` storage) when `AGNES_VAULT_KEY` is set but is not a
+  valid Fernet key; a genuinely unset key still uses the plaintext keyless
+  fallback as before. A previously-silent misconfigured production vault now
+  fails loudly on secret saves instead of writing the secret in cleartext.
+
 
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
@@ -583,6 +661,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   succeeds — the "Add data source" wizard creates a connection row before
   its config is complete.
 
+
 ### Security
 
 - Knowledge-digest generation now frames corpus source chunks as untrusted
@@ -591,95 +670,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   no longer be elevated into persistent agent instructions through the
   generated `.claude/rules/ka_<slug>.md` digest.
 
-### Removed
 
-- **BREAKING: the `/api/agents` builder-CRUD router is deleted**
-  (remediation-program Track C1.2 — "one agent model"). `/api/v1/agents*`
-  is now the ONLY agent API; it absorbed every operation the router served
-  in the previous release (Track C1.1). The Agent builder page (`/agents`)
-  is re-pointed at v1 and behaves the same, with two intentional
-  deviations: `POST /api/v1/agents` requires a non-blank `name` (v1's
-  pre-existing rule), so the builder's "New agent" now sends a placeholder
-  (`"Untitled"`) instead of minting a fully blank draft; and a client
-  supplying an explicit `slug` on `PUT /api/v1/agents/{id}` gets a flat 400
-  `slug_immutable` rather than having it silently dropped, closing that gap
-  a notch tighter than the deleted router's own PATCH did. New agent ids
-  are plain UUIDs — the deleted router's `agt_`-prefixed convention (used
-  only to distinguish builder-created rows in one now-completed one-time
-  migration) is retired; existing `agt_`-prefixed rows are unaffected.
-  `POST /api/v1/agents` now also marks the "Create your first agent"
-  onboarding step, closing a gap versus a plain (non-builder-shape) v1
-  create that never did. Direct callers of `/api/agents*` (there were none
-  outside this repo's own web UI) must move to `/api/v1/agents*`; see
-  `docs/api-reference.md`.
-- **Deleted dead config surfaces flagged by the 2026-08 audit.** The
-  `jira:` section is gone from both the `/admin/server-config` UI (it never
-  had any `instance.yaml` wiring — `connectors/jira/service.py` reads
-  `JIRA_*` environment variables directly) and `config/instance.yaml.example`
-  (replaced with a comment pointing at the real `JIRA_*` env vars, now also
-  listed in `docs/CONFIGURATION.md` and `config/.env.template`); the
-  `email.from_name` key (documented "NOT IMPLEMENTED"); the `admins:` section
-  and `server.ssh_alias`/`ssh_key`/`project_dir` (no ssh-provisioning flow
-  exists); and `server.app_dir` and `deployment.method`/`repo_url`/`branch`
-  (zero readers — found during a sweep for other dead keys in the same
-  section). `deployment.role` is unaffected.
-
-### Internal
-
-- **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
-  A fast, pure-file-parse test that catches the recurring silent-rebase
-  CHANGELOG corruption (git's 3-way merge relocating `[Unreleased]` bullets
-  into an already-released section — sometimes duplicating a version heading —
-  while reporting zero conflicts; it struck four times during the 2026-08
-  remediation program). Asserts exactly one `## [Unreleased]` heading, no
-  duplicate `## [X.Y.Z]` version headings, strictly descending semver order
-  after `[Unreleased]`, and no repeated `### <Group>` heading *inside*
-  `[Unreleased]` — the variant that duplicates no `##` heading at all and so
-  passes the first three. Reuses `assert_no_duplicate_headings` /
-  `find_version_headings` from `scripts/release_cut.py` so the every-push guard
-  and the daily cut enforce the same well-formedness. `[Unreleased]` itself was
-  carrying that fourth corruption at the time this guard was written — `###
-  Added`, `### Changed` and `### Fixed` each appearing twice, split around an
-  `### Internal` block — so this change also repairs it: each group is
-  consolidated into its first occurrence and `### Internal` moves last. All
-  3489 bullets and all 15513 lines of released history are byte-identical; the
-  only lines removed are the three duplicate group headings. No behavior
-  change.
-- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
-  genuine schema change on an existing DuckDB↔Postgres pair under the A3
-  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
-  schema change on an existing pair's table … follows 'Adding a PG-only
-  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
-  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
-  an identical call shape (accepts the same `granted_by` keyword) but has no
-  column to persist it into. `migrations/versions/
-  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
-  agent's `owner_user_id`.
-
-- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
-
-- **PG-first development rule (remediation-program Track A3): the DuckDB
-  app-state backend is frozen.** No user-visible change. Development-rule
-  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
-  app-state repositories/schema changes to be Postgres-only (a
-  `src/repositories/<name>_pg.py` module registered `PG`-only in the
-  `_REGISTRY` factory table, an Alembic-only migration) — no new
-  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
-  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
-  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
-  Resolving a Postgres-only repository on an instance still running the
-  frozen DuckDB app-state backend now raises a typed
-  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
-  handler into a clean `501` instead of an unhandled `500`. New ratchets:
-  `tests/test_repository_registry_pg_first_ratchet.py`,
-  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
-  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
-  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
-  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
-  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
-  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
-  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
-  dev-kit agents are updated to match.
+- Knowledge-digest generation now frames corpus source chunks as untrusted
+  data — behind an explicit do-not-follow-instructions notice and a per-call
+  nonce-delimited fence — before they reach the LLM, so retrieved content can
+  no longer be elevated into persistent agent instructions through the
+  generated `.claude/rules/ka_<slug>.md` digest.
 
 ## [0.89.1] - 2026-08-26
 

@@ -332,7 +332,20 @@ def render_workspace_prompt(*, has_models: bool) -> str:
     self-checking: a context key the template starts using and this function
     does not supply raises here rather than silently rendering an empty arm.
     """
+    from src.chat_icons import CHAT_INLINE_ICON_NAMES
     from src.prompt_render import make_prompt_env
+    from src.semantic.cache_render import DEFAULT_TTL_SECONDS
+
+    semantic_layer: dict[str, Any] = {"has_models": has_models}
+    if has_models:
+        # Only read inside the template's {% if semantic_layer.has_models %}
+        # block, so the baseline arm (has_models=False) never touches these —
+        # but StrictUndefined means the semantic arm needs real values, not
+        # placeholders, to match what a real instance with a registered model
+        # renders (`models` powers the "Registered models:" list at
+        # config/claude_md_template.txt:57-60).
+        semantic_layer["models"] = [{"slug": "retail", "name": "retail", "description": "Retail orders and revenue."}]
+        semantic_layer["cache_ttl_hours"] = DEFAULT_TTL_SECONDS // 3600
 
     context: dict[str, Any] = {
         "instance": {"name": "Agnes Eval", "subtitle": ""},
@@ -352,7 +365,7 @@ def render_workspace_prompt(*, has_models: bool) -> str:
             "count": len(METRICS) if has_models else 0,
             "categories": sorted({m.split("/")[0] for m in METRICS}) if has_models else [],
         },
-        "semantic_layer": {"has_models": has_models},
+        "semantic_layer": semantic_layer,
         "marketplaces": [],
         "user": {
             "id": "u-eval",
@@ -364,6 +377,9 @@ def render_workspace_prompt(*, has_models: bool) -> str:
         "now": "2026-01-01T00:00:00+00:00",
         "today": "2026-01-01",
         "is_sandbox": True,
+        # Referenced unconditionally (config/claude_md_template.txt:216, the
+        # icon-syntax rule), not gated on has_models — both arms need it.
+        "chat_icons": list(CHAT_INLINE_ICON_NAMES),
     }
     env = make_prompt_env()
     return env.from_string(_TEMPLATE_PATH.read_text(encoding="utf-8")).render(**context)
