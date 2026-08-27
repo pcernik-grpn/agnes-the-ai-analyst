@@ -117,6 +117,25 @@ variable "prod_instance" {
     # dev-first rollout doesn't touch prod. Brings up the apps-runner sidecar +
     # the AGNES_DATA_APPS_ENABLED env override on that VM's .env only.
     data_apps_enabled = optional(bool, false)
+    # Serve each hosted app from its OWN origin, `<slug>.<base>`, instead of
+    # `<domain>/apps/<slug>/` (app >= the origin-isolation release). The app
+    # REFUSES main-origin serving by default, so a VM with data apps enabled
+    # and this unset serves no app at all — that is the intended posture, not
+    # a regression: main-origin serving hands an app's user-authored JS the
+    # viewer's own session (docs/architecture.md#hosted-data-apps).
+    #
+    # Setting this requires BOTH, or apps stay unreachable:
+    #   - a wildcard DNS record `*.<base>` pointed at this VM, and
+    #   - TLS covering those names on the terminating proxy.
+    #
+    # SECURITY — the value widens the session cookie to the base's PARENT
+    # domain (the app's `session_cookie_domain()`), so one login also covers
+    # the app subdomains:
+    #   "apps.agnes.example.com" -> cookie Domain=.agnes.example.com  (good)
+    #   "apps.example.com"       -> cookie Domain=.example.com        (BAD —
+    #      the session cookie then rides to every unrelated host under it)
+    # Use `apps.<this VM's domain>`, never `apps.<registrable domain>`.
+    data_apps_subdomain_base = optional(string, "")
     # Opt-in embedded kai-agent turn engine on this VM (app >= the /api/kai
     # host wiring, app/api/kai.py). Per-VM (like dispatcher_enabled) so a
     # dev-first rollout doesn't touch prod. Brings up the engine + its own
@@ -156,6 +175,11 @@ variable "prod_instance" {
     # "kai-agent" requires kai_agent_enabled on the same VM (validated below):
     # pinning web chat onto an engine this VM does not run refuses every
     # session at boot.
+    # "docker" is self-contained: the startup script mints APPS_RUNNER_TOKEN +
+    # DOCKER_GID, activates the `apps` compose profile for the sidecar that
+    # creates the sandboxes, and builds the sandbox image from the app image's
+    # own build context. It does NOT turn on hosted data apps — that stays
+    # data_apps_enabled, even though both features share the sidecar.
     chat_provider = optional(string, "")
 
     # --- Vendor-neutral per-instance branding (all OPTIONAL) ---
@@ -331,6 +355,9 @@ variable "dev_instances" {
     dispatcher_enabled  = optional(bool, false)
     # Per-VM hosted data apps — see prod_instance for the rationale.
     data_apps_enabled = optional(bool, false)
+    # Per-VM app origin base — see prod_instance for the DNS/TLS prerequisites
+    # and the session-cookie widening this value drives.
+    data_apps_subdomain_base = optional(string, "")
     # Per-VM embedded kai-agent turn engine — see prod_instance for the
     # rationale. Same "must be on the type" rule as the fields above.
     kai_agent_enabled = optional(bool, false)
@@ -509,7 +536,7 @@ variable "seed_admin_password" {
 }
 
 variable "data_source" {
-  description = "Data source type — keboola | bigquery | csv."
+  description = "Data source type — keboola | bigquery | csv. First-boot seed only (D1 residual, 2026-08): the value is written into instance.yaml's `data_source.type` the FIRST time a VM in this instance boots (never on a later apply/recreate) — the admin UI (`/admin/server-config`) owns it from day 2 onward. **BREAKING** for pinned infra roots: this used to be an always-wins `.env` line (`DATA_SOURCE=...`) rewritten on EVERY boot, silently reverting any UI change; it no longer reaches `.env` at all. Also still threaded to the startup script to gate the one-time boot-side fetch of the keboola-storage-token secret."
   type        = string
   default     = "keboola"
 }
@@ -521,7 +548,19 @@ variable "keboola_stack_url" {
 }
 
 variable "image_repo" {
-  description = "Docker image repo"
+  description = <<-EOT
+    Docker image repo the instance runs (and extracts host artifacts from).
+    Threaded into /opt/agnes/.env as AGNES_IMAGE_REPO, so the compose files
+    and the recurring host scripts (agnes-auto-upgrade.sh,
+    agnes-state-applier.sh) all resolve the same repository.
+
+    Registry access: when the image lives in GCP Artifact Registry
+    (*-docker.pkg.dev) the startup script runs `gcloud auth
+    configure-docker` for that host, so the VM's own service account
+    authenticates every pull — grant it artifactregistry.reader on the
+    repository. Any other private registry needs pre-authenticated pull
+    access on the VM (not provided by this module).
+  EOT
   type        = string
   default     = "ghcr.io/keboola/agnes-the-ai-analyst"
 }
@@ -529,10 +568,10 @@ variable "image_repo" {
 variable "compose_ref" {
   # RETIRED. This never pinned anything: it was threaded to the startup script
   # as COMPOSE_REF and then never read. Compose files are extracted from the
-  # image the operator pinned with `image_tag`, and agnes-auto-upgrade.sh
-  # refreshes them from the repository's main branch on every tick — so a root
-  # setting `compose_ref = "stable-YYYY.MM.N"` believed it had pinned its
-  # compose files and had not.
+  # image the operator pinned with `image_tag` (agnes-auto-upgrade.sh
+  # refreshes them from that same image's /opt/agnes-host/ on every tick) —
+  # so a root setting `compose_ref = "stable-YYYY.MM.N"` believed it had
+  # pinned its compose files and had not.
   #
   # Kept DECLARED, like `ui_layout` above, so that belief fails loudly instead
   # of quietly: a root that still sets it gets a plan-time error naming the

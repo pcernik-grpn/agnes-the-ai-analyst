@@ -2400,14 +2400,18 @@ def register_foundation_tools(
 
         Returns ``{period, agent_slug, input_tokens, output_tokens,
         cache_read_tokens, cache_creation_tokens, total_tokens,
-        budget_limit, budget_remaining}`` — the usage-shaped fields mirror
-        Anthropic's own usage object; ``total_tokens`` excludes
-        ``cache_read_tokens`` (informational only, not counted against
-        budget), so ``budget_remaining`` lines up with when a call against
-        this agent would actually start 429ing with ``budget_exhausted``.
-        ``budget_limit``/``budget_remaining`` are ``null`` for an agent
-        with no configured budget. Mirrors
-        ``GET /api/v1/agents/{slug}/usage`` and ``agnes agent usage``.
+        budget_limit, budget_remaining, by_caller}`` — the usage-shaped
+        fields mirror Anthropic's own usage object; ``total_tokens``
+        excludes ``cache_read_tokens`` (informational only, not counted
+        against budget), so ``budget_remaining`` lines up with when a call
+        against this agent would actually start 429ing with
+        ``budget_exhausted``. ``budget_limit``/``budget_remaining`` are
+        ``null`` for an agent with no configured budget. ``by_caller`` is a
+        per-caller token breakdown for a SHARED agent run by multiple
+        users — ``null`` unless you own this agent or are an admin (a
+        grantee sees the aggregate total only, never other callers'
+        usage). Mirrors ``GET /api/v1/agents/{slug}/usage`` and ``agnes
+        agent usage``.
         """
         params: dict[str, Any] = {"period": period} if period else {}
         async with httpx.AsyncClient() as c:
@@ -2630,12 +2634,14 @@ def register_foundation_tools(
 
     @tool(read_only=False, idempotent=True)
     async def data_app_set_description(slug: str, description: str) -> dict:
-        """Set the admin description override on a managed (linked) data app.
+        """Set a data app's description — hosted or linked.
 
-        Linked apps are org resources whose ``description`` the ingest sync
-        refreshes; this pins a human-authored description the sync won't clobber.
-        Owner/Admin only; managed rows only (a 409 ``not_managed`` comes back for
-        a hosted app — edit those via the normal update flow).
+        For a linked app the ingest sync refreshes its ``description`` and this
+        pins a human-authored one the sync won't clobber. For a hosted app there
+        is no sync, so this is simply how the description changes after create
+        seeded it — worth knowing because an app's description is the one place
+        an agent can read what the app is and how to interrogate it without
+        waking its container. Owner/Admin only.
 
         Args:
             slug:        The app's slug.

@@ -7981,6 +7981,37 @@
         "title": "SampleInteraction",
         "type": "object"
       },
+      "SaveArtefactBody": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "SaveArtefactBody",
+        "type": "object"
+      },
+      "SaveArtefactResponse": {
+        "properties": {
+          "artefact_slug": {
+            "title": "Artefact Slug",
+            "type": "string"
+          },
+          "library_url": {
+            "title": "Library Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artefact_slug",
+          "library_url"
+        ],
+        "title": "SaveArtefactResponse",
+        "type": "object"
+      },
       "ScopeItem": {
         "properties": {
           "item_id": {
@@ -8269,6 +8300,55 @@
           }
         },
         "title": "ServerConfigUpdateRequest",
+        "type": "object"
+      },
+      "SessionFileEntry": {
+        "properties": {
+          "modified_at": {
+            "title": "Modified At",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "size_bytes",
+          "modified_at"
+        ],
+        "title": "SessionFileEntry",
+        "type": "object"
+      },
+      "SessionFilesResponse": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/SessionFileEntry"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "files",
+          "truncated"
+        ],
+        "title": "SessionFilesResponse",
         "type": "object"
       },
       "SetDescriptionRequest": {
@@ -13439,6 +13519,56 @@
           }
         },
         "summary": "Admin Semantic Layer Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/semantic-sources": {
+      "get": {
+        "description": "List page for registered semantic sources.",
+        "operationId": "admin_semantic_sources_page_admin_semantic_sources_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Semantic Sources Page",
         "tags": [
           "web"
         ]
@@ -27145,6 +27275,60 @@
         ]
       }
     },
+    "/api/admin/server-config/overlay": {
+      "get": {
+        "description": "Return the raw, editable-section-only instance.yaml OVERLAY.\n\nThe export projection behind ``agnes admin config export`` /\n``agnes admin config apply`` \u2014 a small, reviewable slice of the config\nan operator can commit to a PR to onboard a new client from a known-good\nbaseline (Track D3). Distinct from ``GET /server-config`` above:\n\n- This reads the overlay file directly \u2014 no merge with the static\n  config, no ``${VAR}`` resolution \u2014 so an unresolved env reference\n  round-trips as the reference, never the cleartext value it resolves\n  to at runtime.\n- Only sections that actually exist in the overlay are returned (an\n  admin who never touched a section shouldn't see it materialize in\n  their exported YAML); every returned section is still one of\n  ``_EDITABLE_SECTIONS``, so the output is always valid ``apply`` input.\n- Secret-shaped LITERAL values are omitted, not masked \u2014 an env-var\n  NAME (``token_env``, itself validated to actually look like a name\n  rather than a mis-suffixed pasted literal) or a ``${VAR}`` reference\n  passes through unchanged, but a real cleartext credential never\n  leaves the server (see ``_export_scrub``). This applies two ways:\n  (a) any section in ``_FREE_FORM_EXPORT_SECTIONS`` (``connectors``\n  today \u2014 an admin-typed dict whose key names no registry enumerates,\n  e.g. ``connectors.\"connector-slack\".SLACK_WEBHOOK_URL``) has EVERY\n  literal leaf omitted, not just secret-*named* ones, because a\n  key-name blocklist cannot police a key it has never seen; (b) a\n  value that is unambiguously credential-shaped (a PEM block, a JWT, a\n  URL with userinfo or a long opaque path segment, a long opaque\n  alphanumeric run) is omitted everywhere else too, regardless of its\n  key's name. Both apply equally to a LIST item, which has no key to\n  name-match at all \u2014 a scalar array entry gets the same free-form and\n  value-shape checks as a dict value, indexed in ``omitted_keys`` as\n  ``a.b[2]``. There is no DB config table \u2014 the overlay IS the\n  writable state POST /server-config maintains.\n- ``omitted_keys`` lists the dotted path of every leaf this endpoint\n  dropped, so the operator knows what to set via env/``${VAR}`` on the\n  target instead of silently losing it \u2014 `agnes admin config export`\n  surfaces this as a YAML comment header and a stderr note.\n\nDeliberately REST+CLI only, never MCP-exposed \u2014 see CONTRIBUTING.md's\n\"operator security-posture diagnostics\" standing exemption: a one-call\ndump of the instance's entire editable config surface (which upstream\nit points at, what auth is configured) is reconnaissance in a\nprompt-injected chat session, not an agent affordance.",
+        "operationId": "get_server_config_overlay_api_admin_server_config_overlay_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Server Config Overlay",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sessions/facets": {
       "get": {
         "operationId": "facets_api_admin_sessions_facets_get",
@@ -32451,6 +32635,220 @@
         ]
       }
     },
+    "/api/chat/sessions/{chat_id}/files": {
+      "get": {
+        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. A session\nwhose sandbox ran remotely has no local files and lists empty.",
+        "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFilesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Files",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/download": {
+      "get": {
+        "description": "Download one file from this chat session's workspace.\n\nAlways served as an attachment with ``nosniff``; HTML/SVG/XML bodies are\nadditionally pinned to ``application/octet-stream`` so a generated file\ncan never render as same-origin active content. 404 for a missing path\nand for anything resolving outside your session dir / workspace alike.",
+        "operationId": "download_session_file_api_chat_sessions__chat_id__files_download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/save-artefact": {
+      "post": {
+        "description": "Save one session-workspace file as a private single-file artefact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
+        "operationId": "save_session_file_as_artefact_api_chat_sessions__chat_id__files_save_artefact_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveArtefactBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveArtefactResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Session File As Artefact",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
     "/api/chat/sessions/{chat_id}/messages": {
       "get": {
         "operationId": "list_messages_api_chat_sessions__chat_id__messages_get",
@@ -34559,7 +34957,7 @@
         ]
       },
       "patch": {
-        "description": "Set the admin description override on a managed (sync-owned) app.\n\nLinked apps are org resources whose ``description`` is refreshed by the\ningest sync; this override lets an owner/Admin pin a human-authored\ndescription the sync won't clobber. Only ``managed`` rows accept it \u2014\nhosted apps edit their description via the normal create/update flow.",
+        "description": "Set an app's description \u2014 hosted or linked.\n\nFor a **linked** app the stored ``description`` is refreshed by the ingest\nsync, and this writes an override the sync won't clobber. For a **hosted**\napp there is no sync, so the same column simply holds its current\ndescription: ``POST /api/data-apps`` seeds one at create time and this is\nthe only way to change it afterwards. (Hosted rows were refused here with\n``409 not_managed`` until this release, which made the description\nwrite-once \u2014 a typo could only be fixed by recreating the app.)\n\nOne column serves both because every data-app reader already resolves\nthrough ``effective_description`` (``description_override or description``)\n\u2014 ``_serialize`` here, and the library/RBAC projection in\n``app/resource_types.py``. The column keeps its ``_override`` name, which\nreads oddly for a hosted app with nothing to override; renaming it is a\nmigration for no behavioural gain, and the API surface exposes\n``effective_description`` rather than either raw column.\n\nOwner or Admin only, both cases.",
         "operationId": "set_data_app_description_api_data_apps__slug__patch",
         "parameters": [
           {
@@ -49511,7 +49909,7 @@
     },
     "/api/v1/agents/{slug}/usage": {
       "get": {
-        "description": "Per-agent monthly token usage against its budget (Task 8, `agnes\nagent usage` / MCP `agent_usage`).\n\n`period` defaults to the current UTC month (`YYYY-MM`); an explicitly\npassed value that doesn't match that shape is `400\n{\"code\": \"invalid_period\"}`. Same owner/agent-PAT auth as every other\n`/api/v1/agents/{slug}/...` runtime route.\n\nThe usage-shaped fields (`input_tokens`/`output_tokens`/\n`cache_read_tokens`/`cache_creation_tokens`) mirror Anthropic's own\nusage object. `total_tokens` is `input + output + cache_creation`\n(EXCLUDING `cache_read_tokens`, which is informational only) \u2014 the\nexact quantity `app.api.broker_agent_policy.check_budget` compares\nagainst `token_budget_monthly`, so `budget_remaining` (`budget_limit -\ntotal_tokens`, floored at 0, `None` for an unbounded agent) lines up\nwith when a call against this agent would actually start 429ing with\n`budget_exhausted`.\n\nFlushes the broker's batched usage ledger first (best-effort \u2014 see\n`usage_accumulator_flush`) so a just-finished call's rows aren't\nmissing from the sum, same as the `/responses` sync path does before\nbuilding its own `usage` field.",
+        "description": "Per-agent monthly token usage against its budget (Task 8, `agnes\nagent usage` / MCP `agent_usage`), plus a per-caller breakdown for the\nagent's owner or an admin (C2.4, per-caller usage attribution).\n\n`period` defaults to the current UTC month (`YYYY-MM`); an explicitly\npassed value that doesn't match that shape is `400\n{\"code\": \"invalid_period\"}`. Auth is `require_agent_usage_principal`:\nowner-or-runnable-grantee (same chain every other\n`/api/v1/agents/{slug}/...` runtime route uses) PLUS an admin\ninspection fallback that the other routes deliberately do NOT have (see\nthat dependency's docstring).\n\nThe usage-shaped fields (`input_tokens`/`output_tokens`/\n`cache_read_tokens`/`cache_creation_tokens`) mirror Anthropic's own\nusage object. `total_tokens` is `input + output + cache_creation`\n(EXCLUDING `cache_read_tokens`, which is informational only) \u2014 the\nexact quantity `app.api.broker_agent_policy.check_budget` compares\nagainst `token_budget_monthly`, so `budget_remaining` (`budget_limit -\ntotal_tokens`, floored at 0, `None` for an unbounded agent) lines up\nwith when a call against this agent would actually start 429ing with\n`budget_exhausted`. These AGGREGATE fields are visible to anyone this\nprincipal admits (owner, runnable grantee, or admin) \u2014 they say nothing\nabout who spent the tokens, only how much the AGENT (budget's own unit)\nhas spent.\n\n`by_caller` is the new field: a list of `{caller_user_id, input_tokens,\noutput_tokens, cache_read_tokens, cache_creation_tokens, total_tokens}`\n\u2014 one entry per distinct caller who ran this agent that month\n(`caller_user_id` is `None` for a row with no recorded caller: pre-C2.4\nrows, or the DuckDB backend, which has no column to distinguish callers\nat all \u2014 see `LlmUsageRepository.usage_breakdown_by_caller_for_month`).\nPresent ONLY for the agent's owner or an admin \u2014 a plain runnable\ngrantee (shared the agent, C2.3, but not its owner) gets `by_caller:\nnull`: they may see how much the agent as a whole has spent, never a\nbreakdown that would reveal OTHER callers' usage.\n\nFlushes the broker's batched usage ledger first (best-effort \u2014 see\n`usage_accumulator_flush`) so a just-finished call's rows aren't\nmissing from the sum, same as the `/responses` sync path does before\nbuilding its own `usage` field.",
         "operationId": "get_agent_usage_api_v1_agents__slug__usage_get",
         "parameters": [
           {

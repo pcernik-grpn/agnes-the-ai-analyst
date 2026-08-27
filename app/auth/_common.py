@@ -42,8 +42,31 @@ def smtp_from_address() -> str:
     return "noreply@example.com"
 
 
-def send_smtp_email(to_email: str, subject: str, body_text: str) -> None:
-    """Deliver a plaintext mail via the configured SMTP relay; raises on failure.
+def _smtp_from_header() -> str:
+    """``From:`` header value — the instance name as display name when one is
+    configured, so recipients see "Acme Analyst" instead of a bare relay
+    address. ``formataddr`` RFC2047-encodes a non-ASCII name itself.
+
+    Lazy import for the same reason as :func:`smtp_from_address`.
+    """
+    from email.utils import formataddr
+
+    address = smtp_from_address()
+    try:
+        from app.instance_config import get_instance_name
+
+        name = get_instance_name()
+    except Exception:
+        name = ""
+    return formataddr((name, address)) if name else address
+
+
+def send_smtp_email(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None) -> None:
+    """Deliver a mail via the configured SMTP relay; raises on failure.
+
+    Plaintext by default; with ``body_html`` the message goes out as
+    ``multipart/alternative`` (plaintext part first, per RFC 2046 — clients
+    render the last part they support).
 
     SMTP is the only mail transport. Providers with an HTTP API (SendGrid,
     Mailgun, …) are used through their SMTP relay (e.g.
@@ -52,14 +75,17 @@ def send_smtp_email(to_email: str, subject: str, body_text: str) -> None:
     path always died on import — while the endpoint still answered success.
     """
     import smtplib
-    from email.mime.text import MIMEText
+    from email.message import EmailMessage
 
     smtp_host = os.environ.get("SMTP_HOST")
     if not smtp_host:
         raise RuntimeError("SMTP_HOST is not configured")
-    msg = MIMEText(body_text)
+    msg = EmailMessage()
+    msg.set_content(body_text)
+    if body_html is not None:
+        msg.add_alternative(body_html, subtype="html")
     msg["Subject"] = subject
-    msg["From"] = smtp_from_address()
+    msg["From"] = _smtp_from_header()
     msg["To"] = to_email
     with smtplib.SMTP(smtp_host, int(os.environ.get("SMTP_PORT", "587"))) as s:
         if os.environ.get("SMTP_USE_TLS", "true").lower() == "true":
@@ -93,7 +119,62 @@ def safe_next_path(candidate: Optional[str], default: Optional[str] = None) -> s
     if not candidate or not isinstance(candidate, str):
         return default
     if not candidate.startswith("/"):
-        return default
+        # One exception to "same-origin absolute path only": this deployment's
+        # OWN data-app origins. Signing in from an app subdomain has to bounce
+        # to the main host (a relative `/login` there loops — see
+        # `app/data_apps_subdomain.py`), so returning the caller to the app
+        # afterwards needs a cross-host `next`.
+        return candidate if _is_own_data_app_origin(candidate) else default
     if candidate.startswith("//"):
         return default
     return candidate
+
+
+def _is_own_data_app_origin(candidate: str) -> bool:
+    """Is ``candidate`` an absolute URL on one of THIS deployment's app origins?
+
+    True only for ``<single-label>.<data_apps.subdomain_base>`` over http(s),
+    and only while data apps are enabled AND a base is configured — so a
+    deployment that never turned the feature on keeps the old behaviour exactly.
+
+    Deliberately strict about the shapes that merely *look* like an app origin:
+    a bare ``@`` anywhere in the netloc is refused outright (``https://
+    evil.com@s.apps.example.com/`` reaches the right host but renders as the
+    wrong one, and ``https://s.apps.example.com@evil.test/`` reaches the wrong
+    host entirely), backslashes are refused because browsers normalize them to
+    slashes while ``urlsplit`` does not, and the label check mirrors
+    ``DataAppSubdomainMiddleware``'s ``"." not in slug`` — a name this
+    deployment cannot route is not a name it should redirect to.
+
+    Not verified: that the slug is a REAL app. That would put a database lookup
+    inside a helper every login calls, to close a gap that is not a general open
+    redirect — the worst case is that someone who can already create an app
+    makes their own app the landing page, on our own infrastructure, behind the
+    same RBAC as any other app.
+    """
+    if "\\" in candidate:
+        return False
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or "@" in parts.netloc:
+        return False
+
+    from app.instance_config import get_data_apps_config
+
+    cfg = get_data_apps_config()
+    if not cfg.get("enabled"):
+        return False
+    base = (cfg.get("subdomain_base") or "").strip().strip(".").lower()
+    if not base:
+        return False
+
+    host = (parts.hostname or "").rstrip(".").lower()
+    suffix = "." + base
+    if not host.endswith(suffix):
+        return False
+    slug = host[: -len(suffix)]
+    return bool(slug) and "." not in slug

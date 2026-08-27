@@ -648,6 +648,18 @@ _EXEMPT: dict[str, str] = {
         "join its cohort rather than stay exempt"
     ),
     "/api/auth/keboola/projects": _KEBOOLA_LOGIN_PROJECTS_REASON,
+    "/api/admin/server-config/overlay": (
+        "raw editable-section-only instance.yaml overlay — the export "
+        "projection behind `agnes admin config export`/`apply` (Track D3), "
+        "CLI-reachable via both subcommands but deliberately never "
+        "MCP-exposed per the 'operator security-posture diagnostics' "
+        "standing exemption in CONTRIBUTING.md: a one-call dump of the "
+        "instance's entire editable config surface (which upstream it "
+        "points at, what auth is configured) is reconnaissance in a "
+        "prompt-injected chat session, not an agent affordance. Mirrors "
+        "the existing grandfathered GET/POST /api/admin/server-config, "
+        "which the same reasoning already covers"
+    ),
     "/api/admin/doctor/new-instance": (
         "deployment-gate doctor (post-deploy smoke checks) — CLI-reachable via "
         "`agnes admin doctor --new-instance` and called by "
@@ -1027,6 +1039,28 @@ _EXEMPT: dict[str, str] = {
     "/api/chat/sessions/{chat_id}/permanent": (
         "web chats-page affordance — permanently deletes one of the caller's "
         "own conversations and its messages; no analyst CLI/MCP analogue"
+    ),
+    # Session-workspace file delivery (#1611) — the browser's way to reach
+    # deliverables a chat agent rendered into its session workspace (list /
+    # download / save a copy to the Library). Self-scoped to the caller's own
+    # session (404, never 403). No analyst CLI/MCP analogue: the CLI runs IN
+    # the workspace, so its files are already local, and MCP agents write
+    # files rather than fetch them back.
+    "/api/chat/sessions/{chat_id}/files": (
+        "web chat affordance — lists files in the caller's own session "
+        "workspace so the browser can offer downloads; CLI sessions already "
+        "have the files locally, no MCP analogue"
+    ),
+    "/api/chat/sessions/{chat_id}/files/download": (
+        "web chat affordance — streams one session-workspace file to the "
+        "browser as an attachment; CLI sessions already have the files "
+        "locally, no MCP analogue"
+    ),
+    "/api/chat/sessions/{chat_id}/files/save-artefact": (
+        "web chat affordance — saves one session-workspace file as the "
+        "caller's private Library artefact (same bridge the chat composer "
+        "upload uses); CLI sessions already have the files locally, no MCP "
+        "analogue"
     ),
     # Keboola glossary import (2026-07-17 design). `/api/glossary/search`
     # carries the triple-surface contract in _COHORT; list and get-by-id are

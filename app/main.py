@@ -492,6 +492,7 @@ from app.api.data_apps_proxy import router as data_apps_proxy_router
 from app.web.router import router as web_router
 from app.web.router import apps_web_router as data_apps_web_router
 from app.api.chat import router as chat_router
+from app.api.chat_session_files import router as chat_session_files_router
 from app.api.chat_uploads import router as chat_uploads_router
 from app.api.chat_copresence import router as chat_copresence_router
 from app.api.slack import router as slack_router
@@ -2894,6 +2895,7 @@ def create_app() -> FastAPI:
     app.include_router(marketplace_server_router)
     app.include_router(chat_router)
     app.include_router(chat_uploads_router)
+    app.include_router(chat_session_files_router)
     app.include_router(chat_copresence_router)
     app.include_router(slack_router)
     app.include_router(admin_chat_router)
@@ -3157,6 +3159,25 @@ def create_app() -> FastAPI:
             },
         )
 
+    def _main_host_base_url(request) -> str:
+        """Absolute ``scheme://host`` of the MAIN Agnes origin, for redirecting
+        a caller off a data-app subdomain.
+
+        ``SERVER_URL`` is what the customer-instance module actually writes;
+        ``get_public_url()`` covers the ``PUBLIC_URL`` / ``server.public_url``
+        configurations. When neither is set, fall back to the parent domain the
+        session cookie is scoped to — not a guess: the cookie is scoped there
+        precisely so a login on the main host is valid on the app subdomains,
+        which only holds when the main host sits under that parent.
+        """
+        from app.instance_config import get_public_url, session_cookie_domain
+
+        url = get_public_url() or (os.environ.get("SERVER_URL") or "").strip().rstrip("/")
+        if url:
+            return url
+        parent = (session_cookie_domain() or "").lstrip(".")
+        return f"{request.url.scheme}://{parent}" if parent else ""
+
     @app.exception_handler(StarletteHTTPException)
     async def _html_auth_redirect_handler(request, exc: StarletteHTTPException):
         """Browser-friendly error rendering for HTML routes; JSON for API routes.
@@ -3173,6 +3194,31 @@ def create_app() -> FastAPI:
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
 
         if exc.status_code == 401 and request.method == "GET" and not path_is_api:
+            # A request that arrived on a data-app subdomain cannot be sent to a
+            # RELATIVE `/login`: `DataAppSubdomainMiddleware` rewrites EVERY path
+            # on `<slug>.<base>` to `/apps/<slug>/…` with no carve-out, so the
+            # browser would resolve `/login` against the app's own host, land back
+            # on the proxy as `/apps/<slug>/login`, 401 again — an infinite
+            # redirect loop for anyone not already signed in. Send them to the
+            # main host, whose login sets a cookie scoped to cover both.
+            #
+            # The return URL rides along in `next`. That is only safe because
+            # `safe_next_path` (`app/auth/_common.py`) was taught, in this same
+            # change and deliberately as its own reviewed edit to that guard,
+            # to accept exactly one cross-host shape: an absolute http(s) URL on
+            # THIS deployment's own `<slug>.<data_apps.subdomain_base>`. Every
+            # other cross-host target is still discarded at the far end.
+            if request.scope.get("agnes_data_app_subdomain"):
+                main_host = _main_host_base_url(request)
+                if main_host:
+                    # Absolute return URL in the VISITOR's terms — the app
+                    # origin plus the path they actually asked for, not the
+                    # `/apps/<slug>/…` form the middleware rewrote it into.
+                    # `safe_next_path` accepts exactly this shape (see
+                    # `app/auth/_common.py`); anything else login discards.
+                    original = request.scope.get("agnes_data_app_original_path") or "/"
+                    back = quote(str(request.url.replace(path=original)), safe="")
+                    return RedirectResponse(url=f"{main_host}/login?next={back}", status_code=302)
             next_param = quote(request.url.path, safe="")
             return RedirectResponse(url=f"/login?next={next_param}", status_code=302)
 

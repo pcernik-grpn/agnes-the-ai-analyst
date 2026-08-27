@@ -398,6 +398,13 @@ services:
       # was the one that broke. Compose's `:-` treats empty and unset alike, so
       # both spellings now land on the inert loopback address.
       - DOMAIN_ALIAS=${DOMAIN_ALIAS:-127.0.0.1:8081}
+      # Base for hosted data-app origins, `<slug>.<base>` (Caddyfile.apps-subdomain,
+      # appended at boot when it is set). Same `:-` treatment as DOMAIN_ALIAS above
+      # and for the same reason: an empty-but-set value would render the site
+      # address `*.` and take Caddy — including the PRIMARY site — down at config
+      # parse. `apps.invalid` is inert: `.invalid` is reserved by RFC 2606 and
+      # never resolves, so the vhost exists but nothing can reach it.
+      - APPS_SUBDOMAIN_BASE=${APPS_SUBDOMAIN_BASE:-apps.invalid}
     depends_on:
       app:
         condition: service_healthy
