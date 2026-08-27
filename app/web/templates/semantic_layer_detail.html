@@ -77,8 +77,8 @@
     {% if status == 'invalid' %}
     <span class="badge badge--danger">Invalid</span>
     {% endif %}
-    {% if dialect_skipped_count %}
-    <span class="badge badge--warn">{{ dialect_skipped_count }} metric{{ 's' if dialect_skipped_count != 1 else '' }} skipped (unsupported dialect)</span>
+    {% if warehouse_only_metric_count %}
+    <span class="badge badge--warn">{{ warehouse_only_metric_count }} metric{{ 's' if warehouse_only_metric_count != 1 else '' }} run server-side only (warehouse dialect)</span>
     {% endif %}
 </div>
 {{ ds.tabs(items=tabs, aria_label='Semantic model object types') }}
