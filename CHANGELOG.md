@@ -91,6 +91,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Removed
 
+- Removed the unused OpenMetadata catalog export (`src/catalog_export.py`,
+  `connectors/openmetadata/`) and its `openmetadata:` config section —
+  zero non-test runtime callers, orphaned since the metrics/tables YAML
+  pipeline moved to `docs/metrics/*.yaml` + `agnes admin metrics import`.
+  A `POST /api/admin/server-config` with an `openmetadata:` section is now
+  rejected with 400, same as any other unknown section.
+
 ### Internal
 
 ## [0.90.0] - 2026-08-27
