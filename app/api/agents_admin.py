@@ -304,6 +304,7 @@ def _load_agent(
     conn: Optional[duckdb.DuckDBPyConnection],
     *,
     require_owner: bool,
+    allow_grantee: bool = True,
 ) -> Dict[str, Any]:
     """Fetch `agent_id`, enforcing the ownership/admin/grantee auth matrix.
 
@@ -317,6 +318,14 @@ def _load_agent(
     only READ:
     `require_owner=True` 404s a grantee exactly like any other non-owner,
     non-admin caller — a share conveys *use*, never *manage*.
+
+    `allow_grantee` (default True) narrows the READ path further: some
+    read-only routes carry data that a share must NOT convey even though a
+    grantee may otherwise run/inspect the agent — the private memory
+    notebook (`GET /{agent_id}/memories`) is owner-or-admin only, so it
+    passes `require_owner=False, allow_grantee=False`: admin god-mode still
+    reads (unaffected by this flag), a grantee 404s exactly like
+    `require_owner=True` would, existence never leaked.
     """
     row = agents_repo().get_by_id(agent_id)
     if not row or row.get("deleted_at") is not None:
@@ -329,7 +338,7 @@ def _load_agent(
         else:
             from app.api.agents_builder_shared import _granted_agent_ids
 
-            if require_owner or agent_id not in _granted_agent_ids(user["id"]):
+            if require_owner or not allow_grantee or agent_id not in _granted_agent_ids(user["id"]):
                 raise _err(404, "agent_not_found", "Agent not found")
     return row
 
@@ -936,8 +945,14 @@ async def list_agent_memories(
     user: dict = Depends(require_session_or_user_pat()),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    # Read-only — admins may inspect (require_owner=False), mirrors get_agent.
-    _load_agent(agent_id, user, conn, require_owner=False)
+    # Owner/admin only — UNLIKE get_agent, a READ-only grantee (C2.3, a
+    # ResourceType.AGENT grant) does NOT pass here. The memory notebook is
+    # the agent's PRIVATE notebook (CLAUDE.md: "owners inspect/approve/
+    # archive/delete"); a share conveys run+read-the-agent, never read the
+    # owner's private notes. allow_grantee=False 404s a grantee exactly like
+    # the mutation routes below (existence-hiding); require_owner stays
+    # False so admin god-mode can still inspect, same as get_agent.
+    _load_agent(agent_id, user, conn, require_owner=False, allow_grantee=False)
     rows = agent_memories_repo().list_for_agent(agent_id, status=status)
     in_budget_ids = _in_budget_ids(agent_id)
     return {

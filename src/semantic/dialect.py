@@ -30,30 +30,65 @@ def resolve_expression(expression: dict) -> Tuple[Optional[str], Optional[str]]:
     return None, f"only warehouse-specific dialects offered ({offered}); no DUCKDB or ANSI_SQL"
 
 
-# The `resolve_expression` reason prefix that marks a metric which DID
-# declare an expression, just not in a dialect this instance can run —
-# distinct from "no expression in any usable dialect" (an incomplete
-# document, a different problem). Matched by `count_dialect_skipped_metrics`
-# below.
-_UNSUPPORTED_DIALECT_PREFIX = "only warehouse-specific dialects offered"
+def resolve_expression_any(expression: dict) -> Tuple[Optional[str], Optional[str], bool]:
+    """Resolve one metric expression the way :func:`resolve_expression` does,
+    but instead of reporting a warehouse-only expression as unusable, fall
+    back to it — so a caller (the projector) can still store the raw SQL
+    rather than dropping the metric.
+
+    Returns ``(sql, dialect, locally_runnable)``:
+
+    - a local dialect (DUCKDB, then ANSI_SQL) is offered: its SQL, its name,
+      ``True`` — identical precedence and value to :func:`resolve_expression`.
+    - only warehouse-specific dialect(s) offered: the first one declared (by
+      document order — not alphabetical, not arbitrary dict order), its name,
+      ``False``. The raw expression is warehouse-flavour SQL, not something
+      this instance can run locally; the caller is responsible for saying so.
+    - no expression in any dialect: ``(None, None, False)``.
+    """
+    dialects = (expression or {}).get("dialects") or []
+    by_name = {
+        d.get("dialect"): d.get("expression")
+        for d in dialects
+        if d.get("expression") and isinstance(d.get("dialect"), str)
+    }
+
+    for name in _PREFERRED:
+        if by_name.get(name):
+            return by_name[name], name, True
+
+    for d in dialects:
+        name = d.get("dialect")
+        sql = d.get("expression")
+        if sql and isinstance(name, str):
+            return sql, name, False
+
+    return None, None, False
 
 
-def count_dialect_skipped_metrics(metrics: list) -> int:
-    """How many of ``metrics`` were (or would be) silently dropped at
-    projection because every dialect they declare is warehouse-specific —
-    the same check ``src/semantic/projection.py`` runs per metric via
-    :func:`resolve_expression`.
+def count_warehouse_only_metrics(metrics: list) -> int:
+    """How many of ``metrics`` project into ``metric_definitions``
+    (``src/semantic/projection.py::project_document``, via
+    :func:`resolve_expression_any`) with only a warehouse-specific dialect
+    (SNOWFLAKE, DATABRICKS, ...) rather than DUCKDB/ANSI_SQL.
+
+    These metrics DO appear in the metrics catalog — they are not skipped —
+    they just cannot run through a local DuckDB query and need server-side
+    (remote/materialized) execution instead, per the ``notes`` entry
+    ``project_document`` stamps on their row. Renamed from the earlier
+    ``count_dialect_skipped_metrics``: before the projector learned to
+    project a warehouse-only expression (rather than drop it), this count
+    genuinely meant "silently missing from the catalog"; it no longer does.
 
     A metric with no expression at all is a different, pre-existing problem
-    (an incomplete document) and is deliberately not counted — this counts
-    only the "had SQL, none of it runnable here" case the dialect skip is
-    about.
+    (an incomplete document, still a genuine skip — see
+    ``ProjectionReport.skipped``) and is deliberately not counted here.
     """
     count = 0
     for metric in metrics or []:
         if not isinstance(metric, dict):
             continue
-        sql, reason = resolve_expression(metric.get("expression") or {})
-        if sql is None and isinstance(reason, str) and reason.startswith(_UNSUPPORTED_DIALECT_PREFIX):
+        sql, _dialect, locally_runnable = resolve_expression_any(metric.get("expression") or {})
+        if sql is not None and not locally_runnable:
             count += 1
     return count
