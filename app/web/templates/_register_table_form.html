@@ -141,7 +141,18 @@
           <div id="rtfKbWhereFiltersBuilder" class="where-filters-builder"></div>
           <p class="ds-drawer__hint">
             Server-side row filter run by the Keboola Storage API export. Leave empty for a
-            full-table export. <a href="#" id="rtfKbFilterRawToggle">Edit raw JSON</a>
+            full-table export. Operators: <code>eq, ne, gt, ge, lt, le</code>.
+            Date placeholders resolved at sync time:
+            <code>{{ '{{today}}' }}</code>,
+            <code>{{ '{{last_week}}' }}</code>,
+            <code>{{ '{{last_month}}' }}</code>,
+            <code>{{ '{{last_2_months}}' }}</code>,
+            <code>{{ '{{last_3_months}}' }}</code>,
+            <code>{{ '{{last_6_months}}' }}</code>,
+            <code>{{ '{{last_year}}' }}</code>,
+            <code>{{ '{{last_2_years}}' }}</code>,
+            <code>{{ '{{start_of_3_months_ago}}' }}</code>.
+            <a href="#" id="rtfKbFilterRawToggle">Edit raw JSON</a>
           </p>
           <textarea id="rtfKbWhereFilters" class="wfb-raw" rows="6" style="display:none;"
                     placeholder='[{"column": "date", "operator": "ge", "values": ["{{ '{{last_3_months}}' }}"]}]'></textarea>
