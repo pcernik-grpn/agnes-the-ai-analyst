@@ -2240,6 +2240,10 @@ KNOWN_UNTESTED = {
     # Admin semantic-layer sources page (multi-project sync) — tested in
     # tests/test_admin_semantic_layer_page.py.
     "GET /admin/semantic-layer",
+    # Admin semantic-sources page — shell over the existing
+    # /api/admin/semantic-sources* REST API; tested in
+    # tests/test_admin_semantic_sources_page.py (render + admin-gate).
+    "GET /admin/semantic-sources",
     # Guided linked-apps admin wizard (v0.77.28) — tested in
     # tests/test_web_data_apps.py (render + admin-gate).
     "GET /admin/linked-apps",
