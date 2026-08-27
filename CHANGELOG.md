@@ -34,6 +34,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   apply unchanged — after filtering out any non-editable section or literal
   secret client-side. Supports `--dry-run` (diff against the current
   overlay, writes nothing).
+- **The chat agent now knows the web UI.** A new bundled workspace-template
+  skill, `agnes-web-guide`, gives every chat sandbox a page-by-page map of
+  the product — the rail, every user-facing page, the admin area, and a
+  "common questions → destinations" table — so when a user asks "where do I
+  ...?" the agent directs them to the same pages they actually see, instead
+  of denying a surface exists or inventing one. Kept honest by a new guard
+  (`tests/test_web_guide_skill_sync.py`): every user-facing route and every
+  admin-nav destination must be mentioned in the guide, and the guide may
+  only mention live paths — so adding, renaming, or retiring a page without
+  updating the guide fails CI in both directions.
+
 - **`chat_provider = "docker"` now provisions its own backing** in the
   `customer-instance` Terraform module, instead of only pinning the choice.
   Web chat's docker provider spawns each session through the apps-runner
