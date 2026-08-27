@@ -306,14 +306,20 @@ APPS_SUBDOMAIN_BASE="$(_env_get APPS_SUBDOMAIN_BASE)"
 # it here too, so a VM whose last boot predates the fragment picks it up within
 # a tick instead of waiting for a reboot (the block below warns and no-ops
 # while it is absent, leaving the pristine Caddyfile untouched).
-if [ -n "$APPS_SUBDOMAIN_BASE" ]; then
-  if curl -fsSL "$RAW_BASE/deploy/caddy/Caddyfile.apps-subdomain" \
-     -o "$APP_DIR/Caddyfile.apps-subdomain.new" 2>/dev/null; then
-    mv -f "$APP_DIR/Caddyfile.apps-subdomain.new" "$APP_DIR/Caddyfile.apps-subdomain"
-  else
-    rm -f "$APP_DIR/Caddyfile.apps-subdomain.new"
-    logger -t agnes-auto-upgrade "WARN: failed to fetch Caddyfile.apps-subdomain from $RAW_BASE — keeping existing"
-  fi
+#
+# Same source as every other host artifact above: /opt/agnes-host/ inside the
+# PINNED image (the Dockerfile copies deploy/caddy/Caddyfile.apps-subdomain to
+# the top level of that tree, which is why the extract path has no directory
+# component). It is deliberately NOT in CONFIG_FILES — only a VM with a
+# subdomain base has any use for it, and its content reaches the drift hash
+# anyway through the Caddyfile the wiring block below rewrites.
+#
+# Guarded on EXTRACT_CID exactly like the CONFIG_FILES loop: no extract
+# container means the tick already WARNed once at creation time and every
+# artifact keeps its existing on-disk copy.
+if [ -n "$APPS_SUBDOMAIN_BASE" ] && [ -n "$EXTRACT_CID" ]; then
+  extract_host_artifact Caddyfile.apps-subdomain "$APP_DIR/Caddyfile.apps-subdomain" \
+    || logger -t agnes-auto-upgrade "WARN: failed to extract Caddyfile.apps-subdomain from $IMAGE — keeping existing"
 fi
 # --- apps-subdomain-caddy begin (extracted + executed by tests/test_caddyfile_apps_subdomain_docker.py) ---
 # Data-app subdomains: Caddy vhost + per-app certificates

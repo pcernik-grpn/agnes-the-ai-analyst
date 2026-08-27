@@ -301,15 +301,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **VM auto-upgrade refreshes host artifacts from the release image, not
   the repo's raw `main` branch.** The 5-minute tick
   (`scripts/ops/agnes-auto-upgrade.sh`) now extracts the bind-mounted
-  config files (compose overlays, Caddyfile, maintenance page, the
-  compose-file resolver) and its own self-update from `/opt/agnes-host/`
-  inside the pinned image — the same artifact contract the boot startup
-  script already uses — instead of curling the public
-  `raw.githubusercontent.com/.../main` URLs. Host config now stays in
-  lockstep with the image tag the VM actually runs (a config change rides
-  the release that ships it, instead of racing ahead of — or outliving —
-  the image), and the tick keeps working when the source repository is
-  private or the host's egress is restricted to the container registry.
+  config files (compose overlays, Caddyfile, the data-app subdomain vhost
+  fragment, maintenance page, the compose-file resolver) and its own
+  self-update from `/opt/agnes-host/` inside the pinned image — the same
+  artifact contract the boot startup script already uses — instead of
+  curling the public `raw.githubusercontent.com/.../main` URLs. Every
+  artifact, without exception: the vhost fragment's refresh was the last
+  raw-`main` fetch, and leaving it behind would have been worse than
+  cosmetic — its `$RAW_BASE` base URL no longer had a definition, so under
+  `set -euo pipefail` the expansion aborted the whole tick on any VM with
+  `APPS_SUBDOMAIN_BASE` set, stopping auto-upgrade there for good (the
+  self-update that would have shipped the repair never ran). Host config
+  now stays in lockstep with the image tag the VM actually runs (a config
+  change rides the release that ships it, instead of racing ahead of — or
+  outliving — the image), and the tick keeps working when the source
+  repository is private or the host's egress is restricted to the
+  container registry.
   Failure posture is unchanged: a failed pull/extract keeps the existing
   file and WARNs to syslog. Rollout note: a VM still running the previous
   curl-based script picks this up on its next reboot/recreate (the boot
@@ -606,18 +613,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   only lines removed are the three duplicate group headings. No behavior
   change.
 
-- **`agent_scope.granted_by` (remediation-program Track C2.1) is the first
-  genuine schema change on an existing DuckDB↔Postgres pair under the A3
-  PG-first ratchet — Postgres-only, per `docs/migrations.md` → "A genuine
-  schema change on an existing pair's table … follows 'Adding a PG-only
-  feature'".** No DuckDB `_vN_to_v(N+1)` step, no `SCHEMA_VERSION` bump; the
-  DuckDB side of `AgentsRepository`/`AgentsPgRepository` (`set_scope`) keeps
-  an identical call shape (accepts the same `granted_by` keyword) but has no
-  column to persist it into. `migrations/versions/
-  0073_agent_scope_granted_by.py` backfills every pre-existing row to its
-  agent's `owner_user_id`.
-
-
 - **`llm_usage.caller_user_id` (remediation-program Track C2.4) is the
   second genuine schema change on an existing DuckDB↔Postgres pair under
   the A3 PG-first ratchet — Postgres-only, per `docs/migrations.md` →
@@ -633,30 +628,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `granted_by`'s owner backfill (every pre-C2.1 write path was
   ownership-gated; no equivalent fact exists for who was driving a past
   turn).
-- **The shared-Postgres test fixture now has a regression test, and the per-worker database name is checked before it reaches `CREATE DATABASE`.** `_start_pgserver` turning N xdist workers into one postmaster is what took a local `-n auto` run from 11 postmasters (91-100 postgres processes, load average 22 on an 11-core box) down to one — but nothing asserted the two properties that make the sharing *safe* rather than merely cheap: that a worker leaving does not stop the server its siblings are still using, and that the last worker out does stop it. `test_shared_pgserver_serves_every_worker_from_one_postmaster` drives both. Its second worker has to be a real subprocess: pgserver refcounts holders by PID in `<pgdata>/.handle_pids.json`, and `get_server` hands back the same object from `_instances` for a repeated path within one interpreter, so two in-process handles would be a single holder and the first close would stop the server — modelling the fan-out backwards and passing for the wrong reason. Verified by mutation (restoring the per-worker data dir fails the test). Separately, `worker_id` is now resolved through `_worker_database_name`, which rejects anything that is not `master`/`gw<N>`: xdist owns the value so this is not an untrusted-input path, but `CREATE DATABASE` accepts no bind parameters, and the guard is what lets a reader see the f-string is safe instead of having to go and verify where the id came from.
 
-- **PG-first development rule (remediation-program Track A3): the DuckDB
-  app-state backend is frozen.** No user-visible change. Development-rule
-  change only: `CLAUDE.md` → "Dual-backend discipline" now requires new
-  app-state repositories/schema changes to be Postgres-only (a
-  `src/repositories/<name>_pg.py` module registered `PG`-only in the
-  `_REGISTRY` factory table, an Alembic-only migration) — no new
-  `src/repositories/<name>.py` DuckDB module, no new `_REGISTRY` entry with a
-  DuckDB backend, no new `src/db.py` `_vN_to_v(N+1)` step. Existing
-  DuckDB↔Postgres pairs stay maintained until a later cleanup deletes them.
-  Resolving a Postgres-only repository on an instance still running the
-  frozen DuckDB app-state backend now raises a typed
-  `src.repositories.RequiresPostgresBackend`, translated by an app-wide
-  handler into a clean `501` instead of an unhandled `500`. New ratchets:
-  `tests/test_repository_registry_pg_first_ratchet.py`,
-  `tests/db_pg/test_repo_module_pg_first_ratchet.py`,
-  `tests/test_db_schema_version_frozen.py` (pins `SCHEMA_VERSION` at
-  `src/db.py::FROZEN_DUCKDB_SCHEMA_VERSION`); the dynamic status-parity
-  sweeps (`tests/db_pg/_parity_sweep_util.py`) gain a documented
-  `_PG_ONLY_ROUTE_EXEMPTIONS` mechanism. `docs/migrations.md` gains the
-  "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
-  agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
-  dev-kit agents are updated to match.
 - **The CHANGELOG integrity guard now rejects a duplicated *bullet* under
   `[Unreleased]`, not just a duplicated group heading.** The guard's fourth
   check catches `### Added` … `### Added`, and the tempting repair for that is

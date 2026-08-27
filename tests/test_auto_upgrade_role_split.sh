@@ -41,6 +41,18 @@
 #   J. Extract container cannot be created (image not pullable, not in
 #      the local store) — the tick degrades to WARN-and-keep-existing:
 #      no file touched, no recreate, exit 0, still no network fetch.
+#   K. APPS_SUBDOMAIN_BASE is set (data-app subdomains configured). The
+#      Caddyfile.apps-subdomain vhost fragment must ALSO come out of the
+#      pinned image, and the whole tick must survive `set -u`: an earlier
+#      revision left a `$RAW_BASE` reference behind in this block after
+#      the variable's definition was deleted, so on exactly these VMs the
+#      tick aborted before the recreate AND before the self-update —
+#      auto-upgrade stopped dead, unrecoverably (the self-update is what
+#      would have shipped the fix).
+#   L. APPS_SUBDOMAIN_BASE is set but no extract container is available —
+#      the fragment refresh must degrade like every other artifact
+#      (WARN, keep the existing copy, still wire the Caddyfile from it),
+#      never abort the tick and never fall back to a network fetch.
 #
 # Run with: bash tests/test_auto_upgrade_role_split.sh
 set -euo pipefail
@@ -280,13 +292,17 @@ make_sandboxed_script() {
 }
 
 write_env() {
-    # Args: opt_agnes_dir, scheduler_token ("" to omit the key entirely)
-    local dir=$1 token=$2
+    # Args: opt_agnes_dir, scheduler_token ("" to omit the key entirely),
+    #       apps_subdomain_base ("" / omitted to omit the key entirely)
+    local dir=$1 token=$2 apps_base=${3:-}
     {
         echo "AGNES_TAG=test-tag"
         echo "COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml:docker-compose.host-mount.yml"
         if [ -n "$token" ]; then
             echo "SCHEDULER_API_TOKEN=$token"
+        fi
+        if [ -n "$apps_base" ]; then
+            echo "APPS_SUBDOMAIN_BASE=$apps_base"
         fi
     } > "$dir/.env"
 }
@@ -649,6 +665,103 @@ grep -qF "docker compose up -d" "$transcript" \
 grep -q "raw.githubusercontent.com" "$transcript" \
     && fail "J: extraction failure must NOT fall back to a network fetch of the source repo"
 echo "OK: J — no extract container degrades to WARN-and-keep-existing, no recreate, no network fetch"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario K: APPS_SUBDOMAIN_BASE configured. Two things must hold, and
+# the first is why this scenario exists at all:
+#
+#   1. The tick must COMPLETE. Every scenario above leaves
+#      APPS_SUBDOMAIN_BASE unset, so the data-app-subdomain block is
+#      skipped entirely and a bug inside it is invisible. A revision of
+#      this script deleted the RAW_BASE definition but left `$RAW_BASE`
+#      referenced in that block; under `set -u` the expansion aborted the
+#      tick — on every VM with a subdomain base — before the recreate and
+#      before the self-update, which is the one mechanism that could have
+#      delivered a fix. Asserting exit 0 with the base set is the guard.
+#   2. The vhost fragment must come from the pinned image's
+#      /opt/agnes-host/, exactly like every other host artifact — not
+#      from an unauthenticated fetch of the source repo's main branch,
+#      which is the pin this whole change exists to restore.
+# =====================================================================
+run_scenario K
+write_env "$tmp/opt/agnes" "test-scheduler-token" "apps.example.com"
+
+host_artifacts=$tmp/host-artifacts
+mkdir -p "$host_artifacts/scripts/ops" "$host_artifacts/static"
+printf '# compose fresh-from-image\n' > "$host_artifacts/docker-compose.yml"
+printf '# caddyfile fresh-from-image\n' > "$host_artifacts/Caddyfile"
+printf '# apps-subdomain fragment fresh-from-image\n' > "$host_artifacts/Caddyfile.apps-subdomain"
+cp "$(dirname "$script")/agnes-compose-file.sh" "$host_artifacts/scripts/ops/agnes-compose-file.sh"
+printf '#!/bin/bash\n# self-update fresh-from-image\n' > "$host_artifacts/agnes-auto-upgrade.sh"
+
+# A stale fragment on disk — the extraction must overwrite it.
+printf '# apps-subdomain fragment stale-on-disk\n' > "$tmp/opt/agnes/Caddyfile.apps-subdomain"
+
+rc=0
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    READYZ_STATE_DIR="$readyz_state_dir" \
+    FAKE_TOPOLOGY=single \
+    FAKE_TAG_ID=sha256:sameimage000 \
+    FAKE_RUNNING_IMAGE_ID=sha256:sameimage000 \
+    FAKE_EXTRACT_CID=extractcid123 \
+    FAKE_HOST_ARTIFACTS_DIR="$host_artifacts" \
+    WEBHOOK_URL="" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" || rc=$?
+[ "$rc" -eq 0 ] || fail "K: a tick with APPS_SUBDOMAIN_BASE set must complete (got $rc) — an unbound variable under 'set -u' aborts before the recreate AND the self-update"
+
+grep -qF "agnes-host/Caddyfile.apps-subdomain" "$transcript" \
+    || fail "K: the vhost fragment must be extracted from the image's /opt/agnes-host/"
+grep -qF "# apps-subdomain fragment fresh-from-image" "$tmp/opt/agnes/Caddyfile.apps-subdomain" \
+    || fail "K: the on-disk fragment must be replaced by the one shipped in the pinned image"
+grep -qF "curl -fsSL" "$transcript" \
+    && fail "K: the fragment must not be fetched over the network — no raw-main fetch may survive"
+grep -q "raw.githubusercontent.com" "$transcript" \
+    && fail "K: no fetch of the source repo's main branch may remain"
+grep -qF "on_demand_tls" "$tmp/opt/agnes/Caddyfile" \
+    || fail "K: the on-demand-TLS global options block must be prepended to the Caddyfile"
+grep -qF "# apps-subdomain fragment fresh-from-image" "$tmp/opt/agnes/Caddyfile" \
+    || fail "K: the image's fragment must be the one appended to the Caddyfile"
+grep -qF "# self-update fresh-from-image" "$tmp/usr-local-bin/agnes-auto-upgrade.sh" \
+    || fail "K: the self-update must still run on a VM with a data-app subdomain base"
+echo "OK: K — APPS_SUBDOMAIN_BASE set: tick completes, fragment comes from the image, Caddyfile wired, self-update runs"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario L: APPS_SUBDOMAIN_BASE set, but no extract container (the
+# scenario-J failure mode). The fragment refresh must degrade exactly
+# like every other host artifact — WARN, keep the existing copy, still
+# wire the Caddyfile from it — rather than aborting the tick or reaching
+# for the network.
+# =====================================================================
+run_scenario L
+write_env "$tmp/opt/agnes" "test-scheduler-token" "apps.example.com"
+printf '# caddyfile pre-existing\n' > "$tmp/opt/agnes/Caddyfile"
+printf '# apps-subdomain fragment pre-existing\n' > "$tmp/opt/agnes/Caddyfile.apps-subdomain"
+
+rc=0
+TRANSCRIPT="$transcript" CURL_CALLED="$curl_called_file" \
+    READYZ_STATE_DIR="$readyz_state_dir" \
+    FAKE_TOPOLOGY=single \
+    FAKE_TAG_ID=sha256:sameimage000 \
+    FAKE_RUNNING_IMAGE_ID=sha256:sameimage000 \
+    WEBHOOK_URL="" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed" || rc=$?
+[ "$rc" -eq 0 ] || fail "L: a tick with APPS_SUBDOMAIN_BASE set and no extract container must still exit 0 (got $rc)"
+
+grep -qF "# apps-subdomain fragment pre-existing" "$tmp/opt/agnes/Caddyfile.apps-subdomain" \
+    || fail "L: the existing fragment must be kept untouched when extraction is unavailable"
+grep -qF "curl -fsSL" "$transcript" \
+    && fail "L: an unavailable extract container must NOT fall back to a network fetch of the fragment"
+grep -q "raw.githubusercontent.com" "$transcript" \
+    && fail "L: no fetch of the source repo's main branch may remain"
+grep -qF "on_demand_tls" "$tmp/opt/agnes/Caddyfile" \
+    || fail "L: the Caddyfile must still be wired from the fragment already on disk"
+grep -qF "# apps-subdomain fragment pre-existing" "$tmp/opt/agnes/Caddyfile" \
+    || fail "L: the on-disk fragment must be the one appended to the Caddyfile"
+echo "OK: L — no extract container with a subdomain base: WARN-and-keep-existing, tick completes, no network fetch"
 rm -rf "$tmp"
 
 echo "OK"

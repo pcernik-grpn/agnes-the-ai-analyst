@@ -33,6 +33,13 @@ import pytest
 
 HARNESS = Path("tests/test_auto_upgrade_role_split.sh")
 
+# Host-side artifacts the VM runs: the ops scripts plus the boot startup
+# template that seeds them. Every one of these is refreshed from the pinned
+# image's /opt/agnes-host/, never from the source repo over the network.
+HOST_SCRIPTS = sorted(Path("scripts/ops").glob("*.sh")) + [
+    Path("infra/modules/customer-instance/startup-script.sh.tpl")
+]
+
 
 def _find_bash4() -> str | None:
     candidates = []
@@ -77,3 +84,44 @@ def test_role_split_rolling_recreate_and_data_refresh_defer():
         f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     )
     assert "OK" in proc.stdout.splitlines()[-1]
+
+
+def test_host_scripts_never_fetch_the_source_repo():
+    """No host-side script may pull an artifact off the source repo's main branch.
+
+    The static half of scenarios I/K in the harness above, and worth having
+    separately for two reasons. It runs everywhere — the harness *skips*
+    without a bash >=4 interpreter, so on such a toolchain nothing else
+    would notice a raw-main fetch creeping back. And it is broad: the
+    harness only exercises the code paths its scenarios reach, whereas this
+    covers every host script in one sweep, including branches gated behind
+    an env var no scenario happens to set.
+
+    That gap is exactly how the bug this guards against shipped. The change
+    that moved host artifacts onto the pinned image deleted the ``RAW_BASE``
+    definition but left one ``$RAW_BASE`` fetch behind, inside the block
+    gated on ``APPS_SUBDOMAIN_BASE``. Under ``set -u`` the stale reference
+    was not merely a leftover fetch: expanding it aborted the entire tick
+    on every VM with data-app subdomains configured — before the recreate,
+    and before the self-update that would have delivered the repair.
+
+    Keeping this as a substring scan rather than a ``RAW_BASE``-name check
+    is deliberate: the hazard is fetching host config from a moving branch
+    (which breaks the image tag's role as the single version pin, and needs
+    egress to a repo that may be private), not any particular variable name
+    someone might spell it with next time.
+    """
+    offenders: list[str] = []
+    for script in HOST_SCRIPTS:
+        text = script.read_text(encoding="utf-8")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#"):
+                continue  # prose about the retired fetch is fine
+            if "raw.githubusercontent.com" in line or "RAW_BASE" in line:
+                offenders.append(f"{script}:{line_number}: {line.strip()}")
+
+    assert not offenders, (
+        "host-side scripts must source every artifact from the pinned image's "
+        "/opt/agnes-host/ (via `docker create` + `docker cp`), never over the "
+        "network from the source repo's main branch:\n  " + "\n  ".join(offenders)
+    )
