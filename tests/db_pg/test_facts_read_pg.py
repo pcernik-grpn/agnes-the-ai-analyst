@@ -510,6 +510,18 @@ def test_s8_revealed_serves_without_quotes_regardless_of_grants(pg_env, repo):
     assert claims_result["revealed"] is True
     assert len(claims_result["claims"]) == 1
     assert claims_result["claims"][0]["quote"] == ""
+    # Review tightening (spec §4, 2026-08-28): revealed reveals the FACT,
+    # not the geography of its evidence — an ungranted caller gets NO
+    # document name/path/URL for the unreadable claim, opaque ids only.
+    assert claims_result["claims"][0]["document"] is None
+    assert claims_result["claims"][0]["corpus_file_id"] == "cf_a1"
+
+    # A caller who CAN read the evidencing collection (the uploader owns
+    # it — ownership unions into a dict user's readable set) keeps full
+    # document identity on the same revealed subject.
+    owner_claims = repo.claims(_dict_user("uploader1"), fact_id)
+    assert owner_claims["claims"][0]["document"] is not None
+    assert owner_claims["claims"][0]["document"]["name"]
 
 
 def test_s8_restricted_hides_from_a_caller_with_full_grants(pg_env, repo):

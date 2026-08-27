@@ -772,9 +772,18 @@ class FactsPgRepository:
 
         out = []
         for r in rows:
-            document: Dict[str, Any] = {"name": r["filename"], "path": r["path"]}
-            if r.get("source_url"):
-                document["source_url"] = r["source_url"]
+            # A `revealed` correction reveals the FACT, not the geography of
+            # its evidence (spec §4, review tightening 2026-08-28): for a
+            # claim whose collection the caller cannot read, the document's
+            # human identity (name/path/URL) is withheld — opaque ids only.
+            claim_readable = is_admin or r["corpus_id"] in readable
+            document: Optional[Dict[str, Any]]
+            if claim_readable or not is_revealed:
+                document = {"name": r["filename"], "path": r["path"]}
+                if r.get("source_url"):
+                    document["source_url"] = r["source_url"]
+            else:
+                document = None
             out.append(
                 {
                     "id": r["id"],
