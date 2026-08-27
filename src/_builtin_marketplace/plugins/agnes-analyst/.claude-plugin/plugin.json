@@ -1,5 +1,5 @@
 {
   "name": "agnes-analyst",
-  "description": "Analyst rails for working with Agnes data — discover tables (catalog / schema / describe), pick the right query path for local vs remote (BigQuery) data, take estimate-first filtered snapshots of large remote tables, use the per-source SQL flavour, and look up canonical business-metric definitions before computing them.",
+  "description": "Analyst rails for working with Agnes data — discover tables (catalog / schema / describe), pick the right query path for local vs remote (BigQuery) data, take estimate-first filtered snapshots of large remote tables, use the per-source SQL flavour, and look up canonical business-metric definitions before computing them. Includes agnes-web-guide, a page-by-page map of the Agnes web UI.",
   "version": "1.0.0"
 }
