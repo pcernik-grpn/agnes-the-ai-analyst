@@ -12,6 +12,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **A chat send that never started no longer eats the message.** The composer
+  is cleared synchronously on submit, for immediate feedback while the runner
+  boots — but when `ensureWsReady()` then failed (chat disabled, no live
+  ChatManager, session POST refused with 503) the error line appeared over an
+  empty composer and the typed prompt was gone. The failure path now puts the
+  text back, so a chat backend that is down costs a retry rather than the
+  message. Guarded by `tests/test_chat_failed_send_keeps_draft.py`.
+
 - **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
   A ready agent's card used to start a conversation, which meant the one obvious
   gesture on the page whose whole subject is the *configuration* went somewhere

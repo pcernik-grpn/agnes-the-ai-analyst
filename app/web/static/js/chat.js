@@ -4189,6 +4189,15 @@ async function submitUserMessage(text) {
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
+    // Step 1 cleared the composer optimistically, but no turn ever started:
+    // give the text back rather than destroying what they typed. A chat
+    // backend that is down must cost a retry, not the message — otherwise
+    // the only record of a long prompt is the user's memory of it.
+    const taFailed = $("chat-input");
+    if (taFailed && !taFailed.value) {
+      taFailed.value = text;
+      autosizeComposer();
+    }
     // The turn never started, so nothing is settled — hand the picker back
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
