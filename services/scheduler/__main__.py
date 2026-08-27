@@ -180,8 +180,8 @@ _DEFAULTS = {
     "SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL": 6 * 60 * 60,
     # Databricks semantic layer (Unity Catalog metric views) refresh: same
     # cadence + rationale as the Keboola sibling — a handful of warehouse
-    # statements per run, upserts+prunes metric_definitions rows tagged
-    # source='databricks_semantic_layer'.
+    # statements per run, syncing the workspace's `connection`-kind semantic
+    # source (source='ossie_connection', source_ref='databricks_default').
     "SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL": 6 * 60 * 60,
     # Pause between scheduler startup and the first tick. Keeps the
     # scheduler from synchronising its "Table never synced, marking as
@@ -677,11 +677,13 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             "POST",
             900,
         ),
-        # Databricks semantic layer refresh — keeps metric_definitions rows
-        # tagged source='databricks_semantic_layer' in sync with the
-        # workspace's Unity Catalog metric views. Short-circuits (returns an
-        # error result, doesn't crash) when data_source.databricks is not
-        # configured — see connectors/databricks/semantic_layer.py.
+        # Databricks semantic layer refresh — syncs the workspace's Unity
+        # Catalog metric views into the semantic layer through the same
+        # semantic-source pipeline every other source uses (rows land
+        # tagged source='ossie_connection', source_ref='databricks_default').
+        # Answers 400 (doesn't crash the scheduler) when data_source.databricks
+        # is not configured — see connectors/databricks/semantic_layer.py and
+        # connectors/databricks/semantic_ossie.py.
         (
             "databricks-semantic-layer-refresh",
             _seconds_to_schedule(dbxsl),
