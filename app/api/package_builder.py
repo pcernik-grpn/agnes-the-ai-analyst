@@ -36,6 +36,7 @@ from app.api.builder_core import (
     ENGINE_STUB,
     MAX_MESSAGE_CHARS,
     OPENING_JOB,
+    SUGGESTIONS_DESCRIPTION,
     BuilderMessage,
     Slot,
     history_prompt_section,
@@ -237,7 +238,7 @@ def _schema(tables: List[Dict[str, Any]], groups: List[Dict[str, Any]]) -> Dict[
             },
             "suggestions": {
                 "type": "array",
-                "description": "Up to three short follow-ups the admin might say next.",
+                "description": SUGGESTIONS_DESCRIPTION,
                 "items": {"type": "string"},
             },
         },

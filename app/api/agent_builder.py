@@ -67,6 +67,7 @@ from app.api.builder_core import (
     ENGINE_STUB,
     MAX_MESSAGE_CHARS,
     OPENING_JOB,
+    SUGGESTIONS_DESCRIPTION,
     BuilderMessage,
     Slot,
     history_prompt_section,
@@ -270,7 +271,7 @@ RESPONSE_SCHEMA: Dict[str, Any] = {
         },
         "suggestions": {
             "type": "array",
-            "description": "Up to three short follow-ups the owner might say next.",
+            "description": SUGGESTIONS_DESCRIPTION,
             "items": {"type": "string"},
         },
     },

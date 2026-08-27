@@ -155,8 +155,11 @@ class TestTheCreateConversation:
 
     def test_the_history_sent_excludes_the_message_being_answered(self, markup):
         """`conv()` already has the new turn pushed onto it; sending it whole
-        would show the model the same message twice."""
-        assert "history: conv().slice(0, -1)" in markup
+        would show the model the same message twice. The opening turn is the
+        other case: it pushes nothing, and an empty transcript is what tells
+        the server it is being asked to speak first."""
+        assert "conv().slice(0, -1)" in markup
+        assert re.search(r"history:\s*opening \? \[\] : conv\(\)\.slice\(0, -1\)", markup)
 
     def test_the_transcript_is_per_type(self, markup):
         """Switching type must not carry a skill's conversation into a

@@ -184,19 +184,18 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     assert "var TYPE_ORDER = ['skill', 'plugin', 'agent'];" in body
     for kind in ("skill", "plugin", "agent"):
         assert f"key: '{kind}'," in body
-    # Type is a COLLAPSING step inside the form, not a separate picker screen:
-    # one numbering sequence (1 Type → 2 Identity → 3 content), and answering
-    # it collapses to a summary + Change rather than navigating away.
+    # Type is NOT a step. It used to be section 1 — a card with a tick where
+    # every other section has a number, spending the top of the panel
+    # re-asking what "+ Add → Build a skill" already answered. It is identity,
+    # so it rides in the header beside the title, with Change one click away;
+    # the sections are the configuration, numbered 1..3 with no gap.
+    assert "typeBadgeHtml" in body, "the type is no longer shown beside the title"
+    assert "sk-typechip" in body
     assert "data-sk-change" in body
     assert ">Change<" in body
-    assert "sk-sec--done" in body
-    # Step 1 (Type) is still this page's own markup — it is a decision already
-    # made, with a ✓ and a Change button, not an editable section. Steps 2-4
-    # render through the shared builder shell, so their number badge is the
-    # shell's `ag-sec-no`. The claim is unchanged: one numbering sequence.
-    assert '"sk-sec-no' in body, "step 1 lost its number badge"
-    for n in ("2", "3", "4"):
+    for n in ("1", "2", "3"):
         assert f"no: {n}," in body, f"step {n} is not numbered in the shell sections"
+    assert "no: 4," not in body, "the sections should end at 3 now that Type is not one"
     # Access is a required choice before saving: Private or the whole org.
     assert 'name="sk-access"' in body
     assert 'value="private"' in body

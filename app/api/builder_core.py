@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -229,6 +230,84 @@ def history_prompt_section(history: Sequence[BuilderMessage]) -> List[str]:
     return lines
 
 
+#: Wording every adapter puts on its ``suggestions`` field. Spelled out here
+#: because getting it wrong produces a specific, absurd failure: the model
+#: emits the question IT is about to ask, the author clicks it, and the builder
+#: answers its own question back at them.
+SUGGESTIONS_DESCRIPTION = (
+    "Up to three things the AUTHOR might say next — their words, their voice, "
+    "answering or instructing you. Never a question you are asking them, never "
+    "second-person ('what do you want…', 'who is it for?'), and never a "
+    "restatement of the question in your own reply. Good: 'Just the sales "
+    "team', 'Make it stricter about numbers', 'Add the invoice tables'."
+)
+
+#: Markdown emphasis the reply is not supposed to contain. Every adapter's
+#: prompt says plain text, and models emit ``**bold**`` anyway — and the
+#: transcript inserts the reply as TEXT (model output is never trusted as
+#: HTML), so the asterisks are shown literally to the reader. Stripping the
+#: markers is the fix that keeps that rule intact; rendering the markdown
+#: would break it.
+_EMPHASIS_RE = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", re.DOTALL)
+_LEADING_MARKUP_RE = re.compile(r"^\s{0,3}(#{1,6}\s+|[-*+]\s+|\d+\.\s+)", re.MULTILINE)
+
+
+def plain_reply(text: str) -> str:
+    """The reply as prose, with markdown markers the contract forbids removed.
+
+    Not a markdown renderer and not a sanitizer — the transcript still inserts
+    this as text. It only stops ``**who is it for?**`` reaching a reader as
+    literal asterisks.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    out = _EMPHASIS_RE.sub(r"\2", text)
+    out = _LEADING_MARKUP_RE.sub("", out)
+    return out.strip()
+
+
+def usable_suggestions(raw: Any, *, reply: str) -> List[str]:
+    """Drop the chips that are the builder's own question, not the author's answer.
+
+    From an observed failure: a chip reading "Who should this package go to —
+    just Sales, or Sales + Finance?", which was the question the reply was
+    asking. The author clicked it, and the builder answered its own question
+    back at them. It happened repeatedly, because "follow-ups the author might
+    say next" reads to a model as "what comes next in this conversation" — and
+    what comes next, from its side, is the question.
+
+    A chip is a thing the AUTHOR says, so the rule is: **statements only.** An
+    author's next line here is an answer or an instruction ("Just the sales
+    team", "Make it stricter about numbers"), never a question — and no
+    heuristic reliably separates "who is this for?" (the builder's) from "which
+    tables are unpackaged?" (the author's), because the difference is who is
+    being addressed and the text does not carry that. The cost is losing the
+    occasional legitimate author question from the MODEL's suggestions; the
+    hardcoded starter chips each page ships are curated and never pass through
+    here, so that kind of opener is unaffected.
+
+    ``reply`` is taken for one reason and deliberately NOT used to filter:
+    dropping chips that appear in the reply looks right and is wrong. When the
+    reply enumerates the options ("Just the Sales team, or Sales + Finance?"),
+    the chips "Just the sales team" and "Sales and Finance" appear in it *and
+    are exactly the right answers*. Keeping the parameter documents the trap so
+    the next person does not re-add the rule.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = plain_reply(item)
+        if not text or text.rstrip().endswith("?"):
+            continue
+        out.append(text)
+        if len(out) == 3:
+            break
+    return out
+
+
 def turn_response(
     result: Dict[str, Any],
     *,
@@ -245,12 +324,11 @@ def turn_response(
     caller, so the progress the page renders is the progress this turn produced
     rather than the state it started from.
     """
-    reply = result.get("reply")
-    suggestions = result.get("suggestions")
+    reply = plain_reply(result.get("reply") if isinstance(result.get("reply"), str) else "") or fallback_reply
     body: Dict[str, Any] = {
-        "reply": (reply if isinstance(reply, str) else "") or fallback_reply,
+        "reply": reply,
         "patch": patch,
-        "suggestions": [s for s in (suggestions or []) if isinstance(s, str)][:3],
+        "suggestions": usable_suggestions(result.get("suggestions"), reply=reply),
         "engine": engine,
         "slots": slots_payload(slots, draft),
     }
