@@ -22,6 +22,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   showed hundreds of template files that were not session output. An engine
   without those routes degrades to an honest "not exposed yet" notice; the
   kai engine stub gained matching routes and a `deliverable` scenario.
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.90.0] - 2026-08-27
+
+### Added
 - **A hosted data app's description can be edited after it is created.**
   `PATCH /api/data-apps/{slug}` refused every non-`managed` row with `409
   not_managed`, so a hosted app's description was write-once: `POST
