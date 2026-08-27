@@ -42,6 +42,35 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the API until the flag is cleared. Defaults preserve today's behaviour — an
   instance that does not set it is unprotected, exactly as before.
 
+- **Connecting an MCP source is a builder, and so is linking external apps.**
+  Both were the least builder-shaped surfaces in the product, and both are now
+  the two-pane shell the other four use — numbered sections with real
+  summaries, `+` pickers, one primary action.
+  - `/admin/mcp-sources/new` replaces a create modal with eleven fields plus a
+    separate page to introspect, curate tools and grant them: five steps in a
+    fixed order the admin was expected to know, across two pages, with no way
+    to find out whether the server was reachable until step three. The list
+    page is unchanged; only the create path moved.
+  - **`POST /api/admin/mcp-sources/preview-introspect`** dials a connection the
+    admin has *typed* and returns its tool list, writing nothing — the same
+    relationship to `POST /mcp-sources` that `/entities/preview` has to
+    `POST /entities`. You cannot sensibly choose which tools to grant without
+    seeing them, and the alternative was registering a disabled row first. It
+    runs the same url guard and the same introspection as the registered path.
+  - **`POST /api/admin/mcp-sources/builder/turn`** is the fourth builder turn.
+    Its sanitizer refuses two things the others need not: a `url` the admin has
+    not already typed (the model may not choose which host the instance dials),
+    and an `auth_secret_env` not shaped like a variable name (which is what
+    stops a pasted token being stored in a displayed field).
+  - `/admin/linked-apps/new` drops the two things that made the wizard
+    operator-hostile: it **detects** the source and its lister tool instead of
+    asking, and it treats the **projection map** — which response field is the
+    app's name, which is its URL — as an escape hatch shown only when a row
+    came back that the adapter's own aliases could not read, rather than as a
+    step. That map is an integration author's artifact, not an operator's.
+- **Suggested-prompt chips in the builders are the chips from the chat landing
+  screen.** Both are "things you could say next" under a composer; shipping two
+  different chips for one idea is how a product stops reading as one system.
 - **The builders lead the setup instead of waiting for it.** Every builder
   opened with a paragraph the page hardcoded and then waited for the author to
   describe the whole artifact in one go. Nothing modelled what was still

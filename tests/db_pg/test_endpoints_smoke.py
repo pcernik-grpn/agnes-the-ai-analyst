@@ -1338,17 +1338,23 @@ class TestStoreSmoke:
 
 
 class TestMcpBuilderSmoke:
-    """The MCP builder: its page, and the turn that opens its conversation."""
+    """The two admin builders: their pages, and the turn that opens a conversation."""
 
     COVERED_ROUTES = {
         "GET /admin/mcp-sources/new",
         "POST /api/admin/mcp-sources/builder/turn",
+        "GET /admin/linked-apps/new",
     }
 
     def test_builder_page_renders_for_an_admin(self, seeded_app_both):
         r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200, r.text
         assert "mcp-builder-view" in r.text
+
+    def test_linked_apps_builder_page_renders_for_an_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/admin/linked-apps/new", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        assert "la-builder-view" in r.text
 
     def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
         """An empty first message is the builder speaking first; it must come

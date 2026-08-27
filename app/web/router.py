@@ -6147,6 +6147,29 @@ async def admin_hub(
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
 
 
+@router.get("/admin/linked-apps/new", response_class=HTMLResponse)
+async def admin_linked_apps_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Publish externally-hosted apps into the Library, in the builder shell.
+
+    /admin/linked-apps stays as the wizard for now; this is the path the
+    Library's "+ Add" reaches. What it fixes is the two things that made the
+    wizard an operator-hostile surface: step 1 asked which MCP source to read
+    apps from, with a dead end under it ("Not registered yet? Register one
+    first, then come back"), and step 2 asked for a projection map — which
+    response field is the app's name, which is its URL.
+
+    A projection map is an integration author's artifact. The adapter already
+    falls back to alias guesses (src/data_apps/keboola_adapter.py), so the
+    mapping is an escape hatch shown only when a row came back that the aliases
+    could not read, and the source and its lister tool are detected rather than
+    chosen.
+    """
+    return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
+
+
 @router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
 async def admin_mcp_builder(
     request: Request,

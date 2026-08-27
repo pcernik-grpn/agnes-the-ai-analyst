@@ -12,7 +12,6 @@ Two of these are regressions with a screenshot behind them:
 
 from __future__ import annotations
 
-import pytest
 
 from app.api.builder_core import (
     BuilderMessage,

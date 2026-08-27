@@ -145,6 +145,10 @@ body.ag-building .idx > footer { display: none; }
 /* The same action, spelled out, at the end of a list or in an empty slot. */
 .ag-addrow { margin-top: 12px; font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 9px; border: 1px dashed var(--ds-border); background: none; color: var(--ds-text-secondary); cursor: pointer; width: 100%; }
 .ag-addrow:hover, .ag-addrow:focus-visible { border-color: var(--ds-primary); color: var(--ds-primary); border-style: solid; background: var(--ds-primary-light); }
+/* The row is sometimes a link rather than a button — "+ Connect an MCP source"
+   from the linked-apps builder's zero state goes to another page. It has to
+   read as the same control, so it loses the underline and gets the same box. */
+a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-decoration: none; }
 /* Empty section: says what the conversation would do, offers the manual way. */
 .ag-slot { padding: 14px 0 2px; }
 .ag-slot-head { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--ds-text-primary); }
