@@ -11,13 +11,15 @@ Uses a "full refresh" approach with hash-based change detection:
 
 TODO(scheduler-v2): In docker-compose.yml this service is a one-shot process
 restarted by Docker (`restart: unless-stopped`), which is effectively a tight
-boot loop. Replace with proper cadence: wire into services/scheduler/__main__.py
-JOBS list and expose an admin endpoint /api/admin/run-corporate-memory that
-invokes collect_all().
+boot loop (tracked in #221). The other half of this TODO — wiring into
+services/scheduler/__main__.py's JOBS list and exposing an admin endpoint —
+has landed: see the "corporate-memory" job kind in the scheduler and
+POST /api/admin/run-corporate-memory in app/api/admin.py.
 
-TODO(notifications): When new pending items appear after a collection run, no
-admin is notified. Hook into services/telegram_bot or email to ping km_admins
-with a digest so the review queue actually gets triaged.
+Notifications (#1573): when a collection run leaves new items pending
+review, ``_notify_admins_of_pending_items`` below pings every Admin-group
+member's desktop notification channel, gated on
+``corporate_memory.notify_on_new_items`` (default on).
 """
 
 import hashlib
@@ -34,6 +36,8 @@ from app.logging_config import setup_logging
 from app.utils import local_md_filename, uploaded_local_md_dir
 from connectors.llm.exceptions import LLMError
 
+from .confidence import compute_confidence
+from .governance import resolve_initial_status
 from .prompts import (
     CATALOG_REFRESH_PROMPT,
     CATALOG_REFRESH_SYSTEM,
@@ -374,6 +378,7 @@ def _process_catalog_response(
     response_items: list[dict],
     existing: dict,
     initial_status: str = "approved",
+    confidence: float | None = None,
 ) -> dict[str, dict]:
     """Map HAIKU's response back to real IDs, preserving existing ones.
 
@@ -384,6 +389,11 @@ def _process_catalog_response(
         response_items: Items returned by the LLM extractor.
         existing: Current knowledge.json data (with "items" dict).
         initial_status: Status to assign to new items ("approved" or "pending").
+        confidence: Confidence score to stamp on new items (#1573) — the
+            same score that decided ``initial_status`` when approval_mode is
+            "threshold", persisted so the review queue can show *why* an
+            item auto-published or was queued. Not applied to preserved
+            existing items — their confidence (if any) is untouched.
 
     Returns dict of items keyed by ID.
     """
@@ -432,6 +442,7 @@ def _process_catalog_response(
                 "extracted_at": now,
                 "updated_at": now,
                 "status": initial_status,
+                "confidence": confidence,
                 "approved_by": None,
                 "approved_at": None,
                 "mandatory_reason": None,
@@ -475,6 +486,76 @@ def check_sensitivity(extractor, item: dict) -> bool:
         return False
 
 
+def _notify_admins_of_pending_items(new_pending_count: int) -> None:
+    """Best-effort desktop notification to every Admin-group member when a
+    collection run leaves new items awaiting review (#1573 finding 2).
+
+    ``new_pending_count`` is the number of ``pending`` rows *this run*
+    inserted into ``knowledge_items`` — never the size of the whole queue,
+    and never a count taken off the catalog file. Two reasons, in that
+    order:
+
+    * The catalog is rebuilt by full refresh on every run, so items an
+      earlier run queued are carried over into ``final_items`` still marked
+      ``pending``; counting those too would re-notify every admin about the
+      entire backlog whenever any watched file changed, and call all of it
+      "new" (which is exactly what the message below says).
+    * The queue admins actually open is ``repo.list_items(statuses=
+      ["pending"])`` on ``/admin/corporate-memory``, i.e. the DB. A count
+      taken off ``final_items`` announces items whose insert failed —
+      sending admins to a queue that does not contain them — and then goes
+      silent on the retry run that finally lands the row, because by then
+      the item is a *preserved* catalog entry rather than a new one.
+
+    The backlog gauge lives in ``stats["items_pending"]`` and the catalog's
+    own new-item count in ``stats["items_pending_new"]``; neither is what
+    gets published here.
+
+    Mirrors ``app.services.sync_notifier.notify_sync_completed``'s fan-out
+    pattern: ``publish_notification`` only reaches a member with a live
+    desktop WebSocket (``app/api/notifications_ws.py``), keyed on
+    ``users.id`` — the same best-aligned-but-unverified channel key
+    documented there. A dropped notification (no live socket, coordination
+    backend down, no Admin group) is an acceptable degradation — the review
+    queue is still there next time an admin opens
+    ``/admin/corporate-memory`` — so this never raises into the caller.
+    """
+    if new_pending_count <= 0:
+        return
+    try:
+        from app.notifications import publish_notification
+        from src.db import SYSTEM_ADMIN_GROUP
+        from src.repositories import user_group_members_repo, user_groups_repo
+
+        admin_group = user_groups_repo().get_by_name(SYSTEM_ADMIN_GROUP)
+        if not admin_group:
+            return
+        members = user_group_members_repo().list_members_for_group(admin_group["id"])
+        message = (
+            "1 new knowledge item awaiting review"
+            if new_pending_count == 1
+            else f"{new_pending_count} new knowledge items awaiting review"
+        )
+        for member in members:
+            if not member.get("active", True):
+                continue
+            try:
+                publish_notification(
+                    member["id"],
+                    {
+                        "kind": "corporate_memory_pending",
+                        "title": "Corporate Memory review queue",
+                        "message": message,
+                        "new_pending_count": new_pending_count,
+                        "url": "/admin/corporate-memory",
+                    },
+                )
+            except Exception:
+                logger.warning("pending-items notification dropped for admin %s", member.get("id"))
+    except Exception:
+        logger.exception("pending-items notifier failed")
+
+
 def collect_all(dry_run: bool = False) -> dict:
     """Main collection routine using full-refresh approach.
 
@@ -499,6 +580,8 @@ def collect_all(dry_run: bool = False) -> dict:
         "items_preserved": 0,
         "items_new": 0,
         "items_pending": 0,
+        "items_pending_new": 0,
+        "items_pending_queued": 0,
         "skipped": False,
         "errors": [],
         "items_db_inserted": 0,
@@ -544,15 +627,16 @@ def collect_all(dry_run: bool = False) -> dict:
     ai_config = instance_config.get("ai") if instance_config else None
     extractor = create_extractor_from_env_or_config(ai_config)
 
-    # Determine initial status for new items based on approval mode
+    # Determine initial status for new items based on approval mode (#1573:
+    # shared with POST /api/memory via resolve_initial_status so the two
+    # ingestion paths can't drift). Every item from this collector shares
+    # one confidence score — the source-level base for "claude_local_md"
+    # (configurable via corporate_memory.confidence.base, unrelated to the
+    # per-item detection_type variance the user_verification path has) — so
+    # it's computed once per run, not per item.
     governance_config = instance_config.get("corporate_memory", {})
-    approval_mode = governance_config.get("approval_mode", "review_queue")
-    if not governance_config:
-        initial_status = "approved"  # Legacy mode: no governance config
-    elif approval_mode == "auto_publish":
-        initial_status = "approved"
-    else:
-        initial_status = "pending"  # review_queue and threshold default to pending
+    item_confidence = compute_confidence("claude_local_md") if governance_config else None
+    initial_status = resolve_initial_status(governance_config, confidence=item_confidence)
 
     # Step 3: Load existing catalog
     existing = _read_json(KNOWLEDGE_FILE)
@@ -594,7 +678,9 @@ def collect_all(dry_run: bool = False) -> dict:
         return stats
 
     # Step 6: Process response - map to existing IDs
-    processed_items = _process_catalog_response(response_items, existing, initial_status=initial_status)
+    processed_items = _process_catalog_response(
+        response_items, existing, initial_status=initial_status, confidence=item_confidence
+    )
 
     # Step 7: Run sensitivity check on NEW items only
     # Items with IDs that existed before already passed the check
@@ -614,7 +700,18 @@ def collect_all(dry_run: bool = False) -> dict:
             else:
                 stats["items_filtered"] += 1
 
+    # Two different questions, two different numbers. ``items_pending`` is the
+    # size of the whole review queue after this refresh (the gauge the CLI
+    # prints and POST /api/admin/run-corporate-memory returns);
+    # ``items_pending_new`` is what *this run* added to it — preserved items
+    # keep their old status through GOVERNANCE_FIELDS, so the two only
+    # coincide on a first run. Both describe the catalog file; what admins
+    # actually review is the DB, so a third number, ``items_pending_queued``,
+    # is counted during the sync below and is the one that gets notified.
     stats["items_pending"] = sum(1 for item in final_items.values() if item.get("status") == "pending")
+    stats["items_pending_new"] = sum(
+        1 for item_id, item in final_items.items() if item_id not in existing_ids and item.get("status") == "pending"
+    )
 
     # Step 8: Auto-tag new items with topic vocabulary (best-effort)
     new_items = [item for item_id, item in final_items.items() if item_id not in existing_ids]
@@ -660,6 +757,14 @@ def collect_all(dry_run: bool = False) -> dict:
 
         repo = _knowledge_repo()
         inserted = updated_count = errors = 0
+        # What the admin alert must count. ``/admin/corporate-memory`` renders
+        # ``repo.list_items(statuses=["pending"])`` — the DB, never
+        # knowledge.json — so an item only joins the review queue on the run
+        # whose ``create()`` actually succeeds. Counting the catalog instead
+        # got both ends of that wrong: a failed insert still alerted (queue
+        # shows nothing), and the retry that finally landed the row was by
+        # then a *preserved* catalog item, so it alerted nobody, ever.
+        pending_queued = 0
         for item_id, item in final_items.items():
             try:
                 existing = repo.get_by_id(item_id)
@@ -684,11 +789,14 @@ def collect_all(dry_run: bool = False) -> dict:
                         source_user=(item.get("source_users") or [""])[0],
                         tags=item.get("tags") or [],
                         status=item.get("status", "pending"),
+                        confidence=item.get("confidence"),
                         source_type="claude_local_md",
                         sensitivity=item.get("sensitivity", "internal"),
                         is_personal=item.get("is_personal", False),
                     )
                     inserted += 1
+                    if item.get("status", "pending") == "pending":
+                        pending_queued += 1
             except Exception as exc:
                 logger.warning("DB sync error for item %s: %s", item_id, exc)
                 errors += 1
@@ -701,6 +809,18 @@ def collect_all(dry_run: bool = False) -> dict:
         stats["items_db_inserted"] = inserted
         stats["items_db_updated"] = updated_count
         stats["items_db_errors"] = errors
+        stats["items_pending_queued"] = pending_queued
+
+        # #1573: notify admins that this run queued something new to triage,
+        # unless the instance opted out. Defaults on to match the schema
+        # default. Deliberately items_pending_queued, not items_pending — the
+        # knob is named notify_on_new_items, and re-announcing the standing
+        # backlog on every run is how a notification channel gets muted. An
+        # item is announced exactly once, on the run that inserts its row:
+        # every later run takes the ``update()`` branch and cannot re-count
+        # it, so the muting loop cannot come back through this path either.
+        if governance_config.get("notify_on_new_items", True):
+            _notify_admins_of_pending_items(pending_queued)
 
         # Save user hashes only after DB sync — if every item failed to sync,
         # skip the hash write so the next scheduled run retries rather than
@@ -808,6 +928,7 @@ def main() -> int:
     print(f"  Items filtered (sensitive): {stats['items_filtered']}")
     if stats.get("items_pending"):
         print(f"  Items pending review: {stats['items_pending']}")
+        print(f"    ...of which new this run: {stats.get('items_pending_new', 0)}")
 
     if stats["errors"]:
         print(f"\nErrors ({len(stats['errors'])}):")

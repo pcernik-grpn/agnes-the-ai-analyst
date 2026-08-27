@@ -34,13 +34,25 @@ def test_corp_memory_top_level_fields_present(seeded_app):
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     fields = r.json()["known_fields"]["corporate_memory"]
-    for k in ["distribution_mode", "approval_mode", "review_period_months", "notify_on_new_items"]:
+    for k in [
+        "distribution_mode",
+        "approval_mode",
+        "auto_publish_min_confidence",
+        "review_period_months",
+        "notify_on_new_items",
+    ]:
         assert k in fields, f"missing top-level field {k!r}"
     assert fields["distribution_mode"]["kind"] == "select"
     assert "hybrid" in fields["distribution_mode"]["options"]
     assert fields["distribution_mode"]["default"] == "hybrid"
     assert fields["approval_mode"]["kind"] == "select"
     assert "review_queue" in fields["approval_mode"]["options"]
+    assert "threshold" in fields["approval_mode"]["options"]
+    # #1573: approval_mode="threshold" needs a cutoff to compare confidence
+    # against — this is the knob that makes it actually differ from
+    # review_queue (see services/corporate_memory/governance.py).
+    assert fields["auto_publish_min_confidence"]["kind"] == "float"
+    assert fields["auto_publish_min_confidence"]["default"] == 0.80
     assert fields["review_period_months"]["kind"] == "int"
     assert fields["review_period_months"]["default"] == 6
     assert fields["notify_on_new_items"]["kind"] == "bool"
@@ -160,10 +172,16 @@ def test_corp_memory_section_renders_in_html(seeded_app, monkeypatch, tmp_path):
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     import yaml as _yaml
-    (state / "instance.yaml").write_text(_yaml.dump({
-        "data_source": {"type": "bigquery", "bigquery": {"project": "p"}},
-    }))
+
+    (state / "instance.yaml").write_text(
+        _yaml.dump(
+            {
+                "data_source": {"type": "bigquery", "bigquery": {"project": "p"}},
+            }
+        )
+    )
     import app.instance_config as ic
+
     ic._instance_config = None
     try:
         c = seeded_app["client"]
@@ -189,6 +207,7 @@ def test_post_corp_memory_section_persists(seeded_app, monkeypatch, tmp_path):
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     import app.instance_config as ic
+
     ic._instance_config = None
     try:
         c = seeded_app["client"]
@@ -210,6 +229,7 @@ def test_post_corp_memory_section_persists(seeded_app, monkeypatch, tmp_path):
         assert r.status_code in (200, 204), r.text
         # Re-read from disk to verify persistence + merge.
         import yaml as _yaml
+
         loaded = _yaml.safe_load((state / "instance.yaml").read_text())
         cm = loaded.get("corporate_memory", {})
         assert cm.get("distribution_mode") == "admin_curated"
@@ -229,6 +249,7 @@ def test_post_corp_memory_with_dotted_map_keys_persists(seeded_app, monkeypatch,
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     import app.instance_config as ic
+
     ic._instance_config = None
     try:
         c = seeded_app["client"]
@@ -251,6 +272,7 @@ def test_post_corp_memory_with_dotted_map_keys_persists(seeded_app, monkeypatch,
         )
         assert r.status_code in (200, 204), r.text
         import yaml as _yaml
+
         loaded = _yaml.safe_load((state / "instance.yaml").read_text())
         base = loaded["corporate_memory"]["confidence"]["base"]
         # Dotted key survives literally — not split into nested objects.
