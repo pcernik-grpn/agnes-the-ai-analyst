@@ -730,6 +730,32 @@ image yourself.
 
 ## Operator setup details
 
+### Rolling out an engine upgrade (kai-agent provider)
+
+The engine is not part of this repository or its release train, so a feature
+that spans both sides (the session-files download route is the canonical
+example) is **two independent rollouts**:
+
+- **Agnes half** rides the normal release process — daily cut → tag →
+  instance auto-upgrade. Nothing manual.
+- **Engine half, per deployment.** The canonical image is built by the
+  engine repository's own CI into its own registry, which Agnes VMs cannot
+  pull from. Each deployment's infra repo **mirrors the pinned tag** into a
+  registry the VM's service account can read and pins the full image ref via
+  the `customer-instance` module's `kai_agent_image`. Upgrading =
+  `docker pull` the new tag from the canonical registry, retag + push into
+  the deployment's mirror (keep the upstream tag name for traceability),
+  bump the pin, `terraform apply`. **Immutable pins only** — the VM's
+  auto-upgrade tick re-pulls every cycle, so a floating tag makes rollouts
+  non-reproducible.
+- Deployments where the engine also serves other hosts (a platform
+  assistant) are owned by the engine repository's own CI/CD and need nothing
+  from here.
+- **Version skew between the two halves is expected and safe by design**:
+  Agnes features degrade when the engine predates a route (session-file
+  downloads 404, the listing reports `supported: false`), so the merge and
+  rollout order of the two repositories does not matter.
+
 ### Keep the sandbox image fresh (docker provider)
 
 **A stale image silently loses features, it does not fail.** The sandbox
