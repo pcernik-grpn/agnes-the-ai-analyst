@@ -91,10 +91,24 @@ class TestTurnAppliesConfiguration:
         assert r.status_code == 200
         assert r.json()["name"]
 
-    def test_an_empty_message_is_refused(self, builder):
-        r = _turn(builder, "   ")
+    def test_an_empty_message_mid_conversation_is_refused(self, builder):
+        """Empty is only ever the OPENING turn — see the next test. Later it is
+        a client bug, and answering it would spend a turn on whitespace."""
+        r = _turn(builder, "   ", history=[{"role": "user", "text": "hi"}])
         assert r.status_code == 400
         assert r.json()["detail"]["kind"] == "empty_message"
+
+    def test_an_empty_first_message_opens_the_conversation(self, builder):
+        """The builder speaks first. Each page used to hardcode an opening
+        paragraph, which never failed and also never knew what the first
+        question was."""
+        r = _turn(builder, "")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["engine"] in ("stub", "model")
+        assert body["slots"], "an opening turn must report what is still open"
+        assert not all(s["known"] for s in body["slots"])
 
     def test_another_users_agent_is_not_reachable(self, builder):
         r = builder["client"].post(
@@ -181,7 +195,7 @@ class TestDegradingWithoutAModel:
     def test_no_credential_answers_503_with_an_actionable_hint(self, builder, monkeypatch):
         """The panel stays hand-editable, so this is a degraded surface, not a
         broken page — the message has to say which of the two it is."""
-        monkeypatch.setattr("app.api.agent_builder._stub_enabled", lambda: False)
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
 
         def _no_key(_prompt):
             raise ValueError("no AI credential configured")
@@ -192,7 +206,7 @@ class TestDegradingWithoutAModel:
         assert r.json()["detail"]["kind"] == "builder_llm_unavailable"
 
     def test_a_provider_error_is_not_a_500(self, builder, monkeypatch):
-        monkeypatch.setattr("app.api.agent_builder._stub_enabled", lambda: False)
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
 
         def _boom(_prompt):
             raise RuntimeError("upstream exploded")
@@ -204,7 +218,7 @@ class TestDegradingWithoutAModel:
 
     def test_a_model_that_returns_only_prose_still_answers(self, builder, monkeypatch):
         """No patch is a legitimate turn — the assistant asked a question."""
-        monkeypatch.setattr("app.api.agent_builder._stub_enabled", lambda: False)
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
         monkeypatch.setattr(
             "app.api.agent_builder._llm_turn",
             lambda _p: {"reply": "Which team is this for?"},

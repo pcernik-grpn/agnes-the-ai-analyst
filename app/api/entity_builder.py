@@ -30,12 +30,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.api.builder_core import (
+    ENGINE_MODEL,
+    ENGINE_STUB,
+    MAX_MESSAGE_CHARS,
+    OPENING_JOB,
+    BuilderMessage,
+    Slot,
+    history_prompt_section,
+    is_opening_turn,
+    merged_draft,
+    panel_prompt_section,
+    slots_prompt_section,
+    stub_enabled,
+    turn_response,
+)
 from app.auth.dependencies import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -56,19 +70,10 @@ PATCHABLE: Dict[str, tuple] = {
     "plugin": ("name", "description", "category"),
 }
 
-#: Caps. Same reasoning as the agent builder: a client that keeps appending
-#: to `history` must not be able to make one turn arbitrarily expensive.
-MAX_HISTORY = 40
-MAX_MESSAGE_CHARS = 4000
 #: A skill body is a document, so this is far larger than a message — but it
 #: is still bounded, and it is what the column will accept.
 MAX_BODY_CHARS = 40000
 MAX_NAME_CHARS = 64
-
-
-class BuilderMessage(BaseModel):
-    role: str = Field(max_length=16)
-    text: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
 
 
 class EntityDraft(BaseModel):
@@ -94,13 +99,23 @@ class EntityTurnRequest(BaseModel):
 SYSTEM = """You are the builder inside Agnes, a governed data platform, helping
 someone author a Library item.
 
+You lead. The author came here because they know what they want and not what a
+good one of these needs — so do not ask them to describe the whole thing and
+then fill a form from it. Work through what is still unknown, one thing at a
+time, in the order you are given.
+
 You are filling in a form the author can see and edit beside you. Every field
 you write appears in their panel immediately; they can change or undo anything.
 Never claim to have saved, published or shared something — you cannot. Saving
 is a button only they can press.
 
-Write plainly. Prefer a short reply that says what you changed and asks the
-one question that would most improve the item.
+Rules:
+- Every turn must leave the panel further along. Filling something in and
+  saying what you assumed beats asking, whenever you can infer it well.
+- One question per turn, at most, and only about the slot you were given.
+- Never re-ask something already settled or already answered in the
+  transcript.
+- Write plainly. Two or three sentences. No headings, no bullet lists.
 """
 
 #: What each type IS, in the words the model should reason about.
@@ -127,6 +142,108 @@ TYPE_BRIEF = {
         "Library: its name, its description, its category. If the author asks "
         "you to write the plugin itself, say plainly that the bundle is theirs "
         "to upload and offer to describe it instead."
+    ),
+}
+
+
+def _has(draft: Dict[str, Any], key: str, *, chars: int = 1) -> bool:
+    value = draft.get(key)
+    return isinstance(value, str) and len(value.strip()) >= chars
+
+
+#: What each type needs to know, in the order that unblocks the most.
+#:
+#: The thresholds are not arbitrary: the store's own content guardrail rejects
+#: a description under ~60 characters or 5 distinct words, and a body under
+#: ~200 (src/store_guardrails/content_check.py). A slot that counted a
+#: three-word description as settled would hand the author a draft that Check
+#: then refuses — the interview would be leading them into a wall.
+_SLOTS: Dict[str, tuple] = {
+    "skill": (
+        Slot(
+            key="purpose",
+            label="what it does",
+            known=lambda d: _has(d, "body", chars=200) or _has(d, "description", chars=40),
+            ask="the job this skill performs — a report to run, a query to shape, a way this team does something.",
+        ),
+        Slot(
+            key="trigger",
+            label="the trigger",
+            known=lambda d: _has(d, "description", chars=60),
+            ask="when an agent should reach for it. The description IS the trigger and should start 'Use when …'.",
+        ),
+        Slot(
+            key="steps",
+            label="the steps",
+            known=lambda d: _has(d, "body", chars=200),
+            ask="the actual recipe, as instructions to the agent that will follow them.",
+        ),
+        Slot(
+            key="name",
+            label="a name",
+            known=lambda d: _has(d, "name"),
+            ask="a lowercase-hyphenated handle. Propose one from what it does; do not ask.",
+        ),
+        Slot(
+            key="category",
+            label="a category",
+            known=lambda d: _has(d, "category"),
+            ask="which of the offered categories it belongs in. Pick one; do not ask.",
+        ),
+    ),
+    "agent": (
+        Slot(
+            key="role",
+            label="the role",
+            known=lambda d: _has(d, "body", chars=200) or _has(d, "description", chars=40),
+            ask="who this agent is and what it is for.",
+        ),
+        Slot(
+            key="description",
+            label="what it is for",
+            known=lambda d: _has(d, "description", chars=60),
+            ask="what the agent does and the situation that calls for it — what someone reads before installing it.",
+        ),
+        Slot(
+            key="behaviour",
+            label="how it works",
+            known=lambda d: _has(d, "body", chars=200),
+            ask="how it should answer and what it must refuse. Remember it carries no data access of its own.",
+        ),
+        Slot(
+            key="name",
+            label="a name",
+            known=lambda d: _has(d, "name"),
+            ask="a lowercase-hyphenated handle. Propose one; do not ask.",
+        ),
+        Slot(
+            key="category",
+            label="a category",
+            known=lambda d: _has(d, "category"),
+            ask="which of the offered categories it belongs in. Pick one; do not ask.",
+        ),
+    ),
+    # A plugin's contents are not yours to write, so its interview is only
+    # about how it reads in the Library.
+    "plugin": (
+        Slot(
+            key="what",
+            label="what it carries",
+            known=lambda d: _has(d, "description", chars=60),
+            ask="what this plugin adds and who should install it.",
+        ),
+        Slot(
+            key="name",
+            label="a name",
+            known=lambda d: _has(d, "name"),
+            ask="a lowercase-hyphenated handle. Propose one; do not ask.",
+        ),
+        Slot(
+            key="category",
+            label="a category",
+            known=lambda d: _has(d, "category"),
+            ask="which of the offered categories it belongs in. Pick one; do not ask.",
+        ),
     ),
 }
 
@@ -170,23 +287,14 @@ def _prompt(
     categories: List[str],
 ) -> str:
     lines = [TYPE_BRIEF[entity_type], ""]
-    lines.append("The panel currently reads:")
-    for key in PATCHABLE[entity_type]:
-        value = (draft.get(key) or "").strip()
-        if key == "body" and len(value) > 2000:
-            value = value[:2000] + "\n…(truncated)"
-        lines.append(f"- {key}: {value or '(empty)'}")
+    lines += panel_prompt_section(PATCHABLE[entity_type], draft, truncate={"body": 2000})
     if categories:
         lines.append("")
         lines.append("Categories you may choose from: " + ", ".join(categories))
-    if history:
-        lines.append("")
-        lines.append("The conversation so far:")
-        for m in history[-MAX_HISTORY:]:
-            who = "Author" if m.role == "user" else "You"
-            lines.append(f"{who}: {m.text}")
+    lines += slots_prompt_section(_SLOTS[entity_type], draft)
+    lines += history_prompt_section(history)
     lines.append("")
-    lines.append(f"Author: {message}")
+    lines.append(OPENING_JOB if is_opening_turn(message, history) else f"Author: {message}")
     return "\n".join(lines)
 
 
@@ -219,11 +327,6 @@ def _sanitize_patch(raw: Any, *, entity_type: str, categories: List[str]) -> Dic
     return out
 
 
-def _stub_enabled() -> bool:
-    """Scripted turns for local dev / tests, never in a real deployment."""
-    return os.getenv("LOCAL_DEV_MODE") == "1" or os.getenv("TESTING") == "1"
-
-
 def _slugify(text: str) -> str:
     keep = [c.lower() if c.isalnum() else "-" for c in text.strip()]
     slug = "".join(keep)
@@ -237,8 +340,22 @@ def _stub_turn(message: str, entity_type: str, draft: Dict[str, Any]) -> Dict[st
 
     Not a simulation of quality — it exists so the whole path (page → API →
     sanitize → merge → re-render) can be exercised, screenshotted and pinned
-    by tests with no credential and no network.
+    by tests with no credential and no network. Every response it produces is
+    labelled ``engine: "stub"`` on the way out, so nobody mistakes it for one.
     """
+    if not message.strip():
+        # The opening turn. Named the same way a real one would be, so the
+        # unprompted-first-turn path is exercisable without a credential.
+        first = _open_slot_label(entity_type, draft)
+        return {
+            "reply": (
+                f"[stub] Let's build a {entity_type}. First thing I need: {first}."
+                if first
+                else f"[stub] Let's build a {entity_type}. Tell me what it should do."
+            ),
+            "patch": {},
+            "suggestions": [],
+        }
     patch: Dict[str, Any] = {}
     words = [w for w in message.split() if w.isalpha()]
     if not (draft.get("name") or "").strip() and words:
@@ -256,6 +373,13 @@ def _stub_turn(message: str, entity_type: str, draft: Dict[str, Any]) -> Dict[st
         reply = "Drafted that into the panel. Edit anything on the right, or tell me what to change."
         suggestions = ["Add a worked example", "Make it stricter about numbers", "Shorten the body"]
     return {"reply": reply, "patch": patch, "suggestions": suggestions}
+
+
+def _open_slot_label(entity_type: str, draft: Dict[str, Any]) -> Optional[str]:
+    from app.api.builder_core import open_slots
+
+    still_open = open_slots(_SLOTS[entity_type], draft)
+    return still_open[0].label if still_open else None
 
 
 def _llm_turn(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,7 +416,10 @@ async def entity_builder_turn(
         raise HTTPException(status_code=400, detail={"kind": "unknown_type"})
 
     message = (payload.message or "").strip()
-    if not message:
+    # An empty message is the builder opening the conversation — allowed only
+    # on the FIRST turn. Later, it is a client bug, and answering it would let
+    # a page spend tokens on whitespace.
+    if not message and not is_opening_turn(message, payload.history):
         raise HTTPException(status_code=400, detail={"kind": "empty_message"})
 
     from src.store_categories import STORE_CATEGORIES
@@ -300,7 +427,8 @@ async def entity_builder_turn(
     categories = list(STORE_CATEGORIES)
     draft = (payload.draft or EntityDraft()).model_dump()
 
-    if _stub_enabled():
+    engine = ENGINE_STUB if stub_enabled() else ENGINE_MODEL
+    if engine == ENGINE_STUB:
         result: Dict[str, Any] = _stub_turn(message, entity_type, draft)
     else:
         prompt = _prompt(
@@ -333,13 +461,17 @@ async def entity_builder_turn(
             ) from e
 
     patch = _sanitize_patch(result.get("patch"), entity_type=entity_type, categories=categories)
-    reply = result.get("reply")
-    suggestions = result.get("suggestions")
-    return {
-        "reply": (reply if isinstance(reply, str) else "") or "Updated the draft.",
-        "patch": patch,
-        "suggestions": [s for s in (suggestions or []) if isinstance(s, str)][:3],
-    }
+    return turn_response(
+        result,
+        patch=patch,
+        engine=engine,
+        slots=_SLOTS[entity_type],
+        # Progress is reported against the draft the page will HOLD after this
+        # turn, not the one it sent — otherwise a turn that fills two slots
+        # reports the state it started from.
+        draft=merged_draft(draft, patch),
+        fallback_reply="Updated the draft.",
+    )
 
 
 #: The one scratch agent a user's template previews run as. A fixed slug, so

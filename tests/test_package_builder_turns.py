@@ -66,10 +66,24 @@ class TestItProposesAndNeverWrites:
         after = c.get("/api/admin/data-packages", headers=_auth(admin)).json()
         assert before == after, "a turn changed the package list"
 
-    def test_an_empty_message_is_refused(self, client):
-        r = _turn(client, message="   ")
+    def test_an_empty_message_mid_conversation_is_refused(self, client):
+        """Empty is only ever the OPENING turn — see the next test. Later it is
+        a client bug, and answering it would spend a turn on whitespace."""
+        r = _turn(client, message="   ", history=[{"role": "user", "text": "hi"}])
         assert r.status_code == 400
         assert r.json()["detail"]["kind"] == "empty_message"
+
+    def test_an_empty_first_message_opens_the_conversation(self, client):
+        """The builder speaks first. Each page used to hardcode an opening
+        paragraph, which never failed and also never knew what the first
+        question was."""
+        r = _turn(client, message="", history=[])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["engine"] in ("stub", "model")
+        assert body["slots"], "an opening turn must report what is still open"
+        assert not all(s["known"] for s in body["slots"])
 
     def test_the_scripted_engine_never_proposes_a_group(self, client):
         """The stub must not be the thing that teaches this flow to hand out
@@ -134,7 +148,7 @@ class TestSanitizerIsTheTrustBoundary:
 
 class TestDegradingWithoutAModel:
     def test_no_credential_answers_503_with_an_actionable_hint(self, client, monkeypatch):
-        monkeypatch.setattr("app.api.package_builder._stub_enabled", lambda: False)
+        monkeypatch.setattr("app.api.package_builder.stub_enabled", lambda: False)
         monkeypatch.setattr(
             "app.api.package_builder._llm_turn",
             lambda *a, **k: (_ for _ in ()).throw(ValueError("no credential")),
@@ -146,7 +160,7 @@ class TestDegradingWithoutAModel:
         assert "by hand" in detail["hint"]
 
     def test_a_provider_error_is_not_a_500(self, client, monkeypatch):
-        monkeypatch.setattr("app.api.package_builder._stub_enabled", lambda: False)
+        monkeypatch.setattr("app.api.package_builder.stub_enabled", lambda: False)
         monkeypatch.setattr(
             "app.api.package_builder._llm_turn",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),

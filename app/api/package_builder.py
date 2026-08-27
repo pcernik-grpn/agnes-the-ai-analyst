@@ -26,12 +26,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.api.builder_core import (
+    ENGINE_MODEL,
+    ENGINE_STUB,
+    MAX_MESSAGE_CHARS,
+    OPENING_JOB,
+    BuilderMessage,
+    Slot,
+    history_prompt_section,
+    is_opening_turn,
+    merged_draft,
+    slots_prompt_section,
+    stub_enabled,
+    turn_response,
+)
 from app.auth.access import require_admin
 
 logger = logging.getLogger(__name__)
@@ -47,8 +60,6 @@ router = APIRouter(
 #: could only desynchronise them.
 PATCHABLE = ("name", "description", "tables", "groups")
 
-MAX_HISTORY = 40
-MAX_MESSAGE_CHARS = 4000
 MAX_NAME_CHARS = 120
 #: Candidate lists sent to the model, capped so the prompt stays bounded. A
 #: large instance can have thousands of registered tables.
@@ -58,9 +69,31 @@ MAX_CANDIDATES = 120
 _MAX_METRICS_PER_TABLE = 6
 
 
-class BuilderMessage(BaseModel):
-    role: str = Field(max_length=16)
-    text: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
+#: What a package needs before an admin can sensibly press Create.
+#: `groups` is deliberately absent: a private package is a legitimate final
+#: state ("leave this closed and the package is private until you share it"),
+#: so a slot for it could never be settled — and this is the one builder where
+#: an unsettled slot would be nagging an admin toward writing a grant.
+_SLOTS = (
+    Slot(
+        key="contents",
+        label="what data it carries",
+        known=lambda d: bool(d.get("tables")),
+        ask="which registered tables belong in it. Propose them by id from the candidates above.",
+    ),
+    Slot(
+        key="name",
+        label="a name",
+        known=lambda d: isinstance(d.get("name"), str) and len(d["name"].strip()) > 0,
+        ask="what it should be called — name it after what it carries. Propose one; do not ask.",
+    ),
+    Slot(
+        key="description",
+        label="what an analyst reads",
+        known=lambda d: isinstance(d.get("description"), str) and len(d["description"].strip()) >= 40,
+        ask="what is in here and who it is for, as the analyst deciding whether to add it will read it.",
+    ),
+)
 
 
 class PackageDraft(BaseModel):
@@ -257,14 +290,10 @@ def _prompt(
     lines.append("Groups you may grant to:")
     for g in groups[:MAX_CANDIDATES]:
         lines.append(f"- id={g['id']} name={g['name']}")
-    if history:
-        lines.append("")
-        lines.append("The conversation so far:")
-        for m in history[-MAX_HISTORY:]:
-            who = "Admin" if m.role == "user" else "You"
-            lines.append(f"{who}: {m.text}")
+    lines += slots_prompt_section(_SLOTS, draft)
+    lines += history_prompt_section(history)
     lines.append("")
-    lines.append(f"Admin: {message}")
+    lines.append(OPENING_JOB if is_opening_turn(message, history) else f"Admin: {message}")
     return "\n".join(lines)
 
 
@@ -297,12 +326,25 @@ def _sanitize_patch(raw: Any, *, table_ids: set, group_ids: set) -> Dict[str, An
     return out
 
 
-def _stub_enabled() -> bool:
-    """Scripted turns for local dev / tests, never in a real deployment."""
-    return os.getenv("LOCAL_DEV_MODE") == "1" or os.getenv("TESTING") == "1"
-
-
 def _stub_turn(message: str, draft: Dict[str, Any], tables: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not message.strip():
+        from app.api.builder_core import open_slots
+
+        still_open = open_slots(_SLOTS, draft)
+        first = still_open[0].label if still_open else None
+        return {
+            "reply": (
+                f"[stub] Let's build a data package. First thing I need: {first}."
+                if first
+                else "[stub] Let's build a data package. Tell me what it should carry."
+            ),
+            "patch": {},
+            "suggestions": [],
+        }
+    return _stub_turn_body(message, draft, tables)
+
+
+def _stub_turn_body(message: str, draft: Dict[str, Any], tables: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A deterministic stand-in so the whole path can be exercised with no
     credential and no network. Deliberately proposes NO groups: the scripted
     engine must not be the thing that teaches this flow to hand out access."""
@@ -353,14 +395,17 @@ async def package_builder_turn(payload: PackageTurnRequest):
     rather than a default.
     """
     message = (payload.message or "").strip()
-    if not message:
+    # An empty message on the FIRST turn is the builder opening the
+    # conversation. Later it is a client bug.
+    if not message and not is_opening_turn(message, payload.history):
         raise HTTPException(status_code=400, detail={"kind": "empty_message"})
 
     pool = _candidates()
     tables, groups = pool["tables"], pool["groups"]
     draft = (payload.draft or PackageDraft()).model_dump()
 
-    if _stub_enabled():
+    engine = ENGINE_STUB if stub_enabled() else ENGINE_MODEL
+    if engine == ENGINE_STUB:
         result: Dict[str, Any] = _stub_turn(message, draft, tables)
     else:
         try:
@@ -391,10 +436,11 @@ async def package_builder_turn(payload: PackageTurnRequest):
         table_ids={t["id"] for t in tables},
         group_ids={g["id"] for g in groups},
     )
-    reply = result.get("reply")
-    suggestions = result.get("suggestions")
-    return {
-        "reply": (reply if isinstance(reply, str) else "") or "Updated the draft.",
-        "patch": patch,
-        "suggestions": [s for s in (suggestions or []) if isinstance(s, str)][:3],
-    }
+    return turn_response(
+        result,
+        patch=patch,
+        engine=engine,
+        slots=_SLOTS,
+        draft=merged_draft(draft, patch),
+        fallback_reply="Updated the draft.",
+    )

@@ -155,6 +155,16 @@
   .sk-build-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-kind-skill); }
   .sk-build-kicker--skill { color: var(--ds-kind-skill); }
   .sk-build-kicker--plugin { color: var(--ds-kind-plugin); }
+  /* The interview's progress. Sits above the sections because it is a
+     property of the whole panel, not of any one field. */
+  .sk-prog {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    margin: 0 0 14px; padding: 8px 12px;
+    background: var(--ds-surface-sunken); border: 1px solid var(--ds-border);
+    border-radius: 9px; font-size: 12.5px; color: var(--ds-text-secondary);
+  }
+  .sk-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
+  .sk-note--engine { border-color: var(--ds-accent-warn-line); background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sk-build-kicker--agent { color: var(--ds-kind-agent); }
   .sk-build-head h2 { font-size: 24px; margin: 2px 0 0; word-break: break-word; }
   .sk-build-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex: 1 1 320px; flex-wrap: wrap; min-width: 0; margin-top: 4px; }
@@ -580,6 +590,13 @@
   var builderTab = 'create';
   var convs = { skill: [], plugin: [], agent: [] };
   var convBusy = false, convErr = null, convDraft = '', convChips = [];
+  /* What the last turn reported. `engine` is which one answered — a scripted
+     stand-in runs whenever AGNES_BUILDER_STUB (or TESTING) is set, and a
+     degraded mode that looks identical to the real one is a lie the page
+     would otherwise tell. `slots` is the interview's state, computed
+     server-side so the two cannot disagree about what is still missing. */
+  var convEngine = null, convSlots = { skill: null, plugin: null, agent: null };
+  var openedFor = {};   // types whose opening turn has already been fired
   function conv() { return convs[type] || []; }
 
   /* Live preview, for agent templates only. A template IS a system prompt, so
@@ -1186,7 +1203,7 @@
         cfgTitle: 'Configuration',
         cfgSub: 'everything this ' + c.label.toLowerCase() + ' is, editable by hand',
         cfgBodyId: 'sk-steps',
-        cfg: stepsHtml(c, ns),
+        cfg: progressHostHtml() + stepsHtml(c, ns),
       }) +
       // Modal host. Always in the DOM so opening the picker never has to wait
       // for a re-render, and empty whenever it is closed.
@@ -1240,10 +1257,20 @@
           placeholder: 'Ask it something…', busy: pv.busy,
         });
     }
-    return BuilderShell.conversation({
+    /* The opening line used to be a constant in the type table. It is the
+       server's first turn now — generated from the empty draft and the first
+       open slot, which a hardcoded paragraph could not be. `convOpening`
+       survives as the pre-flight line: what the pane says while that turn is
+       still in the air, so the pane is never blank. */
+    var rows = conv().length
+      ? conv()
+      : (convBusy ? [] : [{ role: 'assistant', text: openingMessage(c) }]);
+    return engineNoticeHtml() +
+      BuilderShell.conversation({
         id: 'sk-conv',
-        rows: [{ role: 'assistant', text: openingMessage(c) }].concat(conv()),
+        rows: rows,
         busy: convBusy,
+        busyText: conv().length ? 'Thinking…' : 'Getting started…',
         err: convErr,
       }) +
       BuilderShell.composer({
@@ -1259,6 +1286,41 @@
      it is what tells a first-time author what kind of sentence this box
      wants. Per type, because the answer differs. */
   function openingMessage(c) { return c.convOpening; }
+
+  /* Which engine answered. Only ever rendered for the stub: naming the real
+     one every turn would be noise, but leaving the scripted one unnamed is
+     how someone spends an afternoon judging a string-slicer. */
+  function engineNoticeHtml() {
+    if (convEngine !== 'stub') return '';
+    return '<div class="sk-note sk-note--engine">Scripted stand-in — this instance has no AI ' +
+      'credential configured (or <code>AGNES_BUILDER_STUB</code> is set), so the replies are ' +
+      'canned. The panel and Save work normally.</div>';
+  }
+
+  /* The interview's state, straight from the last turn. Computed server-side
+     from the same predicates the prompt is built out of, so the panel and the
+     assistant cannot disagree about what is still missing. */
+  /* A stable host, so a landed turn can repaint the progress line alone —
+     re-rendering the whole panel for it would rebuild the form under whatever
+     field has focus. */
+  function progressHostHtml() { return '<div id="sk-prog-host">' + progressHtml() + '</div>'; }
+  function syncProgress() {
+    var host = document.getElementById('sk-prog-host');
+    if (host) host.innerHTML = progressHtml();
+  }
+
+  function progressHtml() {
+    var slots = convSlots[type];
+    if (!slots || !slots.length) return '';
+    var known = slots.filter(function (s) { return s.known; }).length;
+    var open = slots.filter(function (s) { return !s.known; });
+    return '<div class="sk-prog">' +
+      '<span class="sk-prog-n">' + known + ' of ' + slots.length + '</span>' +
+      '<span class="sk-prog-t">' + (open.length
+        ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
+        : 'nothing missing — ready to save') + '</span>' +
+    '</div>';
+  }
 
   /* Re-render ONLY the left pane. A full render() would rebuild the form and
      pull the caret out of whatever field is focused. */
@@ -1285,9 +1347,15 @@
      the model's output is untrusted and neither builder page has a
      sanitizer. Nothing is written server-side: the patch is merged into the
      local draft and Save to Library stays the only thing that creates. */
+  /* `text` empty means the builder opens the conversation itself: the server
+     generates the opening from the empty draft and the first open slot, which
+     a hardcoded paragraph could not do. Only valid with an empty transcript —
+     the endpoint refuses a later empty message. */
   function sendBuilderTurn(text) {
     if (!type || !draft || convBusy) return;
-    convs[type] = conv().concat([{ role: 'user', text: text }]);
+    var opening = !text && !conv().length;
+    if (!text && !opening) return;
+    if (!opening) convs[type] = conv().concat([{ role: 'user', text: text }]);
     convBusy = true; convErr = null; convDraft = ''; convChips = [];
     renderLeftPane();
     fetch('/api/store/entities/builder/turn', {
@@ -1296,8 +1364,8 @@
       credentials: 'same-origin',
       body: JSON.stringify({
         type: type,
-        message: text,
-        history: conv().slice(0, -1),
+        message: text || '',
+        history: opening ? [] : conv().slice(0, -1),
         // The panel as it stands, so the turn reasons about what is on screen.
         draft: {
           name: draft.name || '', description: draft.description || '',
@@ -1315,6 +1383,9 @@
     }).then(function (body) {
       convs[type] = conv().concat([{ role: 'assistant', text: body.reply || '' }]);
       convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      convEngine = body.engine || null;
+      convSlots[type] = body.slots || null;
+      syncProgress();
       var patch = body.patch || {};
       var keys = Object.keys(patch);
       if (keys.length) {
@@ -1338,7 +1409,7 @@
   function renderConfigPane() {
     var body = document.getElementById('sk-steps');
     if (!body) { render(); return; }
-    body.innerHTML = stepsHtml(cfg(), nameState());
+    body.innerHTML = progressHostHtml() + stepsHtml(cfg(), nameState());
     syncProblems();
     if (window.dsDropdownInit) body.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
   }
@@ -1521,6 +1592,13 @@
     // render() must run first — it replaces view.innerHTML, so anything written
     // into the builder's own DOM before it (the #sk-alerts host) is wiped out.
     render();
+    // The builder speaks first. Once per type per page load: a re-render or a
+    // switch back must not re-open a conversation that is already going, and a
+    // resumed draft with work in it does not want to be greeted from scratch.
+    if (!openedFor[k] && !conv().length) {
+      openedFor[k] = true;
+      sendBuilderTurn('');
+    }
     // Say what happened to the work, in priority order: a restored draft is
     // the most surprising state, then a parked one.
     if (incoming && cfg().source === 'bundle' && pluginSource() === 'upload') {

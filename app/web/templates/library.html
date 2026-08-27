@@ -1963,6 +1963,31 @@
           <span>New data package<small>Governed tables analysts can query</small></span>
         </button>
         {% endif %}
+        {# The two capabilities an admin brings in from OUTSIDE the instance.
+           They are create verbs — a new capability appears in the workspace —
+           and they sat only in /admin, so the menu that claims to be where you
+           add things did not list two of the six things you can add.
+
+           They keep the blast-radius grouping: an MCP source is arguably the
+           highest-radius item in the product, since it adds tool-calling reach
+           to every agent granted it, so it belongs here with the data package
+           rather than under "Just for you".
+
+           Both still open their existing admin pages. Growing them into the
+           builder shell is its own piece of work — the MCP lifecycle alone is
+           introspect → classify → test → materialize plus OAuth registration,
+           a secret and per-tool grants — and a menu entry that reaches the
+           working surface beats a menu that pretends the surface is elsewhere. #}
+        {% if user.is_admin %}
+        <a class="lib-new__item" href="/admin/mcp-sources" role="menuitem">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 7V5a3 3 0 0 1 6 0v2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><rect x="4.5" y="7" width="15" height="6.5" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M12 13.5V17a3.5 3.5 0 0 0 3.5 3.5H17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>Connect an MCP source<small>Tools an agent can call</small></span>
+        </a>
+        <a class="lib-new__item" href="/admin/linked-apps" role="menuitem">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.7"/><path d="M16.5 13.5v6M13.5 16.5h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
+        </a>
+        {% endif %}
         <div class="lib-new__sep"></div>
         <div class="lib-new__cap">Just for you</div>
         <button type="button" class="lib-new__item" role="menuitem" data-new-upload>

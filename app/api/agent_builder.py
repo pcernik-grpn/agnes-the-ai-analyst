@@ -50,7 +50,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 import duckdb
@@ -63,6 +62,20 @@ from pydantic import BaseModel, Field
 # router now: `AgentUpdate` -> `UpdateAgentRequest`, and `_writable`'s
 # owner-checked load -> `_load_agent(..., require_owner=True)`.
 from app.api.agents_admin import UpdateAgentRequest, _load_agent, update_agent
+from app.api.builder_core import (
+    ENGINE_MODEL,
+    ENGINE_STUB,
+    MAX_MESSAGE_CHARS,
+    OPENING_JOB,
+    BuilderMessage,
+    Slot,
+    history_prompt_section,
+    is_opening_turn,
+    merged_draft,
+    slots_prompt_section,
+    stub_enabled,
+    turn_response,
+)
 from app.auth.access import require_agent_profiles_enabled
 from app.auth.dependencies import _get_db
 from app.auth.dependencies import get_current_user
@@ -106,19 +119,52 @@ SURFACES = ("web", "slack", "telegram", "cli", "mcp")
 #: widening a scope axis are owner decisions, not conversational side effects.
 PATCHABLE = ("name", "role", "instructions", "tone", "greeting", "knowledge", "plugins", "surfaces")
 
-#: Transcript cap. Long enough for a real design conversation, short enough
-#: that one turn cannot be made arbitrarily expensive by a client that keeps
-#: appending to `history`.
-MAX_HISTORY = 40
-MAX_MESSAGE_CHARS = 4000
-
 #: Candidate lists sent to the model, capped so the prompt stays bounded.
 MAX_CANDIDATES = 60
 
 
-class BuilderMessage(BaseModel):
-    role: str = Field(max_length=16)
-    text: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
+def _filled(config: Dict[str, Any], key: str, *, chars: int = 1) -> bool:
+    value = config.get(key)
+    return isinstance(value, str) and len(value.strip()) >= chars
+
+
+#: What an agent needs before it is worth saving, in the order that unblocks
+#: the most. Deliberately excludes `knowledge` and `plugins`: an agent
+#: grounded in nothing is a legitimate final state (the prompt says so — an
+#: agent claiming data it cannot reach is worse), so a slot for them could
+#: never be settled and the progress line would never complete.
+_SLOTS = (
+    Slot(
+        key="job",
+        label="what it does",
+        known=lambda c: _filled(c, "role", chars=10) or _filled(c, "instructions", chars=80),
+        ask="the job this agent is for, in the owner's own terms.",
+    ),
+    Slot(
+        key="behaviour",
+        label="how it should answer",
+        known=lambda c: _filled(c, "instructions", chars=200),
+        ask="how it should answer and what it must refuse — this becomes its system prompt.",
+    ),
+    Slot(
+        key="role",
+        label="a one-line description",
+        known=lambda c: _filled(c, "role", chars=10),
+        ask="the single line shown before anyone opens it. Write one; do not ask.",
+    ),
+    Slot(
+        key="name",
+        label="a name",
+        known=lambda c: _filled(c, "name") and (c.get("name") or "").strip().lower() != PLACEHOLDER_NAME,
+        ask="a name. Propose one from what it does; do not ask.",
+    ),
+    Slot(
+        key="greeting",
+        label="its first line",
+        known=lambda c: _filled(c, "greeting", chars=10),
+        ask="the one sentence it opens with for its users. Write one; do not ask.",
+    ),
+)
 
 
 class PluginCandidate(BaseModel):
@@ -176,11 +222,14 @@ An owner describes an assistant they want; you turn that into configuration.
 You are talking to the owner, not to end users of the agent.
 
 Rules:
-- Ask at most ONE question per turn, and only when the answer would change
-  the configuration. Otherwise propose and move on — the owner can edit
-  every field by hand.
-- Fill in what you can infer immediately. A vague ask still deserves a
-  concrete first draft; an empty form is not a safe default.
+- You LEAD. The owner knows what they want and not what an agent needs, so
+  work through what is still unknown, one thing at a time, in the order you
+  are given below. Never ask them to describe the whole thing at once.
+- Every turn must leave the configuration further along. Filling something
+  in and saying what you assumed beats asking, whenever you can infer it
+  well. A turn that only asks a question made the owner do the work.
+- One question per turn, at most, and only about the slot you were given.
+  Never re-ask something already settled or already answered above.
 - Ground the agent only in the candidate knowledge sources listed below,
   by id. Never invent an id. If nothing fits, say so plainly and leave
   knowledge empty rather than guessing — an agent grounded in nothing is
@@ -257,12 +306,10 @@ def _prompt(
     lines.append("")
     lines.append("## Current configuration")
     lines.append(json.dumps(config, indent=2, sort_keys=True))
+    lines += slots_prompt_section(_SLOTS, config)
+    lines += history_prompt_section(history)
     lines.append("")
-    lines.append("## Conversation")
-    for m in history[-MAX_HISTORY:]:
-        who = "Owner" if m.role == "user" else "You"
-        lines.append(f"{who}: {m.text}")
-    lines.append(f"Owner: {message}")
+    lines.append(OPENING_JOB if is_opening_turn(message, history) else f"Owner: {message}")
     return "\n".join(lines)
 
 
@@ -328,12 +375,25 @@ def _sanitize_patch(
     return UpdateAgentRequest(**patch).model_dump(exclude_unset=True, exclude_none=True)
 
 
-def _stub_enabled() -> bool:
-    """Scripted turns for local dev / tests, never in a real deployment."""
-    return os.getenv("LOCAL_DEV_MODE") == "1" or os.getenv("TESTING") == "1"
-
-
 def _stub_turn(message: str, config: Dict[str, Any], knowledge: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not message.strip():
+        from app.api.builder_core import open_slots
+
+        still_open = open_slots(_SLOTS, config)
+        first = still_open[0].label if still_open else None
+        return {
+            "reply": (
+                f"[stub] Let's build an agent. First thing I need: {first}."
+                if first
+                else "[stub] Let's build an agent. Tell me what it should do."
+            ),
+            "patch": {},
+            "suggestions": [],
+        }
+    return _stub_turn_body(message, config, knowledge)
+
+
+def _stub_turn_body(message: str, config: Dict[str, Any], knowledge: List[Dict[str, Any]]) -> Dict[str, Any]:
     """A deterministic stand-in for the model.
 
     Not a simulation of quality — it exists so the whole path (page → API →
@@ -422,7 +482,9 @@ async def builder_turn(
     """Run one builder turn against an agent the caller owns."""
     row = _load_agent(agent_id, user, conn, require_owner=True)
     message = (payload.message or "").strip()
-    if not message:
+    # An empty message on the FIRST turn is the builder opening the
+    # conversation. Later it is a client bug.
+    if not message and not is_opening_turn(message, payload.history):
         raise HTTPException(status_code=400, detail={"kind": "empty_message"})
 
     knowledge = knowledge_sources_for(user)
@@ -435,7 +497,8 @@ async def builder_turn(
         # than being blanked in the prompt.
         config.update({k: v for k, v in payload.config.items() if k in PATCHABLE})
 
-    if _stub_enabled():
+    engine = ENGINE_STUB if stub_enabled() else ENGINE_MODEL
+    if engine == ENGINE_STUB:
         result: Dict[str, Any] = _stub_turn(message, config, knowledge)
     else:
         prompt = _prompt(
@@ -475,11 +538,12 @@ async def builder_turn(
     if patch and payload.apply:
         agent = await update_agent(agent_id, UpdateAgentRequest(**patch), user, conn)
 
-    reply = result.get("reply")
-    suggestions = result.get("suggestions")
-    return {
-        "reply": (reply if isinstance(reply, str) else "") or "Updated the configuration.",
-        "patch": patch,
-        "agent": agent,
-        "suggestions": [s for s in (suggestions or []) if isinstance(s, str)][:3],
-    }
+    return turn_response(
+        result,
+        patch=patch,
+        engine=engine,
+        slots=_SLOTS,
+        draft=merged_draft(config, patch),
+        fallback_reply="Updated the configuration.",
+        extra={"agent": agent},
+    )
