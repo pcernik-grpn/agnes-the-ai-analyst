@@ -61,9 +61,21 @@ def status(
     # from any cwd reports the real workspace. 0 when unset.
     from cli.config import get_workspace_root
     from cli.lib.session_paths import list_session_files
+    from cli.lib.workspace_resolve import workspace_anchor
 
     ws_root = get_workspace_root()
     session_count = len(list_session_files(Path(ws_root))) if ws_root else 0
+
+    # #1312 (remaining scope, item 2): every OTHER field above is anchored on
+    # `workspace` (`resolve_data_workspace()`, cwd-first), but the upload
+    # count is anchored on `workspace_root` (push's anchor) — deliberately
+    # different resolvers (see `cli/lib/workspace_resolve.py`). Mixing them
+    # with no label meant an analyst standing in a foreign-but-shaped
+    # directory saw an upload count for a workspace never named on screen.
+    # Label it whenever the two genuinely differ; say nothing extra when
+    # they agree (the common case) so the line stays as terse as before.
+    anchor = workspace_anchor()
+    anchor_differs = anchor is not None and anchor != workspace
 
     info = {
         "workspace": str(workspace),
@@ -73,6 +85,8 @@ def status(
         "duckdb_exists": db_path.exists(),
         "last_synced": last_synced,
         "sessions_pending_upload": session_count,
+        "session_anchor": str(anchor) if anchor is not None else None,
+        "session_anchor_differs_from_workspace": anchor_differs,
     }
 
     if as_json:
@@ -93,7 +107,10 @@ def status(
         typer.echo(f"Tables    : {table_count}")
     typer.echo(f"DuckDB    : {'yes' if info['duckdb_exists'] else 'no'}")
     typer.echo(f"Last sync : {last_synced or 'never'}")
-    typer.echo(f"Pending uploads: {session_count} sessions")
+    if anchor_differs:
+        typer.echo(f"Pending uploads: {session_count} sessions (anchor: {anchor} — differs from Workspace above)")
+    else:
+        typer.echo(f"Pending uploads: {session_count} sessions")
 
     if not initialized:
         typer.echo("")
