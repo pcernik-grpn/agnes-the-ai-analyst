@@ -42,6 +42,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the API until the flag is cleared. Defaults preserve today's behaviour — an
   instance that does not set it is unprotected, exactly as before.
 
+- **Chat session files now work under the default `kai-agent` provider**
+  (#1611 follow-up). The Files listing/download/save-to-Library routes are
+  provider-aware: engine-backed sessions proxy the engine's sandbox file
+  browser (`GET /api/chat/{id}/sandbox/files` + the new
+  `…/sandbox/file/download`, session-JWT-authed; wire contract in
+  `docs/cloud-chat.md`) instead of walking the host session dir, which under
+  this provider holds only workspace-template symlinks — the pre-fix listing
+  showed hundreds of template files that were not session output. An engine
+  without those routes degrades to an honest "not exposed yet" notice; the
+  kai engine stub gained matching routes and a `deliverable` scenario.
+
 ### Changed
 - **BREAKING: Databricks Unity Catalog metric views now flow through the
   semantic-source adapter contract, like Snowflake — no more direct
@@ -203,9 +214,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   agent-written symlink escaping them 404s), downloads are always served
   `attachment` + `nosniff` with active content types pinned to
   `application/octet-stream`, and save-to-Library reuses the same
-  single-file-artefact bridge as the chat composer upload. Sessions run on
-  a remote turn engine list empty (their files live in the remote sandbox —
-  delivering those needs an engine-side channel).
+  single-file-artefact bridge as the chat composer upload. Engine-backed
+  sessions (`chat.provider: kai-agent`) are served through the engine proxy —
+  see the dedicated bullet above.
 
 - **`agnes admin config export` / `agnes admin config apply`** round-trip the
   server-config OVERLAY (`${STATE_DIR}/instance.yaml`, editable sections
