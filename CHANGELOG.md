@@ -54,8 +54,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   knob (default `0.80`); an unrecognized `approval_mode` value is logged as a
   warning instead of silently degrading. `corporate_memory.notify_on_new_items`
   (default on) now actually notifies — every Admin-group member with a live
-  desktop session gets a notification when a collection run leaves new items
-  in the review queue. `POST /api/memory` (the "add what you know" button)
+  desktop session gets a notification when a collection run queues new items
+  for review. The count is what *that run* added, never the standing backlog:
+  the catalog is rebuilt by full refresh and preserved items keep their old
+  `pending` status, so counting the whole queue would re-announce it (as
+  "new") on every run where any watched file changed. The run stats now carry
+  both numbers — `items_pending` (queue size) and `items_pending_new` (this
+  run's additions). `POST /api/memory` (the "add what you know" button)
   used to hardcode `status="pending"` regardless of configuration; it now
   respects `approval_mode` the same way the CLAUDE.local.md collector does —
   **on an instance with no `corporate_memory:` block at all** (the documented
