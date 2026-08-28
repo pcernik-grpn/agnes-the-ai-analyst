@@ -157,8 +157,7 @@ class CorpusFilesPgRepository:
             row = (
                 conn.execute(
                     sa.text(
-                        "SELECT COUNT(*) AS n FROM corpus_files "
-                        "WHERE corpus_id = :corpus_id AND storage_path = :sp"
+                        "SELECT COUNT(*) AS n FROM corpus_files WHERE corpus_id = :corpus_id AND storage_path = :sp"
                     ),
                     {"corpus_id": corpus_id, "sp": storage_path},
                 )
@@ -231,4 +230,37 @@ class CorpusFilesPgRepository:
             conn.execute(
                 sa.text("DELETE FROM corpus_files WHERE id = :id"),
                 {"id": file_id},
+            )
+
+    def update_in_place(
+        self,
+        file_id: str,
+        *,
+        filename: str,
+        sha256: str,
+        file_type: Optional[str],
+        size_bytes: Optional[int],
+        storage_path: Optional[str],
+        path: Optional[str],
+    ) -> None:
+        """Postgres twin of the DuckDB ``update_in_place`` — see its
+        docstring (fact-graph-over-Collections §6 prerequisite)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE corpus_files "
+                    "SET filename = :filename, sha256 = :sha256, file_type = :file_type, "
+                    "    size_bytes = :size_bytes, storage_path = :storage_path, path = :path, "
+                    "    updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = :id"
+                ),
+                {
+                    "filename": filename,
+                    "sha256": sha256,
+                    "file_type": file_type,
+                    "size_bytes": size_bytes,
+                    "storage_path": storage_path,
+                    "path": path,
+                    "id": file_id,
+                },
             )

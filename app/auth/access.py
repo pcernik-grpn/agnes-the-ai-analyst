@@ -527,6 +527,24 @@ def require_agent_profiles_enabled() -> None:
         )
 
 
+def require_facts_enabled() -> None:
+    """Dependency: 404 the whole request when ``facts.enabled`` is off.
+
+    Mounted as a router-level ``dependencies=[...]`` entry (not
+    per-endpoint) on ``app/api/facts.py``'s router — the entire
+    ``/api/facts*`` surface disappears at once, same "close the whole
+    surface" posture as ``require_agent_profiles_enabled`` above, but `404`
+    rather than `403`: this is a genuinely new, off-by-default feature
+    (fact-graph-over-Collections design doc §2), not an existing surface an
+    operator deliberately switched off — a caller with no route to have
+    ever discovered should see "not found", not "forbidden".
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="facts_disabled")
+
+
 def access_denied_detail(resource_type: ResourceType, resource_id: str) -> str:
     """Human-readable 403 detail for a resource-scoped denial.
 

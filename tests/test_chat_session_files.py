@@ -173,15 +173,51 @@ def test_list_files_in_session_dir(client: TestClient, session_dir: Path) -> Non
     assert row["modified_at"]
 
 
-def test_list_includes_workspace_symlinked_files(client: TestClient, session_dir: Path) -> None:
-    """Deliverables written through the .claude symlink (the #1611 repro wrote
-    into .claude/skills/sales-proposal/) must surface in the listing."""
-    target = session_dir.resolve() / ".claude" / "skills" / "sales-proposal" / "Meridian_SOW_draft.docx"
-    target.write_bytes(b"sow")
+def test_list_excludes_the_workspace_template(client: TestClient, session_dir: Path) -> None:
+    """The template trees symlinked into EVERY session dir are not session
+    output. Listing them buried the real deliverable under the operator's
+    bundled skills and scaffolds — observed live, dozens of
+    `scaffolds/nodejs-dashboard/...` rows above the file the user asked for.
+
+    (This reverses the original #1611 reading, which followed `.claude/`
+    because the reported skill wrote there. The engine's own sandbox browser
+    filters dot-directories anyway, so such a file was never reachable on that
+    surface; the workspace prompt now directs deliverables to `outputs/`.)"""
+    ws = session_dir.resolve().parent.parent / "workspace"
+    (ws / ".claude" / "skills" / "sales-proposal").mkdir(parents=True, exist_ok=True)
+    (ws / ".claude" / "skills" / "sales-proposal" / "SKILL.md").write_bytes(b"template")
+    (ws / "scaffolds" / "nodejs-dashboard" / "src").mkdir(parents=True, exist_ok=True)
+    (ws / "scaffolds" / "nodejs-dashboard" / "src" / "App.tsx").write_bytes(b"template")
+    (ws / "CLAUDE.md").write_bytes(b"template")
+    for entry in (".claude", "scaffolds", "CLAUDE.md"):
+        link = session_dir / entry
+        if not link.exists():
+            link.symlink_to(ws / entry)
+
+    (session_dir / "outputs").mkdir(exist_ok=True)
+    (session_dir / "outputs" / "report.docx").write_bytes(b"real deliverable")
+
     resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files")
     assert resp.status_code == 200
     paths = {f["path"] for f in resp.json()["files"]}
-    assert ".claude/skills/sales-proposal/Meridian_SOW_draft.docx" in paths
+    assert "outputs/report.docx" in paths
+    assert not any(p.startswith((".claude/", "scaffolds/")) or p == "CLAUDE.md" for p in paths), (
+        f"workspace-template entries leaked into the listing: {sorted(paths)}"
+    )
+
+
+def test_outputs_sort_ahead_of_other_session_files(client: TestClient, session_dir: Path) -> None:
+    """`outputs/` is where the prompt tells the agent to leave deliverables, so
+    it leads the list even when incidental scratch is newer."""
+    (session_dir / "outputs").mkdir(exist_ok=True)
+    deliverable = session_dir / "outputs" / "report.docx"
+    scratch = session_dir / "scratch.txt"
+    deliverable.write_bytes(b"deliverable")
+    scratch.write_bytes(b"scratch")
+    os.utime(deliverable, (1_000_000_000, 1_000_000_000))  # deliberately OLDER
+
+    files = client.get(f"/api/chat/sessions/{CHAT_ID}/files").json()["files"]
+    assert [f["path"] for f in files][0] == "outputs/report.docx"
 
 
 def test_list_sorted_by_mtime_desc(client: TestClient, session_dir: Path) -> None:

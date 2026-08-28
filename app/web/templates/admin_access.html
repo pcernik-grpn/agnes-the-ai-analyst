@@ -1233,6 +1233,19 @@
       table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
     };
 
+    // Collection-only, spec §13.2: a collection with NO group granted at
+    // all (independent of which group is currently selected in this pane)
+    // is indexed but reachable by nobody — the worst silent state, since a
+    // collection that granted no group at share-time looks identical to one
+    // still mid-setup. `grant_count` is computed server-side, once, in
+    // `_collection_blocks()` (app/resource_types.py) — the single source
+    // every list built from that projection reads, so this pane and any
+    // future one agree without recomputing the grant scan client-side.
+    const nobodyBadge = (t, i) =>
+      t.type_key === "collection" && !(i.grant_count > 0)
+        ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this collection — indexed but invisible.">&#9888; nobody</span>`
+        : "";
+
     const itemRow = (t, i) => {
       const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
       const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
@@ -1244,7 +1257,7 @@
       <tr data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant ? ' class="is-granted"' : ""}>
         <td class="ax-chk"><input type="checkbox" ${grant ? "checked" : ""} aria-label="Grant ${esc(i.name || i.resource_id)}"></td>
         <td class="ax-name">
-          <b>${nameHtml}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}
+          <b>${nameHtml}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}${nobodyBadge(t, i)}
           ${i.description ? `<br><span class="desc">${esc(String(i.description).slice(0, 90))}</span>` : ""}
         </td>
         <td class="ax-acc">

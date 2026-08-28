@@ -1,0 +1,37 @@
+# Example run-config for `run_eval.py run --config <this file>`.
+#
+# Only A0 (bare Anthropic) and A4 (Agnes) are API-driven -- see the
+# `scripts/eval/arms.py` module docstring for why A1/A2/A3 are
+# `import-transcript` only.
+#
+# No secret value lives here -- only the env var NAME that holds each
+# credential (ANTHROPIC_API_KEY, AGNES_EVAL_TOKEN_PRINCIPAL, ...). Set
+# those in the operator's shell before running.
+
+round: R1
+runs_per_prompt: 3
+
+arms:
+  - A0
+  - A4
+
+arm_config:
+  A0:
+    model: claude-sonnet-5
+    api_key_env: ANTHROPIC_API_KEY
+
+  A4:
+    surface: chat
+    base_url: https://agnes.example.com
+    agent_slug: eval-agent
+    timeout_s: 120
+    # Design spec Sec 14.4 -- Principal (structured + unstructured) and
+    # Associate (unstructured only). Every prompt/run combination is
+    # executed once per persona listed here.
+    personas: [principal, associate]
+    persona_tokens:
+      principal: AGNES_EVAL_TOKEN_PRINCIPAL
+      associate: AGNES_EVAL_TOKEN_ASSOCIATE
+
+# Where run records land: <output_dir>/<round>/<arm>/<prompt>_<run#>.json
+output_dir: runs

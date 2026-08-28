@@ -1,0 +1,54 @@
+groups:
+- principal
+- associate
+- secret-group-c
+sites:
+  delivery-archive:
+    libraries:
+      active-engagements:
+        groups:
+        - principal
+        - associate
+      completed-engagements:
+        groups:
+        - principal
+        - associate
+      client-feedback:
+        groups:
+        - principal
+        - associate
+  proposals-and-pursuits:
+    libraries:
+      sow-drafts:
+        groups:
+        - principal
+      won-proposals:
+        groups:
+        - principal
+        - associate
+      pricing-sheets:
+        groups:
+        - secret-group-c
+  client-services:
+    libraries:
+      account-notes:
+        groups:
+        - principal
+        - associate
+      escalations:
+        groups:
+        - principal
+        - associate
+  firm-operations:
+    libraries:
+      skills-registry:
+        groups:
+        - principal
+        - associate
+      tooling-notes:
+        groups:
+        - principal
+        - associate
+      legal-secret:
+        groups:
+        - secret-group-c
