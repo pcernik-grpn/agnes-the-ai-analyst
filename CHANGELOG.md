@@ -254,6 +254,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   engine walk now skips the same top-level template entries, derived from the
   same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
   longer even requests those subdirectories.
+- **A completed sign-in is now recorded in `audit_log`, for every provider.**
+  `login_failed` was the only authentication event the trail carried: the
+  Google, Microsoft, email magic-link and Keboola providers wrote nothing at
+  all on their success paths, and the password provider audited only its
+  failures — so an instance whose people sign in through OAuth could not answer
+  "who signed in, and when" from its own audit log. Both password routes (the
+  browser form and the JSON route used by the CLI/desktop client, distinguished
+  by `client_kind`) and all four OAuth/magic-link callbacks now write a
+  `login_success` row carrying the provider and the trusted client IP. Two
+  adjacent gaps in the same lifecycle close with it: consuming an invite
+  (`/auth/password/setup/confirm`) writes `account_activated` alongside the
+  sign-in it also performs, and the self-service `/auth/password/setup/request`
+  writes `setup_link_requested` — whose anti-enumeration response is identical
+  whether or not the address matched, making the audit row the only place the
+  real outcome is visible. A new guard walks `app/auth/providers/` by source
+  rather than a hand-maintained list, so the next provider to mint a session
+  cookie cannot ship without recording it. Separately, the user-management
+  audit helper in `app/api/users.py` swallowed every write failure with a bare
+  `pass` and no log line; it now goes through `src.audit_helpers.log_safe`,
+  which keeps the same never-block-the-request policy but leaves a line in the
+  application log when a row is dropped.
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
