@@ -23,6 +23,8 @@ Three things worth pinning beyond "it works":
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 
@@ -401,18 +403,90 @@ class TestTheComposerCanChooseAnAgent:
         html = Path("app/web/templates/chat.html").read_text(encoding="utf-8")
         assert 'id="chat-agent-btn"' in html, "no way to choose an agent from the composer"
         assert 'id="chat-agent-menu"' in html
-        # In the footer strip UNDER the input, sharing that line with the Stack
-        # context line — not inside the composer pill and not floating loose on
-        # the page.
-        assert html.index('id="chat-agent-btn"') > html.index('id="chat-input"')
-        assert html.index('id="chat-agent-btn"') > html.index('class="cloud-chat-composer-foot"')
-        # Trailing the row, not leading it: the Stack line reads first and the
-        # agent lands at the right edge, under the send button.
-        assert html.index('class="rdb-context"') < html.index('id="chat-agent-btn"')
-        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
-        assert ".cloud-chat-agent-wrap {\n  margin-left: auto;\n}" in css, (
-            "the agent element no longer trails the footer row"
+        # INSIDE the composer and AFTER the textarea, in the trailing cluster
+        # with Send. Choosing an agent is part of composing (the agent is bound
+        # at session creation, so this sets a property of the message about to be
+        # sent), which is why it is in the pill and not in a strip beneath it.
+        #
+        # After the textarea, specifically: ahead of the "+" a longer agent name
+        # moved where the placeholder began — a measured 58px jump between
+        # "Agnes" and "Finance Proposals", reflowing any draft already typed.
+        # Trailing, a wider pill takes its width off the end of the field and the
+        # text origin does not move at all.
+        composer_at = html.index('class="cloud-chat-composer"')
+        assert composer_at < html.index('id="chat-input"') < html.index('id="chat-agent-btn"')
+        assert html.index('id="chat-plus-btn"') < html.index('id="chat-agent-btn"')
+        assert html.index('id="chat-agent-btn"') < html.index('class="cloud-chat-form-actions"'), (
+            "the pill pairs with Send, ahead of it"
         )
+        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
+        assert ".cloud-chat-agent-wrap {\n  margin-left: auto;\n}" not in css, (
+            "the agent element must not be pushed to the far end of a row"
+        )
+        btn_rule = css.split(".cloud-chat-agent-btn {", 1)[1].split("}", 1)[0]
+        # One height across the trailing pair, so the pill reads as Send's
+        # partner rather than a short thing floating beside a tall circle.
+        assert "height: 44px" in btn_rule
+        # A cap remains as a backstop for a long single word (which has no
+        # initials to take — see `_agentPillLabel`).
+        assert "max-width" in btn_rule
+
+    def test_the_pill_abbreviates_a_long_name_but_never_hides_it(self):
+        """The pill shows initials past `AGENT_LABEL_MAX` so its width is stable
+        across agents. That trades legibility for stability — two names sharing
+        initials look alike in the pill — so the full name must remain reachable
+        without opening anything: the title attribute carries it, the menu spells
+        it out, and the in-conversation label is never abbreviated."""
+        js = self._js()
+        assert "function _agentPillLabel" in js
+        # The menu and the label use the FULL name (`_agentLabel`); only the
+        # button text goes through the pill form.
+        assert "btnLabel.textContent = pill" in js
+        assert "_agentPillLabel(name)" in js
+        # Hovering an abbreviated pill must say what it stands for.
+        assert "choose which agent to chat with" in js
+        # A single long word has no initials to take and falls back to the name
+        # (CSS ellipsis), rather than rendering one lonely letter.
+        assert "words.length < 2" in js
+
+    def test_the_menu_offers_the_way_to_make_another_agent(self):
+        """The picker is where a caller discovers their agents are not enough, so
+        the next move belongs in reach rather than back through the rail.
+
+        `?new=1` is the SAME create path the Agents page's own card uses — a
+        second door to one flow, not a second flow."""
+        js = self._js()
+        from pathlib import Path
+
+        assert '"/agents?new=1"' in js
+        assert "Create new agent" in js
+        css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
+        # Ruled off from the agents above it: they switch this conversation,
+        # this one leaves the page.
+        create = css.split(".cloud-chat-agent-menu-create {", 1)[1].split("}", 1)[0]
+        assert "border-top" in create
+        # It must read as a CONTROL, not a label that happens to carry a caret —
+        # which agent answers a question changes the answer. What carries that at
+        # rest is ink and weight, not a fill: a standing tint on the one row under
+        # the composer competed with the input for the eye. The fill is the hover
+        # signal instead, so this asserts the pair rather than either alone.
+        #
+        # Comments stripped first: these rules explain what they replaced, and the
+        # prose mentions the very declarations being asserted about — a raw
+        # substring check matched the explanation instead of the CSS.
+        import re as _re
+
+        def _decls(selector: str) -> str:
+            body = css.split(selector, 1)[1].split("}", 1)[0]
+            return _re.sub(r"/\*.*?\*/", "", body, flags=_re.S)
+
+        btn = _decls(".cloud-chat-agent-btn {")
+        assert "var(--ds-primary)" in btn, "the resting state must carry accent ink"
+        assert "background: transparent" in btn, "no standing fill under the composer"
+        hover = _decls(".cloud-chat-agent-btn:hover:not(:disabled) {")
+        assert "background: color-mix" in hover, "hover is where the fill happens"
+        # One device, not two: no outline drawn around the tinted pill.
+        assert "border-color" not in hover
 
     def test_a_live_conversation_shows_a_label_not_a_control(self):
         """Mid-conversation the agent is fixed, so the button is swapped for a
@@ -442,17 +516,22 @@ class TestTheComposerCanChooseAnAgent:
         html = Path("app/web/templates/chat.html").read_text(encoding="utf-8")
         assert html.index('id="chat-agent-btn"') < html.index('id="chat-empty-extras"')
         assert html.index('id="chat-agent-btn"') > html.index('id="chat-form"')
-        # ...while the Stack line it shares the row with keeps hiding with the
-        # dashboard, by its own rule now that it no longer rides that container.
+        # It is INSIDE the composer pill now, which is inside the form — so it
+        # survives for the same reason, and there is no longer a row under the
+        # input for it to share (the Stack line that occupied it is retired).
+        assert html.index('id="chat-agent-btn"') < html.index("</form>")
         css = Path("app/web/static/css/chat.css").read_text(encoding="utf-8")
-        assert "#chat-capabilities[hidden] ~ #chat-form .rdb-context" in css
+        assert ".cloud-chat-composer-foot {" not in css, "the footer row is retired"
+        assert ".rdb-context {" not in re.sub(r"/\*.*?\*/", "", css, flags=re.S)
 
     def test_the_picker_offers_only_agents_the_caller_owns(self):
         """``GET /api/v1/agents`` also returns agents merely SHARED with the caller,
         but ``_resolve_agent_id`` resolves a slug against their OWN rows only —
         so offering a shared agent would 404 on click."""
         js = self._js()
-        assert "filter(a => a.mine && a.slug)" in js, (
+        block = js[js.index("async function _refreshAgents()") :]
+        block = block[: block.index("\n}")]
+        assert "a.mine" in block and "a.slug" in block, (
             "the picker no longer filters to owned agents; a shared agent would 404 on click"
         )
 
@@ -464,9 +543,15 @@ class TestTheComposerCanChooseAnAgent:
         started"."""
         js = self._js()
         assert "btn.hidden = _sessionHasTurns;" in js
-        # And the flag is raised where a conversation actually begins.
-        assert js.count("_sessionHasTurns = true;") >= 2, (
-            "the turns flag is no longer set on both submit and history hydration"
+        # And the flag is raised where a conversation actually begins. It is
+        # raised through `_markConversationStarted()` rather than assigned at
+        # each site, so the thread header can never disagree with the picker
+        # about whether a conversation has started.
+        helper = js[js.index("function _markConversationStarted()") :]
+        helper = helper[: helper.index("\n}")]
+        assert "_sessionHasTurns = true;" in helper, "the helper stopped raising the flag"
+        assert js.count("_markConversationStarted();") >= 2, (
+            "the turns flag is no longer raised on both submit and history hydration"
         )
 
     def test_the_settled_agent_survives_the_session_open_a_submit_triggers(self):
@@ -484,9 +569,56 @@ class TestTheComposerCanChooseAnAgent:
         assert "if (_switchingSession) _sessionHasTurns = false;" in js
         block = js[js.index("    await ensureWsReady();") :]
         block = block[: block.index("} catch (err) {")]
-        assert "_sessionHasTurns = true;" in block, (
+        assert "_markConversationStarted();" in block, (
             "a first submit creates the session, so openSession resets the flag "
             "and the settled label flips back into a live picker mid-send"
+        )
+
+    def test_switching_agent_on_an_empty_chat_does_not_stage_a_conversation(self):
+        """Picking an agent goes through `newChat()` — it needs a session to
+        run the new agent as — and `openSession` used to title EVERY session it
+        opened, "Untitled chat" when there was nothing better. That put
+        `.has-thread` on the shell, so choosing an agent from the dashboard
+        redrew the page as a conversation that did not exist: thread header,
+        Copy transcript, composer at the foot, dashboard still underneath.
+
+        The header follows the same rule as the picker now — has this
+        conversation started, not does a session row exist — so an untitled
+        session gets no chrome until history says it has turns.
+        """
+        js = self._js()
+        opened = js[js.index("async function openSession(") :]
+        opened = opened[: opened.index("_syncAgentPicker();")]
+        assert '"Untitled chat"' not in opened, (
+            "openSession titles every session again, so switching agent on the "
+            "empty dashboard re-enters the conversation layout"
+        )
+        assert "setThreadTitle(meta && meta.title ? meta.title : null);" in opened, (
+            "a session with no title of its own must open without thread chrome"
+        )
+        # …and the chrome is raised from the one place that decides a
+        # conversation has started, so the two cannot drift apart again.
+        helper = js[js.index("function _markConversationStarted()") :]
+        helper = helper[: helper.index("\n}")]
+        assert "setThreadTitle(" in helper, "the header no longer follows the turns flag"
+
+    def test_the_picker_offers_ready_agents_only(self):
+        """A draft is unfinished by its author's own say-so, so it is not
+        something to start a conversation with; /agents is where drafts belong.
+
+        The DEFAULT agent is the one thing this filter must not catch. It is
+        seeded lazily by `get_or_create_default` and carries `status: "draft"`
+        because nobody ever marked it ready — it is never built in the builder
+        at all. Filtering it out would strand anyone who switched to a named
+        agent with no way back to their own default, which is the exact dead
+        end the picker's on-open refresh exists to avoid.
+        """
+        js = self._js()
+        block = js[js.index("async function _refreshAgents()") :]
+        block = block[: block.index("\n}")]
+        assert 'a.status === "ready"' in block, "the picker offers drafts again"
+        assert "a.is_default" in block, (
+            "the default agent is filtered out with the drafts — switching away from it would be one-way"
         )
 
     def test_the_settled_state_names_the_way_out(self):

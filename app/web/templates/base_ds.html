@@ -78,6 +78,10 @@
        layer on top. Don't reorder without reading
        app/web/templates/base.html for context. #}
     <link rel="stylesheet" href="{{ static_url('style-custom.css') }}">
+    {# Loaded unconditionally, but the partial that uses it renders
+       nothing outside LOCAL_DEV_MODE — a stylesheet is cheaper than a
+       conditional include that someone forgets to update. #}
+    <link rel="stylesheet" href="{{ static_url('css/dev_preview.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/design-tokens.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/components.css') }}">
     <link rel="stylesheet" href="{{ static_url('css/stack_card.css') }}">
@@ -215,5 +219,12 @@
     {% for s in custom_scripts | default([]) if s.placement == 'body_end' %}
     {{ s.html | safe }}
     {% endfor %}
+    {# Local-dev audience switch. Last in the body so it sits above the page
+       without any page having to leave room for it, and included from the
+       BASE so it is on every screen — it was previously inline on /chat, and
+       following a link off that page silently dropped the preview. Renders
+       nothing unless LOCAL_DEV_MODE is on. #}
+    {% include "_dev_preview.html" %}
+    <script src="{{ static_url('js/components/dev_preview.js') }}" defer></script>
 </body>
 </html>

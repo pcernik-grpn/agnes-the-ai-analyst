@@ -6202,3 +6202,411 @@ details.section-card > summary {
    emoji we used to inline. Nudge the baseline so an icon sits centered next
    to heading/label text. Block-level empty-state icons ignore this. */
 .ui-ico { vertical-align: -0.18em; }
+
+/* ── Chat landing: admin notice + doors (.cld-*) ─────────────────────────────
+   The chat landing page introduces itself in text now, not in a banner. The
+   Knowledge Layer hero that used to lead this page (`.klb`, still defined
+   above because `.cbn--bar` shares its surface fill) asserted a category and
+   spent the page's best space on a CTA pointing away from the composer; the
+   six-step admin setup panel that briefly replaced it read as onboarding and
+   graduated at the wrong moment. Both are gone. What is left is small on
+   purpose: one fact for an admin with an empty instance, one capability
+   sentence for everyone, and three labelled doors at the foot.
+
+   All `--ds-*` tokens, so every palette theme follows with no override. */
+
+/* The greeting locates the reader; it must not compete with the heading. */
+.cld-greet {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    margin: 0;
+    font-size: 13px; font-weight: 550;
+    color: var(--ds-text-muted);
+}
+/* Time-of-day glyph. BOTH are rendered and `data-tod` shows one, so
+   chat_dashboard.js can correct the time from the browser clock without
+   fetching or building an icon — it flips one attribute and the words and the
+   glyph change together. A sun over "Good evening" is a small wrongness that
+   makes a page feel unattended. */
+.cld-greet-ico { display: none; line-height: 0; opacity: .75; }
+.cld-greet[data-tod="day"] .cld-greet-ico--day,
+.cld-greet[data-tod="night"] .cld-greet-ico--night { display: inline-flex; }
+/* The one factual sentence about what this answers. Constrained to a reading
+   measure and centred with the heading above the composer. */
+.cld-lede {
+    /* The heading and this lede are one thought. `tight`, because the intro
+       column's own flex gap already contributes the other half — the two
+       together land on `inner`, which is the step this pair wants. */
+    margin: var(--cld-gap-tight, 5px) auto 0;
+    max-width: 56ch;
+    font-size: 14.5px; line-height: 1.5;
+    color: var(--ds-text-secondary);
+}
+
+/* ---- The two doors ----
+   Plain labelled links: each says where it goes and what is there, so nothing
+   needs a banner to explain it. Bordered, not filled — the composer is the
+   page's action and these must not compete with it.
+
+   TWO, not three, and BELOW the suggestions rather than above the composer
+   (except on an instance with nothing registered — see the two position blocks
+   below).
+   Three cards between the heading and the input made the reader's first
+   decision on an "ask something" page a choice of which way to leave; and the
+   third card ("How {brand} works") was reference reading given the same weight
+   as setting the instance up. It is a link in the foot now.
+
+   Held to `--cld-doors-w` and centred: at two cards the grid would otherwise
+   stretch them to whatever the chat column is, and a 1100px-wide pair of
+   three-line cards reads as two banners. This is the same measure the lede
+   above the composer uses. */
+.cld-doors {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    /* The EMPTY-INSTANCE position: end of the intro block, above the composer.
+       That column's own 5px flex gap is subtracted so the visible step lands on
+       `block` exactly — without the calc every margin in there reads 5px larger
+       than the token it names, which is how a scale quietly stops being one.
+       (The ordinary position is overridden below; it sits in a container with
+       no gap, so it needs no subtraction.) */
+    margin: calc(var(--cld-gap-block, 26px) - var(--cld-gap-tight, 5px)) auto 0;
+    /* The shared secondary measure — same edges as the chip row above. */
+    max-width: var(--cld-measure, 660px);
+    text-align: left;
+}
+.cld-door {
+    position: relative;
+    display: flex; flex-direction: column; gap: 3px;
+    /* Top-aligned, not centred. With three cards the grid stretched all of them
+       to the tallest and centring spent the slack on both sides; at two cards
+       of near-equal height the slack is small, and top alignment is what keeps
+       the two titles on one line as the eye crosses between them. */
+    justify-content: flex-start;
+    padding: 15px 16px;
+    /* TRANSPARENT, not `none`: the border is gone to the eye, but its 1px stays
+       in the box so the two cards keep their metrics and nothing shifts by 2px
+       when one of them lifts. A resting outline on a card whose only job is to
+       be one of two quiet doors was drawing a box around something that needed
+       no boxing — the surface already separates it from the page. */
+    border: 1px solid transparent;
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--ds-surface) 70%, transparent);
+    text-decoration: none;
+    transition: box-shadow var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease),
+                background var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+/* A card with no surface of its own needs an EDGE. Keyed on the absence of
+   `--lead` rather than named per card, because that is the actual rule: the
+   tinted card is held off the page by its own fill and an outline on top of it
+   is a box around something already separated, while the plain card's fill is
+   70% surface — nearly the page — so with no border at all it stops reading as
+   a card and its content floats. Subtle enough to be an edge and not a frame:
+   the hover lift below is still what answers the pointer. */
+.cld-door:not(.cld-door--lead) {
+    border-color: color-mix(in srgb, var(--ds-border) 62%, transparent);
+}
+
+/* Hover is a LIFT, not an outline. One channel, so the two cards answer the
+   pointer identically whatever surface each carries. */
+.cld-door:hover {
+    box-shadow:
+        0 1px 2px color-mix(in srgb, var(--ds-text-primary) 5%, transparent),
+        0 18px 38px -24px color-mix(in srgb, var(--ds-primary) 50%, transparent);
+}
+.cld-door-t {
+    font-size: 13.5px; font-weight: 650; letter-spacing: -0.01em;
+    color: var(--ds-text-primary);
+}
+.cld-door-d {
+    font-size: 12px; line-height: 1.4;
+    color: var(--ds-text-muted);
+}
+.cld-door-tools { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.cld-door-tools img { display: block; object-fit: contain; opacity: .8; }
+
+/* ---- Lead-card layout: a marker column, then the words ----
+   The setup card's ring and the other cards' icon tile occupy the same slot, so
+   the pair lines up whichever variant renders. `align-items: flex-start` rather
+   than centre: the marker belongs beside the TITLE, and centring it against a
+   three-line body floats it opposite the description instead. */
+/* Marker column, then the words. Carried by its OWN class, not by
+   `--lead`: the tinted surface below and this layout are different decisions,
+   and the tools card wants the second without the first. */
+.cld-door--split {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 13px;
+}
+.cld-door-bd {
+    display: flex; flex-direction: column; gap: 3px;
+    min-width: 0;
+}
+
+/* The corner mark — what KIND of move this card is, in the one spot that costs
+   no line of text. `arrow-up-right` on a door that hands you off elsewhere,
+   `layers` on the one that is about your own instance. Muted at rest so it is
+   available rather than announced; it takes the accent when the card is live. */
+/* Two classes deep on purpose: `.cld-door--lead > *` below sets every child
+   `position: relative` (to lift them over the card's layered ::before fill), and
+   at equal specificity that later rule would win and drop this mark back into
+   the flex row. */
+.cld-door .cld-door-mark {
+    position: absolute;
+    top: 13px; right: 13px;
+    z-index: 2;
+    line-height: 0;
+    color: var(--ds-text-muted);
+    opacity: .8;
+    transition: color var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+.cld-door:hover .cld-door-mark { color: var(--ds-primary); }
+
+/* ---- The setup progress ring ----
+   Replaces "3 of 6 steps done" as a sentence. Same fact, read at a glance
+   instead of parsed, and the number sits where the eye lands first rather than
+   at the end of a link.
+
+   Server-rendered, unlike the rail's copy of this ring: `admin_setup` already
+   knows both halves of the fraction here, so there is no frame on which this
+   shows the wrong number. */
+.cld-ring {
+    position: relative;
+    flex-shrink: 0;
+    width: 46px; height: 46px;
+    display: grid; place-items: center;
+}
+.cld-ring-svg {
+    grid-area: 1 / 1;
+    width: 100%; height: 100%;
+    /* Starts the arc at 12 o'clock instead of SVG's default 3 o'clock. */
+    transform: rotate(-90deg);
+}
+/* Stroke width is in viewBox units (36 wide, rendered at 46px), so 3.5 here is
+   ~4.5 real px — heavy enough to read as a meter rather than as a decorative
+   circle, which is the whole job of this element. */
+.cld-ring-track { fill: none; stroke: var(--ds-border); stroke-width: 3.5; }
+.cld-ring-fill {
+    fill: none;
+    stroke: var(--ds-primary);
+    stroke-width: 3.5;
+    stroke-linecap: round;
+}
+/* The fraction, inside the ring. Tabular figures so 3/6 and 4/6 do not shift
+   width and nudge the ring's centre as the count changes. */
+.cld-ring-num {
+    grid-area: 1 / 1;
+    font-size: 12px; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    color: var(--ds-text-primary);
+}
+
+/* ---- The lead card's SURFACE ----
+   The first door is audience-dependent — "Set up Agnes" for an admin and
+   "See what Agnes knows" for everyone else — and either way it is the one
+   move this reader has before they start asking. So it gets the weight, and both
+   variants get the SAME weight: they are one slot rendered twice, not two
+   cards that happen to sit in the same place.
+
+   ONLY that slot. The tools card is a peer in layout and type (see
+   `.cld-door--split`) but takes the plain `.cld-door` surface: this fill means
+   "this is Agnes itself", and spending it on both cards made the pair a band of
+   tinted panels with nothing to distinguish the card that is about your own
+   instance from the one that points at your editor.
+
+   The surface is the Knowledge Layer banner's, reused rather than imitated —
+   `.klb`'s own layered fill scaled to card size. That banner is where the
+   product's visual language for "this is Agnes itself" was set, so the card
+   that speaks for Agnes should paint the same thing. Every layer rides
+   `--ds-surface` or a color-mix into it, which is what lets one rule follow
+   every palette theme with no dark-mode override. */
+.cld-door--lead {
+    position: relative;
+    overflow: hidden;
+    background:
+        radial-gradient(70% 130% at 88% 8%, color-mix(in srgb, var(--ds-kind-agent) 9%, transparent), transparent 62%),
+        radial-gradient(64% 130% at 4% 94%, color-mix(in srgb, var(--ds-primary) 11%, transparent), transparent 62%),
+        radial-gradient(96% 150% at 50% -24%, color-mix(in srgb, var(--ds-assistant) 8%, transparent), transparent 64%),
+        linear-gradient(108deg,
+            color-mix(in srgb, var(--ds-agnes) 6%, var(--ds-surface)) 0%,
+            var(--ds-surface) 50%,
+            color-mix(in srgb, var(--ds-kind-agent) 6%, var(--ds-surface)) 100%);
+}
+/* The banner's dotted field, in the corner the icon does not occupy. Drawn in
+   a pseudo-element so the card needs no decorative markup — there is nothing
+   here for a reader to reach, and a real element would be one more thing for
+   the template to carry. */
+.cld-door--lead::before {
+    content: "";
+    position: absolute; right: 0; top: 0; width: 132px; height: 96px;
+    background-image: radial-gradient(color-mix(in srgb, var(--ds-primary) 30%, transparent) 1.2px, transparent 1.3px);
+    background-size: 15px 15px;
+    -webkit-mask-image: linear-gradient(232deg, rgba(0, 0, 0, .5), transparent 70%);
+    mask-image: linear-gradient(232deg, rgba(0, 0, 0, .5), transparent 70%);
+    opacity: .5;
+    pointer-events: none;
+}
+/* …and everything real sits above it. */
+.cld-door--lead > * { position: relative; z-index: 1; }
+
+/* The title is solid accent ink, NOT the banner's blue→purple gradient — that
+   was tried here and does not survive the themes at this size.
+   `.klb-headline-grad` runs `--ds-assistant` → `--ds-kind-agent`: fine on a
+   30px/760 headline, which only owes 3:1, and wrong on a 14.5px card title,
+   which owes 4.5:1. `--ds-assistant` is 4.1:1 on the paper surface, and under
+   `data-theme="dark"` `--ds-kind-agent` collapses to 2.4:1 — so the right end
+   of the gradient would be unreadable. No pair of existing accent tokens
+   clears 4.5:1 in BOTH themes, and a per-theme override for one flourish is
+   not what it is worth. `--ds-primary-dark` is 5.9:1 on paper and 5.7:1 in
+   dark; the banner's character is carried by this card's surface, halo and
+   dotted field, none of which have this problem. */
+.cld-door--split .cld-door-t {
+    font-size: 14.5px;
+    letter-spacing: -0.02em;
+    color: var(--ds-primary-dark, var(--ds-primary));
+    /* Clears the corner mark, so a two-word title cannot run under it. */
+    padding-right: 20px;
+}
+.cld-door--split .cld-door-d { color: var(--ds-text-secondary); }
+
+/* The whole-card link still owes the reader a hover. The setup variant opts
+   back out below — it is not a link. */
+/* No hover rule of its own: `.cld-door:hover` above is the one lift, shared by
+   both cards. This used to add a border tint on top of it, which is the whole
+   thing being removed. */
+
+/* The admin's "Set up {brand}" card — the ONE action an admin has on this page.
+   The hero used to carry a chip and a checklist link as well; three routes into
+   one job meant choosing between them before doing any of it, so the card is
+   now the whole offer and holds a real button.
+
+   It is a block rather than a whole-card link (it contains that button), and it
+   is styled apart from its two neighbours because it is a different KIND of
+   thing: a job this reader owns, not a place to browse. Tinted fill, accent
+   edge, its own icon, and the button carries the weight — on an unset-up
+   instance this is the most important element on the page. */
+/* No rules of its own any more. It used to be the one card that was NOT a
+   link — a <div> holding an <a> — so it had to suppress the hover the others
+   offer and sit at `cursor: default`, leaving the reader a 13px line of text to
+   aim at. It is a whole-card link like its neighbours now, and takes
+   `.cld-door--lead`'s surface and hover unchanged. */
+/* The icon tile, with the orb's soft halo behind it rather than a flat chip —
+   the banner's one gesture that survives being shrunk to 32px. */
+.cld-door-ico {
+    display: inline-grid; place-items: center;
+    flex-shrink: 0;
+    /* The RING's exact slot, so every card's text column starts on the same
+       line whichever leading mark it carries. It was 40px against the ring's
+       46px, which left the two titles 6px out of step — invisible as a number
+       and perfectly visible as two cards that don't quite align. No bottom
+       margin any more: it sits BESIDE the words now, not above them. */
+    width: 46px; height: 46px;
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--ds-primary) 13%, var(--ds-surface));
+    color: var(--ds-primary-dark, var(--ds-primary));
+    box-shadow:
+        0 0 0 4px color-mix(in srgb, var(--ds-primary) 6%, transparent),
+        0 6px 14px -8px color-mix(in srgb, var(--ds-primary) 45%, transparent);
+}
+
+/* The brand-orb variant of that slot: same 40px box, so the pair still lines
+   up, but no chip and no halo. The fill and glow exist to give a monochrome
+   line glyph something to sit on; the orb brings its own colour and edge, and
+   wrapping it in a tinted square puts a badge around a badge. */
+.cld-door-ico--orb {
+    background: none;
+    box-shadow: none;
+}
+.cld-door-orb {
+    display: block;
+    /* The PNG is 256x256, so it stays crisp at this size on retina. */
+    width: 32px; height: 32px;
+}
+
+/* The card's action. Primary while there is nothing registered (the page's one
+   real move); a quiet text link once the instance is running, where it reports
+   progress rather than urging anything. */
+.cld-door-btn {
+    align-self: flex-start;
+    margin-top: 10px;
+    padding: 8px 14px;
+    border-radius: var(--ds-radius-pill, 999px);
+    background: var(--ds-primary); color: var(--ds-text-inverse);
+    font-size: 13px; font-weight: 650; text-decoration: none;
+    box-shadow: 0 8px 18px -10px color-mix(in srgb, var(--ds-primary) 55%, transparent);
+    transition: background var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease),
+                transform var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+/* Hover comes from the CARD, not the span: the whole card is the hit area, so
+   a fill that only lit when the pointer was over the last 100px of text would
+   say the wrong thing about what is clickable.
+
+   `:not(--quiet)` is load-bearing. Without it this rule outranks
+   `.cld-door-btn--quiet { background: none }` — one class deeper — so hovering
+   the card painted the quiet text link with the PRIMARY fill: "Continue setup"
+   turned into a dark blue blob with an underline through it. The quiet variant
+   is a text link and stays one in every state. */
+.cld-door:hover .cld-door-btn:not(.cld-door-btn--quiet) { background: var(--ds-primary-dark); }
+.cld-door:active .cld-door-btn:not(.cld-door-btn--quiet) { transform: translateY(1px); }
+.cld-door-btn--quiet {
+    padding: 0;
+    margin-top: 8px;
+    background: none; box-shadow: none;
+    color: var(--ds-primary);
+    font-size: 12.5px; font-weight: 650;
+}
+.cld-door-btn--quiet:hover { background: none; text-decoration: underline; }
+/* The quiet action is a <span> inside a card-wide link on every variant, so it
+   never receives :hover itself — the card does, and hands it down. */
+.cld-door:hover .cld-door-btn--quiet { text-decoration: underline; }
+
+/* ---- The foot ----
+   The trust claim and the one piece of reference reading that used to be a
+   third card. Both are consulted rather than acted on, so they share one quiet
+   line under everything else, separated by a hairline rather than a bullet —
+   they are two different kinds of statement, not two items in a list. */
+.cld-trust {
+    display: flex; align-items: center; justify-content: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    /* Closes the block under the cards, so `inner` — it belongs to them rather
+       than standing as a region of its own, and it travels with them between the
+       two positions. Same flex-gap subtraction as `.cld-doors` above for the
+       empty-instance position; overridden below for the ordinary one. */
+    margin: calc(var(--cld-gap-inner, 10px) - var(--cld-gap-tight, 5px)) 0 0;
+}
+.cld-trust .klb-hub-caption { justify-content: center; }
+.cld-trust-sep {
+    width: 1px; height: 13px;
+    background: var(--ds-border);
+}
+.cld-trust-link {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--ds-text-muted);
+    font-size: 12.5px; font-weight: 550;
+    text-decoration: none;
+    transition: color var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
+}
+.cld-trust-link:hover { color: var(--ds-primary); text-decoration: underline; }
+
+/* ---- The ORDINARY position ----
+   Same two cards and the same trust line, rendered after the suggestions
+   instead of before the composer — where they sit for admin and member alike
+   on any instance that has data (see chat.html; the empty instance is the one
+   exception). `#chat-empty-extras` has no flex gap of its own, so these take
+   the tokens straight: a full `section` step above the cards — the page's one
+   real boundary, here between asking and the ways out — and `inner` under them
+   for the line that closes the block. */
+#chat-empty-extras .cld-doors {
+    margin-top: var(--cld-gap-section, 40px);
+}
+#chat-empty-extras .cld-trust {
+    margin-top: var(--cld-gap-inner, 10px);
+}
+
+@media (max-width: 820px) {
+    .cld-doors { grid-template-columns: minmax(0, 1fr); }
+    /* The separator is a horizontal device; stacked, it reads as a stray tick. */
+    .cld-trust-sep { display: none; }
+}
+

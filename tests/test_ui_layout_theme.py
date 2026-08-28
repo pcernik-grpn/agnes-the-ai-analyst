@@ -610,14 +610,24 @@ class TestRailOptIn:
         assert resp.status_code == 200
         text = resp.text
         assert 'class="cc-btn ag-del-btn" data-ag-del=' in text
-        # Left of the status button, inside the builder's action group.
-        actions = text.index('<div class="ag-build-actions">')
-        assert actions < text.index('class="cc-btn ag-del-btn"') < text.index("data-ag-status")
+        # Left of the status button, in the header branch that renders an
+        # EXISTING agent's actions. Scoped to that branch on purpose: the
+        # new-agent branch above it also mentions data-ag-status, so a
+        # whole-file index comparison measures source order, not screen order.
+        fn = re.search(r"function headActionsHtml\(a\) \{(.*?)\n  \}", text, re.S)
+        assert fn, "headActionsHtml not found"
+        existing = fn.group(1).rsplit("return statusPill(a) +", 1)[-1]
+        assert existing.index('class="cc-btn ag-del-btn"') < existing.index("data-ag-status")
         # Confirms only for the builder button; the list card is unchanged.
         assert "window.confirm(" in text
         assert "t.classList.contains('ag-del-btn')" in text
-        # A pending debounced PATCH must not outlive the row it would write to.
-        assert "clearTimeout(saveTimers[id]);" in text
+        # Delete is for an agent that EXISTS. A never-saved placeholder shows
+        # "Save as draft" instead and is discarded by leaving — offering both
+        # would be two buttons for one outcome.
+        assert "if (isNewAgent) {" in text
+        # Deleting the open agent must clear the builder's editing state, or
+        # the next open compares against a dead row's baseline.
+        assert "baseline = null; isNewAgent = false;" in text
 
     def test_agents_page_has_no_default_agent_card(self, web_client, admin_cookie, monkeypatch):
         """/agents lists the caller's OWN agents only — the always-on baseline
@@ -748,14 +758,18 @@ class TestRailChatHistory:
         assert "Your Journey" not in text
         assert "Get started" not in text
         assert "rail-getstarted-check" not in text
-        # The row CLOSES the bottom zone: under Admin, above the profile.
-        row_pos = text.find('class="rail-getstarted"')
-        assert text.find('class="rail-admin"') < row_pos < text.find('class="rail-foot"'), (
-            "the onboarding row belongs under Admin, above the profile"
-        )
-        # ...and the foot below it is the profile alone.
+        # The row lives in the FOOT — the zone that survives collapse — under
+        # "Use Agnes elsewhere" and above the profile. It is not part of the
+        # nav proper: setup is a thing you finish and stop seeing, so it sits
+        # with the other always-reachable rows rather than among destinations.
         foot = text.split('class="rail-foot"', 1)[1]
-        assert "rail-getstarted" not in foot
+        row_pos = foot.find('class="rail-getstarted"')
+        assert row_pos != -1, "the onboarding row belongs in the rail foot"
+        assert foot.find('href="/how-it-works#connect"') < row_pos < foot.find('id="userMenu"'), (
+            "the onboarding row belongs under 'Use Agnes elsewhere', above the profile"
+        )
+        # …and nothing left it behind in the collapsible nav above.
+        assert "rail-getstarted" not in text.split('class="rail-foot"', 1)[0]
         # The journey render target moved into the popover — and out of the list.
         journey_pos = text.find('id="chat-journey"')
         panel_pos = text.find('id="rail-getstarted-panel"')
@@ -854,98 +868,99 @@ class TestRailChatHistory:
         resp = web_client.get("/library", cookies=admin_cookie)
         assert 'id="rail-restart-onboarding"' not in resp.text
 
-    def test_pinned_and_chats_are_two_collapsible_sections(self, web_client, admin_cookie, monkeypatch):
-        """Pinned is its OWN section, above Chats, and either can be put away.
+    def test_the_conversation_zone_is_one_unlabelled_list(self, web_client, admin_cookie, monkeypatch):
+        """ONE list: pinned rows first, then the feed, then the row that closes
+        it. No section labels, no disclosures, no seam.
 
-        The two lists answer different questions — a curated shelf vs. a
-        chronological feed — and as sibling groups in one list they could only be
-        told apart by a header that scrolled away, with neither one closable. So:
-        a section each, Pinned first, each with a disclosure and its own list."""
+        Two <section>s survive because there are two RENDER TARGETS — chat.js and
+        rail_history.js both route pinned rows to their own <ul> — but nothing may
+        make them read as two lists. "Pinned" and "Recent" were a <button> with a
+        caret, then an inert <h2>, and are now gone entirely: a pinned row is
+        marked by its pin glyph, and that the feed is a slice is said by the
+        "View all chats" row at the bottom, where a caller who has run out of rows
+        is already looking."""
         self._enable_chat(web_client, monkeypatch)
         text = web_client.get("/library", cookies=admin_cookie).text
         rail = text.split('<nav class="rail"', 1)[1].split("</nav>", 1)[0]
 
-        # Anatomy of each section: a labelled disclosure button wired to its own
-        # body, and a list of its own.
-        # "Recent", not "Chats": the feed is a capped slice with "View all chats"
-        # under it, and a section labelled "Chats" over a slice would make that
-        # link read as a second route to the same list.
-        for sec, toggle, body, label in (
-            ("rail-pinned", "rail-pinned-toggle", "rail-pinned-body", "Pinned"),
-            ("rail-chats", "rail-chats-toggle", "rail-chats-body", "Recent"),
-        ):
+        # Both render targets are present…
+        for sec, body in (("rail-pinned", "rail-pinned-body"), ("rail-chats", "rail-chats-body")):
             assert f'id="{sec}"' in rail
-            assert f'id="{toggle}"' in rail
-            assert f'aria-controls="{body}"' in rail, f"{toggle} must point at its own body"
             assert f'id="{body}"' in rail
-            assert f'<span class="rail-chatsec-txt">{label}</span>' in rail
-        # Both start expanded server-side; rail_history.js applies the persisted
-        # state before any rows arrive.
-        assert rail.count('aria-expanded="true"') >= 2
-        # Two lists, and the chat page's ids are still the ones the renderers
-        # bind to (chat.js owns #chat-list on /chat unchanged).
         assert 'id="pinned-chat-list"' in rail
         assert 'id="chat-list"' in rail
-        # Pinned above Chats, and the empty state lives in Chats (the section
-        # that survives a first run) rather than between them.
-        assert rail.find('id="rail-pinned"') < rail.find('id="rail-chats"') < rail.find('id="cloud-chat-empty-state"')
-        # Pinned starts hidden — a "Pinned" header over nothing is dead chrome,
-        # so a renderer unhides it only once it has rows.
+        # …and nothing labels or separates them.
+        for gone in (
+            "rail-chatsec-txt",
+            "rail-chatsec-hd",
+            ">Pinned<",
+            ">Recent<",
+            'id="rail-pinned-toggle"',
+            'id="rail-chats-toggle"',
+            "rail-chatsec-caret",
+            'aria-controls="rail-pinned-body"',
+            'aria-controls="rail-chats-body"',
+        ):
+            assert gone not in rail, f"the zone must read as one plain list ({gone})"
+        # No gap either — a margin between the two would seam one list in half.
+        css = web_client.get("/static/css/rail.css").text
+        gap = css.split('html[data-ui-layout="rail"] .rail-chatsec + .rail-chatsec {', 1)[1].split("}", 1)[0]
+        assert "margin-top: 0" in gap
+        # Pinned leads, the empty state lives in the feed (the section that
+        # survives a first run), and the "more" row closes the whole thing.
+        assert (
+            rail.find('id="rail-pinned"')
+            < rail.find('id="rail-chats"')
+            < rail.find('id="cloud-chat-empty-state"')
+            < rail.find('class="rail-history-all"')
+        )
+        # Pinned starts hidden — with no label to head it, an empty section would
+        # still contribute stray padding. Emptiness is the ONLY conditional left.
         pinned_open = rail[rail.find('<section class="rail-chatsec" id="rail-pinned"') :][:120]
         assert " hidden" in pinned_open, "the Pinned section must start hidden"
 
-    def test_chat_section_headers_are_labels_not_rows(self, web_client, admin_cookie, monkeypatch):
-        """The headers keep the group-label voice they were promoted from —
-        10.5px/700 uppercase muted ink — and stay LABELS: no background in any
-        state, no border, no divider.
+    def test_the_zone_has_no_section_headers_at_all(self, web_client, admin_cookie, monkeypatch):
+        """There is no section label left to style, so there must be no rules for
+        one — and the "more" row must be a ROW, sharing the conversation row's
+        box rather than sitting under the list as a footer.
 
-        This is the rail's colour rule, not taste (see
+        This is the rail's colour rule doing the work (see
         test_accent_marks_where_you_are_and_nothing_else): the accent marks the
-        active conversation and the neutral wash marks hovering an actual row, so
-        a header that filled on hover would read as a selectable row. Ink is the
-        one channel still free, so hover spends that."""
+        active conversation, the neutral wash marks hovering a row. The closing
+        row takes the wash, because it IS a row you hover and click; what
+        separates it from a conversation is ink and weight, not a treatment of
+        its own."""
         css = web_client.get("/static/css/rail.css").text
+        # Every trace of the retired labels and their disclosure.
+        for gone in (
+            'html[data-ui-layout="rail"] .rail-chatsec-hd {',
+            'html[data-ui-layout="rail"] .rail-chatsec-hd:hover {',
+            'html[data-ui-layout="rail"] .rail-chatsec-hd:focus-visible {',
+            'html[data-ui-layout="rail"] .rail-chatsec-txt {',
+            'html[data-ui-layout="rail"] .rail-chatsec-caret {',
+            "rail-chatsec.is-collapsed",
+            "rail-chatsec-hd-wrap",
+            "rail-chatsec-count",
+        ):
+            assert gone not in css, f"there are no section labels ({gone})"
 
-        def block_for(selector):
-            return css.split(selector, 1)[1].split("}", 1)[0]
+        row = css.split('html[data-ui-layout="rail"] .rail-history-all {', 1)[1].split("}", 1)[0]
+        # The conversation row's own metrics — same height ladder, left edge and
+        # radius, so the list has no seam before its last entry.
+        assert "min-height: var(--rail-row-h)" in row
+        assert "padding: 4px 9px" in row
+        assert "border-radius: 8px" in row
+        # Quieter than a conversation, which is the only thing marking it as the
+        # end of the list rather than another entry in it.
+        assert "color: var(--ds-text-muted)" in row
+        hover = css.split('html[data-ui-layout="rail"] .rail-history-all:hover {', 1)[1].split("}", 1)[0]
+        assert "background: var(--rail-hover-bg)" in hover, "it is a row, so it takes the row wash"
 
-        hd = block_for('html[data-ui-layout="rail"] .rail-chatsec-hd {')
-        assert "background: none" in hd
-        assert "border: none" in hd
-        assert "border-top" not in hd and "border-bottom" not in hd
-        assert "color: var(--ds-text-muted)" in hd
-        # Left edge shared with the conversation titles below (rows: `padding:
-        # 4px 9px`) — a section label indented differently from its own list
-        # reads as a misalignment in a 240px column.
-        assert "9px" in hd
-        hover = block_for('html[data-ui-layout="rail"] .rail-chatsec-hd:hover {')
-        assert "color: var(--ds-text-secondary)" in hover
-        assert "background" not in hover, "a filled header would read as a row"
-        txt = block_for('html[data-ui-layout="rail"] .rail-chatsec-txt {')
-        assert "font-size: 10.5px" in txt
-        assert "font-weight: 700" in txt
-        assert "text-transform: uppercase" in txt
-        # The caret annotates the label, so it sits against it — not flushed to
-        # the rail's right edge, where it read as a second column of controls
-        # beside the conversation rows' own "⋮". No count rides out there either.
-        caret = block_for('html[data-ui-layout="rail"] .rail-chatsec-caret {')
-        assert "margin-left: auto" not in caret
-        assert "rail-chatsec-count" not in css
-        # Keyboard reachability — it is a real <button>, so it must show focus.
-        assert "outline: var(--ds-focus-outline)" in block_for(
-            'html[data-ui-layout="rail"] .rail-chatsec-hd:focus-visible {'
-        )
-        # Whitespace separates the sections; the rail's only nav divider is
-        # Admin's (test_admin_is_the_only_divided_group).
-        gap = block_for('html[data-ui-layout="rail"] .rail-chatsec + .rail-chatsec {')
-        assert "margin-top" in gap
-        assert "border" not in gap
-
-    def test_any_date_boundary_stays_subordinate_to_the_section_label(self, web_client, admin_cookie, monkeypatch):
-        """A date boundary ("Older") lives INSIDE a section, so it cannot wear the
-        same uppercase-700 label voice as that section's own header — two labels
-        of equal weight nested one inside the other read as siblings, i.e. as two
-        sections with the rows above the second one orphaned.
+    def test_any_date_boundary_stays_quieter_than_a_conversation(self, web_client, admin_cookie, monkeypatch):
+        """A date boundary ("Older") is the only label this zone can still grow,
+        now that the section headers are gone. It must not arrive wearing the
+        uppercase-700 voice they used: one list with a single loud label in the
+        middle of it reads as two lists, which is the seam this zone just removed.
 
         Conditional on the rail styling date headers at all: whether a capped
         feed is short enough to need no date labels is a separate call, and this
@@ -959,26 +974,30 @@ class TestRailChatHistory:
         assert "letter-spacing: 0" in block
         assert "font-weight: 600" in block
 
-    def test_section_collapse_is_persisted(self, web_client, admin_cookie, monkeypatch):
-        """One owner for the section chrome — rail_history.js, loaded on every
-        rail page INCLUDING /chat (where chat.js owns only the rows, and calls in
-        through window.railChatSections).
+    def test_sections_have_no_collapse_state_to_persist(self, web_client, admin_cookie, monkeypatch):
+        """There is ONE owner for the section chrome — rail_history.js, loaded on
+        every rail page INCLUDING /chat (where chat.js owns only the rows, and
+        calls in through window.railChatSections) — and exactly one thing left for
+        it to decide: which of the two sections renders, from how many rows each
+        holds.
 
-        The open state survives navigation: a disclosure that forgets what you
-        did to it on every page load reads as broken, and the choice ("I live in
-        my pins") is about how the caller works, not about the page they're on."""
+        The disclosure is gone, so the per-section open flag it persisted is gone
+        with it. Nothing about this region belongs in localStorage any more, and a
+        `is-collapsed` class or an `aria-expanded` on a heading would be state
+        with no control to set it."""
         js = web_client.get("/static/js/rail_history.js").text
-        assert "agnes.rail.chatsec." in js, "the open state must be persisted per section"
-        assert "localStorage.setItem" in js and "localStorage.getItem" in js
-        # Default OPEN: only an explicit "0" closes a section, so a first-time
-        # caller never has to discover a disclosure to see their chats.
-        assert '!== "0"' in js
-        assert 'setAttribute("aria-expanded"' in js
         assert "window.railChatSections" in js, "chat.js needs a seam to re-sync after a render"
         chat_js = web_client.get("/static/js/chat.js").text
         assert "window.railChatSections" in chat_js, "/chat must re-sync the sections it re-renders"
+        # The emptiness rule is the survivor: Pinned only with rows, Recent
+        # standing down only when pins exist and the feed is empty.
+        assert "pinned-chat-list" in js and "sec.hidden" in js
+        # No persisted open/closed state, and no disclosure wiring.
+        assert "agnes.rail.chatsec." not in js, "there is no collapse state to persist"
+        for gone in ("isSecOpen", "rail-pinned-toggle", "rail-chats-toggle", "is-collapsed"):
+            assert gone not in js, f"the disclosure is retired ({gone})"
         css = web_client.get("/static/css/rail.css").text
-        assert 'html[data-ui-layout="rail"] .rail-chatsec.is-collapsed .rail-chatsec-caret {' in css
+        assert "rail-chatsec.is-collapsed" not in css
 
     def test_rail_history_absent_without_chat_grant(self, web_client, admin_cookie, monkeypatch):
         """No chat reachability → no history section, no New chat item, no
@@ -1029,9 +1048,10 @@ class TestRailTwoZones:
             'href="/library"',
             'href="/agents"',
             'class="rail-admin"',  # ...Admin behind a divider
-            'class="rail-getstarted"',  # ...then the onboarding card
-            'class="rail-foot"',
-            'id="userMenu"',  # profile, at the very bottom
+            'class="rail-foot"',  # zone 3 — always reachable, never collapsed
+            'href="/how-it-works#connect"',  # …take Agnes elsewhere,
+            'class="rail-getstarted"',  # …then the onboarding row,
+            'id="userMenu"',  # …then profile, at the very bottom
         ]
         positions = [rail.find(anchor) for anchor in sequence]
         assert -1 not in positions, [a for a, p in zip(sequence, positions) if p == -1]
@@ -1187,10 +1207,10 @@ class TestRailTwoZones:
         contract is: a cap, and a DESTINATION — never a second state of this
         list. The two-state machinery stays retired in CSS and in JS.
 
-        The destination used to be `.rail-history-all`, a link at the foot of the
-        region. It is the Chats row above the lists now, and the old rules must
-        not come back: a way to a page cannot live inside the one part of the rail
-        that collapse hides."""
+        The destination is `.rail-history-all`, a link at the foot of the region,
+        with the Chats row in the nav zone as its COLLAPSED form — the link is
+        inside the part of the rail that collapse hides, so the icon row stands in
+        there and neither is ever conditional on having used it."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         css = web_client.get("/static/css/rail.css").text
         body = css.split('html[data-ui-layout="rail"] .rail-history-body {', 1)[1].split("}", 1)[0]
@@ -1211,27 +1231,38 @@ class TestRailTwoZones:
         assert "applyTruncation()" not in js
         # The cap itself, and its destination.
         assert "slice(0, RAIL_RECENT_LIMIT)" in js
-        # The foot-of-the-list link is gone from BOTH sheets and the renderer —
-        # the Chats row (a `.rail-i`) is the destination now.
-        assert 'html[data-ui-layout="rail"] .rail-history-all {' not in css
-        assert "rail-view-all-chats" not in js
+        # The destination is the foot-of-the-list link, and it is STATIC markup:
+        # the renderer has no say in whether it shows, which is what made the
+        # first version of it unreachable on a first run.
+        assert 'html[data-ui-layout="rail"] .rail-history-all {' in css
+        assert "rail-history-all" not in js, "the link must not be conditional on a render"
 
 
 class TestRailChatsDestination:
-    """Chats is a DESTINATION ROW in the rail, and every rail row has an icon.
+    """/chats is reachable at BOTH rail widths, and every rail row has an icon.
 
     These two facts are one contract. The rail collapses to a 56px glyph strip —
     by default on /admin — so a row with no icon is a row that DISAPPEARS when it
-    collapses. That is exactly how the way to /chats went missing: the whole
+    collapses. That is exactly how the way to /chats went missing once: the whole
     conversation region is text (two section labels plus titles), its only door
     out was a "View all chats" link inside it, and that link was itself hidden
     until the caller had a conversation. On an admin page the product therefore
     had NO path to the chat list, and on a first run it had none anywhere.
 
-    So: /chats is a `.rail-i` with a glyph, in the nav zone beside New chat; the
-    conversation lists are content underneath it; and the icon rule is asserted
-    directly, because the next text-only row would reintroduce the same bug in a
-    different place."""
+    Both halves are answered, and by different things:
+
+      • EXPANDED — the lists are on screen and "View all chats" closes them. It
+        is static markup now, so a first run gets the link with an empty list.
+      • COLLAPSED — the lists cannot render in a glyph strip, so `#nav-chats`
+        stands in for the whole zone: a `.rail-i` with a speech bubble, folded
+        away again (`.rail-i--collapsed-only`) the moment the rail opens, so the
+        two are never on screen together.
+
+    On an ADMIN page the lists are not rendered at all, so the row keeps its
+    place at every width — there is nothing there for it to hand off to.
+
+    The icon rule is asserted directly, because the next text-only row would
+    reintroduce the same bug in a different place."""
 
     def _enable_chat(self, web_client, monkeypatch) -> None:
         """Same recipe as TestRailHistory's — chat enabled AND an explicit grant
@@ -1277,14 +1308,44 @@ class TestRailChatsDestination:
         row = zone[zone.index('id="nav-chats"') - 200 : zone.index('id="nav-chats"')]
         assert "rail-i " in row or 'rail-i"' in row
 
-    def test_the_foot_of_the_list_link_is_gone_everywhere(self, web_client, admin_cookie, monkeypatch):
+    def test_the_two_forms_of_the_destination_are_exact_complements(self, web_client, admin_cookie, monkeypatch):
+        """Expanded shows the link; collapsed shows the row; never both, never
+        neither. The row's fold is what enforces "never both", and its DEFAULT
+        must be folded — so it has to be declared outside the icon-strip media
+        query, or the row would stand above the lists below 1025px, where there
+        is no icon mode to fold it."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
-        assert "rail-view-all-chats" not in self._rail(web_client, admin_cookie)
+        rail = self._rail(web_client, admin_cookie)
+        # Both forms are in the markup; CSS decides which one is on screen.
+        assert '<a class="rail-history-all" href="/chats">View all chats</a>' in rail
+        assert 'id="nav-chats"' in rail
+        assert "rail-i--collapsed-only" in rail
+
         css = web_client.get("/static/css/rail.css").text
-        assert ".rail-history-all {" not in css
-        js = web_client.get("/static/js/rail_history.js").text
-        assert "rail-view-all-chats" not in js
+        assert 'html[data-ui-layout="rail"] .rail-history-all {' in css
+        # The folded default, OUTSIDE the min-width media query.
+        base_sel = 'html[data-ui-layout="rail"] .rail .rail-i--collapsed-only {'
+        assert base_sel in css
+        strip = css.split("@media (min-width: 1025px)", 1)
+        assert base_sel in strip[0], "the folded default must hold below 1025px too"
+        base = css.split(base_sel, 1)[1].split("}", 1)[0]
+        assert "height: 0" in base
+        assert "visibility: hidden" in base
+        # …and the icon strip is the one exception that unfolds it.
+        unfold = css.split('html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only {', 1)[1].split(
+            "}", 1
+        )[0]
+        assert "height: var(--rail-row-h)" in unfold
+        assert "visibility: visible" in unfold
+        # A peeked rail is showing the lists, so the stand-in folds again.
+        peek = css.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
+            ":is(:hover, :focus-within) .rail-i--collapsed-only {",
+            1,
+        )[1].split("}", 1)[0]
+        assert "height: 0" in peek
+        assert "visibility: hidden" in peek
 
     def test_admin_pages_get_the_destination_but_not_the_lists(self, web_client, admin_cookie, monkeypatch):
         """The one place the rail's item set differs by context, and it differs in
@@ -1455,68 +1516,212 @@ class TestRailDashboard:
             "sub-pixel scrollbar on the caption/heading block is back"
         )
 
-    def test_rail_chat_renders_dashboard_empty_state(self, web_client, admin_cookie, monkeypatch):
+    @staticmethod
+    def _tables_registered(monkeypatch):
+        """Report the instance as having registered tables.
+
+        This class signs in with `admin_cookie` against a `tmp_path` instance,
+        which has none — the state in which /chat shows the "no data is
+        registered yet" notice. Tests about the ordinary landing page say so
+        with this; the notice has its own tests below.
+        """
+        import app.services.admin_dashboard as admin_dashboard
+
+        monkeypatch.setattr(
+            admin_dashboard,
+            "resolve_journey",
+            lambda: {
+                "setup": {
+                    "steps": [{"key": "tables", "done": True, "failed": False, "cta": "x", "href": "/x"}],
+                    "complete": False,
+                    "done_count": 1,
+                    "total": 6,
+                    "summary": "",
+                }
+            },
+        )
+
+    @staticmethod
+    def _dev_mode(monkeypatch):
+        """Turn the local-dev preview gate on.
+
+        Patches the FUNCTION rather than setting LOCAL_DEV_MODE=1: the env var
+        also switches the whole auth layer to auto-login as a seeded dev user
+        that does not exist in this fixture's DB, which would change who is
+        making the request — the one thing these tests must hold still.
+        """
+        import app.auth.dependencies as deps
+
+        monkeypatch.setattr(deps, "is_local_dev_mode", lambda: True)
+
+    def test_admin_notice_states_the_instance_has_no_data(self, web_client, admin_cookie, monkeypatch):
+        """One line, not a checklist.
+
+        A six-step panel with a "0 of 6 done" meter lived in the hero slot and
+        was removed as misleading: it read as onboarding, existed only before
+        the first message, and disappeared for good at 6 of 6 — exactly when an
+        admin might still want another source. What survives is the single
+        claim that is a FACT rather than a milestone: with nothing registered, no
+        answer can be GROUNDED in company data.
+
+        Note the scope, because the copy got this wrong once. It read "it knows
+        nothing about your company yet, so it can answer nothing" — and that
+        second clause was false: this state's own placeholder ("Ask how to get
+        Agnes set up…") and its two suggested questions all get real answers from
+        general knowledge. A reader who typed one would catch the page lying on
+        their first attempt. What is missing is the grounding, not the answering,
+        so that is the line the copy draws.
+        """
         self._enable_chat(web_client, monkeypatch)
-        resp = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False)
-        assert resp.status_code == 200
-        text = resp.text
-        assert 'data-ui-layout="rail"' in text
-        for anchor in (
-            # The Knowledge Layer hero — one premium banner: text lead + green
-            # CTA on the left, orb in the centre, floating integration chips on
-            # the right (no inner "Ask Agnes" / tools cards).
-            'class="klb"',  # self-contained hero banner
-            '<div class="klb-lead">',  # left text lead block
-            "Agnes is your knowledge layer.",  # hero headline line 1
-            "Use it here or connect your tools.",  # hero headline line 2 (gradient)
-            '<p class="klb-sub">',  # the supporting sentence renders
-            'href="/how-it-works#connect"',  # the green "Connect your tools" CTA target
-            'class="klb-chips"',  # floating integration chips (no card)
-            "Claude Code",  # a chip label
-            "CLI and more",  # a chip label
-            # Below the banner: the trust caption + "Ask Agnes anything" heading.
-            "klb-hub-label--lead",  # the trust-caption wrapper
-            "Secure. Private. Always in sync.",  # caption text, below the banner
-            'class="rdb-ask-heading"',  # the usage heading above the composer
-            "Ask Agnes anything",
-            'id="rdb-actions"',  # the one personalized section
-            'id="rdb-actions-list"',  # suggested-actions list
-            "css/chat_dashboard.css",  # dashboard styles
-            'id="chat-input"',  # the REAL composer serves the dashboard
-        ):
-            assert anchor in text, f"rail chat dashboard is missing {anchor}"
-        # The retired three-panel layout is gone (one actions list instead).
-        # `rdb-semantic-links` joins it: the dashboard carried a "Browse metrics
-        # & glossary" button (#1108) directly above the composer, and this is
-        # the moment of INTENT — the reader came here to ask something. A
-        # control whose only function is to navigate away from the composer,
-        # offered before they have an answer to check, is a detour.
+        # NOT patched: the tmp_path instance genuinely has no registered table.
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+
+        # The message is the page's own heading and lede now, not a bar above
+        # them: a notice repeating the heading directly underneath said it twice.
+        assert "Set up Agnes for your team" in text, "zero-state heading missing on an instance with no data"
+        # The CONSEQUENCE, scoped to what is actually true: answers are ungrounded,
+        # not absent.
         #
-        # Asserted on the BUTTON'S wrapper class, not on the bare
-        # `/catalog/semantics` URL: the rail chrome now carries a Definitions
-        # nav row, so that URL is legitimately present on every rail page
-        # including this one. What must not come back is the in-page button.
-        for retired in (
-            'id="rdb-continue-list"',
-            'id="rdb-tasks"',
-            "Recent updates",
-            "rdb-semantic-links",
-        ):
-            assert retired not in text, f"retired dashboard panel leaked back: {retired}"
-        # The banner's old two-button CTA row is retired: "Connect your tools"
-        # moved into the tools card (klb-card-cta), "Learn how it works" into
-        # the user menu. Neither the CTA row nor the outline secondary remain.
-        assert 'class="klb-ctas"' not in text
-        assert "klb-cta-secondary" not in text
-        # One composer only — the retired standalone dashboard's look-alike
-        # input and its prompt-handoff module must be gone.
-        assert 'id="rdb-composer"' not in text
-        assert "dashboard_rail" not in text
-        # The retired ask-hero brand block is gone too.
-        assert "Ask anything." not in text
-        # The "Agnes Knowledge Layer" hub title was dropped as redundant with the
-        # "Agnes is your knowledge layer." headline — it must not render anywhere.
-        assert "Agnes Knowledge Layer" not in text
+        # Read off the lede with whitespace collapsed — the sentence wraps across
+        # source lines, so a raw substring search can fail on a phrase that is
+        # plainly present on the page. (It did: "answer from your own numbers"
+        # straddles a newline in the template.)
+        lede = re.sub(r"\s+", " ", text.split('class="cld-lede">', 1)[1].split("</p>", 1)[0]).strip()
+        assert "answers from general knowledge" in lede, "the consequence is what makes the fact mean something"
+        assert "answer from your own numbers" in lede, "…and what changes when you connect a source"
+        # The overclaim must not come back in either of its old forms.
+        for lie in ("so it can answer nothing", "nobody can ask anything"):
+            assert lie not in text, f"the page must not claim it cannot answer: {lie!r}"
+        # "your company", never the org name — `instance.name` is routinely
+        # product-shaped and turns the sentence into a bug.
+        assert "your company's data" in text
+        assert "AI Data Analyst answers" not in text
+        # ONE action, in the setup card. The hero used to carry a chip and a
+        # "Full checklist" link as well; three routes into the same job meant
+        # choosing between them before starting any of it.
+        assert "cld-door--setup" in text, "the setup card is the admin's action now"
+        assert 'class="cld-door-btn"' in text, "…and it carries a primary button"
+        # That button is the CONNECT action, never the journey's current step:
+        # `admin_notice.cta` can read "Invite people" on a partly-set-up
+        # instance, which is incoherent beside "nothing is registered yet".
+        assert "Invite people" not in text
+        assert "/admin/data-sources?add=" in text
+        # The composer must not advertise the one thing that cannot work here.
+        assert "summarize revenue trends" not in text, "the zero state still offers a data example"
+        # The retired panel's framing must not come back with it.
+        for retired in ('class="cset"', "of 6 done", "Do this next", 'class="cset-steps"'):
+            assert retired not in text, f"the retired setup-panel framing is back: {retired}"
+        # The composer is still the page's point.
+        assert 'id="chat-input"' in text
+
+    def test_zero_state_offers_only_answerable_starters(self, web_client, admin_cookie, monkeypatch):
+        """The four data starters must not be offered where they cannot work.
+
+        "Compare revenue trends" against an instance with no reachable tables
+        can only apologise. The renderer picks its set from the server-rendered
+        capability snapshot, so the page has to ship that snapshot with a
+        truthful `tables_total` for the swap to happen at all — this asserts the
+        SIGNAL, since the swap itself is in chat_dashboard.js.
+        """
+        self._enable_chat(web_client, monkeypatch)
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+        assert '"tables_total": 0' in text, "the snapshot must tell the dashboard there is no data"
+        assert '"is_admin": true' in text, "…and who is looking, so it offers connect vs ask-for-access"
+
+    def test_admin_notice_is_silent_once_tables_are_registered(self, web_client, admin_cookie, monkeypatch):
+        """Gated on the FACT, not on chain completion — so it goes quiet as soon
+        as there is data, without ever implying setup is finished."""
+        self._enable_chat(web_client, monkeypatch)
+        self._tables_registered(monkeypatch)
+        text = web_client.get("/chat", cookies=admin_cookie, follow_redirects=False).text
+        assert "Set up Agnes for your team" not in text
+        # …and the page itself is unchanged: it is the same landing page for
+        # everyone, which is the point of retiring the two-hero split.
+        assert 'class="cld-doors"' in text
+        assert 'class="rdb-ask-heading"' in text
+
+    def test_non_admin_never_sees_the_admin_notice(self, web_client, monkeypatch):
+        """A member cannot act on it, so it would be a dead end."""
+        from argon2 import PasswordHasher
+
+        from src.db import get_system_db
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        UserRepository(conn).create(
+            id="member1",
+            email="member@test.com",
+            name="Member",
+            password_hash=PasswordHasher().hash("MemberPass1!"),
+        )
+        conn.close()
+        self._enable_chat(web_client, monkeypatch)
+        # A member has no CHAT grant in this fixture, so /chat would 302 to home
+        # and every "not in text" assertion below would pass against an empty
+        # body — proving nothing. Let them through the gate so the test actually
+        # exercises the render.
+        import app.auth.access as access
+
+        monkeypatch.setattr(access, "can_access", lambda *a, **k: True)
+
+        resp = web_client.post("/auth/token", json={"email": "member@test.com", "password": "MemberPass1!"})
+        assert resp.status_code == 200, f"member login failed: {resp.text}"
+        cookie = {"access_token": resp.json()["access_token"]}
+        page = web_client.get("/chat", cookies=cookie, follow_redirects=False)
+        assert page.status_code == 200, f"member did not reach /chat: {page.status_code}"
+        text = page.text
+        assert "Set up Agnes for your team" not in text, "a non-admin was shown the admin notice"
+        assert "cset-devsw" not in text, "a non-admin was shown the dev audience switch"
+        # They get the same landing page as everyone else.
+        assert 'class="cld-doors"' in text
+
+    def test_dev_preview_member_hides_the_admin_notice(self, web_client, admin_cookie, monkeypatch):
+        """`?preview=member` under LOCAL_DEV_MODE lets one account look at the
+        other audience's landing page — the reason the switch exists."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        text = web_client.get("/chat?preview=member", cookies=admin_cookie, follow_redirects=False).text
+        assert "Set up Agnes for your team" not in text, "?preview=member did not suppress the admin notice"
+        # The switch stays on screen so the view is escapable and labelled. It
+        # moved out of this page's markup and into the base layout — inline it
+        # read as product chrome, and its links could only point back at /chat.
+        assert "data-devsw" in text
+        assert "your data and permissions are unchanged" in text
+
+    def test_dev_preview_empty_forces_the_notice_without_touching_data(self, web_client, admin_cookie, monkeypatch):
+        """`?preview=empty` renders the no-data notice on an instance that has
+        data, so the state can be reviewed without registering or deleting real
+        tables to reach it. It fakes the RENDER only."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        self._tables_registered(monkeypatch)  # …so the notice would normally be silent
+        text = web_client.get("/chat?preview=empty", cookies=admin_cookie, follow_redirects=False).text
+        assert "Set up Agnes for your team" in text
+        assert "answers from general knowledge" in text
+        # The forced state must force the DATA signal too, or the heading sits
+        # above four suggestions that need data — a state no instance can be in.
+        assert '"tables_total": 0' in text
+
+    def test_dev_preview_is_inert_without_local_dev_mode(self, web_client, admin_cookie, monkeypatch):
+        """The switch must not be a production surface. Off the dev gate every
+        value is ignored outright — not half-honoured — and the toggle is not
+        rendered at all, so nothing advertises a view it won't give."""
+        self._enable_chat(web_client, monkeypatch)
+        self._tables_registered(monkeypatch)
+        # No _dev_mode() call: this is the default, production-shaped path.
+        for value in ("member", "empty"):
+            text = web_client.get(f"/chat?preview={value}", cookies=admin_cookie, follow_redirects=False).text
+            assert "cset-devsw" not in text, f"the dev switch rendered outside LOCAL_DEV_MODE (?preview={value})"
+            assert "Set up Agnes for your team" not in text, f"?preview={value} was honoured outside LOCAL_DEV_MODE"
+
+    def test_dev_preview_rejects_an_unknown_value(self, web_client, admin_cookie, monkeypatch):
+        """Anything but the known values falls back to the real view rather than
+        to an arbitrary branch."""
+        self._enable_chat(web_client, monkeypatch)
+        self._dev_mode(monkeypatch)
+        self._tables_registered(monkeypatch)
+        text = web_client.get("/chat?preview=wat", cookies=admin_cookie, follow_redirects=False).text
+        assert "Set up Agnes for your team" not in text
 
     def test_rail_dashboard_actions_section(self, web_client, admin_cookie, monkeypatch):
         """One Suggested-next-actions section below the composer: list +

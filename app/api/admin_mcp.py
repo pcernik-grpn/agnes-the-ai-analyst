@@ -1622,6 +1622,105 @@ async def set_oauth_client_config(
 # ---------------------------------------------------------------------------
 
 
+class PreviewIntrospectRequest(BaseModel):
+    """A connection the admin has typed but not yet registered."""
+
+    transport: str
+    url: Optional[str] = None
+    command: Optional[str] = None
+    args: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
+    auth_method: Optional[str] = None
+    auth_secret_env: Optional[str] = None
+
+    @field_validator("transport")
+    @classmethod
+    def _check_transport(cls, v: str) -> str:
+        return _validate_transport(v)
+
+    @field_validator("auth_method")
+    @classmethod
+    def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_auth_method(v) if v is not None else None
+
+
+@router.post("/mcp-sources/preview-introspect")
+async def preview_introspect_mcp_source(
+    payload: PreviewIntrospectRequest,
+    user: dict = Depends(require_admin),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Dial a connection the admin has typed and list its tools. Writes nothing.
+
+    The builder needs to show what a server exposes BEFORE the admin presses
+    Save — you cannot sensibly choose which tools to grant, or name the source,
+    without seeing them. The alternative was registering a disabled row first
+    and introspecting that, which puts a source in the list that the admin
+    never agreed to create.
+
+    Same shape as ``POST /entities/preview``: the values that would be saved
+    go in, a verdict comes back, and the temp state is gone before the response
+    is. It builds a row-shaped dict and runs the SAME guard and the SAME
+    introspection the registered path does — a probe dials with a credential
+    attached, so it takes the configuration-time url check whether or not a row
+    exists yet.
+
+    The secret is NOT in this payload and never should be: ``auth_secret_env``
+    names an environment variable, and the credential resolves out of the vault
+    exactly as it does for a registered source. A connection whose secret is not
+    stored yet fails here with the reason, which is the truthful answer — store
+    it, then check.
+
+    Audited like its registered sibling above, and for the same reason rather
+    than for symmetry: writing nothing is what would make this endpoint the
+    exception. It dials a network endpoint with a credential attached, or — on
+    ``stdio`` — launches a subprocess with a command the caller supplied. That
+    is the same authority the registered path has, held by the same principal,
+    but the registered path always leaves a row behind and this one leaves
+    nothing, so the audit entry is the only trace that it happened.
+    """
+    from connectors.mcp import extractor as mcp_extractor
+    from connectors.mcp.client import exc_summary as _exc_summary
+
+    row = {
+        "id": "",
+        "name": "(preview)",
+        "transport": payload.transport,
+        "url": payload.url or "",
+        "command": payload.command or "",
+        "args": payload.args or [],
+        "env": payload.env or {},
+        "auth_method": payload.auth_method or "",
+        "auth_secret_env": payload.auth_secret_env or "",
+        "scope": "shared",
+        "enabled": True,
+    }
+    await _check_source_url_or_400(row)
+    # Audited BEFORE the dial, unlike the registered sibling, which records the
+    # tool count it got back. A probe that hangs or crashes the upstream is
+    # exactly the one worth having a trace of, and an entry written only on
+    # success would not have it.
+    _audit(
+        conn,
+        user["id"],
+        "mcp_source.preview_introspect",
+        "mcp_source:(preview)",
+        {
+            "transport": row["transport"],
+            # The url/command, never the env dict: `env` carries non-secret
+            # per-source values by contract, but it is caller-supplied and a
+            # mistyped secret in it must not be copied into the audit trail.
+            "target": row["url"] or row["command"],
+        },
+    )
+    try:
+        tools = await mcp_extractor.introspect_source_async(row, caller_user_id=user["id"])
+    except Exception as exc:
+        logger.warning("preview introspect failed: %s", _exc_summary(exc))
+        raise HTTPException(status_code=502, detail=f"introspect_failed: {_exc_summary(exc)}")
+    return {"tools": tools}
+
+
 @router.post("/mcp-sources/{source_id}/introspect")
 async def introspect_mcp_source(
     source_id: str,
