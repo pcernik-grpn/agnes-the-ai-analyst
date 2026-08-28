@@ -61,6 +61,13 @@
     background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
     font-family: var(--font-mono, ui-monospace, monospace);
   }
+  /* Built-in rows (agnes-builtin / contributed) have no git remote — the pill
+     replaces the non-actionable `builtin://` sentinel in the URL cell. */
+  .mp-builtin-pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 500;
+    background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink);
+  }
   .mp-sha { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--text-primary, #111827); }
   .mp-muted { color: var(--text-secondary, #9ca3af); }
   .mp-err-badge {
@@ -575,10 +582,12 @@ function renderMarketplaces() {
             ? `<div class="mp-curator-cell"><span class="name">${esc(m.curator_name)}</span>${m.curator_email ? `<span class="email">${esc(m.curator_email)}</span>` : ""}</div>`
             : `<span class="mp-muted" title="Open the Edit modal to fill in curator name + email">unset</span>`}</td>
       <td>
-        <span class="mp-url" title="${esc(m.url)}">${esc(m.url)}</span>
+        ${m.is_builtin
+            ? `<span class="mp-builtin-pill" title="Content ships with Agnes and is re-seeded on boot — there is no git remote to sync from">bundled</span>`
+            : `<span class="mp-url" title="${esc(m.url)}">${esc(m.url)}</span>
         ${m.ref
               ? `<br><span class="mp-ref-pill" title="Pinned to ${esc(m.ref)} — nightly/manual syncs stay here regardless of upstream changes">pinned: ${esc(shortRef(m.ref))}</span>`
-              : (m.branch ? `<br><span class="mp-branch-pill" title="Tracks branch ${esc(m.branch)}">branch: ${esc(m.branch)}</span>` : "")}
+              : (m.branch ? `<br><span class="mp-branch-pill" title="Tracks branch ${esc(m.branch)}">branch: ${esc(m.branch)}</span>` : "")}`}
       </td>
       <td>${m.plugin_count > 0
             ? `<span class="mp-plugin-count">${m.plugin_count}</span>`
@@ -588,7 +597,9 @@ function renderMarketplaces() {
       <td><span class="mp-token-dot ${m.has_token ? "has-token" : ""}" title="${m.has_token ? "Authenticated (PAT present in environment)" : "Public / no token"}"></span></td>
       <td>
         <div class="row-actions">
-          <button class="icon-btn primary" data-action="sync" data-id="${esc(m.id)}">Sync now</button>
+          ${m.is_builtin
+              ? ``
+              : `<button class="icon-btn primary" data-action="sync" data-id="${esc(m.id)}">Sync now</button>`}
           <button class="icon-btn" data-action="details" data-id="${esc(m.id)}" data-name="${esc(m.name || m.id)}">Details</button>
           <button class="icon-btn" data-action="edit" data-id="${esc(m.id)}">Edit</button>
           <button class="icon-btn danger" data-action="delete" data-id="${esc(m.id)}" data-name="${esc(m.name || m.id)}">Delete</button>

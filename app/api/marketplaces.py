@@ -21,6 +21,7 @@ from app.resource_types import ResourceType
 from app.secrets import persist_overlay_token
 from src.marketplace import (
     MarketplaceNotFound,
+    MarketplaceNotSyncable,
     delete_marketplace_dir,
     is_valid_ref,
     is_valid_slug,
@@ -130,6 +131,10 @@ class MarketplaceResponse(BaseModel):
     plugin_count: int = 0
     curator_name: Optional[str] = None
     curator_email: Optional[str] = None
+    # Built-in rows (agnes-builtin, agnes-contributed) have no git remote:
+    # surfaced so the admin table can drop the "Sync now" button instead of
+    # offering an action the API refuses with 409.
+    is_builtin: bool = False
 
 
 # Liberal email regex — RFC 5322 is too permissive to be useful at the
@@ -177,6 +182,7 @@ def _to_response(row: dict, plugin_count: int = 0) -> MarketplaceResponse:
         plugin_count=plugin_count,
         curator_name=row.get("curator_name"),
         curator_email=row.get("curator_email"),
+        is_builtin=bool(row.get("is_builtin")),
     )
 
 
@@ -552,6 +558,13 @@ async def trigger_sync(
         result = sync_one(marketplace_id)
     except MarketplaceNotFound:
         raise HTTPException(status_code=404, detail="marketplace not found")
+    except MarketplaceNotSyncable as e:
+        # 409, not 500: the row exists and is healthy — the action simply does
+        # not apply to it. Nothing was touched, so no sync_failed audit row and
+        # no `last_error` stamp (which the nightly sync would never clear,
+        # leaving the built-in row permanently red in the admin table and
+        # "error" in the marketplace-health report).
+        raise HTTPException(status_code=409, detail=str(e))
     except (RuntimeError, ValueError) as e:
         _audit(conn, user["id"], "marketplace.sync_failed", marketplace_id, {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
