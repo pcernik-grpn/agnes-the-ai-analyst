@@ -26576,7 +26576,7 @@
         ]
       },
       "post": {
-        "description": "Create (or replace) a hand-authored (``source='manual'``) model from\na pasted Ossie document. Invalid input 422s with the schema errors \u2014\nnever stored half-valid.",
+        "description": "Create (or replace) a hand-authored (``source='manual'``) model from\na pasted Ossie document. Invalid input 422s with the schema errors \u2014\nnever stored half-valid.\n\nA slug colliding with an existing source-owned model 409s ``source_owned``\n(``_is_source_owned``, shared with PUT/DELETE/``_check_apply``) instead of\ncreating a shadow ``manual/_/<slug>`` row next to the imported one \u2014 two\nrows sharing a slug would leave ``get_by_slug`` (``ORDER BY updated_at\nDESC LIMIT 1``) to resolve the collision nondeterministically. A slug\nmatching a DETACHED source-owned row is exempt from that 409 (F3), but\nstill can't take the plain upsert path below: that row already owns the\nslug, so writing a second, new ``manual/_/<slug>`` id next to it would\nrecreate the exact same collision this guard exists to prevent. It's\nupdated in place instead \u2014 same handling ``apply_manual_model`` already\ngives this case.",
         "operationId": "create_semantic_model_api_admin_semantic_models_post",
         "parameters": [
           {
