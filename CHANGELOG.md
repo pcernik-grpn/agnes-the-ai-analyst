@@ -119,7 +119,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   blob is now unlinked whenever a matched row's `storage_path` moves rather
   than only when its content changed — blob paths are `{sha256}{ext}` with
   the extension taken from the filename, so an extension-only rename kept the
-  sha, allocated a new blob and orphaned the old one on disk. The stable-id mapping
+  sha, allocated a new blob and orphaned the old one on disk. On a role-split
+  `api` replica a content-changed re-upload now rides ONE ordered
+  `collections-purge` job carrying `reingest_after_purge=True`, exactly as
+  `…/reingest` already did, instead of enqueueing a bare derived-table purge
+  while running the re-ingest in-process — because the row id (and therefore
+  the derived `table_id`) is now preserved, those two could land in either
+  order and the purge could delete the table the re-ingest had just rebuilt.
+  The stable-id mapping upsert also `COALESCE`s its optional columns, so a
+  rename-only re-sync carrying `source_stable_ids` without `source_doc_ids`
+  no longer resets a stored `source_doc_id` to NULL. The stable-id mapping
   table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
   instance returns `501`; omitting the field keeps today's flow unchanged.
 

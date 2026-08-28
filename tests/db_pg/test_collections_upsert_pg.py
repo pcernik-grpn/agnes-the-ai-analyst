@@ -559,3 +559,69 @@ def test_preflight_allows_a_stable_id_move_onto_a_free_path(pg_engine, monkeypat
     assert moved.status_code == 201, moved.text
     assert moved.json()[0]["file_id"] == file_id
     assert moved.json()[0]["path"] == "docs/moved/a.md"
+
+
+def test_content_changed_reupload_on_api_plane_uses_one_ordered_job(pg_engine, monkeypatch, tmp_path):
+    """A content-changed re-upload keeps the row id, and the derived
+    `table_id` is derived from that id — so on a process WITHOUT the worker
+    role, enqueueing a bare derived purge while scheduling `ingest_file`
+    in-process lets the purge land AFTER the rebuild and delete the table it
+    just built. (The replaced delete+insert path was immune: a fresh row id
+    meant a different `table_id`.) The upload path must instead do what
+    `reingest_file` does — ONE `collections-purge` job carrying
+    `reingest_after_purge=True` — and must not run the ingest in-process
+    (Devin Review on #1655)."""
+    import io
+
+    import sqlalchemy as _sa
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.csv", io.BytesIO(b"a,b\n1,2\n"), "text/csv")},
+        data={"paths": "docs/a.csv"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    file_id = first.json()[0]["file_id"]
+
+    # Now pretend this replica has no worker role.
+    import app.roles as roles
+
+    real_role_enabled = roles.role_enabled
+    monkeypatch.setattr(roles, "role_enabled", lambda r: False if r is roles.Role.WORKER else real_role_enabled(r))
+
+    with pg_engine.begin() as conn:
+        conn.execute(_sa.text("DELETE FROM jobs WHERE kind = 'collections-purge'"))
+
+    second = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.csv", io.BytesIO(b"a,b\n3,4\n5,6\n"), "text/csv")},
+        data={"paths": "docs/a.csv"},
+        headers=auth,
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()[0]["file_id"] == file_id  # id preserved, hence same table_id
+
+    import json
+
+    with pg_engine.begin() as conn:
+        jobs = (
+            conn.execute(_sa.text("SELECT payload_json FROM jobs WHERE kind = 'collections-purge' ORDER BY created_at"))
+            .scalars()
+            .all()
+        )
+    payloads = [j if isinstance(j, dict) else json.loads(j) for j in jobs]
+    mine = [p for p in payloads if p.get("file_id") == file_id]
+    assert len(mine) == 1, f"expected exactly one ordered job for this file, got {payloads}"
+    assert mine[0].get("reingest_after_purge") is True, (
+        f"the purge must carry its re-ingest, not race an in-process one: {mine[0]}"
+    )
+
+    # ...and nothing ran in-process: TestClient drains BackgroundTasks, so an
+    # in-process ingest would have moved the row off 'pending'.
+    assert second.json()[0]["processing_status"] == "pending"
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    row = next(r for r in listing.json()["files"] if r["file_id"] == file_id)
+    assert row["processing_status"] == "pending", "ingest must be left to the worker plane's ordered job"

@@ -132,6 +132,46 @@ def test_upsert_refreshes_existing_mapping_same_corpus_file_id(pg_engine, monkey
     assert repo.resolve(CORPUS_ID, "graph:abc123") == file_id
 
 
+def test_upsert_omitting_optional_fields_preserves_them(pg_engine, monkeypatch):
+    """`source_doc_ids`/`source_sha256s` are independently optional on the
+    upload endpoint, so a rename-only re-sync carries `source_stable_ids` and
+    nothing else. Writing EXCLUDED unconditionally reset a real
+    `source_doc_id` back to NULL — breaking the very lookup its index exists
+    for (`facts` ingest resolves a doc_id through this column). Omitted now
+    means "leave alone"; the wire format has no way to say "clear it"
+    (Devin Review on #1655)."""
+    repo, cf_repo = _make_repo(pg_engine, monkeypatch)
+    file_id = _add_file(cf_repo)
+    repo.upsert(
+        corpus_file_id=file_id,
+        corpus_id=CORPUS_ID,
+        source_stable_id="graph:abc123",
+        source_doc_id="real-doc-id",
+        source_sha256="crawler-sha",
+    )
+
+    # A rename-only delta: stable id only.
+    repo.upsert(
+        corpus_file_id=file_id,
+        corpus_id=CORPUS_ID,
+        source_stable_id="graph:abc123",
+    )
+
+    row = repo.get(file_id)
+    assert row["source_doc_id"] == "real-doc-id", "an omitted doc_id must not null a stored one"
+    assert row["source_sha256"] == "crawler-sha"
+
+    # ...while a supplied value still overwrites (the provisional -> real
+    # rewrite of spec §6 must keep working).
+    repo.upsert(
+        corpus_file_id=file_id,
+        corpus_id=CORPUS_ID,
+        source_stable_id="graph:abc123",
+        source_doc_id="newer-doc-id",
+    )
+    assert repo.get(file_id)["source_doc_id"] == "newer-doc-id"
+
+
 def test_unique_constraint_rejects_second_file_same_stable_id(pg_engine, monkeypatch):
     """(corpus_id, source_stable_id) is unique — a distinct corpus_file_id
     cannot claim a stable id another row already anchors."""

@@ -74,6 +74,15 @@ class CorpusFileSourcesPgRepository:
         enforced by the table constraint, not by this upsert's conflict
         target. ``source_doc_id`` is rewritten here when a provisional id is
         replaced by the real one on first content crawl (spec §6).
+
+        The three optional columns are ``COALESCE``d against the stored row,
+        so **omitting** one leaves it alone and only a supplied value
+        overwrites. These fields are independently optional on the upload
+        endpoint, so a re-sync that carries `source_stable_ids` but not
+        `source_doc_ids` (a rename-only delta) otherwise reset a real
+        `source_doc_id` back to NULL — which would break exactly the lookup
+        the `source_doc_id` index exists for. The wire format has no way to
+        express "clear this field", so there is no meaning being lost.
         """
         with self._engine.begin() as conn:
             conn.execute(
@@ -85,9 +94,9 @@ class CorpusFileSourcesPgRepository:
                     "ON CONFLICT (corpus_file_id) DO UPDATE SET "
                     "corpus_id = EXCLUDED.corpus_id, "
                     "source_stable_id = EXCLUDED.source_stable_id, "
-                    "source_doc_id = EXCLUDED.source_doc_id, "
-                    "source_sha256 = EXCLUDED.source_sha256, "
-                    "source_url = EXCLUDED.source_url"
+                    "source_doc_id = COALESCE(EXCLUDED.source_doc_id, corpus_file_sources.source_doc_id), "
+                    "source_sha256 = COALESCE(EXCLUDED.source_sha256, corpus_file_sources.source_sha256), "
+                    "source_url = COALESCE(EXCLUDED.source_url, corpus_file_sources.source_url)"
                 ),
                 {
                     "corpus_file_id": corpus_file_id,

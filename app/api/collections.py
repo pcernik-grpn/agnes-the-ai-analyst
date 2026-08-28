@@ -626,7 +626,7 @@ def _purge_file_row(collection_id: str, row: dict, *, keep_blob_path: str | None
             delete_corpus_file(blob)
 
 
-def _purge_children_and_content(collection_id: str, row: dict) -> None:
+def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> None:
     """Purge a matched row's zip-bundle children (fully — they are
     regenerated on the next ingest) plus the row's OWN chunks and derived
     tables, ahead of an in-place content update that reuses ``row``'s id.
@@ -637,6 +637,13 @@ def _purge_children_and_content(collection_id: str, row: dict) -> None:
     ``update_in_place`` repoints the row at the new one — otherwise the row
     would still count as a live reference to its own old blob and the
     refcount check would wrongly skip deleting it.
+
+    ``defer_row_purge`` withholds ONLY the row's own derived-table purge, for
+    a caller that is going to re-ingest this same row and must therefore run
+    purge-then-ingest as one ordered unit (see ``upload_files``). The
+    bundle-children purges above are unaffected: those child rows are
+    hard-deleted here, so the next ingest mints fresh child ids and fresh
+    ``table_id``s — there is nothing for a later purge to collide with.
     """
     cf_repo = corpus_files_repo()
     chunks_repo = corpus_chunks_repo()
@@ -657,7 +664,8 @@ def _purge_children_and_content(collection_id: str, row: dict) -> None:
         if cf_repo.count_by_storage_path(collection_id, blob) == 0:
             delete_corpus_file(blob)
 
-    _schedule_derived_purge(collection_id, row["id"])
+    if not defer_row_purge:
+        _schedule_derived_purge(collection_id, row["id"])
     chunks_repo.delete_for_file(row["id"])
 
 
@@ -698,6 +706,7 @@ def _upsert_corpus_file(
     size_bytes: int | None,
     storage_path: str | None,
     sources_repo: Any,
+    defer_row_purge: bool = False,
 ) -> tuple[str, bool]:
     """Match-then-insert-or-update-in-place for one uploaded file.
 
@@ -744,7 +753,7 @@ def _upsert_corpus_file(
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
-            _purge_children_and_content(collection_id, existing)
+            _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
         cf_repo.update_in_place(
             file_id,
             filename=filename,
@@ -1021,6 +1030,19 @@ async def upload_files(
             cf_repo=cf_repo,
         )
 
+    # A content-changed match now keeps the row's id, and the derived
+    # `table_id` is computed from that id — so on a process WITHOUT the worker
+    # role the enqueued derived purge and an in-process `ingest_file` would
+    # target the SAME table and could land in either order, letting the purge
+    # delete the table the re-ingest just rebuilt. (The replaced delete+insert
+    # path was immune: the new row got a fresh id, hence a different
+    # `table_id`.) So on that plane the row's purge is withheld here and both
+    # halves ride one ordered `collections-purge` job with
+    # `reingest_after_purge=True`, exactly as `reingest_file` does.
+    from app.roles import Role, role_enabled
+
+    _defer_purge_to_ordered_job = not role_enabled(Role.WORKER)
+
     results = []
     any_rejected = False
     _to_ingest: List[str] = []
@@ -1123,6 +1145,7 @@ async def upload_files(
                 size_bytes=stored.size_bytes,
                 storage_path=stored.storage_path,
                 sources_repo=sources_repo,
+                defer_row_purge=_defer_purge_to_ordered_job,
             )
             row = cf_repo.get(file_id)
             results.append(_file_out(row))
@@ -1136,12 +1159,32 @@ async def upload_files(
                 tier,
             )
 
-    # Kick off Tier-1 ingestion in the background (tabular → registered DuckDB
-    # table; documents → chunks). Rejected/unsupported files are not scheduled.
-    from src.ingest.runner import ingest_file
+    # Kick off Tier-1 ingestion (tabular → registered DuckDB table; documents
+    # → chunks). Rejected/unsupported files are not scheduled.
+    #
+    # Worker-role process (single-box `all`) → in-process BackgroundTask, and
+    # any derived purge already ran inline before it, so the order holds.
+    # Process WITHOUT the worker role → one ordered `collections-purge` job
+    # per file carrying `reingest_after_purge=True`, so the worker plane
+    # purges and re-ingests in that order inside a single job. The purge half
+    # is a no-op for a file that had nothing to purge (a new row, or an
+    # unchanged-content retry), and the idempotency key is the same one
+    # `_schedule_derived_purge` would have used, so this replaces the bare
+    # purge rather than racing it.
+    if _defer_purge_to_ordered_job:
+        from src.repositories import jobs_repo
 
-    for fid in _to_ingest:
-        background_tasks.add_task(ingest_file, fid)
+        for fid in _to_ingest:
+            jobs_repo().enqueue(
+                "collections-purge",
+                payload={"corpus_id": collection_id, "file_id": fid, "reingest_after_purge": True},
+                idempotency_key=f"collections-purge:{collection_id}:{fid}",
+            )
+    else:
+        from src.ingest.runner import ingest_file
+
+        for fid in _to_ingest:
+            background_tasks.add_task(ingest_file, fid)
 
     if any_rejected:
         # Return 422 with full result list so clients know which files
