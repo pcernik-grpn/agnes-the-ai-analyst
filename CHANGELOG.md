@@ -734,6 +734,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `{}`, JSON args are pretty-printed, and while a call waits on the decision
   its tool card reads "waiting for approval" instead of a contradictory
   "running…".
+- **"Reset to default" on `/admin/prompts` asks before destroying the
+  override.** One click used to replace a customer's tuned install/workspace
+  prompt with the shipped default — no confirmation, nothing recoverable. The
+  reset now goes through the design-system confirm dialog (same idiom as every
+  other destructive admin action), naming what will be lost.
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores
