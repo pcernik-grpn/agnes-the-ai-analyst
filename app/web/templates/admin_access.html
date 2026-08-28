@@ -1335,6 +1335,46 @@
   .ax-revoke { font-size: 12px; padding: 3px 10px; }
 
   .ax-add { margin-top: 12px; padding: 10px 0; }
+  /* ══ Measure ═══════════════════════════════════════════════════════════
+     The page is `container--full`, so at 1920px the list ran 1864px wide and
+     the name column alone took 758px of it. Nothing was wrong with the row —
+     it was that a group's counts sat a thousand pixels from the group's
+     name, and a row's control sat that far from the thing it controls. Eyes
+     cannot connect two ends of a line that long, which is why the page read
+     as noise however carefully the type was set.
+
+     Full width is right for the shell (the nav, the header); it is wrong for
+     a four-column list. The list gets a measure. Left-aligned, not centred:
+     it belongs to the page, which starts at the left. ── */
+  .ax-toolbar, .ax-one, .ax-pane[data-axpane="sim"] { max-width: 1240px; }
+
+  /* At the cap the name column still has ~600px, which is more than any of
+     these names need — so the two columns that carry meaning get their width
+     back instead, and the row reads as four related things rather than two
+     pairs separated by a gulf. */
+  @media (min-width: 1240px) {
+    .ax-colhd, .ax-r, .ax-fam__hd {
+      grid-template-columns: 5.5rem minmax(0, 1fr) 12rem 13rem;
+    }
+  }
+
+  /* ── Invite, inline ────────────────────────────────────────────────────
+     Same visual weight as a result row, because it IS the result: what the
+     search found for that query. */
+  .ax-invite {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 2px; font-size: 13px; color: var(--ds-text-secondary);
+  }
+  .ax-invite__msg b { color: var(--ds-text-primary); font-weight: 600; }
+  .ax-invite__form { display: flex; align-items: center; gap: 6px; }
+  .ax-invite__mail {
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn, 4px);
+    padding: 5px 9px; font-size: 13px; min-width: 15rem;
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .ax-invite__mail:focus { outline: var(--ds-focus-outline); outline-offset: 1px; }
+  .ax-invite__note { flex-basis: 100%; font-size: 11.5px; color: var(--ds-text-muted); }
+  .ax-invite .btn { font-size: 12.5px; padding: 5px 12px; }
 </style>
 {% endblock %}
 
@@ -2499,10 +2539,33 @@
     if (seq !== findSeq) return; // a later keystroke already answered
 
     if (!people.length) {
-      // The dead end that matters: no account means this is a People job, not
-      // an Access one, so say that instead of "no results".
-      out.innerHTML = `<div class="ax-res__msg">No account matches “${esc(q)}”.
-        <a href="/admin/users">Invite them on People first →</a></div>`;
+      /* No account matched — which used to end the job here and send the
+         admin to People to start it again. "Add someone to this group" and
+         "invite someone" are one intent, and the second half of it was a
+         link out of the page.
+
+         Inline rather than a modal: the query is already typed and scoped to
+         this group, a modal would discard both and ask for them again, and
+         the whole task is one field whose result lands in the roster
+         directly below. A modal earns its interruption when a task needs its
+         own space; this does not. */
+      const looksLikeEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(q.trim());
+      out.innerHTML = looksLikeEmail
+        ? `<div class="ax-invite">
+             <span class="ax-invite__msg">No account for <b>${esc(q)}</b> yet.</span>
+             <button type="button" class="btn btn--primary ax-invite__go" data-invite="${esc(q.trim())}">
+               Invite and add to this group
+             </button>
+           </div>`
+        : `<div class="ax-invite">
+             <span class="ax-invite__msg">No account matches “${esc(q)}”. Invite them:</span>
+             <span class="ax-invite__form">
+               <input type="email" class="ax-invite__mail" placeholder="name@company.com"
+                      aria-label="Email address to invite" value="">
+               <button type="button" class="btn btn--primary" data-invite-typed>Invite</button>
+             </span>
+             <span class="ax-invite__note">They are added to this group, and to Everyone, as soon as the account exists.</span>
+           </div>`;
       openFind();
       return;
     }
@@ -2529,6 +2592,30 @@
       </div>`;
     }).join("");
     openFind();
+  }
+
+  /* Create the account, then put it in this group. Two calls because they
+     are two facts — an account exists, and it is in this audience — and the
+     second failing must not silently undo the first: the toast says which
+     half landed. */
+  async function inviteAndAdd(email) {
+    const addr = String(email || "").trim();
+    if (!addr) return;
+    const r = await fetch("/api/users", {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: addr, name: addr.split("@")[0] }),
+    });
+    if (!r.ok) {
+      const b = await r.json().catch(() => ({}));
+      // 409 is not a failure of intent: the account exists, so the half that
+      // matters here — putting them in the group — can still go ahead.
+      if (r.status === 409) { await addMember(addr); return; }
+      toast(`Could not invite ${addr}: ${typeof b.detail === "string" ? b.detail : r.status}`, false);
+      return;
+    }
+    await addMember(addr);
+    toast(`Invited ${addr} — account created and added to this group`, true);
   }
 
   async function addMember(email) {
@@ -3016,6 +3103,22 @@
         rememberSelection(selectedGroup);
         await repaint();
       }
+      return;
+    }
+
+    const inv = e.target.closest("[data-invite]");
+    if (inv) {
+      inv.disabled = true;
+      try { await inviteAndAdd(inv.dataset.invite); } finally { inv.disabled = false; }
+      return;
+    }
+    const invTyped = e.target.closest("[data-invite-typed]");
+    if (invTyped) {
+      const field = invTyped.closest(".ax-invite").querySelector(".ax-invite__mail");
+      const addr = field ? field.value.trim() : "";
+      if (!addr) { field && field.focus(); return; }
+      invTyped.disabled = true;
+      try { await inviteAndAdd(addr); } finally { invTyped.disabled = false; }
       return;
     }
 

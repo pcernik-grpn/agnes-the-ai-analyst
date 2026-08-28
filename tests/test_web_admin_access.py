@@ -245,14 +245,28 @@ class TestMembersInContext:
         assert "/members" in body
         assert '"POST"' in body and '"DELETE"' in body
 
-    def test_adding_a_stranger_routes_to_People_instead_of_failing_blankly(self, seeded_app):
-        """The common miss is a person with no account yet. That is a People
-        job, so BOTH dead ends name it: the search that finds nobody, and the
-        add that comes back 404 anyway (a race, or an account deactivated
-        between the two calls)."""
+    def test_a_stranger_can_be_invited_from_here(self, seeded_app):
+        """Replaces `test_adding_a_stranger_routes_to_People_instead_of_failing_blankly`.
+
+        The common miss is a person with no account yet, and the page used to
+        end the job there — a link to People, where the admin started again
+        with the query and the group both lost. "Add someone to this group"
+        and "invite someone" are one intent; the second half is now inline.
+
+        The 404-on-add path keeps its People wording: that one is a race (an
+        account deactivated between the search and the add), not a person who
+        was never invited, so it is a different answer to a different case.
+        """
         body = self._body(seeded_app)
+        # A typed address invites in one click…
+        assert "Invite and add to this group" in body
+        # …and a partial name offers the field that completes it.
+        assert 'class="ax-invite__mail"' in body
+        assert "data-invite-typed" in body
+        # It says what inviting does, because it creates an account.
+        assert "added to this group, and to Everyone" in body
+        # The add-path race still routes to People.
         assert "invite them on People first" in body
-        assert "Invite them on People first" in body
 
     def test_everyone_is_explained_not_enumerated(self, seeded_app):
         """`Everyone` has automatic membership — every account is in it by
