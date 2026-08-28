@@ -1052,6 +1052,196 @@
   /* The open group keeps ONE marker — a heavier top edge — so you can see
      which row you are inside while scrolling its contents. */
   .ax-gs[open] > .ax-gs__hd { background: none; }
+  /* ══ Visual hierarchy ══════════════════════════════════════════════════
+     Four levels, and each is meant to be told apart in a glance without
+     reading: GROUP (largest, tinted when open) → SECTION (People / Access,
+     sentence case, ruled) → CATEGORY (Capabilities / Surfaces, a tinted band
+     across the table) → ROW. Depth is carried by indentation and weight,
+     not by boxes: the body indents to the group's name, so everything under
+     a group visibly hangs off it.
+
+     Colour comes from the token set only. The greys were all
+     `--ds-text-muted`, which is why the page read as washed out; primary
+     content moves to `--ds-text-primary`, supporting text to
+     `--ds-text-secondary`, and only genuinely incidental metadata stays
+     muted. ── */
+
+  /* ── 1. Group ── */
+  .ax-gs { border-top: 1px solid var(--ds-border); }
+  .ax-gs + .ax-gs { border-top-color: var(--ds-border-light); }
+  .ax-gs__hd { padding: 11px 10px 11px 4px; gap: 10px; border-left: 2px solid transparent; }
+  .ax-gs[open] { border-top-color: var(--ds-border); }
+  /* The open group's own row is tinted and marked — the one place a
+     background says "you are inside this". */
+  .ax-gs[open] > .ax-gs__hd {
+    background: var(--ds-surface-dim);
+    border-left-color: var(--ds-text-primary);
+    border-bottom: 1px solid var(--ds-border);
+  }
+  .ax-gs[open] > .ax-gs__hd:hover { background: var(--ds-surface-dim); }
+  .ax-gs__hd .ax-g__ava { flex: none; }
+  .ax-gs__id .ax-g__name { font-size: 15px; font-weight: 600; color: var(--ds-text-primary); }
+  .ax-gs__reach { font-size: 12px; color: var(--ds-text-secondary); }
+
+  /* Counts read as data: same order, same widths, lining numerals, label
+     recessive and number solid — so five groups can be compared down the
+     column instead of read one at a time. */
+  .ax-gs__counts { gap: 14px; font-variant-numeric: tabular-nums; }
+  .ax-gs__cnt { font-size: 11px; color: var(--ds-text-muted); min-width: 5.5rem; text-align: right; }
+  .ax-gs__cnt b { font-size: 12px; font-weight: 600; color: var(--ds-text-secondary); margin-left: 3px; }
+  .ax-gs__cnt.is-held b { color: var(--ds-text-primary); }
+  .ax-gs__sim { font-size: 12px; font-weight: 500; }
+
+  /* ── 2. Everything under a group hangs off the group's name ── */
+  .ax-gs__body { padding: 4px 0 18px 46px; }
+  @media (max-width: 900px) { .ax-gs__body { padding-left: 16px; } }
+
+  .ax-gs__body .ax-gh__facts,
+  .ax-gs__body .ax-idsub { font-size: 12px; color: var(--ds-text-muted); }
+
+  /* ── 3. Section: People / Access ── */
+  .ax-gs__body #ax-sec-people > summary h3,
+  .ax-gs__body #ax-sec-access > summary h3 {
+    font-size: 12.5px; font-weight: 600; letter-spacing: 0;
+    text-transform: none; color: var(--ds-text-primary);
+  }
+  .ax-gs__body .dsec-head {
+    padding: 14px 0 6px; border-bottom: 1px solid var(--ds-border);
+    align-items: baseline;
+  }
+  .ax-gs__body .dsec-sum { font-size: 12px; color: var(--ds-text-secondary); }
+
+  /* ── 4. The table ── */
+  .ax-colhd, .ax-r {
+    grid-template-columns: 5.25rem minmax(0, 1fr) 11.5rem 11.5rem;
+    gap: 16px;
+  }
+  .ax-colhd {
+    padding: 10px 0 7px; border-bottom: 1px solid var(--ds-border);
+    font-size: 10.5px; font-weight: 600; letter-spacing: .07em;
+    color: var(--ds-text-secondary);
+  }
+
+  /* Category — a band, not another row of content. Same grid, so its label
+     sits over the Kind column and its count under the reads column. */
+  .ax-fam { margin-top: 0; }
+  .ax-fam__hd {
+    display: grid;
+    grid-template-columns: 5.25rem minmax(0, 1fr) 11.5rem 11.5rem;
+    gap: 16px; align-items: baseline;
+    margin: 0; padding: 7px 8px 7px 0;
+    background: var(--ds-surface-dim);
+    border-bottom: 1px solid var(--ds-border-light);
+  }
+  .ax-fam__nm {
+    grid-column: 1; font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--ds-text-secondary); white-space: nowrap;
+  }
+  .ax-fam__sub { grid-column: 2; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-fam__n {
+    grid-column: 4; margin: 0; text-align: right;
+    font-size: 11px; color: var(--ds-text-muted); font-variant-numeric: tabular-nums;
+  }
+
+  /* Row — one comfortable height, primary name solid, everything else
+     stepping back a level at a time. */
+  .ax-r { padding: 11px 0; min-height: 56px; border-bottom: 1px solid var(--ds-border-light); }
+  .ax-fam .ax-r:last-child { border-bottom: 1px solid var(--ds-border-light); }
+  .ax-r:hover { background: var(--ds-surface-dim); }
+  .ax-r__nm { font-size: 14px; font-weight: 600; color: var(--ds-text-primary); line-height: 1.35; }
+  .ax-r__blk { font-weight: 400; color: var(--ds-text-muted); }
+  .ax-r__d { font-size: 12px; color: var(--ds-text-secondary); margin-top: 2px; line-height: 1.4; }
+  .ax-r__who { font-size: 11px; color: var(--ds-text-muted); margin-top: 3px; }
+
+  /* Kind chip — the design system's resource colours, soft fill so it reads
+     as a label rather than a link. */
+  .ax-r__kd {
+    font-family: var(--ds-font-mono); font-size: 10.5px; line-height: 18px;
+    height: 18px; padding: 0 7px; border-radius: 3px; border: 0;
+    background: var(--ds-surface); color: var(--ds-text-secondary);
+    box-shadow: inset 0 0 0 1px var(--ds-border);
+    justify-self: start; white-space: nowrap;
+  }
+  /* The kind colour is carried by INK and a hairline, never by a `-soft`
+     fill. Those tints are defined light-only while `--ds-kind-*` flips in
+     dark mode, so a soft fill would put flipped (light) ink on a light tint
+     — about 1:1 contrast. `tests/test_design_system_contract.py::
+     test_light_only_soft_tint_never_backs_theme_flipping_ink` catches
+     exactly this, and caught it here. The chip keeps the theme-aware sunken
+     surface underneath in both themes. */
+  .ax-r__kd[data-kind="data"]    { color: var(--ds-kind-data);    box-shadow: inset 0 0 0 1px var(--ds-kind-data); }
+  .ax-r__kd[data-kind="memory"]  { color: var(--ds-kind-memory);  box-shadow: inset 0 0 0 1px var(--ds-kind-memory); }
+  .ax-r__kd[data-kind="recipe"]  { color: var(--ds-kind-recipe);  box-shadow: inset 0 0 0 1px var(--ds-kind-recipe); }
+  .ax-r__kd[data-kind="library"] { color: var(--ds-kind-library); box-shadow: inset 0 0 0 1px var(--ds-kind-library); }
+  .ax-r__kd[data-kind="file"]    { color: var(--ds-kind-file);    box-shadow: inset 0 0 0 1px var(--ds-kind-file); }
+  .ax-r__kd[data-kind="app"]     { color: var(--ds-kind-app);     box-shadow: inset 0 0 0 1px var(--ds-kind-app); }
+  .ax-r__kd[data-kind="plugin"]  { color: var(--ds-kind-plugin);  box-shadow: inset 0 0 0 1px var(--ds-kind-plugin); }
+  .ax-r__kd[data-kind="skill"]   { color: var(--ds-kind-skill);   box-shadow: inset 0 0 0 1px var(--ds-kind-skill); }
+  .ax-r__kd[data-kind="agent"]   { color: var(--ds-kind-agent);   box-shadow: inset 0 0 0 1px var(--ds-kind-agent); }
+
+  /* Reads — a quiet label over a solid value, right-aligned so the column
+     has an edge to scan down. */
+  .ax-r__rd { font-size: 13px; font-weight: 500; color: var(--ds-text-primary); line-height: 1.35; }
+  .ax-r__rd b {
+    display: block; font-size: 11px; font-weight: 400; letter-spacing: 0;
+    text-transform: none; color: var(--ds-text-muted); margin-bottom: 1px;
+  }
+  .ax-r__rd .ax-reads__q { color: var(--ds-text-muted); font-weight: 400; font-style: italic; }
+
+  /* Controls stay findable without pulling the eye down the column. */
+  .ax-revoke { font-size: 12px; color: var(--ds-text-secondary); }
+  .ax-own__edit { font-size: 11px; }
+  .ax-add { margin-top: 10px; padding: 11px 0; font-size: 13px; }
+  .ax-add__hint { color: var(--ds-text-muted); }
+  /* ── Scanning fixes ───────────────────────────────────────────────────
+     Three things were breaking the horizontal read: the category blurb
+     wrapped and made the band two lines tall and ragged; item names broke
+     mid-phrase ("agnes-analyst · Agnes Built-\nin"); and the column header
+     carried the same weight and colour as the category label, so the band
+     did not outrank the chrome above it. */
+
+  /* Give the name column room back. Control and reads were each 11.5rem,
+     which at 980px left the name — the column people actually read — with
+     less width than the two columns of supporting detail beside it. */
+  .ax-colhd, .ax-r, .ax-fam__hd {
+    grid-template-columns: 5.25rem minmax(0, 1fr) 10.5rem 10.5rem;
+  }
+
+  /* One line each, clipped rather than wrapped: a row that can be two or
+     three lines tall depending on its text destroys the vertical rhythm the
+     eye follows down a column. */
+  .ax-r__nm, .ax-r__d, .ax-fam__sub {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ax-r__d { display: block; }
+
+  /* Chrome recedes, structure advances: the column header is the quietest
+     thing in the table, the category label the loudest small thing. */
+  .ax-colhd { color: var(--ds-text-muted); font-weight: 600; }
+  .ax-fam__nm { font-size: 11px; color: var(--ds-text-primary); }
+  .ax-fam__hd { background: var(--ds-surface-sunken); padding: 8px 8px 8px 0; }
+
+  @media (max-width: 1100px) {
+    /* The blurb is a definition, not data — first thing to go when the row
+       needs its width for the things people came to read. */
+    .ax-fam__sub { display: none; }
+  }
+  /* Responsive, declared LAST so it actually wins: the earlier narrow-width
+     rule sat above the desktop grid and was overridden at every width, which
+     left the hidden reads column still reserving 168px of dead space. */
+  @media (max-width: 900px) {
+    .ax-colhd, .ax-r, .ax-fam__hd {
+      grid-template-columns: 4.75rem minmax(0, 1fr) 10.5rem;
+    }
+    .ax-colhd__u, .ax-r__rd { display: none; }
+    .ax-fam__n { grid-column: 3; }
+  }
+  @media (max-width: 640px) {
+    .ax-colhd, .ax-r, .ax-fam__hd { grid-template-columns: 4.75rem minmax(0, 1fr); gap: 12px; }
+    .ax-r__ctl { grid-column: 2; margin-top: 6px; }
+    .ax-colhd > :nth-child(3) { display: none; }
+    .ax-fam__n { grid-column: 2; }
+  }
 </style>
 {% endblock %}
 
@@ -1467,7 +1657,7 @@
     const body = readsFor(typeKey, tier);
     if (!body) return "";
     const quiet = /ax-reads__q/.test(body);
-    const where = quiet ? "" : "In their Library";
+    const where = quiet ? "" : "In their Library";  // sentence case: it is a label, not a heading
     return `${where ? `<b>${where}</b>` : ""}${body}`;
   };
 
@@ -1482,6 +1672,20 @@
     agent: "agent", chat: "chat", slack_channel: "slack",
   };
   const kindWord = (t) => KIND_WORD[t.type_key] || t.type_display;
+
+  /* The kind's colour comes from the design system's resource family
+     (`--ds-kind-*`), which the Library and the detail pages already use — a
+     package is the same colour here as it is there. Types with no resource
+     colour (a chat, a Slack channel) stay neutral rather than borrowing one
+     that means something else. */
+  const KIND_TOKEN = {
+    data_package: "data", table: "data", semantic_model: "data",
+    memory_domain: "memory", memory_item: "memory",
+    recipe: "recipe", collection: "library", corpus_file: "file",
+    knowledge_digest: "file", data_app: "app",
+    marketplace_plugin: "plugin", store_entity: "skill", agent: "agent",
+  };
+  const kindToken = (t) => KIND_TOKEN[t.type_key] || "";
 
   /* Who wrote this grant. Two writers, two shapes: the admin API records an
      email, the Library's owner-sharing path records a user id. Resolve both
@@ -1836,7 +2040,7 @@
           : `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button></span>`;
       return `
       <div class="ax-r" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
-        <span class="ax-r__kd ${owned ? "is-own" : ""}">${esc(kindWord(t))}</span>
+        <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
           ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 110))}</span>` : ""}
           ${who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}
@@ -2481,7 +2685,7 @@
       return `
       <section class="ax-bb${nobody ? " is-nobody" : ""}">
         <div class="ax-bb__hd">
-          <span class="ax-tag">${esc(r.t.type_display)}</span>
+          <span class="ax-r__kd" data-kind="${esc(kindToken(r.t))}">${esc(kindWord(r.t))}</span>
           <span class="ax-bb__nm">${esc(r.i.name || r.i.resource_id)}
             ${r.i.description ? `<span class="ax-bb__sub">${esc(String(r.i.description).slice(0, 110))}</span>` : ""}
           </span>
@@ -2969,7 +3173,7 @@
             return `
             <button type="button" class="ax-pk-r ${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
               <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
-              <span class="ax-r__kd">${esc(kindWord(t))}</span>
+              <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
               <span class="ax-pk-r__nm">${esc(i.name || i.resource_id)}${block ? `<span class="ax-r__blk"> · ${esc(block)}</span>` : ""}
                 ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 100))}</span>` : ""}
               </span>

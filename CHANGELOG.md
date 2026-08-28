@@ -177,6 +177,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **Visual polish on `/admin/access` — hierarchy, contrast, scanning.** No
+  behaviour, IA or vocabulary changed. Four levels now differ in kind rather
+  than by a few pixels: the open **group** row is tinted with an ink left
+  edge, its body indents to the group's own name so everything under it
+  visibly hangs off it; **People / Access** are sentence-case ruled
+  subsections; **Knowledge / Capabilities / Surfaces** are tinted bands
+  across the table's own grid rather than another row of content; **items**
+  are rows on one fixed four-column grid shared by header, bands and rows,
+  so a row can be scanned horizontally without losing the column. Text stops
+  being uniformly `--ds-text-muted`: names take `--ds-text-primary`,
+  descriptions `--ds-text-secondary`, and only incidental metadata stays
+  muted — the "everything is pale blue-grey" effect. Names, descriptions and
+  band blurbs clip to one line instead of wrapping, which is what was
+  breaking the vertical rhythm. Counts use tabular figures and a fixed
+  column so groups compare down the page. Kind chips take the design
+  system's own resource palette (`--ds-kind-*`) instead of one invented
+  colour — carried by ink and a hairline, never by the `-soft` fills, which
+  are defined light-only while their ink flips in dark mode (the contract
+  test caught exactly that).
 - **Granting is one act: + Add, choose, Apply.** The All/Granted segment and
   the *Advanced* tree are both gone — they were two browsing surfaces
   answering the same question in two places, and the segment named a
