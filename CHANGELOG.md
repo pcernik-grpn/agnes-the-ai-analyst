@@ -63,6 +63,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **A generated file is handed over IN the conversation, as a chip on the
+  answer that produced it.** The turn that writes a deliverable now renders it
+  as a chip under that answer — a filename and a size at rest, with Download
+  and Save to Library appearing on hover or keyboard focus. The file is a
+  result of that turn, so it belongs beside the sentence naming it rather than
+  behind a panel thrown over the conversation, and a chip that says nothing
+  until you reach for it keeps a quiet turn quiet. The drawer stays reachable
+  from the header for everything a session has accumulated (older turns, after
+  a reload); it simply no longer opens itself — this **supersedes** the
+  self-opening drawer released in 0.91.0, so that entry describes the previous
+  behaviour, not the current one. Its rows also stop squeezing
+  the actions beside a wrapping path — in a 380px panel they now sit on their
+  own line under the name.
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. Implemented on both backends (`AuditRepository.query_unified` / `AuditPgRepository.query_unified`, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the

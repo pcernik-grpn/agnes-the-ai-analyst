@@ -14895,6 +14895,24 @@
             }
           },
           {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+              "title": "Trail"
+            }
+          },
+          {
             "in": "query",
             "name": "include_self_reads",
             "required": false,

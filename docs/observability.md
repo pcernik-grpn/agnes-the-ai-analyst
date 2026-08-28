@@ -3,11 +3,26 @@
 ## Audit & activity trails (retention status)
 
 Agnes keeps seven distinct records of "who did what": `audit_log` (admin/API
-actions, viewer: `/admin/activity`), chat transcripts (`chat_messages`, no
-admin viewer — privacy decision), CLI session JSONLs (viewer:
-`/admin/sessions`), usage rollups (`usage_events`, viewer: `/admin/telemetry`),
-`sync_history` (folded into `/admin/activity`), `llm_usage`, and agent-runtime
-forensics (`agent_scope_snapshots`).
+actions), chat transcripts (`chat_messages`, no admin viewer — privacy
+decision), CLI session JSONLs (viewer: `/admin/sessions`), usage rollups
+(`usage_events`, viewer: `/admin/telemetry`), `sync_history`, `llm_usage`
+(per-call agent token accounting), and agent-runtime forensics
+(`agent_scope_snapshots`).
+
+`/admin/activity` (`GET /api/admin/activity`, `agnes admin activity`, and the
+`activity` MCP tool) is a **unified, read-side projection** over the first
+four of those — `audit_log` + `sync_history` + `llm_usage` +
+`agent_scope_snapshots` — UNION'd on read (no new table, no migration) into
+one chronological timeline. Each row carries a `trail` field naming its
+source table (`audit` | `sync` | `llm` | `agent_scope`) so an admin can still
+narrow to one trail (`?trail=audit`); the projection reuses the SAME
+filter/facet/cursor machinery `audit_log`-only queries always used
+(`AUDIT_SOURCE_CASE_SQL`, `RESULT_CLASS_CASE_SQL`), implemented in lockstep
+on both backends (`AuditRepository.query_unified` /
+`AuditPgRepository.query_unified` in `src/repositories/audit.py` /
+`audit_pg.py`). **`chat_messages` is never part of this union** — customer
+data in transcripts, no admin viewer by design; it is not one of the four
+SELECTs the projection UNIONs.
 
 Retention, per trail:
 

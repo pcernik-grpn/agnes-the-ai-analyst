@@ -12,7 +12,76 @@ from src.audit_helpers import (
     AUDIT_SOURCE_CASE_SQL,
     RESULT_CLASS_CASE_SQL,
     SCHEDULER_ACTION_SQL,
+    UNIFIED_TRAILS,
 )
+
+# ---------------------------------------------------------------------------
+# Unified Activity Center timeline (E3 slice 2) — a read-side UNION ALL
+# projecting audit_log + sync_history + llm_usage + agent_scope_snapshots
+# into the SAME canonical row shape ``query()`` returns for audit_log alone,
+# plus a literal ``trail`` column identifying which physical table the row
+# came from. No schema change, no new table/view — this is a plain subquery
+# built fresh on every call.
+#
+# Mapping per non-audit trail (mirrors ``audit_pg.py``'s ``_UNIFIED_UNION_SQL``
+# — keep both in lockstep):
+#   sync_history         synced_at->timestamp, NULL user_id (system actor),
+#                         action='sync.table', resource='table:<table_id>',
+#                         result=status, client_kind='scheduler' (source).
+#   llm_usage             created_at->timestamp, user_id=owner, action='llm.call',
+#                         resource='agent:<agent_id>', params carries model +
+#                         token counts, client_kind='agent' (source).
+#   agent_scope_snapshots created_at->timestamp, NULL user_id,
+#                         action='agent.spawn.scope', resource='agent:<agent_id>',
+#                         params carries session_id + effective_scope,
+#                         client_kind='agent' (source).
+#
+# ``chat_messages`` is NEVER part of this union — privacy decision (see
+# docs/observability.md), enforced simply by not being one of the four
+# SELECTs below.
+_UNIFIED_UNION_SQL = """
+    SELECT id, timestamp, user_id, action, resource, params, result, duration_ms,
+           params_before, client_ip, client_kind, correlation_id, 'audit' AS trail
+    FROM audit_log
+
+    UNION ALL
+
+    SELECT id, synced_at AS timestamp, CAST(NULL AS VARCHAR) AS user_id,
+           'sync.table' AS action, 'table:' || table_id AS resource,
+           json_object('rows', rows, 'error', error) AS params,
+           status AS result, duration_ms,
+           CAST(NULL AS JSON) AS params_before, CAST(NULL AS VARCHAR) AS client_ip,
+           'scheduler' AS client_kind, CAST(NULL AS VARCHAR) AS correlation_id,
+           'sync' AS trail
+    FROM sync_history
+
+    UNION ALL
+
+    SELECT id, created_at AS timestamp, user_id,
+           'llm.call' AS action,
+           CASE WHEN agent_id IS NOT NULL THEN 'agent:' || agent_id ELSE NULL END AS resource,
+           json_object('model', model, 'session_id', session_id,
+                       'input_tokens', input_tokens, 'output_tokens', output_tokens,
+                       'cache_read_tokens', cache_read_tokens,
+                       'cache_creation_tokens', cache_creation_tokens) AS params,
+           CAST(NULL AS VARCHAR) AS result, CAST(NULL AS INTEGER) AS duration_ms,
+           CAST(NULL AS JSON) AS params_before, CAST(NULL AS VARCHAR) AS client_ip,
+           'agent' AS client_kind, CAST(NULL AS VARCHAR) AS correlation_id,
+           'llm' AS trail
+    FROM llm_usage
+
+    UNION ALL
+
+    SELECT id, created_at AS timestamp, CAST(NULL AS VARCHAR) AS user_id,
+           'agent.spawn.scope' AS action,
+           'agent:' || agent_id AS resource,
+           json_object('session_id', session_id, 'effective_scope', effective_scope) AS params,
+           CAST(NULL AS VARCHAR) AS result, CAST(NULL AS INTEGER) AS duration_ms,
+           CAST(NULL AS JSON) AS params_before, CAST(NULL AS VARCHAR) AS client_ip,
+           'agent' AS client_kind, CAST(NULL AS VARCHAR) AS correlation_id,
+           'agent_scope' AS trail
+    FROM agent_scope_snapshots
+"""
 
 
 class AuditRepository:
@@ -200,6 +269,91 @@ class AuditRepository:
         if where:
             sql += " WHERE " + " AND ".join(where)
         # Fetch limit+1 to determine whether there's a next page
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        params.append(limit + 1)
+        rows = self.conn.execute(sql, params).fetchall()
+        if not rows:
+            return [], None
+        columns = [desc[0] for desc in self.conn.description]
+        out = [dict(zip(columns, r)) for r in rows]
+
+        next_cursor: Optional[tuple] = None
+        if len(out) > limit:
+            last_shown = out[limit - 1]
+            next_cursor = (last_shown["timestamp"], last_shown["id"])
+            out = out[:limit]
+        return out, next_cursor
+
+    def query_unified(
+        self,
+        *,
+        trail: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        action_prefix: Optional[str] = None,
+        action_in: Optional[List[str]] = None,
+        resource: Optional[str] = None,
+        resource_prefix: Optional[str] = None,
+        result_pattern: Optional[str] = None,
+        result_class: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        q: Optional[str] = None,
+        source: Optional[str] = None,
+        include_self_reads: bool = True,
+        cursor: Optional[tuple] = None,  # keyset (timestamp, id)
+        limit: int = 100,
+    ) -> tuple[List[Dict[str, Any]], Optional[tuple]]:
+        """The Activity Center timeline, widened across every trail.
+
+        Same filter surface, same cursor/ordering contract as :meth:`query`
+        — the only difference is the row source: a UNION ALL over
+        ``audit_log`` + ``sync_history`` + ``llm_usage`` +
+        ``agent_scope_snapshots`` (see :data:`_UNIFIED_UNION_SQL`), each
+        mapped into the canonical row shape plus a ``trail`` column. Reuses
+        ``_filters_where`` unchanged — the projected columns share audit_log's
+        names, so the same WHERE fragments (incl. the ``source``/
+        ``result_class`` CASE expressions) apply transparently to the union.
+
+        ``trail`` narrows to one physical trail (``"audit"``, ``"sync"``,
+        ``"llm"``, ``"agent_scope"``) — e.g. so an admin can filter back to
+        audit-only. Unknown values raise ``ValueError`` rather than silently
+        returning zero rows.
+
+        ``chat_messages`` is never part of this union (privacy decision, see
+        docs/observability.md) — there is no branch for it above.
+        """
+        if trail is not None and trail not in UNIFIED_TRAILS:
+            raise ValueError(f"trail must be one of {UNIFIED_TRAILS}, got {trail!r}")
+
+        where, params = self._filters_where(
+            since=since,
+            until=until,
+            user_id=user_id,
+            action=action,
+            action_prefix=action_prefix,
+            action_in=action_in,
+            resource=resource,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            correlation_id=correlation_id,
+            q=q,
+            source=source,
+            include_self_reads=include_self_reads,
+        )
+        if trail is not None:
+            where.append("trail = ?")
+            params.append(trail)
+        if cursor is not None:
+            ts, cid = cursor
+            where.append("(timestamp, id) < (?, ?)")
+            params.extend([ts, cid])
+
+        sql = f"SELECT *, {AUDIT_SOURCE_CASE_SQL} AS source FROM ({_UNIFIED_UNION_SQL}) unified"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
         params.append(limit + 1)
         rows = self.conn.execute(sql, params).fetchall()
