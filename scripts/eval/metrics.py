@@ -178,15 +178,23 @@ def precision_recall_by_type(
         actual = by_type_actual.get(fact_type, [])
         expected_clusters = [_fact_cluster(f) for f in expected]
 
+        # One planted fact can be matched at most ONCE. A second subject
+        # overlapping an already-matched cluster is not a second hit — it is
+        # the entity-resolution failure EQ9 measures separately, and for EQ3
+        # it is a spurious extra subject, i.e. a false positive. Counting it
+        # as a true positive let TP exceed the planted count, overstating
+        # precision (and letting recall exceed 1) on exactly the runs where
+        # the system duplicated entities.
         matched_expected = [False] * len(expected_clusters)
         true_positives = 0
         false_positives = 0
         for subject in actual:
             subject_aliases = set(subject.get("aliases") or [])
-            hit_index = next(
-                (i for i, cluster in enumerate(expected_clusters) if subject_aliases & cluster),
-                None,
-            )
+            hits = [i for i, cluster in enumerate(expected_clusters) if subject_aliases & cluster]
+            # Prefer a cluster nobody has claimed yet, so greedy assignment
+            # cannot invent a false positive purely from input order when a
+            # subject overlaps both a taken and a free cluster.
+            hit_index = next((i for i in hits if not matched_expected[i]), None)
             if hit_index is None:
                 false_positives += 1
             else:

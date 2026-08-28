@@ -624,6 +624,44 @@ def test_precision_recall_by_type_on_synthetic_manifest():
     assert client.recall == pytest.approx(0.5)
 
 
+def test_precision_recall_counts_a_duplicate_subject_as_a_false_positive():
+    """Two extracted subjects matching the SAME planted cluster used to both
+    increment `true_positives` while the cluster was recorded matched once,
+    so TP could exceed the planted count and precision was overstated —
+    which matters because EQ3 feeds a pre-registered decision threshold. A
+    second subject for one planted fact is an entity-resolution failure: the
+    first is the true positive, the extra one is a false positive (Devin
+    Review on #1652)."""
+    planted = [{"type": "client", "natural_key": "client:myers", "aliases": ["client:myers-eps"]}]
+    actual = [
+        {"type": "client", "id": "s1", "aliases": ["client:myers"]},
+        {"type": "client", "id": "s2", "aliases": ["client:myers-eps"]},  # same planted fact
+    ]
+    r = metrics.precision_recall_by_type(planted, actual)["client"]
+    assert r.true_positives == 1, "one planted fact can be matched at most once"
+    assert r.false_positives == 1, "the duplicate subject is a spurious extra, not a second hit"
+    assert r.false_negatives == 0
+    assert r.true_positives <= len(planted)
+    assert r.precision == pytest.approx(0.5)
+    assert r.recall == pytest.approx(1.0), "recall must stay within [0, 1]"
+
+
+def test_precision_recall_prefers_an_unmatched_cluster_over_a_taken_one():
+    """Greedy first-hit assignment must not manufacture a false positive: a
+    subject overlapping both a taken cluster and a free one is credited to
+    the free one, so input order cannot change the score."""
+    planted = [
+        {"type": "client", "natural_key": "client:a", "aliases": ["shared:x"]},
+        {"type": "client", "natural_key": "client:b", "aliases": ["shared:x"]},
+    ]
+    actual = [
+        {"type": "client", "id": "s1", "aliases": ["client:a", "shared:x"]},
+        {"type": "client", "id": "s2", "aliases": ["shared:x", "client:b"]},
+    ]
+    r = metrics.precision_recall_by_type(planted, actual)["client"]
+    assert (r.true_positives, r.false_positives, r.false_negatives) == (2, 0, 0)
+
+
 def test_cluster_purity_on_synthetic_manifest():
     purity = metrics.cluster_purity(_SYNTHETIC_FACTS, _SYNTHETIC_ACTUAL_SUBJECTS)
     # planted alias-instance total = |{myers,myers-eps}| + |{acme}| = 3
