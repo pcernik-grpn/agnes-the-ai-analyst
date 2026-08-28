@@ -562,8 +562,15 @@ async def _consent_submit(request: Request) -> Response:
 
     client_name = _client_display_name(pending_row["client_id"])
 
+    # Both outcomes are the user's decision about their own pending
+    # authorization, and deny is now destructive (it burns the link), so the
+    # session check covers the whole branch — not just allow.
+    user = _get_session_user(request)
+    if user is None:
+        return HTMLResponse("<h2>Not authenticated.</h2>", status_code=401)
+
     if action != "allow":
-        # User denied — redirect with error.
+        # User denied — burn the link and redirect with error.
         _record_consent_outcome(pending, action="deny", client_name=client_name)
         oauth_clients_repo().delete_auth_code(pending)
         sep = "&" if "?" in redirect_uri else "?"
@@ -571,10 +578,6 @@ async def _consent_submit(request: Request) -> Response:
         if state:
             deny_url += f"&state={quote(state, safe='')}"
         return RedirectResponse(url=deny_url, status_code=302)
-
-    user = _get_session_user(request)
-    if user is None:
-        return HTMLResponse("<h2>Not authenticated.</h2>", status_code=401)
 
     # Replace pending code with the real authorization code.
     real_code = secrets.token_urlsafe(32)

@@ -654,6 +654,39 @@ def test_consent_replay_after_deny_reports_denial(seeded_app):
     assert "Access denied" in replay.text
 
 
+def test_unauthenticated_deny_cannot_burn_someone_elses_pending_link(seeded_app):
+    """Deny is destructive now — it deletes the pending row — so it is the
+    user's decision to make, not something a caller without an Agnes session
+    can do to a link they merely hold."""
+    from src.repositories import oauth_clients_repo
+
+    client = seeded_app["client"]
+    admin_token = seeded_app["admin_token"]
+    pending = _pending_for_new_client(client)
+
+    denied = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "deny"},
+        headers={"Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+
+    assert denied.status_code == 401, f"an unauthenticated deny must not be honoured (got {denied.status_code})"
+    assert oauth_clients_repo().get_auth_code(pending) is not None, (
+        "the pending authorization was destroyed by an unauthenticated caller"
+    )
+
+    # And the link still works for its owner.
+    allowed = client.post(
+        "/api/mcp/oauth/consent",
+        data={"pending": pending, "action": "allow"},
+        headers={"Authorization": f"Bearer {admin_token}", "Origin": "http://testserver"},
+        follow_redirects=False,
+    )
+    assert allowed.status_code in (302, 307), allowed.text
+    assert "code=" in allowed.headers["location"]
+
+
 def test_unknown_pending_token_still_reports_an_invalid_link(seeded_app):
     """No outcome marker → the link really is unusable: keep the 4xx, but say
     what to do about it."""

@@ -218,7 +218,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   minutes"). Allow is double-submit guarded client-side, and the guard resets
   when the page comes back from the browser's back/forward cache, so returning
   with Back never leaves a dead button. A scope Agnes has no description for is
-  now listed verbatim instead of being dropped from the page.
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
