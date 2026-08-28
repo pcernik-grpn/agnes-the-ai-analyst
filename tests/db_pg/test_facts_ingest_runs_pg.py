@@ -52,6 +52,30 @@ def _create(repo, **overrides):
     return repo.create(**defaults)
 
 
+def test_anonymization_defaults_to_empty_dict_not_null(pg_engine, monkeypatch):
+    """A producer that never anonymizes omits the field entirely — the
+    stored column must still round-trip as `{}`, never `None`, so every
+    reader can treat it as always-present (spec §9.2)."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo)
+    row = repo.get(run_id)
+    assert row["anonymization"] == {}
+
+
+def test_anonymization_declaration_round_trips(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    anonymization = {
+        "declared": True,
+        "scopes": {"col_a": {"docs_anonymized": 5, "docs_skipped": 1}},
+    }
+    run_id = _create(repo, anonymization=anonymization)
+    row = repo.get(run_id)
+    assert row["anonymization"] == anonymization
+
+    listed = repo.list_recent(limit=10)
+    assert listed[0]["anonymization"] == anonymization
+
+
 def test_create_returns_an_ir_prefixed_id(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     run_id = _create(repo)

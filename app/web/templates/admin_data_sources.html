@@ -196,7 +196,10 @@
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
   /* Certificate expiry status (spec: catch a silently expiring certificate
      before auth breaks) — reuses the same success/warn/danger accent tokens
-     the health chip and pipeline strip already use. */
+     the health chip and pipeline strip already use. ``badge-warn`` is ALSO
+     "anonymization requested" (a wizard checkbox with nothing declared yet,
+     spec §9.2/§13.2) — same warn tone, distinct from ``badge-env``'s
+     success tone used once a run actually declares it. */
   .ds-badge.badge-ok     { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
   .ds-badge.badge-ok::before     { background: var(--ds-accent-success-ink); }
   .ds-badge.badge-warn   { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
@@ -895,7 +898,11 @@
     border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
     white-space: nowrap;
   }
+  /* "anonymization requested" — the checkbox alone, warn tone (a wish, not
+     yet a fact). ".sp-badge--anon-declared" is the earned state: the latest
+     ingest run actually declared this collection anonymized (spec §9.2). */
   .sp-badge--anon { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .sp-badge--anon-declared { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
   .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
   .sp-share-row {
     display: flex; align-items: flex-start; gap: 12px;
@@ -2071,6 +2078,24 @@ function _sharepointFactsHtml(row) {
   const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
     + ` · ${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group`;
 
+  // Anonymization (spec §9.2/§13.2): "requested" is the connect wizard's
+  // checkbox (a wish); "declared" is the LAST ingest run's own claim. Never
+  // collapse the two into one word — a collection with a checkbox ticked
+  // but nothing declared yet reads "requested" (warn), never "anonymized".
+  // Row only appears at all when at least one collection requests it — an
+  // instance that never anonymizes gets no extra row.
+  const anon = fs.anonymization || { requested: [], declared: [], pending: [] };
+  const anonRowHtml = anon.requested.length
+    ? `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Requested: the connect wizard's anonymize checkbox. Declared: the producer's last ingest run actually reported it anonymized — Agnes cannot verify content itself (see docs/anonymization.md).">Anonymization</span>
+    <span class="ds-src__fact-v ${anon.pending.length ? "is-warn" : "is-ok"}">
+      ${anon.declared.length ? `<span class="ds-badge badge-env">anonymized ${anon.declared.length}</span>` : ""}
+      ${anon.pending.length ? `<span class="ds-badge badge-warn">anonymization requested ${anon.pending.length}</span>` : ""}
+    </span>
+  </div>`
+    : "";
+
   const lastRun = fs.last_run;
   const badgeDefs = [
     ["rejected_quotes", "Rejected quotes"],
@@ -2100,6 +2125,7 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
   </div>
+  ${anonRowHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Last run</span>
     <span class="ds-src__fact-v">${badgesHtml}</span>
@@ -5458,12 +5484,17 @@ function spRenderTree(level) {
     const scope = spScopes[item.id];
     const checked = !!scope;
     const anon = scope ? !!scope.anonymize : false;
+    // Requested vs declared (spec §9.2) applies here too — "· anon" alone
+    // read as a completed fact even mid-wizard; "declared" earns the word
+    // "anonymized", everything else stays the lighter "· anon" hint.
+    const anonDeclared = scope ? !!scope.anonymization_declared : false;
     const path = spDisplayPath(item.name);
     const nameHtml = navigable
       ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spHighlight(item.name)}</button>`
       : `<span class="leaf">${spHighlight(item.name)}</span>`;
+    const anonSuffix = anon ? (anonDeclared ? " · anonymized" : " · anon requested") : "";
     const badge = scope && scope.collection
-      ? `<span class="sp-badge${anon ? " sp-badge--anon" : ""}">&rarr; ${spEsc(scope.collection.slug)}${anon ? " · anon" : ""}</span>`
+      ? `<span class="sp-badge${anon ? (anonDeclared ? " sp-badge--anon-declared" : " sp-badge--anon") : ""}">&rarr; ${spEsc(scope.collection.slug)}${anonSuffix}</span>`
       : "";
     return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}"${visible ? "" : " hidden"}>` +
       `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
@@ -5726,7 +5757,16 @@ function spRenderShare(items) {
   host.innerHTML = items.map((s) => {
     const pending = spPendingGroups[s.source_scope_id] || new Set(s.group_ids || []);
     spPendingGroups[s.source_scope_id] = pending;
-    const anonBadge = s.anonymize ? '<span class="sp-badge sp-badge--anon">anonymized</span>' : "";
+    // Spec §9.2/§13.2: the checkbox alone is a WISH, never rendered as
+    // "anonymized" by itself — that badge is earned only once the latest
+    // ingest run actually declares this collection anonymized
+    // (`anonymization_declared`, computed server-side in
+    // app/api/admin_sharepoint.py::_scope_out). Requested-but-not-declared
+    // still gets a badge (so the admin sees the flag took), just a
+    // different word and tone.
+    const anonBadge = !s.anonymize ? "" : s.anonymization_declared
+      ? '<span class="sp-badge sp-badge--anon-declared">anonymized</span>'
+      : '<span class="sp-badge sp-badge--anon">anonymization requested</span>';
     const collBadge = s.collection ? `<span class="sp-badge">${spEsc(s.collection.name)}</span>` : "";
     const noGroup = pending.size === 0;
     const warn = noGroup ? '<span class="sp-warn">&#9888; indexed but invisible — no group yet</span>' : "";
