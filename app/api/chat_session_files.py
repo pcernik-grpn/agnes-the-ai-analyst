@@ -420,64 +420,6 @@ async def list_session_files(
     return SessionFilesResponse(files=[SessionFileEntry(**f) for f in files], truncated=truncated)
 
 
-def _engine_template_map() -> dict[str, int]:
-    """``{relative path: size}`` of the workspace template AS THE ENGINE
-    MATERIALIZES IT into its sandbox.
-
-    The engine fetches this instance's workspace tarball
-    (``GET /api/kai/workspace``) and unpacks it into the very directory its
-    file browser is rooted at — so on a fresh conversation the engine
-    honestly lists the operator's bundled scaffolds and configs as if the
-    agent had produced them (observed live: 19 template rows and the actual
-    deliverable nowhere). The host walk already excludes the template trees;
-    this map lets the engine listing do the same.
-
-    Walked fresh per listing on purpose: the tree is tiny (~160 KiB bundled;
-    an admin IWT override is the same order), a listing is a user click, and
-    caching would have to chase the admin-override sync for no measurable
-    win.
-    """
-    from app.api.kai import _WORKSPACE_EXCLUDED_TOPLEVEL, _workspace_template_root
-
-    root = _workspace_template_root()
-    mapping: dict[str, int] = {}
-    try:
-        for dirpath, dirnames, filenames in os.walk(root):
-            rel_dir = os.path.relpath(dirpath, root)
-            if rel_dir == ".":
-                dirnames[:] = [d for d in dirnames if d not in _WORKSPACE_EXCLUDED_TOPLEVEL]
-                rel_dir = ""
-            for fname in filenames:
-                fpath = Path(dirpath) / fname
-                try:
-                    size = fpath.stat().st_size
-                except OSError:
-                    continue
-                rel = f"{rel_dir}/{fname}" if rel_dir else fname
-                mapping[rel.replace(os.sep, "/")] = size
-                if len(mapping) >= _MAX_SCAN_FILES:
-                    return mapping
-    except OSError:
-        logger.warning("chat_session_files: workspace template unreadable — engine listing unfiltered")
-    return mapping
-
-
-def _is_engine_template_entry(entry: dict, template: dict[str, int]) -> bool:
-    """Is this engine listing entry the materialized template, not output?
-
-    - The root ``CLAUDE.md`` is always the template's prompt surface — the
-      tarball ships it RENDERED (Workspace Prompt overlay), so its size never
-      matches the file on disk; match by path alone.
-    - Everything else counts as template only when both the path AND the size
-      match — a template file the agent modified, or a new file, stays listed
-      (a changed scaffold is plausibly the deliverable).
-    """
-    path = entry["path"]
-    if path == "CLAUDE.md":
-        return True
-    return template.get(path) == entry.get("size_bytes")
-
-
 async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFilesResponse:
     """Proxy the listing from the engine's sandbox file browser."""
     token = await _engine_token(user, chat_id)
@@ -495,7 +437,6 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
     if listing is None:
         return SessionFilesResponse(files=[], truncated=False, source="engine", supported=False)
     entries, truncated = listing
-    template = _engine_template_map()
     files: list[SessionFileEntry] = []
     for entry in entries:
         # Engine listings reflect agent-chosen names — re-validate each path
@@ -503,9 +444,6 @@ async def _list_engine_files(user: dict, chat_id: str, cfg: object) -> SessionFi
         try:
             _validate_rel_path(entry["path"])
         except HTTPException:
-            continue
-        # The materialized workspace template is not session output.
-        if _is_engine_template_entry(entry, template):
             continue
         files.append(SessionFileEntry(**entry))
     # Engine listings carry no mtime to sort by, but the deliverables-first

@@ -2772,6 +2772,104 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   overflow-y: auto;
 }
 .cloud-chat-files-list:empty { display: none; }
+/* File chips in the transcript — the primary way a deliverable is handed
+   over. They ride the answer that produced them, so the reader meets the file
+   next to the sentence naming it. At rest a chip is just a filename and a
+   size; the actions appear on hover / keyboard focus, because most turns want
+   this to read as a mention, not as a toolbar. Touch has no hover, so there
+   the actions are always shown (see the coarse-pointer rule below). */
+.cloud-chat-file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.cloud-chat-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* max-width alone does not hold: as a flex item of the chips row the chip's
+     own min-width: auto is a content-based floor that outranks it, so a long
+     filename pushed the chip past the bubble's edge even once the LABEL could
+     ellipsize. */
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-surface);
+  font-size: var(--text-xs);
+}
+.cloud-chat-file-chip:hover,
+.cloud-chat-file-chip:focus-within {
+  border-color: var(--ds-primary);
+}
+.cloud-chat-file-chip-label {
+  font-weight: var(--font-semibold);
+  color: var(--ds-text-primary);
+  /* A flex child defaults to min-width: auto, which is its content width — the
+     ellipsis below would never fire on a long agent-chosen filename. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cloud-chat-file-chip-size {
+  color: var(--ds-text-muted);
+  flex: 0 0 auto;
+}
+/* Collapsed at rest, NOT `display: none`. A display:none subtree is removed
+   from the tab order, so its buttons are unfocusable — which means
+   :focus-within below could never fire from the keyboard and the actions
+   would be mouse-only. Zero width + overflow:hidden keeps them focusable
+   (and announced by a screen reader), so Tab reaches Download / Save and
+   the chip expands around the focus ring. */
+.cloud-chat-file-chip-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: var(--space-2);
+  width: 0;
+  padding-left: 0;
+  border-left: 0 solid var(--ds-border);
+  overflow: hidden;
+  opacity: 0;
+}
+.cloud-chat-file-chip:hover .cloud-chat-file-chip-actions,
+.cloud-chat-file-chip:focus-within .cloud-chat-file-chip-actions {
+  width: auto;
+  padding-left: var(--space-2);
+  border-left-width: 1px;
+  overflow: visible;
+  opacity: 1;
+}
+@media (hover: none) {
+  .cloud-chat-file-chip-actions {
+    width: auto;
+    padding-left: var(--space-2);
+    border-left-width: 1px;
+    overflow: visible;
+    opacity: 1;
+  }
+}
+.cloud-chat-file-chip-action {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--ds-primary);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cloud-chat-file-chip-action:hover { text-decoration: underline; }
+.cloud-chat-file-chip-action:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+
+/* Drawer rows keep the full inventory. In a 380px panel the actions no longer
+   sit BESIDE the name — the path wrapped to three lines and squeezed the
+   buttons — they sit under it, on their own line. */
 .cloud-chat-files-row {
   display: flex;
   align-items: center;
@@ -2829,6 +2927,7 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   display: flex;
   gap: var(--space-1);
   flex-shrink: 0;
+  justify-content: flex-end;
 }
 /* Compact icon actions — two text buttons next to every row squeezed the
    name into a sliver at the drawer's 380px width. */

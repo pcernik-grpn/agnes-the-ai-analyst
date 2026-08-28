@@ -63,6 +63,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **A generated file is handed over IN the conversation, as a chip on the
+  answer that produced it.** The turn that writes a deliverable now renders it
+  as a chip under that answer — a filename and a size at rest, with Download
+  and Save to Library appearing on hover or keyboard focus. The file is a
+  result of that turn, so it belongs beside the sentence naming it rather than
+  behind a panel thrown over the conversation, and a chip that says nothing
+  until you reach for it keeps a quiet turn quiet. The drawer stays reachable
+  from the header for everything a session has accumulated (older turns, after
+  a reload); it simply no longer opens itself — this **supersedes** the
+  self-opening drawer released in 0.91.0, so that entry describes the previous
+  behaviour, not the current one. Its rows also stop squeezing
+  the actions beside a wrapping path — in a 380px panel they now sit on their
+  own line under the name.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the
@@ -196,18 +209,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
-
-- **Engine-backed session file listings no longer show the workspace
-  template.** The kai-agent engine materializes the instance workspace
-  tarball into the very directory its file browser lists, so a fresh
-  conversation's Files panel showed the operator's bundled scaffolds and
-  configs (observed live: 19 template rows, the actual deliverable
-  nowhere). The proxy now drops entries matching the template by path+size
-  (the rendered root `CLAUDE.md` by path alone) — a template file the agent
-  modified stays listed — and sorts `outputs/` deliverables first. The Files
-  drawer's list also grew to the panel's full height (a fixed `46vh` box
-  left the bottom half empty), rows gained an extension tile and a hover
-  state.
+- **Session files: the workspace template no longer shows up as session
+  output on kai-agent instances.** The exclusion shipped for the host walk,
+  but a `chat.provider: kai-agent` session is listed by the ENGINE's own
+  sandbox browser — which filters dot-directories only, so `.claude` was
+  hidden while `scaffolds/` and `CLAUDE.md` came straight through. Live, that
+  meant a drawer full of `scaffolds/nodejs-dashboard/{package.json,index.html,
+  postcss.config.js,…}` with the user's actual document nowhere in it. The
+  engine walk now skips the same top-level template entries, derived from the
+  same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
+  longer even requests those subdirectories.
+- **The chat Files drawer got a layout fix and a visual pass.** The file
+  list now flexes across the panel's full remaining height (a fixed `46vh`
+  box left most of the drawer an empty framed rectangle), rows are
+  self-bordered cards with an extension tile, a single-line ellipsized
+  `path · size` hint and compact icon actions (download / save-to-Library /
+  saved-check) instead of two text buttons squeezing the filename; Refresh
+  moved into the header as an icon matching the close button, and the
+  header neutralizes the page-level `header` tag styling that painted a
+  stray divider with a double gap under the title. Engine-backed listings
+  additionally sort `outputs/` deliverables first (they carry no mtime to
+  sort by).
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
