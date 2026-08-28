@@ -84,9 +84,21 @@
               key: b.id,
               label: b.name || b.id,
               tables: (b.tables || []).map(function (t) {
+                // Keboola's `t.id` is the FULL table id (`in.c-main.orders`);
+                // `t.name` is the bare in-bucket name (`orders`). The registry
+                // contract keeps the bucket and the bare name in separate
+                // columns and composes `kbc.<bucket>.<source_table>` at export,
+                // so `source_table` must be the bare one — passing the full id
+                // is the #755-era wizard bug that `storage_api.normalize_source_
+                // table` exists to heal at use. Healing does not reach the view
+                // NAME, though: sanitizing the full id yields `in_c_main_orders`
+                // as the analyst-visible name. Fall back to stripping the
+                // bucket prefix off `t.id` when `name` is absent — table names
+                // cannot contain dots, so the split is unambiguous.
+                var bare = t.name || String(t.id || '').slice(String(b.id || '').length + 1) || t.id;
                 return {
-                  key: b.id + '.' + t.id, name: _sanitizeName(t.id),
-                  bucket: b.id, sourceTable: t.id,
+                  key: b.id + '.' + bare, name: _sanitizeName(bare),
+                  bucket: b.id, sourceTable: bare,
                   meta: _fmtCount(t.rows),
                 };
               }),

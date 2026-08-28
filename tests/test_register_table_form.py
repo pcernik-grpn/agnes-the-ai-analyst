@@ -365,3 +365,47 @@ def test_the_reload_path_calls_the_drop():
         "_reloadDiscovery must clear the discovered selection — it is the one path both "
         "onConnectionChange and loadLocation funnel through"
     )
+
+
+# ── 6: Keboola discover feeds the registry contract, not the display id ──
+
+
+def _keboola_discover_slice() -> str:
+    """The Keboola connector's `discover` plus the `_sanitizeName` /
+    `_fmtCount` helpers it calls, sliced from the shipped source."""
+    js = _JS.read_text(encoding="utf-8")
+    sanitize = js[js.index("  function _sanitizeName(") : js.index("  function _sanitizeName(") + 600]
+    sanitize = sanitize[: sanitize.index("\n  }\n") + 5]
+    discover = js[js.index("      async discover(ctx) {") : js.index("      buildPayload(row, mode, s) {")]
+    return sanitize + "\nfunction _fmtCount(n) { return String(n); }\n" + "const kb = {\n" + discover + "};\n"
+
+
+def test_keboola_connection_browse_registers_the_bare_table_name():
+    """Keboola's `t.id` is the full table id (`in.c-main.orders`); `t.name` is
+    the bare in-bucket name. The registry keeps bucket and bare name in
+    separate columns and composes `kbc.<bucket>.<source_table>` at export, so
+    `source_table` must be the bare one — the full id is the #755-era wizard
+    bug `storage_api.normalize_source_table` heals at use.
+
+    Healing does not reach the view NAME: sanitizing the full id would show
+    the analyst `in_c_main_orders`. Shape of the stubbed response is copied
+    from the endpoint's own fixture in tests/test_admin_source_connections.py.
+    """
+    script = (
+        "function _apiGet() { return Promise.resolve({buckets: [{id: 'in.c-main', name: 'main', "
+        "tables: [{id: 'in.c-main.orders', name: 'orders', rows: 42}]}]}); }\n"
+        + _keboola_discover_slice()
+        + "kb.discover({connectionId: 'c1'}).then(function (g) {"
+        " process.stdout.write(JSON.stringify(g[0].tables[0])); });\n"
+    )
+    row = json.loads(_node_run(script))
+    assert row["sourceTable"] == "orders", (
+        "source_table must be the bare in-bucket name — the export path composes "
+        f"kbc.<bucket>.<source_table>, so {row['sourceTable']!r} would double the bucket prefix"
+    )
+    assert row["name"] == "orders", (
+        "the analyst-visible view name is sanitized from this — the full id would surface "
+        f"as 'in_c_main_orders'; got {row['name']!r}"
+    )
+    assert row["bucket"] == "in.c-main"
+    assert row["key"] == "in.c-main.orders", "the row key doubled the bucket prefix too"
