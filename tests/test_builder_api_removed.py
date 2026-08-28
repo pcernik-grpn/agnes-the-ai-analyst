@@ -77,8 +77,18 @@ def test_the_builder_page_no_longer_fetches_the_deleted_router():
     from pathlib import Path
 
     html = Path("app/web/templates/agents.html").read_text(encoding="utf-8")
-    assert "fetch('/api/agents" not in html
-    assert 'fetch("/api/agents' not in html
+    # Scoped to the CRUD that was actually deleted, not to the whole
+    # `/api/agents` prefix: `POST /api/agents/{id}/builder/turn` is a LIVE
+    # route (app/api/agent_builder.py mounts there), so a blanket prefix ban
+    # would forbid a call the product depends on. The shapes below are the
+    # deleted ones — a bare collection fetch, or an id with no sub-path.
+    import re
+
+    crud = re.findall(r"""fetch\(['"]/api/agents(?:['"]|/['"] \+ [^)]*?\)(?!\s*\+\s*['"]/))""", html)
+    assert not crud, f"the page still fetches the deleted /api/agents CRUD: {crud}"
+    # The one surviving call under that prefix, asserted positively so this
+    # test fails if it silently disappears too.
+    assert "/builder/turn" in html
     # And the replacement really is there — a passing "absence" check alone
     # would also pass if the fetches were deleted outright rather than
     # re-pointed.

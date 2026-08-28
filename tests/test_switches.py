@@ -137,7 +137,9 @@ class TestPortedFlagsAreUnchanged:
     flags' identity fields against the values they shipped with."""
 
     EXPECTED = {
-        "studio": (("studio", "enabled"), "AGNES_STUDIO_ENABLED", True),
+        # `default` is False since the admin cleanup retired the surface; the
+        # config key and env var are what this class pins as unchanged.
+        "studio": (("studio", "enabled"), "AGNES_STUDIO_ENABLED", False),
         "guardrails": (("guardrails", "enabled"), "AGNES_GUARDRAILS_ENABLED", True),
         "chat_approvals": (("chat", "approvals_enabled"), "AGNES_CHAT_APPROVALS_ENABLED", True),
         "chat": (("chat", "enabled"), "AGNES_CHAT_ENABLED", False),
@@ -254,10 +256,13 @@ class TestSwitchValueResolution:
 
     @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off", ""])
     def test_falsy_env_spellings(self, monkeypatch, raw):
+        """Read through `guardrails` (default True), so a spelling the parser
+        failed to recognize as falsy shows up as a failure. On a default-False
+        switch this whole class of test passes without parsing anything."""
         import app.switches as sw
 
-        monkeypatch.setenv("AGNES_STUDIO_ENABLED", raw)
-        assert sw.switch_value("studio") is False
+        monkeypatch.setenv("AGNES_GUARDRAILS_ENABLED", raw)
+        assert sw.switch_value("guardrails") is False
 
     @pytest.mark.parametrize("raw", ["1", "true", "YES", "on", "enabled", "banana"])
     def test_permissive_truthy_env_spellings(self, monkeypatch, raw):
@@ -298,10 +303,15 @@ class TestSwitchValueRefusesRuntimeViewSwitches:
 
     def test_non_runtime_view_switch_is_unaffected(self):
         """Sanity check that the guard is scoped to `runtime_view` switches,
-        not a blanket regression on `switch_value`."""
+        not a blanket regression on `switch_value`.
+
+        Reads `guardrails`, not `studio`: this assertion is only meaningful if
+        the value it expects is not also what a swallowed failure would return,
+        and `studio` defaults to False since the admin cleanup retired it.
+        """
         import app.switches as sw
 
-        assert sw.switch_value("studio") is True
+        assert sw.switch_value("guardrails") is True
 
 
 class TestBackwardCompatibility:

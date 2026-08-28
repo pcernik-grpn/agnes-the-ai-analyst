@@ -1496,10 +1496,17 @@ def test_tls_check_refuses_a_hidden_linked_app(proxy_client, proxy_env):
 
 
 def test_logged_out_on_subdomain_carries_a_usable_return_url(proxy_client, running_app, proxy_env):
-    """The two halves must agree: the redirect hands `/login` a `next` pointing
-    back at the app, and `safe_next_path` — the guard that decides what login
-    will honour — actually accepts it. Asserted together, because either half
-    alone silently drops the caller on the dashboard."""
+    """The redirect hands `/login` a `next` pointing back at the app, and
+    `safe_next_path` accepts that shape.
+
+    Scope, stated precisely because an earlier version of this docstring did
+    not: `safe_next_path` is the SHARED guard, not the only thing standing
+    between this `next` and the login page. Two login routes re-implemented the
+    old relative-only rule inline and dropped the value despite this test being
+    green — the assertion below proves the guard accepts it, never that the
+    route reaches the guard. `tests/test_login_page_next_propagation.py` drives
+    `GET /login` and asserts on the rendered links, which is what actually
+    covers that hop."""
     from urllib.parse import unquote
 
     from app.auth._common import safe_next_path

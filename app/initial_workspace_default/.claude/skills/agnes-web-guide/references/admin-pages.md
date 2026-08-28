@@ -48,14 +48,25 @@ who receives it:
 - `/admin/store` — store moderation: approve or reject published items.
 - `/admin/store/submissions` — community submissions queue.
 - `/admin/store/lint` — lint results for store content.
-- `/admin/studio` — the Studio authoring surface (also open to non-admins
-  when enabled — see the user pages).
-- `/admin/studio/suggestions` — suggestions harvested for Studio curation.
 - `/admin/corporate-memory` — corporate-memory domains and their content.
-- `/admin/knowledge-digests` — periodic knowledge digests.
-- `/admin/news` — author the in-app news.
-- `/admin/contribute-skill` — contribute a skill directly into the
-  instance's own marketplace.
+
+Four pages in this section are **hidden by default** — they redirect home and
+have no sidebar row unless the instance turned them back on, so do not send
+anyone to one without checking `/admin/server-config` first. Each is one flag
+(the pages themselves are intact):
+
+- `/admin/studio` and `/admin/studio/suggestions` — the Studio authoring
+  surface and its moderation queue (`studio.enabled`). The Library's builders
+  (`/library` → "+ New") do the same authoring jobs; go there instead.
+- `/admin/knowledge-digests` — the maintained-digests page
+  (`features.knowledge_digests_enabled`). Only the PAGE is hidden: `agnes admin
+  digest` and the nightly digest job keep working, so an instance can be
+  running digests with nothing to show for it here.
+- `/admin/news` — author the in-app news (`features.news_enabled`, which also
+  hides the `/news` reader).
+- `/admin/contribute-skill` — publish a pasted SKILL.md into the instance's own
+  marketplace (`features.contribute_skill_enabled`). The Library's skill
+  builder is the supported path.
 
 ### Instance
 
