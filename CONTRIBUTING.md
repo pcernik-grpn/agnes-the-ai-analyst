@@ -38,7 +38,7 @@ same suite as one into `main`. This is worth stating because the failure mode
 is silent: with a filter, GitHub fires no workflow at all and the PR shows a
 **green rollup that asserted nothing**, which reads exactly like a passing run.
 When you check a PR's status, confirm the check NAMES are present
-(`test-shard (1..8)`, `test-pg (1..2)`) — "no red" is not the same as "tested".
+(`test-shard (1..8)`, `test-pg (1..4)`) — "no red" is not the same as "tested".
 Stack bases are also unprotected, so `gh pr merge --auto` on one merges
 immediately rather than waiting for anything.
 
