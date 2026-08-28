@@ -540,6 +540,32 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="microsoft_group_sync",
+        config_keys=("auth", "microsoft", "group_sync_enabled"),
+        env_var="AGNES_MICROSOFT_GROUP_SYNC_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="operations",
+        editable=True,
+        description=(
+            "Mirror the signed-in user's Entra ID group memberships (Microsoft Graph "
+            "GET /me/memberOf) into user_group_members (source='microsoft_sync') on every "
+            "Microsoft sign-in — the same mechanism auth.keboola.* uses for Keboola, and "
+            "google_sync uses for Google Workspace. Off by default: turning it on for the "
+            "first time also widens the OAuth consent scope requested at "
+            "/auth/microsoft/login to include the delegated Graph permission "
+            "GroupMember.Read.All, which needs its own admin consent grant in the Entra "
+            "app registration (see docs/auth-microsoft-oauth.md) — the scope change only "
+            "takes effect after a restart, so flip this AND grant consent AND restart "
+            "before relying on it; the sync gate itself (whether apply_user_groups makes "
+            "the Graph call at all) is read live, so a stale token scope degrades to a "
+            "logged, fail-soft no-op rather than a login failure. AGNES_MICROSOFT_GROUP_PREFIX "
+            "(env-only, no instance.yaml key — mirrors AGNES_GOOGLE_GROUP_PREFIX) narrows "
+            "which fetched groups are mirrored/allowed to sign in."
+        ),
+    ),
+    Switch(
         name="mcp_source_url_runtime_enforce",
         config_keys=("mcp", "source_url_runtime_enforce"),
         env_var="AGNES_MCP_SOURCE_URL_RUNTIME_ENFORCE",

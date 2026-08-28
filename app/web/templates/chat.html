@@ -157,12 +157,12 @@
        banner deliberately comes BEFORE the input: first understand what
        Agnes is, then start using it), context line + activity panels below
        (#chat-empty-extras). Flex ``order`` on .cloud-chat-main lays them
-       out hero → composer → extras (see chat.css); ``#chat-empty-extras``
-       follows the composer in the DOM and auto-hides with
-       #chat-capabilities (sibling rule) the moment a conversation starts —
-       so "New chat" simply returns here. #}
+       out hero → suggestions → composer → extras (see chat.css); both
+       ``#chat-suggested`` and ``#chat-empty-extras`` follow #chat-capabilities
+       in the DOM and auto-hide with it (sibling rule) the moment a
+       conversation starts — so "New chat" simply returns here. #}
     {# Dashboard landing (issue #896): the Knowledge Layer lead (headline +
-       supporting sentence) is the page hero → Agnes composer → suggested actions
+       supporting sentence) is the page hero → suggested actions → Agnes composer
        → the diagram-only Knowledge Layer banner docked at the FOOT. Leading
        with the product value proposition (not a greeting) states what Agnes is
        before the input; the diagram at the foot shows the two ways to use it.
@@ -306,8 +306,8 @@
 
       {# The doors, ABOVE the composer: each is somewhere you go INSTEAD of
          asking a question, so they belong before the input rather than after
-         it. (They stay clear of the composer-to-suggestions span, which is
-         reserved for context about what the agent can reach.)
+         it. (They stay clear of the suggestions-to-composer span, which is
+         the ask region and carries nothing that navigates away.)
 
          The first card is audience-dependent. An ADMIN gets "Set up {brand}" —
          the one job only they can do — styled apart from the other two because
@@ -473,7 +473,8 @@
          and putting them between the heading and the input meant the reader's
          first decision on a page whose whole point is "ask something" was
          which of three places to leave for. The order now matches intent —
-         ask, or pick a question we suggest, and only then the ways out. #}
+         pick a question we suggest, or ask your own, and only then the ways
+         out. #}
       {# A "Browse metrics & glossary" button used to sit here (#1108), the only
          in-page path to /catalog/semantics in the rail chrome. Retired: this is
          the moment of INTENT — the reader came to ask something and the
@@ -531,6 +532,59 @@
     </aside>
 
     <div id="chat-messages" class="cloud-chat-messages" aria-live="polite"></div>
+
+    {# ── Suggested for you — ABOVE the composer ──────────────────────────────
+       Its own direct child of .cloud-chat-main so flex order (chat.css) can
+       place it between the hero and the composer. It used to close the empty
+       state from inside #chat-empty-extras, under the input.
+
+       Why it leads the ask region now: a reader who does not yet know what to
+       ask cannot act on an empty field, and the chips are the answer to that —
+       so they have to be readable BEFORE the eye reaches the input, not after
+       it has already been passed. Read top-down the page is now "here is what
+       you could ask" → "ask it", which is the order the reader needs them in.
+
+       It stays a sibling AFTER #chat-capabilities in the DOM so the existing
+       ``#chat-capabilities[hidden] ~ …`` rule still hides it the moment a
+       conversation starts. The ways out (.cld-doors) did NOT come with it —
+       they still close the page from #chat-empty-extras, because every one of
+       them navigates AWAY from the composer. #}
+    <div id="chat-suggested" class="cloud-chat-suggested">
+      <div class="rdb">
+        {# Guided Agnes conversation-starters, directly above the composer so they
+           read as suggestions FOR the input. Items render from the typed task
+           model in js/chat_dashboard.js — each collects any missing input in the
+           shared dialog primitive and submits through chat.js's
+           submitUserMessage (the one conversation flow). The renderer toggles
+           the state elements below so loading / empty degrade section-locally.
+
+           The label reads "Suggested for you", which is the true claim and the
+           reason it is worth a line at all: these are not four static examples,
+           they are derived from what this caller can actually reach (the typed
+           task model in chat_dashboard.js, filtered by their own stack). An
+           earlier "Suggested to ask" only restated what the chips already look
+           like — questions beside a question field — and that is what made it
+           feel like chrome. Naming the personalisation says something the chips
+           cannot say about themselves.
+
+           Not "Suggested questions": that exact phrase is the retired hero's
+           heading and a guard bans it returning anywhere in the body
+           (test_renders_dashboard_and_context_line). #}
+        <section class="rdb-actions" id="rdb-actions" aria-label="Suggested for you">
+          <h2 class="rdb-actions-hd" id="rdb-actions-hd">Suggested for you</h2>
+          <ul id="rdb-actions-list" class="rdb-actions-list" role="list"></ul>
+          <p id="rdb-actions-loading" class="rdb-panel-note">Loading suggestions&hellip;</p>
+          <div id="rdb-actions-empty" class="rdb-actions-empty" hidden>
+            <p class="rdb-actions-empty-title">No suggested actions yet</p>
+            <p class="rdb-panel-note">
+              Ask {{ instance_brand_short or 'Agnes' }} anything below, or add more relevant sources and
+              capabilities to <a href="/library?stack=in_stack">your Stack</a>.
+            </p>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <form id="chat-form" class="cloud-chat-form">
       {# Slash menu — GET /api/chat/skills backs it (server-normalized,
          RBAC-filtered skills + recognized commands, see
@@ -862,52 +916,23 @@
       </div>
     </div>
 
-    {# Empty-state extras that sit BELOW the composer — the Suggested-next-
-       actions card row. Placed after #chat-form in the DOM; flex order
-       (chat.css) renders it below the composer. Auto-hides once a
-       conversation starts via the
-       ``#chat-capabilities[hidden] ~ #chat-empty-extras`` rule.
+    {# Empty-state extras that sit BELOW the composer — the ways out, and
+       nothing else. Placed after #chat-form in the DOM; flex order (chat.css)
+       renders it below the composer. Auto-hides once a conversation starts via
+       the ``#chat-capabilities[hidden] ~ #chat-empty-extras`` rule.
 
-       The Stack status line used to lead this block; it moved up into the
+       The suggested actions used to lead this block. They are #chat-suggested
+       now, above the composer, because they are the one thing here that helps
+       a reader USE the input rather than leave it — see the note there. What
+       is left is the ways out, which genuinely do belong past the thing the
+       reader came for.
+
+       The Stack status line used to lead this block too; it moved up into the
        composer's own footer row so it could share that line with the agent
-       picker. It still hides when a conversation starts — by its own rule
-       now, since it no longer rides this container. #}
+       picker, and is now retired. #}
     <div id="chat-empty-extras" class="cloud-chat-empty-extras">
 
       <div class="rdb">
-        {# Guided Agnes conversation-starters, directly under the composer so they
-           read as suggestions FOR the input. Items render from the typed task
-           model in js/chat_dashboard.js — each collects any missing input in the
-           shared dialog primitive and submits through chat.js's
-           submitUserMessage (the one conversation flow). The renderer toggles
-           the state elements below so loading / empty degrade section-locally.
-
-           The label reads "Suggested for you", which is the true claim and the
-           reason it is worth a line at all: these are not four static examples,
-           they are derived from what this caller can actually reach (the typed
-           task model in chat_dashboard.js, filtered by their own stack). An
-           earlier "Suggested to ask" only restated what the chips already look
-           like — questions under a question field — and that is what made it
-           feel like chrome. Naming the personalisation says something the chips
-           cannot say about themselves.
-
-           Not "Suggested questions": that exact phrase is the retired hero's
-           heading and a guard bans it returning anywhere in the body
-           (test_renders_dashboard_and_context_line). #}
-        <section class="rdb-actions" id="rdb-actions" aria-label="Suggested for you">
-          <h2 class="rdb-actions-hd" id="rdb-actions-hd">Suggested for you</h2>
-          <ul id="rdb-actions-list" class="rdb-actions-list" role="list"></ul>
-          <p id="rdb-actions-loading" class="rdb-panel-note">Loading suggestions&hellip;</p>
-          <div id="rdb-actions-empty" class="rdb-actions-empty" hidden>
-            <p class="rdb-actions-empty-title">No suggested actions yet</p>
-            <p class="rdb-panel-note">
-              Ask {{ instance_brand_short or 'Agnes' }} anything above, or add more relevant sources and
-              capabilities to <a href="/library?stack=in_stack">your Stack</a>.
-            </p>
-          </div>
-        </section>
-
-
         {# The cards' ORDINARY slot: after the suggestions, for admin and member
            alike. On an instance with nothing registered they render above the
            composer instead — see the note in #chat-capabilities for why that

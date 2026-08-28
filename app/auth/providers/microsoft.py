@@ -17,12 +17,16 @@ binding), a guest can land on an account another provider created. Pin
 ``auth.allowed_domain`` — :func:`startup_warnings` says so at boot when it is
 unset. See ``docs/auth-microsoft-oauth.md``.
 
-This module handles authentication only: on success the user is created (or
-matched) via the shared ``ensure_user`` provisioning path and granted Everyone
-membership. There is no Microsoft Graph group sync here — unlike
-``app.auth.providers.google``, which mirrors Workspace group membership via
-``apply_user_groups``. Group sync (Graph ``/me/memberOf``) is deferred to a
-later change; see the TODO below.
+On success the user is created (or matched) via the shared ``ensure_user``
+provisioning path and granted Everyone membership. Group sync mirrors
+``app.auth.providers.google``'s ``apply_user_groups`` — Entra ID group
+memberships (Graph ``GET /me/memberOf``) are written into
+``user_group_members`` (``source='microsoft_sync'``) via
+``app.auth.microsoft_group_sync.apply_user_groups`` — but is config-gated
+and OFF by default (``auth.microsoft.group_sync_enabled`` /
+``AGNES_MICROSOFT_GROUP_SYNC_ENABLED``, see ``app.switches``); see
+``docs/auth-microsoft-oauth.md`` for the Entra app permission it needs and
+the admin-consent step.
 """
 
 import os
@@ -199,6 +203,36 @@ def resolve_identity(user_info: dict) -> str:
     return upn.lower() if _upn_is_usable_identity(upn) else ""
 
 
+def _oauth_scope() -> str:
+    """The scope requested at ``/auth/microsoft/login``.
+
+    ``openid email profile`` unless Entra group sync is turned on
+    (``auth.microsoft.group_sync_enabled`` / ``AGNES_MICROSOFT_GROUP_SYNC_ENABLED``),
+    in which case the delegated Graph permission ``GroupMember.Read.All`` is
+    added so the resulting access token can call ``GET /me/memberOf`` — see
+    ``app.auth.microsoft_group_sync`` and ``docs/auth-microsoft-oauth.md``.
+
+    Read once, at import time (this function runs inside ``_setup_oauth()``
+    below, called once at module load) — same "restart to apply" contract as
+    every other boot-time-consumed switch (``app.switches.Switch.effect``).
+    An operator who flips the switch live gets the *sync* gate immediately
+    (``microsoft_group_sync.apply_user_groups`` reads it live, per sign-in),
+    but the wider consent scope only takes effect after a restart. Fails
+    closed to the narrower scope on any config-read error — better a
+    sign-in with no group sync than a login button that cannot render
+    because ``instance.yaml`` failed to load this early in boot.
+    """
+    scope = "openid email profile"
+    try:
+        from app.auth.microsoft_group_sync import group_sync_enabled
+
+        if group_sync_enabled():
+            scope += " GroupMember.Read.All"
+    except Exception:
+        logger.warning("Microsoft OAuth scope: could not resolve group_sync_enabled at setup", exc_info=True)
+    return scope
+
+
 def _setup_oauth():
     if not is_available():
         problem = tenant_id_error(MICROSOFT_TENANT_ID) if MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET else None
@@ -217,7 +251,7 @@ def _setup_oauth():
             f"https://login.microsoftonline.com/{quote(MICROSOFT_TENANT_ID.strip(), safe='')}"
             "/v2.0/.well-known/openid-configuration"
         ),
-        client_kwargs={"scope": "openid email profile"},
+        client_kwargs={"scope": _oauth_scope()},
     )
 
 
@@ -276,17 +310,40 @@ async def microsoft_callback(request: Request):
         # creation time only (once) — we deliberately do NOT re-assert it on
         # every login, so an admin who later removes the membership stays
         # removed. This matches google.py / keboola.py, which rely solely on
-        # that one-time grant. No Microsoft Graph group sync in this provider
-        # yet; every signed-in user gets Everyone membership and nothing else.
-        # TODO(group-sync): mirror Entra ID group membership via Graph
-        # `/me/memberOf`, the way google.py's apply_user_groups mirrors
-        # Workspace groups.
+        # that one-time grant.
         from app.auth.provisioning import UserDeactivatedError, ensure_user
 
         try:
             user = ensure_user(email, name, source="auth.microsoft:first-signin")
         except UserDeactivatedError:
             return RedirectResponse(url="/login?error=deactivated")
+
+        # Sync Entra ID groups → user_group_members (source='microsoft_sync').
+        # Config-gated, off by default — see app.auth.microsoft_group_sync
+        # and docs/auth-microsoft-oauth.md. Fail-soft: apply_user_groups
+        # never raises; on any failure (disabled, no Graph permission,
+        # network outage) it returns soft_failed=True and login proceeds
+        # with the previous membership snapshot untouched, exactly like the
+        # Google callback above. Unlike google.py's callback, there is no
+        # DuckDB-system-db-handle/conn dance here: apply_user_groups routes
+        # every read/write through the src.repositories factory and never
+        # touches ``conn`` (see its docstring) — opening a DuckDB handle just
+        # to pass it in and immediately discard it would be pointless work on
+        # every sign-in AND a new backend-split-guard violation
+        # (tests/test_backend_split_guard.py) on a Postgres instance.
+        from app.auth.microsoft_group_sync import apply_user_groups
+
+        access_token = str(token.get("access_token") or "")
+        sync_result = apply_user_groups(user["id"], email, access_token, None)
+
+        # Login gate: mirrors the Google callback's not_in_allowed_group
+        # gate — denied=True means the prefix filter is configured and
+        # Graph returned a non-empty memberOf that contained zero groups
+        # matching it. soft_failed (sync disabled, empty fetch, Graph
+        # error) does NOT trigger this, so a transient Graph outage or
+        # the feature being off can never lock a user out.
+        if sync_result.denied:
+            return RedirectResponse(url="/login?error=microsoft_not_in_allowed_group")
 
         # Issue JWT — identity-only, authorization derives from
         # user_group_members at request time (see app.auth.access).
