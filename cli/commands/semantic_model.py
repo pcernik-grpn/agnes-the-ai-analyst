@@ -31,7 +31,7 @@ _SEMANTIC_TYPES = ("dataset", "metric", "relationship")
 
 @semantic_model_app.command("apply")
 def apply(
-    path: str = typer.Argument(..., help="Path to an Ossie document (YAML)"),
+    path: str = typer.Argument(..., help="Path to a semantic-model document (YAML)"),
     description: Optional[str] = typer.Option(None, "--description", help="Listing description for the model"),
     expect_hash: Optional[str] = typer.Option(
         None,

@@ -181,6 +181,7 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
 
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
 
@@ -1134,6 +1135,28 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: How much of a failed producer's stderr to keep for the DEBUG line. Enough
+#: for a Python traceback plus context, small enough that it can never be the
+#: reason a worker dies.
+_PRODUCER_STDERR_TAIL_BYTES = 64 * 1024
+
+
+def _tail_text(fh, limit: int) -> str:
+    """Last ``limit`` bytes of an open binary file, decoded leniently.
+
+    Seeks rather than reads forward, so a multi-gigabyte producer log costs
+    one seek. ``errors="replace"`` because the cut can land mid-codepoint and
+    a diagnostic must never raise on its way to the log.
+    """
+    try:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - limit))
+        return fh.read().decode("utf-8", errors="replace")
+    except Exception:  # pragma: no cover - a diagnostic must not mask the failure it describes
+        return "<unreadable>"
+
+
 def _extraction_timeout_seconds() -> int:
     from app.instance_config import get_value
 
@@ -1199,6 +1222,96 @@ def _extraction_producer_env() -> dict[str, str]:
     return {name: os.environ[name] for name in names if name in os.environ}
 
 
+class AnonymizationKeyError(RuntimeError):
+    """At least one selected scope is ``anonymize=true`` but no per-instance
+    HMAC key resolves (design spec §9.2's pseudonym scheme —
+    ``PERSON_<hmac(key, ...)>`` etc., never a fixed marker). Raised rather
+    than silently omitting the key: a producer falling back to a shared or
+    absent key defeats the "tokens never correlate across tenants"
+    guarantee the key exists for, so the job fails clean instead of running
+    with a weaker guarantee than the wizard promised."""
+
+
+_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT = "AGNES_ANONYMIZATION_HMAC_KEY"
+
+
+def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
+    """``{source_scope_id: collection_id}`` for exactly the scopes THIS
+    connection's wizard marked ``anonymize=true`` (spec §9's
+    anonymize-in-front pipeline: source -> crawl -> convert -> anonymize ->
+    Agnes) — the producer handoff for which scopes it must run through the
+    anonymizer before uploading.
+
+    Reads the connection row's own ``config.scopes`` directly (the shape
+    ``app/api/admin_sharepoint.py`` writes and reads:
+    ``{source_scope_id, display_path, anonymize, collection_id}``) rather
+    than importing that admin router — this worker handler must not gain a
+    dependency on the admin API surface. ``GET .../corpus-map`` stays the
+    flat ``{source_scope_id: collection_id}`` producers already consume;
+    this is the SAME mapping, narrowed to anonymize-marked rows, used only
+    internally to build the child env below.
+    """
+    scopes = (connection.get("config") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return {}
+    out: dict[str, str] = {}
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        if scope.get("anonymize") and scope.get("source_scope_id") and scope.get("collection_id"):
+            out[str(scope["source_scope_id"])] = str(scope["collection_id"])
+    return out
+
+
+def _resolve_anonymization_key() -> str:
+    """Resolve this instance's per-instance anonymization HMAC key (spec
+    §9.2): an admin-configurable env var NAME
+    (``extraction.anonymization.hmac_key_env``, default
+    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against
+    :func:`src.orchestrator_security.is_producer_key_env_allowed` BEFORE the
+    value is read. The env var NAME is admin-writable config, so without a
+    gate an admin could point ``hmac_key_env`` at an unrelated instance
+    secret (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``, ...) and have it
+    forwarded to the external producer as if it were the anonymization key.
+
+    Deliberately uses ``is_producer_key_env_allowed`` — a SEPARATE, narrower
+    allowlist from ``is_token_env_allowed`` (the connector-ATTACH `token_env`
+    gate) — NOT the same function the SharePoint certificate resolver uses.
+    Sharing the certificate's allowlist would additionally make this key a
+    legal `token_env` for a connector-written `_remote_attach` row (a
+    SECOND, unrelated consumer of that allowlist in ``src/orchestrator.py``
+    / ``src/db.py``), letting a malicious connector exfiltrate the resolved
+    key value via ``ATTACH ... TOKEN`` to a connector-chosen URL (RBAC
+    review, 2026-08-28). See ``_PRODUCER_KEY_ENVS``'s docstring in
+    ``src/orchestrator_security.py`` for the full trust-boundary argument.
+
+    Raises :class:`AnonymizationKeyError` (never returns a fallback/empty
+    key) when the name is disallowed or unset — see that class's docstring
+    for why.
+    """
+    from app.instance_config import get_value
+    from src.orchestrator_security import is_producer_key_env_allowed
+
+    env_name = str(get_value("extraction", "anonymization", "hmac_key_env", default="") or "").strip()
+    env_name = env_name or _ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
+
+    if not is_producer_key_env_allowed(env_name):
+        raise AnonymizationKeyError(
+            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed anonymization "
+            f"key variable. Use the default name, {_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT}, or leave "
+            "hmac_key_env empty."
+        )
+
+    value = os.environ.get(env_name)
+    if not value:
+        raise AnonymizationKeyError(
+            f"{env_name} is not set on the server, so the per-instance anonymization key cannot "
+            "be resolved. At least one selected scope is marked anonymize=true — set "
+            f"{env_name} (see docs/anonymization.md) or unmark the scope in the connect wizard."
+        )
+    return value
+
+
 def _run_corpus_extraction(payload: dict) -> dict:
     """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
     §7.5 / §16 step 7). See the module docstring's entry for the wider
@@ -1225,20 +1338,35 @@ def _run_corpus_extraction(payload: dict) -> dict:
         collection the producer should write into. Passed through to the
         producer verbatim; this handler does not interpret it.
 
+    Anonymize-in-front handoff (spec §9/§9.2): this connection's own
+    ``config.scopes`` rows carry a per-scope ``anonymize`` flag (the connect
+    wizard's step-2 column, ``app/api/admin_sharepoint.py``) — the ONLY
+    place that flag is real is here. When at least one confirmed scope is
+    ``anonymize=true``, the child env additionally carries
+    ``AGNES_EXTRACTION_ANONYMIZE_SCOPES`` (a JSON object,
+    ``{source_scope_id: collection_id}``, covering ONLY the anonymize-marked
+    scopes — see :func:`_anonymize_marked_scope_map`) and
+    ``AGNES_ANONYMIZATION_HMAC_KEY`` (the per-instance pseudonym key, see
+    :func:`_resolve_anonymization_key`). Neither var is set when no scope is
+    anonymize-marked — an instance that never anonymizes never resolves or
+    forwards a key it does not need.
+
     Security (playbook F7): every secret this handler resolves —
-    tenant id, client id, certificate private key — reaches the producer
-    ONLY via the child process's environment, never on argv (readable via
-    `ps`/`/proc/<pid>/cmdline`) and never logged. That child env is NOT
+    tenant id, client id, certificate private key, and (when needed) the
+    anonymization HMAC key — reaches the producer ONLY via the child
+    process's environment, never on argv (readable via `ps`/
+    `/proc/<pid>/cmdline`) and never logged. That child env is NOT
     `{**os.environ}` — `extraction.producer` names an EXTERNAL,
     admin-configurable binary, so it starts from a curated non-secret
     allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
     opted-in `extraction.producer.env_passthrough`, then adds only the
-    three named credentials + the corpus id. No other instance secret
-    (vault key, LLM API key, DB DSN, ...) is ever forwarded, no matter what
-    happens to be sitting in this process's own environment. The
-    producer's own stdout/stderr are logged at DEBUG only, and only on
-    failure, in case a misbehaving producer echoes something it shouldn't
-    at INFO-visible levels.
+    three named credentials + the corpus id + (conditionally) the two
+    anonymization vars above. No other instance secret (vault key, LLM API
+    key, DB DSN, ...) is ever forwarded, no matter what happens to be
+    sitting in this process's own environment. The producer's own
+    stdout/stderr are logged at DEBUG only, and only on failure, in case a
+    misbehaving producer echoes something it shouldn't at INFO-visible
+    levels.
 
     No-op guard: raises (so the job fails cleanly, not with a confusing
     subprocess error) when ``extraction.enabled`` is false or no producer
@@ -1298,6 +1426,16 @@ def _run_corpus_extraction(payload: dict) -> dict:
     if corpus_id:
         child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
 
+    # Anonymize-in-front handoff (spec §9/§9.2): which of THIS connection's
+    # scopes the producer must run through the anonymizer before uploading,
+    # plus the per-instance pseudonym key — env only (never argv), and only
+    # added when at least one scope actually needs it, so an instance that
+    # never anonymizes never resolves/forwards the key at all.
+    anonymize_scopes = _anonymize_marked_scope_map(connection)
+    if anonymize_scopes:
+        child_env["AGNES_EXTRACTION_ANONYMIZE_SCOPES"] = json.dumps(anonymize_scopes, sort_keys=True)
+        child_env["AGNES_ANONYMIZATION_HMAC_KEY"] = _resolve_anonymization_key()
+
     timeout_s = _extraction_timeout_seconds()
 
     logger.info(
@@ -1306,22 +1444,37 @@ def _run_corpus_extraction(payload: dict) -> dict:
         corpus_id,
         timeout_s,
     )
+    # NOT `capture_output=True`: that holds every byte the producer writes in
+    # THIS process's memory for the whole run, and the run may legitimately
+    # last `extraction.timeout_s` (default an hour) crawling a real site. The
+    # captured text is used for exactly one thing — a DEBUG line on failure —
+    # so an hour of a chatty producer's progress output would buy a diagnostic
+    # tail at the price of OOM-killing a worker whose container memory limit is
+    # 4g by default (Devin Review on this PR). stdout goes to /dev/null (this
+    # handler never reads it — the producer reports through the ingest API, not
+    # through its own stdout), and stderr streams to a temp file from which
+    # only the last `_PRODUCER_STDERR_TAIL_BYTES` are read back on failure.
+    # Trading unbounded RSS for bounded RSS plus scratch disk is the right way
+    # round: the memory limit is what kills the worker, and the tail is the
+    # part of a stack trace anyone reads anyway.
     try:
-        result = subprocess.run(
-            argv,
-            env=child_env,
-            timeout=timeout_s,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with tempfile.TemporaryFile(mode="w+b") as stderr_buf:
+            result = subprocess.run(
+                argv,
+                env=child_env,
+                timeout=timeout_s,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_buf,
+                check=False,
+            )
+            stderr_tail = _tail_text(stderr_buf, _PRODUCER_STDERR_TAIL_BYTES) if result.returncode != 0 else ""
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"corpus-extraction: producer timed out after {timeout_s}s") from exc
     except FileNotFoundError as exc:
         raise RuntimeError(f"corpus-extraction: producer command not found: {argv[0]!r}") from exc
 
     if result.returncode != 0:
-        logger.debug("corpus-extraction: producer stderr (connection %s): %s", connection_id, result.stderr)
+        logger.debug("corpus-extraction: producer stderr tail (connection %s): %s", connection_id, stderr_tail)
         raise RuntimeError(f"corpus-extraction: producer exited {result.returncode} for connection {connection_id}")
 
     logger.info("corpus-extraction: producer completed for connection %s", connection_id)

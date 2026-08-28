@@ -23,7 +23,7 @@ import typer
 
 from cli.client import api_get, api_post
 
-admin_semantic_model_app = typer.Typer(help="Admin: semantic-model CRUD (Ossie documents)")
+admin_semantic_model_app = typer.Typer(help="Admin: semantic-model CRUD (semantic model documents)")
 
 
 def _fail(resp) -> None:
@@ -101,7 +101,7 @@ def show_model(
 
 @admin_semantic_model_app.command("import")
 def import_model(
-    path: str = typer.Argument(..., help="Path to a local Ossie YAML document"),
+    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
     description: Optional[str] = typer.Option(None, "--description", help="Optional description to store"),
 ):
     """Upload a local document, creating or replacing the hand-authored
@@ -158,9 +158,9 @@ def export_model(
 
 @admin_semantic_model_app.command("validate")
 def validate_model(
-    path: str = typer.Argument(..., help="Path to a local Ossie YAML document"),
+    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
 ):
-    """Schema-check a local file against the vendored Ossie spec.
+    """Schema-check a local file against the vendored semantic-model schema.
 
     Runs entirely offline: no server, no token. An author fixing a
     document should not need a reachable instance to iterate.

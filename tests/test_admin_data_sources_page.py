@@ -1454,6 +1454,65 @@ class TestSharePointSourceCard:
             assert cert["origin"] == "env"
             assert cert["env_name"] == "SHAREPOINT_CERT_PRIVATE_KEY"
             assert "-----BEGIN PRIVATE KEY-----" not in str(cert)
+            # No CERTIFICATE PEM block in this stored value -> a clean typed
+            # absence, not a missing key / a crash.
+            assert cert["metadata_reason"] == "no_certificate_configured"
+            assert "thumbprint_x5t" not in cert
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_certificate_metadata_flows_through_from_a_real_certificate(self, seeded_app, monkeypatch):
+        """The thumbprint/subject/expiry `certificate_metadata` derives are
+        merged into the same cell the settings-resolution fields already
+        populate — one certificate row, not two competing sources of truth."""
+        import datetime
+        import uuid
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=90))
+            .sign(key, hashes.SHA256())
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode()
+        pem = cert_pem + key_pem
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1", "cert_private_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
+        )
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", pem)
+        try:
+            inv = _source_inventory()
+            cert_cell = inv["pipelines"][conn_id]["file_source"]["certificate"]
+            assert cert_cell["origin"] == "env"  # settings-resolution field, unaffected
+            assert cert_cell["subject"] == "CN=agnes-test"
+            assert cert_cell["issuer"] == "CN=agnes-test"
+            assert cert_cell["status"] == "ok"
+            assert cert_cell["thumbprint_x5t"]
+            assert "-----BEGIN PRIVATE KEY-----" not in str(cert_cell)
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1601,6 +1660,240 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
             file_source=fs,
         )
         assert "Nothing in this category" in result["innerHTML"]
+
+    # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
+
+    def test_facts_html_has_no_anonymization_row_when_nothing_requested(self):
+        """No scope has ever been marked anonymize — the row must not
+        appear at all, not render as empty/zero."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        assert "Anonymization" not in result["html"]
+
+    def test_facts_html_renders_requested_but_not_declared_as_warn(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a"], "declared": [], "pending": ["col_a"]}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymization requested 1" in html
+        # Never claims "anonymized" for a scope nothing has declared yet.
+        assert "anonymized 1" not in html
+        assert "badge-warn" in html
+
+    def test_facts_html_renders_declared_as_ok(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a"], "declared": ["col_a"], "pending": []}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymized 1" in html
+        assert "anonymization requested" not in html
+        assert "badge-env" in html
+
+    def test_facts_html_renders_both_declared_and_pending_together(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["anonymization"] = {"requested": ["col_a", "col_b"], "declared": ["col_a"], "pending": ["col_b"]}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "anonymized 1" in html
+        assert "anonymization requested 1" in html
+
+
+class TestSharePointWizardShareBadgeRendering:
+    """`spRenderShare` (the connect wizard's step-3 share preview, spec
+    §13.2) executed for real via `node` — the badge this task exists to
+    fix: `anonymize=true` alone must never render "anonymized"; that word
+    is earned only once the scope row's server-computed
+    `anonymization_declared` is also true. Same node-harness pattern as
+    `TestSharePointSourceCardRendering`."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, items: list) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig) for sig in ("function spEsc(s) {", "function spRenderShare(items) {")
+        )
+        script = f"""
+{fns}
+
+const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
+const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
+let spPendingGroups = {{}};
+let spGroups = [];
+const items = {json.dumps(items)};
+
+spRenderShare(items);
+console.log(_host.innerHTML);
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "source_scope_id": "scope-1",
+            "display_path": "Contracts",
+            "anonymize": False,
+            "anonymization_declared": False,
+            "collection_id": "col_a",
+            "collection": {"id": "col_a", "slug": "contracts", "name": "Contracts"},
+            "group_ids": ["g1"],
+        }
+        row.update(overrides)
+        return row
+
+    def test_not_anonymize_marked_shows_no_badge(self):
+        html = self._run([self._row(anonymize=False)])
+        assert "sp-badge--anon" not in html
+
+    def test_requested_but_not_declared_shows_requested_warn_badge(self):
+        html = self._run([self._row(anonymize=True, anonymization_declared=False)])
+        assert "anonymization requested" in html
+        assert ">anonymized<" not in html
+        assert 'sp-badge--anon"' in html
+        assert "sp-badge--anon-declared" not in html
+
+    def test_declared_shows_anonymized_ok_badge(self):
+        html = self._run([self._row(anonymize=True, anonymization_declared=True)])
+        assert ">anonymized<" in html
+        assert "anonymization requested" not in html
+        assert "sp-badge--anon-declared" in html
+
+    def test_declared_true_but_anonymize_false_shows_no_badge(self):
+        """A defensive edge case: the server never produces this
+        combination (declared implies anonymize was true when the run
+        landed), but the client must not invent a claim from a stale
+        `anonymization_declared` alone."""
+        html = self._run([self._row(anonymize=False, anonymization_declared=True)])
+        assert "sp-badge--anon" not in html
+
+
+class TestSharePointCertificateMetadataRendering:
+    """Certificate metadata rows (thumbprint, subject/issuer, expiry status)
+    on the file-source card — introduced alongside
+    `GET .../connections/{id}/certificate` (integration, #1704). Same
+    node-harness pattern; kept as its own class rather than folded back
+    into `TestSharePointSourceCardRendering` so a merge conflict here next
+    time is a smaller diff."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+    _FILE_SOURCE = TestSharePointSourceCardRendering._FILE_SOURCE
+    _run = TestSharePointSourceCardRendering._run
+
+    def test_certificate_metadata_renders_thumbprint_subject_and_ok_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "vault",
+            "env_name": None,
+            "set_at": "2026-08-20T12:00:00+00:00",
+            "error": None,
+            "thumbprint_x5t": "abcXYZ123-_",
+            "thumbprint_sha1_hex": "AB" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2026-08-01T00:00:00+00:00",
+            "not_after": "2027-08-01T00:00:00+00:00",
+            "expires_in_days": 300,
+            "status": "ok",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "abcXYZ123-_" in html
+        assert "CN=agnes-test" in html
+        assert "badge-ok" in html
+        assert "300d left" in html
+
+    def test_certificate_metadata_expiring_soon_gets_the_warn_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "thumbprint_x5t": "thumb-soon",
+            "thumbprint_sha1_hex": "CD" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2026-01-01T00:00:00+00:00",
+            "not_after": "2026-09-05T00:00:00+00:00",
+            "expires_in_days": 8,
+            "status": "expiring_soon",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "badge-warn" in html
+        assert "8d left" in html
+
+    def test_certificate_metadata_expired_gets_the_danger_badge(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "thumbprint_x5t": "thumb-expired",
+            "thumbprint_sha1_hex": "EF" * 20,
+            "subject": "CN=agnes-test",
+            "issuer": "CN=agnes-test",
+            "not_before": "2025-01-01T00:00:00+00:00",
+            "not_after": "2025-06-01T00:00:00+00:00",
+            "expires_in_days": -80,
+            "status": "expired",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "badge-danger" in html
+        assert "expired 80d ago" in html
+
+    def test_no_certificate_configured_renders_a_clean_absence_not_a_blank_card(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "env",
+            "env_name": "SHAREPOINT_CERT_PRIVATE_KEY",
+            "set_at": None,
+            "error": None,
+            "metadata_reason": "no_certificate_configured",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "not configured" in html
+        assert "badge-ok" not in html and "badge-warn" not in html and "badge-danger" not in html
+
+    def test_unparseable_certificate_renders_unreadable_not_a_blank_card(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": "vault",
+            "env_name": None,
+            "set_at": "2026-08-20T12:00:00+00:00",
+            "error": None,
+            "metadata_reason": "certificate_unparseable: bad PEM",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "unreadable" in html
+
+    def test_settings_resolution_error_does_not_duplicate_the_not_configured_row(self):
+        """`cert.error` (a settings-RESOLUTION failure) already renders "not
+        configured" via the existing Certificate row — the metadata rows must
+        not repeat that verdict a second time."""
+        fs = dict(self._FILE_SOURCE)
+        fs["certificate"] = {
+            "origin": None,
+            "env_name": None,
+            "set_at": None,
+            "error": "SharePoint connection is missing required field(s): tenant_id, client_id",
+        }
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert html.count("Thumbprint") == 0
 
 
 def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):

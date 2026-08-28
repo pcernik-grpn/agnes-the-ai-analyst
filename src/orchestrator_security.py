@@ -63,9 +63,37 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
         # connectors.sharepoint.settings, which funnels every lookup through
         # is_token_env_allowed() for the same reason the Snowflake names above
         # do: the variable name lives in admin-writable connection config.
+        #
+        # NOTE (RBAC review, 2026-08-28): SHAREPOINT_CERT_PRIVATE_KEY has the
+        # SAME dual-consumer exposure this file's `_PRODUCER_KEY_ENVS` split
+        # exists to avoid below — its membership here also makes it a legal
+        # `token_env` for a connector-written `_remote_attach` row. Left as
+        # pre-existing (not introduced by this change); tracked as a
+        # separate follow-up rather than fixed inline here.
         "SHAREPOINT_CERT_PRIVATE_KEY",
     }
 )
+
+# Env var NAME for the anonymize-in-front pipeline's per-instance HMAC key
+# (design spec §9.2 — PERSON_<hmac(key, ...)> etc., never a fixed marker),
+# resolved by ``app.worker.kinds._resolve_anonymization_key`` and forwarded
+# ONLY to the external producer subprocess's child environment.
+#
+# Deliberately NOT part of `_DEFAULT_TOKEN_ENVS` above, and this set must
+# NEVER be merged into it. `_DEFAULT_TOKEN_ENVS` feeds `get_allowed_token_
+# envs()` / `is_token_env_allowed()`, which gate a SECOND, unrelated
+# consumer: `token_env` on a connector-written `_remote_attach` row
+# (src/orchestrator.py, src/db.py) — a value a connector chooses, resolved
+# and sent as an `ATTACH ... TOKEN` to a connector-chosen `url`
+# (`is_attach_host_allowed` is default-open with no `AGNES_REMOTE_ATTACH_
+# HOST_ALLOWLIST` configured). Listing this key there would let a
+# malicious/compromised connector's extract.duckdb declare a
+# `_remote_attach` row with `token_env=AGNES_ANONYMIZATION_HMAC_KEY` and
+# have the orchestrator exfiltrate the real key value to an
+# attacker-controlled host. Keeping this a separate, narrower allowlist
+# means the outbound producer-key resolution and the inbound
+# connector-ATTACH trust boundary can never share membership by accident.
+_PRODUCER_KEY_ENVS: frozenset[str] = frozenset({"AGNES_ANONYMIZATION_HMAC_KEY"})
 
 # Names must additionally match this regex (defense against weird input).
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -129,6 +157,24 @@ def is_token_env_allowed(token_env: str) -> bool:
     if not isinstance(token_env, str) or not _ENV_NAME_RE.match(token_env):
         return False
     return token_env in get_allowed_token_envs()
+
+
+def is_producer_key_env_allowed(name: str) -> bool:
+    """Return True if ``name`` may be read and forwarded to an EXTERNAL
+    producer subprocess's child environment (currently: the anonymize-in-
+    front pipeline's HMAC key, ``app.worker.kinds._resolve_anonymization_
+    key``).
+
+    Same two checks as :func:`is_token_env_allowed` (structural regex, then
+    membership) but against :data:`_PRODUCER_KEY_ENVS` — a SEPARATE, narrower
+    set from :data:`_DEFAULT_TOKEN_ENVS`. Do not use this function for the
+    connector-ATTACH `token_env` gate, and do not use `is_token_env_allowed`
+    for producer-key resolution — see `_PRODUCER_KEY_ENVS`'s docstring for
+    why the two must never share membership.
+    """
+    if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+        return False
+    return name in _PRODUCER_KEY_ENVS
 
 
 def log_effective_policy() -> None:

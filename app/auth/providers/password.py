@@ -420,12 +420,13 @@ async def password_login_web(
             status_code=303,
         )
 
-    if next.startswith("/") and not next.startswith("//"):
-        target = next
-    else:
-        from app.instance_config import get_home_route
+    # The shared rule, not a fourth copy of it: `safe_next_path` carries the
+    # same open-redirect guard PLUS the `_is_own_data_app_origin` exception,
+    # without which signing in with a password lands on the home route while
+    # OAuth and magic-link return you to the app you came from.
+    from app.auth._common import safe_next_path
 
-        target = get_home_route()
+    target = safe_next_path(next)
     response = RedirectResponse(url=target, status_code=302)
     _set_login_cookie(response, user["id"], user["email"], request)
     audit_login_success(user["id"], provider="password", request=request)

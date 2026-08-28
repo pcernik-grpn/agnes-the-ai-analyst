@@ -172,6 +172,32 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
 # ---------------------------------------------------------------------------
 
 
+class FactsIngestAnonymizationScope(BaseModel):
+    """One corpus's anonymization tally within this batch (spec §9.2). A
+    self-reported COUNT, never independently verified by Agnes — see
+    ``docs/anonymization.md``'s "current limits"."""
+
+    docs_anonymized: int = Field(default=0, ge=0)
+    docs_skipped: int = Field(default=0, ge=0)
+
+
+class FactsIngestAnonymizationReport(BaseModel):
+    """OPTIONAL producer declaration that (some of) this batch went through
+    the anonymize-in-front pipeline (spec §9: source -> crawl -> convert ->
+    anonymize -> Agnes) before ingestion. Additive to the wire contract — a
+    producer that never anonymizes omits this field entirely.
+
+    ``scopes`` is keyed by ``corpus_id`` (the collection id, matching the
+    connect wizard's own scope-row shape); a key that does not resolve to a
+    real collection is KEPT, not rejected — this is a self-reported tally,
+    not a join against ``file_corpora`` (spec §9.2's "current limits": Agnes
+    records the declaration, it cannot verify the content was anonymized).
+    """
+
+    declared: bool = False
+    scopes: Dict[str, FactsIngestAnonymizationScope] = Field(default_factory=dict)
+
+
 class FactsIngestRequest(BaseModel):
     """Wire format accepted verbatim (spec §7.0/§7.2) — ``documents`` are the
     crawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/
@@ -180,12 +206,17 @@ class FactsIngestRequest(BaseModel):
     schema — the producer contract explicitly tolerates unknown fields
     (underscore-prefixed crawler internals are stripped server-side, not
     rejected), so a rigid Pydantic model would reject valid producer input
-    on every crawler-side field addition."""
+    on every crawler-side field addition.
+
+    ``anonymization`` is the one exception: a small, OPTIONAL, strictly
+    typed block (spec §9.2) — malformed input there is a real protocol
+    error (422), not tolerated crawler noise."""
 
     documents: List[Dict[str, Any]] = Field(default_factory=list)
     full_documents: List[str] = Field(default_factory=list)
     nodes: List[Dict[str, Any]] = Field(default_factory=list)
     edges: List[Dict[str, Any]] = Field(default_factory=list)
+    anonymization: Optional[FactsIngestAnonymizationReport] = None
 
 
 @router.post("/ingest")
@@ -213,6 +244,13 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     its transaction: a run-report write is a side record, never a condition
     of the ingest succeeding, so a failure there is logged and swallowed,
     never surfaced as a 5xx for a batch that in fact wrote its claims fine.
+
+    ``anonymization`` (spec §9.2, optional) rides along INTO that persisted
+    run report only — never into the returned report above, and never
+    joined against real corpus ids (a corpus id the batch's own
+    ``documents`` never mention is kept, not rejected: this is the
+    producer's self-reported tally of what it anonymized, not something
+    Agnes independently verifies — see ``docs/anonymization.md``).
     """
     try:
         report = facts_repo().ingest_batch(
@@ -243,6 +281,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             subjects_created=report.get("subjects_created", 0),
             subjects_deleted=report.get("subjects_deleted", 0),
             review_items=report.get("review_items", []),
+            anonymization=body.anonymization.model_dump() if body.anonymization else None,
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)

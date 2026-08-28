@@ -4,18 +4,24 @@ Each row binds one user to one group with a `source` label tracking who
 created the row. The source matters because multiple writers populate this
 table:
 
-  - ``google_sync``  — OAuth callback rewrites the user's Google-derived
-                       memberships on every login (DELETE+INSERT scoped to
-                       this source).
-  - ``admin``        — admin UI/CLI manual additions; survives Google sync.
-  - ``system_seed``  — deploy-time seeds (Admin grant for SEED_ADMIN_EMAIL);
-                       survives Google sync and refuses removal via the
-                       admin path. The auto-Everyone seed for every new
-                       user was removed when Google-prefix mapping landed
-                       — explicit grants only.
+  - ``google_sync``    — OAuth callback rewrites the user's Google-derived
+                         memberships on every login (DELETE+INSERT scoped to
+                         this source).
+  - ``microsoft_sync``  — OAuth callback rewrites the user's Entra
+                         ID-derived memberships on every login, same
+                         DELETE+INSERT shape, config-gated (off by default
+                         — see app.auth.microsoft_group_sync).
+  - ``admin``          — admin UI/CLI manual additions; survives sync.
+  - ``system_seed``    — deploy-time seeds (Admin grant for SEED_ADMIN_EMAIL);
+                         survives sync and refuses removal via the
+                         admin path. The auto-Everyone seed for every new
+                         user was removed when Google-prefix mapping landed
+                         — explicit grants only.
 
-The ``replace_google_sync_groups`` method is the bulk operation called from
-the OAuth callback; ``add_member`` / ``remove_member`` cover admin actions.
+``replace_synced_groups`` is the shared bulk-replace primitive;
+``replace_google_sync_groups`` / ``replace_microsoft_sync_groups`` are thin,
+source-pinned wrappers over it, one per provider. ``add_member`` /
+``remove_member`` cover admin actions.
 """
 
 from __future__ import annotations
@@ -139,26 +145,31 @@ class UserGroupMembersRepository:
             ).fetchone()
         return res is not None
 
-    def replace_google_sync_groups(
+    def replace_synced_groups(
         self,
         user_id: str,
         group_ids: List[str],
-        added_by: str = "system:google-sync",
+        source: str,
+        added_by: str,
     ) -> None:
-        """Authoritative refresh of this user's google_sync memberships.
+        """Authoritative refresh of this user's ``source``-tagged memberships.
 
-        DELETEs every row with ``source='google_sync'`` for this user, then
-        INSERTs one row per ``group_ids``. Admin and system_seed rows are
-        untouched. Called from the OAuth callback on every login so the
-        membership reflects the current Cloud Identity state.
+        DELETEs every row with this ``source`` for this user, then INSERTs
+        one row per ``group_ids``. Rows of every OTHER source (admin,
+        system_seed, a different provider's sync) are untouched. Called from
+        a provider's OAuth callback on every login so the membership
+        reflects that provider's current directory state — the shared
+        primitive behind ``replace_google_sync_groups`` and
+        ``replace_microsoft_sync_groups`` below; call this directly for a
+        source those wrappers don't cover.
 
         Wrapped in a single transaction so concurrent readers never observe
         the post-DELETE / pre-INSERT window where the user has *no*
-        google_sync groups. ``get_system_db()`` hands every caller a cursor
+        ``source`` groups. ``get_system_db()`` hands every caller a cursor
         on one shared connection, so a non-atomic rebuild leaks an empty
         intermediate state to anything reading membership mid-refresh — e.g.
         the marketplace git endpoint resolving a user's served plugin set,
-        which would transiently drop every plugin granted via a google_sync
+        which would transiently drop every plugin granted via a synced
         group until the re-INSERTs commit. Mirrors the PG repo's
         ``self._engine.begin()`` atomicity (cross-engine parity).
 
@@ -170,23 +181,23 @@ class UserGroupMembersRepository:
             try:
                 self.conn.execute("BEGIN")
                 self.conn.execute(
-                    "DELETE FROM user_group_members WHERE user_id = ? AND source = 'google_sync'",
-                    [user_id],
+                    "DELETE FROM user_group_members WHERE user_id = ? AND source = ?",
+                    [user_id, source],
                 )
                 for group_id in group_ids:
-                    # ON CONFLICT DO NOTHING: an Admin / system_seed row may
-                    # already own this (user_id, group_id) pair — the user is
-                    # a member through a higher-priority source, leave it.
-                    # Using the conflict clause instead of catching
-                    # ConstraintException keeps the surrounding transaction
-                    # alive (a raised constraint error would otherwise abort
-                    # it). Matches PG.
+                    # ON CONFLICT DO NOTHING: an Admin / system_seed row (or a
+                    # DIFFERENT provider's sync row) may already own this
+                    # (user_id, group_id) pair — the user is a member through
+                    # a higher-priority/other source, leave it. Using the
+                    # conflict clause instead of catching ConstraintException
+                    # keeps the surrounding transaction alive (a raised
+                    # constraint error would otherwise abort it). Matches PG.
                     self.conn.execute(
                         """INSERT INTO user_group_members
                            (user_id, group_id, source, added_by)
-                           VALUES (?, ?, 'google_sync', ?)
+                           VALUES (?, ?, ?, ?)
                            ON CONFLICT (user_id, group_id) DO NOTHING""",
-                        [user_id, group_id, added_by],
+                        [user_id, group_id, source, added_by],
                     )
                 self.conn.execute("COMMIT")
                 return
@@ -203,6 +214,24 @@ class UserGroupMembersRepository:
         # Exhausted retries — surface the last conflict to the caller.
         if last_err is not None:
             raise last_err
+
+    def replace_google_sync_groups(
+        self,
+        user_id: str,
+        group_ids: List[str],
+        added_by: str = "system:google-sync",
+    ) -> None:
+        """``replace_synced_groups`` pinned to ``source='google_sync'``."""
+        self.replace_synced_groups(user_id, group_ids, source="google_sync", added_by=added_by)
+
+    def replace_microsoft_sync_groups(
+        self,
+        user_id: str,
+        group_ids: List[str],
+        added_by: str = "system:microsoft-sync",
+    ) -> None:
+        """``replace_synced_groups`` pinned to ``source='microsoft_sync'``."""
+        self.replace_synced_groups(user_id, group_ids, source="microsoft_sync", added_by=added_by)
 
     def _safe_rollback(self) -> None:
         try:

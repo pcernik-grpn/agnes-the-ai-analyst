@@ -1018,7 +1018,7 @@
   function schedulesBody(a) {
     if (!a.slug) return '<div class="ag-note">This agent has no address yet — reload the page and try again.</div>';
     if (schedulesErr === 'disabled') {
-      return '<div class="ag-note">Scheduled runs are turned off on this instance (agent profiles are disabled) — ask an admin to enable them.</div>';
+      return '<div class="ag-note">Scheduled runs are turned off on this instance (agents are disabled) — ask an admin to enable them.</div>';
     }
     if (schedulesErr) return '<div class="ag-note">Could not load this agent’s schedules right now — try reloading the page.</div>';
     if (schedules === null) return '<p class="ag-row-desc" style="padding:12px 0">Loading schedules…</p>';

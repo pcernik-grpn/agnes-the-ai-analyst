@@ -73,6 +73,30 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "facts_ingest_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/facts_ingest_runs_pg.py"
     ),
+    # External SSO login config (design 2026-08-28) — both parameter-free
+    # GETs reach a PG-only repo before any other validation.
+    "GET /api/admin/sso/config": (
+        "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/sso_config_pg.py"
+    ),
+    "GET /api/admin/sso/identities": (
+        "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
+        "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
+    ),
+    "GET /api/me/external-identity": (
+        "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
+        "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
+    ),
+    # Agent-sharing approval queue (Track C6) — genuinely parameter-free
+    # (`status`/`limit`/`skip` are query params with defaults) and reaches
+    # share_requests_repo() -- DuckDB -> typed 501, Postgres -> 200 (empty
+    # list, nothing seeded). This is the admin QUEUE surface only; sharing
+    # ITSELF (`PUT /api/sharing/agent/{id}`) falls back to an instant grant
+    # on DuckDB instead of a 501 — see app/services/library_sharing.py.
+    "GET /api/admin/share-requests": (
+        "share_requests_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/share_requests_pg.py"
+    ),
 }
 
 

@@ -91,6 +91,10 @@ def _ensure_registry_row(registered_by: Optional[str]) -> None:
         curator_name="Contributed",
         is_builtin=True,
     )
+    # TCRD-219: same stale-stamp problem as the built-in row — after the
+    # sync_one() guard no sync can ever touch this row again, so a failure
+    # stamped by a pre-guard "Sync now" click would otherwise be permanent.
+    marketplace_registry_repo().clear_sync_error(CONTRIBUTED_MARKETPLACE_SLUG)
 
 
 def _upsert_manifest_entry(repo_root: Path, plugin_name: str, description: str) -> None:
