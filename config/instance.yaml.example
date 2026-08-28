@@ -341,10 +341,30 @@ auth:
 # audit:
 #   # How many days to keep `audit_log` rows before the daily audit-prune
 #   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
-#   # Only `audit_log` has a retention policy today — see docs/observability.md
-#   # for the other audit/observability trails (chat, sessions, usage, sync,
-#   # llm_usage, agent-runtime forensics).
 #   retention_days: 365
+
+# --- Per-trail retention (optional, Track E3 Slice 1) ---
+# Opt-in day windows for the other unbounded audit/activity trails. EVERY
+# key below defaults to 0 = keep forever = the daily retention-prune
+# scheduler job is a no-op for that trail — nothing is deleted unless you
+# set a window explicitly. See docs/observability.md for the full trail
+# inventory (chat transcripts and CLI session JSONLs still have no
+# retention policy — deliberately out of scope).
+# retention:
+#   sync_history_days: 0              # sync_history rows, by synced_at. Never
+#                                      # touches sync_state (current per-table
+#                                      # state, not a trail).
+#   llm_usage_days: 0                 # llm_usage rows (per-call token ledger), by created_at.
+#   agent_scope_snapshots_days: 0     # agent_scope_snapshots rows, by created_at.
+#                                      # Never touches the live agents table.
+#   usage_events_days: 0              # usage_events rows, by occurred_at. The
+#                                      # USAGE_EVENTS_RETENTION_DAYS env var wins
+#                                      # over this key when both are set
+#                                      # (back-compat). Pruned by its own
+#                                      # standalone POST /api/admin/usage/prune
+#                                      # job (agnes admin usage prune), not the
+#                                      # retention-prune sweep below. Daily
+#                                      # rollup tables are never touched.
 
 # --- Feature flags (optional) ---
 # See docs/feature-flags.md for the full inventory and resolution order.
@@ -516,19 +536,6 @@ data_source:
   #                                      # parquet size; a larger result is rejected, never written.
   #                                      # Default 10 GiB. Set 0 to disable.
 
-# --- OpenMetadata catalog (optional) ---
-# Enriches table and column metadata from OpenMetadata REST API.
-# If not configured, app works normally without catalog enrichment.
-# All openmetadata.* fields configurable via /admin/server-config UI.
-# openmetadata:
-#   url: "https://your-catalog.example.com"
-#   token: "${OPENMETADATA_TOKEN}"        # JWT bearer token
-#   cache_ttl_seconds: 3600               # Cache TTL in seconds
-#   verify_ssl: true                       # set to false ONLY for internal
-#                                          # CAs / self-signed certs; defaults
-#                                          # to true. Setting false ships the
-#                                          # JWT over an unverified channel.
-
 # --- Email delivery (optional, for magic link auth) ---
 # Without SMTP, magic links are shown directly in browser (development mode).
 # For production, configure any SMTP relay (Gmail, Mailgun, SendGrid SMTP, etc.)
@@ -570,9 +577,10 @@ notifications:
 
 # --- Corporate Memory AI (optional) ---
 # Extracts shared knowledge from team members' CLAUDE.local.md files.
-# Provider: "anthropic" (direct API) or "openai_compat" (LiteLLM, OpenRouter, Azure, etc.)
+# Provider: "anthropic" (direct API), "openai_compat" (LiteLLM, OpenRouter,
+# Azure, etc.), or "vertex" (Claude on Google Vertex AI, keyless — see below)
 ai:
-  provider: "anthropic"                    # or "openai_compat"
+  provider: "anthropic"                    # or "openai_compat" / "vertex"
   api_key: "${ANTHROPIC_API_KEY}"          # or "${LLM_API_KEY}" for proxy
   # base_url: "https://litellm.example.com"  # Required for provider='openai_compat' (LiteLLM,
                                               # OpenRouter, vLLM). Ignored when provider='anthropic'.
@@ -622,6 +630,21 @@ ai:
 #   api_key: "${OPENROUTER_API_KEY}"
 #   model: "anthropic/claude-3-haiku"
 #   structured_output: "auto"
+#
+# --- Google Vertex AI (Claude on Vertex; no API key — auth is Google ADC) ---
+# Credentials resolve via the standard google-auth chain:
+# GOOGLE_APPLICATION_CREDENTIALS (service-account JSON) -> gcloud user ADC
+# (`gcloud auth application-default login`) -> GCE/GKE attached service account.
+# First-party model ids are accepted; dated ids translate to the Vertex form
+# automatically ("claude-haiku-4-5-20251001" -> "claude-haiku-4-5@20251001").
+# structured_output is ignored (Vertex supports native json_schema, same as
+# provider: "anthropic"). Requires the anthropic[vertex] extra (bundled).
+# ai:
+#   provider: "vertex"
+#   vertex:
+#     project_id: "my-gcp-project"   # or env ANTHROPIC_VERTEX_PROJECT_ID
+#     region: "global"               # or "us-east5", "europe-west1", ...; env CLOUD_ML_REGION
+#   model: "claude-haiku-4-5-20251001"
 
 # --- Maintained digests (optional, K4) ---
 # Admin-defined digest documents (title + standing instructions + source
@@ -692,6 +715,10 @@ ai:
 #   # "mandatory_only" — admin controls everything, no user voting
 #   # "admin_curated" — admin controls, users vote as feedback signal
 #   # "hybrid" — mandatory from admin + optional from user voting (default)
+#   #
+#   # NOT YET ENFORCED (#1573): GET /api/memory/bundle currently ships every
+#   # approved item to every user regardless of this value — changing it has
+#   # no effect on distribution yet.
 #   distribution_mode: "hybrid"
 #
 #   # How new AI-extracted items enter the system:
@@ -700,10 +727,17 @@ ai:
 #   # "threshold" — high-confidence auto-publish, low-confidence to review queue
 #   approval_mode: "review_queue"
 #
+#   # Confidence cutoff for approval_mode="threshold" — items scoring >= this
+#   # auto-publish, below it they go to the review queue. Ignored unless
+#   # approval_mode is "threshold". Compare against corporate_memory.confidence.base
+#   # below to pick a realistic cutoff per source type.
+#   auto_publish_min_confidence: 0.80
+#
 #   # Default review period for approved/mandatory items (months)
 #   review_period_months: 6
 #
-#   # Notify km_admins about new pending items
+#   # Notify every Admin-group member's desktop when a collection run
+#   # leaves new items pending review
 #   notify_on_new_items: true
 #
 #   # --- V1 Context Engineering ---
@@ -992,8 +1026,36 @@ chat:
   #                                 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN be
   #                                 unset. See docs/superpowers/specs/2026-07-15-
   #                                 keyless-llm-auth-design.md.
+  #
+  # chat.llm.provider — which LLM platform the chat broker forwards to:
+  #   anthropic (default)         first-party Anthropic API.
+  #   vertex                      Claude through Google Vertex AI. The sandbox
+  #                               CLI runs in its native Vertex gateway mode
+  #                               (CLAUDE_CODE_USE_VERTEX=1 + skip-auth), all
+  #                               traffic still egresses through the relay ->
+  #                               broker, and the broker signs upstream calls
+  #                               with Google ADC (GOOGLE_APPLICATION_CREDENTIALS
+  #                               -> gcloud ADC -> GCE/GKE attached service
+  #                               account). No Anthropic credential exists, and
+  #                               no Google credential ever enters the sandbox.
+  #                               Requires vertex.project_id + vertex.region;
+  #                               the broker pins both server-side. Mutually
+  #                               exclusive with llm.auth=workload_identity and
+  #                               with LLM_DISPATCHER_URL (boot refuses either
+  #                               combination). Prerequisites: enable the Claude
+  #                               models in Vertex Model Garden for the project/
+  #                               region and grant the identity
+  #                               roles/aiplatform.user.
+  #                               `agents.model` / chat.agent_api_utility_models
+  #                               accept either model-id spelling
+  #                               (claude-…-YYYYMMDD or claude-…@YYYYMMDD) —
+  #                               they compare canonically.
   # llm:
   #   auth: api_key
+  #   provider: anthropic         # anthropic (default) | vertex
+  #   vertex:
+  #     project_id: my-gcp-project
+  #     region: europe-west1      # or "global"
 
 # --- Hosted Data Apps (optional) ---
 # Hosted data apps (user web applications run next to the data)
@@ -1044,6 +1106,20 @@ data_apps:
                                 # runtime image with it and extending that
                                 # list from what actually failed; otherwise
                                 # every hosted app crash-loops.
+
+
+# --- Fact graph over Collections (optional) ---
+# `facts.enabled` / `facts.visibility_mode` are switches — set them via the
+# settings panel or AGNES_FACTS_ENABLED / AGNES_FACTS_VISIBILITY_MODE (see
+# docs/feature-flags.md), not here. `single_valued_edges` below is plain
+# instance data (a list, not a bool/select toggle), read directly via
+# get_value — see docs/api-reference.md's `/api/facts` section.
+facts:
+  # Edge types where a src fact should carry exactly ONE live dst (spec
+  # §7.3 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
+  # A second distinct dst becomes a `single_valued_conflict` review item on
+  # the collection detail page instead of silently picking one.
+  single_valued_edges: ["owned_by", "for_client"]
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,

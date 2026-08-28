@@ -491,6 +491,17 @@ def seeded_app_both(state_backend, tmp_path, monkeypatch):
     user_group_members_repo().add_member("admin1", admin_gid, source="system_seed")
 
     app = create_app()
+    # ``state_backend`` above ALWAYS reloads ``src.repositories`` (even for
+    # the "duckdb" param — the fixture's docstring parametrization runs it
+    # unconditionally), which rebinds ``RequiresPostgresBackend`` to a NEW
+    # class object; ``app.main`` registered its 501-translation handler
+    # against the pre-reload one, so a genuinely PG-only repository raised
+    # here would miss the handler and surface as a raw 500 instead of the
+    # typed 501. Same repair as ``_parity_sweep_util.build_seeded_client``
+    # applies here for the same reason — see that function's docstring.
+    from tests.db_pg._parity_sweep_util import _reregister_requires_pg_handler
+
+    _reregister_requires_pg_handler(app)
     client = TestClient(app)
 
     return {

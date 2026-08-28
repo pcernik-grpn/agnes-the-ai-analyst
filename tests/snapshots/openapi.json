@@ -1189,6 +1189,20 @@
       },
       "Body_upload_files_api_collections__collection_id__files_post": {
         "properties": {
+          "document_dates": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Dates"
+          },
           "files": {
             "items": {
               "contentMediaType": "application/octet-stream",
@@ -1210,6 +1224,48 @@
               }
             ],
             "title": "Paths"
+          },
+          "source_doc_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Doc Ids"
+          },
+          "source_sha256s": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Sha256S"
+          },
+          "source_stable_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Stable Ids"
           }
         },
         "required": [
@@ -1681,6 +1737,45 @@
           "data_source"
         ],
         "title": "ConfigureRequest",
+        "type": "object"
+      },
+      "ConfirmScopeBody": {
+        "properties": {
+          "anonymize": {
+            "default": false,
+            "title": "Anonymize",
+            "type": "boolean"
+          },
+          "display_path": {
+            "minLength": 1,
+            "title": "Display Path",
+            "type": "string"
+          },
+          "group_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Ids"
+          },
+          "source_scope_id": {
+            "minLength": 1,
+            "title": "Source Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_scope_id",
+          "display_path"
+        ],
+        "title": "ConfirmScopeBody",
         "type": "object"
       },
       "ConnectorMeta": {
@@ -3863,6 +3958,149 @@
           }
         },
         "title": "EntityRating",
+        "type": "object"
+      },
+      "FactsCorrectionRequest": {
+        "properties": {
+          "reason": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "verdict": {
+            "pattern": "^(wrong|restricted|revealed)$",
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "reason"
+        ],
+        "title": "FactsCorrectionRequest",
+        "type": "object"
+      },
+      "FactsIngestRequest": {
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.",
+        "properties": {
+          "documents": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Documents",
+            "type": "array"
+          },
+          "edges": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "full_documents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Full Documents",
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Nodes",
+            "type": "array"
+          }
+        },
+        "title": "FactsIngestRequest",
+        "type": "object"
+      },
+      "FactsNeighborsRequest": {
+        "properties": {
+          "depth": {
+            "default": 1,
+            "maximum": 2.0,
+            "minimum": 1.0,
+            "title": "Depth",
+            "type": "integer"
+          },
+          "edge_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Types"
+          },
+          "fanout": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Fanout",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 500,
+            "maximum": 500.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "subject_id": {
+            "title": "Subject Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_id"
+        ],
+        "title": "FactsNeighborsRequest",
+        "type": "object"
+      },
+      "FactsSearchRequest": {
+        "properties": {
+          "filters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filters"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "title": "FactsSearchRequest",
         "type": "object"
       },
       "FeedbackCreate": {
@@ -6157,6 +6395,111 @@
         "title": "OnboardedRequest",
         "type": "object"
       },
+      "OntologyDraftCreate": {
+        "properties": {
+          "name": {
+            "default": "Untitled ontology",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "OntologyDraftCreate",
+        "type": "object"
+      },
+      "OntologyDraftUpdate": {
+        "properties": {
+          "document_sample": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Sample"
+          },
+          "edge_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Types"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "node_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Types"
+          }
+        },
+        "title": "OntologyDraftUpdate",
+        "type": "object"
+      },
+      "OntologyDryRunRequest": {
+        "properties": {
+          "collection_id": {
+            "title": "Collection Id",
+            "type": "string"
+          },
+          "edge_types": {
+            "additionalProperties": true,
+            "title": "Edge Types",
+            "type": "object"
+          },
+          "file_id": {
+            "title": "File Id",
+            "type": "string"
+          },
+          "node_types": {
+            "additionalProperties": true,
+            "title": "Node Types",
+            "type": "object"
+          }
+        },
+        "required": [
+          "collection_id",
+          "file_id"
+        ],
+        "title": "OntologyDryRunRequest",
+        "type": "object"
+      },
+      "OntologyImportRequest": {
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "OntologyImportRequest",
+        "type": "object"
+      },
       "OwnerOption": {
         "properties": {
           "display_name": {
@@ -8345,8 +8688,15 @@
       "SessionFileEntry": {
         "properties": {
           "modified_at": {
-            "title": "Modified At",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At"
           },
           "name": {
             "title": "Name",
@@ -8364,8 +8714,7 @@
         "required": [
           "path",
           "name",
-          "size_bytes",
-          "modified_at"
+          "size_bytes"
         ],
         "title": "SessionFileEntry",
         "type": "object"
@@ -8378,6 +8727,16 @@
             },
             "title": "Files",
             "type": "array"
+          },
+          "source": {
+            "default": "host",
+            "title": "Source",
+            "type": "string"
+          },
+          "supported": {
+            "default": true,
+            "title": "Supported",
+            "type": "boolean"
           },
           "truncated": {
             "title": "Truncated",
@@ -11637,7 +11996,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.71.43"
+    "version": "0.91.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -12147,7 +12506,7 @@
     },
     "/admin/chat/secrets/test": {
       "post": {
-        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM auth mode actually\nuses: the static key in ``api_key`` mode, or the workload-identity federation\n(mint a token + confirm the API accepts it) in ``workload_identity`` mode \u2014\nso the admin \"test connection\" surface works in both modes.\n\nThe sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +\nimage, via the apps-runner probe) on a docker deployment; a kai-agent\ndeployment gets only the anthropic probe \u2014 the engine owns its own sandbox\nbacking, and a red row for a credential the instance will never use is\nnoise, not a signal.",
+        "description": "Live-probe the currently-configured credentials. Per-key ``{ok, detail}``.\n\nThe ``anthropic_api_key`` slot probes whatever the LLM provider/auth mode\nactually uses: the static key in ``api_key`` mode, the workload-identity\nfederation (mint a token + confirm the API accepts it) in\n``workload_identity`` mode, or Google ADC + a Vertex completion when\n``chat.llm.provider`` is ``vertex`` \u2014 so the admin \"test connection\"\nsurface works in every mode. The slot name stays ``anthropic_api_key``\nfor UI compatibility; the detail string identifies which probe ran.\n\nThe sandbox slot is provider-aware: ``docker_sandbox`` (sidecar + daemon +\nimage, via the apps-runner probe) on a docker deployment; a kai-agent\ndeployment gets only the anthropic probe \u2014 the engine owns its own sandbox\nbacking, and a red row for a credential the instance will never use is\nnoise, not a signal.",
         "operationId": "test_chat_secrets_admin_chat_secrets_test_post",
         "parameters": [
           {
@@ -13423,6 +13782,56 @@
           }
         },
         "summary": "Admin News Editor",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/ontology": {
+      "get": {
+        "description": "Ontology builder (fact-graph-over-Collections \u00a713.2) \u2014 a semantic\nmodel authored through the shared builder shell: Create | Preview left,\nnumbered sections right, the right panel the source of truth, Save the\nonly write. Zero new navigation (spec \u00a713.2) \u2014 the only entry point is\nthe link on ``/admin/semantic-layer``; this route carries no admin-nav\nentry of its own.\n\nWhen the ``facts`` flag is off, or the active backend is DuckDB (drafts\nare PG-only, A3 ratchet \u2014 the builder cannot persist a draft without\nPostgres), renders an explanatory empty state instead of 404ing, same\nposture as ``/apps`` when ``data_apps`` is disabled.",
+        "operationId": "admin_ontology_page_admin_ontology_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Ontology Page",
         "tags": [
           "web"
         ]
@@ -23350,6 +23759,508 @@
         ]
       }
     },
+    "/api/admin/ontology/drafts": {
+      "get": {
+        "operationId": "list_drafts_api_admin_ontology_drafts_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Drafts",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "post": {
+        "operationId": "create_draft_api_admin_ontology_drafts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}": {
+      "delete": {
+        "operationId": "delete_draft_api_admin_ontology_drafts__draft_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "get": {
+        "operationId": "get_draft_api_admin_ontology_drafts__draft_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "put": {
+        "description": "Section edits land here. Whatever the client sends \u2014 a paste import,\na conversation proposal, a manual attribute tweak \u2014 this is the ONLY\nthing that happens: the draft row changes. Nothing here ever reaches\n``semantic_models``.",
+        "operationId": "update_draft_api_admin_ontology_drafts__draft_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/import": {
+      "post": {
+        "description": "Paste-a-finished-ontology / file upload (spec \u00a713.2 \"source\" section).\n\nRuns the SAME translator Save uses, but only to render the leftover\nreport and fill the draft's node/edge types \u2014 it never validates\nagainst the Ossie schema here and never touches ``semantic_models``.\n\"Import fills the draft. It is not a save, and it is not an\nendorsement\" (``.claude/skills/ontology-building/SKILL.md``).",
+        "operationId": "import_ontology_text_api_admin_ontology_drafts__draft_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Ontology Text",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/save": {
+      "post": {
+        "description": "The one write. Translate -> validate -> POST through the exact path\n``import_ontology.py --server`` uses (in-process, not a self-HTTP-call).",
+        "operationId": "save_draft_api_admin_ontology_drafts__draft_id__save_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/dry-run": {
+      "post": {
+        "description": "One document, the draft's current types, no persistence \u2014 the\nsample-driven test the ontology-building skill calls \"the valuable half\"\nof authoring: what got captured, and what didn't.",
+        "operationId": "ontology_dry_run_api_admin_ontology_dry_run_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDryRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ontology Dry Run",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
     "/api/admin/prompts/iwt-files": {
       "get": {
         "description": "Repo-root-relative bindable file list from the synced IWT clone, for the\nbind-git picker (#622 Slice 3). Returns ``files == []`` (200, not 404) when\nIWT is unconfigured \u2014 the UI disables git mode in that case. Every path\nreturned is a valid ``bind-git`` input (load-bearing invariant). One\nendpoint for both cards: the file set is the same repo; the front-end\npre-selects ``suggested[kind]`` per card.\n\nAdmin-web-only (no analyst CLI/MCP analogue) \u2192 EXEMPT in the triple-surface\ngate, alongside the other ``/api/admin/prompts/*`` routes.",
@@ -25219,7 +26130,7 @@
     },
     "/api/admin/run-databricks-semantic-layer-refresh": {
       "post": {
-        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto metric_definitions. See connectors/databricks/semantic_layer.py for\nthe mapping/prune logic.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 only when the upstream is unreachable or\nanswers 5xx.",
+        "description": "Sync the configured Databricks workspace's Unity Catalog metric views\ninto the semantic layer. See connectors/databricks/semantic_ossie.py for\nthe composition logic and connectors/databricks/semantic_layer.py for\nconnection resolution + the legacy-provenance cutover.\n\n409 if a sync is already in flight. 400 when the sync fails for a reason\nthe admin controls \u2014 Databricks not configured, or a request the\nworkspace refuses (4xx). 502 when the upstream is unreachable, answers\n5xx, or the sync fails for any other reason.",
         "operationId": "run_databricks_semantic_layer_refresh_api_admin_run_databricks_semantic_layer_refresh_post",
         "parameters": [
           {
@@ -25658,6 +26569,60 @@
           }
         },
         "summary": "Run Reap Stuck Reviews",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/run-retention-prune": {
+      "post": {
+        "description": "Trigger the opt-in retention sweep for ``sync_history``,\n``llm_usage``, and ``agent_scope_snapshots``.\n\nWraps :func:`src.audit_retention.run_retention_sweep`. The scheduler\nservice hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as\n``run-audit-prune``); admins can also run it on demand.\n\nEvery trail's window comes from ``retention.<trail>_days`` in\n``instance.yaml`` and defaults to 0 (keep forever) \u2014 nothing is pruned\nuntil an admin explicitly sets a window. ``audit_log`` has its own\nstandalone job (``run-audit-prune`` above, unchanged); ``usage_events``\nkeeps its own standalone job (``POST /api/admin/usage/prune``) \u2014 see\n``src/audit_retention.py``'s module docstring for why those two aren't\nfolded into this sweep.",
+        "operationId": "run_retention_prune_api_admin_run_retention_prune_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Retention Prune",
         "tags": [
           "admin"
         ]
@@ -28182,6 +29147,363 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
+      "get": {
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Corpus Map",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/scopes": {
+      "delete": {
+        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).",
+        "operationId": "remove_scope_api_admin_sharepoint_connections__connection_id__scopes_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_scope_id",
+            "required": true,
+            "schema": {
+              "title": "Source Scope Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Scope",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants.",
+        "operationId": "list_scopes_api_admin_sharepoint_connections__connection_id__scopes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scopes",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, **if the field is present**, is the complete\nset of groups for this collection (step 3): listed groups are granted,\nand any other group's grant on this collection is revoked. The wizard's\ncheckboxes are pre-checked from the grants that exist and its row warns\nthe moment the last one is unticked, so the screen already promises that\nunticking removes access \u2014 making the handler additive-only meant the\nadmin was shown a revocation that never happened. Omitting the field\ntouches no grant at all, which is what keeps a rename or an anonymize\ntoggle from stripping access as a side effect.",
+        "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmScopeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Scope",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/tree": {
+      "get": {
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). Both -> the drive's root children. Exactly\n\"sites -> drives -> root children, one level per call\" (spec \u00a713.2) \u2014\nthere is no deeper recursive browse; a folder's own children are not\nfetched until the admin picks it.",
+        "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Site Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Browse Tree",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/slack-secrets": {
       "get": {
         "description": "Presence/source status for the three Slack tokens. Never leaks values.",
@@ -30277,7 +31599,7 @@
     },
     "/api/admin/telemetry/prune": {
       "post": {
-        "description": "Delete usage_events older than USAGE_EVENTS_RETENTION_DAYS.\n\nDefault retention: env var unset or ``0`` \u2192 no pruning (forever).\nDaily rollup tables untouched \u2014 they're tiny and lossy-by-design.",
+        "description": "Delete usage_events older than the configured retention window.\n\nWindow source: ``USAGE_EVENTS_RETENTION_DAYS`` env var (back-compat), or\n``retention.usage_events_days`` in instance.yaml (Track E3 Slice 1) \u2014\nsee ``app.instance_config.get_usage_events_retention_days``. Default\nretention: unset or ``0`` \u2192 no pruning (forever). Daily rollup tables\nuntouched \u2014 they're tiny and lossy-by-design.",
         "operationId": "prune_usage_api_admin_telemetry_prune_post",
         "parameters": [
           {
@@ -32980,7 +34302,7 @@
     },
     "/api/chat/sessions/{chat_id}/files": {
       "get": {
-        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. A session\nwhose sandbox ran remotely has no local files and lists empty.",
+        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. Sessions\non an engine-sandbox provider (``kai-agent``) never walk the host dir \u2014\nsee the module docstring; they report ``source=\"engine\"``.",
         "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
         "parameters": [
           {
@@ -34369,7 +35691,7 @@
         ]
       },
       "post": {
-        "description": "Upload one or more files into a collection.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, it is REPLACED\n(old blob/chunks/derived tables purged) instead of inserting a duplicate \u2014\nso a doc-sync client can re-upload idempotently. Files without a ``path``\nkeep the legacy plain-insert behavior. The purge runs only after the\nreplacement is safely stored, so a failed re-upload never destroys the\nexisting file. When ``paths`` is supplied it MUST have exactly one entry\nper file (positional pairing), else the request is rejected with **400** \u2014\na short/misaligned list would silently assign paths to the wrong files.\nThe ``(corpus_id, path)`` invariant is also enforced by a unique index.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026}`` for\nevery uploaded file (in upload order).",
+        "description": "Upload one or more files into a collection.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, its row is\nupdated IN PLACE (id preserved) \u2014 chunks/derived tables purged and\n``processing_status`` reset only when the content actually changed;\nunchanged content against an ``indexed`` row just refreshes filename/path\n(a rename/move) and skips re-chunking entirely. Unchanged content against\na row whose ingest never completed (``rejected``, ``needs_review``, or\n``pending``) is treated as a **retry**: the row resets to ``pending`` and\ningestion is re-scheduled, so re-uploading the same bytes after fixing\nthe cause works without a separate ``\u2026/reingest`` call. Files without a\n``path`` keep the legacy plain-insert behavior. The update runs only\nafter the replacement blob is safely stored, so a failed re-upload never\ndestroys the existing file. When ``paths`` is supplied it MUST have\nexactly one entry per file (positional pairing), else the request is\nrejected with **400** \u2014 a short/misaligned list would silently assign\npaths to the wrong files; two files sharing a non-blank ``path`` in one\nbatch are likewise rejected (**400** ``duplicate_path_in_batch``). The\n``(corpus_id, path)`` invariant is also enforced by a unique index.\n\n**Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+\noptional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,\neach paired positionally with ``files`` exactly like ``paths``) lets a\ndoc-sync client supply the producer's own delta key (e.g.\n``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``\nis tried FIRST, before the ``path`` match \u2014 and, like a path match, ANY\nmatch preserves the row's id, including a manual (no-``source_stable_ids``)\npath re-upload of a file a crawler previously anchored, so a hand upload\ncan no longer cascade a document's derived data away. Two files sharing a\nnon-blank ``source_stable_id`` in one batch are rejected with **400**\n``duplicate_source_stable_id_in_batch`` \u2014 the second would otherwise\noverwrite the first's row in place and silently drop its bytes \u2014 and a\nread-only pre-flight resolves every file's target row before anything is\nstored to catch the two collisions that cross the two key spaces: two\nfiles landing on the SAME existing row through different anchors (**400**\n``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is\nalready held by another row, which would otherwise violate the\n``(corpus_id, path)`` unique index and 500 mid-batch (**409**\n``path_owned_by_another_file``). The mapping table\nis Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed\ninstance answers **501** before any file is touched; omitting the field\nkeeps this endpoint byte-identical to the plain ``paths`` behavior above.\n``document_dates`` is accepted and pairing-validated for forward\ncompatibility with the doc-sync wire format but is not yet persisted\nhere \u2014 it belongs to a claim, written by the (future) fact-ingest API.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026}`` for\nevery uploaded file (in upload order).",
         "operationId": "upload_files_api_collections__collection_id__files_post",
         "parameters": [
           {
@@ -35585,6 +36907,7 @@
     },
     "/api/data-apps/{slug}/git-credential": {
       "post": {
+        "description": "Mint the app owner's 24-hour `data-app-git:<slug>` push credential.\n\nDeliberately gated by `get_current_user`, NOT `require_session_token`:\n`agnes app git-credential` authenticates with the PAT `agnes login` wrote\n(`cli/config.py::get_token`), and the same is true of this route's MCP\ntool over the PAT-authenticated SSE transport. Refusing a PAT here would\nbreak a shipped command while changing nothing an attacker can do \u2014 the\ngit surface admits a plain PAT for a push directly\n(`app/api/data_apps_git.py`: `allowed = is_owner or admin`, pinned by\n`tests/test_data_apps_git.py::test_push_allowed_for_owner`), so a PAT\nholder reaches the same repo one `git push` away with no mint call at all.\nThe mint is a convenience wrapper over authority the caller already holds,\nnot the gate that grants it.\n\nWhat the mint DID add was persistence: the credential is its own\n`personal_access_tokens` row, so revoking the PAT that produced it left it\npushing for the rest of its 24 hours. `revocable_credential_id` closes\nthat \u2014 when the caller holds a PAT, the successor is stamped with its id\nand dies with it.",
         "operationId": "mint_git_credential_api_data_apps__slug__git_credential_post",
         "parameters": [
           {
@@ -36255,6 +37578,556 @@
         "summary": "Debug Throw",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/api/facts/corrections": {
+      "get": {
+        "description": "The producer export (spec \u00a77.4): every ``wrong`` subject with its\n``natural_keys`` snapshot, so a producer's re-extraction pass can prune\nthem before re-asserting claims. Server-side, corrections are ALSO\nenforced at read time regardless (\u00a74) \u2014 a producer that ignores this\nexport cannot resurrect a withheld fact, this just saves it the wasted\nwork. Scheduler token or admin PAT.",
+        "operationId": "list_corrections_api_facts_corrections_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Corrections Api Facts Corrections Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Corrections",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/corrections/{subject_kind}/{subject_id}": {
+      "delete": {
+        "description": "Remove a correction \u2014 the subject reverts to normal grant-based\nvisibility (spec \u00a74). Idempotent: deleting an already-absent\ncorrection still returns 204.",
+        "operationId": "delete_correction_api_facts_corrections__subject_kind___subject_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject_kind",
+            "required": true,
+            "schema": {
+              "title": "Subject Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "title": "Subject Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Correction",
+        "tags": [
+          "facts"
+        ]
+      },
+      "put": {
+        "description": "Record (or replace) an admin correction on one fact or edge (spec\n\u00a74): ``wrong`` (withheld everywhere, exported to the producer so\nre-extraction does not resurrect it \u2014 \u00a77.4), ``restricted`` (withheld\nregardless of grants \u2014 legal hold), or ``revealed`` (served without\nquotes to every authenticated caller instance-wide, regardless of\ngrants). ``natural_keys`` is snapshotted from the subject's CURRENT\naliases (fact) or endpoint aliases (edge) at write time, so a subject\nlater deleted and re-created re-attaches this correction (spec \u00a73).\nEvery decision is audit-logged with its ``reason``.",
+        "operationId": "upsert_correction_api_facts_corrections__subject_kind___subject_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject_kind",
+            "required": true,
+            "schema": {
+              "title": "Subject Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "title": "Subject Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsCorrectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Upsert Correction Api Facts Corrections  Subject Kind   Subject Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upsert Correction",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/ingest": {
+      "post": {
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
+        "operationId": "facts_ingest_api_facts_ingest_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsIngestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Ingest Api Facts Ingest Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Ingest",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/ingest-runs": {
+      "get": {
+        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.",
+        "operationId": "list_ingest_runs_api_facts_ingest_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Ingest Runs Api Facts Ingest Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Ingest Runs",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/neighbors": {
+      "post": {
+        "description": "Bounded graph traversal from one subject.\n\nAn edge appears in the response only if it has its own readable claim\n(never inferred from its endpoints' visibility) AND both its endpoint\nfacts are independently visible to the caller \u2014 traversal never walks\nfrom a visible subject into one whose claims are unreadable, and never\nreveals that a path continues past it (spec \u00a75 rule 3). `depth`\ndefaults to 1 (max 2), `fanout` per node and total `limit` are capped,\nand the underlying query runs under a Postgres statement timeout.\nResponse: ``{\"nodes\": [...], \"edges\": [...], \"truncated\": {\"depth\",\n\"fanout\", \"result\"}}``. `404` (never `403`) when `subject_id` does not\nexist or has no readable claim \u2014 indistinguishable from the caller's\npoint of view (spec \u00a75 rule 2).",
+        "operationId": "facts_neighbors_api_facts_neighbors_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsNeighborsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Neighbors Api Facts Neighbors Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Neighbors",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/search": {
+      "post": {
+        "description": "Search typed subjects (facts) by ``type`` and attribute ``filters``.\n\nVisibility (spec \u00a74/\u00a75) is enforced entirely in the repository: a\nsubject is returned only if the caller can read at least one of its\nclaims (or ALL of them, under `facts.visibility_mode: all_evidence`),\nor it carries an active `revealed` correction. ``attrs`` are projected\nfrom readable claims only, per-key latest-document_date-wins with a\n`conflicted` marker on a genuine tie \u2014 the projection runs in SQL so\n`filters` evaluate against it BEFORE the `limit` is applied (never a\nPython post-filter, which would leak a shortfall signal). Response:\n``{\"subjects\": [{\"id\", \"type\", \"aliases\", \"attrs\", \"claim_count\",\n\"quote_count\", \"revealed\"}], \"limit_applied\"}`` \u2014 `limit_applied` is\nTrue only when the CALLER'S OWN readable result set exceeds `limit`,\nnever a signal that grants hid additional matches.",
+        "operationId": "facts_search_api_facts_search_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Search Api Facts Search Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Search",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
+    "/api/facts/{subject_id}/claims": {
+      "get": {
+        "description": "The caller's readable evidence for one subject (fact or edge).\n\nEach entry carries the evidencing document's identity (``corpus_id``,\n``corpus_file_id``, ``document: {name, path, source_url?}``), the\nverbatim ``quote``, that claim's own (unprojected) ``attrs``, and\n``document_date``. A subject under an active `revealed` correction is\nserved to every authenticated caller regardless of grants, but with\nevery ``quote`` suppressed to an empty string (`\"revealed\": true` on\nthe response marks this). `404` (never `403`) when `subject_id` does\nnot exist or has no readable claim \u2014 same status, body shape, and cost\nprofile either way (spec \u00a75 rule 2): this endpoint never lets a caller\ndistinguish \"nothing there\" from \"something you can't see\".",
+        "operationId": "facts_claims_api_facts__subject_id__claims_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "title": "Subject Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Claims Api Facts  Subject Id  Claims Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Claims",
+        "tags": [
+          "facts"
         ]
       }
     },
@@ -39116,6 +40989,7 @@
     },
     "/api/marketplaces/{marketplace_id}/sync": {
       "post": {
+        "description": "Sync one marketplace on demand (\"Sync now\" in the admin UI).\n\nDeclared ``def`` (not ``async def``) for the same reason as\n:func:`trigger_sync_all` below \u2014 ``sync_one`` does blocking I/O\n(subprocess git clone/fetch, DuckDB writes, the module-wide sync lock)\nand would freeze the event loop for the duration of the sync if it ran\non the asyncio thread.",
         "operationId": "trigger_sync_api_marketplaces__marketplace_id__sync_post",
         "parameters": [
           {
@@ -48285,7 +50159,7 @@
     },
     "/api/user/cowork-bundle": {
       "post": {
-        "description": "Generate a Cowork Setup Bundle ZIP for the calling user.\n\nReturns a ``application/zip`` file containing a setup script, a\n``README.txt``, and a ```.agnes-bundle.json`` with a short-lived setup\ntoken embedded. The analyst unzips and runs ``./setup.sh``, which calls\n``agnes init --bundle .`` to exchange the setup token for a PAT and\nbootstrap their workspace in one step.\n\nRate-limited: max 5 active (unexpired, unused) setup tokens per user.",
+        "description": "Generate a Cowork Setup Bundle ZIP for the calling user.\n\nReturns a ``application/zip`` file containing a setup script, a\n``README.txt``, and a ```.agnes-bundle.json`` with a short-lived setup\ntoken embedded. The analyst unzips and runs ``./setup.sh``, which calls\n``agnes init --bundle .`` to exchange the setup token for a PAT and\nbootstrap their workspace in one step.\n\nRate-limited: max 5 active (unexpired, unused) setup tokens per user.\n\nSession-only (``require_session_token``, #1292): this route mints two\ndurable follow-on credentials \u2014 a pre-baked PAT inline in the ZIP, and a\nsetup token that ``POST /api/auth/exchange-setup-token`` (unauthenticated\nby design \u2014 the setup token IS the credential) trades for a fresh 90-day\nPAT. Gating it on ``get_current_user`` alone let a caller holding only a\nPAT mint a new 90-day one that outlives revoking the original \u2014 the same\nclass of hole ``require_session_token`` already closes for ``POST\n/auth/tokens`` and agent-PAT issuance. ``require_session_token`` also\nrejects the ``X-StorageApi-Token`` header credential (PR #1288's narrower\nfix, now subsumed), the scheduler shared secret, and an agent PAT.",
         "operationId": "generate_bundle_api_user_cowork_bundle_post",
         "parameters": [
           {
@@ -54262,6 +56136,16 @@
             "schema": {
               "title": "Slug",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "facts_page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Facts Page",
+              "type": "integer"
             }
           },
           {

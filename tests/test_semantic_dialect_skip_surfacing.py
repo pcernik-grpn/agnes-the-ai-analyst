@@ -1,12 +1,15 @@
-"""A metric whose only declared expression dialect Agnes cannot run (e.g.
-SNOWFLAKE-only) is silently dropped at projection (``src/semantic/
-projection.py``, via ``src/semantic/dialect.py::resolve_expression``). The
-model browse UI must surface how many were dropped, rather than showing no
-hint that metrics went missing.
+"""A metric whose only declared expression dialect Agnes cannot run locally
+(e.g. SNOWFLAKE-only) still projects into ``metric_definitions``
+(``src/semantic/projection.py``, via
+``src/semantic/dialect.py::resolve_expression_any`` — see the D6 dialect
+projection fix) — it is not dropped. The model browse UI must still surface
+which metrics are warehouse-only, so an admin knows those need server-side
+execution rather than assuming every listed metric runs through a plain
+local query.
 
-B3 (remediation program) acceptance test. The unit test must fail (function
-does not exist) against unfixed code; the endpoint test must fail (no warn
-pill rendered) against unfixed code.
+B3 (remediation program) acceptance test, updated for D6: the counter and
+the pill used to mean "silently dropped from the catalog"; after D6 they
+mean "in the catalog, but not locally runnable".
 """
 
 from __future__ import annotations
@@ -59,38 +62,39 @@ def _seed_model() -> dict:
     )
 
 
-class TestDialectSkipCount:
-    def test_counts_only_the_unusable_dialect_metric(self):
-        from src.semantic.dialect import count_dialect_skipped_metrics
+class TestWarehouseOnlyMetricCount:
+    def test_counts_only_the_warehouse_only_dialect_metric(self):
+        from src.semantic.dialect import count_warehouse_only_metrics
 
         metrics = _document_json()["semantic_model"][0]["metrics"]
-        assert count_dialect_skipped_metrics(metrics) == 1
+        assert count_warehouse_only_metrics(metrics) == 1
 
     def test_a_metric_with_no_expression_at_all_is_not_counted(self):
-        """A different, pre-existing problem (an incomplete document) — not
-        the "silently dropped despite having SQL" case this surfaces."""
-        from src.semantic.dialect import count_dialect_skipped_metrics
+        """A different, pre-existing problem (an incomplete document, a
+        genuine skip — see `ProjectionReport.skipped`) — not the
+        "projects, but not locally runnable" case this counts."""
+        from src.semantic.dialect import count_warehouse_only_metrics
 
-        assert count_dialect_skipped_metrics([{"name": "no_expr", "expression": {"dialects": []}}]) == 0
+        assert count_warehouse_only_metrics([{"name": "no_expr", "expression": {"dialects": []}}]) == 0
 
-    def test_zero_when_every_metric_is_runnable(self):
-        from src.semantic.dialect import count_dialect_skipped_metrics
+    def test_zero_when_every_metric_is_locally_runnable(self):
+        from src.semantic.dialect import count_warehouse_only_metrics
 
         metrics = [
             {"name": "a", "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "SUM(a)"}]}},
         ]
-        assert count_dialect_skipped_metrics(metrics) == 0
+        assert count_warehouse_only_metrics(metrics) == 0
 
 
-class TestDialectSkipWarnPill:
-    def test_model_detail_page_shows_the_skipped_count(self, seeded_app):
+class TestWarehouseOnlyMetricPill:
+    def test_model_detail_page_shows_the_warehouse_only_count(self, seeded_app):
         _seed_model()
         c = seeded_app["client"]
         r = c.get(f"/semantic-layer/{_SLUG}", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
-        assert "1 metric skipped (unsupported dialect)" in r.text
+        assert "1 metric run server-side only (warehouse dialect)" in r.text
 
-    def test_no_pill_when_nothing_was_skipped(self, seeded_app):
+    def test_no_pill_when_every_metric_is_locally_runnable(self, seeded_app):
         from src.repositories import semantic_model_repo
 
         semantic_model_repo().upsert(
@@ -124,4 +128,4 @@ class TestDialectSkipWarnPill:
         c = seeded_app["client"]
         r = c.get("/semantic-layer/clean_model", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
-        assert "skipped (unsupported dialect)" not in r.text
+        assert "run server-side only (warehouse dialect)" not in r.text

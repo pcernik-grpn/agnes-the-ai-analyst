@@ -65,6 +65,7 @@
 
 {% set page_hero_eyebrow = "Semantic layer" %}
 {% set page_hero_title = model_name %}
+{% set page_hero_plain = True %}
 {% set page_hero_subtitle = model_description %}
 
 {% block toolbar %}
@@ -77,8 +78,8 @@
     {% if status == 'invalid' %}
     <span class="badge badge--danger">Invalid</span>
     {% endif %}
-    {% if dialect_skipped_count %}
-    <span class="badge badge--warn">{{ dialect_skipped_count }} metric{{ 's' if dialect_skipped_count != 1 else '' }} skipped (unsupported dialect)</span>
+    {% if warehouse_only_metric_count %}
+    <span class="badge badge--warn">{{ warehouse_only_metric_count }} metric{{ 's' if warehouse_only_metric_count != 1 else '' }} run server-side only (warehouse dialect)</span>
     {% endif %}
     {% if sync_mode == 'detached' %}
     <span class="badge badge--warn">
@@ -168,7 +169,7 @@
     {% if constraints %}
     <table class="data-table">
         <thead>
-            <tr><th>Name</th><th>Type</th><th>Rule</th><th>Severity</th><th>Metrics</th></tr>
+            <tr><th>Name</th><th>Type</th><th>Rule</th><th title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when Type is statically checkable (currently just required_filter) and the rule is missing from the query — any other Type is advisory only regardless of severity.">Severity</th><th>Metrics</th></tr>
         </thead>
         <tbody>
             {% for c in constraints %}

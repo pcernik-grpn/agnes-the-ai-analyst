@@ -159,6 +159,16 @@
     </span>
   </div>
 
+  {# Ontology builder entry point — zero new navigation (fact-graph-over-
+     Collections §13.2): "ontology = a semantic model in the builder shell",
+     reached only from here, no admin-nav item of its own. The page itself
+     explains the facts flag / Postgres-backend prerequisites when either is
+     unmet, so this link is unconditional. #}
+  <div class="apg-strip">
+    <span><strong>Ontology:</strong> author the entity and relationship types the fact graph extracts against.</span>
+    <span class="apg-strip__end"><a href="/admin/ontology">Ontology builder →</a></span>
+  </div>
+
   <div class="sl-lenses">{{ ds.tabs(items=lens_tabs, aria_label='Semantic layer lens') }}</div>
 
   {% if active_tab == 'coverage' %}

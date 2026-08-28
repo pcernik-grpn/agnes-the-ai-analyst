@@ -1,3 +1,16 @@
+> [!IMPORTANT]
+> **Last reviewed 2026-05-26 — this document is stale and its "Remaining" list is
+> no longer accurate.** Since it was written, the `paper` theme shipped and became
+> the default (Wave 0, 2026-08), the topnav chrome was retired, and the base-template
+> tree was unified: every page now resolves to `base_ds.html` except four catalog
+> pages and the login pages.
+>
+> Verify against the code before treating any item below as open. Several were closed
+> long ago; a design-review sweep in Aug 2026 re-filed items from this list as new
+> defects because nobody had updated it.
+>
+> Current standard: [`.claude/skills/agnes-conventions/references/design-system.md`](../../.claude/skills/agnes-conventions/references/design-system.md).
+
 # Agnes UI — Design System Status & Handoff
 
 Sources: `.design/design-system-unification/` + `.interface-design/system.md`

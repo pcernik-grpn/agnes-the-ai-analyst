@@ -1,4 +1,4 @@
-"""Databricks semantic layer refresh — owner of the sync_semantic_layer() call path.
+"""Databricks semantic layer refresh — owner of the sync-trigger call path.
 
 POST /api/admin/run-databricks-semantic-layer-refresh — called by the
 scheduler container (auth: shared scheduler token resolves to a synthetic
@@ -6,10 +6,22 @@ admin user, same mechanism as app/api/keboola_semantic_layer_refresh.py) on
 the SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL cadence. Also
 callable by a real admin on demand.
 
+Before the semantic-source adapter cutover (Track D6) this endpoint ran
+``connectors.databricks.semantic_layer.sync_semantic_layer()``, a direct
+``metric_definitions`` writer. It now ensures the Databricks connection is
+registered as a `connection`-kind semantic source
+(``connectors.databricks.semantic_layer.ensure_semantic_source``) and syncs
+it through the same pipeline every other semantic source uses
+(``src.semantic.transports.import_source``), then reconciles any
+``metric_definitions`` rows the retired direct writer left behind
+(``purge_legacy_metric_rows``) — see that module's docstring for the
+provenance-cutover rationale. The scheduler cadence and endpoint path are
+unchanged; only what runs behind them.
+
 Single-flight guarded (mirrors the Keboola sibling): a second concurrent
 call while a sync is in flight gets 409 already_running instead of racing a
 second warehouse fetch + upsert/prune pass against the same
-metric_definitions rows.
+metric_definitions / semantic_models rows.
 """
 
 from __future__ import annotations
@@ -17,42 +29,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth.access import require_admin
-from connectors.databricks.semantic_layer import sync_semantic_layer
+from connectors.databricks.client import DatabricksApiError
+from connectors.databricks.semantic_layer import ensure_semantic_source, purge_legacy_metric_rows
+from src.semantic.transports import import_source
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _refresh_lock = asyncio.Lock()
 # In-flight bookkeeping only — both fields are read by the 409 branch below.
-# The Keboola sibling additionally keeps the LAST completed run's summary for
-# its admin page (`/admin/semantic-layer`); that page enumerates Keboola
-# master-token connections and counts `keboola_semantic_layer` rows, so it has
-# no Databricks section to feed. Those fields land here together with the
-# reader that needs them, rather than as state nothing reads.
-_refresh_state: dict[str, Any] = {
+_refresh_state: dict = {
     "run_id": None,
     "started_at": None,
 }
 
 
-# Error codes `sync_semantic_layer` attaches to a returned {"status": "error"}
-# and the HTTP status each deserves — 400 when the admin can fix it, 502 when
-# the upstream is genuinely unreachable or broken. Unmapped codes stay 502.
-_ERROR_CODE_STATUS = {
-    "credentials_not_configured": 400,
-    "upstream_client_error": 400,
-    "upstream_error": 502,
-}
-
-
-def _status_for_error_code(code: Any) -> int:
-    return _ERROR_CODE_STATUS.get(code, 502) if isinstance(code, str) else 502
+def _run_sync() -> dict:
+    """Runs off the event loop (``asyncio.to_thread``): ensure the semantic
+    source exists, sync it, then reconcile any pre-cutover rows. All three
+    are synchronous (repo calls + the adapter's own warehouse HTTP calls)."""
+    source_id = ensure_semantic_source()
+    report = import_source(source_id)
+    purged_legacy = purge_legacy_metric_rows()
+    result = asdict(report)
+    result["purged_legacy"] = purged_legacy
+    return result
 
 
 @router.post("/api/admin/run-databricks-semantic-layer-refresh")
@@ -60,13 +67,14 @@ async def run_databricks_semantic_layer_refresh(
     user: dict = Depends(require_admin),
 ):
     """Sync the configured Databricks workspace's Unity Catalog metric views
-    into metric_definitions. See connectors/databricks/semantic_layer.py for
-    the mapping/prune logic.
+    into the semantic layer. See connectors/databricks/semantic_ossie.py for
+    the composition logic and connectors/databricks/semantic_layer.py for
+    connection resolution + the legacy-provenance cutover.
 
     409 if a sync is already in flight. 400 when the sync fails for a reason
     the admin controls — Databricks not configured, or a request the
-    workspace refuses (4xx). 502 only when the upstream is unreachable or
-    answers 5xx.
+    workspace refuses (4xx). 502 when the upstream is unreachable, answers
+    5xx, or the sync fails for any other reason.
     """
     if _refresh_lock.locked():
         raise HTTPException(
@@ -85,26 +93,29 @@ async def run_databricks_semantic_layer_refresh(
         _refresh_state["run_id"] = run_id
         _refresh_state["started_at"] = started_at
         try:
-            result = await asyncio.to_thread(sync_semantic_layer)
-            # Config/upstream failures arrive as a returned {"status": "error"}
-            # dict rather than an exception — surface them as the HTTP status
-            # the caller can act on, or a failed sync reads as a success.
-            if result.get("status") == "error":
-                message = result.get("error", "Databricks semantic layer sync failed")
-                raise HTTPException(status_code=_status_for_error_code(result.get("code")), detail=message)
+            result = await asyncio.to_thread(_run_sync)
+        except DatabricksApiError as exc:
+            # Checked BEFORE RuntimeError: DatabricksApiError subclasses it,
+            # so the broader clause would otherwise shadow this one and every
+            # upstream 5xx would misreport as an admin-fixable 400.
+            status = 400 if (exc.status is not None and 400 <= exc.status < 500) else 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            # DatabricksSemanticAdapter.extract() raises a plain RuntimeError
+            # for everything the admin controls — not configured, no catalog.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not swallowed
+            raise HTTPException(status_code=502, detail=f"sync failed: {exc}") from exc
         finally:
             _refresh_state["run_id"] = None
             _refresh_state["started_at"] = None
 
     logger.info(
-        "databricks semantic layer refresh: run_id=%s status=%s created_or_updated=%s "
-        "pruned=%s metric_views_seen=%s skipped_unparseable=%s skipped_conflict=%s",
+        "databricks semantic layer refresh: run_id=%s models_written=%s models_pruned=%s invalid=%s purged_legacy=%s",
         run_id,
-        result.get("status"),
-        result.get("created_or_updated"),
-        result.get("pruned"),
-        result.get("metric_views_seen"),
-        result.get("skipped_unparseable"),
-        result.get("skipped_conflict"),
+        result.get("models_written"),
+        len(result.get("models_pruned") or []),
+        len(result.get("invalid") or []),
+        result.get("purged_legacy"),
     )
-    return {**result, "run_id": run_id, "started_at": started_at}
+    return {**result, "status": "ok", "run_id": run_id, "started_at": started_at}

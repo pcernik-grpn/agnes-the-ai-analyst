@@ -164,7 +164,7 @@ def load_instance_config(*, strict: bool = False) -> dict:
     Resolution:
     1. Static base: ``CONFIG_DIR/instance.yaml`` via ``config.loader``
        (the source of truth for sections the editor doesn't expose —
-       ``datasets``, ``corporate_memory``, ``openmetadata``, etc.).
+       ``datasets``, ``corporate_memory``, etc.).
     2. Overlay patch: ``DATA_DIR/state/instance.yaml`` (written by
        ``/api/admin/configure`` and ``/api/admin/server-config``;
        contains only the sections those endpoints accept).
@@ -176,7 +176,7 @@ def load_instance_config(*, strict: bool = False) -> dict:
     silent footgun: the moment someone saved any section through the
     new editor (which writes a narrow overlay by design), every
     consumer of static-only sections (corporate memory page, dataset
-    list, OpenMetadata client) saw empty defaults. See PR #107.
+    list) saw empty defaults. See PR #107.
     """
     global _instance_config, _loaded_once, _last_good_config, _static_config_error
     if _instance_config is not None:
@@ -1700,15 +1700,82 @@ def get_audit_retention_days() -> int:
     Reads ``audit.retention_days``. Default 365. Set to 0 to keep audit
     rows forever (disables the prune job's DELETE, mirroring
     ``blocked_bundle_ttl_days``'s "0 = retain indefinitely" convention).
-    Every other audit/observability trail (chat transcripts, CLI session
-    JSONLs, usage rollups, sync_history, llm_usage, agent-runtime
-    forensics) has no retention policy yet — see docs/observability.md.
+    ``sync_history``, ``llm_usage`` and ``agent_scope_snapshots`` now have
+    their own opt-in ``retention.*_days`` knobs (Track E3 Slice 1, default
+    0 = off — see the ``get_*_retention_days`` functions below); chat
+    transcripts and CLI session JSONLs still have no retention policy — see
+    docs/observability.md.
     """
     val = get_value("audit", "retention_days", default=365)
     try:
         return max(0, int(val))
     except (TypeError, ValueError):
         return 365
+
+
+def get_sync_history_retention_days() -> int:
+    """How many days to keep ``sync_history`` rows before the daily
+    ``retention-prune`` scheduler job deletes them.
+
+    Reads ``retention.sync_history_days``. Default 0 = keep forever (the
+    prune is a no-op until an admin opts in). Never affects ``sync_state``
+    — that table is current per-table state, not a trail, and has no
+    retention window of its own.
+    """
+    val = get_value("retention", "sync_history_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_llm_usage_retention_days() -> int:
+    """How many days to keep ``llm_usage`` rows before the daily
+    ``retention-prune`` scheduler job deletes them.
+
+    Reads ``retention.llm_usage_days``. Default 0 = keep forever (the
+    prune is a no-op until an admin opts in).
+    """
+    val = get_value("retention", "llm_usage_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_agent_scope_snapshots_retention_days() -> int:
+    """How many days to keep ``agent_scope_snapshots`` rows before the
+    daily ``retention-prune`` scheduler job deletes them.
+
+    Reads ``retention.agent_scope_snapshots_days``. Default 0 = keep
+    forever (the prune is a no-op until an admin opts in). Never affects
+    the live ``agents`` table — snapshots are forensic audit trail, not
+    agent state.
+    """
+    val = get_value("retention", "agent_scope_snapshots_days", default=0)
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_usage_events_retention_days() -> int:
+    """How many days to keep ``usage_events`` rows before ``POST
+    /api/admin/usage/prune`` (``agnes admin usage prune``) deletes them.
+
+    ``USAGE_EVENTS_RETENTION_DAYS`` env var wins when set (back-compat with
+    the original Phase C.4 knob, still the documented CLI-facing name);
+    otherwise reads ``retention.usage_events_days`` from ``instance.yaml``.
+    Default 0 = keep forever (the prune stays a no-op). Daily rollup tables
+    are never touched — only the raw event ledger.
+    """
+    raw = os.environ.get("USAGE_EVENTS_RETENTION_DAYS")
+    if raw is None or raw == "":
+        raw = get_value("retention", "usage_events_days", default=0)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_guardrails_min_description_chars() -> int:
@@ -1810,7 +1877,8 @@ def get_store_verification_enabled() -> bool:
 
 def get_guardrails_llm_provider_ready() -> bool:
     """Whether the LLM provider has credentials present in the
-    environment.
+    environment (or the instance is configured for Vertex, which needs no
+    static key — Google ADC signs its calls).
 
     Independent from :func:`get_guardrails_enabled` (operator intent).
     A False return here when intent is True is a misconfiguration —
@@ -1821,6 +1889,13 @@ def get_guardrails_llm_provider_ready() -> bool:
         return True
     if os.environ.get("LLM_API_KEY", "").strip():
         return True
+    try:
+        from connectors.llm.factory import vertex_config_or_none
+
+        if vertex_config_or_none():
+            return True
+    except Exception:  # noqa: BLE001 — readiness probe; a broken import means "not ready"
+        pass
     return False
 
 

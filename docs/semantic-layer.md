@@ -166,39 +166,49 @@ than being presented as ordinary public surface.
 
 ### `databricks_metric_views`
 
-Register it as a `connection`-kind source. As with `snowflake_semantic`, the
-config carries only scope — never credentials, which resolve from the
+Composes one document per Unity Catalog **metric view** — Databricks's
+semantic layer — discovered via `information_schema.tables`
+(`table_type='METRIC_VIEW'`) per configured catalog, with each view's YAML
+definition read through `SHOW CREATE TABLE`. As with `snowflake_semantic`,
+the config carries only scope — never credentials, which resolve from the
 instance's Databricks connection (`resolve_databricks_settings()`) like every
 other Databricks code path, so a semantic source row never becomes a second
-place a workspace token is stored:
+place a workspace token is stored. Register it the same way as the Snowflake
+adapter:
 
 ```bash
 agnes admin semantic-source add --kind connection --name "Databricks semantics" \
     --adapter databricks_metric_views
 ```
 
+The scheduled refresh (`POST /api/admin/run-databricks-semantic-layer-refresh`,
+see [`DATA_SOURCES.md`](DATA_SOURCES.md#semantic-layer-sync-unity-catalog-metric-views))
+registers this source automatically under a fixed id (`databricks_default`) if
+it does not already exist — manual registration through the CLI, or the
+connect wizard's "Also sync semantic views" opt-in, is only needed to pin a
+specific `connection_id` or a second, differently-scoped source (e.g. a
+narrower `config.catalogs`).
+
 Optional scope keys in `config`: `catalogs` (a list; or the single `catalog`,
 defaulting to the connection's own catalog / `semantic_layer_catalogs`) and
 `connection_id`, which pins WHICH Databricks connection this source reads —
-the connect wizard's "Also sync semantic views" opt-in writes the row it just
-saved. A pinned connection that no longer exists, or that turns out to belong
-to another connector, fails the sync by name rather than falling back to the
-default — which would import a different workspace's metric views under this
-source's provenance.
+the connect wizard writes the row it just saved. A pinned connection that no
+longer exists, or that turns out to belong to another connector, fails the
+sync by name rather than falling back to the default — which would import a
+different workspace's metric views under this source's provenance.
 
-Discovery is `information_schema.tables` filtered to `METRIC_VIEW`, then
-`SHOW CREATE TABLE` for the YAML body — the same two queries the pre-Ossie
-`connectors/databricks/semantic_layer.py` sync issued. `dimensions[]` become
-dataset fields, `measures[]` become metrics, and there is no analogue to
-Keboola's relationships, constraints or glossary because the YAML declares
-none.
-
-**Every measure expression is tagged `DATABRICKS`** — the full runnable
-`SELECT MEASURE(...) FROM <metric view>`, not a bare fragment, since a metric
-view is a warehouse-side object with nothing in `table_registry` to bind
-against. `MEASURE()` is a Databricks-only aggregate, so the same
+`dimensions[]` become dataset fields, `measures[]` become metrics, and there
+is no analogue to Keboola's relationships, constraints or glossary because
+the YAML declares none. **Every measure expression is tagged `DATABRICKS`** —
+the full runnable `SELECT MEASURE(...) FROM <metric view>`, not a bare
+fragment, since a metric view is a warehouse-side object with nothing in
+`table_registry` to bind against; the measure's own `expr` fragment is not
+runnable anywhere on its own and rides along instead in `custom_extensions`.
+`MEASURE()` is a Databricks-only aggregate, so the same
 `src/semantic/dialect.py` rule as Snowflake's applies: readable here, refused
-for local DuckDB execution, runnable through `agnes query --remote`.
+for local DuckDB execution, runnable through `agnes query --remote`. The
+model name is the fully qualified `catalog.schema.view`, for the same
+name-collision reason as Snowflake's `DB.SCHEMA.VIEW`.
 
 ## Ownership: imported models are read-only
 

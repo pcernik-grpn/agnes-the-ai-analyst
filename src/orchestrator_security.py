@@ -57,6 +57,13 @@ _DEFAULT_TOKEN_ENVS: frozenset[str] = frozenset(
         # own default key-pair passphrase path breaks for every deploy that
         # relies on it (RBAC review second round, 2026-08-26).
         "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+        # PEM private key for a SharePoint app registration's certificate.
+        # Microsoft Graph refuses client secrets for app-only access, so the
+        # certificate IS the credential. Resolved by name through
+        # connectors.sharepoint.settings, which funnels every lookup through
+        # is_token_env_allowed() for the same reason the Snowflake names above
+        # do: the variable name lives in admin-writable connection config.
+        "SHAREPOINT_CERT_PRIVATE_KEY",
     }
 )
 

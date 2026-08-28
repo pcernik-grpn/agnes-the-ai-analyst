@@ -152,9 +152,11 @@ def test_the_minter_is_reusable_and_returns_the_token_id():
     needs the raw token plus the id to revoke. Both callers now share one
     minter so the scope and TTL cannot drift apart."""
     src = _read(Path("app/api/data_apps.py"))
-    assert "def mint_git_token(row: dict) -> tuple[str, str]:" in src
+    assert "def mint_git_token(row: dict, *, parent_token_id: str | None = None) -> tuple[str, str]:" in src
     cred = src[src.index("def _mint_git_credential(") : src.index("# Cookie carrying a")]
-    assert "mint_git_token(row)" in cred, "the URL builder must delegate, not duplicate the mint"
+    assert "mint_git_token(row, parent_token_id=parent_token_id)" in cred, (
+        "the URL builder must delegate, not duplicate the mint"
+    )
 
 
 def test_the_skill_sends_the_agent_through_the_relay():

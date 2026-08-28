@@ -43,6 +43,7 @@ ResolutionReason = Literal[
     "agent_pat_wrong_surface",
     "agent_pat_agent_deleted",
     "pat_scope_forbidden",
+    "pat_parent_revoked",
 ]
 
 # Path prefixes an agent PAT (typ="agent_pat") is allowed to authenticate
@@ -56,6 +57,22 @@ _AGENT_PAT_ALLOWED_PREFIXES = ("/api/v1/agents/", "/api/v1/sessions/", "/api/v1/
 # same DB-backed validity chain (revoked/expired/unknown/hash-mismatch +
 # last-used bookkeeping) below.
 _PAT_LIKE_TYPES = ("pat", "agent_pat")
+
+# Claim naming the credential a token was minted ON BEHALF OF — set by
+# `app.api.data_apps._mint_git_credential` when the mint request itself
+# authenticated with a PAT. A minted successor must not outlive its minter:
+# revoking a leaked PAT has to revoke what that PAT already produced, or the
+# one incident-response move that matters leaves the door open for the
+# successor's full TTL. Checked in `resolve_token_to_user` (not at any single
+# consuming surface) so every surface that ever accepts such a token inherits
+# the binding and no second, drifting copy of the rule can appear.
+#
+# ABSENT CLAIM MEANS NO PARENT, and is unconstrained — the container clone
+# token (`_mint_container_git_token`, minted by the deploy path, not by a
+# caller credential), the broker's per-request token (revoked in its own
+# `finally`), credentials minted from an interactive session JWT (no
+# revocable row to bind to), and every credential minted before this release.
+PARENT_TOKEN_ID_CLAIM = "parent_token_id"
 
 
 def _stash_payload(request: Optional[Request], payload: dict) -> None:
@@ -289,6 +306,17 @@ def resolve_token_to_user(
         return None, "pat_unknown"
     if record.get("revoked_at") is not None:
         return None, "pat_revoked"
+
+    # Minted-successor binding. A token carrying `parent_token_id` is only as
+    # alive as the credential that minted it — so revoking that credential
+    # revokes this one too, with no sweep to run and nothing to remember.
+    # A parent row that has vanished outright counts as revoked (fail closed):
+    # the alternative is a successor that outlives a hard-deleted PAT.
+    parent_id = payload.get(PARENT_TOKEN_ID_CLAIM)
+    if parent_id:
+        parent = tokens_repo.get_by_id(parent_id)
+        if not parent or parent.get("revoked_at") is not None:
+            return None, "pat_parent_revoked"
 
     exp_at = record.get("expires_at")
     if exp_at is not None:

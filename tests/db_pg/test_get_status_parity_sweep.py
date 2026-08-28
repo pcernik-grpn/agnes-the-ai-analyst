@@ -34,6 +34,28 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # still requires each one to fail CLEAN (a typed 501) on DuckDB, not crash or
 # merely return some unrelated 4xx. The mechanism itself is proven in
 # `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
+#
+# The fact graph over Collections read surface (build order steps 2+3) has
+# no GET entry here: its one GET route, `/api/facts/{subject_id}/claims`,
+# carries a path param and is out of scope for THIS sweep by construction
+# (`collect_statuses` skips any path containing "{") — same treatment as
+# every other path-param endpoint in the codebase, none of which are
+# exempted here either. `search`/`neighbors` are POST, so they live in the
+# mutation sweep instead.
+#
+# Build order step 4 (write path) DOES add one: `GET /api/facts/corrections`
+# (the producer export, spec §7.4) is genuinely parameter-free and reaches
+# `facts_repo().list_wrong_corrections()` — DuckDB -> typed 501, Postgres ->
+# 200 (empty list, nothing seeded). Requires the flag forced on below (this
+# sweep leaves it off by default, unlike the mutation sweep) so the route
+# is actually reached rather than 404ing identically on both backends.
+#
+# `GET /api/facts/ingest-runs` (spec §13.2 source card) is the same shape:
+# parameter-free (its `limit` is a query param with a default, so the
+# route matches with no path template), reaches
+# `facts_ingest_runs_repo().list_recent(...)` — a SEPARATE PG-only repo
+# from `facts_repo()` (see src/repositories/facts_ingest_runs_pg.py) so it
+# needs its own exemption entry even though the reason reads similarly.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "GET /api/admin/semantic-model/coverage": (
         "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
@@ -46,10 +68,31 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "the health roll-up resolves `semantic_health_mutes` (the mute overlay) as a "
         "gate dependency before any other check runs, a PG-only table (F4.2)"
     ),
+    "GET /api/facts/corrections": (
+        "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
+        "to resolve; see src/repositories/facts_pg.py"
+    ),
+    # Ontology builder draft persistence (spec §13.2) — genuinely
+    # parameter-free and reaches ontology_drafts_repo() -- DuckDB -> typed
+    # 501, Postgres -> 200 (empty list, nothing seeded).
+    "GET /api/admin/ontology/drafts": (
+        "ontology_drafts_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/ontology_drafts_pg.py"
+    ),
+    "GET /api/facts/ingest-runs": (
+        "facts_ingest_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/facts_ingest_runs_pg.py"
+    ),
 }
 
 
 def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engine):
+    # facts.enabled defaults OFF (the router-level 404 gate would otherwise
+    # make BOTH backends answer 404 identically, hiding the PG-only
+    # divergence the exemption above is supposed to prove) — force it on for
+    # the duration of this sweep, mirroring test_mutation_status_parity_sweep.py.
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
     # Must run here, before `build_seeded_client("pg", ...)` below repoints

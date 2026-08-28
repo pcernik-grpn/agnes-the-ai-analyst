@@ -36,8 +36,13 @@ def _auth(token):
 
 
 def test_builder_module_loaded_and_hosts_present(seeded_app):
-    """The standalone builder JS is loaded and both Keboola modals carry a
-    builder mount + the preserved raw-JSON escape-hatch textarea."""
+    """The standalone builder JS is loaded and both the Keboola edit modal
+    AND the shared register drawer (D4 — one registration flow) carry a
+    builder mount + the preserved raw-JSON escape-hatch textarea. The
+    register-side host moved from `#kbWhereFiltersBuilder` (the old
+    connector-specific modal) to `#rtfKbWhereFiltersBuilder` (generic,
+    shared across all four connectors' Configure step) — same reuse of
+    the builder, different id."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     html = c.get("/admin/tables", headers=_auth(token)).text
@@ -45,15 +50,23 @@ def test_builder_module_loaded_and_hosts_present(seeded_app):
     # Module shipped + loaded.
     assert "/static/js/where-filters-builder.js" in html
 
-    # Register modal: builder host + the existing escape-hatch textarea.
-    assert 'id="kbWhereFiltersBuilder"' in html
-    assert 'id="kbWhereFilters"' in html  # raw-JSON hatch preserved
-    # Edit modal: same pair.
+    # Shared register drawer: builder host + the preserved raw-JSON
+    # escape-hatch textarea (Direct-extract's `where_filters` AND the
+    # 'custom' materialized mode's JSON-wrapped `source_query` both read
+    # from this one instance — see register_table_form.js).
+    assert 'id="rtfKbWhereFiltersBuilder"' in html
+    assert 'id="rtfKbWhereFilters"' in html
+    assert 'id="kbWhereFiltersBuilder"' not in html
+    # Edit modal: unchanged.
     assert 'id="editKbWhereFiltersBuilder"' in html
     assert 'id="editKbWhereFilters"' in html
 
-    # The escape hatch is reachable via an explicit toggle (not deleted).
+    # The escape hatch is reachable via an explicit toggle in both places
+    # (edit's server-rendered `toggleWhereFiltersRaw`, register's JS-built
+    # equivalent in register_table_form.js).
     assert "toggleWhereFiltersRaw" in html
+    js = (Path("app/web/static/js/register_table_form.js")).read_text(encoding="utf-8")
+    assert "rtfKbFilterRawToggle" in js
 
 
 def test_builder_initialised_for_both_modals(seeded_app):

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from src.repositories import column_metadata_repo, glossary_repo, metric_repo
-from src.semantic.dialect import resolve_expression
+from src.semantic.dialect import resolve_expression_any
 
 logger = logging.getLogger(__name__)
 
@@ -554,6 +554,13 @@ class ProjectionReport:
     # often that happened this pass.
     name_collisions: int = 0
     skipped: list[dict] = field(default_factory=list)
+    # Metrics that DID project (they're in `metric_definitions`, counted in
+    # `metrics_written` too) but whose only declared expression is a
+    # warehouse-specific dialect (SNOWFLAKE, DATABRICKS, ...) rather than
+    # DUCKDB/ANSI_SQL — the raw expression rides as-is, not locally runnable.
+    # Kept separate from `skipped`, which is reserved for metrics that never
+    # made it into `metric_definitions` at all.
+    warehouse_only: list[dict] = field(default_factory=list)
 
 
 def _synonyms_of(ai_context: Any) -> list[str]:
@@ -721,9 +728,11 @@ def project_document(
             metric_name = metric.get("name")
             if not metric_name:
                 continue
-            sql, reason = resolve_expression(metric.get("expression") or {})
+            sql, dialect_name, locally_runnable = resolve_expression_any(metric.get("expression") or {})
             if sql is None:
-                report.skipped.append({"kind": "metric", "name": metric_name, "reason": reason})
+                report.skipped.append(
+                    {"kind": "metric", "name": metric_name, "reason": "no expression in any usable dialect"}
+                )
                 continue
             # The bare aggregation fragment, before `_bind_metric` composes it
             # into a runnable `SELECT ... FROM ...` (or a JOIN). The legacy
@@ -732,15 +741,34 @@ def project_document(
             # block in catalog_semantics.html still has something to render.
             fragment = sql
             table_id = _agnes_payload(metric).get("dataset") or ""
-            bound = _bind_metric(sql, table_id, binder, kb_lookups, rel_lookup)
-            if bound is None:
-                # A binding was declared but cannot be honored — skip, as the
-                # legacy composer does, rather than write an unrunnable row.
-                report.skipped.append({"kind": "metric", "name": metric_name, "reason": "unresolved_binding"})
-                continue
-            sql, table_name, tables = bound
-            grain = grain_by_table.get(table_id)
-            notes = [f"dataset grain: {grain}"] if grain else None
+            if locally_runnable:
+                bound = _bind_metric(sql, table_id, binder, kb_lookups, rel_lookup)
+                if bound is None:
+                    # A binding was declared but cannot be honored — skip, as
+                    # the legacy composer does, rather than write an
+                    # unrunnable row.
+                    report.skipped.append({"kind": "metric", "name": metric_name, "reason": "unresolved_binding"})
+                    continue
+                sql, table_name, tables = bound
+                grain = grain_by_table.get(table_id)
+                notes = [f"dataset grain: {grain}"] if grain else None
+            else:
+                # Only a warehouse-specific dialect was declared (SNOWFLAKE,
+                # DATABRICKS, ...). Dropping the metric would make it vanish
+                # from the catalog entirely even though the document itself
+                # carries it fine — so it still projects, verbatim, with the
+                # caveat that it cannot run through a local DuckDB query.
+                # Mirrors the notes-based marker
+                # `connectors/databricks/semantic_layer.py::build_metric_rows`
+                # already uses for the same "needs server-side execution"
+                # case (no `query_mode`/`remote` column on
+                # `metric_definitions` to carry this instead).
+                table_name, tables = None, None
+                notes = [
+                    f"{dialect_name} expression — not locally runnable; run server-side "
+                    "(remote query or a materialized row) on the source warehouse."
+                ]
+                report.warehouse_only.append({"kind": "metric", "name": metric_name, "dialect": dialect_name})
             metric_id = _scoped_id(source, source_ref, model_key, metric_name)
             if _check_name_collision(metric_name, metric_id, source, source_ref):
                 report.name_collisions += 1

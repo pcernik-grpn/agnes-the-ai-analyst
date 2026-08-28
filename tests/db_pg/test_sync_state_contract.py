@@ -278,3 +278,71 @@ def test_get_all_states_deserializes_parts(sync_repo):
 
     all_states = {s["table_id"]: s for s in repo.get_all_states()}
     assert all_states["kbc.partitioned"]["parts"] == parts
+
+
+# ---------------------------------------------------------------------------
+# Track E3 Slice 1: prune_history_older_than — opt-in sync_history retention
+# ---------------------------------------------------------------------------
+
+
+def _backdate_sync_history(sync_repo_tuple, history_id: str, ts: datetime) -> None:
+    """Rewrite one sync_history row's `synced_at` directly — `update_sync`
+    always stamps `now()`, so the prune tests need an implementation-specific
+    path to plant an old row (same reasoning as test_audit_contract.py's
+    `_backdate` helper)."""
+    repo, conn, backend = sync_repo_tuple
+    if backend == "duckdb":
+        conn.execute("UPDATE sync_history SET synced_at = ? WHERE id = ?", [ts, history_id])
+    else:
+        import sqlalchemy as sa
+
+        with repo._engine.begin() as c:
+            c.execute(
+                sa.text("UPDATE sync_history SET synced_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": history_id},
+            )
+
+
+def test_prune_history_older_than_deletes_only_old_rows(sync_repo):
+    repo, _, _ = sync_repo
+    repo.update_sync(table_id="t.old", rows=1, file_size_bytes=10, hash="h1")
+    repo.update_sync(table_id="t.new", rows=1, file_size_bytes=10, hash="h2")
+
+    old_hist = repo.get_sync_history("t.old")[0]
+    _backdate_sync_history(sync_repo, old_hist["id"], datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_history_older_than(365)
+
+    assert pruned == 1
+    assert repo.get_sync_history("t.old") == []
+    assert repo.get_sync_history("t.new") != []
+
+
+def test_prune_history_older_than_returns_zero_when_nothing_qualifies(sync_repo):
+    repo, _, _ = sync_repo
+    repo.update_sync(table_id="t.recent", rows=1, file_size_bytes=10, hash="h1")
+
+    pruned = repo.prune_history_older_than(365)
+
+    assert pruned == 0
+    assert repo.get_sync_history("t.recent") != []
+
+
+def test_prune_history_older_than_never_touches_sync_state(sync_repo):
+    """The current-state row (sync_state) must survive even when its entire
+    sync_history is pruned — a table that hasn't synced in over a year
+    should still report its last-known state to the manifest / registry UI,
+    just with no history rows to browse."""
+    repo, _, _ = sync_repo
+    repo.update_sync(table_id="t.old", rows=42, file_size_bytes=1024, hash="abc123")
+    old_hist = repo.get_sync_history("t.old")[0]
+    _backdate_sync_history(sync_repo, old_hist["id"], datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_history_older_than(365)
+
+    assert pruned == 1
+    assert repo.get_sync_history("t.old") == []
+    state = repo.get_table_state("t.old")
+    assert state is not None
+    assert state["rows"] == 42
+    assert state["hash"] == "abc123"

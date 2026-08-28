@@ -99,6 +99,7 @@
 
 {% set page_hero_eyebrow = model_name ~ " · " ~ object_type_label %}
 {% set page_hero_title = object_name %}
+{% set page_hero_plain = True %}
 
 {% block toolbar %}
 <div class="slb-meta">
@@ -181,7 +182,7 @@
 {% if object_type == 'constraint' %}
 <div class="slb-panel">
     <h2>Rule</h2>
-    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
+    <p><span class="badge{% if (obj.severity or '') | lower == 'error' %} badge--danger{% else %} badge--warn{% endif %}" title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when the constraint type is statically checkable (currently just required_filter) and the rule is missing from the query — any other type is advisory only regardless of severity.">{{ obj.severity or "warning" }}</span> &middot; {{ obj.constraint_type or "—" }}</p>
     <pre class="slb-expr">{{ obj.rule or "" }}</pre>
     <p>Applies to metrics: {{ (obj.metrics or []) | join(', ') }}</p>
 </div>

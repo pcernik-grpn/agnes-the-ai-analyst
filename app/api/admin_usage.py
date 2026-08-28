@@ -30,7 +30,7 @@ from connectors.llm.exceptions import (
     LLMRefusalError,
     LLMTimeoutError,
 )
-
+from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
 from src.repositories import (
     audit_repo,
     usage_repo,
@@ -211,11 +211,15 @@ def ask_usage(
     if len(question) > 1000:
         raise HTTPException(status_code=400, detail="question too long (>1000 chars)")
 
+    vertex = vertex_config_or_none()
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
+    if not api_key and not vertex:
         raise HTTPException(
             status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured on the server. Set it in instance env / .env_overlay.",
+            detail=(
+                "ANTHROPIC_API_KEY is not configured on the server. Set it in "
+                "instance env / .env_overlay, or configure ai.provider: vertex."
+            ),
         )
 
     dialect = "postgresql" if use_pg() else "duckdb"
@@ -225,7 +229,11 @@ def ask_usage(
         # escaped exception here would surface as an unhandled 500 instead
         # of this endpoint's documented LLM-failure response. t0 is taken
         # after construction so the reported llm_ms stays the API call.
-        extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
+        extractor: AnthropicExtractor
+        if vertex:
+            extractor = create_vertex_extractor(_ASK_MODEL)
+        else:
+            extractor = AnthropicExtractor(api_key=api_key, model=_ASK_MODEL)
         t0 = time.monotonic()
         llm_out = extractor.extract_json(
             prompt=build_prompt(question),
@@ -403,14 +411,19 @@ def reprocess_usage(
 def prune_usage(
     user: dict = Depends(require_admin),
 ):
-    """Delete usage_events older than USAGE_EVENTS_RETENTION_DAYS.
+    """Delete usage_events older than the configured retention window.
 
-    Default retention: env var unset or ``0`` → no pruning (forever).
-    Daily rollup tables untouched — they're tiny and lossy-by-design.
+    Window source: ``USAGE_EVENTS_RETENTION_DAYS`` env var (back-compat), or
+    ``retention.usage_events_days`` in instance.yaml (Track E3 Slice 1) —
+    see ``app.instance_config.get_usage_events_retention_days``. Default
+    retention: unset or ``0`` → no pruning (forever). Daily rollup tables
+    untouched — they're tiny and lossy-by-design.
     """
-    retention = int(os.environ.get("USAGE_EVENTS_RETENTION_DAYS", "0") or 0)
+    from app.instance_config import get_usage_events_retention_days
+
+    retention = get_usage_events_retention_days()
     if retention <= 0:
-        return {"status": "skipped", "reason": "USAGE_EVENTS_RETENTION_DAYS unset or 0"}
+        return {"status": "skipped", "reason": "usage_events retention window unset or 0"}
     try:
         deleted = usage_repo().delete_older_than(retention)
         after = usage_repo().count_events()

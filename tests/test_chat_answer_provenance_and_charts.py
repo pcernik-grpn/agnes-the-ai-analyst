@@ -178,7 +178,13 @@ def test_the_server_rendered_default_makes_the_promise_true():
 def _assert_names_chart_channel(md: str) -> None:
     assert "inline SVG" in md
     assert "svg.fonttype" in md, "without this matplotlib emits glyph outlines and the SVG is huge"
-    assert "Never tell the user to open a file path." in md
+    # Was "Never tell the user to open a file path. They cannot reach it."
+    # That stopped being true when the session-files panel shipped: a file
+    # under `outputs/` IS reachable. The rule the agent still needs is the
+    # narrower one — a *chart* belongs in the reply, never handed over as a
+    # file — so the refusal is pinned in its current, honest form rather than
+    # dropped. See "## Files you produce" for the half that is now allowed.
+    assert "Never send a chart as a file." in md
     assert "data:" in md, "the failing alternative has to be named to be refused"
     assert "broken image" in md, "say what the user sees, not just that it is forbidden"
 
@@ -276,6 +282,84 @@ def test_the_charts_sandbox_wording_does_not_drift():
         f"{SERVER_DEFAULT_TEMPLATE}'s is_sandbox=True branch — keep them identical or this "
         "guard will always fail"
     )
+
+
+def _assert_names_the_file_handover_channel(md: str) -> None:
+    assert "outputs/" in md, "the one directory every surface collects from has to be named"
+    assert ".claude/" in md, (
+        "the failing location has to be named to be refused — a deliverable left under "
+        ".claude/ is filtered out of the engine's file browser and never reaches the user"
+    )
+    assert "download button" in md, (
+        "the agent must be told NOT to promise a download control — whether the surface "
+        "shows one is provider- and deployment-dependent, and it cannot see that from inside"
+    )
+
+
+def test_the_workspace_prompt_names_the_file_handover_channel():
+    """A chart is *shown* in the reply; a document is *handed over* as a file,
+    and where the agent writes it decides whether it can reach the user at all.
+    `outputs/` is the intersection of all three collectors (the agent-API
+    harvest scans ``/work/outputs``, the engine's sandbox browser lists the
+    workspace tree, the host walk lists the session dir), while ``.claude/``
+    is filtered out by the engine browser — which is exactly where the skill
+    in #1611 wrote its SOW and deck, so they were invisible. Pins the bundled
+    fallback file; see the sibling below for the server-rendered default."""
+    _assert_names_the_file_handover_channel(_prose(WORKSPACE_CLAUDE_MD))
+
+
+def test_the_server_rendered_default_names_the_file_handover_channel():
+    """Same gap as the chart rule: in DEFAULT mode the bundled file above is
+    immediately overwritten by this render, so a handover rule that lives only
+    in the bundled file never reaches an agent on the common path."""
+    _assert_names_the_file_handover_channel(_collapse_ws(_rendered_server_default_claude_md(is_sandbox=True)))
+
+
+def test_a_laptop_workspace_is_not_told_to_write_into_outputs():
+    """The mirror of ``test_the_server_rendered_default_gives_true_chart_guidance_on_a_laptop``:
+    `outputs/` is a *sandbox* collection point. On a laptop workspace the
+    filesystem really is the analyst's own machine, nothing harvests
+    ``outputs/``, and the right answer is the path itself — so this section
+    must stay inside the ``is_sandbox`` branch."""
+    laptop = _collapse_ws(_rendered_server_default_claude_md(is_sandbox=False))
+    assert "Files you produce" not in laptop, (
+        "the outputs/ handover rule is sandbox-only — on a laptop there is no collector "
+        "and naming the path IS the delivery"
+    )
+    assert "outputs/" not in laptop, (
+        "assert on the directory too, not just the heading: a rename of the section would "
+        "otherwise let the sandbox-only rule leak into the laptop render unnoticed"
+    )
+
+
+def test_the_file_handover_wording_does_not_drift():
+    """Same pairing as ``test_the_charts_sandbox_wording_does_not_drift``: two
+    independent files carry this sandbox prose with no shared source, so pin
+    the bundled file equal to the template's ``is_sandbox=True`` render or an
+    edit to one will silently leave the other behind."""
+    heading = "Files you produce"
+    bundled = _section(_read(WORKSPACE_CLAUDE_MD), heading)
+    server_default = _section(_rendered_server_default_claude_md(is_sandbox=True), heading)
+    assert bundled == server_default, (
+        f"the sandbox-facing {heading!r} wording differs between {WORKSPACE_CLAUDE_MD} and "
+        f"{SERVER_DEFAULT_TEMPLATE}'s is_sandbox=True branch — keep them identical or this "
+        "guard will always fail"
+    )
+
+
+def test_the_prompt_no_longer_claims_files_cannot_be_delivered():
+    """The sentence this replaced ('What you do not have is any way to hand the
+    user a file') was true when the only channel out was inline SVG, and false
+    from #1613 on — while still actively steering the agent away from writing
+    the deliverable the user asked for. Pin the retraction: a future edit that
+    reinstates the blanket claim has to fail here first."""
+    for md in (
+        _prose(WORKSPACE_CLAUDE_MD),
+        _collapse_ws(_rendered_server_default_claude_md(is_sandbox=True)),
+    ):
+        assert "any way to hand the user a file" not in md, (
+            "the blanket 'no file channel' claim is false since #1613 — say where to write the deliverable instead"
+        )
 
 
 def test_the_sandbox_image_carries_matplotlib():

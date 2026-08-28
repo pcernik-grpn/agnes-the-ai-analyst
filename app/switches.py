@@ -532,6 +532,43 @@ SWITCHES: tuple[Switch, ...] = (
             "flag. New feature — off by default."
         ),
     ),
+    Switch(
+        name="facts",
+        config_keys=("facts", "enabled"),
+        env_var="AGNES_FACTS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Fact graph over Collections — typed subjects (facts/edges) extracted from "
+            "Collections documents, each claim carrying its evidencing document, verbatim "
+            "quote and date; visibility is enforced per-caller from readable collection "
+            "grants. Postgres-only (A3 ratchet) — a DuckDB-backed instance answers a typed "
+            "501 regardless of this flag. Read surface (search/neighbors/claims) and write "
+            "surface (ingest + corrections, scheduler-token-or-admin) both live behind this "
+            "flag. New feature — off by default."
+        ),
+    ),
+    Switch(
+        name="facts_visibility_mode",
+        config_keys=("facts", "visibility_mode"),
+        env_var="AGNES_FACTS_VISIBILITY_MODE",
+        kind="select",
+        options=("any_evidence", "all_evidence"),
+        default="any_evidence",
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Fact-graph subject existence rule (design doc §4): `any_evidence` — a "
+            "subject is visible if AT LEAST ONE of its claims is in a readable "
+            "collection (default). `all_evidence` — visible only if ALL of its claims "
+            "are readable; hides strictly more within one grant snapshot. Facts and "
+            "edges use the same rule."
+        ),
+    ),
 )
 
 _BY_NAME: dict[str, Switch] = {s.name: s for s in SWITCHES}

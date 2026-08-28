@@ -32,6 +32,14 @@ features in future versions.
 
 ## Three Governance Modes (configurable)
 
+> **Status (#1573):** `distribution_mode` is exposed at `/admin/server-config`
+> and persists to `instance.yaml`, but `GET /api/memory/bundle` does not yet
+> branch on it — every mode currently ships every approved item to every
+> user, same as today's de-facto behavior. Wiring this up touches the JSON
+> bundle route, the per-domain markdown route `agnes pull` writes, and the
+> sync-manifest md5 those two must agree with — tracked as open work, not
+> done in the #1573 fix.
+
 ### Mode 1: "mandatory_only"
 
 CEO/admin has full control. Users receive what's mandated, nothing else.
@@ -129,10 +137,16 @@ AI extraction → confidence > threshold? → auto-publish (approved)
 
 - Admin only reviews borderline items
 - Reduces review burden while maintaining quality gate
-- Threshold configurable in instance.yaml
+- Threshold configurable via `corporate_memory.auto_publish_min_confidence`
+  (default `0.80`) in instance.yaml
 - Confidence score visible to admin in review queue (helps calibrate trust over time)
-- **Implementation note**: requires adding a confidence assessment step to the
-  AI extraction prompt (new field in CATALOG_SCHEMA)
+- **Implementation note**: the confidence score is computed in code from
+  `(source_type, detection_type)` via `services/corporate_memory/confidence.py`,
+  the same scorer the `user_verification` path already uses — the LLM is
+  never trusted to self-report its own credibility (see
+  `services/session_processors/verification.py`). For the CLAUDE.local.md
+  collector every item in a run shares one score (the `claude_local_md`
+  source's base confidence); there is no per-item LLM-reported score.
 
 ---
 

@@ -293,6 +293,110 @@ def test_sync_marketplaces_mixed(clean_env, fake_remote, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# served-cache invalidation on successful sync — issue #1615
+#
+# sync_marketplaces() already invalidated the ZIP ETag + cowork caches after
+# a successful sync; sync_one() did not, so a manual "Sync now" reported a
+# fresh commit while /marketplace.zip and the cowork bundle kept serving
+# pre-sync bytes until their TTL expired. Both paths must go through the
+# same helper so they can't drift again, and neither must invalidate on a
+# failed sync (nothing changed, so warm caches are still correct).
+# ---------------------------------------------------------------------------
+
+
+def test_sync_one_invalidates_served_caches_on_success(clean_env, fake_remote, monkeypatch):
+    from app.marketplace_server import cowork_packager, packager
+    from src.db import get_system_db
+    from src.marketplace import sync_one
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    calls: list[str] = []
+    monkeypatch.setattr(packager, "invalidate_etag_cache", lambda: calls.append("etag"))
+    monkeypatch.setattr(cowork_packager, "invalidate_cache", lambda: calls.append("cowork"))
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(id="hello", name="Hello", url=fake_remote["url"], branch="main")
+    finally:
+        conn.close()
+
+    sync_one("hello")
+
+    assert calls == ["etag", "cowork"], "a successful manual sync must invalidate both served caches"
+
+
+def test_sync_one_does_not_invalidate_caches_on_failure(clean_env, tmp_path, monkeypatch):
+    from app.marketplace_server import cowork_packager, packager
+    from src.db import get_system_db
+    from src.marketplace import sync_one
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-config"))
+    calls: list[str] = []
+    monkeypatch.setattr(packager, "invalidate_etag_cache", lambda: calls.append("etag"))
+    monkeypatch.setattr(cowork_packager, "invalidate_cache", lambda: calls.append("cowork"))
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(
+            id="bogus",
+            name="Bogus",
+            url="https://127.0.0.1:1/does-not-exist.git",
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError):
+        sync_one("bogus")
+
+    assert calls == [], "a failed sync must not invalidate warm caches — nothing changed"
+
+
+def test_sync_marketplaces_invalidates_served_caches_on_success(clean_env, fake_remote, monkeypatch):
+    from app.marketplace_server import cowork_packager, packager
+    from src.db import get_system_db
+    from src.marketplace import sync_marketplaces
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(Path(os.environ["DATA_DIR"]) / "no-global"))
+    calls: list[str] = []
+    monkeypatch.setattr(packager, "invalidate_etag_cache", lambda: calls.append("etag"))
+    monkeypatch.setattr(cowork_packager, "invalidate_cache", lambda: calls.append("cowork"))
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(id="good", name="Good", url=fake_remote["url"], branch="main")
+    finally:
+        conn.close()
+
+    sync_marketplaces()
+
+    assert calls == ["etag", "cowork"]
+
+
+def test_sync_marketplaces_skips_invalidation_when_nothing_synced(clean_env, monkeypatch):
+    from app.marketplace_server import cowork_packager, packager
+    from src.db import get_system_db
+    from src.marketplace import sync_marketplaces
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(Path(os.environ["DATA_DIR"]) / "no-global"))
+    calls: list[str] = []
+    monkeypatch.setattr(packager, "invalidate_etag_cache", lambda: calls.append("etag"))
+    monkeypatch.setattr(cowork_packager, "invalidate_cache", lambda: calls.append("cowork"))
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(id="bad", name="Bad", url="https://127.0.0.1:1/x.git")
+    finally:
+        conn.close()
+
+    sync_marketplaces()
+
+    assert calls == [], "no marketplace synced → nothing to invalidate"
+
+
+# ---------------------------------------------------------------------------
 # ref pinning (tag / commit SHA) — issue #781
 # ---------------------------------------------------------------------------
 
@@ -1422,3 +1526,26 @@ def test_refresh_plugin_cache_auto_disables_deprecated(clean_env, monkeypatch):
     assert _refresh_plugin_cache(slug) == 2
     flags = _disabled_flags()
     assert flags["old"] is True, "removing the flag must never auto-re-enable"
+
+
+# ---------------------------------------------------------------------------
+# route handler shape — issue #1614
+#
+# FastAPI runs `async def` handlers on the event loop; `def` handlers run in
+# a thread pool. trigger_sync's body is fully blocking (subprocess git
+# clone, DuckDB writes, a process-wide lock), so it must be declared `def`
+# like its sibling trigger_sync_all — otherwise one "Sync now" freezes every
+# other request for the duration of the sync.
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_sync_and_trigger_sync_all_are_not_coroutines():
+    import inspect
+
+    from app.api.marketplaces import trigger_sync, trigger_sync_all
+
+    assert not inspect.iscoroutinefunction(trigger_sync), (
+        "trigger_sync calls the blocking sync_one() directly — as `async def` it would "
+        "run on the event loop and block every other request for the duration of the sync"
+    )
+    assert not inspect.iscoroutinefunction(trigger_sync_all)

@@ -3,6 +3,19 @@
    Modern, professional modal for business metrics visualization
    ══════════════════════════════════════════════════════════════ */
 
+/* #1625 raw-hex sweep: this whole file is intentionally left untouched and
+   allowlisted in tests/test_design_system_contract.py's raw-hex guard.
+   No template loads metric_modal.css or metric_modal.js — /catalog/semantics
+   is the only page that ever used this modal and explicitly builds its own
+   accordion instead (see test_catalog_semantics_page.py, which asserts
+   "metric_modal.css" is NOT in the page body). The dark-mode invisible-text
+   bug this guard targets cannot manifest here because nothing renders it.
+   A correct per-rule token conversion would still mean touching ~20
+   non-flagged text-color declarations across ~700 lines for internal
+   background/ink consistency (the same class of bug at 10x the surface
+   area) — a full redesign of an unused stylesheet, disproportionate to a
+   raw-hex retirement sweep. Revisit (or delete) if the modal is revived. */
+
 /* Modal Overlay */
 .metric-modal-overlay {
     display: none;

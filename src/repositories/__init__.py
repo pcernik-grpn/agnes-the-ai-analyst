@@ -154,6 +154,11 @@ __all__ = [
     "file_corpora_repo",
     "corpus_files_repo",
     "corpus_chunks_repo",
+    "corpus_file_sources_repo",
+    # Fact graph over Collections
+    "facts_repo",
+    "ontology_drafts_repo",
+    "facts_ingest_runs_repo",
     # Agent registry (v103) — the Library's agent items
     "agents_repo",
     # Maintained digests (K4, #799)
@@ -188,12 +193,13 @@ def use_pg() -> bool:
     """Return True when the active backend is Postgres (side-car or cloud).
 
     Precedence:
-      1. ``instance.yaml::database.backend`` (admin-controlled).
+      1. ``instance.yaml::database.backend`` — ONLY when EXPLICITLY declared
+         (admin-controlled / migrator / first-boot seed).
       2. ``DATABASE_URL`` env var presence (12-factor convention).
       3. ``AGNES_DB_URL`` env var presence (legacy alias).
     """
     try:
-        from src.db_state_machine import BackendState, _OVERLAY_PATH, read_backend_state
+        from src.db_state_machine import BackendState, is_backend_explicitly_declared, read_backend_state
 
         state, _ = read_backend_state()
         if state in (
@@ -203,9 +209,16 @@ def use_pg() -> bool:
             BackendState.CLOUD_IN_PROGRESS,
         ):
             return True
-        # Only treat DUCKDB as authoritative when the overlay actually exists;
-        # otherwise fall through to the env-var fallback (fresh-install default).
-        if state == BackendState.DUCKDB and _OVERLAY_PATH.exists():
+        # Only treat DUCKDB as authoritative when the overlay EXPLICITLY
+        # declares it (`database: {backend: duckdb}` present) — an overlay
+        # that merely EXISTS (e.g. because an unrelated
+        # /admin/server-config save touching only data_source/theme/etc.
+        # created the file) with no `database` key at all is NOT a DuckDB
+        # declaration. Checking `_OVERLAY_PATH.exists()` alone here used to
+        # conflate the two and silently revert a DATABASE_URL-based Postgres
+        # instance to an empty DuckDB backend on the next restart — see
+        # CHANGELOG "PG-backend-revert" fix.
+        if state == BackendState.DUCKDB and is_backend_explicitly_declared():
             return False
     except Exception:
         pass
@@ -519,6 +532,28 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "corpus_chunks": {
         DUCKDB: ("src.repositories.corpus_chunks", "CorpusChunksRepository"),
         PG: ("src.repositories.corpus_chunks_pg", "CorpusChunksPgRepository"),
+    },
+    # Crawler-anchor mapping (fact-graph-over-Collections §6 prerequisite) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "corpus_file_sources": {
+        PG: ("src.repositories.corpus_file_sources_pg", "CorpusFileSourcesPgRepository"),
+    },
+    # Fact graph over Collections (design doc §2 consequences) — PG-only,
+    # A3 ratchet: no DuckDB backend.
+    "facts": {
+        PG: ("src.repositories.facts_pg", "FactsPgRepository"),
+    },
+    # Ontology builder draft state (fact-graph-over-Collections §13.2) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "ontology_drafts": {
+        PG: ("src.repositories.ontology_drafts_pg", "OntologyDraftsPgRepository"),
+    },
+    # Persisted ingest run reports (design doc §7.2/§13.2) — PG-only, A3
+    # ratchet: no DuckDB backend. Separate repo/table from "facts" above so
+    # a report-write failure is structurally never part of the ingest
+    # transaction.
+    "facts_ingest_runs": {
+        PG: ("src.repositories.facts_ingest_runs_pg", "FactsIngestRunsPgRepository"),
     },
     # agent registry (v103)
     "agents": {
@@ -886,6 +921,33 @@ def agents_repo() -> Any:
 
 def corpus_chunks_repo() -> Any:
     return _build("corpus_chunks")
+
+
+def corpus_file_sources_repo() -> Any:
+    """Crawler-anchor mapping (fact-graph-over-Collections §6). PG-only —
+    raises ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
+    return _build("corpus_file_sources")
+
+
+def facts_repo() -> Any:
+    """Fact graph over Collections (facts/fact_aliases/edges/claims/
+    corrections — design doc §2 consequences). PG-only — raises
+    ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
+    return _build("facts")
+
+
+def ontology_drafts_repo() -> Any:
+    """Ontology builder draft state (design doc §13.2, "Ontology builder").
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance."""
+    return _build("ontology_drafts")
+
+
+def facts_ingest_runs_repo() -> Any:
+    """Persisted run reports for ``POST /api/facts/ingest`` (design doc
+    §7.2/§13.2 source card). PG-only — raises ``RequiresPostgresBackend``
+    on a DuckDB-backed instance."""
+    return _build("facts_ingest_runs")
 
 
 # Maintained digests (K4, #799)

@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import json
 
-
 from app.api import broker_agent_policy as pol
-
 
 # ---------------------------------------------------------------------------
 # check_model
@@ -62,6 +60,51 @@ def test_check_model_missing_model_key_passes():
 def test_check_model_non_dict_json_passes():
     agent_row = {"model": "claude-opus-4-7"}
     assert pol.check_model(b"[1, 2, 3]", agent_row, []) is None
+
+
+def test_canonical_model_id_forms():
+    assert pol.canonical_model_id("claude-sonnet-4-5@20250929") == "claude-sonnet-4-5-20250929"
+    assert pol.canonical_model_id("claude-sonnet-4-5-20250929") == "claude-sonnet-4-5-20250929"
+    assert pol.canonical_model_id("claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert pol.canonical_model_id("  claude-opus-4-7 ") == "claude-opus-4-7"
+    assert pol.canonical_model_id("") == ""
+
+
+def test_check_model_pinned_first_party_allows_vertex_form():
+    """Operators may pin either spelling of a dated snapshot; the sandbox CLI
+    in Vertex mode sends the @-form."""
+    agent_row = {"model": "claude-sonnet-4-5-20250929"}
+    body = json.dumps({"model": "claude-sonnet-4-5@20250929"}).encode()
+    assert pol.check_model(body, agent_row, []) is None
+
+
+def test_check_model_pinned_vertex_form_allows_first_party():
+    agent_row = {"model": "claude-sonnet-4-5@20250929"}
+    body = json.dumps({"model": "claude-sonnet-4-5-20250929"}).encode()
+    assert pol.check_model(body, agent_row, []) is None
+
+
+def test_check_model_utility_models_accept_vertex_form():
+    agent_row = {"model": "claude-opus-4-7"}
+    body = json.dumps({"model": "claude-haiku-4-5-20251001"}).encode()
+    assert pol.check_model(body, agent_row, ["claude-haiku-4-5@20251001"]) is None
+
+
+def test_check_model_value_url_model_direct():
+    """Vertex native paths carry the model in the URL — the broker calls
+    check_model_value directly with the URL-extracted model."""
+    agent_row = {"model": "claude-sonnet-4-5-20250929"}
+    assert pol.check_model_value("claude-sonnet-4-5@20250929", agent_row, []) is None
+    assert pol.check_model_value("claude-opus-4-7", agent_row, []) == "model_not_allowed"
+    assert pol.check_model_value("", agent_row, []) is None
+    assert pol.check_model_value(None, agent_row, []) is None
+    assert pol.check_model_value("anything", {"model": None}, []) is None
+
+
+def test_check_model_truthy_non_string_model_still_rejected():
+    agent_row = {"model": "claude-opus-4-7"}
+    body = json.dumps({"model": 123}).encode()
+    assert pol.check_model(body, agent_row, []) == "model_not_allowed"
 
 
 # ---------------------------------------------------------------------------

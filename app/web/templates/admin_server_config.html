@@ -345,6 +345,7 @@
 <div class="cfg-page" data-page="server-config">
   {% set page_hero_eyebrow = "Server" %}
   {% set page_hero_title = "Instance settings" %}
+  {% set page_hero_plain = True %}
   {% set page_hero_subtitle = "Edits land in <code style=&quot;color:#fff;background:rgba(255,255,255,0.15);padding:1px 6px;border-radius:4px&quot;>instance.yaml</code>. Most changes apply immediately — some need a restart before they take effect, and the save confirmation tells you which. Secret values are masked here — re-enter them to change." %}
   {% include "_page_hero.html" %}
 
@@ -555,7 +556,6 @@ const SECTION_META = {
   server: { title: "Server", help: "Hostname and host. Changing these can break OAuth callbacks." },
   auth: { title: "Authentication", help: "Allowed sign-in domain and Google OAuth keys. Misconfiguration can lock everyone out." },
   ai: { title: "AI / LLM", help: "Provider + API key for the corporate-memory extractor. provider=anthropic|openai_compat; api_key uses ${ENV_VAR} so the secret stays in .env." },
-  openmetadata: { title: "OpenMetadata", help: "Optional REST catalog enrichment. Without it, the app runs without catalog cross-links." },
   corporate_memory: {
     title: "Corporate memory",
     help: "Optional governance for AI-extracted knowledge. When the section is unset, the system runs in legacy democratic-wiki mode with no admin review.",
@@ -587,6 +587,10 @@ const SECTION_META = {
   access_policies: {
     title: "Access policies",
     help: "Table access policies — lets an admin attach one row-filtering and column-masking SQL policy per non-distributed table, substituted in on every server-side read with the caller's identity bound.",
+  },
+  facts: {
+    title: "Fact graph",
+    help: "Typed facts and edges extracted from Collections documents, each claim carrying its evidencing document and a verbatim quote. Postgres-only; visibility derives from collection grants. visibility_mode: any_evidence (default) shows a subject when any readable claim evidences it, all_evidence requires every claim to be readable.",
   },
   mcp: {
     title: "MCP access",
@@ -1156,7 +1160,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "ai", "openmetadata", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in

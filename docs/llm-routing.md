@@ -14,9 +14,10 @@ Different clients deploying this platform use different AI providers:
 | Client profile | AI Provider | Why |
 |----------------|------------|-----|
 | Enterprise with central AI gateway | LiteLLM proxy | Cost control, audit, policy enforcement |
-| Keboola | Direct Anthropic | Simple setup, single provider |
+| Single-vendor deployment | Direct Anthropic | Simplest setup, one provider to operate |
 | Multi-model deployments | OpenRouter | Multi-model access, cost optimization |
-| GCP-native stack | Google Gemini | Existing Google Cloud relationship |
+| GCP-native stack (Claude) | Google Vertex AI | Claude via GCP capacity/billing, keyless (ADC) |
+| GCP-native stack (Gemini) | Google Gemini | Existing Google Cloud relationship |
 
 **Problem**: The code only works with Anthropic. Adding a second client means duplicating
 or rewriting the AI calling logic.
@@ -155,12 +156,30 @@ instance.yaml (ai: section)
        ↓
   Extractor routes to the right API:
     ├─ Anthropic SDK  → api.anthropic.com/v1/messages
+    ├─ AnthropicVertex SDK → {region}-aiplatform.googleapis.com (Google ADC, no key)
     └─ OpenAI SDK     → litellm.example.com/v1/chat/completions
                          openrouter.ai/v1/chat/completions
                          any OpenAI-compatible endpoint
 ```
 
 ### Config examples
+
+**Claude on Google Vertex AI (keyless — Google ADC):**
+```yaml
+ai:
+  provider: "vertex"
+  vertex:
+    project_id: "my-gcp-project"   # or env ANTHROPIC_VERTEX_PROJECT_ID
+    region: "global"               # or a specific region; env CLOUD_ML_REGION
+  model: "claude-haiku-4-5-20251001"   # first-party ids accepted; dated ids
+                                       # translate to the @-form automatically
+```
+`structured_output` is ignored for vertex — like the anthropic provider it
+uses native `json_schema` output, so the semantics match exactly. No
+`api_key`: credentials come from Application Default Credentials
+(GOOGLE_APPLICATION_CREDENTIALS → gcloud ADC → GCE/GKE attached service
+account); requires the `anthropic[vertex]` extra (bundled in this repo's
+dependencies).
 
 **OpenAI-compatible proxy (LiteLLM, OpenRouter, Azure OpenAI, ...):**
 ```yaml
@@ -171,7 +190,7 @@ ai:
   model: "claude-haiku-4-5-20251001"
 ```
 
-**Keboola (direct Anthropic):**
+**Single-vendor deployment (direct Anthropic):**
 ```yaml
 ai:
   provider: "anthropic"
@@ -248,6 +267,10 @@ Each client controls their own provider, model, and API gateway independently.
 - Retry with backoff for transient errors
 - Corporate Memory collector integration
 
+**In scope since the Vertex provider landed:**
+- Claude on Google Vertex AI (`provider: vertex`) — VertexExtractor subclasses
+  AnthropicExtractor, so the whole retry/structured-output loop is shared.
+
 **Explicitly NOT in scope (future):**
 - Azure OpenAI, OpenRouter, Gemini — listed as "untested" until verified per-provider
 - General-purpose AI chat/generation interface
@@ -283,37 +306,21 @@ Each client controls their own provider, model, and API gateway independently.
 
 ## Deployment
 
-The existing `deploy.sh` handles dependency installation from `requirements.txt`,
-so no manual pip install is needed. The deployment sequence:
+The connector ships with the platform and its SDKs are declared dependencies
+(`pyproject.toml`), so enabling a provider on an instance is configuration
+only — no code change and no manual install:
 
-1. Add `openai` to `requirements.txt` (OSS repo)
-2. Update `collector.py` to use new connector (OSS repo)
-3. Add `ai:` section to `instance.yaml` (instance repo)
-4. Add `LLM_API_KEY` secret to GHA secrets and deploy.yml (instance repo)
-5. Add `CONFIG_DIR` to the wrapper script `collect-knowledge` (OSS repo)
-6. Push both repos → CI/CD deploys automatically
-7. Verify via `--dry-run` on server
+1. Add the `ai:` section to `config/instance.yaml` (see the config examples
+   above; `config/instance.yaml.example` carries the annotated template)
+2. Set the matching secret in `.env` — `ANTHROPIC_API_KEY` for the direct
+   provider, `LLM_API_KEY` for an OpenAI-compatible proxy
+   (both documented in `config/.env.template`)
+3. Restart the service and verify with a dry run:
+   `python -m services.corporate_memory.collector --dry-run`
 
-**Rollback**: Revert both repos to previous commit. The legacy config path
-means existing `ai.anthropic_api_key` still works if we need to roll back.
-
-## Files to Modify
-
-| File | Repo | Change |
-|------|------|--------|
-| `connectors/llm/` (5 new files) | OSS | New connector module |
-| `services/corporate_memory/collector.py` | OSS | Use connector instead of direct API |
-| `server/bin/collect-knowledge` | OSS | Add CONFIG_DIR |
-| `requirements.txt` | OSS | Add `openai>=1.0.0` |
-| `server/deploy.sh` | OSS | Add LLM_API_KEY to env propagation |
-| `config/.env.template` | OSS | Document LLM_API_KEY |
-| `config/instance.yaml.example` | OSS | Expanded ai: section with examples |
-| `docs/CONFIGURATION.md` | OSS | Add AI provider docs |
-| `tests/test_llm_connector.py` | OSS | New: connector tests |
-| `tests/test_corporate_memory.py` | OSS | New/expanded: behavior tests |
-| `config/instance.yaml` | Instance | Add ai: section for the target provider |
-| `.github/workflows/deploy.yml` | Instance | Add LLM_API_KEY to .env |
-| `env.example` | Instance | Document LLM_API_KEY |
+**Rollback**: revert the `ai:` section. The legacy `ai.anthropic_api_key`
+config shape is still honored, so an instance that never moved off it keeps
+working unchanged.
 
 ## Risk Assessment
 
@@ -321,6 +328,5 @@ means existing `ai.anthropic_api_key` still works if we need to roll back.
 |------|-------|-----------|
 | LiteLLM structured output translation | Medium | Three-layer fallback + manual verification before deploy |
 | Config migration breaks existing instances | Low | Backward compat shim for legacy config shape |
-| New `openai` dependency conflicts | Low | Standard package, deploy.sh handles install |
+| New `openai` dependency conflicts | Low | Standard package, declared in `pyproject.toml` |
 | Corporate Memory regression | Medium | Expanded behavior tests covering all current logic |
-| Systemd/wrapper script CONFIG_DIR | Low | Follows existing pattern from other services |

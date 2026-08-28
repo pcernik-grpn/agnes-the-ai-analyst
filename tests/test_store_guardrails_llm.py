@@ -583,3 +583,68 @@ class TestReviewBundleConstructorFailure:
         assert verdict["error"] == "RuntimeError: client construction failed"
         assert verdict["risk_level"] is None
         assert verdict["findings"] == []
+
+
+class TestVertexMode:
+    """ai.provider: vertex — keyless guardrails (Google ADC signs the calls)."""
+
+    def test_default_api_key_loader_returns_sentinel_in_vertex_mode(self, monkeypatch):
+        from src.store_guardrails.runner import default_api_key_loader
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        with patch("connectors.llm.factory.vertex_config_or_none", return_value=("p", "global")):
+            assert default_api_key_loader() == ""
+
+    def test_default_api_key_loader_error_mentions_vertex(self, monkeypatch):
+        from src.store_guardrails.runner import default_api_key_loader
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        with (
+            patch("connectors.llm.factory.vertex_config_or_none", return_value=None),
+            pytest.raises(RuntimeError, match="ai.provider: vertex"),
+        ):
+            default_api_key_loader()
+
+    def test_static_key_still_wins(self, monkeypatch):
+        from src.store_guardrails.runner import default_api_key_loader
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-static")
+        assert default_api_key_loader() == "sk-static"
+
+    def test_llm_review_builds_vertex_extractor_on_empty_key(self, plugin_dir):
+        from src.store_guardrails.llm_review import review_bundle
+
+        with (
+            patch("src.store_guardrails.llm_review.vertex_config_or_none", return_value=("p", "global")),
+            patch("src.store_guardrails.llm_review.create_vertex_extractor") as mock_factory,
+        ):
+            mock_factory.return_value.extract_json.return_value = {
+                "risk_level": "safe",
+                "summary": "fine",
+                "findings": [],
+                "template_placeholders_found": False,
+            }
+            verdict = review_bundle(
+                plugin_dir,
+                type_="skill",
+                name="probe",
+                version="1.0.0",
+                description="d",
+                api_key="",
+                model="claude-haiku-4-5-20251001",
+            )
+        assert verdict["risk_level"] == "safe"
+        assert verdict["error"] is None
+        mock_factory.assert_called_once_with("claude-haiku-4-5-20251001")
+
+    def test_guardrails_provider_ready_true_in_vertex_mode(self, monkeypatch):
+        from app.instance_config import get_guardrails_llm_provider_ready
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        with patch("connectors.llm.factory.vertex_config_or_none", return_value=("p", "global")):
+            assert get_guardrails_llm_provider_ready() is True
+        with patch("connectors.llm.factory.vertex_config_or_none", return_value=None):
+            assert get_guardrails_llm_provider_ready() is False

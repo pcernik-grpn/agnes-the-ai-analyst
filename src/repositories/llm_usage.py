@@ -176,3 +176,17 @@ class LlmUsageRepository:
             [session_id, limit],
         ).fetchall()
         return self._rows_to_dicts(rows)
+
+    def prune_older_than(self, days: int) -> int:
+        """Delete ``llm_usage`` rows older than ``days``, by ``created_at``.
+        Returns the deleted-row count.
+
+        The caller (``src/audit_retention.py``) owns the "days<=0 = keep
+        forever, skip entirely" short-circuit — this method always executes
+        the DELETE it's given, no matter the value (mirrors
+        ``AuditRepository.prune_older_than``)."""
+        rows = self.conn.execute(
+            "DELETE FROM llm_usage WHERE created_at < (CURRENT_TIMESTAMP - INTERVAL (?) DAY) RETURNING id",
+            [days],
+        ).fetchall()
+        return len(rows)
