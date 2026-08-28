@@ -125,3 +125,34 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         src = self._source()
         assert "Required by your admin" in src
         assert "In their Library" in src
+
+
+class TestRowsAndTheirHandlerAgree:
+    """A row is identified by `data-rid`, never by its tag.
+
+    The group view's rows were `<tr>` until the table was flattened into a
+    CSS grid, and the click handler kept matching `tr[data-rid]` — so
+    Available / Required and Revoke silently did nothing on the one surface
+    people actually use, while continuing to work in the bundle view, whose
+    rows are still `<tr>`. Nothing failed and nothing logged; the control
+    just had no effect.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_row_handler_is_not_tag_specific(self):
+        src = self._source()
+        assert 'closest("tr[data-rid]")' not in src
+        assert 'closest("[data-rid]")' in src
+
+    def test_both_views_mark_their_rows_the_same_way(self):
+        """The grid rows and the bundle view's table rows both carry it, so
+        one handler serves both."""
+        src = self._source()
+        assert 'class="ax-r" data-type=' in src      # group view, a <div>
+        assert '<tr data-type=' in src               # bundle view, a <tr>

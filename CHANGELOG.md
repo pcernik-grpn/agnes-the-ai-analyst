@@ -201,6 +201,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **People and Access both start closed inside a group, and the expanded
+  group is quieter.** Opening a group is a step toward an answer, not the
+  answer, and unrolling the tallest thing on the page for someone who came to
+  check a member count repeats the mistake the two-pane layout made with the
+  group list. An open group is now three short lines — the identity line and
+  two section rows stating their counts — with one connective rule drawn from
+  the group's left edge so the content reads as hanging off the row above
+  rather than as the next thing on the page. Section rows get a real row
+  height, a hover and a rotating chevron; a closed section needs no divider
+  from its neighbour, an open one gets one.
 - **Custom groups sit above `Admin` and `Everyone` on `/admin/access`.**
   System led while `Everyone` was the page's default selection — the row that
   opened on load belonged at the top — and nothing is selected on arrival any

@@ -1375,6 +1375,62 @@
   .ax-invite__mail:focus { outline: var(--ds-focus-outline); outline-offset: 1px; }
   .ax-invite__note { flex-basis: 100%; font-size: 11.5px; color: var(--ds-text-muted); }
   .ax-invite .btn { font-size: 12.5px; padding: 5px 12px; }
+  /* ══ The expanded group ════════════════════════════════════════════════
+     Both sections are closed on arrival now, so what an open group shows
+     first is two summary lines — People and Access, each stating its count.
+     That is the shape to design for: a short, readable stack that expands
+     on demand, not a wall that happens to start with two headings.
+
+     The problem it had was that every part of it — the identity line, the
+     two section heads, the table furniture — sat at roughly one visual
+     weight in roughly one grey, so an open group looked like debris under
+     the row rather than its contents. ── */
+
+  /* One connective line, drawn from the group's own left edge, so the
+     expanded content reads as hanging off the row above rather than as the
+     next thing on the page. It is the only new ink in this pass. */
+  .ax-gs[open] > .ax-gs__body {
+    position: relative;
+    margin-left: 22px;
+    padding-left: 24px;
+    border-left: 1px solid var(--ds-border);
+  }
+  @media (max-width: 900px) {
+    .ax-gs[open] > .ax-gs__body { margin-left: 10px; padding-left: 12px; }
+  }
+
+  /* The identity line is the group restated — created date, description,
+     upstream address. It belongs at the top and it belongs quiet. */
+  .ax-gs__body .ax-gh { padding: 10px 0 4px; }
+  .ax-gs__body .ax-gh__facts { font-size: 11.5px; }
+
+  /* Section rows: a closed section is a LINE, and both start closed, so the
+     two of them are what an open group is. Give them a real row height, a
+     hover, and a chevron that reads as an affordance. */
+  .ax-gs__body .dsec > summary { cursor: pointer; border-radius: 4px; }
+  .ax-gs__body .dsec > summary:hover { background: var(--ds-surface-dim); }
+  .ax-gs__body .dsec-head { padding: 9px 8px 9px 2px; gap: 10px; }
+  .ax-gs__body #ax-sec-people > summary h3,
+  .ax-gs__body #ax-sec-access > summary h3 { font-size: 13px; font-weight: 600; }
+  .ax-gs__body .dsec-sum {
+    margin-left: auto; font-size: 12px; color: var(--ds-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .ax-gs__body .dsec-chev { opacity: .45; transition: transform 120ms ease; }
+  @media (prefers-reduced-motion: reduce) { .ax-gs__body .dsec-chev { transition: none; } }
+  .ax-gs__body .dsec[open] > summary .dsec-chev { transform: rotate(180deg); }
+  /* Open, a section separates from its neighbour by rule; closed, by nothing
+     — two closed lines do not need a divider between them. */
+  .ax-gs__body .dsec[open] > summary { border-bottom: 1px solid var(--ds-border-light); }
+  .ax-gs__body .dsec[open] { margin-bottom: 10px; }
+  .ax-gs__body .dsec-body { padding-top: 4px; }
+
+  /* The table sits inside an open section, so it no longer needs its own
+     top rule — the section head above it is the rule. */
+  .ax-colhd { border-bottom: 1px solid var(--ds-border-light); padding-top: 4px; }
+
+  /* Add row: the end of the list, at the list's own indent. */
+  .ax-add { margin-top: 8px; padding: 9px 0; border-top: 1px solid var(--ds-border-light); }
 </style>
 {% endblock %}
 
@@ -1507,7 +1563,11 @@
 
       {# ── Access ──────────────────────────────────────────────────────
          Open by default — the job the page exists for. #}
-      <details class="dsec" id="ax-sec-access" open aria-label="What this group can use">
+      {# Closed on arrival, like People. Opening a group is a step toward an
+         answer, not the answer — and unrolling the tallest thing on the page
+         for someone who came to check the member count is the same mistake
+         the two-pane layout made with the group list. #}
+      <details class="dsec" id="ax-sec-access" aria-label="What this group can use">
         <summary>
           <div class="dsec-head">
             <span class="dsec-ico">{{ ico.icon('shield-check', 14) }}</span>
@@ -3236,7 +3296,13 @@
       return;
     }
 
-    const row = e.target.closest("tr[data-rid]");
+    /* NOT `tr[data-rid]`. The group view's rows became CSS-grid <div>s when
+       the table was flattened, and this selector kept matching only the
+       bundle view's <tr>s — so Available/Required and Revoke silently did
+       nothing on the surface people actually use. Match the data attribute,
+       which is what identifies a row; the element it sits on is a layout
+       decision and may change again. */
+    const row = e.target.closest("[data-rid]");
     if (!row) return;
     // By bundle renders one row per GROUP, so the row carries its own; the
     // group view has none and falls back to the open section.
