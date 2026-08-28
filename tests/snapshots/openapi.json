@@ -860,6 +860,17 @@
         "title": "Body_import_metrics_api_admin_metrics_import_post",
         "type": "object"
       },
+      "Body_logout_submit_auth_logout_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          }
+        },
+        "title": "Body_logout_submit_auth_logout_post",
+        "type": "object"
+      },
       "Body_password_login_web_auth_password_login_web_post": {
         "properties": {
           "email": {
@@ -54780,6 +54791,113 @@
         "summary": "Keboola Login",
         "tags": [
           "auth"
+        ]
+      }
+    },
+    "/auth/logout": {
+      "get": {
+        "description": "Logout CONFIRMATION page (no state change) \u2014 issue #1675.\n\nThe Logout menu item used to be a plain ``GET`` link to ``/login``,\nwhich neither cleared the ``access_token`` cookie nor ended the session\n\u2014 it just LOOKED like sign-out (the app happily reopened on the next\nvisit). Ending a session is a mutation, so it cannot happen on a GET\n(security playbook #10, F2); this route only renders a confirm form\nwith a double-submit CSRF token. The actual cookie-clear + server-side\nrevocation is :func:`logout_submit` (POST) \u2014 same GET-confirms /\nPOST-mutates shape this codebase already uses for :func:`slack_bind` /\n:func:`slack_bind_confirm`.\n\nAn already-signed-out visitor has nothing to confirm \u2014 straight to\n``/login``.",
+        "operationId": "logout_page_auth_logout_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Page",
+        "tags": [
+          "web"
+        ]
+      },
+      "post": {
+        "description": "End the session \u2014 clear the cookie AND revoke it server-side.\n\nIssue #1675 (clear the browser's ``access_token`` cookie) and #1676\n(revoke the token so a copy captured before logout \u2014 a synced browser\nprofile, host malware, a shared machine \u2014 stops working too, not only\nthe browser that clicked Logout) land together: a client-side-only fix\nleaves every other copy of the token valid for the rest of its 30-day\n``exp``.\n\nRequires the double-submit ``web_csrf`` token minted by the GET\nconfirmation above (F2) \u2014 a state-changing action reachable from a menu\nitem on every page must not fire on ambient cookie auth alone, the same\nreasoning the F2 security review applied to :func:`slack_bind_confirm`.",
+        "operationId": "logout_submit_auth_logout_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_logout_submit_auth_logout_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Submit",
+        "tags": [
+          "web"
         ]
       }
     },

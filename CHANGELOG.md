@@ -943,6 +943,31 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
   carry the four stored token counters on both backends, so the sessions
   list payload has them too.
+- **Logout now actually ends the session** (#1675, #1676). The user-menu
+  "Logout" item used to be a plain `GET /login` link — no route existed for
+  it, so it never cleared the 30-day `access_token` cookie or invalidated
+  anything; the app happily reopened on the next visit. `GET /auth/logout`
+  now renders a confirm form (mutating on a GET is forbidden by this repo's
+  CSRF rules) and `POST /auth/logout` — gated by the same double-submit
+  `web_csrf` token every other state-changing web form uses — clears the
+  cookie with the exact attributes it was set with (`path`, `domain`,
+  `samesite`, `secure`) and revokes the session server-side, so a copy of
+  the token captured before logout (a synced browser profile, host malware,
+  a shared machine) stops working too, not only the browser that clicked
+  Logout. Revocation is a new `users.session_revoked_before` timestamp
+  floor compared against each `typ="session"` JWT's `iat` on every
+  authenticated request — it rides the user row `pat_resolver` already
+  loads to check `active`, so it costs no extra query on this hot path.
+  **Postgres-only** (schema-freeze ratchet, A3): a DuckDB-backed instance
+  clears the cookie on logout but has no column to persist the revocation
+  floor against, so a token copied out before logout stays valid on that
+  backend until its own `exp` — same as before this fix, not a regression.
+  Deploying this column does not itself invalidate any existing session
+  (the floor starts unset); only a future `POST /auth/logout` click revokes
+  anything, and revoking one session revokes every other live session for
+  that account too (a per-user floor, not a per-session one — the
+  narrower, per-token design was rejected on the same per-request cost
+  grounds `pat_resolver`'s PAT chain already documents).
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from

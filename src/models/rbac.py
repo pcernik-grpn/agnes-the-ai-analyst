@@ -56,6 +56,17 @@ class User(Base):
     # was set by someone else (seed admin from SEED_ADMIN_PASSWORD, admin-set
     # passwords). Cleared when the user sets their own password.
     must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    # Issue #1676: server-side session revocation, PG-only (A3 ratchet — see
+    # migrations/versions/0079_session_revoked_before.py). A `typ="session"`
+    # JWT whose `iat` predates this timestamp is refused by
+    # `app.auth.pat_resolver.resolve_token_to_user` even though its signature
+    # and `exp` are still valid — the mechanism `POST /auth/logout` uses to end
+    # a session server-side, not merely clear the browser cookie. NULL means "no
+    # floor set" (every pre-existing session stays valid until its own `exp` —
+    # a deploy of this column does not itself invalidate anything). DuckDB has
+    # no matching column (frozen post-A3 schema): the check simply never fires
+    # there, and `revoke_sessions()` is a documented no-op on that backend.
+    session_revoked_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class UserGroup(Base):
