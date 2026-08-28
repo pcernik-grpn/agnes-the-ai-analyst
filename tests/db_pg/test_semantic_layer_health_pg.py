@@ -134,6 +134,76 @@ class TestOrphanedModels:
         health = compute_semantic_layer_health()
         assert health["orphaned_models"] == []
 
+    def test_a_keboola_model_with_a_live_connection_is_not_flagged(self, pg_state):
+        """Keboola metastore sync stamps ``source_ref`` with the
+        ``source_connections.id`` it came from, never a ``semantic_sources``
+        row — checking it against ``semantic_sources`` always misses."""
+        from src.repositories import source_connections_repo
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        source_connections_repo().create(
+            id="conn-kbc", name="Keboola", source_type="keboola", config={}, is_default=False, created_by="test"
+        )
+        _model("m1", slug="revenue", source="keboola_metastore", source_ref="conn-kbc")
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_models"] == []
+
+    def test_a_keboola_model_whose_connection_was_deleted_is_flagged(self, pg_state):
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        _model("m1", slug="revenue", source="keboola_metastore", source_ref="conn-gone")
+
+        health = compute_semantic_layer_health()
+        assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
+
+    def test_a_databricks_model_matching_the_configured_workspace_is_not_flagged(self, pg_state, monkeypatch):
+        """The legacy Databricks sync stamps ``source_ref`` with the
+        warehouse hostname, never a ``semantic_sources`` row. Liveness must
+        hold even with no resolvable token — the health-report process may
+        not carry Databricks credentials at all."""
+        import src.connection_resolver as connection_resolver
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        monkeypatch.setattr(
+            connection_resolver,
+            "resolve_source_connection",
+            lambda source_type: (
+                {"config": {"host": "my-workspace.cloud.databricks.com"}} if source_type == "databricks" else None
+            ),
+        )
+        _model("m1", slug="revenue", source="databricks_metrics", source_ref="my-workspace.cloud.databricks.com")
+
+        health = compute_semantic_layer_health()
+        assert health["orphaned_models"] == []
+
+    def test_a_databricks_model_from_a_reconfigured_workspace_is_flagged(self, pg_state, monkeypatch):
+        import src.connection_resolver as connection_resolver
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        monkeypatch.setattr(
+            connection_resolver,
+            "resolve_source_connection",
+            lambda source_type: (
+                {"config": {"host": "new-workspace.cloud.databricks.com"}} if source_type == "databricks" else None
+            ),
+        )
+        _model("m1", slug="revenue", source="databricks_metrics", source_ref="old-workspace.cloud.databricks.com")
+
+        health = compute_semantic_layer_health()
+        assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
+
+    def test_a_databricks_model_is_flagged_when_no_workspace_is_configured(self, pg_state, monkeypatch):
+        import src.connection_resolver as connection_resolver
+        from src.semantic.coverage import compute_semantic_layer_health
+
+        monkeypatch.setattr(connection_resolver, "resolve_source_connection", lambda source_type: None)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *a, **k: "")
+        _model("m1", slug="revenue", source="databricks_metrics", source_ref="some-workspace.cloud.databricks.com")
+
+        health = compute_semantic_layer_health()
+        assert [m["model_id"] for m in health["orphaned_models"]] == ["m1"]
+
 
 class TestInvalidModels:
     def test_an_invalid_model_is_flagged_with_its_errors(self, pg_state):

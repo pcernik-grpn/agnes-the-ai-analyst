@@ -656,6 +656,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- Semantic-layer health's `orphaned_models` check no longer flags every
+  Keboola- and legacy-Databricks-sourced model as disconnected. It compared
+  every non-manual model's `source_ref` against `semantic_sources.id`, but
+  the Keboola metastore sync stamps `source_ref` with the `source_connections.id`
+  it synced from, and the legacy Databricks metrics sync stamps it with the
+  warehouse hostname — neither ever writes a `semantic_sources` row, so the
+  check always missed. It now dispatches per model `source` to the liveness
+  check that matches what that provider actually stamps (a live
+  `source_connections` row for Keboola, the currently-configured workspace
+  host for Databricks), falling back to the `semantic_sources` check for
+  everything else.
+
 - **"Sync now" on a built-in marketplace no longer deletes its content.**
   `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
   rows, but the per-row path — the admin table's "Sync now" button and
