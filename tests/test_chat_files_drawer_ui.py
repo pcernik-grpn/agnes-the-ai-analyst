@@ -480,6 +480,35 @@ def test_sandbox_prompt_no_longer_claims_files_cannot_reach_the_user():
     assert "any way to hand the user a file" not in template
 
 
+def _css_block(css: str, selector: str) -> str:
+    """The declaration body of one rule, by exact selector."""
+    m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert m, f"expected a rule for {selector}"
+    return m.group(1)
+
+
+def test_the_chip_actions_stay_reachable_from_the_keyboard():
+    """The actions are hidden at rest and revealed on ``:hover`` /
+    ``:focus-within``. Hiding them with ``display: none`` makes that second
+    half a lie — a display:none subtree is removed from the tab order, so its
+    Download link and Save button are unfocusable and ``:focus-within`` can
+    never fire from a keyboard. The chip would be mouse-only.
+
+    Review finding on this PR. Measured after the fix in headless Chromium:
+    Tab reaches ``#dl`` then ``#save``; while focus sits on Download the chip
+    matches ``:focus-within`` and the actions measure opacity 1 / width 154px,
+    against opacity 0 / width 0 at rest.
+    """
+    css = _read(Path("app/web/static/css/chat.css"))
+    rest = _css_block(css, ".cloud-chat-file-chip-actions")
+    assert not re.search(r"display:\s*none", rest), (
+        "display: none takes the actions out of the tab order, so the "
+        ":focus-within reveal below can never fire from the keyboard"
+    )
+    # And the reveal must actually key on focus, not hover alone.
+    assert ".cloud-chat-file-chip:focus-within .cloud-chat-file-chip-actions" in css
+
+
 def test_a_long_filename_can_ellipsize_inside_its_chip():
     """The chip is a flex container and its label sets ``text-overflow:
     ellipsis``. A flex child defaults to ``min-width: auto`` — its content
@@ -492,10 +521,16 @@ def test_a_long_filename_can_ellipsize_inside_its_chip():
     chip = re.search(r"\.cloud-chat-file-chip \{([^}]*)\}", css)
     assert chip and "flex" in chip.group(1), "premise: the chip is a flex container"
 
-    label = re.search(r"\.cloud-chat-file-chip-label \{([^}]*)\}", css)
-    assert label, "the chip label rule must exist"
-    block = label.group(1)
+    block = _css_block(css, ".cloud-chat-file-chip-label")
     assert "text-overflow: ellipsis" in block, "premise: the label truncates rather than wraps"
     assert re.search(r"min-width:\s*0", block), (
         "a flex child needs min-width: 0 or the ellipsis never fires"
+    )
+    # The chip is itself a flex item of the chips row, with the same
+    # content-based min-width floor — which outranks its own max-width: 100%.
+    # Without this the LABEL ellipsized and the chip still overflowed the
+    # bubble: measured 282px inside a 260px bubble, 260px once set.
+    assert re.search(r"min-width:\s*0", chip.group(1)), (
+        "the chip needs min-width: 0 too, or max-width: 100% loses to its "
+        "content-based minimum and it overflows the message bubble"
     )
