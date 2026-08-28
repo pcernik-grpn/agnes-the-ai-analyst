@@ -2329,6 +2329,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
+- **The release-cut moves out of feature PRs and into one daily cut PR.**
+  The old rule — whichever PR happened to land last with content under
+  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
+  section — raced two PRs against the same version number and produced a
+  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
+  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
+  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
+  the new `.github/workflows/daily-cut.yml` (minor bump by default,
+  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
+  labeled `release-cut` that a human reviews and merges — the workflow
+  never merges or tags anything itself. The cut arithmetic is pure
+  functions in `scripts/release_cut.py` (unit-tested in
+  `tests/test_release_cut.py`, including a guard against the known
+  3-way-merge duplicate-heading failure class), reused for the emergency
+  manual path when Actions dispatch isn't available. See
+  `docs/RELEASING.md` for the full ritual and the train-driver operating
+  rule.
+
+### Added
 
 - **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
   A fast, pure-file-parse test that catches the recurring silent-rebase
@@ -2501,26 +2520,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the original bug (which only overwrote it with corrupt bytes). Healthy
   sibling parts of the same table, and the same table on a later rebuild once
   the source part is repaired, are unaffected. (#1364)
-
-### Internal
-
-- **The release-cut moves out of feature PRs and into one daily cut PR.**
-  The old rule — whichever PR happened to land last with content under
-  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
-  section — raced two PRs against the same version number and produced a
-  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
-  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
-  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
-  the new `.github/workflows/daily-cut.yml` (minor bump by default,
-  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
-  labeled `release-cut` that a human reviews and merges — the workflow
-  never merges or tags anything itself. The cut arithmetic is pure
-  functions in `scripts/release_cut.py` (unit-tested in
-  `tests/test_release_cut.py`, including a guard against the known
-  3-way-merge duplicate-heading failure class), reused for the emergency
-  manual path when Actions dispatch isn't available. See
-  `docs/RELEASING.md` for the full ritual and the train-driver operating
-  rule.
 
 ## [0.88.0] - 2026-08-25
 
