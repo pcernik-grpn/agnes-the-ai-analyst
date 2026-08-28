@@ -1119,6 +1119,82 @@ def test_api_sync_nonexistent_returns_404(seeded_app):
     assert r.status_code == 404
 
 
+def test_api_sync_builtin_returns_409(seeded_app):
+    """"Sync now" on a built-in row is refused, not attempted.
+
+    Built-in rows carry a `builtin://` sentinel URL. Before the guard, this
+    endpoint passed it to git — which failed with "remote helper 'builtin'
+    aborted session" AFTER the clone path had already rmtree'd the seeded
+    content — and stamped a `last_error` that the nightly sync (which skips
+    built-in rows) never clears.
+    """
+    client = seeded_app["client"]
+    token_headers = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+
+    from src.db import get_system_db
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(
+            id="builtin-row",
+            name="Built-in",
+            url="builtin://builtin-row",
+            is_builtin=True,
+        )
+    finally:
+        conn.close()
+
+    r = client.post("/api/marketplaces/builtin-row/sync", headers=token_headers)
+    assert r.status_code == 409, r.text
+    assert "built-in" in r.json()["detail"]
+
+    # No last_error stamped, and the flag is surfaced so the admin table can
+    # drop the button rather than offer an action the API refuses.
+    r = client.get("/api/marketplaces", headers=token_headers)
+    assert r.status_code == 200, r.text
+    row = next(m for m in r.json() if m["id"] == "builtin-row")
+    assert row["is_builtin"] is True
+    assert row["last_error"] is None
+
+
+def test_api_delete_builtin_returns_409(seeded_app):
+    """A built-in row cannot be deleted, with or without `purge`.
+
+    `agnes-builtin` is re-seeded from the wheel on every boot, so deleting it
+    is a no-op the next restart undoes. The contributed marketplace has no
+    re-seed — with `purge=true` `delete_marketplace_dir` would take its locally
+    written skills with it, permanently. Retiring built-in content is what the
+    per-plugin disable endpoint is for.
+    """
+    client = seeded_app["client"]
+    token_headers = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+
+    from src.db import get_system_db
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    conn = get_system_db()
+    try:
+        MarketplaceRegistryRepository(conn).register(
+            id="builtin-del",
+            name="Built-in",
+            url="builtin://builtin-del",
+            is_builtin=True,
+        )
+    finally:
+        conn.close()
+
+    for query in ("", "?purge=true"):
+        r = client.delete(f"/api/marketplaces/builtin-del{query}", headers=token_headers)
+        assert r.status_code == 409, f"purge={query!r}: {r.text}"
+        assert "built-in" in r.json()["detail"]
+
+    # Row survives both attempts.
+    r = client.get("/api/marketplaces", headers=token_headers)
+    assert r.status_code == 200, r.text
+    assert any(m["id"] == "builtin-del" for m in r.json()), "built-in row must survive a refused delete"
+
+
 def test_api_requires_admin(seeded_app):
     client = seeded_app["client"]
     analyst_headers = {"Authorization": f"Bearer {seeded_app['analyst_token']}"}

@@ -668,6 +668,31 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   host for Databricks), falling back to the `semantic_sources` check for
   everything else.
 
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.
