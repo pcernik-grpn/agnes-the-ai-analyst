@@ -164,3 +164,35 @@ class TestRowsAndTheirHandlerAgree:
         assert src.count('class="ax-r" data-type=') == 2   # one per view
         assert "<tr data-type=" not in src
         assert 'class="ax-gs ax-gs--bb' in src             # a bundle is a group-shaped row
+
+
+class TestActingOnARowDoesNotCloseIt:
+    """A write from inside an open row must not shut the row.
+
+    The group view survives a repaint because the selected group is state and
+    is re-emitted with `open`. The bundle view had no equivalent: every
+    repaint rebuilt the list closed, so changing a tier or revoking from
+    inside an open bundle shut the thing you were working in, immediately
+    after acting on it — the one moment you are most certain to still be
+    looking at it.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_open_bundles_are_remembered(self):
+        src = self._source()
+        assert "const openBundles = new Set()" in src
+        assert "openBundles.has(bkey)" in src        # re-emitted open on render
+        assert "openBundles.add(key)" in src         # …and recorded on toggle
+        assert "openBundles.delete(key)" in src
+
+    def test_the_group_view_re_emits_its_open_group(self):
+        """The same property, by a different mechanism: `selectedGroup`."""
+        src = self._source()
+        assert "const open = selectedGroup === g.id;" in src
+        assert '${open ? "open" : ""}' in src

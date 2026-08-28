@@ -2965,6 +2965,13 @@
      layout made impossible), and the bundles granted to NOBODY, which in
      the group view are invisible by construction because you are always
      looking at one group's holdings. */
+  /* Which bundles are open. The group view survives a repaint because the
+     selected group is state — it is re-emitted with `open` — and the bundle
+     view had no equivalent, so every repaint rebuilt the list closed. Any
+     write from inside an open bundle (a tier change, a revoke) therefore
+     shut the thing you were working in, right after acting on it. */
+  const openBundles = new Set();
+
   function renderBundles() {
     const host = el("ax-groups");
     parkWork();
@@ -3040,8 +3047,10 @@
       const meta = nobody
         ? "granted to nobody"
         : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
+      const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
-      <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}">
+      <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}" data-bb="${esc(bkey)}"${
+        openBundles.has(bkey) ? " open" : ""}>
         <summary class="ax-gs__hd">
           <span class="ax-gs__car" aria-hidden="true">›</span>
           <span class="ax-r__kd" data-kind="${esc(kindToken(r.t))}">${esc(kindWord(r.t))}</span>
@@ -3268,6 +3277,20 @@
         el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
           b.classList.toggle("is-active", b.dataset.by === viewMode));
         await repaint();
+      }
+      return;
+    }
+
+    const bbSum = e.target.closest(".ax-gs--bb > .ax-gs__hd");
+    if (bbSum && !e.target.closest("[data-tier]") && !e.target.closest("[data-revoke]")
+        && !e.target.closest("[data-share-bundle]")) {
+      // Let the <details> toggle natively; just remember which way it went,
+      // so the next repaint can put it back.
+      const sec = bbSum.closest("[data-bb]");
+      const key = sec && sec.dataset.bb;
+      if (key) {
+        if (sec.hasAttribute("open")) openBundles.delete(key);
+        else openBundles.add(key);
       }
       return;
     }
