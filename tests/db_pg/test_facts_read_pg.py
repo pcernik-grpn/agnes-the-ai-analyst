@@ -987,6 +987,168 @@ def test_neighbors_depth_truncation_flag_false_when_graph_ends_exactly_at_the_ca
 
 
 # ---------------------------------------------------------------------------
+# neighbors response shape (spec §12) — nodes/edges carry the SAME projected
+# subject shape search() returns, not a bare {id, type, revealed}.
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_node_carries_the_full_subject_shape(pg_env, repo):
+    """Spec §12: a neighbors node is the SAME subject shape search() returns
+    — aliases, projected attrs, claim_count, quote_count — not the bare
+    {id, type, revealed} of the pre-fix response. Walking the graph must not
+    force a second fact_search/fact_claims round trip just to learn a node's
+    own attributes."""
+    _seed_full_fixture()
+    fact_a = repo.create_fact(type="person")
+    repo.add_alias(fact_id=fact_a, type="person", natural_key="person:alice-doe")
+    repo.add_claim(
+        fact_id=fact_a,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Alice Doe leads the engagement.",
+        attrs={"role": "lead"},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="nora", email="nora@test.com", name="Nora")
+    _make_group_with_grant(pg_env, group_name="group-nora", collection_id=CORPUS_A, member_user_id="nora")
+
+    result = repo.neighbors(_dict_user("nora"), fact_a)
+    node = next(n for n in result["nodes"] if n["id"] == fact_a)
+    assert node["aliases"] == ["person:alice-doe"]
+    assert node["attrs"]["role"]["value"] == "lead"
+    assert node["claim_count"] == 1
+    assert node["quote_count"] == 1
+    assert node["revealed"] is False
+
+
+def test_neighbors_endpoint_only_fact_serves_empty_attrs_with_its_aliases(pg_env, repo):
+    """An endpoint-only fact (visible purely via its anchoring edge's
+    readable claim) still carries its OWN aliases in the walk, but attrs
+    stay {} and claim_count 0 — own-claims-only, same as search()."""
+    src, dst, _edge = _seed_endpoint_only_fixture(repo, readable_edge_claim=True)
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="oscar", email="oscar@test.com", name="Oscar")
+    _make_group_with_grant(pg_env, group_name="group-oscar", collection_id=CORPUS_A, member_user_id="oscar")
+
+    result = repo.neighbors(_dict_user("oscar"), src)
+    node = next(n for n in result["nodes"] if n["id"] == dst)
+    assert node["attrs"] == {}
+    assert node["aliases"] == ["industry:saas"]
+    assert node["claim_count"] == 0
+    assert node["quote_count"] == 0
+
+
+def test_neighbors_s2_shaped_attrs_never_reopen_through_the_walk(pg_env, repo):
+    """S2 extended to neighbors: the SAME fact with one readable
+    (existence-only) claim and one unreadable claim carrying `price` must
+    NOT leak `price` through a neighbors() node either — the oracle must not
+    reopen through the walk just because search() closes it."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1")
+
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement is underway.",
+        attrs={},
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_b1",
+        corpus_id=CORPUS_B,
+        file_sha256="sha1",
+        quote="The contract value is $412,000.",
+        attrs={"price": 412000},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="petra", email="petra@test.com", name="Petra")
+    _make_group_with_grant(pg_env, group_name="group-petra", collection_id=CORPUS_A, member_user_id="petra")
+
+    result = repo.neighbors(_dict_user("petra"), fact_id)
+    node = next(n for n in result["nodes"] if n["id"] == fact_id)
+    assert "price" not in node["attrs"]
+
+
+def test_neighbors_revealed_node_serves_attrs_with_zero_quote_count(pg_env, repo):
+    """A `revealed` node in the walk shows its attrs (revealed bypasses
+    grants entirely per spec §4, same as search()) but quote_count is 0 —
+    the caller still never sees a quote through neighbors()."""
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="The engagement went ahead as planned.",
+        attrs={"status": "active"},
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="revealed",
+        reason="publicly announced",
+        decided_by="admin1",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="quinn", email="quinn@test.com", name="Quinn")
+    # Quinn has NO grants at all.
+
+    result = repo.neighbors(_dict_user("quinn"), fact_id)
+    node = next(n for n in result["nodes"] if n["id"] == fact_id)
+    assert node["revealed"] is True
+    assert node["attrs"]["status"]["value"] == "active"
+    assert node["quote_count"] == 0
+
+
+def test_neighbors_edge_carries_projected_attrs(pg_env, repo):
+    """Spec §12: an edge's attrs are projected the same way as a node's,
+    from the edge's OWN readable claims."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+
+    fact_a = repo.create_fact(type="person")
+    fact_b = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_a, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="A exists.")
+    repo.add_claim(fact_id=fact_b, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="B exists.")
+    edge_id = repo.create_edge(src=fact_a, type="knows", dst=fact_b)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="A knows B since 2019.",
+        attrs={"since": 2019},
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="rex", email="rex@test.com", name="Rex")
+    _make_group_with_grant(pg_env, group_name="group-rex", collection_id=CORPUS_A, member_user_id="rex")
+
+    result = repo.neighbors(_dict_user("rex"), fact_a)
+    edge = next(e for e in result["edges"] if e["id"] == edge_id)
+    assert edge["attrs"]["since"]["value"] == 2019
+
+
+# ---------------------------------------------------------------------------
 # statement-timeout smoke test.
 # ---------------------------------------------------------------------------
 

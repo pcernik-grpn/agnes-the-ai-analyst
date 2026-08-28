@@ -422,6 +422,150 @@ class FactsPgRepository:
             return False
         return bool(status["revealed"] or status["has_claim_visibility"])
 
+    @staticmethod
+    def _projection_cte_sql(*, with_aliases: bool) -> str:
+        """The per-key latest-document_date-wins attrs projection (spec
+        §12), factored out of ``search()`` so ``neighbors()`` can serve
+        the SAME projected shape on its nodes/edges without duplicating
+        the ~40-line CTE chain. Consumes two CTEs the CALLER must already
+        have defined earlier in the same ``WITH`` clause:
+
+        - ``target_ids(subject_id)`` — the EXACT set of subjects to
+          project (never a broader set — this is projection, not a
+          visibility gate; the caller has already decided who is visible).
+        - ``counted_claims(claim_id, subject_id, attrs, document_date)`` —
+          the OWN, already caller-filtered claims to project from (own-
+          claims-only, per S2: never the endpoint-evidence union).
+
+        Produces ``subject_attrs(subject_id, attrs)``,
+        ``counts(subject_id, claim_count)`` and, when ``with_aliases``,
+        ``aliases(subject_id, aliases)`` (facts only — edges carry no
+        aliases)."""
+        parts = [
+            """attr_kv AS (
+                SELECT cc.subject_id, kv.key, kv.value, cc.document_date
+                FROM counted_claims cc
+                CROSS JOIN LATERAL jsonb_each(cc.attrs) AS kv(key, value)
+            )""",
+            """key_maxdate AS (
+                SELECT subject_id, key, MAX(document_date) AS max_dated
+                FROM attr_kv
+                WHERE document_date IS NOT NULL
+                GROUP BY subject_id, key
+            )""",
+            """winning AS (
+                SELECT ak.subject_id, ak.key, ak.value, ak.document_date
+                FROM attr_kv ak
+                LEFT JOIN key_maxdate kmd ON kmd.subject_id = ak.subject_id AND kmd.key = ak.key
+                WHERE (kmd.max_dated IS NOT NULL AND ak.document_date = kmd.max_dated)
+                   OR (kmd.max_dated IS NULL)
+            )""",
+            """attr_proj AS (
+                SELECT subject_id, key,
+                       COUNT(DISTINCT value) AS n_distinct,
+                       MAX(document_date) AS rep_date,
+                       jsonb_agg(DISTINCT value) AS values_agg,
+                       (array_agg(value))[1] AS single_value
+                FROM winning
+                GROUP BY subject_id, key
+            )""",
+            """attr_value_json AS (
+                SELECT subject_id, key,
+                    CASE WHEN n_distinct = 1
+                        THEN jsonb_build_object('value', single_value, 'document_date', to_jsonb(rep_date))
+                        ELSE jsonb_build_object('conflicted', true, 'values', values_agg)
+                    END AS proj
+                FROM attr_proj
+            )""",
+            """subject_attrs AS (
+                SELECT subject_id, jsonb_object_agg(key, proj) AS attrs
+                FROM attr_value_json
+                GROUP BY subject_id
+            )""",
+        ]
+        if with_aliases:
+            parts.append(
+                """aliases AS (
+                SELECT fact_id AS subject_id, jsonb_agg(natural_key ORDER BY natural_key) AS aliases
+                FROM fact_aliases
+                WHERE fact_id IN (SELECT subject_id FROM target_ids)
+                GROUP BY fact_id
+            )"""
+            )
+        parts.append(
+            """counts AS (
+                SELECT t.subject_id, COUNT(cc.claim_id) AS claim_count
+                FROM target_ids t
+                LEFT JOIN counted_claims cc ON cc.subject_id = t.subject_id
+                GROUP BY t.subject_id
+            )"""
+        )
+        return ",\n".join(parts)
+
+    def _project_subjects(
+        self,
+        conn,
+        *,
+        kind: str,
+        ids_with_revealed: List[tuple],
+        is_admin: bool,
+        readable: Optional[frozenset],
+        with_aliases: bool,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Own-claims-only attrs/aliases/claim_count projection for an
+        EXACT, already-determined set of subject ids — never a visibility
+        gate itself (the caller has already decided which ids to project;
+        ``neighbors()`` calls this AFTER truncation, per spec §12's cost
+        note, so the projection never runs on more nodes/edges than the
+        capped result set). Shares :meth:`_projection_cte_sql` with
+        ``search()``, so a neighbors node/edge carries byte-identical
+        projected ``attrs`` to a search subject (spec §12). A subject
+        carrying an active ``revealed`` correction projects from ALL its
+        own claims regardless of grants (spec §4, matching ``search()``);
+        every other subject projects only from claims the caller can
+        read."""
+        if not ids_with_revealed:
+            return {}
+        ids = [i for i, _r in ids_with_revealed]
+        revealed_flags = [bool(r) for _i, r in ids_with_revealed]
+        kind_column = "fact_id" if kind == "fact" else "edge_id"
+        vis = self._visibility_predicate("c.corpus_id", is_admin)
+        alias_select = ", COALESCE(al.aliases, '[]'::jsonb) AS aliases" if with_aliases else ""
+        alias_join = "LEFT JOIN aliases al ON al.subject_id = t.subject_id" if with_aliases else ""
+        sql = sa.text(
+            f"""
+            WITH target_ids AS (
+                SELECT * FROM unnest(CAST(:ids AS text[]), CAST(:revealed AS bool[])) AS t(subject_id, revealed)
+            ),
+            counted_claims AS (
+                SELECT c.id AS claim_id, c.{kind_column} AS subject_id, c.attrs, c.document_date
+                FROM claims c
+                JOIN target_ids t ON t.subject_id = c.{kind_column}
+                WHERE t.revealed OR ({vis})
+            ),
+            {self._projection_cte_sql(with_aliases=with_aliases)}
+            SELECT t.subject_id,
+                   COALESCE(cnt.claim_count, 0) AS claim_count{alias_select},
+                   COALESCE(satt.attrs, '{{}}'::jsonb) AS attrs
+            FROM target_ids t
+            LEFT JOIN counts cnt ON cnt.subject_id = t.subject_id
+            {alias_join}
+            LEFT JOIN subject_attrs satt ON satt.subject_id = t.subject_id
+            """
+        )
+        params: Dict[str, Any] = {"ids": ids, "revealed": revealed_flags}
+        if not is_admin:
+            params["readable"] = list(readable) if readable else []
+        rows = conn.execute(sql, params).mappings().all()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            out[r["subject_id"]] = {
+                "aliases": (_decode_jsonb(r["aliases"]) or []) if with_aliases else [],
+                "attrs": _decode_jsonb(r["attrs"]) or {},
+                "claim_count": int(r["claim_count"]),
+            }
+        return out
+
     # ------------------------------------------------------------------
     # search
     # ------------------------------------------------------------------
@@ -529,58 +673,10 @@ class FactsPgRepository:
                         )
                    )
             ),
-            attr_kv AS (
-                SELECT cc.subject_id, kv.key, kv.value, cc.document_date
-                FROM counted_claims cc
-                JOIN visible v ON v.subject_id = cc.subject_id
-                CROSS JOIN LATERAL jsonb_each(cc.attrs) AS kv(key, value)
+            target_ids AS (
+                SELECT subject_id FROM visible
             ),
-            key_maxdate AS (
-                SELECT subject_id, key, MAX(document_date) AS max_dated
-                FROM attr_kv
-                WHERE document_date IS NOT NULL
-                GROUP BY subject_id, key
-            ),
-            winning AS (
-                SELECT ak.subject_id, ak.key, ak.value, ak.document_date
-                FROM attr_kv ak
-                LEFT JOIN key_maxdate kmd ON kmd.subject_id = ak.subject_id AND kmd.key = ak.key
-                WHERE (kmd.max_dated IS NOT NULL AND ak.document_date = kmd.max_dated)
-                   OR (kmd.max_dated IS NULL)
-            ),
-            attr_proj AS (
-                SELECT subject_id, key,
-                       COUNT(DISTINCT value) AS n_distinct,
-                       MAX(document_date) AS rep_date,
-                       jsonb_agg(DISTINCT value) AS values_agg,
-                       (array_agg(value))[1] AS single_value
-                FROM winning
-                GROUP BY subject_id, key
-            ),
-            attr_value_json AS (
-                SELECT subject_id, key,
-                    CASE WHEN n_distinct = 1
-                        THEN jsonb_build_object('value', single_value, 'document_date', to_jsonb(rep_date))
-                        ELSE jsonb_build_object('conflicted', true, 'values', values_agg)
-                    END AS proj
-                FROM attr_proj
-            ),
-            subject_attrs AS (
-                SELECT subject_id, jsonb_object_agg(key, proj) AS attrs
-                FROM attr_value_json
-                GROUP BY subject_id
-            ),
-            counts AS (
-                SELECT v.subject_id, COUNT(cc.claim_id) AS claim_count
-                FROM visible v
-                LEFT JOIN counted_claims cc ON cc.subject_id = v.subject_id
-                GROUP BY v.subject_id
-            ),
-            aliases AS (
-                SELECT fact_id AS subject_id, jsonb_agg(natural_key ORDER BY natural_key) AS aliases
-                FROM fact_aliases
-                GROUP BY fact_id
-            )
+            {self._projection_cte_sql(with_aliases=True)}
             SELECT v.subject_id, v.subject_type, v.is_revealed,
                    COALESCE(cnt.claim_count, 0) AS claim_count,
                    COALESCE(al.aliases, '[]'::jsonb) AS aliases,
@@ -666,6 +762,7 @@ class FactsPgRepository:
             }
             edges_out: List[Dict[str, Any]] = []
             edges_seen: set = set()
+            edges_revealed: Dict[str, bool] = {}
             visited = {subject_id}
             frontier = {subject_id}
             truncated = {"depth": False, "fanout": False, "result": False}
@@ -686,7 +783,11 @@ class FactsPgRepository:
                         break
                     edge_sql = sa.text(
                         f"""
-                        SELECT e.id, e.src, e.dst, e.type
+                        SELECT e.id, e.src, e.dst, e.type,
+                               EXISTS (
+                                 SELECT 1 FROM corrections co2 WHERE co2.subject_kind = 'edge'
+                                   AND co2.subject_id = e.id AND co2.verdict = 'revealed'
+                               ) AS revealed
                         FROM edges e
                         WHERE (e.src = :node_id OR e.dst = :node_id)
                           {edge_types_clause}
@@ -745,6 +846,7 @@ class FactsPgRepository:
                             }
                         if erow["id"] not in edges_seen:
                             edges_seen.add(erow["id"])
+                            edges_revealed[erow["id"]] = bool(erow["revealed"])
                             edges_out.append(
                                 {"id": erow["id"], "src": erow["src"], "dst": erow["dst"], "type": erow["type"]}
                             )
@@ -795,8 +897,49 @@ class FactsPgRepository:
                     more = conn.execute(check_sql, check_params).first()
                     truncated["depth"] = more is not None
 
+            # Project attrs/aliases/claim_count for the FINAL, already-
+            # truncated node/edge sets only (spec §12 cost note: "project
+            # AFTER truncation") — never the wider candidate set a deeper
+            # walk might have touched. Same shared projection `search()`
+            # uses, so a node/edge here carries byte-identical `attrs` to
+            # a `search()` subject (spec §12).
+            node_proj = self._project_subjects(
+                conn,
+                kind="fact",
+                ids_with_revealed=[(n["id"], n["revealed"]) for n in nodes.values()],
+                is_admin=is_admin,
+                readable=readable,
+                with_aliases=True,
+            )
+            edge_proj = self._project_subjects(
+                conn,
+                kind="edge",
+                ids_with_revealed=[(eid, edges_revealed.get(eid, False)) for eid in edges_seen],
+                is_admin=is_admin,
+                readable=readable,
+                with_aliases=False,
+            )
+
+        nodes_out = []
+        for n in nodes.values():
+            proj = node_proj.get(n["id"], {"aliases": [], "attrs": {}, "claim_count": 0})
+            claim_count = proj["claim_count"]
+            nodes_out.append(
+                {
+                    "id": n["id"],
+                    "type": n["type"],
+                    "aliases": proj["aliases"],
+                    "attrs": proj["attrs"],
+                    "claim_count": claim_count,
+                    "quote_count": 0 if n["revealed"] else claim_count,
+                    "revealed": n["revealed"],
+                }
+            )
+        for e in edges_out:
+            e["attrs"] = edge_proj.get(e["id"], {"attrs": {}})["attrs"]
+
         return {
-            "nodes": [{"id": n["id"], "type": n["type"], "revealed": n["revealed"]} for n in nodes.values()],
+            "nodes": nodes_out,
             "edges": edges_out,
             "truncated": truncated,
         }
