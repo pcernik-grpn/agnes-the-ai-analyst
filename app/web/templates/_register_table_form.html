@@ -1,0 +1,256 @@
+{#
+  _register_table_form.html — the ONE table-registration drawer (D4 "one
+  registration flow"). Included by /admin/tables (entry point 1) and the
+  onboarding wizard's Discover-Tables step (entry point 2); every field
+  below is rendered exactly once and relabeled / shown / hidden by
+  register_table_form.js based on the selected connector and access mode.
+  No connector gets its own copy of this markup.
+
+  Structure: a two-step `.ds-drawer` (drawer.css) —
+    step "browse"    — pick a source connection/location, then check the
+                        tables to register from a discovered list (or add
+                        one manually when the connector has no browse API
+                        yet).
+    step "configure"  — access mode (live / synced / …), the fields that
+                        mode needs, and the settings applied to every
+                        checked table (bulk defaults; the per-row name is
+                        still editable back in the browse step).
+
+  All ids are generic (`rtf*`, not `bq*`/`kb*`/`dbx*`/`sf*`) — the same
+  input plays the "Dataset" role for BigQuery and the "Schema" role for
+  Snowflake, relabeled by register_table_form.js's per-connector config.
+
+  Include once per page:
+      {% include "_register_table_form.html" %}
+  then open it from an event handler:
+      RegisterTableForm.open({ sourceType: 'keboola' })
+#}
+<div class="ds-drawer ds-drawer--wide" id="registerTableModal" role="dialog" aria-modal="true"
+     aria-labelledby="rtfTitle" data-close-handler="closeRegisterTableModal">
+  <div class="ds-drawer__backdrop" onclick="RegisterTableForm.close()"></div>
+  <div class="ds-drawer__panel">
+    <div class="ds-drawer__head">
+      <div class="ds-drawer__head-main">
+        <h2 class="ds-drawer__title" id="rtfTitle">Register tables</h2>
+        <p class="ds-drawer__sub" id="rtfSub">Browse the source, pick tables, then register.</p>
+      </div>
+      <button class="ds-drawer__x" aria-label="Close" onclick="RegisterTableForm.close()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="ds-drawer__steps">
+      <button type="button" class="ds-drawer__step is-now" id="rtfStepBtnBrowse" onclick="RegisterTableForm.goToStep('browse')">
+        <span class="n">1</span><span class="lbl">Browse &amp; select</span>
+      </button>
+      <button type="button" class="ds-drawer__step" id="rtfStepBtnConfigure" disabled onclick="RegisterTableForm.goToStep('configure')">
+        <span class="n">2</span><span class="lbl">Configure &amp; register</span>
+      </button>
+    </div>
+
+    <div class="ds-drawer__body">
+
+      {# ── Step 1: Browse & select ─────────────────────────────────── #}
+      <div class="ds-drawer__pane is-on" id="rtfPaneBrowse">
+        <p class="ds-drawer__lede" id="rtfBrowseLede">Pick a connector, then check the tables to register.</p>
+
+        {# One connectedness signal (mirrors the pre-D4 per-modal banners):
+           `document.body.dataset.connectedSources` — set on /admin/tables,
+           absent on setup.html (onboarding's connector is whatever step 2
+           just configured, so the check doesn't apply there). Filled in by
+           RegisterTableForm.open() when the connector isn't in that list. #}
+        <div class="ds-drawer__err" id="rtfConnectivityWarning" hidden></div>
+
+        <div class="ds-drawer__field" id="rtfConnectorPickerField" hidden>
+          <label for="rtfConnectorPicker">Data source</label>
+          <select id="rtfConnectorPicker" onchange="RegisterTableForm.onConnectorChange()"></select>
+        </div>
+
+        <div class="ds-drawer__field" id="rtfConnectionPickerField" hidden>
+          <label for="rtfConnectionPicker">Connection</label>
+          <select id="rtfConnectionPicker" onchange="RegisterTableForm.onConnectionChange()"></select>
+          <p class="ds-drawer__hint">Which project/account to browse and register from.</p>
+        </div>
+
+        <div class="ds-drawer__row" id="rtfLocationRow" hidden>
+          <div class="ds-drawer__field">
+            <label for="rtfLocationInput" id="rtfLocationLabel">Dataset</label>
+            <input type="text" id="rtfLocationInput" list="rtfLocationList" placeholder="e.g. analytics">
+            <datalist id="rtfLocationList"></datalist>
+          </div>
+          <div class="ds-drawer__field" style="align-self:end;">
+            <button type="button" class="btn btn-secondary" id="rtfLocationLoadBtn" onclick="RegisterTableForm.loadLocation()">List tables</button>
+          </div>
+        </div>
+
+        <div id="rtfBrowseError" class="ds-drawer__err" hidden></div>
+
+        <div class="rtf-browse-toolbar">
+          <input type="text" class="rtf-search" id="rtfSearch" placeholder="Filter tables…" oninput="RegisterTableForm.renderTableList()">
+          <label class="rtf-select-all">
+            <input type="checkbox" id="rtfSelectAll" onchange="RegisterTableForm.onSelectAllChange()">
+            Select all
+          </label>
+        </div>
+
+        <div id="rtfTableList"><p class="ds-drawer__empty" id="rtfBrowseEmpty">Choose a data source to browse its tables.</p></div>
+
+        <div class="rtf-manual-add" id="rtfManualAdd" hidden>
+          <input type="text" id="rtfManualEntry" placeholder="bucket.table or schema.table">
+          <button type="button" class="btn btn-secondary" onclick="RegisterTableForm.addManualRow()">+ Add</button>
+        </div>
+
+        <p class="rtf-selection-count" id="rtfSelectionCount"></p>
+      </div>
+
+      {# ── Step 2: Configure & register ────────────────────────────── #}
+      <div class="ds-drawer__pane" id="rtfPaneConfigure">
+        <p class="ds-drawer__lede" id="rtfConfigureLede">These settings apply to every checked table.</p>
+
+        <div class="ds-drawer__field" id="rtfModeGroupField">
+          <label>How should analysts access this data?</label>
+          <div class="ds-drawer__mode-group" id="rtfModeGroup"></div>
+        </div>
+
+        {# Bucket / source table are never edited here — every checked row
+           already carries its own `bucket`/`source_table` from the Browse
+           step (discovered, or typed via "+ Add" there). This step is only
+           the settings that apply to every checked row. #}
+        <div class="ds-drawer__field" id="rtfProjectField" hidden>
+          <label for="rtfProject">Project <span class="ds-drawer__opt">(optional)</span></label>
+          <input type="text" id="rtfProject" placeholder="defaults to the configured data project">
+          <p class="ds-drawer__hint">Live access only — leave blank unless the table lives in a different project.</p>
+        </div>
+
+        <div class="ds-drawer__field" id="rtfCustomQueryField" hidden>
+          <label for="rtfCustomQuery" id="rtfCustomQueryLabel">SQL</label>
+          <textarea id="rtfCustomQuery" rows="8"></textarea>
+          <p class="ds-drawer__hint" id="rtfCustomQueryHint">SELECT statement, no trailing semicolon.</p>
+        </div>
+
+        {# Keboola-only: structured where_filters builder, reused verbatim
+           from the Direct-extract flow (#408) for BOTH the 'direct'
+           (local) sync strategy AND the 'custom' (materialized, Storage
+           API JSON filter) mode fixed by D4 — see register_table_form.js
+           `_kbBuildCustomFilterQuery`. #}
+        <div class="ds-drawer__field" id="rtfKbFilterField" hidden>
+          <label>Storage API filter <span class="ds-drawer__opt">(optional)</span></label>
+          <div id="rtfKbWhereFiltersBuilder" class="where-filters-builder"></div>
+          <p class="ds-drawer__hint">
+            Server-side row filter run by the Keboola Storage API export. Leave empty for a
+            full-table export. Operators: <code>eq, ne, gt, ge, lt, le</code>.
+            Date placeholders resolved at sync time:
+            <code>{{ '{{today}}' }}</code>,
+            <code>{{ '{{last_week}}' }}</code>,
+            <code>{{ '{{last_month}}' }}</code>,
+            <code>{{ '{{last_2_months}}' }}</code>,
+            <code>{{ '{{last_3_months}}' }}</code>,
+            <code>{{ '{{last_6_months}}' }}</code>,
+            <code>{{ '{{last_year}}' }}</code>,
+            <code>{{ '{{last_2_years}}' }}</code>,
+            <code>{{ '{{start_of_3_months_ago}}' }}</code>.
+            <a href="#" id="rtfKbFilterRawToggle">Edit raw JSON</a>
+          </p>
+          <textarea id="rtfKbWhereFilters" class="wfb-raw" rows="6" style="display:none;"
+                    placeholder='[{"column": "date", "operator": "ge", "values": ["{{ '{{last_3_months}}' }}"]}]'></textarea>
+        </div>
+
+        {# Keboola-only: v26 sync-strategy sub-panel, shown only in 'direct' mode. #}
+        <div class="ds-drawer__field" id="rtfKbStrategyPanel" hidden style="padding:12px; border:1px solid var(--ds-border); border-radius:var(--ds-radius-btn); background:var(--ds-surface-dim);">
+          <label for="rtfKbStrategy">Sync strategy</label>
+          <select id="rtfKbStrategy" onchange="RegisterTableForm.onKbStrategyChange()">
+            <option value="full_refresh">Full refresh — pull entire table each tick</option>
+            <option value="incremental">Incremental — pull rows changed since last sync</option>
+            <option value="partitioned">Partitioned — per-partition files, per-month/day/year</option>
+          </select>
+
+          <div id="rtfKbIncrementalFields" hidden>
+            <div class="ds-drawer__row">
+              <div class="ds-drawer__field">
+                <label for="rtfKbIncrementalWindowDays">Incremental window (days) <span class="ds-drawer__opt">(default 7)</span></label>
+                <input type="number" id="rtfKbIncrementalWindowDays" min="0" placeholder="7">
+              </div>
+              <div class="ds-drawer__field">
+                <label for="rtfKbMaxHistoryDays">Max history (days) <span class="ds-drawer__opt">(first sync only)</span></label>
+                <input type="number" id="rtfKbMaxHistoryDays" min="1" placeholder="365">
+              </div>
+            </div>
+          </div>
+          <div id="rtfKbPartitionFields" hidden>
+            <div class="ds-drawer__field">
+              <label for="rtfKbPartitionBy">Partition by column <strong>(required)</strong></label>
+              <input type="text" id="rtfKbPartitionBy" placeholder="e.g. event_date">
+            </div>
+            <div class="ds-drawer__row">
+              <div class="ds-drawer__field">
+                <label for="rtfKbPartitionGranularity">Granularity</label>
+                <select id="rtfKbPartitionGranularity">
+                  <option value="month">Month — YYYY_MM.parquet (default)</option>
+                  <option value="day">Day — YYYY_MM_DD.parquet</option>
+                  <option value="year">Year — YYYY.parquet</option>
+                </select>
+              </div>
+              <div class="ds-drawer__field">
+                <label for="rtfKbInitialLoadChunkDays">Initial-load chunk (days)</label>
+                <input type="number" id="rtfKbInitialLoadChunkDays" min="1" placeholder="30">
+              </div>
+            </div>
+          </div>
+          <p class="ds-drawer__hint" id="rtfKbStrategyHint">Only meaningful for Direct extract (Storage API).</p>
+        </div>
+
+        <div class="ds-drawer__field" id="rtfViewNameField">
+          <label for="rtfViewName">View name</label>
+          <input type="text" id="rtfViewName" placeholder="orders_recent">
+          <p class="ds-drawer__hint">Name analysts use to query the data. Only shown for a single selected table — bulk registration keeps each table's own name (editable in step 1).</p>
+        </div>
+
+        <div class="ds-drawer__row">
+          <div class="ds-drawer__field">
+            <label for="rtfDescription">Description <span class="ds-drawer__opt">(optional)</span></label>
+            <textarea id="rtfDescription" placeholder="Brief description of the table contents..."></textarea>
+          </div>
+          <div class="ds-drawer__field">
+            <label for="rtfFolder">Folder <span class="ds-drawer__opt">(optional)</span></label>
+            <input type="text" id="rtfFolder" placeholder="e.g. crm, finance, marketing">
+          </div>
+        </div>
+
+        <div class="ds-drawer__row" id="rtfScheduleRow">
+          <div class="ds-drawer__field">
+            <label for="rtfSyncSchedule">Sync schedule <span class="ds-drawer__opt">(default every 1h)</span></label>
+            <input type="text" id="rtfSyncSchedule" placeholder="every 6h">
+          </div>
+          <div class="ds-drawer__field">
+            <label class="ds-drawer__checkbox-label" for="rtfServerOnly">
+              <input type="checkbox" id="rtfServerOnly">
+              Server-only (don't distribute to laptops)
+            </label>
+          </div>
+        </div>
+
+        <details class="ds-drawer__field" id="rtfAdvanced" hidden>
+          <summary>Advanced (optional)</summary>
+          <div class="ds-drawer__field">
+            <label for="rtfPrimaryKey">Primary key</label>
+            <input type="text" id="rtfPrimaryKey" placeholder="e.g. id">
+            <p class="ds-drawer__hint">Comma-separated. Required for Keboola Direct extract → Incremental.</p>
+          </div>
+        </details>
+
+        <div id="rtfResults" class="rtf-results" hidden></div>
+      </div>
+    </div>
+
+    <div class="ds-drawer__foot">
+      <button type="button" class="btn btn-secondary" id="rtfBackBtn" onclick="RegisterTableForm.goToStep('browse')" hidden>Back</button>
+      <span class="ds-drawer__foot-gap"></span>
+      <button type="button" class="btn btn-secondary" onclick="RegisterTableForm.close()">Cancel</button>
+      <button type="button" class="btn btn-primary" id="rtfNextBtn" onclick="RegisterTableForm.goToStep('configure')">Next</button>
+      <button type="button" class="btn btn-primary" id="rtfSubmitBtn" onclick="RegisterTableForm.submit()" hidden>Register</button>
+    </div>
+  </div>
+</div>

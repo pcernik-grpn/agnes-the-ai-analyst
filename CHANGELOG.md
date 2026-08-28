@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Per-trail retention pruning (Track E3 Slice 1), opt-in and off by default.** Generalizes the existing `audit_log` retention pattern (B8) to the other unbounded audit/activity trails: `sync_history` (`retention.sync_history_days`), `llm_usage` (`retention.llm_usage_days`), and `agent_scope_snapshots` (`retention.agent_scope_snapshots_days`) each get a new `SyncStateRepository.prune_history_older_than`/`LlmUsageRepository.prune_older_than`/`AgentsRepository.prune_scope_snapshots_older_than` method (DuckDB + Postgres), dispatched by a generalized `src/audit_retention.py::run_retention_sweep` and run daily by a new `retention-prune` scheduler job (`POST /api/admin/run-retention-prune`). Every new window defaults to `0` = keep forever — nothing is pruned on a freshly-installed instance until an admin sets a window. `sync_state` (current per-table sync status) and the live `agents` table are never touched, only the trail tables themselves. `usage_events`'s pre-existing retention (`USAGE_EVENTS_RETENTION_DAYS` env var, `POST /api/admin/usage/prune`) now also honors an equivalent `retention.usage_events_days` config key (env var still wins when set); `chat_messages` and CLI session JSONLs remain out of scope. See `docs/observability.md`.
 - **Fact graph over Collections — read surface** (`facts.enabled`, off by default; Postgres-only). Typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, a verbatim quote and a date. `POST /api/facts/search` (typed subject search with attribute filters, projected per-caller from readable claims), `POST /api/facts/neighbors` (bounded graph traversal, depth ≤2, capped fanout/result, statement-timeout guarded — a node now carries the SAME projected shape `search` returns, aliases and per-caller-projected attrs and claim/quote counts included, and an edge carries its own projected attrs too, so walking the graph no longer needs a follow-up `search`/`claims` round trip per node just to learn its attributes; the projection runs once, after truncation, over the already-capped node/edge set), and `GET /api/facts/{subject_id}/claims` (the caller's readable evidence for one subject) — any authenticated caller, no admin gate; every bit of visibility enforcement lives server-side in the repository, never in a route dependency, so an agent's restricted scope or a group's collection grants are the only thing that decides what a caller sees. A subject under an admin `revealed` correction is served instance-wide without quotes; `restricted`/`wrong` withhold it everywhere; a nonexistent id and an unreadable one are indistinguishable (`404`, never `403`). A fact's visibility (search/neighbors/claims and the orphan sweep) now also counts a readable, non-withheld incident edge's claim as evidence of that fact's own existence — a node created only to anchor an evidenced edge (no evidence of its own, permitted by the producer wire contract) is no longer invisible or garbage-collected; its `attrs` and claim list still project from its own claims only. Honest scope: this is the READ surface only (build order steps 2+3) — the write surface and the CLI/MCP query surface ship alongside it (their own bullets below). DuckDB-backed instances answer a typed `501` (A3 PG-first ratchet). See `docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
 - **`agnes facts search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/`fact_claims` (MCP foundation tools) — the query surface over the fact graph** (build order step 6). Facts have no local scope, so unlike `agnes query`'s local/server auto-routing there is no `--scope` flag — every CLI result labels its origin `[server]` on stderr with a hint explaining the deliberate deviation. The MCP tools call `src.repositories.facts_repo()` directly (never an HTTP self-call) with the caller's own resolved principal, so a scoped `AgentPrincipal` sees exactly its own narrowed subset rather than an owner's full authority. A `404` (never `403`) from `neighbors`/`claims` gets one honest hint covering all three indistinguishable causes — wrong id, no readable evidence, or the `facts` feature is off — never a probe that tells them apart.
 - **Fact graph over Collections — eval-critical UI surfaces** (behind the same `facts.enabled` flag, Postgres-only): the collection detail page grows a **Facts** section (fact count by type, a paged per-fact row list with display name/claim/quote counts, same-attribute-key conflicts rendered inline where the fact lives with both values and their evidencing documents' names/dates, and `possible_duplicate_of` review-item rows naming both subjects) — caller-scoped through `facts_repo().collection_facts_summary`, absent entirely (no error, no empty shell) when the flag is off, the backend is DuckDB, or the collection has zero facts. The Library collection card gains a caller-scoped "N files · M facts" count (omitted at zero). `/admin/access` collection rows carry a "⚠ nobody" badge when no group holds a grant on them ("indexed but invisible"). Web chat renders `fact_search`/`fact_neighbors`/`fact_claims` tool calls with a human head ("Searched the knowledge graph" / "Walked related facts" / "Read the evidence"), `fact_claims` results as a quote + document list (open-in-source link only when available, sanitized through the same markdown renderer as every other message body), and an end-of-turn "answered from N documents in M collections you can access" scope line. Connect wizard, source card and ontology builder remain out of scope for this round.
@@ -168,6 +169,44 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   ask, receive a document — never opened anything), and switching
   conversations resets the count and reloads an open drawer instead of
   leaving the previous chat's rows on screen with their old download links.
+- **Table registration: one shared form, two entry points (D4).** The
+  `/admin/tables` "+ Register new table" menu and the onboarding wizard's
+  step 3 now both open the SAME two-pane drawer (browse & multi-select →
+  configure & register) instead of four near-duplicate connector-specific
+  modals plus a separate onboarding auto-register-all. Every registration —
+  from either entry point, for all four connectors — POSTs through the
+  validated `POST /api/admin/register-table`, one row at a time; the
+  onboarding wizard no longer bypasses that validation via
+  `discover-and-register` (the sync-time drift-detection use of that helper
+  is unchanged). A "Select all" checkbox keeps the onboarding one-click
+  path fast — scoped to the rows the search filter leaves visible, and
+  switching connection or dataset clears the previous source's checkmarks,
+  so nothing can be registered that the operator cannot see. Reopening the
+  drawer starts from a clean Configure step rather than the previous
+  registration's description / folder / schedule / SQL / primary key /
+  server-only / Keboola filter. Also fixes Keboola's "Custom SQL" registration mode, which
+  422'd on every submit — a Keboola materialized row's `source_query` is a
+  Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
+  and reuses the existing structured where_filters builder. Databricks has
+  no catalog-browse endpoint yet, so its tables are still added by name (in
+  the same multi-select flow) rather than browsed — tracked as a follow-up.
+
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
 - **Session files: the workspace template no longer shows up as session
@@ -180,6 +219,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   engine walk now skips the same top-level template entries, derived from the
   same `WORKSPACE_LINK_ENTRIES` source of truth as the host side, and no
   longer even requests those subdirectories.
+- **Revoking a PAT now revokes the data-app git push credentials it minted.**
+  `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
+  hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own
+  `personal_access_tokens` row: revoking the PAT that asked for it left it
+  pushing for the rest of its life, on every data app that user owned, with
+  nothing in the token UI to say so — so the one incident-response move that
+  matters ("that PAT leaked, revoke it") did not close the door. Reachable from
+  every surface that can call the mint: `agnes app git-credential`, the
+  `data_app_git_credential` / `data_app_create_draft` MCP tools over both HTTP
+  transports, and the chat broker. A credential minted by a PAT-authenticated
+  caller now carries that PAT's id and is refused once the parent is revoked or
+  gone, checked in `resolve_token_to_user` so every surface that accepts such a
+  token inherits the binding. No behavior change for a credential with no
+  parent — the container's clone token, the broker's per-request token, one
+  minted from an interactive session, and every credential minted before this
+  release. The mint itself stays open to a PAT on purpose: the git surface
+  admits a plain PAT for a push directly, so gating the mint behind
+  `require_session_token` would have broken `agnes app git-credential` for a
+  boundary that does not exist.
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
   `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),
@@ -361,6 +419,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   light-theme blue under dark, measuring ~3.3:1 against the dark surface
   (below WCAG AA). Now aliased to `var(--ds-primary*)` like the rest of the
   family (#1625).
+- **A known-bad table no longer looks like a healthy, empty one.** A corrupt
+  parquet part is refused at hash time since #1559, but the refusal died in a
+  WARNING log line — `sync_state` (and so `GET /api/admin/registry` /
+  `agnes admin list-tables`) still reported `status: ok`, indistinguishable
+  from a genuinely empty or fully synced table. `_update_sync_state`
+  (`src/orchestrator.py`) now flags the row via the existing `sync_state`
+  `status`/`error` columns — the same mechanism already used for the
+  both-layouts collision (#1339) — naming the rejected part(s) whether the
+  table's manifest just got frozen at its last known-good state or nothing
+  was ever published for it. Separately, Jira's `extract_init.py` was
+  collapsing a failed view build into `rows=0`, identical to a real empty
+  table even though DuckDB's own exception names the offending file; it now
+  reports `rows=NULL` ("could not count") through `_meta`, which
+  `_update_sync_state` flags the same way instead of publishing a plain,
+  unflagged zero. No change to what is refused or served — refusal at hash
+  time (#1559) and quarantining a corrupt part at view build (deliberately
+  not pursued, per the issue's decision memo) are unaffected. (#1364)
 
 ### Removed
 
@@ -373,6 +448,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`docs/llm-routing.md` scrubbed of customer-specific and stale planning
+  content.** The provider-selection table and one config-example heading named
+  a specific company where every neighbouring entry is a neutral deployment
+  profile; both now read as profiles ("Single-vendor deployment"). The
+  "Files to Modify" plan table is gone — it described a two-repo OSS/private
+  split and listed `server/bin/collect-knowledge`, `server/deploy.sh`,
+  `requirements.txt` and `tests/test_corporate_memory.py`, none of which exist
+  in this repo — and the "Deployment" section it fed is rewritten to the
+  configuration-only steps that actually apply now that the connector ships
+  with the platform. Docs only; no behaviour change.
 - **`scripts/eval/corpus_gen.py` generates the planted proving-run corpus for
   the fact-graph spec's Run P (§15.5).** A deterministic (seeded), SharePoint-
   shaped filesystem corpus — ≥4 sites, 2-3 libraries each, mixed

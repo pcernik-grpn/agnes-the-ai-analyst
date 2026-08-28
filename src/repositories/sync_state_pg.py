@@ -162,9 +162,7 @@ class SyncStatePgRepository:
         """Mirrors ``SyncStateRepository.status_counts_since``."""
         with self._engine.connect() as conn:
             rows = conn.execute(
-                sa.text(
-                    "SELECT status, COUNT(*) FROM sync_history WHERE synced_at >= :since GROUP BY status"
-                ),
+                sa.text("SELECT status, COUNT(*) FROM sync_history WHERE synced_at >= :since GROUP BY status"),
                 {"since": since},
             ).all()
         return {r[0]: int(r[1]) for r in rows}
@@ -225,3 +223,16 @@ class SyncStatePgRepository:
                 {"t": table_id},
             )
         return result.rowcount
+
+    def prune_history_older_than(self, days: int) -> int:
+        """Mirrors ``SyncStateRepository.prune_history_older_than``."""
+        with self._engine.begin() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "DELETE FROM sync_history "
+                    "WHERE synced_at < (CURRENT_TIMESTAMP - (:days * INTERVAL '1 day')) "
+                    "RETURNING 1"
+                ),
+                {"days": days},
+            ).all()
+        return len(rows)

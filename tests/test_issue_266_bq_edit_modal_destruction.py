@@ -25,6 +25,7 @@ on: PUTs that OMIT bucket/source_table keys preserve existing values
 (thanks to `exclude_unset=True` in `app/api/admin.update_table`).
 The template-grep test pins the JS-side fixes themselves.
 """
+
 from __future__ import annotations
 
 
@@ -33,7 +34,9 @@ def _auth(token: str) -> dict:
 
 
 def test_put_omitting_bucket_preserves_existing_value_on_materialized_row(
-    seeded_app, bq_instance, stub_bq_extractor,
+    seeded_app,
+    bq_instance,
+    stub_bq_extractor,
 ):
     """Bug 1 fix contract: when the new Edit-modal save path omits
     bucket/source_table from the JSON body on a no-op-mode save, the
@@ -91,7 +94,9 @@ def test_put_omitting_bucket_preserves_existing_value_on_materialized_row(
 
 
 def test_put_explicit_null_clears_bucket_on_mode_flip(
-    seeded_app, bq_instance, stub_bq_extractor,
+    seeded_app,
+    bq_instance,
+    stub_bq_extractor,
 ):
     """Bug 1 fix contract: a TRUE mode-flip save (remote → materialized
     custom) still wants to clear stale bucket/source_table from the
@@ -140,7 +145,9 @@ def test_put_explicit_null_clears_bucket_on_mode_flip(
 
 
 def test_register_whole_table_materialized_persists_bucket(
-    seeded_app, bq_instance, stub_bq_extractor,
+    seeded_app,
+    bq_instance,
+    stub_bq_extractor,
 ):
     """Bug 2/3 fix contract: post-#266 the JS whole-table register
     branch sends bucket+source_table alongside source_query so a
@@ -185,27 +192,36 @@ def test_admin_tables_template_has_266_fixes():
     Agnes has no JS test harness. A future maintainer who reverts
     one of them will trip an obvious failure here."""
     from pathlib import Path
+
     tpl = Path(__file__).parent.parent / "app" / "web" / "templates" / "admin_tables.html"
     text = tpl.read_text(encoding="utf-8")
 
     # Bug 1: saveBqTabEdit synced/custom branch must guard the null
     # writes with a mode-flip check, not null unconditionally.
     assert "_editOriginalQueryMode !== 'materialized'" in text, (
-        "Bug 1 regression: saveBqTabEdit nulls bucket/source_table "
-        "unconditionally — must guard on a real mode flip."
+        "Bug 1 regression: saveBqTabEdit nulls bucket/source_table unconditionally — must guard on a real mode flip."
     )
     # The unconditional null pattern from pre-#266 must be GONE in
     # the custom branch. We grep for the surrounding comment-tail.
     assert "payload.bucket = null;\n            payload.source_table = null;\n        } else" not in text, (
-        "Bug 1 regression: the unconditional `payload.bucket = null` "
-        "block is back in the synced/custom branch."
+        "Bug 1 regression: the unconditional `payload.bucket = null` block is back in the synced/custom branch."
     )
 
-    # Bug 2/3: _buildBigQueryPayload synced/whole branch must include
-    # bucket+source_table in the JSON.
-    assert "bucket: dataset," in text, (
-        "Bug 2/3 regression: _buildBigQueryPayload whole-table branch "
-        "must send bucket alongside source_query so Edit can pre-fill."
+    # Bug 2/3: the register-side payload builder's synced/whole branch
+    # must include bucket+source_table in the JSON, so Edit can pre-fill.
+    # D4 replaced `_buildBigQueryPayload` (admin_tables.html) with
+    # `CONNECTORS.bigquery.buildPayload` (register_table_form.js) — same
+    # invariant, different file.
+    js_path = Path(__file__).parent.parent / "app" / "web" / "static" / "js" / "register_table_form.js"
+    js_text = js_path.read_text(encoding="utf-8")
+    bq_start = js_text.index("bigquery: {")
+    bq_end = js_text.index("\n    databricks: {", bq_start)
+    bq_config = js_text[bq_start:bq_end]
+    whole_start = bq_config.index("if (mode === 'synced_whole')")
+    whole_branch = bq_config[whole_start : whole_start + 400]
+    assert "bucket: row.bucket, source_table: row.sourceTable," in whole_branch, (
+        "Bug 2/3 regression: CONNECTORS.bigquery.buildPayload's synced_whole "
+        "branch must send bucket alongside source_query so Edit can pre-fill."
     )
 
     # _openEditBqModal must parse dataset+source_table out of the

@@ -386,3 +386,179 @@ button.ds-drawer__step:not([disabled]):hover { background: var(--ds-surface-sunk
   background: var(--ds-surface-dim);
 }
 .ds-drawer__foot-gap { flex: 1 1 auto; }
+
+/* A checkbox field reads as one clickable row, not a label sitting above an
+   input the way every other `.ds-drawer__field` does — drop the field's own
+   bottom margin down to match the other controls' tighter rhythm. */
+.ds-drawer__checkbox-field { margin-bottom: 12px; }
+.ds-drawer__checkbox-label {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.ds-drawer__checkbox-label input[type="checkbox"] { flex: 0 0 auto; }
+
+/* ── Mode picker cards ────────────────────────────────────────────────
+   The "how should analysts access this data?" radio-card group, shared
+   by every connector's register form (D4 — one shared registration
+   form). One rule set instead of the inline `style="…"` repeated on
+   every `.sync-option-card` across the four connector-specific modals
+   it replaces. */
+.ds-drawer__mode-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 6px 0 14px;
+}
+.ds-drawer__mode-card {
+  flex: 1 1 200px;
+  padding: 10px 12px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  cursor: pointer;
+}
+.ds-drawer__mode-card:has(input:checked) {
+  border-color: var(--ds-primary);
+  background: var(--ds-surface-dim);
+}
+.ds-drawer__mode-card input { margin-right: 6px; }
+.ds-drawer__mode-card .ds-drawer__mode-title { font-weight: 700; font-size: 13px; color: var(--ds-text-primary); }
+.ds-drawer__mode-card .ds-drawer__mode-desc { font-size: 11.5px; color: var(--ds-text-muted); margin-top: 3px; }
+.ds-drawer__mode-card[hidden] { display: none; }
+
+/* ── Browse pane — the multi-select table list ──────────────────────── */
+.rtf-browse-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.rtf-browse-toolbar .rtf-search {
+  flex: 1 1 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  color: var(--ds-text-primary);
+  font: inherit;
+  font-size: 12.5px;
+}
+.rtf-select-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ds-text-primary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.rtf-group-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--ds-text-muted);
+  margin: 12px 0 4px;
+}
+.rtf-group-label:first-child { margin-top: 0; }
+.rtf-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-radius: var(--ds-radius-btn);
+}
+.rtf-row:hover { background: var(--ds-surface-sunken); }
+.rtf-row input[type="checkbox"] { flex: 0 0 auto; }
+.rtf-row .rtf-row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--ds-text-primary);
+}
+.rtf-row .rtf-row-meta { flex: 0 0 auto; font-size: 11px; color: var(--ds-text-muted); }
+.rtf-manual-add {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--ds-border);
+}
+.rtf-manual-add input {
+  flex: 1 1 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  color: var(--ds-text-primary);
+  font: inherit;
+  font-size: 12.5px;
+}
+.rtf-selection-count {
+  margin-top: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ds-text-secondary);
+}
+
+/* ── Structured where_filters builder (#408) ──────────────────────────
+   Moved here from admin_tables.html's page-local <style> block (D4 — one
+   registration flow): the builder now mounts inside the shared register
+   drawer, which is included from BOTH /admin/tables and the onboarding
+   wizard (setup.html), so its styling has to live somewhere both pages
+   load — this file already is. Structural CSS only; where-filters-
+   builder.js owns the markup it decorates. */
+.where-filters-builder .wfb-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+  align-items: center;
+}
+.where-filters-builder .wfb-col { flex: 1 1 30%; }
+.where-filters-builder .wfb-op { flex: 0 0 auto; min-width: 140px; }
+.where-filters-builder .wfb-val { flex: 2 1 40%; }
+.where-filters-builder .wfb-remove {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  line-height: 1;
+}
+.where-filters-builder .wfb-add { margin: 4px 0 12px; }
+.where-filters-builder .wfb-range {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid var(--ds-border);
+}
+.where-filters-builder .wfb-range-label {
+  flex: 0 0 100%;
+  margin-bottom: 2px;
+}
+.where-filters-builder .wfb-range input { flex: 1 1 30%; }
+.wfb-raw-toggle {
+  margin-left: 8px;
+  color: var(--ds-primary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* ── Configure pane — per-table results after submit ─────────────────── */
+.rtf-results { margin-top: 14px; }
+.rtf-result-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--ds-border-light);
+}
+.rtf-result-row .rtf-result-name { flex: 0 0 auto; font-weight: 600; color: var(--ds-text-primary); }
+.rtf-result-row .rtf-result-msg { flex: 1 1 auto; color: var(--ds-text-muted); }
+.rtf-result-row.is-error .rtf-result-msg { color: var(--ds-accent-danger-ink); }
+.rtf-result-row.is-ok .rtf-result-msg { color: var(--ds-accent-success-ink); }
