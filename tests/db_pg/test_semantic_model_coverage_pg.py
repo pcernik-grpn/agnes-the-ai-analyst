@@ -10,6 +10,7 @@ DuckDB side's contract — the admin gate, then a typed
 
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ def pg_state(pg_engine, tmp_path, monkeypatch):
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
-    import src.db_pg as db_pg
+    from src import db_pg
 
     db_pg.dispose()
     db_pg.get_engine()
@@ -220,7 +221,7 @@ class TestSemantic:
         assert "semantic source" in semantic["detail"]
 
     def test_a_native_adapter_source_with_an_imported_model_is_ok(self, pg_state):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from src.repositories import semantic_model_repo, semantic_source_repo
         from src.semantic.coverage import compute_cross_domain_coverage
@@ -246,10 +247,57 @@ class TestSemantic:
             source_ref="ss_1",
             status="valid",
             validation_errors=None,
-            validated_at=datetime.now(timezone.utc),
+            validated_at=datetime.now(UTC),
         )
 
         semantic = _domains(compute_cross_domain_coverage(), "conn-sf")["semantic"]
+        assert semantic["status"] == "ok"
+        assert semantic["raw"]["models"] == 1
+
+    def test_a_databricks_connection_has_an_adapter_not_not_applicable(self, pg_state):
+        """``databricks_metric_views`` (connectors/databricks/semantic_ossie.py)
+        is a registered adapter (``src/semantic/adapters/__init__.py``), so a
+        Databricks connection must be scored the same way a Snowflake one is
+        — never ``not_applicable`` for "no adapter exists"."""
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-dbx", source_type="databricks", name="Databricks")
+
+        semantic = _domains(compute_cross_domain_coverage(), "conn-dbx")["semantic"]
+        assert semantic["status"] == "missing"
+        assert "semantic source" in semantic["detail"]
+
+    def test_a_databricks_connection_with_an_imported_model_is_ok(self, pg_state):
+        from datetime import datetime
+
+        from src.repositories import semantic_model_repo, semantic_source_repo
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-dbx", source_type="databricks", name="Databricks")
+        semantic_source_repo().create(
+            id="ss_dbx",
+            kind="connection",
+            name="Databricks metric views",
+            adapter="databricks_metric_views",
+            config={"connection_id": "conn-dbx"},
+        )
+        semantic_model_repo().upsert(
+            id="ossie_connection/ss_dbx/sales",
+            slug="sales",
+            name="sales",
+            description=None,
+            document="version: '0.2.0.dev0'",
+            document_json={"semantic_model": [{"name": "sales"}]},
+            spec_version="0.2.0.dev0",
+            content_hash="abc",
+            source="ossie_connection",
+            source_ref="ss_dbx",
+            status="valid",
+            validation_errors=None,
+            validated_at=datetime.now(UTC),
+        )
+
+        semantic = _domains(compute_cross_domain_coverage(), "conn-dbx")["semantic"]
         assert semantic["status"] == "ok"
         assert semantic["raw"]["models"] == 1
 

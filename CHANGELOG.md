@@ -656,6 +656,49 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **Databricks "sync semantic views" wizard checkbox is now functional.**
+  `DatabricksMetricViewAdapter.extract` (`connectors/databricks/
+  semantic_ossie.py`) previously required `host`/`warehouse_id`/`token` in
+  the `semantic_sources` row's `config`, but the wizard checkbox (`app/web/
+  templates/admin_data_sources.html`) creates that row with `config={}` —
+  the same shape the Snowflake checkbox uses — so every wizard-triggered
+  Databricks sync failed silently. The adapter now falls back to
+  `connectors.databricks.semantic_layer.resolve_databricks_settings()` for
+  any field missing from `config`, the instance's own Databricks connection,
+  matching `SnowflakeSemanticAdapter.extract`'s existing "credentials never
+  live in a semantic source's config" contract. Also: `SEMANTIC_ADAPTER_BY_
+  SOURCE_TYPE` (`src/semantic/coverage.py`) was missing a `"databricks"`
+  entry despite the `databricks_metric_views` adapter being registered, so
+  every Databricks connection's cross-domain coverage report always showed
+  `not_applicable` ("no adapter") instead of a real semantic-coverage status.
+
+- **Keboola-imported column descriptions now actually surface somewhere.**
+  `project_document`'s column leg (`src/semantic/projection.py`) wrote
+  `column_metadata` keyed on the raw Keboola tableId (e.g.
+  `in.c-shop.orders`) instead of resolving it through `resolve_dataset_table`
+  the way the metric leg already does — nothing reads `column_metadata` under
+  a raw Keboola tableId, so an imported field description was written but
+  never shown anywhere (`/api/v2/schema/{table_id}`, table schema pages).
+  Column rows now resolve onto the same `table_registry.id` every other
+  `column_metadata` reader expects (falling back to the raw id when the table
+  isn't registered yet, unchanged). Resolving onto a real, shared table id
+  also reopens a collision the projector already guards against for the
+  manual-model path: an existing row owned by a different writer (the
+  profiler, the admin metadata API, `ai_enrichment`) always wins over a
+  projection's write, so a Keboola sync can no longer blank a
+  previously-authored description for a table it now shares a key with.
+
+- `POST /api/admin/semantic-models` and `DELETE /api/admin/semantic-models/{id}`
+  now enforce the same source-ownership guard as `PUT`/`/apply`: creating a
+  model whose slug collides with an existing source-owned model, or deleting
+  a source-owned model outright, now 409s `source_owned` instead of silently
+  succeeding. Previously an admin could create a shadow `manual/_/<slug>` row
+  next to an imported one — `get_by_slug`'s `ORDER BY updated_at DESC LIMIT 1`
+  tie-break then resolved the collision nondeterministically — or delete a
+  source-owned model that a scheduled sync would just recreate, destroying its
+  provenance history. The four mutating endpoints now share one
+  `_is_source_owned` predicate instead of duplicating the check.
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.

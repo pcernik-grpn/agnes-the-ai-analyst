@@ -185,3 +185,66 @@ class TestAdapterExtract:
         adapter = DatabricksMetricViewAdapter()
         with pytest.raises(ValueError):
             adapter.extract({"host": "h", "warehouse_id": "w", "token": "t"})
+
+    def test_empty_config_falls_back_to_the_connection_settings(self, monkeypatch):
+        """The Databricks "sync semantic views" wizard checkbox creates the
+        ``semantic_sources`` row with ``config={}`` — same as the Snowflake
+        checkbox does for ``snowflake_semantic``. Snowflake's adapter never
+        needed credentials in config because it always resolves fresh from
+        ``resolve_snowflake_settings()``; this pins the Databricks adapter to
+        the same contract so the wizard checkbox is functional without the
+        admin re-pasting host/warehouse_id/token a second time.
+        """
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda: {
+                "host": "https://dbc-test.cloud.databricks.com",
+                "warehouse_id": "wh-1",
+                "catalog": "main",
+                "catalogs": ["main"],
+                "token": "tok",
+            },
+        )
+        client = FakeStatementClient()
+        adapter = DatabricksMetricViewAdapter()
+        # `client` is still an explicit override (tests never hit the network);
+        # every credential/scope field is resolved from the connection.
+        docs = adapter.extract({"client": client})
+        assert len(docs) == 1
+        assert validate_document(docs[0]).ok
+
+    def test_explicit_config_wins_over_the_connection_settings(self, monkeypatch):
+        """An explicit config value (e.g. a future non-wizard caller) is
+        never silently overridden by the connection's own settings."""
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda: {
+                "host": "https://wrong.cloud.databricks.com",
+                "warehouse_id": "wrong-wh",
+                "catalog": "wrong",
+                "catalogs": ["wrong"],
+                "token": "wrong-tok",
+            },
+        )
+        adapter = DatabricksMetricViewAdapter()
+        docs = adapter.extract(
+            {
+                "host": "https://dbc-test.cloud.databricks.com",
+                "warehouse_id": "wh-1",
+                "catalogs": ["main"],
+                "token": "tok",
+                "client": FakeStatementClient(),
+            }
+        )
+        assert len(docs) == 1
+
+    def test_empty_config_with_no_connection_configured_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.databricks.semantic_layer.resolve_databricks_settings",
+            lambda: None,
+        )
+        import pytest
+
+        adapter = DatabricksMetricViewAdapter()
+        with pytest.raises(ValueError, match="host"):
+            adapter.extract({})

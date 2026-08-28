@@ -720,38 +720,39 @@ def project_document(
             report.metrics_written += 1
 
         for dataset in model.get("datasets") or []:
-            # Deliberately NOT resolved through the table binder to the Agnes
-            # view name (unlike the metric leg above). `column_metadata` is
-            # keyed `(table_id, column_name)` with a single `source` column —
-            # no source dimension — so writing under the view name collides
-            # with rows the profiler / import_proposal / admin already own
-            # there: Keboola fields frequently have `description=None`, so
-            # every sync would blank a previously-authored description and
-            # re-stamp `source='keboola_metastore'`, and `_prune_columns` then
-            # deletes it outright. Surfacing Keboola per-column descriptions
-            # under the view name is deferred pending an ownership-aware
-            # design for that key; for now this write is inert for Keboola
-            # (nothing reads the raw tableId) but harmless.
-            table_id = dataset.get("source") or dataset.get("name") or ""
+            # Resolved through the same `resolve_dataset_table` chain the
+            # metric leg's table binder above already uses, so `column_
+            # metadata` is keyed under the same `table_registry.id` every
+            # other reader of it (the schema API, the profiler, the admin
+            # metadata API) already expects — previously this stayed under
+            # the RAW dataset id (e.g. a Keboola tableId like
+            # `in.c-shop.orders`), which nothing else ever reads, making an
+            # imported column description a silent no-op. Falls back to the
+            # raw id when resolution misses (table not registered yet),
+            # preserving the prior behavior for that case.
+            raw_table_id = dataset.get("source") or dataset.get("name") or ""
+            table_id = resolve_dataset_table(dataset, source) or raw_table_id
             field_names = written_columns_by_table.setdefault(table_id, set())
             for column in dataset.get("fields") or []:
                 column_name = column.get("name")
                 if not column_name:
                     continue
-                if column_source != source:
-                    # Manual path only (`_column_source` remapped it): a
-                    # manual dataset's `source` is an Agnes table id, i.e.
-                    # the SAME `(table_id, column_name)` key the admin
-                    # metadata API, the profiler and ai_enrichment write.
-                    # A row any of those already owns wins — the upsert
-                    # would otherwise silently overwrite an admin-authored
-                    # description (frequently blanking it, since model
-                    # fields often carry none). Skipped rows are also out
-                    # of `_prune_columns`'s reach, which is scoped to
-                    # `column_source`.
-                    existing = column_metadata_repo().get(table_id, column_name)
-                    if existing is not None and (existing.get("source") or "") != column_source:
-                        continue
+                # An existing row owned by a DIFFERENT writer (profiler, the
+                # admin metadata API, ai_enrichment, or another semantic-layer
+                # source) always wins over this projection's write. This used
+                # to be gated to the manual path only (whose raw dataset id
+                # was already a live Agnes table id, `_column_source`
+                # remapped), but resolving `table_id` above now lets ANY
+                # source's projection land on an id another writer already
+                # owns — so the guard runs unconditionally. Without it, a
+                # Keboola field with `description=None` (the common case)
+                # would silently blank a previously-authored description on
+                # every sync, and `_prune_columns` would then delete it
+                # outright. Skipped rows are also out of `_prune_columns`'s
+                # reach, which is scoped to `column_source`.
+                existing = column_metadata_repo().get(table_id, column_name)
+                if existing is not None and (existing.get("source") or "") != column_source:
+                    continue
                 column_metadata_repo().save(
                     table_id=table_id,
                     column_name=column_name,

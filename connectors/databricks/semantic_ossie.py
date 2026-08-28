@@ -29,7 +29,7 @@ of these metrics as not locally executable, with no change to their logic.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import yaml
 
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 DATABRICKS_DIALECT = "DATABRICKS"
 
 
-def _compose_field(dimension: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _compose_field(dimension: dict[str, Any]) -> dict[str, Any] | None:
     """One `dimensions[]` entry -> an Ossie `Field`.
 
     `Field.expression` is REQUIRED by the vendored schema; a Unity Catalog
@@ -56,7 +56,7 @@ def _compose_field(dimension: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     expr = dimension.get("expr")
     expr = str(expr) if expr else name
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "name": name,
         "expression": {"dialects": [{"dialect": DATABRICKS_DIALECT, "expression": expr}]},
     }
@@ -66,7 +66,7 @@ def _compose_field(dimension: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return out
 
 
-def _compose_metric(measure: Dict[str, Any], *, quoted_fqn: str) -> Optional[Dict[str, Any]]:
+def _compose_metric(measure: dict[str, Any], *, quoted_fqn: str) -> dict[str, Any] | None:
     """One `measures[]` entry -> an Ossie `Metric`.
 
     The composed expression is the FULL runnable statement
@@ -90,7 +90,7 @@ def _compose_metric(measure: Dict[str, Any], *, quoted_fqn: str) -> Optional[Dic
         "MEASURE() only evaluates on a Databricks SQL warehouse — this is not "
         "locally executable in DuckDB; run it server-side."
     )
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "name": name,
         "expression": {"dialects": [{"dialect": DATABRICKS_DIALECT, "expression": sql}]},
         "description": f"{description}\n\n{note}" if description else note,
@@ -100,7 +100,7 @@ def _compose_metric(measure: Dict[str, Any], *, quoted_fqn: str) -> Optional[Dic
 
 def compose_document(
     catalog: str, schema: str, view: str, comment: str, yaml_text: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Compose one metric view's YAML definition into an Ossie document (YAML
     text), or ``(None, skip_reason)`` when the YAML cannot be interpreted.
 
@@ -127,7 +127,9 @@ def compose_document(
 
     metrics = [
         m
-        for m in (_compose_metric(measure, quoted_fqn=quoted_fqn) for measure in raw_measures if isinstance(measure, dict))
+        for m in (
+            _compose_metric(measure, quoted_fqn=quoted_fqn) for measure in raw_measures if isinstance(measure, dict)
+        )
         if m is not None
     ]
     if not metrics:
@@ -140,7 +142,7 @@ def compose_document(
         else []
     )
 
-    dataset: Dict[str, Any] = {"name": view, "source": str(spec.get("source") or fqn)}
+    dataset: dict[str, Any] = {"name": view, "source": str(spec.get("source") or fqn)}
     if comment:
         dataset["description"] = comment
     if fields:
@@ -151,7 +153,7 @@ def compose_document(
     # ::_model_key falls back to `name` when a document carries no explicit
     # identity extension), and two catalogs both holding a view named
     # `orders_metrics` must not collapse onto one document.
-    semantic_model: Dict[str, Any] = {"name": fqn, "datasets": [dataset], "metrics": metrics}
+    semantic_model: dict[str, Any] = {"name": fqn, "datasets": [dataset], "metrics": metrics}
     if comment:
         semantic_model["description"] = comment
 
@@ -159,7 +161,7 @@ def compose_document(
     return yaml.safe_dump(document, sort_keys=False), None
 
 
-def extract_documents(client, catalogs: List[str]) -> Tuple[List[str], Dict[str, int]]:
+def extract_documents(client, catalogs: list[str]) -> tuple[list[str], dict[str, int]]:
     """Discover every metric view across ``catalogs`` and compose one Ossie
     document per view. Returns ``(documents, counters)`` —
     ``metric_views_seen`` / ``skipped_unparseable`` — for callers (the sync
@@ -182,7 +184,7 @@ def extract_documents(client, catalogs: List[str]) -> Tuple[List[str], Dict[str,
     )
 
     counters = {"metric_views_seen": 0, "skipped_unparseable": 0}
-    views: List[Tuple[str, str, str, str]] = []
+    views: list[tuple[str, str, str, str]] = []
     for cat in catalogs:
         views.extend(_list_metric_views(client, cat))
     counters["metric_views_seen"] = len(views)
@@ -194,7 +196,7 @@ def extract_documents(client, catalogs: List[str]) -> Tuple[List[str], Dict[str,
         _log_table_type_vocabulary(client, catalogs)
         return [], counters
 
-    documents: List[str] = []
+    documents: list[str] = []
     for catalog, schema, view, comment in views:
         fqn_quoted = f"{_quote_dbx_ident(catalog)}.{_quote_dbx_ident(schema)}.{_quote_dbx_ident(view)}"
         try:
@@ -234,26 +236,52 @@ class DatabricksMetricViewAdapter:
     ``config`` is ``{"host", "warehouse_id", "token", "catalogs"}`` — the same
     connection shape `resolve_databricks_settings()` already resolves per
     configured instance (``catalogs`` may also be given as the single
-    ``"catalog"`` key, for symmetry with that resolver's return shape).
+    ``"catalog"`` key, for symmetry with that resolver's return shape). Any
+    field missing from ``config`` falls back to
+    ``connectors.databricks.semantic_layer.resolve_databricks_settings()`` —
+    the instance's own Databricks connection — mirroring
+    ``connectors.snowflake.semantic_ossie.SnowflakeSemanticAdapter.extract``,
+    which never takes credentials from config at all. This is what makes the
+    "sync semantic views" wizard checkbox (which creates the
+    ``semantic_sources`` row with ``config={}``, same as the Snowflake
+    checkbox) work without asking the admin to paste host/warehouse_id/token
+    a second time, and it never becomes a second place those credentials are
+    stored — nothing here ever writes them back into ``config``.
     ``config["client"]``, when given, overrides construction (tests). This
     adapter owns its own statement client the same way the Keboola adapter
     owns its own Metastore client — a self-contained "hand it connection
     config, get documents back" contract.
     """
 
-    def extract(self, config: Dict[str, Any]) -> List[str]:
+    def extract(self, config: dict[str, Any]) -> list[str]:
         from connectors.databricks.client import DatabricksStatementClient
 
         host = config.get("host")
         token = config.get("token")
         warehouse_id = config.get("warehouse_id")
+        catalogs = config.get("catalogs") or ([config["catalog"]] if config.get("catalog") else [])
+
+        if not (host and token and warehouse_id and catalogs):
+            from connectors.databricks.semantic_layer import resolve_databricks_settings
+
+            settings = resolve_databricks_settings()
+            if settings:
+                host = host or settings.get("host")
+                token = token or settings.get("token")
+                warehouse_id = warehouse_id or settings.get("warehouse_id")
+                if not catalogs:
+                    catalogs = settings.get("catalogs") or ([settings["catalog"]] if settings.get("catalog") else [])
+
         if not (host and token and warehouse_id):
             raise ValueError(
-                "DatabricksMetricViewAdapter requires config['host'], config['warehouse_id'] and config['token']"
+                "DatabricksMetricViewAdapter requires config['host'], config['warehouse_id'] and "
+                "config['token'], or a configured Databricks connection to fall back to"
             )
-        catalogs = config.get("catalogs") or ([config["catalog"]] if config.get("catalog") else [])
         if not catalogs:
-            raise ValueError("DatabricksMetricViewAdapter requires config['catalogs'] (or config['catalog'])")
+            raise ValueError(
+                "DatabricksMetricViewAdapter requires config['catalogs'] (or config['catalog']), or a "
+                "configured Databricks connection with a default catalog to fall back to"
+            )
 
         client = config.get("client") or DatabricksStatementClient(host=host, token=token, warehouse_id=warehouse_id)
         documents, _counters = extract_documents(client, catalogs)
