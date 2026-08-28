@@ -5,19 +5,22 @@ A user may build agents freely, but SHARING one needs admin approval: when a
 non-admin owner shares an ``agent`` (``PUT /api/sharing/agent/{id}``), the
 would-be ``resource_grants`` write is deferred into a row here instead of
 being written immediately (``app/services/library_sharing.py::set_shares``).
-An admin decides via ``POST /api/admin/share-requests/{id}/approve`` (writes
-the grant through the existing ``resource_grants_repo().ensure_grant``) or
-``.../reject`` (no grant, row marked ``rejected``). Sharing into a group by
-an admin actor stays instant and never touches this table.
+An admin decides via ``PATCH /api/admin/share-requests/{id}``
+(``{"decision": "approve"|"reject"}`` — approve writes the grant through the
+existing ``resource_grants_repo().ensure_grant``, reject leaves no grant,
+row marked ``rejected``). Sharing into a group by an admin actor, and any
+un-share, stay instant and never touch this table. On a DuckDB-backed
+instance sharing itself falls back to the pre-C6 instant grant (the queue
+is a PG-only enhancement, not a hard requirement) — only the admin queue
+endpoints are genuinely unavailable there.
 
 PG-first ratchet (A3): brand-new app-state table, Alembic-only — no matching
 DuckDB ``_vN_to_v(N+1)`` step, ``SCHEMA_VERSION`` does not move.
 ``src/repositories/share_requests_pg.py`` is the only repository; there is
-no DuckDB sibling, so this feature fails clean (``501
-requires_postgres_backend``) on a DuckDB-backed instance.
+no DuckDB sibling.
 
-Revision ID: 0079_share_requests
-Revises: 0078_facts_ingest_runs
+Revision ID: 0080_share_requests
+Revises: 0079_sso_login
 Create Date: 2026-08-28
 """
 
@@ -28,8 +31,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0079_share_requests"
-down_revision: Union[str, None] = "0078_facts_ingest_runs"
+revision: str = "0080_share_requests"
+down_revision: Union[str, None] = "0079_sso_login"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
