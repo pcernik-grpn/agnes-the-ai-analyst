@@ -7746,6 +7746,7 @@ def run_corporate_memory(
     audit_params: dict = {
         "items_new": stats.get("items_new", 0),
         "items_filtered": stats.get("items_filtered", 0),
+        "items_duplicate_skipped": stats.get("items_duplicate_skipped", 0),
         "items_db_inserted": stats.get("items_db_inserted", 0),
         "items_db_updated": stats.get("items_db_updated", 0),
         "items_db_errors": stats.get("items_db_errors", 0),

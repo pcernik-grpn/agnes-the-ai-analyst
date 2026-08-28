@@ -715,6 +715,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Corporate Memory: the nightly collector no longer queues duplicate
+  suggestions the catalog-refresh LLM failed to recognize as restatements of
+  an existing item.** Its own `existing_id` verdict was the only dedup
+  signal, so a paraphrase reported as brand new landed as a second item in
+  the triage queue. A deterministic, stdlib-only guard now re-checks every
+  `existing_id: null` item against same-category catalog items — both
+  already-approved items and suggestions still awaiting review — before it
+  is accepted: an exact match after normalization, or a normalized-token
+  Jaccard / `difflib.SequenceMatcher` similarity of 0.9 or higher, skips the
+  proposal (logged, and counted in the run's `items_duplicate_skipped`
+  stat, visible on `/admin/scheduler-runs` and in the CLI collector's
+  summary). Below that threshold nothing is skipped — a false "duplicate"
+  would silently drop a real finding.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
