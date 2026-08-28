@@ -40,6 +40,7 @@ _VALIDATION_STUB_CONTEXT = {
     "tables": [{"name": "orders", "description": "Sample orders", "query_mode": "local", "source_type": "keboola"}],
     "metrics": {"count": 3, "categories": ["revenue", "growth"]},
     "semantic_layer": {"has_models": True},
+    "facts": {"enabled": True},
     "marketplaces": [{"slug": "example", "name": "Example Marketplace", "plugins": [{"name": "plugin-a"}]}],
     "user": {
         "id": "u",
