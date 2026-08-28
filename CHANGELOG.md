@@ -165,7 +165,9 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   onboarding wizard no longer bypasses that validation via
   `discover-and-register` (the sync-time drift-detection use of that helper
   is unchanged). A "Select all" checkbox keeps the onboarding one-click
-  path fast. Also fixes Keboola's "Custom SQL" registration mode, which
+  path fast — scoped to the rows the search filter leaves visible, and
+  switching connection or dataset clears the previous source's checkmarks,
+  so nothing can be registered that the operator cannot see. Also fixes Keboola's "Custom SQL" registration mode, which
   422'd on every submit — a Keboola materialized row's `source_query` is a
   Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
   and reuses the existing structured where_filters builder. Databricks has

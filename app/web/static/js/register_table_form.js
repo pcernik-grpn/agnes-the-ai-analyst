@@ -515,6 +515,13 @@
     var btn = document.getElementById('rtfLocationLoadBtn');
     if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
     _hideBrowseError();
+    // The rows about to be replaced are gone from the operator's view, so any
+    // checkmark on them is now invisible — and `submit()` reads selectedKeys,
+    // not the DOM. Left alone, a table checked under the previous Keboola
+    // connection would be registered under the newly selected connection_id,
+    // i.e. against the wrong project. Manually-added rows survive: they are
+    // not part of the discovered set and the reload does not touch them.
+    _dropDiscoveredSelection();
     try {
       state.groups = await state.connector.discover({ connectionId: state.connectionId, location: state.location });
     } catch (e) {
@@ -549,6 +556,50 @@
     return rows.concat(state.manualRows);
   }
 
+  var MANUAL_KEY_PREFIX = '__manual.';
+
+  function _isManualKey(key) {
+    return String(key).indexOf(MANUAL_KEY_PREFIX) === 0;
+  }
+
+  /** Drop every discovered row from the selection, keeping manual ones.
+   *  Called when the browsed source changes (connection or location) and the
+   *  previous discovered set stops being something the operator can see. */
+  function _dropDiscoveredSelection() {
+    Object.keys(state.selectedKeys).forEach(function (k) {
+      if (!_isManualKey(k)) delete state.selectedKeys[k];
+    });
+    Object.keys(state.rowByKey).forEach(function (k) {
+      if (!_isManualKey(k)) delete state.rowByKey[k];
+    });
+  }
+
+  /** The one filter predicate — shared by the renderer and by Select all, so
+   *  the box can never toggle a row the list is not showing. */
+  function _currentSearch() {
+    var el = document.getElementById('rtfSearch');
+    return ((el && el.value) || '').toLowerCase();
+  }
+
+  function _matchesSearch(t, search) {
+    return !search
+      || t.sourceTable.toLowerCase().indexOf(search) !== -1
+      || t.name.toLowerCase().indexOf(search) !== -1;
+  }
+
+  function _visibleRows() {
+    var search = _currentSearch();
+    return _allRows().filter(function (t) { return _matchesSearch(t, search); });
+  }
+
+  /** Whether the Select all box should read checked: every row the operator can
+   *  currently SEE is selected. Computed over the visible subset, never the
+   *  whole discovered catalog — with a filter active those disagree. */
+  function _allVisibleSelected() {
+    var visible = _visibleRows();
+    return visible.length > 0 && visible.every(function (r) { return state.selectedKeys[r.key]; });
+  }
+
   function _selectionCount() {
     return Object.keys(state.selectedKeys).filter(function (k) { return state.selectedKeys[k]; }).length;
   }
@@ -557,15 +608,13 @@
     if (!state) return;
     var container = document.getElementById('rtfTableList');
     container.innerHTML = '';
-    var search = (document.getElementById('rtfSearch').value || '').toLowerCase();
+    var search = _currentSearch();
     var groups = (state.groups || []).slice();
     if (state.manualRows.length) groups = groups.concat([{ key: '__manual', label: 'Added manually', tables: state.manualRows }]);
 
     var rendered = 0;
     groups.forEach(function (g) {
-      var visible = g.tables.filter(function (t) {
-        return !search || t.sourceTable.toLowerCase().indexOf(search) !== -1 || t.name.toLowerCase().indexOf(search) !== -1;
-      });
+      var visible = g.tables.filter(function (t) { return _matchesSearch(t, search); });
       if (!visible.length) return;
       var label = document.createElement('div');
       label.className = 'rtf-group-label';
@@ -596,20 +645,23 @@
       empty.textContent = (state.groups.length || state.manualRows.length) ? 'No tables match your filter.' : 'No tables found yet.';
       container.appendChild(empty);
     }
-    var allChecked = rendered > 0 && _allRows().every(function (r) { return state.selectedKeys[r.key]; });
-    document.getElementById('rtfSelectAll').checked = allChecked;
+    document.getElementById('rtfSelectAll').checked = _allVisibleSelected();
     _updateSelectionCount();
   }
 
   function toggleRow(key, checked) {
     state.selectedKeys[key] = !!checked;
     _updateSelectionCount();
-    document.getElementById('rtfSelectAll').checked = _allRows().length > 0 && _allRows().every(function (r) { return state.selectedKeys[r.key]; });
+    document.getElementById('rtfSelectAll').checked = _allVisibleSelected();
   }
 
   function onSelectAllChange() {
     var checked = document.getElementById('rtfSelectAll').checked;
-    _allRows().forEach(function (r) { state.selectedKeys[r.key] = checked; });
+    // Only the rows the operator can currently see. Over `_allRows()` this
+    // would register the whole discovered catalog while the list shows a
+    // filtered handful — and the hidden ones are never rendered, so nothing
+    // in the UI would reveal it before submit.
+    _visibleRows().forEach(function (r) { state.selectedKeys[r.key] = checked; });
     renderTableList();
   }
 

@@ -24,7 +24,12 @@ Covers:
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 _JS = Path("app/web/static/js/register_table_form.js")
@@ -216,3 +221,147 @@ def test_admin_data_sources_register_flow_still_targets_the_validated_endpoint()
     change to admin_data_sources.html can't quietly repoint it."""
     html = Path("app/web/templates/admin_data_sources.html").read_text(encoding="utf-8")
     assert 'API_REGISTER_TABLE = "/api/admin/register-table"' in html
+
+
+# ── 5: the selection can never outrun what the operator can see ─────────
+#
+# Both bugs below share one shape: `submit()` reads `state.selectedKeys`,
+# never the DOM, so a key that survives in that map is registered whether or
+# not any row on screen corresponds to it. Run the SHIPPED helpers under node
+# against a stubbed document — same `_node_run` pattern as
+# tests/test_chat_files_drawer_ui.py; there is no DOM harness in CI.
+
+
+def _node_run(script: str) -> str:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available — the selection helpers need a runtime")
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+def _selection_slice() -> str:
+    """The shipped selection helpers plus the two handlers that read them.
+
+    Sliced from the source rather than copied so these tests exercise the real
+    code. `renderTableList` sits between the two ranges and is DOM-bound —
+    excluded here and stubbed in the harness, since what these tests assert is
+    which keys survive in `state.selectedKeys`, not what got painted.
+    """
+    js = _JS.read_text(encoding="utf-8")
+    helpers = js[js.index("  function _allRows() {") : js.index("  function renderTableList() {")]
+    handlers = js[js.index("  function toggleRow(key, checked) {") : js.index("  function addManualRow() {")]
+    return helpers + "\n" + handlers
+
+
+_HARNESS = """
+let searchValue = '';
+let selectAllChecked = false;
+const renders = [];
+function renderTableList() { renders.push(1); }
+function _updateSelectionCount() {}
+const document = {
+  getElementById(id) {
+    if (id === 'rtfSearch') return { value: searchValue };
+    if (id === 'rtfSelectAll') {
+      return {
+        get checked() { return selectAllChecked; },
+        set checked(v) { selectAllChecked = v; },
+      };
+    }
+    return null;
+  },
+};
+function row(key, sourceTable) { return { key: key, name: sourceTable, sourceTable: sourceTable }; }
+let state;
+"""
+
+
+def _run_selection(setup: str, report: str) -> dict:
+    script = (
+        _HARNESS
+        + _selection_slice()
+        + "\n"
+        + setup
+        + "\nprocess.stdout.write(JSON.stringify("
+        + report
+        + "));\n"
+    )
+    return json.loads(_node_run(script))
+
+
+def test_select_all_only_toggles_rows_the_filter_leaves_visible():
+    """Pre-fix `onSelectAllChange` looped over `_allRows()` — the whole
+    discovered catalog — while the list showed only the search matches. The
+    hidden rows are never rendered, so nothing in the UI reveals them before
+    `submit()` registers the lot."""
+    result = _run_selection(
+        """
+        state = {
+          groups: [{ key: 'g', label: 'g', tables: [row('a', 'orders'), row('b', 'orders_archive'), row('c', 'users')] }],
+          manualRows: [], selectedKeys: {}, rowByKey: {},
+        };
+        searchValue = 'orders';
+        selectAllChecked = true;
+        onSelectAllChange();
+        """,
+        "Object.keys(state.selectedKeys).filter(function (k) { return state.selectedKeys[k]; }).sort()",
+    )
+    assert result == ["a", "b"], (
+        "Select all under an active filter must not reach the rows the filter hides — "
+        f"got {result}, which includes the unfiltered 'users' row"
+    )
+
+
+def test_select_all_box_reflects_the_visible_subset_not_the_whole_catalog():
+    """The companion to the bug above: with every visible row checked the box
+    must read checked, even while unfiltered rows stay unselected. Computing
+    it over `_allRows()` left the box unchecked and invited a second click
+    that then selected everything."""
+    result = _run_selection(
+        """
+        state = {
+          groups: [{ key: 'g', label: 'g', tables: [row('a', 'orders'), row('c', 'users')] }],
+          manualRows: [], selectedKeys: { a: true }, rowByKey: {},
+        };
+        searchValue = 'orders';
+        """,
+        "_allVisibleSelected()",
+    )
+    assert result is True
+
+
+def test_switching_source_drops_discovered_selections_and_keeps_manual_ones():
+    """A checkmark set under the previous Keboola connection is invisible after
+    the reload but still live in `state.selectedKeys`, so `submit()` registers
+    it — against the newly selected `connection_id`, i.e. the wrong project.
+    Manually-added rows are not part of the discovered set and must survive."""
+    result = _run_selection(
+        """
+        state = {
+          groups: [{ key: 'g', label: 'g', tables: [row('proj1.orders', 'orders')] }],
+          manualRows: [row('__manual.buck.tbl', 'tbl')],
+          selectedKeys: { 'proj1.orders': true, '__manual.buck.tbl': true },
+          rowByKey: { 'proj1.orders': row('proj1.orders', 'orders'), '__manual.buck.tbl': row('__manual.buck.tbl', 'tbl') },
+        };
+        _dropDiscoveredSelection();
+        """,
+        "{selected: Object.keys(state.selectedKeys).sort(), resolvable: Object.keys(state.rowByKey).sort()}",
+    )
+    assert result == {"selected": ["__manual.buck.tbl"], "resolvable": ["__manual.buck.tbl"]}, (
+        "the discovered row must be dropped from BOTH maps — surviving in rowByKey alone "
+        "still lets _selectedRows() resolve it if anything re-checks the key"
+    )
+
+
+def test_the_reload_path_calls_the_drop():
+    """The helper is only worth having if the reload actually invokes it.
+    `_reloadDiscovery` is async and network-bound, so pin the call site at the
+    source level rather than executing it."""
+    js = _JS.read_text(encoding="utf-8")
+    body = js[js.index("async function _reloadDiscovery()") : js.index("function _showBrowseError")]
+    assert "_dropDiscoveredSelection();" in body, (
+        "_reloadDiscovery must clear the discovered selection — it is the one path both "
+        "onConnectionChange and loadLocation funnel through"
+    )
