@@ -166,3 +166,125 @@ class TestDeleteInternalExcept:
 # Postgres-only column with no DuckDB sibling), so they are not part of
 # this dual-backend contract. See tests/db_pg/test_table_registry_pg.py
 # for their PG-only-shaped coverage.
+
+
+def _seed_dependants(repos: dict, table_id: str) -> None:
+    """Give ``table_id`` one ``data_package_tables`` row and one
+    ``resource_grants`` row, written straight to the tables so the contract
+    below is about ``unregister`` alone.
+
+    Both parents are seeded too: DuckDB enforces
+    ``data_package_tables.package_id -> data_packages(id)`` and
+    ``resource_grants.group_id -> user_groups(id)``.
+    """
+    if repos["backend"] == "duckdb":
+        conn = repos["conn"]
+        conn.execute("INSERT INTO data_packages (id, slug, name) VALUES (?, ?, ?)", ["pkg-1", "pkg-1", "Pkg"])
+        conn.execute("INSERT INTO data_package_tables (package_id, table_id) VALUES (?, ?)", ["pkg-1", table_id])
+        conn.execute("INSERT INTO user_groups (id, name) VALUES (?, ?)", ["grp-1", "Analysts"])
+        conn.execute(
+            "INSERT INTO resource_grants (id, group_id, resource_type, resource_id, resource_id_table) "
+            "VALUES (?, ?, 'table', ?, ?)",
+            ["grant-1", "grp-1", table_id, table_id],
+        )
+        return
+
+    import sqlalchemy as sa
+
+    with repos["engine"].begin() as conn:
+        conn.execute(
+            sa.text("INSERT INTO data_packages (id, slug, name) VALUES ('pkg-1', 'pkg-1', 'Pkg')"),
+        )
+        conn.execute(
+            sa.text("INSERT INTO data_package_tables (package_id, table_id) VALUES ('pkg-1', :t)"),
+            {"t": table_id},
+        )
+        conn.execute(sa.text("INSERT INTO user_groups (id, name) VALUES ('grp-1', 'Analysts')"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO resource_grants (id, group_id, resource_type, resource_id, resource_id_table) "
+                "VALUES ('grant-1', 'grp-1', 'table', :t, :t)"
+            ),
+            {"t": table_id},
+        )
+
+
+def _count(repos: dict, sql: str, table_id: str) -> int:
+    if repos["backend"] == "duckdb":
+        return int(repos["conn"].execute(sql.replace(":t", "?"), [table_id]).fetchone()[0])
+
+    import sqlalchemy as sa
+
+    with repos["engine"].connect() as conn:
+        return int(conn.execute(sa.text(sql), {"t": table_id}).scalar_one())
+
+
+class TestUnregisterCascade:
+    """Pins ``unregister``'s dependant cleanup on both backends.
+
+    The two engines disagreed in opposite directions before this: DuckDB
+    declares ``data_package_tables.table_id REFERENCES table_registry(id)``
+    with no ``ON DELETE``, so deleting a packaged table raised a constraint
+    violation (a raw 500 out of ``DELETE /api/admin/registry/{id}``);
+    Postgres declares no FK on that column and quietly kept the orphan
+    junction row. ``resource_grants`` was the mirror image — a real
+    ``ON DELETE CASCADE`` on PG, no enforcement at all on DuckDB.
+    """
+
+    def test_removes_the_registry_row(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed_dependants(repos, "orders")
+
+        repos["registry"].unregister("orders")
+
+        assert repos["registry"].get("orders") is None
+
+    def test_removes_the_data_package_membership(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed_dependants(repos, "orders")
+
+        repos["registry"].unregister("orders")
+
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "orders") == 0
+
+    def test_removes_the_tables_grants(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed_dependants(repos, "orders")
+
+        repos["registry"].unregister("orders")
+
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "orders",
+            )
+            == 0
+        )
+
+    def test_leaves_another_tables_dependants_alone(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed(repos, "customers", "Customers", source_type="keboola")
+        _seed_dependants(repos, "customers")
+
+        repos["registry"].unregister("orders")
+
+        assert repos["registry"].get("customers") is not None
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "customers") == 1
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "customers",
+            )
+            == 1
+        )
+
+    def test_unregistering_an_unknown_id_is_a_no_op(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed_dependants(repos, "orders")
+
+        repos["registry"].unregister("nope")
+
+        assert repos["registry"].get("orders") is not None
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "orders") == 1

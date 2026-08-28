@@ -230,7 +230,24 @@ class TableRegistryPgRepository:
             )
 
     def unregister(self, table_id: str) -> None:
+        """Postgres mirror of ``TableRegistryRepository.unregister`` —
+        see that docstring for why the dependants are cleared explicitly.
+
+        ``resource_grants`` would go anyway (its ``resource_id_table`` FK
+        is ``ON DELETE CASCADE``); ``data_package_tables`` would NOT — that
+        column carries no FK here, so without this the junction row simply
+        outlived the table. Both statements are spelled out so the two
+        backends read alike and neither can drift.
+        """
         with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("DELETE FROM data_package_tables WHERE table_id = :id"),
+                {"id": table_id},
+            )
+            conn.execute(
+                sa.text("DELETE FROM resource_grants WHERE resource_type = 'table' AND resource_id = :id"),
+                {"id": table_id},
+            )
             conn.execute(
                 sa.text("DELETE FROM table_registry WHERE id = :id"),
                 {"id": table_id},

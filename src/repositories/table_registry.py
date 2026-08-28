@@ -312,6 +312,36 @@ class TableRegistryRepository:
         )
 
     def unregister(self, table_id: str) -> None:
+        """Delete the registry row, and the rows that depend on it.
+
+        Two dependants, cleared here so the DELETE means the same thing on
+        either backend:
+
+        - ``data_package_tables`` — the DuckDB DDL declares ``REFERENCES
+          table_registry(id)`` with no ``ON DELETE`` clause, so deleting a
+          table that belongs to a data package raised a constraint
+          violation and ``DELETE /api/admin/registry/{id}`` answered a raw
+          500. Postgres declares no FK on that column at all, so the same
+          call succeeded there and left an orphan junction row — the
+          package kept "containing" a table that no longer exists.
+        - ``resource_grants`` — Postgres's ``resource_id_table`` FK
+          (migration 0013) IS ``ON DELETE CASCADE``, while DuckDB enforces
+          no FK for it, so a per-table grant outlived the table it named
+          and would silently re-apply if that id were ever registered
+          again. Deleting on the polymorphic ``(resource_type,
+          resource_id)`` pair also reaches legacy rows written before the
+          per-type column existed.
+
+        The Postgres sibling runs the same two statements (the second
+        redundant with its own cascade, kept so the two implementations
+        read alike). A3 PG-first ratchet: this is a code-path fix, not a
+        schema change — the frozen DuckDB DDL is untouched.
+        """
+        self.conn.execute("DELETE FROM data_package_tables WHERE table_id = ?", [table_id])
+        self.conn.execute(
+            "DELETE FROM resource_grants WHERE resource_type = 'table' AND resource_id = ?",
+            [table_id],
+        )
         self.conn.execute("DELETE FROM table_registry WHERE id = ?", [table_id])
 
     def delete_internal_except(self, keep_ids: List[str]) -> int:

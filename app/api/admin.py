@@ -6844,6 +6844,13 @@ async def unregister_table(
     (sync_state-driven) and the orchestrator's next rebuild could
     resurrect a master view from the leftover parquet (E2E sub-agent
     finding 2026-05-01).
+
+    The table's `data_package_tables` memberships and `resource_grants`
+    rows go with it — cleared inside `TableRegistryRepository.unregister`
+    on both backends, since a DELETE that leaves them behind means
+    something different on DuckDB (a foreign-key violation surfacing as a
+    raw 500) than on Postgres (an orphan junction row). See that repo
+    method's docstring.
     """
     repo = table_registry_repo()
     existing = repo.get(table_id)
