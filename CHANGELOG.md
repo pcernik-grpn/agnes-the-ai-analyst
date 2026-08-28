@@ -16,6 +16,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
 
 ### Changed
+- **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
+  (`agnes app list`, `agnes app show <slug>`) and read its description for
+  context before hunting for a definition — both are registry-only reads, so a
+  sleeping app is not woken. When the description doesn't cover the figure,
+  Agnes falls back to `agnes catalog --metrics` as before, but now flags in the
+  answer that it cannot see how the report builds the figure and that the
+  metric it picked is a best match for the label rather than the app's own
+  definition.
 - **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
   now enforced, not just a label.** The credential a running data app calls
   Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
