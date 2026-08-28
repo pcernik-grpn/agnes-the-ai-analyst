@@ -1224,24 +1224,54 @@ _MCP_ARCNAME = ".mcp.json"
 
 def _marketplace_identity(session: Any, owner: Optional[Dict[str, Any]]) -> Any:
     """The identity the marketplace overlay is resolved FOR: the session user,
-    narrowed to an ``AgentPrincipal`` when the session carries a narrowing
-    agent.
+    narrowed to a restricted principal when the session is not a plain solo
+    conversation.
 
-    Mirrors ``_mint_identity_jwt``'s decision exactly: an agent that is not
-    explicitly all-``'all'`` (``agent_is_passthrough``) — or whose session
-    user is not its owner (a Slack channel binding: the mentioner) — must
-    resolve through the intersection-filtered marketplace path
-    (``src.marketplace_filter._resolve_principal_marketplace``), or the
-    flattened tarball would ship a scoped agent every plugin its caller
-    holds: skill and command TEXT the agent's scope deliberately withholds,
-    even though the tool seams would still enforce the narrower authority.
+    Mirrors ``_mint_identity_jwt``'s decision exactly. A co-session resolves
+    through a ``SessionPrincipal`` carrying the live participant
+    grant-intersection — the stored owner's full stack must not ship
+    skill/command TEXT into a guest-driven turn, the same reason the prompt
+    renderer downgrades and the MCP mint refuses that session kind. An agent
+    that is not explicitly all-``'all'`` (``agent_is_passthrough``) — or
+    whose session user is not its owner (a Slack channel binding: the
+    mentioner) — resolves through an ``AgentPrincipal``, or the flattened
+    tarball would ship a scoped agent every plugin its caller holds: text
+    the agent's scope deliberately withholds, even though the tool seams
+    would still enforce the narrower authority. Both principal paths land in
+    ``src.marketplace_filter._resolve_principal_marketplace``.
 
     Fail-closed like its callers: any resolution failure (agent row gone,
-    owner unresolvable) answers ``None``, which ``_marketplace_components``
-    reads as "no marketplace content" — never the un-narrowed caller.
+    owner unresolvable, no live participants) answers ``None``, which
+    ``_marketplace_components`` reads as "no marketplace content" — never
+    the un-narrowed caller.
     """
-    agent_id = getattr(session, "agent_id", None) if session is not None else None
-    if not agent_id or owner is None:
+    if session is None or owner is None:
+        return owner
+    if getattr(session, "is_co_session", False):
+        try:
+            from app.auth.session_principal import SessionPrincipal
+            from src.grant_intersection import compute_grant_intersection
+            from src.repositories import chat_session_participants_repo
+
+            # The same construction the co-session token resolver performs
+            # (`app.auth.pat_resolver`): live participants are the whole
+            # authority, no single owner.
+            participants = chat_session_participants_repo().get_session_participants(getattr(session, "id", ""))
+            participants = [p for p in participants if getattr(p, "left_at", None) is None]
+            if not participants:
+                return None
+            emails = [p.user_email for p in participants]
+            return SessionPrincipal(
+                session_id=getattr(session, "id", ""),
+                participant_user_ids=[p.user_id for p in participants],
+                participant_emails=emails,
+                intersection=compute_grant_intersection(emails),
+            )
+        except Exception:
+            logger.warning("kai workspace: co-session marketplace narrowing failed — shipping none", exc_info=True)
+            return None
+    agent_id = getattr(session, "agent_id", None)
+    if not agent_id:
         return owner
     try:
         from app.auth.session_principal import AgentPrincipal

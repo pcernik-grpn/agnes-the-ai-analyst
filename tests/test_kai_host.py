@@ -1138,6 +1138,44 @@ def test_marketplace_identity_narrows_a_scoped_agent(seeded_app, kai_env, monkey
     assert kai_mod._marketplace_identity(SimpleNamespace(id="s4", agent_id="ag_gone"), owner) is None
 
 
+def test_marketplace_identity_narrows_a_co_session(seeded_app, kai_env, monkeypatch):
+    """A guest-driven conversation must not receive the stored owner's whole
+    marketplace text — the overlay resolves through a `SessionPrincipal`
+    carrying the live participant grant-intersection (the same construction
+    the co-session token resolver performs), and a co-session with no live
+    participants ships nothing."""
+    from types import SimpleNamespace
+
+    import src.repositories as repos
+    from app.api import kai as kai_mod
+    from app.auth.session_principal import SessionPrincipal
+
+    owner = {"id": "analyst1", "email": "analyst@test.com"}
+    guest = SimpleNamespace(id="cs1", is_co_session=True, agent_id=None)
+
+    live = [
+        SimpleNamespace(user_id="analyst1", user_email="analyst@test.com", left_at=None),
+        SimpleNamespace(user_id="u2", user_email="guest@test.com", left_at=None),
+    ]
+    monkeypatch.setattr(
+        repos,
+        "chat_session_participants_repo",
+        lambda: SimpleNamespace(get_session_participants=lambda _sid: live),
+    )
+    monkeypatch.setattr("src.grant_intersection.compute_grant_intersection", lambda _emails: {"table": frozenset()})
+    principal = kai_mod._marketplace_identity(guest, owner)
+    assert isinstance(principal, SessionPrincipal)
+    assert principal.participant_emails == ["analyst@test.com", "guest@test.com"]
+
+    # No live participants → nothing, never the un-narrowed owner.
+    monkeypatch.setattr(
+        repos,
+        "chat_session_participants_repo",
+        lambda: SimpleNamespace(get_session_participants=lambda _sid: []),
+    )
+    assert kai_mod._marketplace_identity(guest, owner) is None
+
+
 @pytest.mark.parametrize(
     ("method", "path", "auth"),
     [

@@ -665,8 +665,10 @@ docstring):
   Co-drive is unchanged and fails **closed**: `POST /api/kai/mcp` answers a
   co-session `403 mcp_not_available_to_co_session` rather than resolving it
   to the owner, and `GET /api/kai/workspace` ships the unfiltered bundled
-  `CLAUDE.md` instead of the owner's RBAC-filtered Workspace Prompt — a
-  collaborator's engine turn reaches **no** Agnes tool surface. Co-drive on
+  `CLAUDE.md` instead of the owner's RBAC-filtered Workspace Prompt (the
+  marketplace overlay it does ship is narrowed to the live participant
+  grant-intersection) — a collaborator's engine turn reaches **no** Agnes
+  tool surface. Co-drive on
   this provider is therefore a conversation without host data access, not an
   unscoped one.
 - **`chat.per_tool_call_seconds` and `chat.tool_calls_per_turn_budget` are
