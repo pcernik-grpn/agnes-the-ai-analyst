@@ -48,7 +48,7 @@
 
    So: tabs are `ds.tabs` (`.tab-strip`, same as /library and /chats),
    panels are `.ds-card`, every list of items is the shared `.data-table`,
-   every button is `ds.button`/`.btn`, the Optional/Automatic control is the
+   every button is `ds.button`/`.btn`, the Available/Required control is the
    shared segmented control from `.fbar` (`filter_toolbar.css`), search boxes
    are `.fbar__search`, the person picker is `.fbar-select`, and messages use
    the `.flash` accent vocabulary. What remains page-local below is only what
@@ -784,6 +784,21 @@
      Library and one an admin wrote here are the same row in the same table,
      and only this line says which hand made it. */
   .ax-by-who { font-size: 11px; color: var(--ds-text-muted); }
+  /* Advanced — the per-resource matrix, kept and demoted. Quiet, and clearly
+     a foot rather than a section: what is above it is the answer, this is
+     the rest of the surface. */
+  .ax-adv { margin-top: 16px; border-top: 1px solid var(--ds-border); }
+  .ax-adv > summary {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 12px 4px; cursor: pointer; list-style: none; font-size: 13px;
+  }
+  .ax-adv > summary::-webkit-details-marker { display: none; }
+  .ax-adv > summary:hover { background: var(--ds-surface-dim); }
+  .ax-adv > summary b { color: var(--ds-text-primary); font-weight: 600; }
+  .ax-adv__what { color: var(--ds-text-muted); }
+  .ax-adv__more { margin-left: auto; color: var(--ds-text-link); font-weight: 600; }
+  .ax-adv[open] .ax-adv__more { visibility: hidden; }
+  .ax-adv__body { padding-bottom: 8px; }
 </style>
 {% endblock %}
 
@@ -1567,7 +1582,23 @@
         <tbody>${items.map((i) => itemRow(t, i)).join("")}</tbody>
       </table>`;
 
-    const typeHtml = (t) => {
+    /* The default view carries two things: the bundles an admin hands out
+       as a unit, and everything this group actually HOLDS whatever its kind.
+       Everything else — the ungranted long tail, six hundred tables among
+       it — moves behind Advanced.
+
+       Nothing is migrated and nothing is revoked by this: a grant written
+       one resource at a time still works, still shows (it is held), and is
+       still editable. What changes is that browsing the whole grantable
+       surface stops being the first thing the page does. */
+    const BUNDLE = new Set(["data_package", "memory_domain", "semantic_model", "marketplace_plugin"]);
+    const isHeld = (t, i) => !!grantOf(selectedGroup, t.type_key, i.resource_id);
+    const inHalf = (half, t, i) => half === "primary"
+      ? (BUNDLE.has(t.type_key) || isHeld(t, i))
+      : (!BUNDLE.has(t.type_key) && !isHeld(t, i));
+
+    const typeHtml = (t, half) => {
+      if (half === "advanced" && BUNDLE.has(t.type_key)) return "";
       const nested = isNested(t);
       const blocks = (t.blocks || []).map((b) => {
         const bItems = (b.items || []).map((i) => ({ ...i, _block: b.name }));
@@ -1575,7 +1606,8 @@
           name: b.name,
           all: bItems,
           shown: bItems.filter((i) =>
-            hits(t, i) && (!onlyGranted || grantOf(selectedGroup, t.type_key, i.resource_id))),
+            hits(t, i) && inHalf(half, t, i)
+            && (!onlyGranted || grantOf(selectedGroup, t.type_key, i.resource_id))),
           granted: bItems.filter((i) => grantOf(selectedGroup, t.type_key, i.resource_id)).length,
         };
       });
@@ -1591,6 +1623,15 @@
           <span class="cnt">${cnt}</span></summary>
         ${t.type_description ? `<p class="ax-type-desc">${esc(t.type_description)}</p>` : ""}`;
       if (!items.length) {
+        // In Advanced, "nothing left" means the group holds all of them —
+        // not that the kind is missing. Say nothing rather than say that.
+        if (half === "advanced") return "";
+        if (all.length) return "";
+        // "No recipes exist yet" is not news to anyone reading a group's
+        // access. For the four kinds an admin actually hands out it IS news
+        // — you cannot grant a package that nobody has made — so those, and
+        // only those, say so.
+        if (!BUNDLE.has(t.type_key)) return "";
         return `<details class="ax-sec">${head("none registered")}
           <div class="ax-empty" style="padding-left:22px;">Nothing of this kind exists on the instance yet.</div>
         </details>`;
@@ -1652,7 +1693,7 @@
        still says so instead of vanishing. */
     const byFamily = new Map();
     for (const t of types) {
-      const html = typeHtml(t);
+      const html = typeHtml(t, "primary");
       if (!html) continue;
       const key = t.family || "knowledge";
       if (!byFamily.has(key)) byFamily.set(key, []);
@@ -1679,9 +1720,26 @@
       </div>`;
     }).join("");
 
+    /* Advanced. The per-resource matrix is not deleted and not migrated —
+       an instance that curated grants one row at a time for a year wakes up
+       to the same authorization result. It stops being the FIRST thing the
+       page shows, which is the whole of the change. */
+    const advParts = types.map((t) => typeHtml(t, "advanced")).filter(Boolean);
+    const advCount = types.reduce((n, t) => n + (BUNDLE.has(t.type_key) ? 0 :
+      (t.blocks || []).reduce((m, b) => m + (b.items || []).filter((i) => !isHeld(t, i)).length, 0)), 0);
+    const advanced = advParts.length ? `
+      <details class="ax-adv" ${fq ? "open" : ""}>
+        <summary>
+          <b>Advanced</b>
+          <span class="ax-adv__what">${advCount} more ${advCount === 1 ? "resource" : "resources"} can be granted one at a time — tables among them.</span>
+          <span class="ax-adv__more">Show</span>
+        </summary>
+        <div class="ax-adv__body">${advParts.join("")}</div>
+      </details>` : "";
+
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const painted = sections || (fq
+    const painted = (sections + advanced) || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
@@ -2660,9 +2718,12 @@
   // The Library-shaped preview panel — the RESULT the chain explains. Rows
   // come from the same StackResolver.browse projection the /library page
   // renders for the person, so this cannot drift from what they'd see; the
-  // state chip speaks the product's one vocabulary: "In stack · Automatic"
-  // (a required-tier grant), "In stack" (added/auto), "Not in stack yet ·
-  // Optional" (classic mode, not subscribed — granted but not delivered).
+  // state chip speaks the product's one vocabulary — the words the person
+  // reads in their own Library, not the admin's: "Required by your admin"
+  // (a required-tier grant), "In their Library" (added/auto), "Available,
+  // no local copy yet" (classic mode, not subscribed — granted but not
+  // delivered). This lens exists to show what THEY see; saying it in words
+  // they never see would defeat the whole point of it.
   function renderLibraryPreview(preview, uid) {
     if (!preview || !Array.isArray(preview.sections)) return "";
     if (!preview.sections.length) {
@@ -2672,10 +2733,10 @@
     const bands = preview.sections.map((sec) => {
       const rows = (sec.items || []).map((it) => {
         const state = it.requirement === "required"
-          ? `<span class="ax-chip ok" title="Automatic — in their stack; only an admin changes this">In stack · Automatic</span>`
+          ? `<span class="ax-chip ok" title="Required — permanent and always downloaded; only an admin changes this">Required by your admin</span>`
           : it.in_stack
-            ? `<span class="ax-chip ok" title="${it.materialized ? "In their stack and downloaded on their next pull" : "In their stack"}">In stack</span>`
-            : `<span class="ax-chip info" title="Optional — granted, but they haven't added it to their stack">Not in stack yet · Optional</span>`;
+            ? `<span class="ax-chip ok" title="${it.materialized ? "In their Library, and downloaded on their next pull" : "In their Library"}">In their Library</span>`
+            : `<span class="ax-chip info" title="Available — granted, and they have not kept a local copy">Available, no local copy yet</span>`;
         const name = it.href
           ? `<a href="${esc(it.href)}?from=admin&user=${encodeURIComponent(uid)}">${esc(it.name)}</a>`
           : esc(it.name);

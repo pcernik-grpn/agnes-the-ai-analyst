@@ -177,6 +177,27 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **The per-resource matrix moves behind *Advanced* on `/admin/access`.** The
+  default view now carries the four kinds an admin hands out as a unit — data
+  packages, memory domains, semantic models, marketplace plugins — plus
+  everything the group actually holds, whatever its kind. The ungranted long
+  tail (six hundred tables among it, on a real instance) sits behind one line
+  saying how much it is. **Nothing is migrated and nothing is revoked**: a
+  grant written one resource at a time still works, still shows because it is
+  held, and is still editable — what changed is that browsing the whole
+  grantable surface stopped being the first thing the page does. Kinds with
+  nothing registered stay silent unless they are one of the four, where "none
+  registered" is real news.
+- **Simulate speaks the person's words too.** Its Library-preview chips said
+  *In stack · Automatic* and *Not in stack yet · Optional* — the retired admin
+  vocabulary, on the one lens whose entire job is showing what somebody else
+  sees. They now read *Required by your admin*, *In their Library* and
+  *Available, no local copy yet*. A new guard
+  (`tests/test_access_vocabulary.py`) pins the tier labels, the Library
+  sentences and the admin-god-mode line, and reads the template **source** as
+  well as the rendered page — these chips are built in JS from a fetch, so a
+  response-body assertion could never have seen them, which is how they
+  drifted in the first place.
 - **A grant row says who wrote it.** `/api/admin/access-overview` now carries
   `assigned_by` per grant — both writers already recorded it (the admin API an
   email, the Library's owner-sharing path a user id) but the snapshot the page
