@@ -177,6 +177,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **An open group shows what the group HAS, not the whole catalogue.** The
+  page listed every grantable resource with a dead control and the words *not
+  granted* beside most of them — so every row looked like a control and most
+  were not one, which is what made it unreadable. The open group is now the
+  holding: one column header for the whole group, families as labelled bands
+  with their own counts, and one row per thing the group actually has.
+  Granting moved to *Advanced*, where the checkboxes are. With only held rows
+  on screen there is nothing to tick, so the checkbox column is gone and the
+  control column is the affordance — a tier switch where the tier applies,
+  **Revoke** where it does not, **Revoke + *where it lives ↗*** where an
+  owner shared it. Each row's right column names where the person meets it
+  ("IN THEIR LIBRARY") above the words they read there.
 - **The open group is three levels deep, not seven.** It rendered
   family → type accordion → block accordion → table, with the column headers
   repeated once per type and eight disclosures on screen; measured, there

@@ -889,6 +889,77 @@
   }
   .ax-gs__body .dsec-head { padding: 6px 0; }
   .ax-gs__body .dsec-body { padding: 0; }
+  /* ── The holding, as drawn ───────────────────────────────────────────
+     Four columns on one grid, shared by the header and every row in every
+     family, so the whole open group is one scannable list with family
+     labels as dividers — not three tables that each size themselves. */
+  .ax-colhd, .ax-r {
+    display: grid;
+    grid-template-columns: 5.5rem minmax(0, 1fr) 12rem 12.5rem;
+    gap: 1.1rem;
+    align-items: center;
+  }
+  .ax-colhd {
+    padding: 0 2px 6px;
+    font-size: 10px; font-weight: 600; letter-spacing: .11em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+    border-bottom: 1px solid var(--ds-border);
+  }
+  .ax-colhd__u { text-align: right; }
+
+  .ax-r {
+    padding: 9px 2px;
+    border-bottom: 1px solid var(--ds-border-light);
+  }
+  .ax-r:hover { background: var(--ds-surface-dim); }
+
+  /* Mono, outlined, quiet — a label for the row, never mistaken for the
+     family heading above it. Amber-linked when an owner shared it. */
+  .ax-r__kd {
+    font-family: var(--ds-font-mono, ui-monospace, monospace);
+    font-size: 10.5px; line-height: 1.5;
+    color: var(--ds-text-link); border: 1px solid var(--ds-text-link);
+    border-radius: 3px; padding: 0 5px; text-align: center;
+    white-space: nowrap; justify-self: start;
+  }
+  .ax-r__kd.is-own { color: var(--ds-warn-ink, #96690A); border-color: var(--ds-warn-ink, #96690A); }
+
+  .ax-r__nm { font-size: 13.5px; font-weight: 600; min-width: 0; }
+  .ax-r__nm a { color: inherit; text-decoration: none; }
+  .ax-r__nm a:hover { text-decoration: underline; }
+  .ax-r__blk { font-weight: 400; color: var(--ds-text-muted); }
+  .ax-r__d {
+    display: block; font-size: 12px; font-weight: 400;
+    color: var(--ds-text-muted); margin-top: 1px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ax-r__who {
+    display: block; font-size: 11px; font-weight: 400;
+    color: var(--ds-text-muted); margin-top: 2px;
+  }
+
+  .ax-r__ctl { justify-self: start; }
+  .ax-ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  /* Where the person meets it, then the words they read there. */
+  .ax-r__rd { text-align: right; font-size: 12px; color: var(--ds-text-primary); }
+  .ax-r__rd b {
+    display: block; font-size: 9.5px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ds-text-muted); margin-bottom: 1px;
+  }
+  .ax-r__rd .ax-reads__q { color: var(--ds-text-muted); font-style: italic; }
+
+  .ax-fam { margin-top: 20px; }
+  .ax-fam__hd {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 0 2px 4px; margin: 0; border: 0;
+  }
+  .ax-fam__n { margin-left: auto; font-size: 11px; color: var(--ds-text-muted); }
+
+  @media (max-width: 900px) {
+    .ax-colhd, .ax-r { grid-template-columns: 4.5rem minmax(0, 1fr) 10rem; }
+    .ax-colhd__u, .ax-r__rd { display: none; }
+  }
 </style>
 {% endblock %}
 
@@ -1279,6 +1350,23 @@
       <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
       <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
     </span>`;
+
+  //: Which kinds actually carry the Required/Available tier. On everything
+  //: else the pair is not a choice, so the row shows Revoke instead of a
+  //: control with one reachable state.
+  const TIERED = new Set(["data_package", "memory_domain", "memory_item", "marketplace_plugin"]);
+
+  /* The reads cell, as drawn: a small label saying WHERE the person meets
+     this, and under it the words they actually read there. The label is what
+     makes the column legible at a glance — without it a column of bare
+     sentences reads as a second description. */
+  const readsLabelled = (typeKey, tier) => {
+    const body = readsFor(typeKey, tier);
+    if (!body) return "";
+    const quiet = /ax-reads__q/.test(body);
+    const where = quiet ? "" : "In their Library";
+    return `${where ? `<b>${where}</b>` : ""}${body}`;
+  };
 
   /* The type, as one word on the row. `display_name` is a plural section
      header ("Skills, agents & plugins"); a chip in a 5rem column is not a
@@ -1815,37 +1903,41 @@
       table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
     };
 
-    const flatRow = (t, i, blockName) => {
-      const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
-      const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
+    /* ONE row shape, and the open group shows only what the group HAS.
+       Ungranted rows with a dead control and the words "not granted" were
+       noise the design never had — they are what made the page unreadable,
+       because every row looked like a control and most of them were not one.
+       Granting is Advanced (or + Grant a bundle); this is the holding.
+
+       No checkbox either: with only held rows on screen there is nothing to
+       tick, and a checkbox beside a tier switch asks "where do I click"
+       twice on one row. The control column IS the affordance. */
+    const grantedRow = (t, i, blockName, grant) => {
+      const tier = grant.requirement === "required" ? "required" : "available";
       const owned = OWNER_SHARED.has(t.type_key);
+      const tiered = TIERED.has(t.type_key);
       const hrefFn = ENTITY_PAGE[t.type_key];
       const name = esc(i.name || i.resource_id);
       const nameHtml = hrefFn ? `<a class="ax-name__link" href="${hrefFn(i.resource_id)}">${name}</a>` : name;
-      const who = grant ? whoGranted(grant) : "";
-      /* Owner-shareable kinds are OVERSIGHT here, not a place to grant: the
-         Library's Share dialog writes the same row, and the item's own page
-         is where its sharing is edited. So a held one offers revoke and a
-         way to the item — not a checkbox that quietly competes with the
-         other editor. Ungranted ones are in Advanced, where the checkbox
-         still works and the admin has clearly gone looking. */
-      const control = owned && grant
-        ? `<span class="ax-own"><button type="button" class="ax-revoke" data-revoke>Revoke</button>
-             ${hrefFn ? `<a class="ax-own__edit" href="${hrefFn(i.resource_id)}">Shared where it lives ↗</a>` : ""}</span>`
-        : tierControl(tier, !!grant);
+      const who = whoGranted(grant);
+      const control = owned
+        ? `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button>
+             ${hrefFn ? `<a class="ax-own__edit" href="${hrefFn(i.resource_id)}">where it lives ↗</a>` : ""}</span>`
+        : tiered
+          ? tierControl(tier, true)
+          : `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button></span>`;
       return `
-      <tr data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant ? ' class="is-granted"' : ""}>
-        <td class="ax-chk">${owned && grant ? "" : `<input type="checkbox" ${grant ? "checked" : ""} aria-label="Grant ${name}">`}</td>
-        <td class="ax-kind"><span class="ax-tag ${owned ? "ax-tag--own" : ""}">${esc(kindWord(t))}</span></td>
-        <td class="ax-name">
-          <b>${nameHtml}</b>${blockName ? `<span class="blk"> · ${esc(blockName)}</span>` : ""}${nobodyBadge(t, i)}
-          ${i.description ? `<span class="desc">${esc(String(i.description).slice(0, 96))}</span>` : ""}
-          ${who ? `<span class="ax-by-who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}
-        </td>
-        <td class="ax-acc">${control}</td>
-        <td class="ax-reads">${readsFor(t.type_key, tier)}</td>
-      </tr>`;
+      <div class="ax-r" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
+        <span class="ax-r__kd ${owned ? "is-own" : ""}">${esc(kindWord(t))}</span>
+        <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
+          ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 110))}</span>` : ""}
+          ${who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}
+        </span>
+        <span class="ax-r__ctl">${control}</span>
+        <span class="ax-r__rd">${readsLabelled(t.type_key, tier)}</span>
+      </div>`;
     };
+
 
     const byFamily = new Map();
     for (const t of types) {
@@ -1853,10 +1945,10 @@
       for (const b of (t.blocks || [])) {
         const blockName = (b.name && b.name !== t.type_display) ? b.name : "";
         for (const i of (b.items || [])) {
+          const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
+          if (!grant) continue;             // the holding, not the catalogue
           if (!hits(t, i)) continue;
-          if (!inHalf("primary", t, i)) continue;
-          if (onlyGranted && !grantOf(selectedGroup, t.type_key, i.resource_id)) continue;
-          rows.push(flatRow(t, i, blockName));
+          rows.push(grantedRow(t, i, blockName, grant));
         }
       }
       if (!rows.length) continue;
@@ -1864,36 +1956,32 @@
       if (!byFamily.has(key)) byFamily.set(key, []);
       byFamily.get(key).push(...rows);
     }
+
     const families = (overview.families || []).length
       ? overview.families
       : [{ key: "knowledge", display_name: "Knowledge", blurb: "" }];
     const sections = families.map((f) => {
       const parts = byFamily.get(f.key) || [];
-      // Under a filter, an empty family is noise — the view collapsed to the
-      // answer and a header over nothing is not part of the answer.
-      if (!parts.length && narrowed) return "";
-      const inner = parts.length
-        ? `<table class="data-table data-table--compact ax-rows">
-             <thead><tr>
-               <th class="ax-chk" aria-label="Granted"></th>
-               <th class="ax-kind">Kind</th>
-               <th>What the group gets</th>
-               <th class="ax-acc">Admin control</th>
-               <th class="ax-reads">What the person reads</th>
-             </tr></thead>
-             <tbody>${parts.join("")}</tbody>
-           </table>`
-        : `<div class="ax-empty">Nothing in this family yet.</div>`;
+      if (!parts.length) return "";
       return `
       <div class="ax-fam">
         <div class="ax-fam__hd">
           <span class="ax-fam__nm">${esc(f.display_name)}</span>
           ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
-          <span class="ax-fam__n">${parts.length}</span>
+          <span class="ax-fam__n">${parts.length} granted</span>
         </div>
-        ${inner}
+        ${parts.join("")}
       </div>`;
     }).join("");
+
+    // The column header belongs to the GROUP, not to each family. Repeated
+    // per family it was three copies of four words, and it made each family
+    // read as its own table rather than a band of one list.
+    const colhd = sections ? `
+      <div class="ax-colhd">
+        <span>Kind</span><span>What the group gets</span>
+        <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
+      </div>` : "";
 
     /* Advanced. The per-resource matrix is not deleted and not migrated —
        an instance that curated grants one row at a time for a year wakes up
@@ -1914,7 +2002,7 @@
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const painted = (sections + advanced) || (fq
+    const painted = (colhd + sections + advanced) || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
