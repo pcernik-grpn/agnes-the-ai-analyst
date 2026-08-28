@@ -1181,6 +1181,32 @@ crawling moves inside Agnes.
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
 
+### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
+
+Admin-only, behind the `facts` feature flag. The builder shell on
+`/admin/ontology` authors the entity/relationship types the fact graph
+extracts against. Everything fills an **unsaved draft**; only `save`
+materializes it — conversation and import never apply on their own.
+
+- /api/admin/ontology/drafts
+- /api/admin/ontology/drafts/{draft_id}
+- /api/admin/ontology/drafts/{draft_id}/import
+- /api/admin/ontology/drafts/{draft_id}/save
+- /api/admin/ontology/dry-run
+
+`POST/GET /drafts` create and list drafts; `GET/PUT/DELETE /drafts/{id}` read,
+edit and discard one. `POST …/import` translates a pasted or uploaded
+ontology (the producer's YAML) into the draft, reporting the leftovers the
+translator could not place structurally (mirrors the allowlisted
+`/api/admin/metrics/import`). `POST …/save` validates the frozen draft against
+the vendored Ossie schema and materializes it into a semantic model through
+the same path `agnes admin semantic-model import` uses. `POST /dry-run` runs
+the draft's current types over one selected document through the server-side
+LLM and returns proposed facts/edges plus a **not-captured** block; it is a
+typed `501` when no LLM provider is configured. Admin-only authoring with no
+analyst CLI/MCP analogue (the ontology is consumed as a semantic model, which
+has its own surface).
+
 ### `/api/admin/contributed-skills` — Contributed skill management
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
