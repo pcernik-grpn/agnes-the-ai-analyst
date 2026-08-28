@@ -357,6 +357,8 @@ def test_list_page_and_count(pg_engine, monkeypatch):
     assert {"user_id", "provider_type", "tenant_id", "subject", "email_at_link", "linked_at", "last_login_at"} <= set(
         page[0].keys()
     )
+    # The bound user's CURRENT email rides along for the admin list.
+    assert page[0]["email"].endswith("@fabrikam.com")
     rest = ids_repo.list_page(limit=10, offset=2)
     assert len(rest) == 3
     # Ordered linked_at DESC — no row repeats across pages.

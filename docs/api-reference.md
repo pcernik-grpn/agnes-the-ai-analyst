@@ -1230,6 +1230,22 @@ Admin-only, write-only vault for datasource secrets (`KEBOOLA_STORAGE_TOKEN`, `B
 - /api/admin/slack-secrets
 - /api/admin/slack-secrets/{name}
 
+### `/api/admin/sso` — External SSO login (runtime-configured Entra ID OIDC)
+
+Singleton runtime config for the optional external-identity login (`sso`
+provider slot): tenant/client IDs, a write-only Fernet-encrypted client
+secret, the mandatory email-domain allowlist, button label and enable flag,
+plus the captured external-identity bindings. `PUT`/`DELETE` on the config
+and secret are guarded by the last-login-door rule (422 `last_login_door`
+when the operation would leave no usable sign-in method). Postgres app-state
+backend required (typed 501 on DuckDB). See `docs/auth-sso-entra.md`.
+
+- /api/admin/sso/config
+- /api/admin/sso/client-secret
+- /api/admin/sso/test-config
+- /api/admin/sso/identities
+- /api/admin/sso/identities/{user_id}
+
 ### `/api/admin/db` — Database state and migration
 
 - /api/admin/db/cancel/{job_id}

@@ -142,7 +142,9 @@ class UserExternalIdentitiesPgRepository:
         return result.rowcount > 0
 
     def list_page(self, *, limit: int, offset: int) -> list[dict[str, Any]]:
-        """One page of linked identities, ``linked_at`` DESC.
+        """One page of linked identities, ``linked_at`` DESC, with the bound
+        user's CURRENT email joined in (``email`` — ``email_at_link`` stays
+        the drift-forensics snapshot).
 
         Deliberately no unbounded list method — one admin call must not
         serialize an entire tenant's links (design: identities pagination).
@@ -151,8 +153,10 @@ class UserExternalIdentitiesPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT * FROM user_external_identities "
-                        "ORDER BY linked_at DESC, user_id "
+                        "SELECT uei.*, u.email AS email "
+                        "FROM user_external_identities uei "
+                        "JOIN users u ON u.id = uei.user_id "
+                        "ORDER BY uei.linked_at DESC, uei.user_id "
                         "LIMIT :limit OFFSET :offset"
                     ),
                     {"limit": limit, "offset": offset},

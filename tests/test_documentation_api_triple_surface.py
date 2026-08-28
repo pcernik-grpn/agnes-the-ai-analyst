@@ -599,6 +599,42 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/sso/config": (
+        "external SSO login config (design 2026-08-28) — CLI-reachable via "
+        "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
+        "the PUT/DELETE reconfigure which external tenant this instance "
+        "trusts to assert identities (the 'admin credential-provisioning "
+        "writes' standing exemption in CONTRIBUTING.md), and the GET "
+        "enumerates the instance's auth posture (the 'operator "
+        "security-posture diagnostics' standing exemption)"
+    ),
+    "/api/admin/sso/client-secret": (
+        "external SSO client secret (write-only vault write) — CLI-reachable "
+        "via `agnes admin sso set-secret|clear-secret`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that stores "
+        "the credential a third-party tenant authenticates with is a "
+        "privilege-escalation seam, not a convenience"
+    ),
+    "/api/admin/sso/test-config": (
+        "external SSO discovery probe — CLI-reachable via `agnes admin sso "
+        "test`, deliberately never MCP-exposed per the 'admin "
+        "credential-provisioning writes' standing exemption in "
+        "CONTRIBUTING.md (it validates the same credential-trust config the "
+        "writes provision, against the live tenant)"
+    ),
+    "/api/admin/sso/identities": (
+        "linked external identities list — CLI-reachable via `agnes admin "
+        "sso identities`, deliberately never MCP-exposed: it enumerates "
+        "which users an external tenant can authenticate as (auth-posture "
+        "reconnaissance), and is admin recovery tooling, not analyst tooling"
+    ),
+    "/api/admin/sso/identities/{user_id}": (
+        "admin unlink of one external identity — CLI-reachable via `agnes "
+        "admin sso unlink`, deliberately never MCP-exposed: unlinking "
+        "re-opens first-login email attach for that user (an auth-trust "
+        "mutation), and is admin recovery tooling, not analyst tooling"
+    ),
     "/api/admin/users/{user_id}/library-preview": (
         "feeds the Simulate lens's Library-shaped preview on /admin/access — "
         "a projection of another person's /library page, meaningful only "
