@@ -119,6 +119,53 @@ DATA_APP_GIT_SCOPE_PREFIX = "data-app-git:"
 # never authorize viewing a different one).
 DATA_APP_PREVIEW_SCOPE_PREFIX = "data-app-preview:"
 
+# Scope prefix minted by `app.api.data_apps._mint_service_token` for the
+# RUNTIME credential a hosted app calls the Agnes API with (`AGNES_TOKEN`).
+#
+# Unlike its two siblings above, this credential legitimately needs MANY
+# endpoints — it is a data client, "exactly like the CLI and MCP surfaces"
+# (spec `2026-07-21-data-apps-design.md`) — so a per-surface boolean does not
+# fit. It is gated the way agent PATs are instead: a fail-closed path-prefix
+# allowlist, `_DATA_APP_ALLOWED_PREFIXES` below.
+#
+# Note the prefixes do not overlap: `"data-app-git:x".startswith("data-app:")`
+# is False (`-` vs `:` at index 8), so a clone credential still falls to its
+# own gate above rather than being reclassified as a service token. That is
+# load-bearing and pinned by a test.
+DATA_APP_SERVICE_SCOPE_PREFIX = "data-app:"
+
+# The API surface a hosted data app may reach. Sourced from what the design
+# spec documents an app needs — `/api/query` for SQL, `/api/data/...` for
+# parquet, catalog endpoints for discovery — plus the definition lookups the
+# CLI performs on an app's behalf (`agnes catalog --metrics` hits
+# `/api/metrics`; CLAUDE.md requires looking up a canonical metric definition
+# before computing one).
+#
+# Deliberately absent: `/api/admin/*` and every credential-minting route
+# (`/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token`,
+# `/api/cli-auth/rescope-surface`). Those made this a privilege-escalation
+# rather than merely a wide credential: the service token is minted WITHOUT
+# expiry (`omit_exp=True` / `expires_at=None`), so reaching a minting route
+# let it launder itself into a further durable credential.
+#
+# Match is exact-or-child (`/api/query` and `/api/query/hybrid`, never
+# `/api/queryevil`), so entries carry no trailing slash. Bare `/api/metrics`
+# admits `/api/metrics/...` but never `/api/admin/metrics`.
+_DATA_APP_ALLOWED_PREFIXES = (
+    "/api/query",
+    "/api/data",
+    "/api/catalog",
+    "/api/metrics",
+    "/api/glossary",
+    "/api/semantic-models",
+)
+
+
+def _path_is_allowed(path: str, allowed: tuple[str, ...]) -> bool:
+    """Exact-or-child match. `startswith` alone would let `/api/queryevil`
+    ride in on `/api/query`."""
+    return any(path == p or path.startswith(p + "/") for p in allowed)
+
 
 def _client_ip(request: Optional[Request]) -> Optional[str]:
     """See app/auth/dependencies._client_ip — same trusted-hop model (F9)."""
@@ -158,6 +205,12 @@ def resolve_token_to_user(
     ``app/api/data_apps_proxy.py``'s view-only serving path passes
     ``True``. Both scope checks reject their own prefix independently, so a
     caller that (mistakenly) allows one never accepts the other.
+
+    The third data-app scope, ``data-app:<slug>`` (the runtime service token
+    minted by ``app.api.data_apps._mint_service_token``), has no boolean
+    because it is not confined to one surface — it is a data client. It is
+    gated instead by the ``_DATA_APP_ALLOWED_PREFIXES`` path allowlist, so
+    there is no parameter to pass: every caller gets the same enforcement.
     """
     if not token:
         return None, "no_token"
@@ -171,6 +224,25 @@ def resolve_token_to_user(
         return None, "pat_scope_forbidden"
     if scope.startswith(DATA_APP_PREVIEW_SCOPE_PREFIX) and not allow_data_app_preview_scope:
         return None, "pat_scope_forbidden"
+
+    if scope.startswith(DATA_APP_SERVICE_SCOPE_PREFIX):
+        # Callers that omit `request` fall through to path="" — which matches
+        # no prefix, so the service token is fail-closed rejected there, the
+        # same way an agent PAT is (see `_AGENT_PAT_ALLOWED_PREFIXES` below).
+        # Today that means MCP-over-HTTP and the git smart-HTTP surfaces; a
+        # hosted app is a REST client by design.
+        path = request.url.path if request is not None else ""
+        if not _path_is_allowed(path, _DATA_APP_ALLOWED_PREFIXES):
+            # Log the refused path: this failure is otherwise invisible from
+            # the outside — the container stays healthy and the app renders,
+            # only its API calls 401 — so an operator needs to see WHICH
+            # endpoint the app was refused, not just that something broke.
+            logger.warning(
+                "data-app service token refused off-surface: scope=%s path=%s",
+                scope,
+                path or "<no-request>",
+            )
+            return None, "pat_scope_forbidden"
 
     if payload.get("typ") == "agent_pat":
         # Callers that omit `request` (git smart-HTTP in

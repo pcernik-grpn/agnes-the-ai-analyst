@@ -63,6 +63,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
+  now enforced, not just a label.** The credential a running data app calls
+  Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
+  claim that no code path read — so it was functionally a full-privilege PAT
+  for the app's owner, usable against the whole REST API by anything running
+  in the container, including an externally-cloned, less-trusted repo. Because
+  this token is deliberately minted **without expiry**, that included the
+  credential-minting routes: it could launder itself into a further durable
+  credential that survives revoking it, and reach `/api/admin/*` whenever the
+  owner was an Admin. `app/auth/pat_resolver.py` now admits the scope only on
+  a fail-closed path allowlist (`_DATA_APP_ALLOWED_PREFIXES`) covering the
+  surface the design spec documents an app needs — `/api/query`, `/api/data`,
+  `/api/catalog`, `/api/metrics`, `/api/glossary`, `/api/semantic-models` —
+  matched exact-or-child so `/api/metrics` never admits `/api/admin/metrics`.
+  This mirrors how agent PATs are already gated; the two sibling scopes
+  (`data-app-git:`, `data-app-preview:`) keep their per-surface booleans and
+  are unaffected. **Upgrade note:** an app calling anything outside that list
+  now gets a 401 where it previously succeeded — including MCP-over-HTTP,
+  which passes no request path and is therefore fail-closed. Each refusal logs
+  a warning naming the scope and the refused path, because this failure is
+  otherwise invisible from the outside (the container stays healthy and the
+  app renders; only its API calls fail). Unchanged: within the allowed
+  surface an app still reads with the **owner's** grants, evaluated live —
+  sharing an app remains an act of publication.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the

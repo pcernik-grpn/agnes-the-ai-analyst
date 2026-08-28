@@ -606,6 +606,14 @@ client, via an owner-scoped token injected as `AGNES_TOKEN` — never through a
 mounted parquet. See spec §8 for the full rationale and the owner-inherited
 access model this implies for sharing.
 
+That token's `data-app:<slug>` scope is enforced fail-closed in
+`app/auth/pat_resolver.py`: it is admitted only on the app data surface
+(`_DATA_APP_ALLOWED_PREFIXES` — query, data, catalog, metrics, glossary,
+semantic-models) and refused everywhere else, notably `/api/admin/*` and
+every credential-minting route. The scope narrows which **endpoints** the app
+may call; it does not narrow **which rows** it sees — inside that surface the
+app still reads with the owner's grants, evaluated live per request.
+
 **Container hardening** (spec §10): every data-app container runs
 `cap_drop: ALL`, `no-new-privileges` and a `pids_limit`
 (`data_apps.container_pids_limit`, default 512) — never applied to the
