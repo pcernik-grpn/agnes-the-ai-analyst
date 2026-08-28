@@ -24,6 +24,40 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   answer that it cannot see how the report builds the figure and that the
   metric it picked is a best match for the label rather than the app's own
   definition.
+- **BREAKING (hosted data apps): the `data-app:<slug>` service-token scope is
+  now enforced, not just a label.** The credential a running data app calls
+  Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
+  claim that no code path read — so it was functionally a full-privilege PAT
+  for the app's owner, usable against the whole REST API by anything running
+  in the container, including an externally-cloned, less-trusted repo. Two
+  concrete consequences: `/api/admin/*` was reachable whenever the app owner
+  was an Admin, and `POST /cli/auth/rescope-surface` — admin-gated, but it
+  *requires* a PAT and mints a fresh 90-day `surface='all'` one — let a token
+  that is itself minted **without expiry** launder itself into a further
+  durable credential. (The `require_session_token` minting routes —
+  `/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token` — were
+  already closed to it: that guard rejects any PAT-typed credential
+  regardless of scope.) `app/auth/pat_resolver.py` now admits the scope only
+  on a fail-closed allowlist of the surface a hosted app actually uses:
+  `/api/query` (not `/api/query/hybrid`), `/api/data/…`, the `/api/catalog`
+  read routes, `/api/metrics`, `/api/glossary`, the read-only
+  `/api/semantic-models` members (not `/apply`), and the `/api/v2` catalog,
+  schema, sample and scan routes the `agnes` CLI calls from inside an app.
+  Entries are exact paths plus narrow subtrees rather than one per router,
+  because a per-router prefix silently admits every route that router later
+  grows; `tests/…::test_the_admitted_route_set_is_pinned` walks the real
+  route table so a new route under an allowed path can never be admitted
+  without a deliberate decision. The two sibling scopes (`data-app-git:`,
+  `data-app-preview:`) keep their per-surface booleans and are unaffected.
+  **Upgrade note:** an app calling anything outside that list now gets a 401
+  where it previously succeeded — including MCP-over-HTTP, which passes no
+  request path and is therefore fail-closed. Each refusal logs a warning
+  naming the scope and the refused path, because this failure is otherwise
+  invisible from the outside (the container stays healthy and the app
+  renders; only its API calls fail). Unchanged: within the allowed surface an
+  app still reads with the **owner's** grants, evaluated live — sharing an
+  app remains an act of publication.
+- **Activity Center timeline now spans all activity trails, not just `audit_log` (Track E3 Slice 2).** `GET /api/admin/activity`, `agnes admin activity`, and the new `activity` MCP foundation tool are now a unified, read-side UNION over `audit_log` + `sync_history` + `llm_usage` + `agent_scope_snapshots` — one chronological feed instead of four separate pages, with each row carrying a `trail` field (`audit`/`sync`/`llm`/`agent_scope`) and a new `trail=` filter to narrow back to one. The KPI cards and facet dropdowns (`GET /api/admin/observability/kpis` + `/facets`) are widened to the same union and accept the same `trail=` filter, so the whole page tells one story instead of the cards undercounting rows the table below them shows. Implemented on both backends (`AuditRepository.query_unified`/`facets`/`kpis` and `AuditPgRepository` mirrors, cross-engine contract-tested). `chat_messages` is deliberately excluded — privacy decision, unchanged. `/admin/activity` web, `/api/admin/activity/health`, `/api/admin/activity/sync`, and `/me/activity` self-view are unaffected. See `docs/observability.md`.
 - **The chat Files drawer got a layout fix and a visual pass.** The file
   list now flexes across the panel's full remaining height (a fixed `46vh`
   box left most of the drawer an empty framed rectangle), rows are
@@ -37,6 +71,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
