@@ -45,24 +45,30 @@ cookie session:
 - ``GET  /api/facts/corrections``      — the producer export (spec §7.4):
   every ``wrong`` subject's natural keys, so re-extraction does not
   resurrect what an admin withdrew.
+- ``GET  /api/facts/ingest-runs``      — persisted run reports (spec
+  §7.2/§13.2), newest first: what the ``/admin/data-sources`` source card
+  reads for its pipeline-strip counts and per-category error badges.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
-from src.repositories import audit_repo, facts_repo
+from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
 from src.repositories.facts_pg import (
     FactNotFound,
     IngestBatchTooLarge,
     IngestDocumentExceedsClaimCap,
     IngestUnresolvedDocIds,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/facts",
@@ -199,9 +205,17 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     Response IS the run report: ``{claims_written, claims_rejected:
     [{row, reason}], deferred: [...], subjects_created, subjects_deleted,
     corrections_active: [...], review_items: [...]}``.
+
+    A copy of that same report is ALSO persisted to ``facts_ingest_runs``
+    (``GET /api/facts/ingest-runs``, the source card's pipeline strip and
+    error badges — spec §13.2) — deliberately AFTER
+    :meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE
+    its transaction: a run-report write is a side record, never a condition
+    of the ingest succeeding, so a failure there is logged and swallowed,
+    never surfaced as a 5xx for a batch that in fact wrote its claims fine.
     """
     try:
-        return facts_repo().ingest_batch(
+        report = facts_repo().ingest_batch(
             documents=body.documents,
             full_documents=body.full_documents,
             nodes=body.nodes,
@@ -216,6 +230,24 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
         )
     except IngestUnresolvedDocIds as exc:
         raise HTTPException(status_code=400, detail={"reason": "unresolved_doc_ids", "doc_ids": exc.unresolved})
+
+    try:
+        corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})
+        facts_ingest_runs_repo().create(
+            corpus_ids=corpus_ids,
+            caller=user.get("email") or user.get("id", "admin"),
+            documents_seen=len(body.documents),
+            claims_written=report.get("claims_written", 0),
+            claims_rejected=report.get("claims_rejected", []),
+            deferred=report.get("deferred", []),
+            subjects_created=report.get("subjects_created", 0),
+            subjects_deleted=report.get("subjects_deleted", 0),
+            review_items=report.get("review_items", []),
+        )
+    except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
+        logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)
+
+    return report
 
 
 class FactsCorrectionRequest(BaseModel):
@@ -295,3 +327,18 @@ def list_corrections(user: dict = Depends(require_admin)) -> Dict[str, Any]:
     export cannot resurrect a withheld fact, this just saves it the wasted
     work. Scheduler token or admin PAT."""
     return {"corrections": facts_repo().list_wrong_corrections()}
+
+
+@router.get("/ingest-runs")
+def list_ingest_runs(
+    limit: int = Query(default=20, ge=1, le=200),
+    user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Persisted run reports (spec §7.2/§13.2), newest first — what the
+    ``/admin/data-sources`` source card reads its pipeline-strip counts and
+    per-category error badges from (``app/web/router.py``'s
+    ``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only
+    (A3 ratchet); on a DuckDB-backed instance this raises
+    ``RequiresPostgresBackend``, translated to a typed ``501`` by the
+    app-wide handler."""
+    return {"runs": facts_ingest_runs_repo().list_recent(limit=limit)}

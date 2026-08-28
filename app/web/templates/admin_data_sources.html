@@ -194,6 +194,26 @@
   .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
   .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* The file-source card's error-category badges are BUTTONS (they open the
+     filtered drawer, spec §13.2) — normalize away the browser's default
+     button chrome so a clickable badge still reads as a badge. */
+  button.ds-badge { font: inherit; border: none; cursor: pointer; }
+  button.ds-badge:disabled { cursor: default; opacity: 0.55; }
+  button.ds-badge:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
+
+  /* File-source error drawer (spec §13.2): the itemized rows for whichever
+     error badge is active. */
+  .ds-filesource-drawer { margin: 4px 16px 8px; }
+  .ds-filesource-drawer__list {
+    margin: 0; padding: 0; list-style: none;
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 8px; overflow: hidden;
+  }
+  .ds-filesource-drawer__list li {
+    padding: 6px 12px; font-size: 12.5px;
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-filesource-drawer__list li:last-child { border-bottom: none; }
 
   /* The Test verdict. It reports on the whole card, so it lands at the top
      of the body under the fact it is about, not floating after a button in
@@ -414,6 +434,7 @@
   .ds-srcopt .so-logo--sf   { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-srcopt .so-logo--csv  { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .ds-srcopt .so-logo--jira { background: var(--ds-kind-plugin-soft, #f2e9fb); color: var(--ds-kind-plugin, #391c57); }
+  .ds-srcopt .so-logo--spo  { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); font-size: 10px; }
   .ds-srcopt .so-name { font-weight: 700; font-size: 13px; }
   .ds-srcopt .so-sub { font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.3; }
 
@@ -823,6 +844,53 @@
   .ds-toast.toast-fail { cursor: pointer; }
   .ds-toast.toast-ok   { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border: 1px solid var(--ds-accent-success-line); }
   .ds-toast.toast-fail { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); border: 1px solid var(--ds-accent-danger-line); }
+
+  /* ── SharePoint connect wizard (spec 2026-08-27 §13.2) ──────────────────
+     Its own drawer, its own three-step strip (connect -> scope -> share —
+     the table wizard's "bundle" step does not apply here: the selected
+     scope of collections IS the package). Shares the drawer chrome
+     (drawer.css) and every other class already established above; only
+     the scope-tree/share-preview rows below are new vocabulary. */
+  .sp-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0 0 10px; font-size: 12.5px; }
+  .sp-crumbs button { border: none; background: none; padding: 2px 4px; font: inherit; color: var(--ds-primary); cursor: pointer; border-radius: 4px; }
+  .sp-crumbs button:hover { background: var(--ds-surface-sunken); }
+  .sp-crumbs button[disabled] { color: var(--ds-text-primary); font-weight: 700; cursor: default; }
+  .sp-crumbs .sep { color: var(--ds-text-muted); }
+  .sp-tree { border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .sp-tree__row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-bottom: 1px solid var(--ds-border-light);
+    font-size: 12.5px;
+  }
+  .sp-tree__row:last-child { border-bottom: none; }
+  .sp-tree__row:hover { background: var(--ds-surface-sunken); }
+  .sp-tree__name { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
+  .sp-tree__name button { border: none; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--ds-text-primary); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__name button:hover { color: var(--ds-primary); }
+  .sp-tree__name span.leaf { font-weight: 600; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__anon { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; color: var(--ds-text-muted); }
+  .sp-badge {
+    flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+    white-space: nowrap;
+  }
+  .sp-badge--anon { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
+  .sp-share-row {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); margin-bottom: 10px;
+  }
+  .sp-share-row__main { flex: 1 1 auto; min-width: 0; }
+  .sp-share-row__title { font-weight: 700; font-size: 13px; color: var(--ds-text-primary); }
+  .sp-share-row__badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .sp-share-row__groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .sp-share-row__groups label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ds-text-secondary); }
+  .sp-warn {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
+    padding: 2px 8px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
+  }
+  .sp-corpus-map { font-size: 12px; }
 </style>
 {% endblock %}
 
@@ -1003,6 +1071,15 @@
             <span class="so-logo so-logo--jira">J</span>
             <span class="so-name">Jira</span>
             <span class="so-sub">Real-time via webhooks</span>
+          </button>
+          {# SharePoint runs its own three-step flow (connect -> scope -> share;
+             spec 2026-08-27 §13.2) in a separate drawer (#sp-wizard-overlay,
+             below) — the "bundle" step of this table wizard does not apply to
+             files, where the selected scope of collections IS the package. #}
+          <button type="button" class="ds-srcopt" data-wsrc="sharepoint">
+            <span class="so-logo so-logo--spo">SP</span>
+            <span class="so-name">SharePoint</span>
+            <span class="so-sub">Files → Collections, per-folder scope</span>
           </button>
         </div>
 
@@ -1311,6 +1388,127 @@
   </div>
 </div>
 
+{# ── SharePoint connect wizard (spec 2026-08-27 §13.2): connect -> scope ->
+   share. A separate drawer from the table wizard above — the "bundle" step
+   is dropped; the selected scope of collections IS the package. Opened by
+   the "SharePoint" tile in the picker above (openSpWizard(), see the script
+   block at the end of this page). #}
+<div id="sp-wizard-overlay" class="ds-drawer ds-drawer--wide" role="dialog" aria-modal="true" aria-labelledby="sp-wizard-title">
+  <div class="ds-drawer__backdrop" data-spw-close></div>
+  <div class="ds-drawer__panel">
+    <div class="ds-drawer__head">
+      <div class="ds-drawer__head-main">
+        <h2 class="ds-drawer__title" id="sp-wizard-title">Connect SharePoint</h2>
+        <p class="ds-drawer__sub">Connect, choose what's in scope, share it — stop after any step.</p>
+      </div>
+      <button type="button" class="ds-drawer__x" id="sp-wizard-close" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="ds-drawer__steps" role="group" aria-label="SharePoint connect steps">
+      <button type="button" class="ds-drawer__step is-now" data-spw-step="1"><span class="n">1</span><span class="lbl">Connect</span></button>
+      <button type="button" class="ds-drawer__step" data-spw-step="2" disabled><span class="n">2</span><span class="lbl">Scope</span></button>
+      <button type="button" class="ds-drawer__step" data-spw-step="3" disabled><span class="n">3</span><span class="lbl">Share</span></button>
+    </div>
+
+    <div class="ds-drawer__body" id="spw-body">
+
+      {# Step 1: connect — tenant/client id as FIELDS (exact foreign values
+         never travel through conversation) and the certificate choice. #}
+      <section class="ds-drawer__pane is-on" data-spw-pane="1">
+        <div class="sp-existing" id="spw-existing" hidden style="margin-bottom:14px;">
+          <div class="ds-field">
+            <label for="spw-existing-select">Continue an existing connection</label>
+            <select id="spw-existing-select" class="ds-dropdown-native"></select>
+            {{ ds.dropdown(id='spw-existing-select-dd', target='spw-existing-select', aria_label='Existing SharePoint connection', options=[]) }}
+          </div>
+          <button type="button" class="btn btn-secondary" id="spw-existing-btn">Continue to scope &rarr;</button>
+          <div class="ds-wor"><span>or connect a new tenant</span></div>
+        </div>
+
+        <div class="ds-field">
+          <label for="spw-name">Connection name</label>
+          <input type="text" id="spw-name" placeholder="e.g. Corp SharePoint" autocomplete="off">
+        </div>
+        <div class="ds-field">
+          <label for="spw-tenant">Tenant ID <span style="color:var(--ds-accent-danger-ink)">*</span></label>
+          <input type="text" id="spw-tenant" placeholder="11111111-1111-1111-1111-111111111111" autocomplete="off" spellcheck="false">
+          <div class="field-hint">The Entra tenant this app registration belongs to.</div>
+        </div>
+        <div class="ds-field">
+          <label for="spw-client">Client (application) ID <span style="color:var(--ds-accent-danger-ink)">*</span></label>
+          <input type="text" id="spw-client" placeholder="app registration client id" autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="ds-field">
+          <label for="spw-cert-choice">Certificate</label>
+          <select id="spw-cert-choice" class="ds-dropdown-native">
+            <option value="upload" selected>Upload your own</option>
+            <option value="env">Server certificate</option>
+          </select>
+          {{ ds.dropdown(
+            id='spw-cert-choice-dd', target='spw-cert-choice',
+            aria_label='Certificate source', selected='upload',
+            options=[
+              {'value': 'upload', 'label': 'Upload your own'},
+              {'value': 'env', 'label': 'Server certificate'},
+            ],
+          ) }}
+          <div id="spw-cert-upload" style="margin-top:10px;">
+            <textarea id="spw-cert-pem" rows="5" placeholder="-----BEGIN CERTIFICATE-----...-----END PRIVATE KEY-----" autocomplete="off" spellcheck="false"></textarea>
+            <div class="field-hint">The certificate followed by its private key, in one PEM. Stored write-only in the server vault — never echoed back, only its origin and set-date are shown.</div>
+          </div>
+          <div id="spw-cert-env" style="margin-top:10px; display:none;">
+            <input type="text" id="spw-cert-env-name" placeholder="SHAREPOINT_CERT_PRIVATE_KEY (default)" autocomplete="off" spellcheck="false">
+            <div class="field-hint">Name of the env var the deployment injects the certificate under. A new value only takes effect after the server process is recreated.</div>
+          </div>
+          <div id="spw-cert-status" class="field-hint" style="display:none;"></div>
+        </div>
+
+        <div id="spw-connect-error" class="ds-wizard-error"></div>
+      </section>
+
+      {# Step 2: the folder tree — one level per call (sites -> drives -> root
+         children); each selected row shows its collection badge, unselected
+         rows are explicit exclusions, anonymize sits on the same row. #}
+      <section class="ds-drawer__pane" data-spw-pane="2">
+        <p class="ds-wizard-lede">
+          Pick the sites, libraries or folders you want indexed. Each one becomes its own Collection.
+        </p>
+        <nav class="sp-crumbs" id="spw-crumbs" aria-label="Browsing"></nav>
+        <div id="spw-tree" class="sp-tree"><div class="ds-loading">Loading…</div></div>
+        <p class="sp-note">
+          The original file is not copied — {{ instance_brand or 'Agnes' }} stores the extracted markdown.
+          Originals open in the source, under your own identity.
+        </p>
+        <div id="spw-tree-error" class="ds-wizard-error"></div>
+      </section>
+
+      {# Step 3: share preview — per-collection group badges, anonymized
+         collections keep their badge, warn on any collection with no group. #}
+      <section class="ds-drawer__pane" data-spw-pane="3">
+        <p class="ds-wizard-lede">
+          Who gets these collections? A collection with no group is indexed but invisible.
+        </p>
+        <div id="spw-share-rows"><div class="ds-loading">Loading…</div></div>
+        <p class="sp-corpus-map" id="spw-corpus-map-wrap" hidden>
+          <a href="#" id="spw-corpus-map-link" download="corpus-map.json">Download corpus map</a>
+          — the scope-to-collection mapping the crawl pipeline reads.
+        </p>
+        <div id="spw-share-error" class="ds-wizard-error"></div>
+      </section>
+
+    </div>
+    <div class="ds-drawer__foot">
+      <button type="button" class="btn btn-secondary" id="spw-cancel">Cancel</button>
+      <span class="ds-drawer__foot-gap"></span>
+      <button type="button" class="btn btn-primary" id="spw-connect-btn">Connect &amp; validate</button>
+      <button type="button" class="btn btn-primary" id="spw-scope-continue-btn" style="display:none;">Continue to share</button>
+      <button type="button" class="btn btn-primary" id="spw-finish-btn" style="display:none;">Share &amp; finish</button>
+      <button type="button" class="btn btn-secondary" id="spw-done-btn" style="display:none;">Done</button>
+    </div>
+  </div>
+</div>
+
 <div id="ds-toast" class="ds-toast" role="status" aria-live="polite"></div>
 
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
@@ -1514,6 +1712,11 @@ const CONNECTOR = {
   databricks: { abbr: "DB", cls: "databricks", wizard: "databricks" },
   jira:       { abbr: "JR", cls: "jira",      wizard: "jira" },
   local:      { abbr: "FS", cls: "local",     wizard: "csv" },
+  // The connect wizard for this type ships separately; this entry only
+  // gives an EXISTING sharepoint connection row (however it got created) a
+  // logo/palette instead of falling back to raw initials. `local`'s palette
+  // is reused rather than adding a new one — this is a file source too.
+  sharepoint: { abbr: "SP", cls: "local",     wizard: "sharepoint" },
 };
 function _connector(type) {
   return CONNECTOR[type] || { abbr: (type || "?").slice(0, 2).toUpperCase(), cls: "local", wizard: "keboola" };
@@ -1532,7 +1735,44 @@ function _relAge(minutes) {
   return `${d} day${d === 1 ? "" : "s"} ago`;
 }
 
+/* A file source's pipeline is a DIFFERENT shape entirely — crawl → text
+   extraction + scan transcription → facts → graph (spec §13.2 "Source
+   card"), not tables/sync/feeds. Cells are plain (not links): there is no
+   monitoring page to send an admin to — "no new pages" is the point — so
+   the strip stays a verdict, and the itemized detail lives one click below
+   in the error-badge drawer (`_sharepointFactsHtml`). */
+function _sharepointPipelineStripHtml(row) {
+  const fs = (SOURCE_PIPELINES[row.id] || {}).file_source;
+  if (!fs) return "";
+  const extract = fs.extract || {};
+  const extractedTotal = Object.values(extract).reduce((a, b) => a + b, 0);
+  const extractTitle = extractedTotal
+    ? Object.entries(extract).map(([k, v]) => `${k}: ${v}`).join(" · ")
+    : "Nothing extracted yet";
+  const cost = fs.cost_estimate || { amount_usd: 0 };
+  const cells = [
+    `<div class="ds-pipe__cell">
+       <span class="ds-pipe__k">Crawl</span>
+       <span class="ds-pipe__v">${fs.crawl.documents} document${fs.crawl.documents === 1 ? "" : "s"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell" title="${_esc(extractTitle)}">
+       <span class="ds-pipe__k">Extraction</span>
+       <span class="ds-pipe__v ${extractedTotal ? "" : "is-warn"}">${extractedTotal ? `${extract.indexed || 0} indexed` : "Nothing yet"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell">
+       <span class="ds-pipe__k">Facts → graph</span>
+       <span class="ds-pipe__v">${fs.graph.facts} fact${fs.graph.facts === 1 ? "" : "s"} · ${fs.graph.edges} edge${fs.graph.edges === 1 ? "" : "s"}</span>
+     </div>`,
+    `<div class="ds-pipe__cell" title="Estimated from the last run's rejected/deferred queue — not a real cost model.">
+       <span class="ds-pipe__k">Queue cost</span>
+       <span class="ds-pipe__v">~$${(cost.amount_usd || 0).toFixed(2)}</span>
+     </div>`,
+  ];
+  return `<div class="ds-pipe ds-pipe--${cells.length}">${cells.join("")}</div>`;
+}
+
 function _pipelineStripHtml(row) {
+  if (row.source_type === "sharepoint") return _sharepointPipelineStripHtml(row);
   const p = SOURCE_PIPELINES[row.id];
   if (!p) return "";
   const cells = [];
@@ -1655,10 +1895,26 @@ function _pipelineStripHtml(row) {
 function _sourceHealth(row) {
   const p = SOURCE_PIPELINES[row.id];
   if (!p) return null;
+  if (row.source_type === "sharepoint") return _sharepointHealth(p.file_source);
   const s = p.sync || {}, t = p.tables || {}, f = p.feeds || {};
   if (s.errors) return { tone: "is-err", label: `${s.errors} failing sync${s.errors === 1 ? "" : "s"}` };
   if (!t.count && !t.unlinked) return { tone: "is-warn", label: "No tables yet" };
   if (!f.packages) return { tone: "is-warn", label: "Reaches nobody" };
+  return { tone: "is-ok", label: "Healthy" };
+}
+
+/* The file-source verdict has nothing to do with "tables" — its own ladder:
+   an ungranted collection (fail-closed, spec §13.1) is the worst silent
+   state, then any error in the last run, else healthy. */
+function _sharepointHealth(fs) {
+  if (!fs) return null;
+  const identity = fs.identity || {};
+  if (identity.collections_no_group) {
+    return { tone: "is-warn", label: `${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group` };
+  }
+  const lastRun = fs.last_run;
+  const errCount = lastRun ? lastRun.rejected_quotes.length + lastRun.protocol_errors.length : 0;
+  if (errCount) return { tone: "is-warn", label: `${errCount} error${errCount === 1 ? "" : "s"} in last run` };
   return { tone: "is-ok", label: "Healthy" };
 }
 
@@ -1679,6 +1935,96 @@ function _sourceSubtitle(row) {
     }
   }
   return bits.join(" · ");
+}
+
+/* File-source card body (spec §13.2 "Source card"): schedule (static text —
+   the crawl runs externally), certificate (origin + set-date, NEVER the
+   value), identity matching (fail-closed grant coverage), and error badges
+   from the LAST run report — each opens a drawer filtered to that one
+   category. `_sharepointPipelineStripHtml` above already covers the
+   crawl/extract/facts/graph counts, so this is everything ELSE on the card. */
+function _sharepointFactsHtml(row) {
+  const fs = (SOURCE_PIPELINES[row.id] || {}).file_source;
+  if (!fs) {
+    return `
+    <div class="ds-src__fact">
+      <span class="ds-src__fact-k">File source</span>
+      <span class="ds-src__fact-v">Pipeline data needs a Postgres backend (facts graph is PG-only).</span>
+    </div>`;
+  }
+
+  const cert = fs.certificate || {};
+  const certBadge = cert.error
+    ? `<span class="ds-badge badge-unset">not configured</span>`
+    : `<span class="ds-badge ${cert.origin === "vault" ? "badge-vault" : "badge-env"}">${_esc(cert.origin || "unset")}</span>`;
+  const certDetail = cert.error
+    ? _esc(cert.error)
+    : cert.origin === "vault"
+      ? (cert.set_at ? `set ${_esc(new Date(cert.set_at).toLocaleDateString())}` : "set date unknown")
+      : `env <code>${_esc(cert.env_name || "")}</code>`;
+
+  const identity = fs.identity || { groups_matched: 0, collections_no_group: 0 };
+  const identityTone = identity.collections_no_group ? "is-warn" : "";
+  const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
+    + ` · ${identity.collections_no_group} collection${identity.collections_no_group === 1 ? "" : "s"} with no group`;
+
+  const lastRun = fs.last_run;
+  const badgeDefs = [
+    ["rejected_quotes", "Rejected quotes"],
+    ["deferred", "Deferred"],
+    ["protocol_errors", "Protocol errors"],
+  ];
+  const badgesHtml = lastRun
+    ? badgeDefs.map(([key, label]) => {
+        const n = (lastRun[key] || []).length;
+        return `<button type="button" class="ds-badge ${n ? "badge-env" : "badge-unset"}" ${n ? "" : "disabled"}
+                  onclick="toggleFileSourceDrawer('${row.id}', '${key}')" title="${_esc(label)} — click to filter the drawer below">
+                  ${_esc(label)} ${n}
+                </button>`;
+      }).join(" ")
+    : `<span style="color:var(--ds-text-muted)">No ingest runs yet</span>`;
+
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
+    <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Certificate</span>
+    <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
+    <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Last run</span>
+    <span class="ds-src__fact-v">${badgesHtml}</span>
+  </div>
+  <div class="ds-filesource-drawer" id="ds-fs-drawer-${row.id}" hidden></div>`;
+}
+
+/* Segmented switch: click a badge, see that category's itemized rows below
+   it; click the same one again to close. One category open at a time. */
+function toggleFileSourceDrawer(connId, category) {
+  const el = document.getElementById(`ds-fs-drawer-${connId}`);
+  if (!el) return;
+  const fs = (SOURCE_PIPELINES[connId] || {}).file_source;
+  const lastRun = fs && fs.last_run;
+  if (!lastRun) { el.hidden = true; return; }
+  if (el.dataset.category === category && !el.hidden) {
+    el.hidden = true;
+    delete el.dataset.category;
+    return;
+  }
+  const rows = lastRun[category] || [];
+  el.dataset.category = category;
+  el.hidden = false;
+  el.innerHTML = rows.length
+    ? `<ul class="ds-filesource-drawer__list">${rows.map((r) =>
+        `<li><code>${_esc(r.doc_id || "")}</code> — ${_esc(r.reason || "")}</li>`
+      ).join("")}</ul>`
+    : `<div class="ds-empty">Nothing in this category in the last run.</div>`;
 }
 
 function _connectionCardHtml(row) {
@@ -1717,6 +2063,8 @@ function _connectionCardHtml(row) {
       <span class="ds-src__fact-v">Registered against this connector, not against a stored connection.</span>
       <span class="ds-src__fact-a"><a class="btn btn-secondary" href="/admin/tables">View tables</a></span>
     </div>`
+    : row.source_type === "sharepoint"
+    ? _sharepointFactsHtml(row)
     : `
     <div class="ds-src__fact">
       <span class="ds-src__fact-k" title="Where Agnes reads this project's storage token from.">Storage token</span>
@@ -4416,9 +4764,18 @@ document.getElementById("ds-add-btn").addEventListener("click", () => openWizard
 document.getElementById("ds-wizard-close").addEventListener("click", closeWizard);
 document.getElementById("ds-wizard-cancel").addEventListener("click", closeWizard);
 
-// Step 1: the connector picker swaps the connect form.
+// Step 1: the connector picker swaps the connect form. SharePoint runs its
+// own drawer (own 3-step flow, own endpoints) rather than a form inside this
+// one — picking it closes this wizard and opens that one instead.
 document.querySelectorAll("[data-wsrc]").forEach((opt) => {
-  opt.addEventListener("click", () => _setWizSource(opt.dataset.wsrc));
+  opt.addEventListener("click", () => {
+    if (opt.dataset.wsrc === "sharepoint") {
+      closeWizard();
+      openSpWizard();
+      return;
+    }
+    _setWizSource(opt.dataset.wsrc);
+  });
 });
 
 // Step 1 primary: what "continue" means depends on the connector.
@@ -4654,6 +5011,482 @@ document.addEventListener("keydown", function (e) {
 // entry path that needs it most.
 loadConnections().then(() => {
   if (new URLSearchParams(window.location.search).has("add")) openWizard();
+});
+</script>
+
+{# ── SharePoint connect wizard script (spec 2026-08-27 §13.2) ───────────
+   Self-contained: its own state, its own `sp*`-prefixed functions, no
+   sharing with the table wizard above beyond the drawer chrome and the
+   picker tile that opens it (openSpWizard, wired near the top of the
+   previous script block). #}
+<script>
+const SP_CONN_API = "/api/admin/source-connections";
+const SP_API = "/api/admin/sharepoint/connections";
+const SP_GROUPS_API = "/api/admin/groups";
+const SP_DEFAULT_CERT_ENV = "SHAREPOINT_CERT_PRIVATE_KEY";
+
+let spConnId = null;
+let spCertChoice = "upload";
+let spLevel = { site_id: null, drive_id: null };
+let spCrumbs = [];        // [{label, site_id, drive_id}]
+let spItems = [];         // current level's tree items
+let spScopes = {};        // source_scope_id -> scope row (server shape, incl. no_group_warning)
+let spGroups = null;      // cached [{id, name}]
+let spPendingGroups = {}; // source_scope_id -> Set(group_id), locally ticked but not yet applied
+
+function spEsc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function spApi(url, opts) {
+  opts = opts || {};
+  opts.credentials = "include";
+  if (opts.body && typeof opts.body !== "string") {
+    opts.body = JSON.stringify(opts.body);
+    opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  }
+  return fetch(url, opts).then((r) => {
+    if (!r.ok) {
+      return r.json().catch(() => ({})).then((b) => {
+        const d = b && b.detail;
+        const msg = d && typeof d === "object" ? (d.message || d.error || ("HTTP " + r.status))
+                                                 : (d || ("HTTP " + r.status));
+        const err = new Error(msg);
+        err.detail = d;
+        err.status = r.status;
+        throw err;
+      });
+    }
+    return r.status === 204 ? null : r.json();
+  });
+}
+
+/* ── Open / close / steps ─────────────────────────────────────────────── */
+
+function openSpWizard() {
+  spConnId = null;
+  spCertChoice = "upload";
+  spLevel = { site_id: null, drive_id: null };
+  spCrumbs = [];
+  spItems = [];
+  spScopes = {};
+  spGroups = null;
+  spPendingGroups = {};
+
+  document.getElementById("spw-name").value = "";
+  document.getElementById("spw-tenant").value = "";
+  document.getElementById("spw-client").value = "";
+  document.getElementById("spw-cert-pem").value = "";
+  document.getElementById("spw-cert-env-name").value = "";
+  document.getElementById("spw-cert-status").style.display = "none";
+  document.getElementById("spw-connect-error").style.display = "none";
+  spSetCertChoice("upload");
+  spGoStep(1);
+
+  const sel = document.getElementById("spw-existing-select");
+  spApi(SP_CONN_API + "?source_type=sharepoint").then((rows) => {
+    rows = Array.isArray(rows) ? rows : [];
+    const existing = document.getElementById("spw-existing");
+    if (!rows.length) { existing.hidden = true; return; }
+    sel.innerHTML = rows.map((c) => `<option value="${spEsc(c.id)}">${spEsc(c.name || c.id)}</option>`).join("");
+    _syncDropdownRebuild(sel);
+    existing.hidden = false;
+  }).catch(() => { document.getElementById("spw-existing").hidden = true; });
+
+  document.getElementById("sp-wizard-overlay").classList.add("show");
+  document.body.style.overflow = "hidden";
+  setTimeout(() => document.getElementById("spw-tenant").focus({ preventScroll: true }), 60);
+}
+
+function closeSpWizard() {
+  document.getElementById("sp-wizard-overlay").classList.remove("show");
+  document.body.style.overflow = "";
+}
+
+function spGoStep(step) {
+  document.querySelectorAll("#sp-wizard-overlay [data-spw-pane]").forEach((p) =>
+    p.classList.toggle("is-on", p.dataset.spwPane === String(step)));
+  document.querySelectorAll("#sp-wizard-overlay [data-spw-step]").forEach((b) => {
+    const n = Number(b.dataset.spwStep);
+    b.classList.toggle("is-now", n === step);
+    b.classList.toggle("is-done", n < step);
+  });
+  document.getElementById("spw-connect-btn").style.display = step === 1 ? "" : "none";
+  document.getElementById("spw-scope-continue-btn").style.display = step === 2 ? "" : "none";
+  document.getElementById("spw-finish-btn").style.display = step === 3 ? "" : "none";
+  document.getElementById("spw-done-btn").style.display = "none";
+  document.getElementById("spw-body").scrollTop = 0;
+}
+
+function spEnableStep(n) {
+  document.querySelector(`#sp-wizard-overlay [data-spw-step="${n}"]`).disabled = false;
+}
+
+/* ── Step 1: connect ──────────────────────────────────────────────────── */
+
+function spSetCertChoice(choice) {
+  spCertChoice = choice;
+  document.getElementById("spw-cert-choice").value = choice;
+  document.getElementById("spw-cert-upload").style.display = choice === "upload" ? "" : "none";
+  document.getElementById("spw-cert-env").style.display = choice === "env" ? "" : "none";
+}
+document.getElementById("spw-cert-choice").addEventListener("change", (e) => spSetCertChoice(e.target.value));
+
+function spConnectErr(msg) {
+  const el = document.getElementById("spw-connect-error");
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+document.getElementById("spw-existing-btn").addEventListener("click", () => {
+  const id = document.getElementById("spw-existing-select").value;
+  if (!id) return;
+  spConnId = id;
+  spEnableStep(2);
+  spEnableStep(3);
+  spGoStep(2);
+  spLevel = { site_id: null, drive_id: null };
+  spCrumbs = [];
+  spLoadScopesThenTree();
+});
+
+document.getElementById("spw-connect-btn").addEventListener("click", () => {
+  const tenant = document.getElementById("spw-tenant").value.trim();
+  const client = document.getElementById("spw-client").value.trim();
+  document.getElementById("spw-connect-error").style.display = "none";
+  if (!tenant || !client) {
+    spConnectErr("Tenant ID and Client ID are both required.");
+    return;
+  }
+  const name = document.getElementById("spw-name").value.trim() || `SharePoint (${tenant})`;
+  const config = { tenant_id: tenant, client_id: client };
+  if (spCertChoice === "env") {
+    const envName = document.getElementById("spw-cert-env-name").value.trim();
+    if (envName) config.cert_private_key_env = envName;
+  }
+
+  const btn = document.getElementById("spw-connect-btn");
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
+
+  spApi(SP_CONN_API, { method: "POST", body: { name: name, source_type: "sharepoint", config: config } })
+    .then((row) => {
+      spConnId = row.id;
+      if (spCertChoice === "upload") {
+        const pem = document.getElementById("spw-cert-pem").value.trim();
+        if (!pem) return Promise.resolve(row);
+        return spApi(`${SP_CONN_API}/${encodeURIComponent(row.id)}/secret`, {
+          method: "PUT", body: { value: pem, kind: "storage" },
+        }).then(() => row);
+      }
+      return row;
+    })
+    .then(() => {
+      btn.disabled = false;
+      btn.textContent = "Connect & validate";
+      spEnableStep(2);
+      spEnableStep(3);
+      spLevel = { site_id: null, drive_id: null };
+      spCrumbs = [];
+      spGoStep(2);
+      spLoadScopesThenTree();
+    })
+    .catch((e) => {
+      btn.disabled = false;
+      btn.textContent = "Connect & validate";
+      spConnectErr("Could not save the connection: " + e.message);
+    });
+});
+
+/* ── Step 2: scope (folder tree) ──────────────────────────────────────── */
+
+function spTreeErr(msg) {
+  const el = document.getElementById("spw-tree-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+function spLoadScopesThenTree() {
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`).then((body) => {
+    spScopes = {};
+    (body.items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
+  }).catch(() => { spScopes = {}; }).then(spLoadTree);
+}
+
+function spLoadTree() {
+  spTreeErr("");
+  document.getElementById("spw-tree").innerHTML = '<div class="ds-loading">Loading…</div>';
+  spRenderCrumbs();
+  const params = new URLSearchParams();
+  if (spLevel.site_id) params.set("site_id", spLevel.site_id);
+  if (spLevel.drive_id) params.set("drive_id", spLevel.drive_id);
+  const qs = params.toString();
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree${qs ? "?" + qs : ""}`)
+    .then((body) => {
+      spItems = body.items || [];
+      spRenderTree(body.level);
+    })
+    .catch((e) => {
+      spItems = [];
+      document.getElementById("spw-tree").innerHTML = "";
+      if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
+        spTreeErr("No certificate configured yet — " + e.detail.message);
+      } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
+        spTreeErr("SharePoint did not answer: " + e.detail.message);
+      } else {
+        spTreeErr("Could not load the folder tree: " + e.message);
+      }
+    });
+}
+
+function spRenderCrumbs() {
+  const nav = document.getElementById("spw-crumbs");
+  const parts = [{ label: "Sites", site_id: null, drive_id: null }].concat(spCrumbs);
+  nav.innerHTML = parts.map((c, i) => {
+    const last = i === parts.length - 1;
+    const btn = `<button type="button" data-spw-crumb="${i}" ${last ? "disabled" : ""}>${spEsc(c.label)}</button>`;
+    return i === 0 ? btn : `<span class="sep">/</span>${btn}`;
+  }).join("");
+  nav.querySelectorAll("[data-spw-crumb]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const i = Number(b.dataset.spwCrumb);
+      const target = ([{ site_id: null, drive_id: null }].concat(spCrumbs))[i];
+      spCrumbs = spCrumbs.slice(0, i);
+      spLevel = { site_id: target.site_id, drive_id: target.drive_id };
+      spLoadTree();
+    });
+  });
+}
+
+function spDisplayPath(name) {
+  return spCrumbs.map((c) => c.label).concat([name]).join(" / ");
+}
+
+function spRenderTree(level) {
+  const host = document.getElementById("spw-tree");
+  if (!spItems.length) {
+    host.innerHTML = '<div class="sp-tree__row"><span class="sp-tree__name"><span class="leaf">Nothing here.</span></span></div>';
+    return;
+  }
+  const navigable = level === "sites" || level === "drives"; // one level per call — items (folders) are leaves
+  host.innerHTML = spItems.map((item) => {
+    const scope = spScopes[item.id];
+    const checked = !!scope;
+    const anon = scope ? !!scope.anonymize : false;
+    const path = spDisplayPath(item.name);
+    const nameHtml = navigable
+      ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spEsc(item.name)}</button>`
+      : `<span class="leaf">${spEsc(item.name)}</span>`;
+    const badge = scope && scope.collection
+      ? `<span class="sp-badge${anon ? " sp-badge--anon" : ""}">&rarr; ${spEsc(scope.collection.slug)}${anon ? " · anon" : ""}</span>`
+      : "";
+    return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}">` +
+      `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
+      `<span class="sp-tree__name">${nameHtml}</span>` +
+      `<label class="sp-tree__anon"><input type="checkbox" data-spw-anon="${spEsc(item.id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
+      badge +
+      `</div>`;
+  }).join("");
+
+  host.querySelectorAll("[data-spw-drill]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const id = b.dataset.spwDrill;
+      const name = b.dataset.spwName;
+      spCrumbs = spCrumbs.concat([level === "sites"
+        ? { label: name, site_id: id, drive_id: null }
+        : { label: name, site_id: spLevel.site_id, drive_id: id }]);
+      spLevel = level === "sites" ? { site_id: id, drive_id: null } : { site_id: spLevel.site_id, drive_id: id };
+      spLoadTree();
+    });
+  });
+  host.querySelectorAll("[data-spw-select]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSelectToggle(cb));
+  });
+  host.querySelectorAll("[data-spw-anon]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnAnonToggle(cb));
+  });
+}
+
+function spOnSelectToggle(cb) {
+  const id = cb.dataset.spwSelect;
+  const row = cb.closest("[data-spw-item]");
+  const path = row.dataset.spwPath;
+  const anonBox = row.querySelector("[data-spw-anon]");
+  if (cb.checked) {
+    anonBox.disabled = false;
+    spConfirmScope(id, path, anonBox.checked);
+  } else {
+    anonBox.disabled = true;
+    spRemoveScope(id);
+  }
+}
+
+function spOnAnonToggle(cb) {
+  const id = cb.dataset.spwAnon;
+  if (!spScopes[id]) return; // not selected yet — nothing to update server-side
+  const row = cb.closest("[data-spw-item]");
+  spConfirmScope(id, row.dataset.spwPath, cb.checked);
+}
+
+function spConfirmScope(sourceScopeId, displayPath, anonymize) {
+  spTreeErr("");
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
+    method: "POST",
+    body: { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
+  }).then((scope) => {
+    spScopes[sourceScopeId] = scope;
+    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+  }).catch((e) => {
+    spTreeErr("Could not confirm that scope: " + e.message);
+    spLoadTree(); // resync checkbox state with the server
+  });
+}
+
+function spRemoveScope(sourceScopeId) {
+  spTreeErr("");
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes?source_scope_id=${encodeURIComponent(sourceScopeId)}`, {
+    method: "DELETE",
+  }).then(() => {
+    delete spScopes[sourceScopeId];
+    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+  }).catch((e) => {
+    spTreeErr("Could not remove that scope: " + e.message);
+    spLoadTree();
+  });
+}
+
+document.getElementById("spw-scope-continue-btn").addEventListener("click", () => {
+  spGoStep(3);
+  spLoadShare();
+});
+
+/* ── Step 3: share preview ────────────────────────────────────────────── */
+
+function spShareErr(msg) {
+  const el = document.getElementById("spw-share-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+function spLoadGroups() {
+  if (spGroups) return Promise.resolve(spGroups);
+  return spApi(SP_GROUPS_API).then((body) => {
+    spGroups = Array.isArray(body) ? body : (body && body.groups) || [];
+    return spGroups;
+  }).catch(() => { spGroups = []; return spGroups; });
+}
+
+function spLoadShare() {
+  document.getElementById("spw-corpus-map-wrap").hidden = false;
+  document.getElementById("spw-corpus-map-link").href = `${SP_API}/${encodeURIComponent(spConnId)}/corpus-map`;
+  document.getElementById("spw-share-rows").innerHTML = '<div class="ds-loading">Loading…</div>';
+  Promise.all([
+    spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`),
+    spLoadGroups(),
+  ]).then(([body]) => {
+    const items = body.items || [];
+    (items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
+    spRenderShare(items);
+  }).catch((e) => {
+    document.getElementById("spw-share-rows").innerHTML = "";
+    spShareErr("Could not load the share preview: " + e.message);
+  });
+}
+
+function spRenderShare(items) {
+  const host = document.getElementById("spw-share-rows");
+  if (!items.length) {
+    host.innerHTML = '<div class="ds-empty">No scopes confirmed yet — go back to step 2 and pick at least one.</div>';
+    return;
+  }
+  host.innerHTML = items.map((s) => {
+    const pending = spPendingGroups[s.source_scope_id] || new Set(s.group_ids || []);
+    spPendingGroups[s.source_scope_id] = pending;
+    const anonBadge = s.anonymize ? '<span class="sp-badge sp-badge--anon">anonymized</span>' : "";
+    const collBadge = s.collection ? `<span class="sp-badge">${spEsc(s.collection.name)}</span>` : "";
+    const noGroup = pending.size === 0;
+    const warn = noGroup ? '<span class="sp-warn">&#9888; indexed but invisible — no group yet</span>' : "";
+    const groupsHtml = (spGroups || []).map((g) => {
+      const on = pending.has(g.id);
+      return `<label><input type="checkbox" data-spw-share-group="${spEsc(s.source_scope_id)}" value="${spEsc(g.id)}"${on ? " checked" : ""}> ${spEsc(g.name)}</label>`;
+    }).join("") || '<span class="ds-drawer__opt">No groups yet — create one in <a href="/admin/access">Access</a>.</span>';
+    return `<div class="sp-share-row" data-spw-share-row="${spEsc(s.source_scope_id)}">` +
+      `<div class="sp-share-row__main">` +
+      `<div class="sp-share-row__title">${spEsc(s.display_path)}</div>` +
+      `<div class="sp-share-row__badges">${collBadge}${anonBadge}${warn}</div>` +
+      `<div class="sp-share-row__groups">${groupsHtml}</div>` +
+      `</div></div>`;
+  }).join("");
+  host.querySelectorAll("[data-spw-share-group]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const id = cb.dataset.spwShareGroup;
+      const set = spPendingGroups[id] || new Set();
+      if (cb.checked) set.add(cb.value); else set.delete(cb.value);
+      spPendingGroups[id] = set;
+      // Re-render just the warning state without a round trip.
+      const row = cb.closest("[data-spw-share-row]");
+      const warnEl = row.querySelector(".sp-warn");
+      const nowEmpty = set.size === 0;
+      if (warnEl && !nowEmpty) warnEl.remove();
+      if (!warnEl && nowEmpty) {
+        row.querySelector(".sp-share-row__badges").insertAdjacentHTML(
+          "beforeend", '<span class="sp-warn">&#9888; indexed but invisible — no group yet</span>');
+      }
+    });
+  });
+}
+
+document.getElementById("spw-finish-btn").addEventListener("click", () => {
+  spShareErr("");
+  const btn = document.getElementById("spw-finish-btn");
+  btn.disabled = true;
+  btn.textContent = "Sharing…";
+  const calls = Object.keys(spScopes).map((id) => {
+    const s = spScopes[id];
+    const groupIds = Array.from(spPendingGroups[id] || []);
+    return spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
+      method: "POST",
+      body: {
+        source_scope_id: id, display_path: s.display_path, anonymize: !!s.anonymize, group_ids: groupIds,
+      },
+    });
+  });
+  Promise.allSettled(calls).then((results) => {
+    btn.disabled = false;
+    btn.textContent = "Share & finish";
+    const failures = results.filter((r) => r.status === "rejected").length;
+    if (failures) {
+      spShareErr(`${failures} scope(s) could not be shared. The rest were applied — try again for the rest.`);
+      spLoadShare();
+      return;
+    }
+    btn.style.display = "none";
+    document.getElementById("spw-done-btn").style.display = "";
+    loadConnections();
+  });
+});
+
+document.getElementById("spw-done-btn").addEventListener("click", closeSpWizard);
+document.getElementById("sp-wizard-close").addEventListener("click", closeSpWizard);
+document.getElementById("spw-cancel").addEventListener("click", closeSpWizard);
+document.querySelectorAll("#sp-wizard-overlay [data-spw-close]").forEach((el) => {
+  el.addEventListener("click", closeSpWizard);
+});
+document.querySelectorAll("#sp-wizard-overlay [data-spw-step]").forEach((b) => {
+  b.addEventListener("click", () => {
+    if (b.disabled) return;
+    const n = Number(b.dataset.spwStep);
+    spGoStep(n);
+    if (n === 2) spLoadScopesThenTree();
+    if (n === 3) spLoadShare();
+  });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (document.getElementById("sp-wizard-overlay").classList.contains("show")) closeSpWizard();
 });
 </script>
 {% endblock %}

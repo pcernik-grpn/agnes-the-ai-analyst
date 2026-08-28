@@ -1189,6 +1189,63 @@ class FactsPgRepository:
                 out[corpus_id] = int(row[0]) if row else 0
         return out
 
+    def _visible_edges_for_corpus_cte(self, is_admin: bool) -> str:
+        """SQL for an ``edge_visible(subject_id)`` CTE over EDGES evidenced
+        by ``:corpus_id`` — the edge analogue of
+        :meth:`_visible_facts_for_corpus_cte`, used only by
+        :meth:`count_visible_edges_for_collections` (the source card's
+        pipeline-strip "edges" number, spec §13.2). Unlike a fact, an edge's
+        own claim IS its only evidence path — there is no endpoint-claim
+        fallback — so this candidacy/visibility rule is simpler: any_evidence
+        semantics only (matching :meth:`neighbors`'s own edge-visibility
+        rule — an edge needs its OWN readable claim, never inferred from its
+        endpoints), withheld (``wrong``/``restricted``) edges excluded,
+        ``revealed`` ones included unconditionally. Returned as a fragment
+        (no leading ``WITH``); every caller must bind ``:corpus_id`` and,
+        when ``is_admin`` is False, ``:readable``."""
+        vis = self._visibility_predicate("c2.corpus_id", is_admin)
+        return f"""
+            edge_candidates AS (
+                SELECT DISTINCT c.edge_id AS subject_id
+                FROM claims c
+                WHERE c.corpus_id = :corpus_id AND c.edge_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM corrections co
+                    WHERE co.subject_kind = 'edge' AND co.subject_id = c.edge_id
+                      AND co.verdict IN ('wrong', 'restricted')
+                  )
+            ),
+            edge_revealed_ids AS (
+                SELECT subject_id FROM corrections WHERE subject_kind = 'edge' AND verdict = 'revealed'
+            ),
+            edge_visible AS (
+                SELECT cand.subject_id
+                FROM edge_candidates cand
+                WHERE cand.subject_id IN (SELECT subject_id FROM edge_revealed_ids)
+                   OR EXISTS (SELECT 1 FROM claims c2 WHERE c2.edge_id = cand.subject_id AND {vis})
+            )
+            """
+
+    def count_visible_edges_for_collections(self, caller, corpus_ids: List[str]) -> Dict[str, int]:
+        """Caller-scoped edge count per collection — added alongside
+        :meth:`count_visible_facts_for_collections` for the source card's
+        pipeline-strip "edges" number (spec §13.2); there was no edge
+        equivalent of that fact counter yet. Same batch-resolves-readable-
+        once shape."""
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        base: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
+        sql = sa.text(f"WITH {self._visible_edges_for_corpus_cte(is_admin)} SELECT COUNT(*) FROM edge_visible")
+
+        out: Dict[str, int] = {}
+        if not corpus_ids:
+            return out
+        with self._engine.connect() as conn:
+            for corpus_id in corpus_ids:
+                row = conn.execute(sql, {**base, "corpus_id": corpus_id}).first()
+                out[corpus_id] = int(row[0]) if row else 0
+        return out
+
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
         (spec §13.2 "Collection detail"): fact count by type, a paged list of

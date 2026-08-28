@@ -3000,6 +3000,38 @@ KNOWN_UNTESTED = {
     # `proxy_app` docstring for why) and so never reaches `all_routes`
     # here at all. Behaviour covered in tests/test_data_apps_proxy.py.
     "GET /apps/{slug}",
+    # SharePoint connect wizard admin API (spec 2026-08-27 §13.2) — live
+    # Graph folder-tree browse + scope->collection confirmation. All state
+    # lives in `source_connections.config` (existing JSON column, both
+    # backends) plus ordinary `file_corpora`/`resource_grants` rows (existing
+    # tables) — no new schema surface to verify per-backend. Auth matrix,
+    # typed cert-missing/Graph-error responses (Graph mocked via
+    # httpx.MockTransport), scope->collection idempotency, the no-group
+    # warning, and the corpus-map producer handoff are all covered by
+    # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
+    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Ontology builder (spec §13.2) — the admin builder-shell page and its
+    # draft CRUD + state-machine actions + dry-run are covered directly by
+    # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and
+    # tests/db_pg/test_ontology_admin_pg.py (auth matrix, flag gate, DuckDB
+    # typed-501, Save-only-write, mocked-LLM dry-run); not duplicated here.
+    "GET /admin/ontology",
+    "GET /api/admin/ontology/drafts",
+    "POST /api/admin/ontology/drafts",
+    "GET /api/admin/ontology/drafts/{draft_id}",
+    "PUT /api/admin/ontology/drafts/{draft_id}",
+    "DELETE /api/admin/ontology/drafts/{draft_id}",
+    "POST /api/admin/ontology/drafts/{draft_id}/import",
+    "POST /api/admin/ontology/drafts/{draft_id}/save",
+    "POST /api/admin/ontology/dry-run",
+    # Persisted ingest-run reports for the source card (spec §7.2/§13.2) —
+    # covered by tests/db_pg/test_facts_ingest_runs_pg.py + the source-card
+    # PG test; the write happens post-ingest in tests/db_pg/test_facts_ingest_pg.py.
+    "GET /api/facts/ingest-runs",
 }
 
 

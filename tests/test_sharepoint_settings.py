@@ -120,3 +120,116 @@ def test_missing_identity_fields_are_reported_before_any_credential_lookup(no_va
         resolve_sharepoint_settings({"id": "conn-1", "source_type": "sharepoint", "config": {}})
 
     assert "tenant_id" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# credential_set_at — the source card's certificate row (spec §13.2) shows
+# WHEN a vault credential was set, never the value.
+# ---------------------------------------------------------------------------
+
+
+def test_vault_credential_carries_its_set_date(monkeypatch):
+    import datetime
+
+    stamp = datetime.datetime(2026, 8, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(
+        "connectors.sharepoint.settings._vault_secret",
+        lambda connection_id: PEM_FROM_VAULT,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "connectors.sharepoint.settings._vault_secret_updated_at",
+        lambda connection_id: stamp,
+        raising=False,
+    )
+
+    settings = resolve_sharepoint_settings(_row())
+
+    assert settings.credential_source == "vault"
+    assert settings.credential_set_at == stamp
+
+
+def test_env_credential_has_no_set_date(no_vault, monkeypatch):
+    """An env var carries no timestamp of its own — the field stays honest
+    (``None``) rather than inventing one from, say, process start time."""
+    monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, PEM_FROM_ENV)
+    settings = resolve_sharepoint_settings(_row())
+
+    assert settings.credential_source == "env"
+    assert settings.credential_set_at is None
+
+
+def test_the_repos_string_stamp_becomes_a_real_datetime(monkeypatch):
+    """The test above monkeypatches ``_vault_secret_updated_at`` itself, so it
+    never crosses the seam that actually matters: BOTH ``connection_secrets``
+    repos (``app/secrets_vault.py`` and its ``_pg`` sibling) return
+    ``str(row[0])``, while ``credential_set_at`` is annotated
+    ``Optional[datetime]`` and its one consumer — the source card's
+    certificate cell — calls ``.isoformat()`` on it. A string reached that
+    call, raised ``AttributeError`` into a handler that swallows it, and a
+    working vault certificate was rendered as unconfigured.
+    """
+    import datetime
+
+    class _StringRepo:
+        def updated_at(self, connection_id):
+            # Exactly what both backends produce: str() of a timestamp.
+            return "2026-08-20 12:00:00"
+
+    monkeypatch.setattr(
+        "connectors.sharepoint.settings._vault_secret",
+        lambda connection_id: PEM_FROM_VAULT,
+        raising=False,
+    )
+    monkeypatch.setattr("src.repositories.connection_secrets_repo", lambda: _StringRepo())
+
+    settings = resolve_sharepoint_settings(_row())
+
+    assert settings.credential_source == "vault"
+    assert isinstance(settings.credential_set_at, datetime.datetime)
+    assert settings.credential_set_at.isoformat().startswith("2026-08-20T12:00:00")
+
+
+def test_an_unparseable_stamp_degrades_to_none_not_a_broken_card(monkeypatch):
+    """Same posture as every other failure in this lookup: the card would
+    rather show a blank set-date than lose a working credential."""
+
+    class _JunkRepo:
+        def updated_at(self, connection_id):
+            return "not a timestamp"
+
+    monkeypatch.setattr(
+        "connectors.sharepoint.settings._vault_secret",
+        lambda connection_id: PEM_FROM_VAULT,
+        raising=False,
+    )
+    monkeypatch.setattr("src.repositories.connection_secrets_repo", lambda: _JunkRepo())
+
+    settings = resolve_sharepoint_settings(_row())
+
+    assert settings.credential_source == "vault"
+    assert settings.credential_set_at is None
+
+
+def test_vault_set_date_lookup_failure_degrades_to_none(monkeypatch):
+    """A raising ``connection_secrets_repo()`` (no vault configured, or a
+    lookup error) must not turn a resolvable credential into a resolution
+    failure — the tolerant try/except inside ``_vault_secret_updated_at``
+    (same posture as ``_vault_secret`` itself) degrades to "set-date
+    unknown", never propagates."""
+
+    class _BoomRepo:
+        def updated_at(self, connection_id):
+            raise RuntimeError("vault unavailable")
+
+    monkeypatch.setattr(
+        "connectors.sharepoint.settings._vault_secret",
+        lambda connection_id: PEM_FROM_VAULT,
+        raising=False,
+    )
+    monkeypatch.setattr("src.repositories.connection_secrets_repo", lambda: _BoomRepo())
+
+    settings = resolve_sharepoint_settings(_row())
+
+    assert settings.credential_source == "vault"
+    assert settings.credential_set_at is None

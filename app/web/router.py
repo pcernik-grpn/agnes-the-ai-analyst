@@ -7141,7 +7141,11 @@ async def admin_data_sources_page(
     # fact. Status lives at /admin/semantic-layer.
     # Per-connection pipeline strip: connected → synced → semantic → feeding
     # whom, in one glance on each source card. See `_source_pipelines`.
-    inventory = _source_inventory()
+    # `user` is threaded through ONLY for the sharepoint file-source cell
+    # (`_sharepoint_pipeline_cell`) — its facts/edges counts are genuinely
+    # caller-scoped (spec §5), and this admin's own identity is what proves
+    # them admin-omniscient; every other cell is caller-independent.
+    inventory = _source_inventory(user=user)
     ctx["source_pipelines"] = inventory["pipelines"]
     # Connectors that are live on this instance but keep no connection row —
     # BigQuery, Jira, uploaded files. Rendered as cards in the SAME list, so
@@ -7216,16 +7220,20 @@ _DERIVED_SOURCES: dict[str, dict] = {
 }
 
 
-def _source_pipelines() -> dict:
+def _source_pipelines(user: dict | None = None) -> dict:
     """The pipeline strip for every source card, keyed by connection id.
 
     Thin wrapper over `_source_inventory()` — kept because the strip is the
-    part other callers and the guards name.
+    part other callers and the guards name. ``user`` is optional and used
+    ONLY by the sharepoint file-source cell's caller-scoped facts/edges
+    counts (see `_sharepoint_pipeline_cell`) — every other cell is
+    caller-independent, so every pre-existing call site (including every
+    test that calls this with no arguments) is unaffected.
     """
-    return _source_inventory()["pipelines"]
+    return _source_inventory(user=user)["pipelines"]
 
 
-def _source_inventory() -> dict:
+def _source_inventory(user: dict | None = None) -> dict:
     """Every source on this instance: its pipeline strip, and the cards that
     have no connection row of their own.
 
@@ -7489,6 +7497,14 @@ def _source_inventory() -> dict:
                     "title": "Databricks queries run on the SQL warehouse. Remote results are capped at the scan limit and materialized rows are refused above the materialize cap. Editable in server config.",
                 }
 
+        # ── File source (sharepoint): a DIFFERENT pipeline shape entirely —
+        # crawl → text extraction + scan transcription → facts → graph, not
+        # tables/sync (spec §13.2 "Source card"). See
+        # `_sharepoint_pipeline_cell` for what each sub-block means and its
+        # honesty notes (placeholder cost, interim scope heuristic).
+        if stype == "sharepoint":
+            cells["file_source"] = _sharepoint_pipeline_cell(conn, user)
+
         # ── Feeds: packages holding this source's tables → groups granted →
         # people reached. The end of the chain the redesign cares about; a
         # source with tables in no package reads "0 packages", which is the
@@ -7516,6 +7532,181 @@ def _source_inventory() -> dict:
 
         out[cid] = cells
     return {"pipelines": out, "derived": derived}
+
+
+# Not a real cost model: Agnes has no visibility into the producer's LLM
+# extraction cost per item (that spend happens entirely outside this
+# instance, in the crawler's own pipeline). This constant only keeps the
+# source card's cost cell from being blank — spec §13.2 asks for "the
+# queue's cost in $" but the only honest input Agnes holds is a rejected/
+# deferred item COUNT from the last run report, not a $ figure. Replace once
+# the producer reports real per-item cost.
+_FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
+
+
+def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
+    """The file-source pipeline strip + card rows for a SharePoint connection
+    (spec §13.2 "Source card"): crawl → text extraction + scan transcription
+    → facts → graph counts, a queue-cost PLACEHOLDER (see the constant
+    above), the static schedule line, the certificate row (origin + set-date,
+    never the value), the identity-matching row, and the LAST persisted
+    ingest run's error badges — each carrying its itemized detail for the
+    admin's filtered drawer.
+
+    **"Scope collections" is an interim heuristic**
+    (`facts_ingest_runs_repo().distinct_corpus_ids()` — see that method's
+    own docstring): every collection this instance has EVER ingested facts
+    into, because there is no persisted connection → collection mapping yet
+    (the connect wizard's step 2 owns that; a sibling, independent effort).
+    Two sharepoint connections on one instance would not be told apart by
+    this alone — acceptable for a single-connection instance, named here so
+    it is not rediscovered as a surprise later.
+
+    **Error badge categories are a deliberate, narrower simplification** of
+    spec §13.2's illustrative four (unsupported type / model error / deleted
+    / rejected quote) — those live in the CRAWLER's own per-document error
+    log, which Agnes never receives. The three badges below are the ones
+    Agnes's own ingest run report actually carries: `rejected_quotes` (the
+    verbatim gate, spec §8, doing its job), `deferred` (a claim whose file
+    was not yet `indexed` — free retry once it is), and `protocol_errors`
+    (every OTHER `claims_rejected` reason — unresolved doc id, malformed
+    edge, alias type conflict, …).
+
+    Every sub-block degrades independently on its own `try/except` — a
+    repo call that raises (PG-only `RequiresPostgresBackend` on a
+    DuckDB-backed instance, a misconfigured certificate, no vault) yields a
+    partial/empty shape for that block, never a 500 for the whole page.
+    """
+    cell: dict[str, Any] = {}
+
+    scope_ids: list[str] = []
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        scope_ids = facts_ingest_runs_repo().distinct_corpus_ids()
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: could not resolve scope collections: %s", e)
+
+    # ── crawl / extract: corpus_files across scope collections, bucketed by
+    # processing_status (the five-state lifecycle: pending | processing |
+    # indexed | needs_review | rejected).
+    documents = 0
+    extracted: dict[str, int] = {}
+    if scope_ids:
+        try:
+            from src.repositories import corpus_files_repo
+
+            cf_repo = corpus_files_repo()
+            for scope_id in scope_ids:
+                for f in cf_repo.list_for_corpus(scope_id):
+                    documents += 1
+                    status = f.get("processing_status") or "pending"
+                    extracted[status] = extracted.get(status, 0) + 1
+        except Exception as e:
+            logger.warning("sharepoint pipeline cell: could not list corpus files: %s", e)
+    cell["crawl"] = {"documents": documents}
+    cell["extract"] = extracted
+
+    # ── facts / graph: caller-scoped (spec §5) — needs the real admin `user`
+    # this request authenticated as; with none supplied (a legacy call site)
+    # the numbers are simply unavailable, same "degrade, don't guess" rule.
+    facts_count = 0
+    edges_count = 0
+    if scope_ids and user is not None:
+        try:
+            from src.repositories import facts_repo
+
+            fr = facts_repo()
+            facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
+            edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
+        except Exception as e:
+            logger.debug("sharepoint pipeline cell: facts/edges counts unavailable: %s", e)
+    cell["graph"] = {"facts": facts_count, "edges": edges_count}
+
+    # ── the last persisted run report (see facts_ingest_runs_pg.py) — the
+    # error badges' source, and this cell's only input for the cost
+    # placeholder above.
+    last_run = None
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        runs = facts_ingest_runs_repo().list_recent(limit=1)
+        last_run = runs[0] if runs else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: run report history unavailable: %s", e)
+
+    if last_run is not None:
+        claims_rejected = last_run.get("claims_rejected") or []
+        deferred = last_run.get("deferred") or []
+        rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
+        protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
+        queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
+        cell["cost_estimate"] = {
+            "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
+            "placeholder": True,
+        }
+        cell["last_run"] = {
+            "id": last_run.get("id"),
+            "created_at": last_run.get("created_at"),
+            "rejected_quotes": rejected_quotes,
+            "deferred": deferred,
+            "protocol_errors": protocol_errors,
+        }
+    else:
+        cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
+        cell["last_run"] = None
+
+    # ── schedule: static text — the crawl runs externally, so this is
+    # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
+    # full check · extraction in its own lane" collapsed to one line here).
+    cell["schedule"] = {"text": "external producer · hourly delta"}
+
+    # ── certificate: origin + set-date from resolve_sharepoint_settings,
+    # NEVER the value (spec §13.2). A resolution error (missing identity
+    # fields, an unset/disallowed env var) is shown as its own message
+    # rather than raised — this is a status row, not a gate.
+    try:
+        from connectors.sharepoint.settings import resolve_sharepoint_settings
+
+        settings = resolve_sharepoint_settings(conn)
+        cell["certificate"] = {
+            "origin": settings.credential_source,
+            "env_name": settings.credential_env,
+            "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
+            "error": None,
+        }
+    except Exception as e:
+        # Logged, not just rendered: this block swallowed a real type bug
+        # (a str set-date reaching .isoformat()) for as long as its only
+        # signal was the word "unconfigured" on a card.
+        logger.warning(
+            "source card: sharepoint certificate row for connection %s failed to resolve",
+            conn.get("id"),
+            exc_info=True,
+        )
+        cell["certificate"] = {"origin": None, "env_name": None, "set_at": None, "error": str(e)}
+
+    # ── identity: grants across scope collections — "N groups matched /
+    # collections with no group", fail-closed (an ungranted collection is
+    # invisible to everyone, spec §13.1's "under-sharing looks like a bug"
+    # made visible as a count rather than discovered by an analyst).
+    groups_matched = 0
+    collections_no_group = 0
+    if scope_ids:
+        try:
+            from src.repositories import resource_grants_repo
+
+            by_collection: dict[str, set] = {}
+            for g in resource_grants_repo().list_all(resource_type="collection"):
+                if g["resource_id"] in scope_ids:
+                    by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
+            groups_matched = len({gid for gids in by_collection.values() for gid in gids})
+            collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
+        except Exception as e:
+            logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
+    cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
+
+    return cell
 
 
 def _bq_cap(key: str, default: int) -> int:
@@ -7855,6 +8046,32 @@ async def admin_semantic_layer_page(
     ctx["default_connection_id"] = default_id
     ctx["semantic_refresh_summary"] = summary
     return templates.TemplateResponse(request, "admin_semantic_layer.html", ctx)
+
+
+@router.get("/admin/ontology", response_class=HTMLResponse)
+async def admin_ontology_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Ontology builder (fact-graph-over-Collections §13.2) — a semantic
+    model authored through the shared builder shell: Create | Preview left,
+    numbered sections right, the right panel the source of truth, Save the
+    only write. Zero new navigation (spec §13.2) — the only entry point is
+    the link on ``/admin/semantic-layer``; this route carries no admin-nav
+    entry of its own.
+
+    When the ``facts`` flag is off, or the active backend is DuckDB (drafts
+    are PG-only, A3 ratchet — the builder cannot persist a draft without
+    Postgres), renders an explanatory empty state instead of 404ing, same
+    posture as ``/apps`` when ``data_apps`` is disabled.
+    """
+    from app.instance_config import feature_enabled
+    from src.repositories import use_pg
+
+    ctx = _build_context(request, user=user)
+    ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+    ctx["pg_backend"] = use_pg()
+    return templates.TemplateResponse(request, "ontology_builder.html", ctx)
 
 
 @router.get("/admin/database", response_class=HTMLResponse)

@@ -159,3 +159,40 @@ def test_corrections_put_empty_reason_is_422(facts_client):
         headers=_auth(facts_client["admin_token"]),
     )
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /api/facts/ingest-runs — persisted run reports (spec §7.2/§13.2), the
+# source card's data. Same DuckDB-side split as every other route on this
+# router: flag/auth/fail-clean here, real reads in
+# tests/db_pg/test_facts_ingest_runs_pg.py + the E2E extension in
+# tests/db_pg/test_facts_ingest_pg.py.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_runs_404s_when_flag_off(seeded_app):
+    r = seeded_app["client"].get("/api/facts/ingest-runs", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 404
+
+
+def test_ingest_runs_anon_401(facts_client):
+    r = facts_client["client"].get("/api/facts/ingest-runs")
+    assert r.status_code == 401
+
+
+def test_ingest_runs_requires_admin_not_just_any_caller(facts_client):
+    r = facts_client["client"].get("/api/facts/ingest-runs", headers=_auth(facts_client["analyst_token"]))
+    assert r.status_code == 403
+
+
+def test_ingest_runs_fails_clean_on_duckdb(facts_client):
+    r = facts_client["client"].get("/api/facts/ingest-runs", headers=_auth(facts_client["admin_token"]))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_ingest_runs_invalid_limit_is_422(facts_client):
+    r = facts_client["client"].get(
+        "/api/facts/ingest-runs", params={"limit": 0}, headers=_auth(facts_client["admin_token"])
+    )
+    assert r.status_code == 422
