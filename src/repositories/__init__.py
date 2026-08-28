@@ -153,6 +153,9 @@ __all__ = [
     "facts_repo",
     "ontology_drafts_repo",
     "facts_ingest_runs_repo",
+    # External SSO login (design 2026-08-28)
+    "sso_config_repo",
+    "user_external_identities_repo",
     # Agent registry (v103) — the Library's agent items
     "agents_repo",
     # Maintained digests (K4, #799)
@@ -164,7 +167,6 @@ __all__ = [
     # Data apps (hosted user web apps registry)
     "data_apps_repo",
     # Agent profiles + agent-as-API (v100)
-    "agents_repo",
     "llm_usage_repo",
     "idempotency_repo",
     # Agent webhooks + artifacts (v101, agent-api V1b)
@@ -566,6 +568,15 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "facts_ingest_runs": {
         PG: ("src.repositories.facts_ingest_runs_pg", "FactsIngestRunsPgRepository"),
     },
+    # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
+    # DuckDB backend. The singleton runtime config for the `sso` provider
+    # slot and the per-user external identity bindings it captures.
+    "sso_config": {
+        PG: ("src.repositories.sso_config_pg", "SsoConfigPgRepository"),
+    },
+    "user_external_identities": {
+        PG: ("src.repositories.user_external_identities_pg", "UserExternalIdentitiesPgRepository"),
+    },
     # agent registry (v103)
     "agents": {
         DUCKDB: ("src.repositories.agents", "AgentsRepository"),
@@ -941,6 +952,20 @@ def facts_ingest_runs_repo() -> Any:
     §7.2/§13.2 source card). PG-only — raises ``RequiresPostgresBackend``
     on a DuckDB-backed instance."""
     return _build("facts_ingest_runs")
+
+
+def sso_config_repo() -> Any:
+    """Singleton runtime config for the external SSO login (design
+    2026-08-28). PG-only — raises ``RequiresPostgresBackend`` on a
+    DuckDB-backed instance."""
+    return _build("sso_config")
+
+
+def user_external_identities_repo() -> Any:
+    """Per-user external identity bindings captured by the ``sso`` provider
+    (design 2026-08-28). PG-only — raises ``RequiresPostgresBackend`` on a
+    DuckDB-backed instance."""
+    return _build("user_external_identities")
 
 
 # Maintained digests (K4, #799)
