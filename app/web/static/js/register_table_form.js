@@ -409,6 +409,7 @@
     document.getElementById('rtfLocationRow').hidden = state.connector.browseMode !== 'location';
     document.getElementById('rtfManualAdd').hidden = false;
     document.getElementById('rtfConnectionPickerField').hidden = !state.connector.hasConnectionPicker;
+    _resetConfigureStep();
     _applyConnectivityWarning(sourceType);
 
     if (state.connector.browseMode === 'location') {
@@ -430,6 +431,38 @@
 
     goToStep('browse');
     modal.classList.add('is-open');
+  }
+
+  /** Clear every Configure-step control back to its blank/default state.
+   *
+   *  `close()` only drops the `is-open` class — the drawer's DOM (and so
+   *  every value typed into it) outlives the modal. Without this, registering
+   *  table B after table A opens on A's description, folder, schedule,
+   *  project, SQL, primary key, server-only checkbox and Keboola filter, and
+   *  `submit()` forwards them as if the operator had entered them.
+   *
+   *  Belongs on `open()` rather than `close()`: a reset on close depends on
+   *  the drawer having been closed through this function, and the browser's
+   *  own bfcache/restore can repopulate fields afterwards. Opening is the one
+   *  moment a clean form is actually required. */
+  function _resetConfigureStep() {
+    ['rtfViewName', 'rtfDescription', 'rtfFolder', 'rtfSyncSchedule', 'rtfProject',
+     'rtfCustomQuery', 'rtfPrimaryKey', 'rtfKbPartitionBy', 'rtfKbIncrementalWindowDays',
+     'rtfKbMaxHistoryDays', 'rtfKbInitialLoadChunkDays'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    var serverOnly = document.getElementById('rtfServerOnly');
+    if (serverOnly) serverOnly.checked = false;
+    ['rtfKbStrategy', 'rtfKbPartitionGranularity'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.selectedIndex = 0;
+    });
+    // The where-filters textarea is the builder's own source of truth: it
+    // re-hydrates from this value on the next attach, so leaving the previous
+    // table's JSON here would rebuild the previous table's filter rows.
+    var wf = document.getElementById('rtfKbWhereFilters');
+    if (wf) { wf.value = ''; wf.style.display = 'none'; }
   }
 
   function close() {

@@ -168,7 +168,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   is unchanged). A "Select all" checkbox keeps the onboarding one-click
   path fast — scoped to the rows the search filter leaves visible, and
   switching connection or dataset clears the previous source's checkmarks,
-  so nothing can be registered that the operator cannot see. Also fixes Keboola's "Custom SQL" registration mode, which
+  so nothing can be registered that the operator cannot see. Reopening the
+  drawer starts from a clean Configure step rather than the previous
+  registration's description / folder / schedule / SQL / primary key /
+  server-only / Keboola filter. Also fixes Keboola's "Custom SQL" registration mode, which
   422'd on every submit — a Keboola materialized row's `source_query` is a
   Storage API JSON filter, not SQL; the mode is renamed "Filtered export"
   and reuses the existing structured where_filters builder. Databricks has
