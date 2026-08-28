@@ -142,7 +142,6 @@ you produced — name the file in your answer rather than leaving the panel to
 speak for itself. Don't tell the user to open a path, and don't promise them a
 download button: you cannot see what controls the surface puts around a reply.
 
-
 ## Icons — never emoji
 
 **NEVER use emoji characters in a reply** — not in headings, not in lists, not

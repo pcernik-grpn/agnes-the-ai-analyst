@@ -313,9 +313,13 @@ def test_a_laptop_workspace_is_not_told_to_write_into_outputs():
     ``outputs/``, and the right answer is the path itself — so this section
     must stay inside the ``is_sandbox`` branch."""
     laptop = _collapse_ws(_rendered_server_default_claude_md(is_sandbox=False))
-    assert "Handing over a file" not in laptop, (
+    assert "Files you produce" not in laptop, (
         "the outputs/ handover rule is sandbox-only — on a laptop there is no collector "
         "and naming the path IS the delivery"
+    )
+    assert "outputs/" not in laptop, (
+        "assert on the directory too, not just the heading: a rename of the section would "
+        "otherwise let the sandbox-only rule leak into the laptop render unnoticed"
     )
 
 

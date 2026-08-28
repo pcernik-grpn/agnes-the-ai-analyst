@@ -156,20 +156,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   conversations resets the count and reloads an open drawer instead of
   leaving the previous chat's rows on screen with their old download links.
 
-- **The chat agent is now told where to leave a file it produces.** The
-  workspace prompt claimed the agent had "no way to hand the user a file" —
-  true when inline SVG was the only channel out, false since the session-files
-  panel shipped, and it actively steered the agent away from producing the
-  deliverable a user asked for. Replaced with a `Handing over a file` section
-  (sandbox surface only — on a laptop workspace the filesystem IS the user's
-  machine): write deliverables to `outputs/` under a descriptive filename,
-  never into `.claude/` or another dot-directory, name the file in the reply,
-  and don't promise a download control the agent cannot see. `outputs/` is the
-  one location all three collectors agree on — the agent-API harvest scans
-  `/work/outputs`, the engine's sandbox file browser lists the workspace tree
-  while filtering dot-directories, and the host walk lists the session dir —
-  so a skill that rendered into `.claude/skills/<name>/` produced a file no
-  surface could show. Mirrored across both prompt files
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
   (`app/initial_workspace_default/CLAUDE.md` and
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
