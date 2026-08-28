@@ -210,6 +210,35 @@ class TestDataAppsAllowSameOriginSwitch:
         assert sw.switch_value("data_apps_allow_same_origin") is True
 
 
+class TestExtractionSwitch:
+    """`extraction.enabled` (spec §7.5 / §16 step 7) gates the
+    `corpus-extraction` job kind's handler — locked in the panel because it
+    depends on deployment machinery the settings panel cannot satisfy (a
+    producer bundled into the `worker` image + the `extraction-worker`
+    compose service actually running), same rationale as `data_apps`."""
+
+    def test_identity_and_lock(self):
+        s = get_switch("extraction")
+        assert s.config_keys == ("extraction", "enabled")
+        assert s.env_var == "AGNES_EXTRACTION_ENABLED"
+        assert s.kind == "bool"
+        assert s.default is False
+        assert s.editable is False
+        assert s.lock_reason.strip()
+
+    def test_handler_gate_reads_the_registry(self, monkeypatch):
+        """The `corpus-extraction` handler's enabled-check goes through
+        `feature_enabled` with this switch's own config keys/env var — not
+        a hand-rolled `get_value` pair (sync-map: "new user-visible switch")."""
+        from app.instance_config import feature_enabled
+
+        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is False
+        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "1")
+        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is True
+
+
 class TestGetSwitch:
     def test_returns_the_entry(self):
         assert get_switch("chat").name == "chat"

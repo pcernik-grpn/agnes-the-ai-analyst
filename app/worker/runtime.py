@@ -741,12 +741,13 @@ async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
     """Run the worker runtime until cancelled.
 
     Starts the reaper task, then — for every lane :func:`selected_lanes`
-    returns (default: all three; see the module docstring and
-    ``AGNES_WORKER_LANES``) — that lane's own concurrency worth of slots,
-    and waits on all of them. Cancelling the enclosing task (the
-    ``canary_loop`` task-create/cancel pattern in ``app/main.py``'s
-    lifespan) cancels every child task too — ``asyncio.gather`` propagates
-    cancellation of its own awaiter to every task it's gathering. Before
+    returns (default: heavy + light only, extraction is opt-in; see the
+    module docstring and ``AGNES_WORKER_LANES``) — that lane's own
+    concurrency worth of slots, and waits on all of them. Cancelling the
+    enclosing task (the ``canary_loop`` task-create/cancel pattern in
+    ``app/main.py``'s lifespan) cancels every child task too —
+    ``asyncio.gather`` propagates cancellation of its own awaiter to every
+    task it's gathering. Before
     returning, performs one bounded drain of any handler still mid-flight
     (see module docstring).
 

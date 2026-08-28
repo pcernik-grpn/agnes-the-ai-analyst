@@ -107,9 +107,15 @@ distribution mirror, and the api-role write conversions) map onto:
   SAME resolution path the SharePoint admin UI uses) and shells out to
   the operator-configured producer (crawl -> convert -> anonymize ->
   extract -> ingest against ``POST /api/facts/ingest``, spec §7.2) as a
-  subprocess, under a bounded timeout, with secrets passed via the CHILD
-  PROCESS ENVIRONMENT — never argv, never logged (security playbook F7).
-  The producer itself (``keboola/cuesta-star-graph``) is adopted, not
+  subprocess, under a bounded timeout, with the resolved credentials passed
+  via the CHILD PROCESS ENVIRONMENT — never argv, never logged (security
+  playbook F7). That child env is NOT the full parent environment: only a
+  curated non-secret allowlist (+ any operator-opted-in
+  ``extraction.producer.env_passthrough``) plus the named SharePoint
+  credentials and the corpus id are forwarded — see
+  ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST``. No other instance secret ever
+  reaches this subprocess. The producer itself
+  (``keboola/cuesta-star-graph``) is adopted, not
   ported into this repo (spec §1 "Out of scope") — see
   ``_run_corpus_extraction`` below for exactly where that boundary is.
   Registered UNCONDITIONALLY (its own no-op guard on
@@ -204,6 +210,41 @@ _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
 # (not-yet-timed-out) producer call — same pattern as _agent_response_job
 # _timeout_seconds()'s lease_seconds below.
 _EXTRACTION_LEASE_MARGIN_S = 120
+
+# Non-secret operational env vars forwarded to the producer subprocess from
+# THIS process's own environment, when present. Deliberately a NARROW
+# allowlist, never `{**os.environ}`: `extraction.producer.command`/`.module`
+# names an EXTERNAL, admin-configurable binary — unlike the in-repo Keboola
+# extractor subprocess `app/api/sync.py` spawns (which legitimately inherits
+# the full parent env because it IS this codebase, reviewed and trusted the
+# same way the rest of the process is), a producer an admin can point
+# anywhere must not receive this instance's secrets (JWT_SECRET_KEY,
+# AGNES_VAULT_KEY, ANTHROPIC_API_KEY, POSTGRES_PASSWORD/DATABASE_URL,
+# SLACK_BOT_TOKEN, KEBOOLA_STORAGE_TOKEN, ...) just because they happen to
+# sit in os.environ. Only what a well-behaved subprocess needs to run at
+# all (PATH), plus locale/timezone/tempdir/TLS/proxy settings — nothing an
+# attacker (or a merely careless producer) could exfiltrate for profit.
+_EXTRACTION_PRODUCER_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 def _data_refresh_lease_seconds() -> int:
@@ -1132,6 +1173,32 @@ def _extraction_producer_argv() -> list[str] | None:
     return None
 
 
+def _extraction_producer_env_passthrough() -> list[str]:
+    """Extra env var NAMES an operator explicitly opted into forwarding to
+    the producer, beyond :data:`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`
+    (``extraction.producer.env_passthrough``, default empty). A per-name
+    opt-in, not a way back to `{**os.environ}` — only the names listed here
+    are copied, and only when they actually exist in this process's
+    ``os.environ``."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "producer", "env_passthrough", default=[])
+    if isinstance(raw, list):
+        return [str(v) for v in raw]
+    if raw:
+        return [str(raw)]
+    return []
+
+
+def _extraction_producer_env() -> dict[str, str]:
+    """The non-secret base env for the producer subprocess: the curated
+    allowlist plus whatever :func:`_extraction_producer_env_passthrough`
+    names — each copied from ``os.environ`` only when present. Callers add
+    the resolved SharePoint credentials + corpus id on top of this."""
+    names = list(_EXTRACTION_PRODUCER_ENV_ALLOWLIST) + _extraction_producer_env_passthrough()
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def _run_corpus_extraction(payload: dict) -> dict:
     """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
     §7.5 / §16 step 7). See the module docstring's entry for the wider
@@ -1161,10 +1228,17 @@ def _run_corpus_extraction(payload: dict) -> dict:
     Security (playbook F7): every secret this handler resolves —
     tenant id, client id, certificate private key — reaches the producer
     ONLY via the child process's environment, never on argv (readable via
-    `ps`/`/proc/<pid>/cmdline`) and never logged. The producer's own
-    stdout/stderr are logged at DEBUG only, and only on failure, in case a
-    misbehaving producer echoes something it shouldn't at INFO-visible
-    levels.
+    `ps`/`/proc/<pid>/cmdline`) and never logged. That child env is NOT
+    `{**os.environ}` — `extraction.producer` names an EXTERNAL,
+    admin-configurable binary, so it starts from a curated non-secret
+    allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
+    opted-in `extraction.producer.env_passthrough`, then adds only the
+    three named credentials + the corpus id. No other instance secret
+    (vault key, LLM API key, DB DSN, ...) is ever forwarded, no matter what
+    happens to be sitting in this process's own environment. The
+    producer's own stdout/stderr are logged at DEBUG only, and only on
+    failure, in case a misbehaving producer echoes something it shouldn't
+    at INFO-visible levels.
 
     No-op guard: raises (so the job fails cleanly, not with a confusing
     subprocess error) when ``extraction.enabled`` is false or no producer
@@ -1173,10 +1247,10 @@ def _run_corpus_extraction(payload: dict) -> dict:
     instead of silently returning, since a `corpus-extraction` job only
     ever exists because something explicitly enqueued it.
     """
-    from app.instance_config import get_value
+    from app.instance_config import feature_enabled
 
-    if not get_value("extraction", "enabled", default=False):
-        raise RuntimeError("corpus-extraction: extraction.enabled is false in instance.yaml — refusing to run")
+    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
 
     argv = _extraction_producer_argv()
     if not argv:
@@ -1208,10 +1282,15 @@ def _run_corpus_extraction(payload: dict) -> dict:
     corpus_id = payload.get("corpus_id") or payload.get("scope")
 
     # Secrets go in the CHILD process env, never on argv (security playbook
-    # F7) — inherits the parent env (PATH, locale, etc.) plus the resolved
-    # credentials and the corpus id, so the producer needs no other wiring.
+    # F7) — but NOT the full parent environment. `extraction.producer`
+    # names an EXTERNAL, admin-configurable binary, so this starts from the
+    # curated non-secret allowlist (+ any operator-opted-in
+    # `env_passthrough`) — see `_EXTRACTION_PRODUCER_ENV_ALLOWLIST`'s
+    # comment for why `{**os.environ}` would leak every instance secret
+    # (vault key, LLM API key, DB DSN, ...) to whatever the admin pointed
+    # this at — and adds only the resolved credentials and the corpus id.
     child_env = {
-        **os.environ,
+        **_extraction_producer_env(),
         "AGNES_SHAREPOINT_TENANT_ID": settings.tenant_id,
         "AGNES_SHAREPOINT_CLIENT_ID": settings.client_id,
         "AGNES_SHAREPOINT_PRIVATE_KEY": settings.private_key,

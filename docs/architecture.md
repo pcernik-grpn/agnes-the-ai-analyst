@@ -729,12 +729,18 @@ same way the admin UI does (`connectors.sharepoint.settings
 .resolve_sharepoint_settings`, vault-first then the server's
 `SHAREPOINT_CERT_PRIVATE_KEY` env var) and shells out to the
 operator-configured `extraction.producer.command`/`.module`
-(`instance.yaml`, off by default via `extraction.enabled`) under a bounded
-timeout, with secrets reaching the subprocess only via its child
-environment — never argv, never logged. The producer itself
-(`keboola/cuesta-star-graph`, adopted per spec §7.1) is not vendored into
-this repo. Off by default and additive: an instance that never sets
-`extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
+(`instance.yaml`, off by default via `extraction.enabled` — a registered
+switch, `AGNES_EXTRACTION_ENABLED`) under a bounded timeout, with the
+resolved credentials reaching the subprocess only via its child
+environment — never argv, never logged. That child env is a curated
+non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus
+any operator-opted-in `extraction.producer.env_passthrough`, plus the
+three named SharePoint credentials and the corpus id — never the full
+parent environment, so no other instance secret (vault key, LLM API key,
+DB DSN, ...) reaches an external, admin-configurable binary. The producer
+itself (`keboola/cuesta-star-graph`, adopted per spec §7.1) is not
+vendored into this repo. Off by default and additive: an instance that
+never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
 
 Deployment: the `worker` Dockerfile build target (an extension point,
 `EXTRACTION_PRODUCER_INSTALL` build-arg, for bundling a producer's runtime

@@ -123,8 +123,8 @@ operator-facing toggle. Each entry declares:
   and then deep-merges the patch, so `editable=True` on one switch exposes
   every key in that switch's section, not just the switch's own key. Most
   switches in the table below are editable; the locked rows (`data_apps`,
-  `data_apps_allow_same_origin`, `kai_broker_mcp_enabled`, `agent_profiles`)
-  each state their reason in the table — e.g. `data_apps` is read per
+  `data_apps_allow_same_origin`, `kai_broker_mcp_enabled`, `agent_profiles`,
+  `extraction`) each state their reason in the table — e.g. `data_apps` is read per
   request, but the `apps_runner` sidecar it gates sits behind the `apps`
   Compose profile, so flipping it live would surface a feature with no
   backend running.
@@ -210,6 +210,7 @@ that shipped `mcp.allow_query_param_token` without a write path.
 | `access_policies` | `access_policies.enabled` | `AGNES_ACCESS_POLICIES_ENABLED` | `false` | yes | Table access policies (row filtering + column masking via one admin-authored SQL policy per non-distributed table). New feature — off by default. Gates *attaching* a policy at `PUT /api/admin/registry/{id}` only; a table that already carries one stays protected — and the distribution interlock (a policied table can't be made distributable, and no other row may point at its physical source while distributable) stays enforced — regardless of this flag's later state. |
 | `facts` | `facts.enabled` | `AGNES_FACTS_ENABLED` | `false` | yes | Fact graph over Collections (design doc `2026-08-27-fact-graph-over-collections-design.md`) — typed subjects (facts/edges) extracted from Collections documents, each claim carrying its evidencing document, verbatim quote and date. Gates the whole `/api/facts*` router (`404` when off — see `app.auth.access.require_facts_enabled`). Postgres-only (A3 ratchet): a DuckDB-backed instance answers a typed `501` regardless of this flag. New feature — off by default. Read surface (`search`/`neighbors`/`claims`, any authenticated caller) and write surface (`ingest` + corrections CRUD/export, scheduler-token-or-admin) both live behind this one flag. The read surface is available across all three surfaces — REST, `agnes facts search\|neighbors\|claims`, and the `fact_search`/`fact_neighbors`/`fact_claims` MCP foundation tools; the write surface is REST-only by design (a producer/admin contract, not an analyst command). |
 | `facts_visibility_mode` | `facts.visibility_mode` | `AGNES_FACTS_VISIBILITY_MODE` | `any_evidence` | yes | Fact-graph subject existence rule (design doc §4): `any_evidence` — a subject is visible if AT LEAST ONE of its claims is in a readable collection (default). `all_evidence` — visible only if ALL of its claims are readable; hides strictly more within one grant snapshot (not a general monotonic guarantee across grant changes). Facts and edges use the same rule. |
+| `extraction` | `extraction.enabled` | `AGNES_EXTRACTION_ENABLED` | `false` | no — needs a configured `extraction.producer` command AND a worker process polling the `extraction` lane (the `extraction-worker` Compose profile) | Document extraction (spec §7.5 "Extraction inside Agnes (later)") as its own worker lane — gates the `corpus-extraction` job kind's handler, which shells out to the operator-configured producer command/module. New feature — off by default. |
 
 ## The `instance.experience` preset
 

@@ -27,6 +27,8 @@ Verifies:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -495,6 +497,14 @@ class TestCorpusExtractionHandler:
         }
     }
 
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        """The `extraction` switch's env var (`AGNES_EXTRACTION_ENABLED`)
+        wins over the mocked `get_value` config in every test here — clear
+        it so each test's `_config_get_value` fake is what actually decides
+        the gate, not whatever happens to be in the runner's shell env."""
+        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+
     def _register(self):
         from app.worker.kinds import register_all_kinds
         from app.worker.registry import JOB_KINDS
@@ -610,6 +620,89 @@ class TestCorpusExtractionHandler:
         assert call["env"]["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
         assert call["env"]["AGNES_SHAREPOINT_PRIVATE_KEY"] == "super-secret-pem-material"
         assert call["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+
+    def test_child_env_does_not_forward_instance_secrets(self, monkeypatch):
+        """The producer is an EXTERNAL, admin-configurable binary — it must
+        get a curated non-secret allowlist (+ any explicit
+        `env_passthrough`), never the full parent environment. This is the
+        actual security boundary: forwarding `{**os.environ}` would leak
+        every instance secret (vault key, LLM API key, DB DSN, ...) to
+        whatever command an admin points `extraction.producer` at."""
+        monkeypatch.setenv("AGNES_VAULT_KEY", "vault-secret-value")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret-value")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, private_key="cert-secret-material")
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append(dict(env or {}))
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert len(calls) == 1
+        env = calls[0]
+        # Instance secrets sitting in the PARENT process env must be absent.
+        assert "AGNES_VAULT_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        # The allowlisted operational vars and the named credentials must
+        # still be present.
+        assert env.get("PATH") == os.environ.get("PATH")
+        assert env["AGNES_SHAREPOINT_TENANT_ID"] == "tenant-1"
+        assert env["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
+        assert env["AGNES_SHAREPOINT_PRIVATE_KEY"] == "cert-secret-material"
+
+    def test_env_passthrough_forwards_only_named_vars(self, monkeypatch):
+        """`extraction.producer.env_passthrough` is an explicit, per-name
+        operator opt-in — it must forward ONLY the vars it names, not open
+        the floodgates back to the full environment."""
+        monkeypatch.setenv("AGNES_VAULT_KEY", "vault-secret-value")
+        monkeypatch.setenv("MY_CUSTOM_PRODUCER_VAR", "custom-value")
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {
+                    "extraction": {
+                        "enabled": True,
+                        "producer": {
+                            "command": "python -m fake_producer",
+                            "env_passthrough": ["MY_CUSTOM_PRODUCER_VAR"],
+                        },
+                        "timeout_s": 60,
+                    }
+                }
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch)
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, **kwargs):
+            calls.append(dict(env or {}))
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]
+        assert env["MY_CUSTOM_PRODUCER_VAR"] == "custom-value"
+        assert "AGNES_VAULT_KEY" not in env
 
     def test_producer_module_config_builds_python_dash_m_argv(self, monkeypatch):
         import sys
