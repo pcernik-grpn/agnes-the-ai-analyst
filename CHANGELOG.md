@@ -201,6 +201,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The fact strip inside an open group is gone.** It restated the reach and
+  the grant count that the group's own row prints two words to the left, and
+  carried two things the row did not: the group's purpose and its age. Those
+  moved onto the row as its second line — the same shape a bundle row already
+  uses — so nothing was lost and the duplicate went with the strip. What
+  remains in that header is the Workspace address and the managed notice,
+  which a row genuinely cannot say, and it collapses to nothing when neither
+  applies. The group row's header is a flex row rather than a three-column
+  grid: it holds five children, and a grid of three silently wrapped the last
+  two onto a second line as soon as a description made the row tall enough —
+  `Everyone` rendered 97px against every other row's 65px.
 - **The People roster loses its header row, and the add actions move above the
   column header.** An address, a name, a provenance line and a Remove button do
   not need labelling — a header over four self-evident columns is chrome on a

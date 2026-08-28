@@ -1776,6 +1776,46 @@
      than a divider between itself and the header below it. */
   .ax-table > .ax-add:first-child { border-bottom: 0; padding-bottom: 6px; }
   .ax-table > .ax-add:first-child + .ax-colhd { border-top: 0; }
+  /* The group row is two lines now, like a bundle's: identity on the first,
+     purpose and age on the second. Its chrome aligns to the name's line
+     rather than floating between them. */
+  .ax-gs__id--g { display: block; min-width: 0; }
+  .ax-gs:has(.ax-gs__desc) > .ax-gs__hd { align-items: start; }
+  .ax-gs:has(.ax-gs__desc) > .ax-gs__hd > .ax-gs__car,
+  .ax-gs:has(.ax-gs__desc) > .ax-gs__hd > .ax-g__ava { margin-top: 1px; }
+  .ax-gs:has(.ax-gs__desc) > .ax-gs__hd > .ax-gs__counts { margin-top: 4px; }
+
+  /* The fact strip is empty for an ordinary group, so it takes no room. It
+     still appears for a Workspace-synced one, whose upstream address is
+     something the row genuinely cannot say. */
+  .ax-gs__body .ax-gh:empty,
+  .ax-gs__body .ax-gh__facts:empty { display: none; }
+  .ax-gs__body .ax-gh { padding: 0; }
+  .ax-gs__body .ax-idsub:not([hidden]) { display: block; padding: 8px 0 2px; font-size: 11.5px; }
+  /* The row header is a FLEX row, not a three-column grid. It holds five
+     children — caret, avatar, identity, counts, kebab — and a grid of three
+     columns silently wrapped the last two onto a second row as soon as a
+     description made the middle column tall. Flex takes any number of
+     children and keeps the counts hard right. */
+  .ax-gs__hd {
+    display: flex; align-items: center; gap: 10px;
+  }
+  .ax-gs__id { flex: 1 1 auto; min-width: 0; }
+  .ax-gs__counts { flex: 0 0 auto; margin-left: auto; }
+  .ax-gs:has(.ax-gs__desc) > .ax-gs__hd { align-items: flex-start; }
+  .ax-gs__desc { max-width: 72ch; }
+  /* No wrapping: a long description must shorten, never push the counts onto
+     a line of their own — that is what made `Everyone` 97px tall while every
+     other row was 65px, and a list whose rows change height by their text is
+     a list with no rhythm. */
+  .ax-gs__hd { flex-wrap: nowrap; }
+  .ax-gs__line { flex-wrap: nowrap; min-width: 0; }
+  .ax-gs__line .ax-g__name { white-space: nowrap; }
+  .ax-gs__reach { white-space: nowrap; }
+  .ax-gs__desc {
+    max-width: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 </style>
 {% endblock %}
 
@@ -2355,10 +2395,23 @@
         <summary class="ax-gs__hd" title="${esc(g.description || label)}">
           <span class="ax-gs__car" aria-hidden="true">›</span>
           <span class="ax-g__ava">${esc(String(label || "?").charAt(0).toUpperCase())}</span>
-          <span class="ax-gs__id">
-            <span class="ax-g__name">${esc(label)}</span>
-            ${origin !== "custom" ? `<span class="ax-orig ax-orig--${esc(origin)}">${esc(origin.replace("_", " "))}</span>` : ""}
-            <span class="ax-gs__reach">${esc(meta)}</span>
+          <span class="ax-gs__id ax-gs__id--g">
+            <span class="ax-gs__line">
+              <span class="ax-g__name">${esc(label)}</span>
+              ${origin !== "custom" ? `<span class="ax-orig ax-orig--${esc(origin)}">${esc(origin.replace("_", " "))}</span>` : ""}
+              <span class="ax-gs__reach">${esc(meta)}</span>
+            </span>
+            ${(() => {
+              // What the retired fact strip uniquely carried — the purpose
+              // and the age. The counts it also carried are two words to the
+              // left of here, which is why the strip went.
+              const when = fmtDate(g.created_at);
+              const bits = [g.description ? esc(g.description) : "",
+                            when ? `created ${esc(when)}` : ""].filter(Boolean);
+              return bits.length
+                ? `<span class="ax-gs__desc">${bits.join(' <span class="ax-r__sep">·</span> ')}</span>`
+                : "";
+            })()}
           </span>
           <span class="ax-gs__counts">${familyCounts(g.id)}</span>
           ${isEditable(g) ? `
@@ -2452,11 +2505,13 @@
         : people
           ? `<b>${people} ${people === 1 ? "person" : "people"}</b>`
           : `<span class="warn">Nobody</span>`;
-      meta.innerHTML = [
-        `<span>${reach} · ${grants} granted</span>`,
-        group.description ? `<span>${esc(group.description)}</span>` : "",
-        when ? `<span class="muted">created ${esc(when)}</span>` : "",
-      ].filter(Boolean).join(` <span class="sep">·</span> `);
+      /* Empty by design. Reach and grants are on the group's own row, two
+         words to the left of where this used to print them, and the purpose
+         and age moved onto that row as its second line. What is left in this
+         header is the Workspace address and the managed notice — the two
+         things a row cannot say — and both render themselves below. */
+      meta.innerHTML = "";
+      void reach; void grants; void when;
     }
 
     // The standing explanation for every control Workspace owns.
