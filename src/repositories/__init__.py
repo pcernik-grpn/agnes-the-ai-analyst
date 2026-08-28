@@ -151,6 +151,7 @@ __all__ = [
     "corpus_file_sources_repo",
     # Fact graph over Collections
     "facts_repo",
+    "ontology_drafts_repo",
     # Agent registry (v103) — the Library's agent items
     "agents_repo",
     # Maintained digests (K4, #799)
@@ -552,6 +553,11 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "facts": {
         PG: ("src.repositories.facts_pg", "FactsPgRepository"),
     },
+    # Ontology builder draft state (fact-graph-over-Collections §13.2) —
+    # PG-only, A3 ratchet: no DuckDB backend.
+    "ontology_drafts": {
+        PG: ("src.repositories.ontology_drafts_pg", "OntologyDraftsPgRepository"),
+    },
     # agent registry (v103)
     "agents": {
         DUCKDB: ("src.repositories.agents", "AgentsRepository"),
@@ -913,6 +919,13 @@ def facts_repo() -> Any:
     corrections — design doc §2 consequences). PG-only — raises
     ``RequiresPostgresBackend`` on a DuckDB-backed instance."""
     return _build("facts")
+
+
+def ontology_drafts_repo() -> Any:
+    """Ontology builder draft state (design doc §13.2, "Ontology builder").
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance."""
+    return _build("ontology_drafts")
 
 
 # Maintained digests (K4, #799)

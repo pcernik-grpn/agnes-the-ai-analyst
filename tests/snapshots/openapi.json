@@ -6197,6 +6197,111 @@
         "title": "OnboardedRequest",
         "type": "object"
       },
+      "OntologyDraftCreate": {
+        "properties": {
+          "name": {
+            "default": "Untitled ontology",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "OntologyDraftCreate",
+        "type": "object"
+      },
+      "OntologyDraftUpdate": {
+        "properties": {
+          "document_sample": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document Sample"
+          },
+          "edge_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edge Types"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "node_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Types"
+          }
+        },
+        "title": "OntologyDraftUpdate",
+        "type": "object"
+      },
+      "OntologyDryRunRequest": {
+        "properties": {
+          "collection_id": {
+            "title": "Collection Id",
+            "type": "string"
+          },
+          "edge_types": {
+            "additionalProperties": true,
+            "title": "Edge Types",
+            "type": "object"
+          },
+          "file_id": {
+            "title": "File Id",
+            "type": "string"
+          },
+          "node_types": {
+            "additionalProperties": true,
+            "title": "Node Types",
+            "type": "object"
+          }
+        },
+        "required": [
+          "collection_id",
+          "file_id"
+        ],
+        "title": "OntologyDryRunRequest",
+        "type": "object"
+      },
+      "OntologyImportRequest": {
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "OntologyImportRequest",
+        "type": "object"
+      },
       "OwnerOption": {
         "properties": {
           "display_name": {
@@ -13443,6 +13548,56 @@
           }
         },
         "summary": "Admin News Editor",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/ontology": {
+      "get": {
+        "description": "Ontology builder (fact-graph-over-Collections \u00a713.2) \u2014 a semantic\nmodel authored through the shared builder shell: Create | Preview left,\nnumbered sections right, the right panel the source of truth, Save the\nonly write. Zero new navigation (spec \u00a713.2) \u2014 the only entry point is\nthe link on ``/admin/semantic-layer``; this route carries no admin-nav\nentry of its own.\n\nWhen the ``facts`` flag is off, or the active backend is DuckDB (drafts\nare PG-only, A3 ratchet \u2014 the builder cannot persist a draft without\nPostgres), renders an explanatory empty state instead of 404ing, same\nposture as ``/apps`` when ``data_apps`` is disabled.",
+        "operationId": "admin_ontology_page_admin_ontology_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Ontology Page",
         "tags": [
           "web"
         ]
@@ -23317,6 +23472,508 @@
         "summary": "Delete View",
         "tags": [
           "observability"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts": {
+      "get": {
+        "operationId": "list_drafts_api_admin_ontology_drafts_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Drafts",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "post": {
+        "operationId": "create_draft_api_admin_ontology_drafts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}": {
+      "delete": {
+        "operationId": "delete_draft_api_admin_ontology_drafts__draft_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "get": {
+        "operationId": "get_draft_api_admin_ontology_drafts__draft_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Draft",
+        "tags": [
+          "ontology"
+        ]
+      },
+      "put": {
+        "description": "Section edits land here. Whatever the client sends \u2014 a paste import,\na conversation proposal, a manual attribute tweak \u2014 this is the ONLY\nthing that happens: the draft row changes. Nothing here ever reaches\n``semantic_models``.",
+        "operationId": "update_draft_api_admin_ontology_drafts__draft_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDraftUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/import": {
+      "post": {
+        "description": "Paste-a-finished-ontology / file upload (spec \u00a713.2 \"source\" section).\n\nRuns the SAME translator Save uses, but only to render the leftover\nreport and fill the draft's node/edge types \u2014 it never validates\nagainst the Ossie schema here and never touches ``semantic_models``.\n\"Import fills the draft. It is not a save, and it is not an\nendorsement\" (``.claude/skills/ontology-building/SKILL.md``).",
+        "operationId": "import_ontology_text_api_admin_ontology_drafts__draft_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Ontology Text",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/drafts/{draft_id}/save": {
+      "post": {
+        "description": "The one write. Translate -> validate -> POST through the exact path\n``import_ontology.py --server`` uses (in-process, not a self-HTTP-call).",
+        "operationId": "save_draft_api_admin_ontology_drafts__draft_id__save_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "title": "Draft Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Draft",
+        "tags": [
+          "ontology"
+        ]
+      }
+    },
+    "/api/admin/ontology/dry-run": {
+      "post": {
+        "description": "One document, the draft's current types, no persistence \u2014 the\nsample-driven test the ontology-building skill calls \"the valuable half\"\nof authoring: what got captured, and what didn't.",
+        "operationId": "ontology_dry_run_api_admin_ontology_dry_run_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OntologyDryRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ontology Dry Run",
+        "tags": [
+          "ontology"
         ]
       }
     },
