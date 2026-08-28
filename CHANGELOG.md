@@ -15,6 +15,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- A data source whose name is not a valid SQL identifier (e.g. a hyphenated
+  name) was silently skipped during rebuild and the rebuild still reported
+  success — the caller had no way to tell the source was rejected from
+  "source has zero tables". A single-source `rebuild_source()` call now
+  raises a typed error naming the identifier rule instead of returning an
+  empty list; a full multi-source rebuild still skips the bad directory and
+  rebuilds every other valid source, but now attributes the skip
+  (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
+  operator alert now surfaces too.
 
 ### Removed
 
