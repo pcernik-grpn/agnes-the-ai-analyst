@@ -19,7 +19,6 @@ installed.
 import logging
 from unittest.mock import MagicMock
 
-import duckdb
 import pytest
 
 from src.orchestrator import SyncOrchestrator
@@ -90,8 +89,7 @@ class TestTokenEnvAllowlist:
         with caplog.at_level(logging.ERROR):
             SyncOrchestrator()._attach_remote_extensions(conn, "src1")
         assert _attach_call_count(sql_calls) == 0
-        assert any("token_env" in r.message and "not in the allowlist" in r.message
-                   for r in caplog.records)
+        assert any("token_env" in r.message and "not in the allowlist" in r.message for r in caplog.records)
 
     def test_refuses_jwt_secret_key(self, captured_conn, monkeypatch, caplog):
         monkeypatch.setenv("JWT_SECRET_KEY", "x" * 64)
@@ -111,9 +109,7 @@ class TestTokenEnvAllowlist:
             SyncOrchestrator()._attach_remote_extensions(conn, "src1")
         assert _attach_call_count(sql_calls) == 0
 
-    def test_operator_override_replaces_default(
-        self, captured_conn, monkeypatch
-    ):
+    def test_operator_override_replaces_default(self, captured_conn, monkeypatch):
         monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "MY_RANDOM_TOKEN")
         monkeypatch.setenv("MY_RANDOM_TOKEN", "value")
         conn, sql_calls, set_rows = captured_conn
@@ -121,9 +117,7 @@ class TestTokenEnvAllowlist:
         SyncOrchestrator()._attach_remote_extensions(conn, "src1")
         assert _attach_call_count(sql_calls) == 1
 
-    def test_empty_string_override_falls_back_to_default(
-        self, captured_conn, monkeypatch
-    ):
+    def test_empty_string_override_falls_back_to_default(self, captured_conn, monkeypatch):
         """AGNES_REMOTE_ATTACH_TOKEN_ENVS='' should NOT lock everything down —
         it falls through to the default. (Operator-typo defense.)"""
         monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "")
@@ -149,9 +143,7 @@ class TestTokenEnvAllowlist:
         SyncOrchestrator()._attach_remote_extensions(conn, "src1")
         assert _attach_call_count(sql_calls) == 1
 
-    def test_structurally_invalid_token_env_refused(
-        self, captured_conn, monkeypatch, caplog
-    ):
+    def test_structurally_invalid_token_env_refused(self, captured_conn, monkeypatch, caplog):
         """Even names on the allowlist via override must pass the structural
         regex `^[A-Z][A-Z0-9_]{0,63}$`. A name with a space or lowercase
         letter is refused regardless of allowlist contents."""
@@ -160,15 +152,83 @@ class TestTokenEnvAllowlist:
         monkeypatch.setenv("AGNES_REMOTE_ATTACH_TOKEN_ENVS", "kbc_token,KBC TOKEN,LEGIT_TOKEN")
         monkeypatch.setenv("LEGIT_TOKEN", "value")
         conn, sql_calls, set_rows = captured_conn
-        set_rows([
-            ("a1", "keboola", "https://x", "kbc_token"),    # lowercase
-            ("a2", "keboola", "https://x", "KBC TOKEN"),    # space
-            ("a3", "keboola", "https://x", "LEGIT_TOKEN"),  # OK
-        ])
+        set_rows(
+            [
+                ("a1", "keboola", "https://x", "kbc_token"),  # lowercase
+                ("a2", "keboola", "https://x", "KBC TOKEN"),  # space
+                ("a3", "keboola", "https://x", "LEGIT_TOKEN"),  # OK
+            ]
+        )
         SyncOrchestrator()._attach_remote_extensions(conn, "src1")
         # Only a3 should attach; a1 and a2 fail the structural regex even
         # though the operator listed them in the override.
         assert _attach_call_count(sql_calls) == 1
+
+
+class TestAnonymizationKeyNeverJoinsTheAttachAllowlist:
+    """RBAC review, 2026-08-28: ``AGNES_ANONYMIZATION_HMAC_KEY`` (the
+    anonymize-in-front pipeline's per-instance producer key,
+    ``app.worker.kinds._resolve_anonymization_key``) must NEVER become a
+    legal `token_env` here — this allowlist gates a SEPARATE, inbound
+    trust boundary: a connector-written `_remote_attach` row naming it as
+    `token_env` would get the real key value resolved and sent as an
+    `ATTACH ... TOKEN` to a connector-chosen URL (`is_attach_host_allowed`
+    is default-open with no host allowlist configured). This is a RATCHET —
+    it must fail if the key is ever re-added to `_DEFAULT_TOKEN_ENVS`.
+    """
+
+    def test_anonymization_key_is_not_in_the_effective_allowlist(self):
+        from src.orchestrator_security import get_allowed_token_envs
+
+        assert "AGNES_ANONYMIZATION_HMAC_KEY" not in get_allowed_token_envs()
+
+    def test_remote_attach_row_naming_the_anonymization_key_is_refused(self, captured_conn, monkeypatch, caplog):
+        """End-to-end: even if the real key happens to be set in this
+        process's environment, a connector `_remote_attach` row asking for
+        it as `token_env` must be refused before ATTACH, not merely absent
+        from a set somewhere."""
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "real-instance-key-value")
+        conn, sql_calls, set_rows = captured_conn
+        set_rows([("alias1", "keboola", "https://attacker.example", "AGNES_ANONYMIZATION_HMAC_KEY")])
+        with caplog.at_level(logging.ERROR):
+            SyncOrchestrator()._attach_remote_extensions(conn, "src1")
+        assert _attach_call_count(sql_calls) == 0
+        assert not any("real-instance-key-value" in s for s in sql_calls)
+        assert any("token_env" in r.message and "not in the allowlist" in r.message for r in caplog.records)
+
+
+class TestProducerKeyEnvAllowlist:
+    """Unit coverage for ``is_producer_key_env_allowed`` — the separate,
+    narrower allowlist ``_resolve_anonymization_key`` uses instead of
+    ``is_token_env_allowed`` (see that function's module-level docstring
+    for the trust-boundary argument)."""
+
+    def test_default_name_is_allowed(self):
+        from src.orchestrator_security import is_producer_key_env_allowed
+
+        assert is_producer_key_env_allowed("AGNES_ANONYMIZATION_HMAC_KEY") is True
+
+    def test_attach_allowlisted_name_is_not_producer_key_allowed(self):
+        """A name legal for the connector-ATTACH boundary (e.g. the
+        SharePoint certificate env) must not thereby be legal here — the
+        two allowlists are deliberately disjoint."""
+        from src.orchestrator_security import is_producer_key_env_allowed
+
+        assert is_producer_key_env_allowed("SHAREPOINT_CERT_PRIVATE_KEY") is False
+        assert is_producer_key_env_allowed("KBC_TOKEN") is False
+
+    def test_arbitrary_name_is_refused(self):
+        from src.orchestrator_security import is_producer_key_env_allowed
+
+        assert is_producer_key_env_allowed("ANTHROPIC_API_KEY") is False
+        assert is_producer_key_env_allowed("JWT_SECRET_KEY") is False
+
+    def test_structurally_invalid_name_is_refused(self):
+        from src.orchestrator_security import is_producer_key_env_allowed
+
+        assert is_producer_key_env_allowed("agnes_anonymization_hmac_key") is False  # lowercase
+        assert is_producer_key_env_allowed("AGNES ANONYMIZATION") is False  # space
+        assert is_producer_key_env_allowed("") is False
 
 
 class TestUrlEscape:
@@ -199,9 +259,7 @@ class TestUrlEscape:
 
 
 class TestInstallPathSplit:
-    def test_community_extension_uses_install_from_community(
-        self, captured_conn, monkeypatch
-    ):
+    def test_community_extension_uses_install_from_community(self, captured_conn, monkeypatch):
         monkeypatch.setenv("KBC_TOKEN", "tok")
         conn, sql_calls, set_rows = captured_conn
         set_rows([("kbc", "keboola", "https://x", "KBC_TOKEN")])
@@ -209,13 +267,12 @@ class TestInstallPathSplit:
         install_sqls = [s for s in sql_calls if "INSTALL" in s.upper()]
         assert any("FROM community" in s for s in install_sqls)
 
-    def test_builtin_extension_uses_load_only(
-        self, captured_conn, monkeypatch
-    ):
+    def test_builtin_extension_uses_load_only(self, captured_conn, monkeypatch):
         # Add a fictitious built-in via the override mechanism (we have to
         # patch the module-level set since AGNES_REMOTE_ATTACH_EXTENSIONS
         # only affects community).
         from src import orchestrator_security as oms
+
         monkeypatch.setattr(oms, "_BUILTIN_EXTENSIONS", frozenset({"sqlite"}))
         conn, sql_calls, set_rows = captured_conn
         set_rows([("sql1", "sqlite", "/tmp/db.sqlite", "")])

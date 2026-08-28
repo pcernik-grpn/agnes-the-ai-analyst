@@ -860,6 +860,17 @@
         "title": "Body_import_metrics_api_admin_metrics_import_post",
         "type": "object"
       },
+      "Body_logout_submit_auth_logout_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          }
+        },
+        "title": "Body_logout_submit_auth_logout_post",
+        "type": "object"
+      },
       "Body_password_login_web_auth_password_login_web_post": {
         "properties": {
           "email": {
@@ -4158,9 +4169,57 @@
         "title": "FactsCorrectionRequest",
         "type": "object"
       },
-      "FactsIngestRequest": {
-        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.",
+      "FactsIngestAnonymizationReport": {
+        "description": "OPTIONAL producer declaration that (some of) this batch went through\nthe anonymize-in-front pipeline (spec \u00a79: source -> crawl -> convert ->\nanonymize -> Agnes) before ingestion. Additive to the wire contract \u2014 a\nproducer that never anonymizes omits this field entirely.\n\n``scopes`` is keyed by ``corpus_id`` (the collection id, matching the\nconnect wizard's own scope-row shape); a key that does not resolve to a\nreal collection is KEPT, not rejected \u2014 this is a self-reported tally,\nnot a join against ``file_corpora`` (spec \u00a79.2's \"current limits\": Agnes\nrecords the declaration, it cannot verify the content was anonymized).",
         "properties": {
+          "declared": {
+            "default": false,
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "scopes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FactsIngestAnonymizationScope"
+            },
+            "title": "Scopes",
+            "type": "object"
+          }
+        },
+        "title": "FactsIngestAnonymizationReport",
+        "type": "object"
+      },
+      "FactsIngestAnonymizationScope": {
+        "description": "One corpus's anonymization tally within this batch (spec \u00a79.2). A\nself-reported COUNT, never independently verified by Agnes \u2014 see\n``docs/anonymization.md``'s \"current limits\".",
+        "properties": {
+          "docs_anonymized": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Anonymized",
+            "type": "integer"
+          },
+          "docs_skipped": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Skipped",
+            "type": "integer"
+          }
+        },
+        "title": "FactsIngestAnonymizationScope",
+        "type": "object"
+      },
+      "FactsIngestRequest": {
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` is the one exception: a small, OPTIONAL, strictly\ntyped block (spec \u00a79.2) \u2014 malformed input there is a real protocol\nerror (422), not tolerated crawler noise.",
+        "properties": {
+          "anonymization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactsIngestAnonymizationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "documents": {
             "items": {
               "additionalProperties": true,
@@ -29176,7 +29235,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
-        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.\n\nDeliberately does NOT carry ``anonymize`` \u2014 that would break this\nendpoint's flat, backward-compatible shape. A producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).",
         "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
         "parameters": [
           {
@@ -38505,7 +38564,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -54962,6 +55021,113 @@
         "summary": "Keboola Login",
         "tags": [
           "auth"
+        ]
+      }
+    },
+    "/auth/logout": {
+      "get": {
+        "description": "Logout CONFIRMATION page (no state change) \u2014 issue #1675.\n\nThe Logout menu item used to be a plain ``GET`` link to ``/login``,\nwhich neither cleared the ``access_token`` cookie nor ended the session\n\u2014 it just LOOKED like sign-out (the app happily reopened on the next\nvisit). Ending a session is a mutation, so it cannot happen on a GET\n(security playbook #10, F2); this route only renders a confirm form\nwith a double-submit CSRF token. The actual cookie-clear + server-side\nrevocation is :func:`logout_submit` (POST) \u2014 same GET-confirms /\nPOST-mutates shape this codebase already uses for :func:`slack_bind` /\n:func:`slack_bind_confirm`.\n\nAn already-signed-out visitor has nothing to confirm \u2014 straight to\n``/login``.",
+        "operationId": "logout_page_auth_logout_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Page",
+        "tags": [
+          "web"
+        ]
+      },
+      "post": {
+        "description": "End the session \u2014 clear the cookie AND revoke it server-side.\n\nIssue #1675 (clear the browser's ``access_token`` cookie) and #1676\n(revoke the token so a copy captured before logout \u2014 a synced browser\nprofile, host malware, a shared machine \u2014 stops working too, not only\nthe browser that clicked Logout) land together: a client-side-only fix\nleaves every other copy of the token valid for the rest of its 30-day\n``exp``.\n\nRequires the double-submit ``web_csrf`` token minted by the GET\nconfirmation above (F2) \u2014 a state-changing action reachable from a menu\nitem on every page must not fire on ambient cookie auth alone, the same\nreasoning the F2 security review applied to :func:`slack_bind_confirm`.",
+        "operationId": "logout_submit_auth_logout_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_logout_submit_auth_logout_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Submit",
+        "tags": [
+          "web"
         ]
       }
     },

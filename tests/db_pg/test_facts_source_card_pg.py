@@ -180,6 +180,61 @@ def test_identity_row_counts_matched_groups_and_ungranted_collections(tmp_path, 
     assert fs["identity"] == {"groups_matched": 1, "collections_no_group": 1}
 
 
+def test_anonymization_distinguishes_requested_declared_and_pending(tmp_path, monkeypatch, pg_engine):
+    """Spec §9.2/§13.2: the checkbox alone (`requested`) must never be
+    read as `declared` — only the LATEST run's own declaration earns that.
+    A_scope is requested AND the latest run declares it (-> declared);
+    B_scope is requested but the run declares nothing for it (-> pending)."""
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _seed_collection(CORPUS_A)
+    _seed_collection(CORPUS_B)
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=[CORPUS_A],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=1,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=1,
+        subjects_deleted=0,
+        review_items=[],
+        anonymization={"declared": True, "scopes": {CORPUS_A: {"docs_anonymized": 2, "docs_skipped": 0}}},
+    )
+
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=[
+            {"source_scope_id": "s-a", "display_path": "A", "anonymize": True, "collection_id": CORPUS_A},
+            {"source_scope_id": "s-b", "display_path": "B", "anonymize": True, "collection_id": CORPUS_B},
+        ],
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert fs["anonymization"] == {
+        "requested": [CORPUS_A, CORPUS_B],
+        "declared": [CORPUS_A],
+        "pending": [CORPUS_B],
+    }
+
+
+def test_anonymization_empty_when_no_scope_requests_it(tmp_path, monkeypatch, pg_engine):
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)  # last run exists but no `anonymization` block was sent
+    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert fs["anonymization"] == {"requested": [], "declared": [], "pending": []}
+
+
 def test_certificate_row_shows_origin_and_never_the_value(tmp_path, monkeypatch, pg_engine):
     pg_env_setup(tmp_path, monkeypatch, pg_engine)
     conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")

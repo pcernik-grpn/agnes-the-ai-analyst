@@ -277,6 +277,23 @@ auth:
   #   allow_token_header: false     # X-StorageApi-Token API auth; see docs/feature-flags.md
   #   multi_project_mode: disabled  # disabled | select | auto; see docs/feature-flags.md
 
+  # --- Microsoft Entra ID group sync (optional) ---
+  # Mirrors the signed-in user's Entra ID group memberships into
+  # user_group_members (source='microsoft_sync') on every Microsoft
+  # sign-in, the way Google sync mirrors Workspace groups. Off by default:
+  # enabling it also widens the OAuth consent scope requested at
+  # /auth/microsoft/login to the delegated Graph permission
+  # GroupMember.Read.All, which needs its own admin-consent grant in the
+  # Entra app registration — see docs/auth-microsoft-oauth.md before
+  # turning this on.
+  # microsoft:
+  #   group_sync_enabled: false     # AGNES_MICROSOFT_GROUP_SYNC_ENABLED env override
+  #
+  # AGNES_MICROSOFT_GROUP_PREFIX (env-only, like Google's
+  # AGNES_GOOGLE_GROUP_PREFIX — neither has an instance.yaml key): when set,
+  # only mirror/allow groups whose identifier starts with this
+  # (case-insensitive) prefix.
+
 # --- Security (optional) ---
 # security:
 #   # Hostnames exempt from the private/reserved-network SSRF guard on admin-
@@ -1202,6 +1219,31 @@ extraction:
   # non-secret allowlist (+ any `env_passthrough` above) plus the four vars
   # named above. No other instance secret (vault key, LLM API key, DB DSN,
   # OAuth client secrets, ...) is ever forwarded to it.
+  #
+  # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
+  # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
+  # scopes must be pseudonymized by the producer before upload. When at
+  # least one confirmed scope on a connection is anonymize=true, the
+  # producer subprocess ALSO receives AGNES_EXTRACTION_ANONYMIZE_SCOPES (a
+  # JSON object, {source_scope_id: collection_id}, covering only the
+  # anonymize-marked scopes) and AGNES_ANONYMIZATION_HMAC_KEY (this
+  # instance's per-instance pseudonym key — different instances must use
+  # different keys, or the same person pseudonymizes identically across
+  # tenants). Neither var is set when no scope is anonymize-marked.
+  anonymization:
+    # Name of the env var holding the per-instance HMAC key — checked
+    # against ITS OWN allowlist before the value is read (the name here is
+    # admin-writable config, so an unlisted name is refused rather than
+    # silently read). This is a SEPARATE, narrower allowlist from the
+    # SharePoint certificate's above (AGNES_REMOTE_ATTACH_TOKEN_ENVS) —
+    # deliberately, so this key can never be referenced as a `token_env` on
+    # a connector-written `_remote_attach` row (see
+    # src/orchestrator_security.py's `_PRODUCER_KEY_ENVS`). Empty (or the
+    # default name itself) uses AGNES_ANONYMIZATION_HMAC_KEY; any other
+    # name is refused. A connection with an anonymize-marked scope and no
+    # resolvable key fails the extraction job clean rather than running the
+    # producer without a key.
+    hmac_key_env: ""
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,

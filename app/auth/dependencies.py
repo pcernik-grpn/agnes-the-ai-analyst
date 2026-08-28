@@ -44,6 +44,7 @@ _AUTH_DETAIL_BY_REASON = {
     "agent_pat_wrong_surface": "Agent token not valid on this surface",
     "agent_pat_agent_deleted": "Agent deleted",
     "pat_parent_revoked": "Token revoked",
+    "session_revoked": "Session revoked — please sign in again",
 }
 
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
