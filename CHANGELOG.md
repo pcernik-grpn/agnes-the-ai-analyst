@@ -201,6 +201,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The whole access list is one table, four levels deep.** A group row, a
+  People / Access row and an item row are rows at different depths, and they
+  were drawn as three separate objects — the group on the page ground, the
+  sections on the page ground, the items on their own framed surface — so the
+  only cue for the relationship was indentation while every other signal said
+  "unrelated". One surface now holds the lot, the way `.lib-list` holds the
+  Library's groups: SYSTEM / GROUPS and the category bands are header rows of
+  it, depth is carried by indent and weight, and **every level answers a
+  pointer the same way**. The inner frame is gone (inside one surface a second
+  border reads as a second box) and the connective left rule with it.
 - **Access rows adopt the Library's row states.** Hover is the same grey the
   rail uses for "the thing I am pointing at", so a row here and a destination
   in the sidebar do not answer one gesture in two colours. Keyboard focus gets

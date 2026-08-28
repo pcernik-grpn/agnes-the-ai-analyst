@@ -1561,6 +1561,69 @@
      primitive's header grey rather than a tint over the page. */
   .ax-fam__hd { background: var(--ds-surface-dim); }
   .ax-colhd { border-bottom: 1px solid var(--ds-border-light); }
+  /* ══ One table, four levels ════════════════════════════════════════════
+     A group row, a People / Access row and an item row are not three
+     objects — they are rows of one table at different depths, and they were
+     drawn as three: the group on the page ground, the sections on the page
+     ground, the items on their own framed white surface. So the eye had to
+     work out the relationship from indentation alone while every other cue
+     said "separate things".
+
+     One surface holds the lot, the way `.lib-list` holds the Library's
+     groups. Depth is then carried by indent and weight, and every level
+     answers a pointer the same way — which is what makes it read as a
+     table rather than as nested panels. ── */
+  #ax-groups {
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-lg, 8px);
+    overflow: clip;
+  }
+
+  /* Level 0 — the group. */
+  .ax-gs { border-top: 0; border-bottom: 1px solid var(--ds-border-light); }
+  .ax-gs:last-child { border-bottom: 0; }
+  .ax-gs__hd { padding: 11px 12px 11px 10px; }
+  .ax-gs__hd:hover { background: var(--ds-surface-dim); }
+  .ax-gs[open] > .ax-gs__hd { border-bottom: 1px solid var(--ds-border-light); }
+
+  /* The list's own band — SYSTEM / GROUPS — is a header row of this table,
+     so it wears the same treatment the category bands do. */
+  .ax-glist__label {
+    padding: 7px 12px; background: var(--ds-surface-dim);
+    border-bottom: 1px solid var(--ds-border-light);
+    font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+  }
+
+  /* Level 1 — the group's own body. Indent replaces the connective rule:
+     inside one surface a left border reads as a second frame. */
+  .ax-gs[open] > .ax-gs__body {
+    margin-left: 0; padding: 0 12px 14px 34px; border-left: 0;
+  }
+  @media (max-width: 900px) { .ax-gs[open] > .ax-gs__body { padding-left: 18px; } }
+
+  /* Level 2 — People / Access. Rows of the same table, one step in. */
+  .ax-gs__body .dsec { margin: 0; }
+  .ax-gs__body .dsec + .dsec { border-top: 1px solid var(--ds-border-light); }
+  .ax-gs__body .dsec-head { padding: 10px 0; }
+  .ax-gs__body .dsec > summary:hover { background: var(--ds-surface-dim); border-radius: 0; }
+  .ax-gs__body .dsec[open] > summary { border-bottom: 1px solid var(--ds-border-light); }
+
+  /* Level 3 — the items. No frame of its own any more: it is inside the
+     table's surface, so it contributes rows, not a box. */
+  .ax-table {
+    background: none; border: 0; border-radius: 0; overflow: visible;
+  }
+  .ax-table .ax-colhd { padding-left: 0; }
+  .ax-table .ax-fam__hd { padding-left: 8px; box-shadow: inset 3px 0 0 var(--ds-border); }
+  .ax-table .ax-r { padding-left: 8px; padding-right: 0; }
+  .ax-table .ax-r:hover { background-color: var(--ds-surface-dim); }
+
+  /* The identity line is metadata about the group, not a row of the table —
+     it keeps its quiet, and loses the row chrome. */
+  .ax-gs__body .ax-gh { padding: 8px 0 2px; }
+  .ax-gs__body .ax-gh:hover { background: none; }
 </style>
 {% endblock %}
 
