@@ -228,10 +228,23 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     protocol error (never split across requests, per §7.2). ``documents``
     may be omitted only when every evidence ``doc_id`` already resolves
     through a prior upload's ``corpus_file_sources`` mapping — otherwise
-    400 with the unresolved ids itemized. Everything else — the verbatim
-    gate, deferred-vs-rejected, union vs `full_documents` replace, alias/
-    edge resolution, correction re-attachment, the post-ingest orphan
-    sweep — happens in :meth:`FactsPgRepository.ingest_batch`; this
+    400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)
+    can anchor more than one ``corpus_file_sources`` row for the same
+    ``doc_id``; resolution is corpus-scoped and deterministic (indexed
+    copies preferred, ``corpus_file_id`` as tiebreak) — never an arbitrary
+    cross-collection pick, since that would mis-scope a claim's visibility.
+    When this batch's ``documents[]`` declared at least one collection but a
+    cited ``doc_id`` is anchored only in some OTHER, undeclared collection,
+    that claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized
+    in ``claims_rejected`` like any other reason) rather than written under
+    a collection wider than the producer's batch ever declared (RBAC
+    review, PR #1736) — nothing is ever silently attached cross-collection.
+    An entirely `documents[]`-omitted batch (the "already resolves" replay
+    above) has no batch-declared scope to escape and is unaffected.
+    Everything else — the verbatim gate, deferred-vs-rejected, union vs
+    `full_documents` replace, alias/edge resolution, correction
+    re-attachment, the post-ingest orphan sweep — happens in
+    :meth:`FactsPgRepository.ingest_batch`; this
     handler only translates its typed exceptions to HTTP status codes.
     Response IS the run report: ``{claims_written, claims_rejected:
     [{row, reason}], deferred: [...], subjects_created, subjects_deleted,

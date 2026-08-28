@@ -279,21 +279,21 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
     if not token:
         token_env = row.get("token_env") or ""
         if token_env:
-            # SECURITY: only read env vars on the remote-attach allowlist. Without
+            # SECURITY: only read env vars on the config-secret allowlist. Without
             # this, an admin could set token_env=JWT_SECRET_KEY (or DATABASE_URL,
             # ANTHROPIC_API_KEY, …) and exfiltrate that server-process secret via
             # the outbound X-StorageApi-Token header in /test and /tables. Enforced
             # here (validate-at-use) as well as at create/update, so a row written
             # before this guard existed still cannot leak an off-allowlist env var.
-            from src.orchestrator_security import is_token_env_allowed
+            from src.orchestrator_security import is_config_secret_env_allowed
 
-            if is_token_env_allowed(token_env):
+            if is_config_secret_env_allowed(token_env):
                 token = os.environ.get(token_env, "")
             else:
                 logger.warning(
-                    "connection %s: token_env %r is not on the remote-attach "
+                    "connection %s: token_env %r is not on the config-secret "
                     "allowlist; refusing to read it (add it to "
-                    "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+                    "AGNES_CONFIG_SECRET_ENVS or use a vault secret)",
                     connection_id,
                     token_env,
                 )
@@ -301,20 +301,28 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
 
 
 def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
-    """Reject a token_env that isn't on the remote-attach allowlist (409-style
-    400). None/empty is allowed — vault-secret connections don't use token_env.
-    Called on create/update so a bad name never lands in the row."""
+    """Reject a secret-ref env name that isn't on the config-secret allowlist
+    (409-style 400). None/empty is allowed — vault-secret connections don't use
+    token_env. Called on create/update so a bad name never lands in the row.
+
+    The write-time gate is the config-resolution UNION (attach names plus
+    config-only names like the SharePoint certificate env) — the hard
+    per-consumer boundary is enforced again at resolve time: the ATTACH paths
+    accept only ``is_token_env_allowed`` names, the settings resolvers only
+    ``is_config_secret_env_allowed`` ones."""
     if not token_env:
         return
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(token_env):
+    if not is_config_secret_env_allowed(token_env):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"token_env {token_env!r} is not allowlisted. Use a Keboola storage-"
-                "token env var (or add the name to AGNES_REMOTE_ATTACH_TOKEN_ENVS), "
-                "or store the token in the vault via PUT .../secret instead."
+                f"token_env {token_env!r} is not allowlisted. Use a data-source "
+                "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
+                "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
+                "remote-attach token_env), or store the token in the vault via "
+                "PUT .../secret instead."
             ),
         )
 
@@ -336,7 +344,7 @@ _CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
 
 def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict[str, Any]]) -> None:
     """Reject config-EMBEDDED secret-ref env var names that aren't on the
-    remote-attach allowlist — the same guard :func:`_reject_disallowed_token_env`
+    config-secret allowlist — the same guard :func:`_reject_disallowed_token_env`
     already applies to the request's top-level ``token_env`` field.
 
     Snowflake needs up to three independent secret-ref NAMES at once

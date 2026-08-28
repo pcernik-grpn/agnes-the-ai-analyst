@@ -328,6 +328,21 @@
       await load();
     });
     card.querySelector('[data-action="reset"]').addEventListener('click', async function () {
+      // TCRD-227: one click used to destroy the operator's override with no
+      // confirmation and no way back. Same design-system confirm every other
+      // destructive admin action uses; the `: true` fallback (not a native
+      // confirm — banned by the design-system contract) matches
+      // admin_package_detail.html's idiom when modal.js is absent.
+      const ok = window.confirmModal
+        ? await window.confirmModal({
+            title: 'Reset to the shipped default?',
+            message: 'The override in this editor is replaced by the built-in '
+              + 'default and cannot be recovered. Copy it out first if you '
+              + 'might want it back.',
+            confirmText: 'Reset to default',
+          })
+        : true;
+      if (!ok) return;
       const r = await api('DELETE', base);
       if (!r.ok) { setStatus(statusEl, detailHint(r.data), false); return; }
       setStatus(statusEl, 'Reset to default', true);
