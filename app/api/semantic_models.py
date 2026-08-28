@@ -578,7 +578,13 @@ async def create_semantic_model(
     (``_is_source_owned``, shared with PUT/DELETE/``_check_apply``) instead of
     creating a shadow ``manual/_/<slug>`` row next to the imported one — two
     rows sharing a slug would leave ``get_by_slug`` (``ORDER BY updated_at
-    DESC LIMIT 1``) to resolve the collision nondeterministically."""
+    DESC LIMIT 1``) to resolve the collision nondeterministically. A slug
+    matching a DETACHED source-owned row is exempt from that 409 (F3), but
+    still can't take the plain upsert path below: that row already owns the
+    slug, so writing a second, new ``manual/_/<slug>`` id next to it would
+    recreate the exact same collision this guard exists to prevent. It's
+    updated in place instead — same handling ``apply_manual_model`` already
+    gives this case."""
     result = validate_document(body.document)
     if not result.ok:
         raise HTTPException(status_code=422, detail={"errors": result.errors})
@@ -596,6 +602,22 @@ async def create_semantic_model(
         _raise_source_owned(existing)
 
     content_hash = hashlib.sha256(body.document.encode()).hexdigest()
+    if existing is not None and existing.get("sync_mode") == "detached":
+        row = semantic_model_repo().update_document(
+            existing["id"],
+            name=slug,
+            description=body.description,
+            document=body.document,
+            document_json=result.parsed,
+            spec_version=result.spec_version,
+            content_hash=content_hash,
+            status="valid",
+            validation_errors=None,
+            validated_at=datetime.now(UTC),
+        )
+        _project(result.parsed, source=existing["source"], source_ref=existing.get("source_ref"))
+        return row
+
     row = semantic_model_repo().upsert(
         id=f"manual/_/{slug}",
         slug=slug,

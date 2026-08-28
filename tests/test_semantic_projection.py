@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from src.semantic.projection import project_document
+from src.semantic.projection import project_document, prune_model
 
 
 @pytest.fixture
@@ -617,6 +617,101 @@ class TestColumnBinding:
         row = repo.get("shop_orders", "amount")
         assert row["description"] == "Authored by the profiler."
         assert row["source"] == "profiler"
+
+    def test_sibling_keboola_models_sharing_a_resolved_table_do_not_prune_each_others_columns(self, system_db):
+        """Regression: the column leg's write path resolves `table_id` via
+        `resolve_dataset_table`, but `_sibling_column_claims` used to key its
+        claims on the RAW dataset id — a mismatch invisible for `source=
+        'manual'` (whose raw id already IS the resolved one) but live for
+        every other source. A partial projection's `keep_by_table.get
+        (resolved_id)` then always missed a sibling's claim, so projecting
+        one Keboola model onto a shared table pruned a sibling model's
+        columns for that same table outright."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        def _doc(model_name, field_names):
+            return {
+                "semantic_model": [
+                    {
+                        "name": model_name,
+                        "datasets": [
+                            {
+                                "name": "orders",
+                                "source": "in.c-shop.orders",
+                                "fields": [{"name": n} for n in field_names],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        # `_sibling_column_claims` reads OTHER models' claims from their
+        # STORED `semantic_models` rows (as the real importer writes them
+        # before projecting, per `src/semantic/importer.py`) — a bare
+        # `project_document` call alone never populates that table, so each
+        # model's document must be seeded here too, or the sibling read sees
+        # nothing and the test can't tell a real fix from a no-op one.
+        from src.repositories import semantic_model_repo
+
+        def _seed(model_name, field_names):
+            doc = _doc(model_name, field_names)
+            semantic_model_repo().upsert(
+                id=f"keboola_metastore/conn-1/{model_name}",
+                slug=model_name,
+                name=model_name,
+                description=None,
+                document="version: '0.2.0.dev0'",
+                document_json=doc,
+                spec_version="0.2.0.dev0",
+                content_hash=model_name,
+                source="keboola_metastore",
+                source_ref="conn-1",
+                status="valid",
+                validation_errors=None,
+                validated_at=None,
+            )
+            return doc
+
+        project_document(_seed("retail", ["col_a"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+        project_document(_seed("finance", ["col_b"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+
+        from src.repositories import column_metadata_repo
+
+        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("shop_orders")}
+        assert remaining == {"col_a", "col_b"}, "projecting finance must not prune retail's sibling columns"
+
+    def test_deleting_a_keboola_model_prunes_its_own_columns_under_the_resolved_id(self, system_db):
+        """Regression: `prune_model`'s `written_by_table` used to key on the
+        RAW dataset id too, so `repo.list_for_table(raw_id)` found nothing
+        for a Keboola model (whose rows now live under the resolved id) and
+        deleting the model's document left its `column_metadata` rows
+        orphaned — never cleaned up."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "in.c-shop.orders",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="keboola_metastore", source_ref="conn-1")
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("shop_orders", "amount") is not None
+
+        prune_model(doc, source="keboola_metastore", source_ref="conn-1")
+
+        assert repo.get("shop_orders", "amount") is None, "deleting the model must not orphan its column_metadata row"
 
 
 class TestDuplicateModelName:

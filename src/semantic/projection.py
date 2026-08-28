@@ -891,7 +891,7 @@ def prune_model(document_json: dict, *, source: str, source_ref: Optional[str]) 
         report.glossary_pruned += _prune_glossary(source, source_ref, set(), scope_prefixes={prefix})
 
         written_by_table = {
-            (dataset.get("source") or dataset.get("name") or ""): set()
+            (resolve_dataset_table(dataset, source) or dataset.get("source") or dataset.get("name") or ""): set()
             for dataset in model.get("datasets") or []
             if isinstance(dataset, dict)
         }
@@ -960,7 +960,7 @@ def _sibling_column_claims(
             for dataset in model.get("datasets") or []:
                 if not isinstance(dataset, dict):
                     continue
-                table_id = dataset.get("source") or dataset.get("name") or ""
+                table_id = resolve_dataset_table(dataset, source) or dataset.get("source") or dataset.get("name") or ""
                 names = claims.setdefault(table_id, set())
                 for column in dataset.get("fields") or []:
                     if isinstance(column, dict) and column.get("name"):

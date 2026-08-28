@@ -122,6 +122,53 @@ class TestDetach:
         assert entries[0]["resource"] == row["id"]
 
 
+class TestCreateAfterDetach:
+    """``POST /api/admin/semantic-models`` on a slug that already belongs to
+    a DETACHED source-owned row must update that row in place, not create a
+    second ``manual/_/<slug>`` row next to it — ``_is_source_owned`` exempts
+    a detached row from the 409, but the row still owns the slug, and two
+    rows sharing one slug is exactly the nondeterministic-``get_by_slug``
+    collision the source-ownership guard exists to prevent."""
+
+    def test_create_updates_the_detached_row_instead_of_shadowing_it(self, state_backend, seeded_app_both):
+        _skip_unless_pg(state_backend)
+        seeded = _seed_source_owned_model()
+        c = seeded_app_both["client"]
+        c.post(
+            "/api/admin/semantic-models/orders/detach",
+            headers=_auth(seeded_app_both["admin_token"]),
+            json={"confirm_detach": True},
+        )
+
+        doc = (
+            "version: '0.2.0.dev0'\n"
+            "semantic_model:\n"
+            "  - name: orders\n"
+            "    description: edited\n"
+            "    datasets:\n"
+            "      - name: orders\n"
+            "        source: db.public.orders\n"
+            "        fields: []\n"
+        )
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": doc},
+            headers=_auth(seeded_app_both["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+
+        # Same row, same id/provenance — not a new manual/_/orders row.
+        assert body["id"] == seeded["id"]
+        assert body["source"] == "keboola_metastore"
+        assert body["source_ref"] == "proj1"
+        assert body["document"] == doc
+
+        listed = c.get("/api/admin/semantic-models", headers=_auth(seeded_app_both["admin_token"])).json()
+        matching = [m for m in listed if m["slug"] == "orders"]
+        assert len(matching) == 1, "no shadow manual/_/orders row alongside the detached one"
+
+
 class TestReattach:
     def _detach(self, c, token):
         _seed_source_owned_model()
