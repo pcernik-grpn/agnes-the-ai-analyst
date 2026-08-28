@@ -317,3 +317,73 @@ def test_sync_one_still_syncs_normal_rows(tmp_path, monkeypatch):
     assert result["commit"] == "a" * 40
 
     conn.close()
+
+
+def test_boot_seed_clears_a_stale_sync_error(tmp_path, monkeypatch):
+    """TCRD-219: before sync_one() learned to refuse built-in rows, one
+    "Sync now" click stamped a `last_error` that nothing ever cleared — the
+    nightly sync skips built-in rows, so it never ran, never succeeded, and
+    never removed the stamp. The boot re-seed is the honest place to clear
+    it: for the built-in row the content is re-baked from the bundle in the
+    same breath, so any previous sync error is stale by construction."""
+    conn = _setup_duckdb_repos(tmp_path)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    from src.marketplace import seed_builtin_marketplace, BUILTIN_MARKETPLACE_SLUG
+    from src.repositories import marketplace_registry_repo
+
+    seed_builtin_marketplace()
+    # The pre-fix wound: a manual sync attempt stamped its failure.
+    marketplace_registry_repo().update_sync_status(
+        BUILTIN_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found"
+    )
+    assert (
+        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is not None
+    ), "precondition: the stale stamp is in place"
+
+    seed_builtin_marketplace()
+
+    assert (
+        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is None
+    ), "boot re-seed must clear the stale sync error it makes moot"
+    conn.close()
+
+
+def test_contributed_registry_row_seed_clears_a_stale_sync_error(tmp_path, monkeypatch):
+    """Same wound, other bundled row. The contributed marketplace's registry
+    row is (re-)asserted whenever a skill is contributed; a stale sync error
+    on it is exactly as non-actionable — after the sync_one() guard, no sync
+    can ever run against it again, so the stamp could otherwise never clear."""
+    conn = _setup_duckdb_repos(tmp_path)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    from src.skill_contribution import _ensure_registry_row, CONTRIBUTED_MARKETPLACE_SLUG
+    from src.repositories import marketplace_registry_repo
+
+    _ensure_registry_row(registered_by="test")
+    marketplace_registry_repo().update_sync_status(
+        CONTRIBUTED_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found"
+    )
+
+    _ensure_registry_row(registered_by="test")
+
+    assert (
+        marketplace_registry_repo().get(CONTRIBUTED_MARKETPLACE_SLUG)["last_error"] is None
+    ), "re-asserting the contributed registry row must clear the stale sync error"
+    conn.close()
+
+
+def test_admin_table_shows_no_sync_state_for_builtin_rows():
+    """The sync-state cell renders `failed <date>` / `never` from
+    last_error/last_synced_at — states a bundled row can never leave, since
+    nothing syncs it. The cell must branch on is_builtin before it reads
+    either field, the same way the URL cell already does."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    # The lastSync const must consult is_builtin before last_error.
+    last_sync_def = template.split("const lastSync")[1].split(";")[0]
+    assert "is_builtin" in last_sync_def, (
+        "the sync-state cell must branch on m.is_builtin — a bundled row "
+        "otherwise shows 'failed'/'never' for a sync that can never run"
+    )

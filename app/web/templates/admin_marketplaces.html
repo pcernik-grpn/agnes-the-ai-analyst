@@ -564,7 +564,11 @@ function renderMarketplaces() {
   tbody.innerHTML = "";
   for (const m of filtered) {
     const tr = document.createElement("tr");
-    const lastSync = m.last_error
+    // Bundled rows have no git remote — "failed"/"never" would describe a
+    // sync that can never run (same is_builtin branch as the URL cell).
+    const lastSync = m.is_builtin
+      ? `<span class="mp-muted" title="Bundled content is re-seeded on boot — there is no git sync to report">—</span>`
+      : m.last_error
       ? `<span class="mp-err-badge" title="${esc(m.last_error)}">failed ${esc(fmtDate(m.last_synced_at))}</span>`
       : (m.last_synced_at ? `<span class="mp-ok-dot">●</span> ${esc(fmtDate(m.last_synced_at))}` : `<span class="mp-muted">never</span>`);
     tr.innerHTML = `

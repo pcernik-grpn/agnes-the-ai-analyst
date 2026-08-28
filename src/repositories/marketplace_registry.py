@@ -156,3 +156,16 @@ class MarketplaceRegistryRepository:
             f"UPDATE marketplace_registry SET {', '.join(sets)} WHERE id = ?",
             params,
         )
+
+    def clear_sync_error(self, marketplace_id: str) -> None:
+        """Null out ``last_error`` without pretending a sync happened.
+
+        Exists for the boot re-seed of bundled rows (TCRD-219): a stale
+        failure stamped by a pre-guard "Sync now" click could otherwise
+        never clear, because the nightly sync skips built-in rows.
+        Deliberately NOT ``update_sync_status(commit_sha=...)`` — that
+        would also stamp a sync that never ran."""
+        self.conn.execute(
+            "UPDATE marketplace_registry SET last_error = NULL WHERE id = ?",
+            [marketplace_id],
+        )
