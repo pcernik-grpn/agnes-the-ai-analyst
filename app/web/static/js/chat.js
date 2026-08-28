@@ -5664,8 +5664,18 @@ function renderCoPresence(host, participants) {
   // Doing it here also retires the stale badge/rows a switch used to leave
   // behind.
   document.addEventListener("agnes:session-open", async (e) => {
-    const chatId = (e.detail && e.detail.chatId) || currentChatId;
+    const detail = e.detail || {};
+    const chatId = detail.chatId || currentChatId;
     if (!chatId) return;
+    // A RE-open of the same conversation is not a switch. `ensureWsReady`
+    // re-enters openSession whenever the socket is closed, so this fires
+    // mid-turn on a reconnect — and folding the listing into the baseline
+    // there would absorb a deliverable written while the socket was down as
+    // "already seen", leaving the turn-end that follows with nothing fresh
+    // and the drawer shut. Nothing about the conversation changed, and the
+    // turn-end poll refreshes the view after every turn, so the honest
+    // response to a reconnect is to do nothing at all.
+    if (detail.switching === false && _filesSessionId === chatId) return;
     // Reset synchronously, before the round-trip: until it lands the badge
     // and any open drawer would otherwise still show the previous
     // conversation's count and rows, whose links carry the old chat id.
@@ -5696,10 +5706,14 @@ function renderCoPresence(host, participants) {
     // files is worse than one missed.
     if (_filesSessionId !== chatId) {
       const seq = ++_filesSeq;
-      _filesSessionId = chatId;
-      _knownOutputs = new Set();
       const seed = await fetchSessionFiles(chatId, { quiet: true });
-      if (seq !== _filesSeq || currentChatId !== chatId) return;
+      // Same ok/ownership rules as the other two writers. Nothing is
+      // assigned until the listing actually succeeds: claiming the session
+      // with an empty baseline would make the NEXT turn read every
+      // pre-existing file as fresh — the spurious auto-open this branch
+      // exists to avoid — and would stop this branch from retrying.
+      if (!seed.ok || seq !== _filesSeq || currentChatId !== chatId) return;
+      _filesSessionId = chatId;
       _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
       updateFilesBadge(seed.files.length);
       return;

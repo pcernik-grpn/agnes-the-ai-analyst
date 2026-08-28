@@ -219,6 +219,54 @@ def test_a_slow_open_seed_cannot_clobber_a_newer_turn_end_baseline():
     assert res["opened"] == 0, "the late seed must not reset the baseline the turn-end already advanced"
 
 
+def test_a_mid_turn_reconnect_does_not_absorb_the_turns_deliverable():
+    """`ensureWsReady` re-enters `openSession` whenever the socket is closed,
+    so `agnes:session-open` can fire *during* a turn — after the agent wrote
+    `outputs/deck.pptx` but before the `done` frame.
+
+    Folding the listing into the baseline there marks that file as already
+    seen, and the turn-end that follows finds nothing fresh. A re-open of the
+    same conversation carries `switching: false`, and is left alone.
+    """
+    res = _run_scenario(
+        """
+        currentChatId = "c1";
+        _nextFiles = () => [];
+        await fire("agnes:session-open", { chatId: "c1", switching: true });
+        _nextFiles = () => ["outputs/deck.pptx"];       // written mid-turn
+        await fire("agnes:session-open", { chatId: "c1", switching: false });  // socket dropped
+        await fire("agnes:turn-end");
+        process.stdout.write(JSON.stringify({ opened }));
+        """
+    )
+    assert res["opened"] == 1, "the reconnect must not consume the turn's own deliverable"
+
+
+def test_the_turn_end_reseed_branch_refuses_a_failed_listing():
+    """The defensive branch has to obey the same rule as the other two
+    baseline writers: a failed listing knows nothing.
+
+    Unreachable in normal flow (session-open claims the session first), which
+    is exactly why it needs a test — nothing else would notice it drifting.
+    Driven directly by dispatching turn-end with no prior session-open.
+    """
+    res = _run_scenario(
+        """
+        currentChatId = "c1";
+        _nextFiles = () => ["outputs/old.pptx"];
+        _failNext = true;
+        await fire("agnes:turn-end");        // re-seed attempt, fetch fails
+        await fire("agnes:turn-end");        // retry: seeds for real, no open
+        await fire("agnes:turn-end");        // nothing new
+        process.stdout.write(JSON.stringify({ opened, badge }));
+        """
+    )
+    assert res["opened"] == 0, "a failed seed must not leave an empty baseline that fakes a fresh file"
+    # The failed attempt reports nothing at all; the two that follow report
+    # the real count. A `0` here would mean the failure was published.
+    assert res["badge"] == [1, 1], res["badge"]
+
+
 def test_a_failed_refresh_does_not_wipe_the_auto_open_baseline():
     """A listing that failed knows nothing — it must not be adopted as "these
     are the deliverables I have seen".
