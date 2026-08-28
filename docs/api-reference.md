@@ -1153,6 +1153,7 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
+- /api/admin/sharepoint/connections/{connection_id}/certificate
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1177,6 +1178,19 @@ exclusion — without touching its already-created collection.
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
 crawling moves inside Agnes.
+
+`GET …/certificate` returns read-only certificate metadata — the thumbprint
+the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
+header value) plus the conventional uppercase-hex SHA-1 fingerprint
+(`thumbprint_sha1_hex`), `subject`/`issuer`, `not_before`/`not_after`, and a
+derived `expires_in_days` (may be negative) / `status`
+(`ok`/`expiring_soon` at ≤30 days/`expired`) — derived at request time from
+the connection's already-stored PEM, no new schema. Catches two real
+failure modes: a registered certificate that doesn't match what the
+connection presents (opaque provider auth error), and a certificate
+expiring silently. Never returns the private key. No certificate configured
+or an unparseable one is a typed absence — `{"certificate": null, "reason":
+"..."}` — not an error status.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.

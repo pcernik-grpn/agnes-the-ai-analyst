@@ -27,6 +27,14 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 ``{source_scope_id: collection_id}``
                                                                 mapping ``ship_to_agnes.py
                                                                 --corpus-map`` consumes.
+  GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
+                                                                (thumbprint, subject/issuer, expiry)
+                                                                derived at request time from the
+                                                                connection's already-stored PEM.
+                                                                Never the private key. ``certificate:
+                                                                null`` (plus ``reason``) when no
+                                                                certificate is configured or it
+                                                                cannot be parsed — never a 500.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -56,6 +64,7 @@ from app.auth.access import require_admin
 from app.resource_types import ResourceType
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
+    certificate_metadata,
     get_app_token,
     list_drives,
     list_root_children,
@@ -359,3 +368,31 @@ async def corpus_map(
     verbatim as the mapping itself."""
     row = _sharepoint_connection_or_404(connection_id)
     return {s["source_scope_id"]: s["collection_id"] for s in _scopes(row) if s.get("source_scope_id")}
+
+
+@router.get("/connections/{connection_id}/certificate")
+async def certificate(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Read-only certificate metadata for the connection's already-stored
+    PEM — thumbprint (the ``x5t`` value the client actually presents, plus
+    the conventional uppercase-hex fingerprint), subject/issuer, validity
+    window, and a derived ``ok``/``expiring_soon``/``expired`` status. Two
+    real failure modes this closes: a registered certificate that does not
+    match what the connection actually presents (opaque provider auth
+    error), and a certificate expiring silently (crawl/sync fails with no
+    warning).
+
+    Never the private key — only :func:`connectors.sharepoint.graph_client.
+    certificate_metadata`'s CERTIFICATE-block parse reaches the response.
+    No certificate configured, or a certificate that fails to resolve or
+    parse, is a typed absence (``certificate: null`` plus ``reason``) —
+    never a 500.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        settings = resolve_sharepoint_settings(row)
+    except SharePointSettingsError as exc:
+        return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
+    return certificate_metadata(settings.private_key)

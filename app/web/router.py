@@ -7590,17 +7590,33 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity
     # fields, an unset/disallowed env var) is shown as its own message
-    # rather than raised — this is a status row, not a gate.
+    # rather than raised — this is a status row, not a gate. Enriched with
+    # thumbprint/subject/issuer/expiry (`certificate_metadata` — same
+    # derivation the standalone `GET .../certificate` endpoint calls, so
+    # there is exactly one place that parses the certificate) so the card
+    # answers two real failure modes: a registered certificate that doesn't
+    # match what the connection presents, and one expiring silently.
     try:
+        from connectors.sharepoint.graph_client import certificate_metadata
         from connectors.sharepoint.settings import resolve_sharepoint_settings
 
         settings = resolve_sharepoint_settings(conn)
-        cell["certificate"] = {
+        cert_cell: dict[str, Any] = {
             "origin": settings.credential_source,
             "env_name": settings.credential_env,
             "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
             "error": None,
         }
+        meta = certificate_metadata(settings.private_key)
+        if meta["certificate"] is not None:
+            cert_cell.update(meta["certificate"])
+        else:
+            # A resolvable-but-unusable certificate (no CERTIFICATE PEM
+            # block, or one that fails to parse) — distinct from `error`
+            # above, which is a settings-RESOLUTION failure, not a content
+            # one.
+            cert_cell["metadata_reason"] = meta["reason"]
+        cell["certificate"] = cert_cell
     except Exception as e:
         # Logged, not just rendered: this block swallowed a real type bug
         # (a str set-date reaching .isoformat()) for as long as its only

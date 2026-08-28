@@ -194,6 +194,15 @@
   .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
   .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* Certificate expiry status (spec: catch a silently expiring certificate
+     before auth breaks) — reuses the same success/warn/danger accent tokens
+     the health chip and pipeline strip already use. */
+  .ds-badge.badge-ok     { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .ds-badge.badge-ok::before     { background: var(--ds-accent-success-ink); }
+  .ds-badge.badge-warn   { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+  .ds-badge.badge-warn::before   { background: var(--ds-accent-warn-line); }
+  .ds-badge.badge-danger { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+  .ds-badge.badge-danger::before { background: var(--ds-accent-danger-line); }
   /* The file-source card's error-category badges are BUTTONS (they open the
      filtered drawer, spec §13.2) — normalize away the browser's default
      button chrome so a clickable badge still reads as a badge. */
@@ -1947,6 +1956,48 @@ function _sharepointFactsHtml(row) {
       ? (cert.set_at ? `set ${_esc(new Date(cert.set_at).toLocaleDateString())}` : "set date unknown")
       : `env <code>${_esc(cert.env_name || "")}</code>`;
 
+  // Certificate METADATA — thumbprint (what the client actually presents,
+  // compared against the identity provider), subject, and an expiry badge.
+  // Derived server-side from the same stored PEM `certDetail` above already
+  // resolved; never the private key. Rendered only once the connection's
+  // settings resolved (`cert.error` already covers a settings-resolution
+  // failure above — repeating "not configured" here would be noise): a
+  // resolvable-but-unusable certificate (no CERTIFICATE block, or one that
+  // fails to parse) gets its own single honest line rather than silently
+  // vanishing (`cert.metadata_reason`).
+  let certMetaHtml = "";
+  if (!cert.error && cert.thumbprint_x5t) {
+    const tone = cert.status === "expired" ? "badge-danger" : cert.status === "expiring_soon" ? "badge-warn" : "badge-ok";
+    const expiresDate = cert.not_after ? new Date(cert.not_after).toLocaleDateString() : "unknown";
+    const daysText = cert.expires_in_days < 0 ? `expired ${Math.abs(cert.expires_in_days)}d ago` : `${cert.expires_in_days}d left`;
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The value the client actually presents (JWT x5t) — compare against the identity provider's app registration.">Thumbprint</span>
+    <span class="ds-src__fact-v">
+      <code>${_esc(cert.thumbprint_x5t)}</code>
+      <button type="button" class="btn btn-secondary" onclick="_copySharepointThumbprint(this)">Copy</button>
+    </span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Subject</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(cert.subject || "unknown")}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Expires</span>
+    <span class="ds-src__fact-v">
+      <span class="ds-badge ${tone}">${_esc(cert.status || "")}</span>
+      <span style="color:var(--ds-text-muted)">${_esc(expiresDate)} &middot; ${_esc(daysText)}</span>
+    </span>
+  </div>`;
+  } else if (!cert.error && cert.metadata_reason) {
+    const reasonText = cert.metadata_reason === "no_certificate_configured" ? "not configured" : "unreadable";
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Thumbprint</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(reasonText)}</span>
+  </div>`;
+  }
+
   const identity = fs.identity || { groups_matched: 0, collections_no_group: 0 };
   const identityTone = identity.collections_no_group ? "is-warn" : "";
   const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
@@ -1976,7 +2027,7 @@ function _sharepointFactsHtml(row) {
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Certificate</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
-  </div>
+  </div>${certMetaHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
@@ -1986,6 +2037,22 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-v">${badgesHtml}</span>
   </div>
   <div class="ds-filesource-drawer" id="ds-fs-drawer-${row.id}" hidden></div>`;
+}
+
+/* Copies the certificate thumbprint an admin compares against the identity
+   provider's app registration. Reads the rendered <code> text directly
+   (already `_esc`-escaped on the way in, and a base64url thumbprint has no
+   characters that escaping would have changed) rather than threading the
+   raw value through an onclick attribute string. */
+function _copySharepointThumbprint(btn) {
+  const code = btn.previousElementSibling;
+  const text = code && code.textContent;
+  if (!text || !navigator.clipboard || typeof navigator.clipboard.writeText !== "function") return;
+  navigator.clipboard.writeText(text).then(() => {
+    const original = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  });
 }
 
 /* Segmented switch: click a badge, see that category's itemized rows below
