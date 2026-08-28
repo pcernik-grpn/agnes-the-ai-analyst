@@ -173,7 +173,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
 - **Fact graph over Collections — ingest run reports + the file-source source card** (build order step 6, same `facts.enabled`/Postgres-only gate). Every `POST /api/facts/ingest` batch now also persists its run report to `facts_ingest_runs` (id, corpus ids touched, documents seen, claims written/rejected — count plus itemized detail, deferred, subjects created/deleted, review items, caller) — written AFTER the ingest transaction commits, log-and-continue on failure, so a report-write hiccup never rolls back or fails an ingest. `GET /api/facts/ingest-runs?limit=` (admin) lists them newest-first. On `/admin/data-sources`, a `sharepoint`-type connection now renders the shared `.ds-src` card with a file-source pipeline strip (crawl → extraction → facts → graph counts, plus a labeled-placeholder queue-cost estimate), a static schedule line ("external producer · hourly delta" — the crawl runs externally), a certificate row (vault/env origin and set-date, never the credential value), an identity-matching row (groups matched / collections with no group, fail-closed), and per-run error badges (rejected quotes / deferred / protocol errors) that open a drawer itemizing that category. A connection with no ingest history yet, or a DuckDB-backed instance, degrades gracefully rather than erroring; a "scope collections" heuristic (every collection this instance has ever ingested facts into) stands in until the connect wizard's own connection→collection scope mapping ships.
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
-- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. This ships the Agnes-side seam only — the producer itself is a separate project the operator supplies, adopted rather than vendored into this repo.
+- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
 - **The chat sandbox now tells the agent the truth about its runtime, and
@@ -247,6 +247,35 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **A `no_tools_registered` 409 no longer reads as "already granted".** The
+  source-wide grant (`POST /api/admin/mcp-sources/{id}/grants`) answers 409
+  `no_tools_registered` when a source has no *enabled* tool row — nothing was
+  granted, and re-enabling the tools later does not go back and grant anyone.
+  Already-granted is not a 409 there at all (200 with an `already` count), so
+  the MCP builder's blanket "409 means done" reported a failed access change as
+  success, on a state the builder can produce: turn every introspected tool off,
+  pick a group, Save. The swallow is now keyed on the error code rather than the
+  status, so that case surfaces the server's own sentence (which names the fix)
+  and Save does not redirect. Sibling checked and left alone: the linked-apps
+  builder swallows 409 from `/api/admin/grants`, whose single 409 genuinely does
+  mean the grant already exists.
+- **The MCP builder's Save now registers the tools, so the source it hands back
+  is actually callable.** A source exposes only the `tool_registry` rows that
+  are `passthrough` and enabled (`app/api/mcp/tools_generator.py`), and Save
+  wrote the source, the secret and the grants but never a tool row — so it
+  produced a registered, granted source with **zero callable tools**, while the
+  Tools panel invited the admin to "turn off anything agents should not call"
+  and counted "N of M" on. The toggles described an outcome Save did not
+  produce, in both directions. Each tool left on is now registered as a
+  resumable step before the grants (a group pointed at a source with nothing
+  callable has been given nothing), keyed on the deterministic
+  `<source>__<tool>` id the source detail page already uses so a second Save
+  cannot duplicate a row and the 409 a re-register answers reads as done. Tools
+  toggled off are simply not registered. The introspected `input_schema` — which
+  the panel's mapper had been discarding — now reaches the registry, since it is
+  how an agent learns the tool's arguments. Materialize mode still belongs to
+  the source's own page: it needs a schedule and a table this panel does not ask
+  for.
 - **`dev_preview_available` had two definitions.** `_chrome_ctx` computed it as
   `_dev_preview_enabled()`; `/chat` also passed it to `_build_context` as
   `is_local_dev_mode() and is_user_admin(...)`. Only the first was corrected
@@ -672,6 +701,50 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rest (logged; default-deny, so a future unknown beta degrades one optional
   feature instead of 400-ing every turn), and omits the header entirely when
   nothing survives.
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser
@@ -817,6 +890,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   destructive now (it burns the link so a refused consent cannot be re-submitted
   as an allow), so it requires the same authenticated Agnes session Allow always
   did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
@@ -846,14 +932,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   user was actively resuming. Any other spawn failure still propagates
   untouched.
 
-- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
-  **Not fully closed:** a third copy of the same rule lives in the password
-  provider's web-form POST handler, which is the terminal consumer of the form
-  `/login/password` renders — so signing in *with a password* still lands on the
-  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
-  magic-link all route through `safe_next_path` and do return you to the app.
-  The underlying fault is that this one rule had four implementations; three of
-  them still exist.
+- **Signing in dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app — on every provider, password included.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  The password provider's web-form POST handler — the terminal consumer of the
+  form `/login/password` renders, and the reason a *password* sign-in still
+  landed on the home route while OAuth and magic-link returned you to the app —
+  held a third copy of the same rule and now calls `safe_next_path` too. All
+  four sign-in paths (OAuth, magic-link, password form, login pages) resolve
+  `next` through the one implementation that knows about app origins.
 
 ### Removed
 

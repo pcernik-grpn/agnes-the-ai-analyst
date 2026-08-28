@@ -586,6 +586,14 @@ class UsageRepository:
         "distinct_tools",
         "distinct_skills",
         "primary_model",
+        # v44 token counters — stored since the processor learned to sum
+        # message.usage, but never projected until TCRD-222 (the admin
+        # sessions surfaces showed tool calls with no way to answer "what
+        # did this session cost").
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
     ]
 
     def sessions_count(self, filters: dict) -> int:
@@ -673,11 +681,17 @@ class UsageRepository:
             "tool_calls",
             "tool_errors",
             "primary_model",
+            # TCRD-222 — stored since v44, projected at last.
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
         )
         row = self.conn.execute(
             "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
             "user_messages, assistant_messages, tool_calls, tool_errors, "
-            "primary_model FROM usage_session_summary WHERE session_file = ?",
+            "primary_model, input_tokens, output_tokens, cache_read_tokens, "
+            "cache_creation_tokens FROM usage_session_summary WHERE session_file = ?",
             [session_file],
         ).fetchone()
         if row is None:
