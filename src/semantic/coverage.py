@@ -479,45 +479,31 @@ def _sync_status(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def _keboola_source_ref_is_live(source_ref: Optional[str]) -> bool:
-    """Keboola metastore sync stamps ``source_ref = source_connections.id``
-    (``connectors/keboola/semantic_layer.py``), never a ``semantic_sources``
-    row — so liveness here means a live *connection*, not a registered
-    semantic source.
+def _configured_databricks_host() -> Optional[str]:
+    """The currently-configured Databricks workspace host, independent of
+    whether a token can be resolved for it.
+
+    :func:`connectors.databricks.semantic_layer.resolve_databricks_settings`
+    returns ``None`` whenever the token isn't resolvable (env var unset,
+    vault unreachable) — correct for the sync path, which cannot do anything
+    without a token, but wrong for a liveness check: a health-report process
+    that simply lacks Databricks credentials would then flag every live
+    ``databricks_metrics`` model as orphaned, reviving the exact false-orphan
+    bug this module exists to fix. Liveness only needs the host, so this
+    mirrors the same row-first / else-legacy-instance-config order without
+    ever touching the token or warehouse id.
     """
-    if source_ref is None:
-        return False
-    from src.repositories import source_connections_repo
+    from src.connection_resolver import resolve_source_connection
 
-    return any(c["id"] == source_ref for c in source_connections_repo().list(source_type="keboola"))
+    connection = resolve_source_connection("databricks")
+    if connection is not None:
+        host = str((connection.get("config") or {}).get("host") or "").strip()
+        return host or None
 
+    from app.instance_config import get_value
 
-def _databricks_source_ref_is_live(source_ref: Optional[str]) -> bool:
-    """The legacy Databricks metrics sync stamps ``source_ref`` as the
-    warehouse hostname (``connectors/databricks/semantic_layer.py::
-    _source_ref_for_host``), never a ``semantic_sources`` row — so liveness
-    here means it matches the currently-configured workspace host.
-    """
-    if source_ref is None:
-        return False
-    from connectors.databricks.semantic_layer import _source_ref_for_host, resolve_databricks_settings
-
-    settings = resolve_databricks_settings()
-    if settings is None:
-        return False
-    return source_ref == _source_ref_for_host(settings["host"])
-
-
-#: Per-``source`` liveness check for ``_orphaned_models``, for the two
-#: providers that never write to ``semantic_sources`` (see each check's
-#: docstring). Any ``source`` absent from this map falls back to the
-#: default ``semantic_sources.id`` membership test — the same branching
-#: shape as ``src/semantic/projection.py::resolve_dataset_table``, a
-#: different question over the same ``source`` dispatch.
-_SOURCE_REF_LIVENESS_CHECK: Dict[str, Any] = {
-    "keboola_metastore": _keboola_source_ref_is_live,
-    "databricks_metrics": _databricks_source_ref_is_live,
-}
+    host = str(get_value("data_source", "databricks", "host", default="") or "").strip()
+    return host or None
 
 
 def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> List[Dict[str, Any]]:
@@ -533,22 +519,56 @@ def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> Lis
 
     "Live" does not mean the same thing for every ``source``: only documents
     synced through the registered semantic-source flow (git/upload/
-    connection) ever get a ``semantic_sources`` row at all.
-    ``keboola_metastore`` and ``databricks_metrics`` (see the module docstring
-    for both connectors) stamp ``source_ref`` with something else entirely —
-    a ``source_connections.id`` and a warehouse hostname, respectively — so
+    connection) ever get a ``semantic_sources`` row at all. ``keboola_
+    metastore`` and ``databricks_metrics`` (see each connector's module
+    docstring) stamp ``source_ref`` with something else entirely — a
+    ``source_connections.id`` and a warehouse hostname, respectively — so
     checking either against ``known_source_ids`` always misses and flags
-    every model those two providers ever produce. ``_SOURCE_REF_LIVENESS_
-    CHECK`` dispatches each ``source`` to the check that actually matches
-    what it stamps.
+    every model those two providers ever produce. The two closures below
+    dispatch each ``source`` to the check that matches what it actually
+    stamps — the same branching shape as
+    :func:`src.semantic.projection.resolve_dataset_table`, a different
+    question over the same ``source`` dispatch — each resolving its shared,
+    per-report state (the live Keboola connection ids; the configured
+    Databricks host) lazily on first use and reusing it for every remaining
+    model of that source, rather than re-querying per model.
     """
+    live_keboola_connection_ids: Optional[set] = None
+    live_databricks_ref: Optional[str] = None
+    databricks_host_resolved = False
+
+    def keboola_is_live(source_ref: Optional[str]) -> bool:
+        nonlocal live_keboola_connection_ids
+        if source_ref is None:
+            return False
+        if live_keboola_connection_ids is None:
+            from src.repositories import source_connections_repo
+
+            live_keboola_connection_ids = {c["id"] for c in source_connections_repo().list(source_type="keboola")}
+        return source_ref in live_keboola_connection_ids
+
+    def databricks_is_live(source_ref: Optional[str]) -> bool:
+        nonlocal live_databricks_ref, databricks_host_resolved
+        if source_ref is None:
+            return False
+        if not databricks_host_resolved:
+            databricks_host_resolved = True
+            host = _configured_databricks_host()
+            if host:
+                from connectors.databricks.semantic_layer import _source_ref_for_host
+
+                live_databricks_ref = _source_ref_for_host(host)
+        return live_databricks_ref is not None and source_ref == live_databricks_ref
+
+    checks: Dict[str, Any] = {"keboola_metastore": keboola_is_live, "databricks_metrics": databricks_is_live}
+
     orphans = []
     for m in models:
         source = m.get("source") or "manual"
         if source == "manual":
             continue
         source_ref = m.get("source_ref")
-        check = _SOURCE_REF_LIVENESS_CHECK.get(source)
+        check = checks.get(source)
         is_live = check(source_ref) if check is not None else source_ref in known_source_ids
         if not is_live:
             orphans.append(
