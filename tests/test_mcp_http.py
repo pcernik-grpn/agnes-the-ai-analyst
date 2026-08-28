@@ -1078,14 +1078,18 @@ class TestMySecretTestTool:
         assert result["message"] == "not_granted"
 
     def test_5xx_still_raises(self):
+        import httpx
+
         mod = _import_mod()
 
         with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
             tv.get.return_value = "tok"
             resp = _mock_resp({}, status=500)
-            resp.raise_for_status.side_effect = RuntimeError("boom")
+            resp.text = "internal error"
+            resp.reason_phrase = "Internal Server Error"
+            resp.request = httpx.Request("POST", "http://server/api/mcp/sources/src_test/my-secret/test")
             MC.return_value.__aenter__.return_value.post = AsyncMock(return_value=resp)
-            with pytest.raises(RuntimeError):
+            with pytest.raises(httpx.HTTPStatusError, match="internal error"):
                 _run(mod.my_secret_test("src_test"))
 
 
