@@ -630,16 +630,25 @@ _MCP_CLIENT_ID = "kai-agent-broker"
 #: resolved identity, exactly as it is for a real connector.
 _MCP_SCOPES = ["read"]
 
-#: session_id -> (token, expires_at). Minting is a DB write, and an MCP turn
-#: makes many JSON-RPC calls, so the token is reused across them. In-process
-#: like the broker's own budget cache — Agnes runs a single chat worker, and a
-#: lost cache just re-mints.
+#: session_id -> (token, expires_at, kind). Minting is a DB write, and an MCP
+#: turn makes many JSON-RPC calls, so the token is reused across them.
+#: In-process like the broker's own budget cache — Agnes runs a single chat
+#: worker, and a lost cache just re-mints.
+#:
+#: `kind` records which identity SHAPE the entry was minted as (`"owner"` — a
+#: plain user token; `"agent"` — an agent-session token resolved to a live
+#: `AgentPrincipal` per request). The per-call guards recompute the required
+#: kind BEFORE the cache is read, and a mismatch is a miss: without that, an
+#: owner editing their agent from all-'all' to 'selected' mid-conversation
+#: would keep serving the un-narrowed owner token for the rest of the entry's
+#: 15-minute life — the same cache-skips-the-guards bug this function already
+#: fixed once for the deleted/co-session cases.
 #:
 #: Swept on every mint (see `_prune_mcp_token_cache`). Without that it is an
 #: unbounded leak rather than a cache: a chat's entry is never read again once
 #: the chat ends, but it would hold a full JWT for the process lifetime, so
 #: memory grew with the number of engine chats ever served and never shrank.
-_mcp_token_cache: Dict[str, tuple[str, int]] = {}
+_mcp_token_cache: Dict[str, tuple[str, int, str]] = {}
 
 #: Guards every read, prune and write of `_mcp_token_cache`. A `threading.Lock`
 #: rather than an asyncio one because the function that touches the cache runs
@@ -711,7 +720,7 @@ def _prune_mcp_token_cache(now: int) -> None:
     # iteration`, and a bare `del` raced another thread's prune into a
     # `KeyError` — both surfacing as intermittent 500s on `/api/kai/mcp` rather
     # than as anything diagnosable. Found by Copilot on this PR.
-    for stale in [sid for sid, (_, exp) in list(_mcp_token_cache.items()) if exp <= now]:
+    for stale in [sid for sid, entry in list(_mcp_token_cache.items()) if entry[1] <= now]:
         _mcp_token_cache.pop(stale, None)
 
 
@@ -721,23 +730,38 @@ def _mint_mcp_access_token(session_id: str) -> str:
 
     The verifier resolves a bearer against ``oauth_access_tokens`` — a plain
     session JWT is not enough — so this mints the same shape the OAuth code
-    exchange does and registers it: an Agnes session JWT carrying
-    ``scope='mcp-oauth'``, saved with its digest. That scope is load-bearing,
-    not decoration: ``resolve_token_to_user`` reads it to stamp the stack
-    data-read surface, which is the correct posture for an agent surface —
-    the engine follows its user's stack rather than inheriting an admin's
-    catalog god-mode.
+    exchange does and registers it. For a plain solo session that is an Agnes
+    session JWT carrying ``scope='mcp-oauth'``, saved with its digest. That
+    scope is load-bearing, not decoration: ``resolve_token_to_user`` reads it
+    to stamp the stack data-read surface, which is the correct posture for an
+    agent surface — the engine follows its user's stack rather than
+    inheriting an admin's catalog god-mode.
 
-    **The two narrowed session kinds are refused, not resolved to the owner.**
-    ``_mint_identity_jwt`` (the native replay path) answers a co-session with a
-    live participant grant-intersection and a scope-limited agent session with
-    owner-grants ∩ agent-scope, and it documents the fall-through to the stored
-    owner as the bug that "over-authorized guests". This token cannot express
-    either: it is a registered bearer with a baked subject, so there is nothing
-    to recompute per request. Refusing is therefore the only honest answer, and
-    it is the same call ``_ticket_owner_for_git`` makes for the same reason —
-    a write with "no notion of a partial identity" fails closed rather than
-    silently widening to the owner.
+    **A scope-limited agent session mints the same narrowed identity the
+    native replay path does, not the owner.** ``_mint_identity_jwt`` answers
+    it with an ``agent_session`` JWT (``mint_agent_session_jwt``) that bakes
+    in NO authority: ``resolve_token_to_user`` rebuilds owner-grants ∩
+    agent-scope live on every request the MCP tools make under it
+    (``AgentPrincipal``), so narrowing the agent or revoking a grant takes
+    effect on the very next tool call — a registered bearer is only the
+    transport, never the authority. Registering that JWT in
+    ``oauth_access_tokens`` is what lets the mounted MCP app's verifier
+    accept it; the identity seams downstream are the ones the native broker
+    already exercises with the identical token. The same narrowed path is
+    taken for an all-'all' agent whose session user is NOT its owner (a
+    Slack channel binding: the mentioner), mirroring ``_mint_identity_jwt``'s
+    owner-mismatch branch. One shape this transport cannot express remains:
+    dynamic passthrough tools whose source is ``scope='per_user'`` resolve
+    the caller off the JWT's ``sub``, which an agent-session token
+    deliberately does not carry — those fail closed for agent sessions, as
+    they do for every restricted principal on the streamable surface.
+
+    **A co-session is still refused, not resolved to the owner.** Its live
+    participant grant-intersection has an equivalent token
+    (``mint_co_session_jwt``), but the co-drive surfaces on this provider
+    (workspace, copresence seams) have not been built out — refusing keeps
+    the documented "conversation without host data access" posture instead
+    of shipping tools without the rest.
 
     On reachability, corrected: this once read "ANY ``mcp``-scoped ticket
     satisfies this route", which was true only while the engine and the native
@@ -746,15 +770,15 @@ def _mint_mcp_access_token(session_id: str) -> str:
     (``app/chat/manager.py``) and none of them reach here. The guards below stay
     because the remaining path is narrower but real: a row created by
     ``/api/kai/sessions`` can BECOME a co-session, or acquire a scope-limited
-    agent, while ``/api/kai/tickets`` keeps minting ``kai_mcp`` against it. So
-    the identity this route bakes into a registered bearer token must still be
-    refused rather than resolved to the owner. Guards found by Devin Review on
-    this PR; the stale reachability claim likewise.
+    agent, while ``/api/kai/tickets`` keeps minting ``kai_mcp`` against it.
+    Guards found by Devin Review on the original PR; the stale reachability
+    claim likewise.
     """
     import time as _time
     import uuid as _uuid
     from datetime import timedelta
 
+    from app.auth.access import mint_agent_session_jwt
     from app.auth.jwt import create_access_token
     from app.auth.public_url import mcp_issuer_url
     from src.repositories import oauth_clients_repo, users_repo
@@ -774,9 +798,9 @@ def _mint_mcp_access_token(session_id: str) -> str:
         raise HTTPException(status_code=401, detail="ticket_session_not_found")
     if getattr(session, "is_co_session", False):
         raise HTTPException(status_code=403, detail="mcp_not_available_to_co_session")
+    agent = None
     agent_id = getattr(session, "agent_id", None)
     if agent_id:
-        from src.agent_scope_intersection import agent_is_passthrough
         from src.repositories import agents_repo
 
         agent = agents_repo().get_by_id(agent_id)
@@ -785,33 +809,53 @@ def _mint_mcp_access_token(session_id: str) -> str:
             # attributed to a deleted agent must not regain the owner's full
             # authority through the fall-through below.
             raise HTTPException(status_code=401, detail="ticket_agent_not_found")
-        if not agent_is_passthrough(agent):
-            raise HTTPException(status_code=403, detail="mcp_not_available_to_scoped_agent")
     user = users_repo().get_by_email(session.user_email)
     if user is None:
         raise HTTPException(status_code=401, detail="ticket_user_not_found")
 
+    # The identity SHAPE this call requires — `_mint_identity_jwt`'s decision,
+    # reproduced: any non-passthrough agent (unknown mode values included, per
+    # `agent_is_passthrough`'s fail-closed contract) takes the narrowed
+    # agent-session path, and so does an all-'all' agent whose session user is
+    # not its owner (Slack channel binding: the turn must carry the OWNER-
+    # derived AgentPrincipal, not the mentioner's own authority).
+    agent_scoped = False
+    if agent is not None:
+        from src.agent_scope_intersection import agent_is_passthrough
+
+        agent_scoped = not agent_is_passthrough(agent) or str(user["id"]) != str(agent.get("owner_user_id"))
+    kind = "agent" if agent_scoped else "owner"
+
     with _mcp_token_cache_lock:
         cached = _mcp_token_cache.get(session_id)
-        if cached and cached[1] - _MCP_ACCESS_TOKEN_REFRESH_MARGIN_SECONDS > now:
+        if cached and cached[2] == kind and cached[1] - _MCP_ACCESS_TOKEN_REFRESH_MARGIN_SECONDS > now:
             return cached[0]
         _prune_mcp_token_cache(now)
 
     expires_at = now + _MCP_ACCESS_TOKEN_TTL_SECONDS
-    token = create_access_token(
-        user_id=user["id"],
-        email=user["email"],
-        expires_delta=timedelta(seconds=_MCP_ACCESS_TOKEN_TTL_SECONDS),
-        token_id=_uuid.uuid4().hex,
-        typ="session",
-        extra_claims={"scope": "mcp-oauth", "chat_session_id": session_id},
-    )
+    if agent_scoped:
+        # No baked-in authority: `resolve_token_to_user` rebuilds the agent's
+        # intersection live on every request made under this token, exactly as
+        # it does for the native broker's replay identity.
+        token = mint_agent_session_jwt(session_id, ttl=_MCP_ACCESS_TOKEN_TTL_SECONDS)
+        # Label, not identity — the JWT's own synthetic sub is what resolves.
+        subject = f"agent-session:{session_id}"
+    else:
+        token = create_access_token(
+            user_id=user["id"],
+            email=user["email"],
+            expires_delta=timedelta(seconds=_MCP_ACCESS_TOKEN_TTL_SECONDS),
+            token_id=_uuid.uuid4().hex,
+            typ="session",
+            extra_claims={"scope": "mcp-oauth", "chat_session_id": session_id},
+        )
+        subject = user["id"]
     oauth_clients_repo().save_access_token(
         token=token,
         client_id=_MCP_CLIENT_ID,
         scopes=list(_MCP_SCOPES),
         expires_at=expires_at,
-        subject=user["id"],
+        subject=subject,
         # Parity with the genuine code exchange, which passes the client's
         # requested `resource` (`app/auth/mcp_oauth.py`). `load_access_token`
         # copies the stored value through without validating, so a `None` is
@@ -822,7 +866,7 @@ def _mint_mcp_access_token(session_id: str) -> str:
         resource=mcp_issuer_url(),
     )
     with _mcp_token_cache_lock:
-        _mcp_token_cache[session_id] = (token, expires_at)
+        _mcp_token_cache[session_id] = (token, expires_at, kind)
     return token
 
 
@@ -1055,14 +1099,25 @@ def _workspace_prompt_for(session: Any, *, override_active: bool = False) -> Opt
     """This session's rendered Workspace Prompt, or ``None`` to ship the
     template's static ``CLAUDE.md`` unchanged.
 
-    The rendered document is RBAC-filtered — it names the tables, metrics and
-    skills its subject may reach — so it belongs to the session's OWNER, not
-    to whoever is driving the session. A conversation that became a
-    co-session, or that acquired a scope-limited agent, therefore gets the
-    un-filtered bundled text instead: the same narrowing
-    ``_mint_mcp_access_token`` applies, expressed here as a downgrade rather
+    The rendered document is RBAC-filtered for the session's USER — it names
+    the tables, metrics and skills that identity may reach. A co-session gets
+    the un-filtered bundled text instead (the live participant intersection
+    cannot be expressed in a static render), expressed as a downgrade rather
     than a refusal because this route's contract is closed (``200`` or
     ``204``) and a ``403`` would fail the turn instead of degrading it.
+
+    An agent session — scope-limited included — DOES get the render, for
+    native parity: ``WorkdirManager`` seeds every agent session's workdir
+    from the session user's own rendered prompt regardless of agent scope
+    (the prompt is advisory text for that same user; enforcement is the live
+    ``AgentPrincipal`` intersection at the tool seams, which
+    ``_mint_mcp_access_token`` now applies on this provider too). Only a
+    deleted agent still falls back — the same fail-closed direction
+    ``_mint_identity_jwt`` takes, so a session attributed to a deleted agent
+    cannot recover a filtered view under an identity that no longer resolves.
+    Note the render is skipped entirely when the agent carries a persona —
+    ``_agent_workspace_members`` then replaces ``CLAUDE.md`` outright,
+    exactly as ``WorkdirManager._materialize_profile`` does natively.
     """
     if override_active and not _editor_prompt_overrides_a_git_template():
         # Git-bound prompt (or none): the clone's own CLAUDE.md ships verbatim,
@@ -1073,17 +1128,10 @@ def _workspace_prompt_for(session: Any, *, override_active: bool = False) -> Opt
         return None
     agent_id = getattr(session, "agent_id", None)
     if agent_id:
-        from src.agent_scope_intersection import agent_is_passthrough
         from src.repositories import agents_repo
 
         agent = agents_repo().get_by_id(agent_id)
-        # Deleted agent → fall back, never up: the same fail-closed direction
-        # `_mint_identity_jwt` and `_mint_mcp_access_token` take, so a session
-        # attributed to a deleted agent cannot recover the owner's filtered
-        # view of the catalog.
         if agent is None or agent.get("deleted_at") is not None:
-            return None
-        if not agent_is_passthrough(agent):
             return None
 
     from app.chat.workspace_prompt import render_sandbox_workspace_prompt
@@ -1105,12 +1153,121 @@ def _workspace_prompt_for(session: Any, *, override_active: bool = False) -> Opt
     return rendered if rendered and rendered.strip() else None
 
 
+def _agent_workspace_members(session: Any) -> Dict[str, bytes]:
+    """The agent-persona overlay for this session's workspace tarball, keyed
+    by arcname — empty for a session with no (live) agent.
+
+    The native providers deliver an agent by materializing it into the
+    session workdir (``ChatManager._spawn_live`` → ``build_profile`` /
+    ``materialize_memories`` → ``WorkdirManager._materialize_profile``),
+    which this provider never uploads — the engine reads THIS tarball
+    instead. So the same three artifacts are synthesized here, at the same
+    paths the native workdir carries them:
+
+    - ``CLAUDE.md`` — the persona + :data:`~app.chat.agent_profile.
+      DATA_ACCESS_RAILS`, REPLACING the rendered Workspace Prompt exactly as
+      ``_materialize_profile`` replaces it natively (override mode included —
+      a persona wins over every CLAUDE.md source on the native path too).
+      Only when the agent carries a non-empty ``system_prompt``; the seeded
+      default agent (empty prompt) changes nothing, same as natively.
+    - ``.claude/skills/agnes-agent-context/SKILL.md`` — the identity skill.
+      Minted with ``advertise_memory_write=False``: the engine sandbox has no
+      channel to the remember endpoint (no ``agnes-api`` broker scope, no
+      ``$AGNES_SERVER`` env), so the curl recipe the native skill carries
+      would only ever fail there.
+    - ``.claude/agent-memory.md`` — the in-budget active memories, rendered
+      by the same helper the native seam writes through
+      (``agent_profile.render_memories``), persona or not.
+
+    Deterministic for a given agent row + memory set, preserving the
+    archive's byte-stability contract: a persona or memory edit is a
+    configuration change and is meant to move the bytes.
+
+    Best-effort like ``_marketplace_components``: the archive's job is to
+    carry the workspace, so any failure here degrades to "no agent overlay"
+    (the template persona), never to a failed turn. A deleted/missing agent
+    contributes nothing — the same fail-closed direction the prompt renderer
+    and the MCP mint take.
+    """
+    agent_id = getattr(session, "agent_id", None)
+    if not agent_id:
+        return {}
+    try:
+        from app.chat import agent_profile
+        from src.repositories import agents_repo
+
+        agent = agents_repo().get_by_id(agent_id)
+        if agent is None or agent.get("deleted_at") is not None:
+            return {}
+
+        members: Dict[str, bytes] = {}
+        profile = agent_profile.build_profile(agent, advertise_memory_write=False)
+        if profile is not None:
+            members[_WORKSPACE_PROMPT_ARCNAME] = profile.claude_md.encode("utf-8")
+            members[f".claude/skills/{profile.skill_name}/SKILL.md"] = profile.skill_body.encode("utf-8")
+        memories = agent_profile.render_memories(agent)
+        if memories:
+            members[".claude/agent-memory.md"] = memories.encode("utf-8")
+        return members
+    except Exception:
+        logger.warning("kai workspace: agent overlay unavailable, shipping without it", exc_info=True)
+        return {}
+
+
 #: Project-scope settings file inside the shipped tree — where a plugin's hooks
 #: have to end up, since this shape has no installed plugin to carry them.
 _SETTINGS_ARCNAME = ".claude/settings.json"
 
 #: Project-scope MCP config inside the shipped tree.
 _MCP_ARCNAME = ".mcp.json"
+
+
+def _marketplace_identity(session: Any, owner: Optional[Dict[str, Any]]) -> Any:
+    """The identity the marketplace overlay is resolved FOR: the session user,
+    narrowed to an ``AgentPrincipal`` when the session carries a narrowing
+    agent.
+
+    Mirrors ``_mint_identity_jwt``'s decision exactly: an agent that is not
+    explicitly all-``'all'`` (``agent_is_passthrough``) — or whose session
+    user is not its owner (a Slack channel binding: the mentioner) — must
+    resolve through the intersection-filtered marketplace path
+    (``src.marketplace_filter._resolve_principal_marketplace``), or the
+    flattened tarball would ship a scoped agent every plugin its caller
+    holds: skill and command TEXT the agent's scope deliberately withholds,
+    even though the tool seams would still enforce the narrower authority.
+
+    Fail-closed like its callers: any resolution failure (agent row gone,
+    owner unresolvable) answers ``None``, which ``_marketplace_components``
+    reads as "no marketplace content" — never the un-narrowed caller.
+    """
+    agent_id = getattr(session, "agent_id", None) if session is not None else None
+    if not agent_id or owner is None:
+        return owner
+    try:
+        from app.auth.session_principal import AgentPrincipal
+        from src.agent_scope_intersection import agent_is_passthrough, resolve_agent_authority
+        from src.repositories import agents_repo, users_repo
+
+        agent = agents_repo().get_by_id(agent_id)
+        if agent is None or agent.get("deleted_at") is not None:
+            return None
+        if agent_is_passthrough(agent) and str(owner.get("id")) == str(agent.get("owner_user_id")):
+            return owner
+        agent_owner = users_repo().get_by_id(agent.get("owner_user_id") or "")
+        if agent_owner is None:
+            return None
+        return AgentPrincipal(
+            session_id=getattr(session, "id", ""),
+            agent_id=agent_id,
+            owner_user_id=agent_owner["id"],
+            owner_email=agent_owner["email"],
+            intersection=resolve_agent_authority(agent_id),
+            caller_user_id=owner.get("id"),
+            caller_email=owner.get("email"),
+        )
+    except Exception:
+        logger.warning("kai workspace: agent marketplace narrowing failed — shipping none", exc_info=True)
+        return None
 
 
 def _marketplace_components(
@@ -1244,6 +1401,12 @@ def _build_workspace_archive(
     but the instructions are per-user and rendered, so packing the tree alone
     is not enough. Found by Devin Review on this PR.
 
+    A session bound to an agent additionally gets the agent overlay
+    (:func:`_agent_workspace_members`): the persona ``CLAUDE.md`` (which then
+    wins over the rendered prompt, override mode included — native parity
+    with ``_materialize_profile``), the identity skill, and the agent's
+    active memories at ``.claude/agent-memory.md``.
+
     ...except in override mode, where the git template's ``CLAUDE.md`` is
     authoritative verbatim and the admin Workspace Prompt is mutually exclusive
     with it by design (``run_init``'s OVERRIDE MODE branch in
@@ -1270,7 +1433,14 @@ def _build_workspace_archive(
     if not root.is_dir():
         return None
 
-    claude_md = None if session is None else _workspace_prompt_for(session, override_active=override_active)
+    # The agent overlay first: a persona REPLACES the rendered Workspace
+    # Prompt (native parity — `_materialize_profile` writes the profile's
+    # CLAUDE.md over whatever the workspace carries, override mode included),
+    # so the render is skipped outright rather than computed and discarded.
+    agent_members = {} if session is None else _agent_workspace_members(session)
+    claude_md = None
+    if session is not None and _WORKSPACE_PROMPT_ARCNAME not in agent_members:
+        claude_md = _workspace_prompt_for(session, override_active=override_active)
 
     paths: Dict[str, Path] = {}
     for path in sorted(root.rglob("*")):
@@ -1281,7 +1451,9 @@ def _build_workspace_archive(
             continue
         paths[rel.as_posix()] = path
 
-    overlay, hooks, mcp_servers = _marketplace_components(conn, owner)
+    # Resolved for the session's effective identity: a narrowing agent gets
+    # the intersection-filtered set, not its caller's whole stack.
+    overlay, hooks, mcp_servers = _marketplace_components(conn, _marketplace_identity(session, owner))
     if overlay:
         # Shadow whole SKILL directories, not individual files: a bundled skill
         # the marketplace overrides must contribute nothing to the winner (a
@@ -1292,11 +1464,13 @@ def _build_workspace_archive(
         paths = {k: v for k, v in paths.items() if not any(k.startswith(f"{root}/") for root in shadowed)}
         paths.update(overlay)
 
-    # Synthesized members: the rendered prompt, plus the two config files a
+    # Synthesized members: the agent overlay (persona CLAUDE.md, identity
+    # skill, memories), the rendered prompt, plus the two config files a
     # flattened plugin needs (its hooks and MCP servers have no installed plugin
-    # to live in). Each merges into the template's own file rather than
-    # replacing it, so an operator's settings survive.
-    synthesized: Dict[str, bytes] = {}
+    # to live in). Config files merge into the template's own rather than
+    # replacing it, so an operator's settings survive; a synthesized arcname
+    # wins over a same-named tree/overlay file at pack time.
+    synthesized: Dict[str, bytes] = dict(agent_members)
     if claude_md:
         synthesized[_WORKSPACE_PROMPT_ARCNAME] = claude_md.encode("utf-8")
     settings_additions: Dict[str, Any] = dict(hooks)

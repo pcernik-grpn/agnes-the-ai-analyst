@@ -158,7 +158,7 @@ _MODE_FIELD_TO_SCOPE = {
 }
 
 
-def _context_skill(agent_row: dict) -> str:
+def _context_skill(agent_row: dict, *, advertise_memory_write: bool = True) -> str:
     """Render the small read-only SKILL.md describing this agent's identity.
 
     States the agent's name/description and that its capability is scoped
@@ -172,11 +172,16 @@ def _context_skill(agent_row: dict) -> str:
 
     Also advertises the "remember" write tool (V1c Task 4,
     `POST /api/v1/sessions/{id}/memories`) — but ONLY when this agent's
-    `memory_write_mode` is not `'off'`. The endpoint enforces the mode
+    `memory_write_mode` is not `'off'` AND the caller left
+    ``advertise_memory_write`` on. The endpoint enforces the mode
     regardless of what this text says (a stale/forged skill body can never
     grant a write `off` denies), but a well-behaved agent should never even
     attempt a call it knows is disabled — and telling an `off` agent about a
     tool it cannot use would just invite a wasted/failed call.
+    ``advertise_memory_write=False`` is for sandboxes that have no channel
+    to the endpoint at all (the embedded kai-agent engine: no ``agnes-api``
+    broker scope and no ``$AGNES_SERVER``/``$AGNES_SESSION_ID`` env), where
+    the curl recipe below would only ever fail.
 
     Includes a concrete curl invocation against `$AGNES_SERVER` +
     `$AGNES_SESSION_ID` — the two env vars `app/chat/runner.py` sets in the
@@ -209,7 +214,7 @@ def _context_skill(agent_row: dict) -> str:
     from app.instance_config import get_agent_profiles_enabled
 
     memory_write_mode = agent_row.get("memory_write_mode") or "propose"
-    if memory_write_mode != "off" and get_agent_profiles_enabled():
+    if advertise_memory_write and memory_write_mode != "off" and get_agent_profiles_enabled():
         lines.append(
             "\n## Remember\n\n"
             "You can save a durable note to your own memory notebook by "
@@ -233,7 +238,7 @@ def _context_skill(agent_row: dict) -> str:
     return "".join(lines)
 
 
-def build_profile(agent_row: dict) -> Optional[ChatProfile]:
+def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Optional[ChatProfile]:
     """Build a dynamic ``ChatProfile`` from an ``agents`` row.
 
     Returns ``None`` when ``system_prompt`` is empty/whitespace-only — the
@@ -248,6 +253,11 @@ def build_profile(agent_row: dict) -> Optional[ChatProfile]:
     early return above means this only ever applies where a persona
     actually replaces the workspace prompt; an agent with no persona keeps
     the full symlinked rails and is untouched.
+
+    ``advertise_memory_write`` is threaded to :func:`_context_skill` — pass
+    ``False`` when the profile is materialized for a sandbox with no channel
+    to the remember endpoint (the embedded kai-agent engine's workspace
+    tarball, ``app/api/kai.py``).
     """
     system_prompt = (agent_row.get("system_prompt") or "").strip()
     if not system_prompt:
@@ -257,7 +267,7 @@ def build_profile(agent_row: dict) -> Optional[ChatProfile]:
         slug=f"agent-{slug}",
         claude_md=system_prompt + DATA_ACCESS_RAILS,
         skill_name="agnes-agent-context",
-        skill_body=_context_skill(agent_row),
+        skill_body=_context_skill(agent_row, advertise_memory_write=advertise_memory_write),
     )
 
 
@@ -389,6 +399,54 @@ def _memory_date(memory: dict) -> str:
     return text[:10] if text else "unknown-date"
 
 
+def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
+    """``(document, count)`` for this agent's in-budget active memories —
+    ``(None, 0)`` when there is nothing to write. Shared never-raises core of
+    :func:`render_memories` and :func:`materialize_memories`."""
+    agent_id = agent_row.get("id")
+    try:
+        if not agent_id:
+            return None, 0
+
+        from src.repositories import agent_memories_repo
+
+        memories = agent_memories_repo().list_active(agent_id)
+        if not memories:
+            return None, 0
+
+        in_budget, _shadowed = select_in_budget(memories, _MEMORY_BUDGET_CHARS)
+        if not in_budget:
+            return None, 0
+
+        lines = ["# Agent memory\n\n"]
+        for memory in in_budget:
+            content = (memory.get("content") or "").strip()
+            lines.append(f"- **{_memory_date(memory)}** — {content}\n")
+        return "".join(lines), len(in_budget)
+    except Exception:
+        logger.exception(
+            "agent memory render failed for agent_id=%s — continuing without memories",
+            agent_id,
+        )
+        return None, 0
+
+
+def render_memories(agent_row: dict) -> Optional[str]:
+    """Render this agent's in-budget active memories as the ``agent-memory.md``
+    document, or ``None`` when there is nothing to write.
+
+    The single renderer behind both delivery shapes: the native session
+    workdir (:func:`materialize_memories` writes it to
+    ``.claude/agent-memory.md``) and the embedded engine's workspace tarball
+    (``app/api/kai.py`` packs the same bytes at the same arcname), so the two
+    sandboxes cannot drift in what an agent remembers.
+
+    Same never-raises posture as :func:`materialize_memories`: any failure
+    (repo error, malformed row) is logged and answered with ``None``.
+    """
+    return _rendered_memories_with_count(agent_row)[0]
+
+
 def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     """Write this agent's active memories into the session workdir.
 
@@ -397,10 +455,9 @@ def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     into the (remote) sandbox. A file written after spawn
     would never reach the agent; see the module docstring.
 
-    Reads ``agent_memories_repo().list_active(agent_id)`` (newest-first),
-    caps it to ``_MEMORY_BUDGET_CHARS`` via ``select_in_budget``, and
-    renders the in-budget set as a simple dated list at
-    ``session_dir / ".claude" / "agent-memory.md"``. No active memories
+    Renders via the shared memory renderer (newest-first, capped to
+    ``_MEMORY_BUDGET_CHARS`` via ``select_in_budget``) and writes the result
+    to ``session_dir / ".claude" / "agent-memory.md"``. No active memories
     (or nothing fits the budget) -> no file is written, returns ``0``.
 
     This is the read side of agent memory; the write side is the remember
@@ -411,32 +468,18 @@ def materialize_memories(agent_row: dict, session_dir: Path) -> int:
     ``logger.exception`` and swallowed, so a memory-materialization bug can
     never block the chat spawn the user is waiting on.
     """
-    agent_id = agent_row.get("id")
     try:
-        if not agent_id:
-            return 0
-
-        from src.repositories import agent_memories_repo
-
-        memories = agent_memories_repo().list_active(agent_id)
-        if not memories:
-            return 0
-
-        in_budget, _shadowed = select_in_budget(memories, _MEMORY_BUDGET_CHARS)
-        if not in_budget:
+        rendered, count = _rendered_memories_with_count(agent_row)
+        if rendered is None:
             return 0
 
         claude_dir = session_dir / ".claude"
         claude_dir.mkdir(parents=True, exist_ok=True)
-        lines = ["# Agent memory\n\n"]
-        for memory in in_budget:
-            content = (memory.get("content") or "").strip()
-            lines.append(f"- **{_memory_date(memory)}** — {content}\n")
-        (claude_dir / "agent-memory.md").write_text("".join(lines), encoding="utf-8")
-        return len(in_budget)
+        (claude_dir / "agent-memory.md").write_text(rendered, encoding="utf-8")
+        return count
     except Exception:
         logger.exception(
             "agent memory materialization failed for agent_id=%s — spawn continues without memories",
-            agent_id,
+            agent_row.get("id"),
         )
         return 0
