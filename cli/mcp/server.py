@@ -357,11 +357,20 @@ def query(sql: str, limit: int = 1000) -> dict:
         limit: Maximum rows to return (default 1000).
 
     Returns ``{"columns": [...], "rows": [[...], ...], "truncated": bool,
-    "row_scope": {"policied_tables": [...], "note": str} | None}``.
+    "row_scope": {"policied_tables": [...], "note": str} | None,
+    "semantic_validation": {...} | None}``.
     ``row_scope`` is present when a table this query touched has an access
     policy applied — the result is YOUR scoped slice, not the whole table.
     When present, state that qualification in your answer; never present an
     aggregate over the result as an organisation-wide figure.
+
+    ``semantic_validation`` is present only when the server's semantic layer
+    has something to say about the statement — an error-severity constraint
+    violation, or a used metric with no expression for the engine that ran
+    it. Enforcement is SOFT: the rows are unaffected. Its ``warnings`` list
+    is the human-readable form; say the qualification out loud rather than
+    reporting the number alone. Check a statement up front with
+    ``agnes semantic-model validate-query "<SQL>"``.
 
     Tips:
     - Always run ``catalog()`` first to know what tables exist.

@@ -275,6 +275,19 @@ accessible valid models the response is `{"available": false, "error":
 all-clear — do not read a missing `available` (or `available: true`) as
 "no semantic layer configured".
 
+Validation also happens **without being asked**. `POST /api/query` runs the
+same check over the caller's readable models after a statement succeeds and
+attaches `semantic_validation` to the response — but only when there is
+something to say: an `error`-severity constraint violation, or a used metric
+with no expression for the engine that actually ran the statement (DuckDB,
+BigQuery, or a Databricks warehouse). A clean query, a caller who can read no
+model, and an instance with no semantic layer all return `null`, so the field
+appearing means something. Enforcement is **soft** by design — the rows are
+untouched, the status stays `200`, and a failure of the check itself is
+swallowed (logged, field omitted) rather than costing the caller their
+result. `agnes query` prints each warning to stderr as `[semantic] …`, and the
+MCP `query` tool passes the field through verbatim.
+
 Constraints have no slot in core Ossie, so they ride `custom_extensions`
 under the Agnes vendor name, and the key naming the rule kind is
 `constraint_type` — the same key the Keboola adapter composes, the projector

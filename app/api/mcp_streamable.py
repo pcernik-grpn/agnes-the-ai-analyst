@@ -48,7 +48,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.api.mcp.foundation_tools import register_foundation_tools
+from app.api.mcp.foundation_tools import SERVER_INSTRUCTIONS, register_foundation_tools
 from app.auth.mcp_oauth import AgnesMCPOAuthProvider
 from app.auth.public_url import mcp_issuer_url, pinned_public_base_url, public_base_url
 
@@ -541,12 +541,7 @@ def _make_streamable_app() -> ASGIApp:
 
     mcp = FastMCP(
         "Agnes",
-        instructions=(
-            "Agnes is a self-hosted AI harness for the organization's data, skills, and memory. "
-            "Use `catalog` first to discover available tables, then `schema` to "
-            "understand columns, `describe` for sample rows, and `query` to run SQL. "
-            "Run `server_info` to check connectivity at the start of a session."
-        ),
+        instructions=SERVER_INSTRUCTIONS,
         # DNS-rebinding/Host-header protection is disabled deliberately: this is
         # a REMOTE connector reached through a TLS-terminating reverse proxy on a
         # fixed FQDN (operators set AGNES_BASE_URL to that host), and the proxy

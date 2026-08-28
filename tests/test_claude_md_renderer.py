@@ -427,16 +427,19 @@ def test_metrics_summary_no_table_metric_always_visible(conn):
     assert ctx["metrics"]["categories"] == ["misc"]
 
 
-def _seed_semantic_model(conn, *, slug: str = "retail", status: str = "valid") -> dict:
+def _seed_semantic_model(conn, *, slug: str = "retail", status: str = "valid", ai_context=None) -> dict:
     from src.repositories import semantic_model_repo
 
+    model: dict = {"name": slug, "datasets": [{"name": "orders", "source": "db.orders"}]}
+    if ai_context is not None:
+        model["ai_context"] = ai_context
     return semantic_model_repo().upsert(
         id=f"manual/_/{slug}",
         slug=slug,
         name=slug,
         description=None,
         document="version: '0.2.0.dev0'\nsemantic_model:\n  - name: " + slug + "\n",
-        document_json={"semantic_model": [{"name": slug, "datasets": [{"name": "orders", "source": "db.orders"}]}]},
+        document_json={"semantic_model": [model]},
         spec_version="0.2.0.dev0",
         content_hash=f"hash-{slug}",
         source="manual",
@@ -573,7 +576,7 @@ class TestSemanticLayerSection:
         )
         ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
         assert ctx["semantic_layer"]["models"] == [
-            {"slug": "retail", "name": "retail", "description": "Retail orders and revenue."}
+            {"slug": "retail", "name": "retail", "description": "Retail orders and revenue.", "instructions": ""}
         ]
 
     def test_models_catalog_empty_without_any_semantic_model(self, conn):
@@ -615,6 +618,48 @@ class TestSemanticLayerSection:
         out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
         assert "`retail`" in out
         assert "Retail orders and revenue." in out
+
+    def test_models_catalog_carries_the_authors_ai_instructions(self, conn):
+        """`ai_context.instructions` is the model author's own steering — the
+        one field written FOR the agent. It reached no agent surface before."""
+        _seed_semantic_model(conn, ai_context={"instructions": "Always filter orders by tenant_id."})
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"][0]["instructions"] == "Always filter orders by tenant_id."
+
+    def test_bare_string_ai_context_counts_as_instructions(self, conn):
+        """The Ossie schema allows `ai_context` as a bare string OR an object
+        with `instructions` — both are the same authored steering."""
+        _seed_semantic_model(conn, ai_context="Revenue is net of refunds.")
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"][0]["instructions"] == "Revenue is net of refunds."
+
+    def test_instructions_are_truncated_rather_than_flooding_the_prompt(self, conn):
+        """CLAUDE.md is read on every session start; an author's essay must not
+        become the prompt. Truncated with an ellipsis, not dropped."""
+        _seed_semantic_model(conn, ai_context={"instructions": "x" * 600})
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        instructions = ctx["semantic_layer"]["models"][0]["instructions"]
+        assert len(instructions) <= 300
+        assert instructions.endswith("…")
+
+    def test_instructions_empty_when_the_model_declares_none(self, conn):
+        _seed_semantic_model(conn)
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["semantic_layer"]["models"][0]["instructions"] == ""
+
+    def test_rendered_section_carries_the_model_instructions(self, conn):
+        _seed_semantic_model(conn, ai_context={"instructions": "Always filter orders by tenant_id."})
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "Always filter orders by tenant_id." in out
+
+    def test_rendered_section_names_the_glossary_and_authoring_commands(self, conn):
+        """Documented drift: the section taught `context` / `schema` /
+        `validate-query` but never how to look a business term up, nor how to
+        write the model back."""
+        _seed_semantic_model(conn)
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "agnes glossary search" in out
+        assert "agnes semantic-model apply" in out
 
     def test_rendered_section_mentions_the_physical_cache_and_ttl(self, conn):
         _seed_semantic_model(conn)

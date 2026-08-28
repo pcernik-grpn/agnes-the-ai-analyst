@@ -410,6 +410,14 @@ def _query_remote(sql: str, fmt: str, limit: int, *, auto_snapshot: bool = False
     # so json/csv stdout stays pure, same convention as the notices below.
     if data.get("row_scope"):
         typer.echo(f"[scope] {data['row_scope']['note']}", err=True)
+    # Soft-enforce semantic advisory: present only when the server's semantic
+    # layer had something to say about this statement (an error-severity
+    # constraint violation, or a used metric with no expression for the engine
+    # that ran it). Enforcement is SOFT -- the rows above are already printed
+    # and the exit code stays 0; this only qualifies them. STDERR like the
+    # notices around it, so `--format json` stdout stays machine-parseable.
+    for warning in (data.get("semantic_validation") or {}).get("warnings") or []:
+        typer.echo(f"[semantic] {warning}", err=True)
     if data.get("truncated"):
         typer.echo(f"(truncated at {limit} rows)", err=True)
     # BigQuery dry-run scan estimate — present only for query_mode='remote'

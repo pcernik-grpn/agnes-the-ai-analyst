@@ -8281,6 +8281,18 @@
             "title": "Rows",
             "type": "array"
           },
+          "semantic_validation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semantic Validation"
+          },
           "truncated": {
             "default": false,
             "title": "Truncated",

@@ -1004,7 +1004,11 @@ _NO_MODEL_MESSAGE = (
 
 
 def _accessible_valid_documents(
-    user: dict, conn: duckdb.DuckDBPyConnection, model_refs: set[str] | None = None
+    user: dict,
+    conn: duckdb.DuckDBPyConnection,
+    model_refs: set[str] | None = None,
+    *,
+    rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """The individual model dicts (``document_json["semantic_model"]``
     entries) of every ``status='valid'`` semantic-model row ``user`` may
@@ -1026,7 +1030,13 @@ def _accessible_valid_documents(
     # Case-folded once, not per row (the match below is case-insensitive like
     # object-id matching).
     refs_cf = {str(r).casefold() for r in model_refs} if model_refs is not None else None
-    for row in semantic_model_repo().list_all():
+    # ``rows`` is an optional caller-supplied snapshot of
+    # ``semantic_model_repo().list_all()`` — for a caller that already listed
+    # the rows to decide whether to bother at all (``semantic_validation_
+    # for_query`` below), so the decision and the load share ONE read instead
+    # of hitting the repo twice on a hot path. Semantics are identical; the
+    # status/document filter below still applies to whatever is passed in.
+    for row in semantic_model_repo().list_all() if rows is None else rows:
         if row.get("status") != "valid" or not row.get("document_json"):
             continue
         if not _can_read_model(user, row, conn):
@@ -1077,6 +1087,79 @@ def _accessible_valid_rows(user: dict, conn: duckdb.DuckDBPyConnection) -> list[
             continue
         rows.append(row)
     return rows
+
+
+def semantic_validation_for_query(
+    sql: str,
+    user: dict,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    target_engine: str = "duckdb",
+) -> dict[str, Any] | None:
+    """The soft-enforce advisory for ``sql``, or ``None`` when the semantic
+    layer has nothing to say about it.
+
+    Called from the ``POST /api/query`` success path so a caller who never
+    asks for validation still hears about a violated constraint. Enforcement
+    is SOFT by product decision: this returns an advisory that rides an
+    otherwise untouched 200 — it never blocks, never changes a status code,
+    and never alters a row.
+
+    "Something to say" is deliberately narrow, because a field that appears
+    on every query is a field agents learn to ignore:
+
+    * an **error**-severity constraint violation (a warning-severity one is
+      carried along once the advisory exists, but never triggers it on its
+      own), or
+    * a used metric that is not executable on ``target_engine`` — the number
+      the caller just computed is not the declared metric.
+
+    RBAC is the same tier as every other read here (``_can_read_model`` via
+    ``_accessible_valid_documents``): a model the caller cannot read cannot
+    warn them. The cheap existence check runs FIRST — an instance with no
+    valid model at all returns before a single per-model grant lookup, which
+    is the common case and the one that must stay free.
+    """
+    rows = semantic_model_repo().list_all()
+    # Cheap gate: `any` short-circuits on the first valid row, and no
+    # `_can_read_model` call (resource_grants + package joins, several reads
+    # per model) happens until we know there is something to check.
+    if not any(row.get("status") == "valid" and row.get("document_json") for row in rows):
+        return None
+    documents = _accessible_valid_documents(user, conn, rows=rows)
+    if not documents:
+        return None
+
+    result = validate_query(sql, documents, target_engine=target_engine)
+    violations = result.get("violations") or []
+    blocking = [v for v in violations if v.get("severity") == "error"]
+    locally_executable = bool(result.get("locally_executable", True))
+    if not blocking and locally_executable:
+        return None
+
+    warnings: list[str] = []
+    for violation in blocking:
+        metrics = ", ".join(str(m) for m in (violation.get("metrics") or [])) or "this query"
+        warnings.append(f"constraint '{violation.get('name')}' on {metrics}: {violation.get('reason')}")
+    if not locally_executable:
+        used = ", ".join(str(m) for m in (result.get("used_metrics") or [])) or "a used metric"
+        warnings.append(
+            f"{used}: no expression declared for {target_engine} — this result is not the declared metric, "
+            "check `agnes semantic-model context metric` before reporting it"
+        )
+    return {
+        "valid": result.get("valid", True),
+        "warnings": warnings,
+        # The raw engine output for the two findings above, so a UI can render
+        # more than the prose line. `violations` carries EVERY violation once
+        # the advisory exists (see the docstring) — hiding the advisory-
+        # severity ones next to a blocking one would misreport the total.
+        "violations": violations,
+        "locally_executable": locally_executable,
+        "used_metrics": result.get("used_metrics") or [],
+        "used_datasets": result.get("used_datasets") or [],
+        "summary": result.get("summary", ""),
+    }
 
 
 @router.post("/api/semantic-models/validate-query")

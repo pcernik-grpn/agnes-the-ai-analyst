@@ -840,6 +840,15 @@ class QueryResponse(BaseModel):
     # nothing to disclose. "Silent partial scope is forbidden"
     # (command-ux.md) applies to row filtering as much as to source scope.
     row_scope: dict | None = None
+    # Soft-enforce semantic advisory: present only when the caller's readable
+    # semantic layer has something to say about this statement (an
+    # error-severity constraint violation, or a used metric with no
+    # expression for the engine that ran it). ``None`` when the query is
+    # clean, when the caller can read no model, or when the check itself
+    # failed -- see ``app/api/semantic_models.py::semantic_validation_for_
+    # query``. Advisory by product decision: it never blocks, never changes
+    # the status code, and never alters a row.
+    semantic_validation: dict | None = None
 
 
 def _run_internal_query(
@@ -2029,6 +2038,26 @@ def execute_query(
             bytes_scanned=_bytes_scanned,
             row_scope=row_scope_payload(policied_table_ids),
         )
+        # Soft-enforce semantic check (consumption loop): the statement ran
+        # and the rows are already in `response`, so nothing below can change
+        # the answer -- only add a qualification to it. Placed AFTER execution
+        # deliberately: enforcement is soft, so a pre-flight check would buy
+        # nothing and would put a semantic-layer read on the latency path of
+        # every query that was going to run anyway.
+        #
+        # The engine label is the one that actually executed, so
+        # `locally_executable` means "the metric has an expression for the
+        # engine that produced these numbers" rather than a guess.
+        try:
+            from app.api.semantic_models import semantic_validation_for_query
+
+            _engine = "bigquery" if _dry_run_set else ("databricks" if _dbx_plan is not None else "duckdb")
+            response.semantic_validation = semantic_validation_for_query(request.sql, user, conn, target_engine=_engine)
+        except Exception:
+            # Never let an advisory break a delivered result -- a half-migrated
+            # database, an unreadable document, or a validator bug must cost
+            # the caller the warning, not the query.
+            logger.exception("semantic validation failed for query; returning the result without it")
         # Determine action: remote when an external engine ran the statement
         # (BQ dry-run set non-empty, or a Databricks plan executed), local
         # otherwise. One audit action for both engines — the engine itself is

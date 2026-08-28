@@ -10,6 +10,35 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 ### Added
+- **The semantic layer now reaches the agent that is about to ignore it.** An
+  instance could hold a fully populated semantic layer and still be queried as
+  if it had none, because nothing on the consumption path mentioned it.
+  - **`POST /api/query` validates against the semantic layer on its own.**
+    After a statement succeeds, the caller's readable `status='valid'` models
+    are checked (same `_can_read_model` RBAC tier as the rest of the read
+    surface) and the response carries a new optional `semantic_validation`
+    field — but only when there is something to say: an error-severity
+    constraint violation, or a used metric with no expression for the engine
+    that actually ran the statement. Enforcement is **soft**: rows are
+    untouched, the status stays `200`, and a failure of the check itself is
+    logged and the field omitted rather than costing the caller their result.
+    A clean query, a caller who can read no model, and an instance with no
+    semantic layer all return `null`, so the field appearing means something.
+    `agnes query` prints each warning to stderr as `[semantic] …` (stdout
+    stays machine-parseable), and the MCP `query` tool passes it through.
+  - **MCP clients are steered to the layer before they write SQL.** The
+    server-level instructions both MCP transports advertise now say to read a
+    business term's declared definition first (`glossary_search`, then
+    `get_semantic_context`) and to call `validate_semantic_query` before
+    running SQL over modeled data; the `catalog` and `query` tool descriptions
+    carry the same cross-reference. The two transports previously held
+    byte-identical hand-copies of that prose and now read one shared constant.
+  - **A model author's `ai_context.instructions` reaches the workspace
+    prompt.** The one field a document declares *for the agent* reached no
+    agent surface at all; each model's bullet in the rendered `CLAUDE.md`
+    "Semantic layer" section now carries it (truncated to ~300 chars). That
+    section also names `agnes glossary search` and `agnes semantic-model
+    apply`, which it taught around but never mentioned.
 - **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
 - **Connecting an MCP source is a builder, and so is linking external apps.**
   Both were the least builder-shaped surfaces in the product, and both are now

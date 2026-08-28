@@ -37,7 +37,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.api.mcp.foundation_tools import register_foundation_tools
+from app.api.mcp.foundation_tools import SERVER_INSTRUCTIONS, register_foundation_tools
 from app.auth.session_principal import PRINCIPAL_TYPES
 
 logger = logging.getLogger(__name__)
@@ -67,12 +67,7 @@ _BASE = os.environ.get("AGNES_MCP_INTERNAL_URL", "http://localhost:8000").rstrip
 
 mcp = FastMCP(
     "Agnes",
-    instructions=(
-        "Agnes is a self-hosted AI harness for the organization's data, skills, and memory. "
-        "Use `catalog` first to discover available tables, then `schema` to "
-        "understand columns, `describe` for sample rows, and `query` to run SQL. "
-        "Run `server_info` to check connectivity at the start of a session."
-    ),
+    instructions=SERVER_INSTRUCTIONS,
     # DNS rebinding protection is redundant — _AuthMiddleware validates PAT
     # before any request reaches FastMCP, so the protection is already in place.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
