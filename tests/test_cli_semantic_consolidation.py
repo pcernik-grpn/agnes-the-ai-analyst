@@ -354,6 +354,20 @@ class TestDeprecatedAliases:
         assert result.exit_code == 0
         assert _DEPRECATED in result.output
         assert "agnes semantic-model export" in result.output
+        # ONE notice, naming ONE destination. `export` did not follow its group
+        # to `admin semantic`, so a generic group-level "the group moved" line
+        # printed alongside would send the reader to the wrong place.
+        assert result.output.count(_DEPRECATED) == 1
+        assert "admin semantic export" not in result.output
+
+    def test_each_alias_names_the_command_that_was_actually_run(self):
+        """"The group moved" is not an instruction — the line has to name the
+        command the user just typed and its replacement."""
+        with patch("cli.commands.admin_semantic.api_post", return_value=_resp(200, {"package_ids": []})):
+            result = runner.invoke(app, ["admin", "semantic-model", "link-package", "retail", "pkg_1"])
+        assert result.exit_code == 0
+        assert "agnes admin semantic-model link-package" in result.output
+        assert "agnes admin semantic link-package" in result.output
 
     def test_admin_semantic_model_validate_points_at_the_user_group(self, tmp_path):
         p = tmp_path / "m.yaml"

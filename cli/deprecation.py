@@ -41,15 +41,31 @@ def deprecation_notice(old: str, new: str) -> None:
     )
 
 
-def deprecated_group_notice(old: str, new: str) -> Callable[[], None]:
-    """Build a Typer group callback that announces the group's new home.
+def deprecated_group_notice(
+    old: str, new: str, *, overrides: dict[str, str] | None = None
+) -> Callable[[typer.Context], None]:
+    """Build a Typer group callback that names the new path of the command
+    actually being run.
 
-    Register it with ``@alias_app.callback()``; it fires once per invocation,
-    before whichever subcommand was asked for.
+    Register it with ``alias_app.callback()(...)``; Click runs a group callback
+    before the subcommand, so one registration covers every command under the
+    group. It reads ``ctx.invoked_subcommand`` rather than printing a bare
+    group rename, so `agnes admin semantic-model list` is told about
+    `agnes admin semantic list` and not merely "the group moved".
+
+    ``overrides`` is for the commands that did NOT follow the group: pass
+    ``{"export": "semantic-model export"}`` and that one command's notice names
+    its real destination instead of ``f"{new} export"``.
     """
 
-    def _notice() -> None:
-        deprecation_notice(old, new)
+    def _notice(ctx: typer.Context) -> None:
+        sub = ctx.invoked_subcommand
+        if sub is None:
+            # `--help` / no subcommand: Click prints the group help and never
+            # gets here, but a group that ever gains `invoke_without_command`
+            # would — and "your command moved" with no command named is noise.
+            return
+        deprecation_notice(f"{old} {sub}", (overrides or {}).get(sub) or f"{new} {sub}")
 
     _notice.__doc__ = f"(deprecated alias of `agnes {new}`)"
     return _notice
