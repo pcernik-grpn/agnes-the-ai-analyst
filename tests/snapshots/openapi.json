@@ -14895,6 +14895,24 @@
             }
           },
           {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset returns the unified timeline across all four.",
+              "title": "Trail"
+            }
+          },
+          {
             "in": "query",
             "name": "include_self_reads",
             "required": false,
@@ -22773,7 +22791,7 @@
     },
     "/api/admin/observability/facets": {
       "get": {
-        "description": "Return the distinct facet values present in `audit_log` for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
+        "description": "Return the distinct facet values present across the unified timeline\n(audit_log + sync_history + llm_usage + agent_scope_snapshots) for the\nselected window, each with a count \u2014 under the SAME filters the\ntimeline uses, so dropdown counts always describe rows the table can\nactually show. `include_self_reads` defaults to False: the Activity\nCenter's own `activity.read` audit rows are hidden unless asked for.\n\nCounts are capped at 50 per facet (largest first). 50 is comfortable in\na dropdown; tighter windows usually have <20 anyway.",
         "operationId": "facets_api_admin_observability_facets_get",
         "parameters": [
           {
@@ -22901,6 +22919,24 @@
             }
           },
           {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
+            }
+          },
+          {
             "in": "query",
             "name": "include_self_reads",
             "required": false,
@@ -22961,7 +22997,7 @@
     },
     "/api/admin/observability/kpis": {
       "get": {
-        "description": "KPIs for the top-bar cards \u2014 same filter surface as the timeline, so\nthe cards and the table can never tell different stories. `active_users`\ncounts people (scheduler/system actors excluded); `errors` counts\nresult_class='error'; `duration_coverage` says what fraction of rows\ncarry a measured duration (feeds the p95 card's honesty sub-label).",
+        "description": "KPIs for the top-bar cards \u2014 same filter surface as the (unified)\ntimeline, so the cards and the table can never tell different stories.\n`active_users` counts people (scheduler/system actors excluded);\n`errors` counts result_class='error'; `duration_coverage` says what\nfraction of rows carry a measured duration (feeds the p95 card's\nhonesty sub-label).",
         "operationId": "kpis_api_admin_observability_kpis_get",
         "parameters": [
           {
@@ -23086,6 +23122,24 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+            "in": "query",
+            "name": "trail",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one physical trail: audit | sync | llm | agent_scope. Unset covers the unified timeline across all four \u2014 same filter the timeline accepts.",
+              "title": "Trail"
             }
           },
           {
