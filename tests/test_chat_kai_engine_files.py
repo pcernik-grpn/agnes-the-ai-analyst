@@ -114,6 +114,49 @@ def test_listing_proxied_from_engine(data_dir: Path, monkeypatch: pytest.MonkeyP
     assert len(seen) == 2  # root + one subdirectory
 
 
+def test_engine_listing_excludes_the_materialized_template(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    """The engine unpacks this instance's workspace tarball into the very
+    directory its browser lists, so a fresh conversation showed the
+    operator's scaffolds as session output (observed live: 19 template rows,
+    the deliverable nowhere). Entries matching the template by path+size are
+    dropped; the rendered root CLAUDE.md by path alone (its size never
+    matches the file on disk); a template file the agent MODIFIED stays."""
+    import app.api.chat_session_files as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_engine_template_map",
+        lambda: {"scaffolds/nodejs-dashboard/package.json": 918, "scripts/run.sh": 40},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _entries(
+            {"name": "CLAUDE.md", "path": "CLAUDE.md", "type": "file", "size": 23_456},
+            {"name": "package.json", "path": "scaffolds/nodejs-dashboard/package.json", "type": "file", "size": 918},
+            # same template path but a DIFFERENT size — the agent edited it
+            {"name": "run.sh", "path": "scripts/run.sh", "type": "file", "size": 99},
+            {"name": "report.docx", "path": "outputs/report.docx", "type": "file", "size": 10},
+            {"name": "notes.txt", "path": "notes.txt", "type": "file", "size": 5},
+        )
+
+    client = _make_client(data_dir, monkeypatch, handler)
+    body = client.get(f"/api/chat/sessions/{CHAT_ID}/files").json()
+    # template rows gone, deliverables first, remainder by path
+    assert [f["path"] for f in body["files"]] == ["outputs/report.docx", "notes.txt", "scripts/run.sh"]
+
+
+def test_engine_template_map_reads_the_bundled_template() -> None:
+    """The real map walks the same tree GET /api/kai/workspace packs: the
+    bundled scaffolds are in, the docker-sandbox build tree is not."""
+    from app.api.chat_session_files import _engine_template_map
+
+    mapping = _engine_template_map()
+    assert any(path.startswith("scaffolds/") for path in mapping)
+    assert not any(path.startswith("docker-sandbox/") for path in mapping)
+
+
 def test_listing_engine_404_degrades_to_unsupported(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
 ) -> None:

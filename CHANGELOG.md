@@ -196,6 +196,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
+
+- **Engine-backed session file listings no longer show the workspace
+  template.** The kai-agent engine materializes the instance workspace
+  tarball into the very directory its file browser lists, so a fresh
+  conversation's Files panel showed the operator's bundled scaffolds and
+  configs (observed live: 19 template rows, the actual deliverable
+  nowhere). The proxy now drops entries matching the template by path+size
+  (the rendered root `CLAUDE.md` by path alone) — a template file the agent
+  modified stays listed — and sorts `outputs/` deliverables first. The Files
+  drawer's list also grew to the panel's full height (a fixed `46vh` box
+  left the bottom half empty), rows gained an extension tile and a hover
+  state.
 - **Revoking a PAT now revokes the data-app git push credentials it minted.**
   `POST /api/data-apps/{slug}/git-credential` and `POST /api/data-apps/{slug}/drafts`
   hand back a 24-hour `data-app-git:<slug>` push credential, and it was its own

@@ -5616,6 +5616,15 @@ function renderCoPresence(host, participants) {
     const li = document.createElement("li");
     li.className = "cloud-chat-files-row";
 
+    // Extension tile — a scannable anchor per row (textContent only; the
+    // name is agent-chosen).
+    const icon = document.createElement("span");
+    icon.className = "cloud-chat-files-icon";
+    icon.setAttribute("aria-hidden", "true");
+    const dot = f.name.lastIndexOf(".");
+    const ext = dot > 0 ? f.name.slice(dot + 1).slice(0, 4) : "";
+    icon.textContent = ext || "file";
+
     const meta = document.createElement("div");
     meta.className = "cloud-chat-files-meta";
     const name = document.createElement("span");
@@ -5634,9 +5643,25 @@ function renderCoPresence(host, participants) {
     const actions = document.createElement("div");
     actions.className = "cloud-chat-files-actions";
 
+    // Static SVG markup only — never interpolate file names into it.
+    const ICON_DOWNLOAD =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M8 2v8.5"/><path d="M4.5 7.5 8 11l3.5-3.5"/><path d="M2.5 13.5h11"/></svg>';
+    const ICON_SAVE =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M12.5 14V6.5L9.5 3.5H3.5v10.5z"/><path d="M5.5 3.5V7h5"/><path d="M5.5 14v-4h5v4"/></svg>';
+    const ICON_IN_LIBRARY =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M3 8.5 6.5 12 13 4.5"/></svg>';
+
     const dl = document.createElement("a");
-    dl.className = "btn btn-secondary cloud-chat-files-btn";
-    dl.textContent = "Download";
+    dl.className = "cloud-chat-files-btn";
+    dl.innerHTML = ICON_DOWNLOAD;
+    dl.title = "Download";
+    dl.setAttribute("aria-label", "Download " + f.name);
     dl.href =
       "/api/chat/sessions/" + encodeURIComponent(chatId) +
       "/files/download?path=" + encodeURIComponent(f.path);
@@ -5644,12 +5669,12 @@ function renderCoPresence(host, participants) {
 
     const save = document.createElement("button");
     save.type = "button";
-    save.className = "btn btn-secondary cloud-chat-files-btn";
-    save.textContent = "Save to Library";
-    save.title = "Keep a copy in your Library — it outlives this session";
+    save.className = "cloud-chat-files-btn";
+    save.innerHTML = ICON_SAVE;
+    save.title = "Save to Library — it outlives this session";
+    save.setAttribute("aria-label", "Save " + f.name + " to Library");
     save.addEventListener("click", async () => {
       save.disabled = true;
-      save.textContent = "Saving…";
       clearDialogError(filesErrorEl);
       try {
         const res = await fetch(
@@ -5664,8 +5689,10 @@ function renderCoPresence(host, participants) {
         if (res.ok) {
           const data = await res.json();
           const link = document.createElement("a");
-          link.className = "btn btn-secondary cloud-chat-files-btn";
-          link.textContent = "In Library ↗";
+          link.className = "cloud-chat-files-btn";
+          link.innerHTML = ICON_IN_LIBRARY;
+          link.title = "Saved — open in Library";
+          link.setAttribute("aria-label", "Saved to Library — open");
           link.href = data.library_url || "/library";
           link.target = "_blank";
           link.rel = "noopener";
@@ -5679,17 +5706,16 @@ function renderCoPresence(host, participants) {
           } catch (_) {}
           showDialogError(filesErrorEl, msg);
           save.disabled = false;
-          save.textContent = "Save to Library";
         }
       } catch (err) {
         showDialogError(filesErrorEl, "Could not save to Library: " + String(err));
         save.disabled = false;
-        save.textContent = "Save to Library";
       }
     });
 
     actions.appendChild(dl);
     actions.appendChild(save);
+    li.appendChild(icon);
     li.appendChild(meta);
     li.appendChild(actions);
     return li;
