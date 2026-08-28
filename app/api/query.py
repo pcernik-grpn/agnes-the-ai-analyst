@@ -1708,6 +1708,15 @@ def execute_query(
     # the ones that raise before planning.
     _dbx_plan: dict | None = None
     _dbx_bytes: int | None = None
+    # Which engine actually COMPOSED and ran the statement — the dialect the
+    # numbers below were produced in, not "a BQ table was mentioned". Only
+    # the branch that executes may set it, because the two BQ paths that
+    # look remote from the outside are not: a cross-source JOIN makes the
+    # rewriter bail and DuckDB run the SQL, and a BQ parse error falls back
+    # to DuckDB after the rewrite. Judging a semantic metric's declared
+    # dialect against `_dry_run_set` instead would warn against DuckDB-only
+    # metrics on those paths and stay silent on BigQuery-only ones.
+    _executed_engine = "duckdb"
     try:
         # Non-admin SQL RBAC: catalog gate (#868) + master-view-name denylist +
         # internal-extract-table denylist (M1). Shared with the snapshot path
@@ -1836,6 +1845,7 @@ def execute_query(
                 # are deliberately NOT billed against the BQ daily byte quota
                 # (which prices a different thing on a different engine).
                 columns, rows, truncated, _dbx_bytes = _execute_databricks_plan(_dbx_plan, request.limit, user_id)
+                _executed_engine = "databricks"
             else:
                 # Performance fix: rewrite user SQL referencing BQ-remote tables
                 # to a single ``bigquery_query()`` call so WHERE / projection /
@@ -1906,6 +1916,7 @@ def execute_query(
                     except PolicyError as exc:
                         raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
                     columns, rows, truncated = _arrow_table_to_rows(table, request.limit)
+                    _executed_engine = "bigquery"
                 else:
                     if did_rewrite:
                         # Memory-safety: ``bigquery_query()`` materialises the entire
@@ -1917,6 +1928,10 @@ def execute_query(
                         # is pushed into the BQ job itself. Aliased subquery so the
                         # outer LIMIT applies to the final rewritten result.
                         execution_sql = f"SELECT * FROM ({execution_sql}) AS _bqq_outer LIMIT {request.limit + 1}"
+                        # BigQuery composes and runs the inner statement here
+                        # (DuckDB only relays it), so this is BQ dialect —
+                        # unless the fallback below undoes it.
+                        _executed_engine = "bigquery"
                         logger.info(
                             "query_rewrite_to_bigquery_query: user_id=%s — wrapped "
                             "SQL in bigquery_query() with outer LIMIT for BQ "
@@ -1975,6 +1990,12 @@ def execute_query(
                             # request.sql — this fallback re-enters the ATTACH-catalog
                             # path (same as the did_rewrite=False branch above), so
                             # it must stay policy-filtered too.
+                            #
+                            # DuckDB, not BigQuery, ran what the caller gets
+                            # back: undo the push-down's engine label so a
+                            # downstream dialect verdict describes the rows
+                            # actually returned.
+                            _executed_engine = "duckdb"
                             if policy_params:
                                 result = analytics.execute(policy_rewritten_sql, policy_params).fetchmany(
                                     request.limit + 1
@@ -2045,19 +2066,26 @@ def execute_query(
         # nothing and would put a semantic-layer read on the latency path of
         # every query that was going to run anyway.
         #
-        # The engine label is the one that actually executed, so
-        # `locally_executable` means "the metric has an expression for the
-        # engine that produced these numbers" rather than a guess.
+        # `_executed_engine` is set by the branch that actually ran the
+        # statement (see its declaration above), so `locally_executable`
+        # means "the metric has an expression for the engine that produced
+        # these numbers" rather than a guess from which tables were named.
         try:
             from app.api.semantic_models import semantic_validation_for_query
 
-            _engine = "bigquery" if _dry_run_set else ("databricks" if _dbx_plan is not None else "duckdb")
-            response.semantic_validation = semantic_validation_for_query(request.sql, user, conn, target_engine=_engine)
-        except Exception:
+            response.semantic_validation = semantic_validation_for_query(
+                request.sql, user, conn, target_engine=_executed_engine
+            )
+        except Exception as exc:
             # Never let an advisory break a delivered result -- a half-migrated
             # database, an unreadable document, or a validator bug must cost
             # the caller the warning, not the query.
-            logger.exception("semantic validation failed for query; returning the result without it")
+            #
+            # WARNING, not exception(): every failure mode here is systemic
+            # (schema, document, validator), so it fires on EVERY query — a
+            # per-query traceback buries the logs it is meant to explain. The
+            # message is carried so the line is still actionable.
+            logger.warning("semantic validation failed for query; returning the result without it: %s", exc)
         # Determine action: remote when an external engine ran the statement
         # (BQ dry-run set non-empty, or a Databricks plan executed), local
         # otherwise. One audit action for both engines — the engine itself is

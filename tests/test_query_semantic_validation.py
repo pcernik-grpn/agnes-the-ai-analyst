@@ -243,6 +243,80 @@ class TestMcpQueryPassthrough:
 
         assert result["semantic_validation"] == payload["semantic_validation"]
 
+    def _run_query_tool(self, payload):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        pytest.importorskip("mcp", reason="mcp package not installed")
+        import app.api.mcp_http as mod
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = payload
+        resp.raise_for_status = MagicMock()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.post = AsyncMock(return_value=resp)
+            return asyncio.run(mod.query("SELECT revenue FROM orders"))
+
+    def test_an_advisory_never_pushes_a_deliverable_result_over_the_output_cap(self, monkeypatch):
+        """`ensure_output_size` RAISES rather than truncating, so an advisory
+        bolted onto a borderline result could fail a query that would have
+        succeeded a day earlier. An advisory must never do that: it is capped,
+        then dropped, before the rows are."""
+        monkeypatch.setenv("AGNES_MCP_MAX_OUTPUT_CHARS", "4000")
+        rows = [[i, "x" * 40] for i in range(60)]  # ~3.5k chars of real result
+        payload = {
+            "columns": ["id", "blob"],
+            "rows": rows,
+            "truncated": False,
+            "semantic_validation": {
+                "valid": False,
+                "warnings": [f"constraint 'c{i}' violated" for i in range(40)],
+                "violations": [{"name": f"c{i}", "reason": "y" * 200} for i in range(40)],
+                "post_execution_checks": [{"name": f"p{i}", "reason": "z" * 200} for i in range(40)],
+                "used_metrics": ["revenue"],
+                "used_datasets": ["orders"],
+                "summary": "s" * 500,
+                "detection": "best-effort text match",
+                "locally_executable": False,
+            },
+        }
+        result = self._run_query_tool(payload)
+
+        assert result["rows"] == rows, "the rows the caller asked for are untouched"
+        sv = result.get("semantic_validation")
+        if sv is not None:
+            assert len(sv["warnings"]) < 40
+            assert sv.get("truncated") is True
+
+    def test_a_result_too_large_on_its_own_still_raises(self, monkeypatch):
+        """Dropping the advisory does not turn the pre-existing oversize guard
+        off — a genuinely huge result must still tell the agent to narrow."""
+        from src.mcp_tooling import MCPOutputTooLarge
+
+        monkeypatch.setenv("AGNES_MCP_MAX_OUTPUT_CHARS", "2000")
+        payload = {
+            "columns": ["blob"],
+            "rows": [["x" * 100] for _ in range(200)],
+            "truncated": False,
+            "semantic_validation": {"valid": False, "warnings": ["w"]},
+        }
+        with pytest.raises(MCPOutputTooLarge):
+            self._run_query_tool(payload)
+
+    def test_a_small_response_keeps_the_full_advisory(self, monkeypatch):
+        monkeypatch.setenv("AGNES_MCP_MAX_OUTPUT_CHARS", "100000")
+        payload = {
+            "columns": ["revenue"],
+            "rows": [[100]],
+            "truncated": False,
+            "semantic_validation": {"valid": False, "warnings": ["a", "b"], "violations": [{"name": "c"}]},
+        }
+        result = self._run_query_tool(payload)
+        assert result["semantic_validation"] == payload["semantic_validation"]
+
 
 # ── CLI: `[semantic]` note on stderr ──────────────────────────────────────
 
@@ -298,3 +372,340 @@ class TestCliSemanticNote:
         assert json.loads(result.stdout.strip()) == [{"revenue": 100}]
         assert "[semantic]" not in result.stdout
         assert "[semantic]" in result.stderr
+
+
+# ── Which engine the advisory is judged against ───────────────────────────
+
+
+def _seed_raw_model(document: dict, *, slug: str = "retail") -> dict:
+    """Seed one valid model from a hand-built model dict."""
+    from src.repositories import semantic_model_repo
+
+    return semantic_model_repo().upsert(
+        id=f"manual/_/{slug}",
+        slug=slug,
+        name=slug,
+        description=None,
+        document=f"version: '0.2.0.dev0'\nsemantic_model:\n  - name: {slug}\n",
+        document_json={"semantic_model": [document]},
+        spec_version="0.2.0.dev0",
+        content_hash=f"hash-{slug}",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+
+
+class _StubAnalytics:
+    """Records every SQL that reaches DuckDB; optionally raises a BQ-style
+    parse error for the rewritten statement so the fallback path fires."""
+
+    description = [("c0",)]
+
+    def __init__(self, *, fail_on_bigquery_query: bool = False):
+        self.sqls: list[str] = []
+        self._fail = fail_on_bigquery_query
+
+    def execute(self, sql, *args, **kwargs):
+        self.sqls.append(sql)
+        if self._fail and "bigquery_query(" in sql:
+            raise RuntimeError("BinderException: Query execution failed: Syntax error: Unexpected token at [1:42]")
+
+        class _R:
+            def fetchmany(self, _n):
+                return [(1,)]
+
+        return _R()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def engine_probe(monkeypatch):
+    """Capture the ``target_engine`` the endpoint judged the statement on."""
+    import app.api.semantic_models as sm_mod
+
+    seen: dict = {"engine": None, "calls": 0}
+
+    def _spy(sql, user, conn, *, target_engine="duckdb"):
+        seen["engine"] = target_engine
+        seen["calls"] += 1
+        return None
+
+    monkeypatch.setattr(sm_mod, "semantic_validation_for_query", _spy)
+    return seen
+
+
+@pytest.fixture
+def stub_bq(monkeypatch):
+    monkeypatch.setattr("app.api.query._bq_dry_run_bytes", lambda *a, **k: 1024, raising=False)
+
+    class _FakeProjects:
+        data = "test-data-prj"
+        billing = "test-billing-prj"
+
+    class _FakeBqAccess:
+        projects = _FakeProjects()
+
+    monkeypatch.setattr("app.api.query.get_bq_access", lambda: _FakeBqAccess(), raising=False)
+
+
+def _register_bq_remote(name: str, bucket: str, source_table: str) -> None:
+    from src.db import get_system_db
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).register(
+            id=f"bq.{bucket}.{source_table}",
+            name=name,
+            source_type="bigquery",
+            bucket=bucket,
+            source_table=source_table,
+            query_mode="remote",
+        )
+    finally:
+        conn.close()
+
+
+class TestEngineLabel:
+    """The advisory's `locally_executable` verdict is only as good as the
+    engine label it is judged against — a metric declared BigQuery-only is
+    fine on a statement BigQuery composed and wrong on one DuckDB ran. The
+    label must therefore come from what ACTUALLY composed the statement, not
+    from "a BQ table was mentioned somewhere"."""
+
+    def test_all_local_query_is_judged_on_duckdb(self, orders_app, engine_probe):
+        r = _query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert engine_probe["engine"] == "duckdb"
+
+    def test_bigquery_pushdown_is_judged_on_bigquery(self, orders_app, engine_probe, stub_bq, monkeypatch):
+        """The rewrite fired and BQ composed the whole statement."""
+        _register_bq_remote("ue", "fin", "ue")
+        monkeypatch.setattr("app.api.query.get_analytics_db_readonly", lambda: _StubAnalytics(), raising=False)
+
+        r = orders_app["client"].post(
+            "/api/query",
+            json={"sql": "SELECT count(*) FROM ue WHERE country = 'CZ'"},
+            headers=_auth(orders_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert engine_probe["engine"] == "bigquery"
+
+    def test_cross_source_join_bigquery_never_composed_is_judged_on_duckdb(
+        self, orders_app, engine_probe, stub_bq, monkeypatch
+    ):
+        """A JOIN across a BQ-remote and a local table makes the rewriter bail
+        (`did_rewrite=False`) and DuckDB's ATTACH-catalog path run the SQL —
+        so a DuckDB-only metric must NOT be reported as unexecutable, and a
+        BigQuery-only one must not pass silently."""
+        _register_bq_remote("ue", "fin", "ue")
+        stub = _StubAnalytics()
+        monkeypatch.setattr("app.api.query.get_analytics_db_readonly", lambda: stub, raising=False)
+
+        r = orders_app["client"].post(
+            "/api/query",
+            json={"sql": "SELECT count(*) FROM ue JOIN orders ON ue.id = orders.id"},
+            headers=_auth(orders_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert not any("bigquery_query(" in s for s in stub.sqls), "precondition: the rewriter must have bailed"
+        assert engine_probe["engine"] == "duckdb"
+
+    def test_bigquery_parse_error_fallback_is_judged_on_duckdb(self, orders_app, engine_probe, stub_bq, monkeypatch):
+        """The rewrite fired, BQ refused it, and the statement re-ran through
+        DuckDB. The numbers came from DuckDB, so the verdict must too."""
+        _register_bq_remote("ue", "fin", "ue")
+        stub = _StubAnalytics(fail_on_bigquery_query=True)
+        monkeypatch.setattr("app.api.query.get_analytics_db_readonly", lambda: stub, raising=False)
+
+        r = orders_app["client"].post(
+            "/api/query",
+            json={"sql": "SELECT (count(*))::INT FROM ue"},
+            headers=_auth(orders_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert len(stub.sqls) == 2, "precondition: rewrite raised, then fell back"
+        assert engine_probe["engine"] == "duckdb"
+
+    def test_databricks_plan_is_judged_on_databricks(self, orders_app, engine_probe, monkeypatch):
+        monkeypatch.setattr("app.api.query._databricks_remote_plan", lambda *a, **k: {"sql": "SELECT 1"}, raising=False)
+        monkeypatch.setattr(
+            "app.api.query._execute_databricks_plan",
+            lambda *a, **k: (["c0"], [(1,)], False, 128),
+            raising=False,
+        )
+        r = _query(orders_app, orders_app["admin_token"], sql="SELECT revenue FROM dbx_orders")
+        assert r.status_code == 200, r.text
+        assert engine_probe["engine"] == "databricks"
+
+
+# ── The gate must stay cheap ──────────────────────────────────────────────
+
+
+class TestExistenceGateCost:
+    def test_no_valid_model_never_loads_a_document(self, orders_app, monkeypatch):
+        """Every query pays this gate. With no semantic layer it must cost one
+        COUNT — not a `list_all()` that drags `document` + `document_json` for
+        every row."""
+        from src.repositories.semantic_models import SemanticModelsRepository
+
+        calls = {"list_all": 0, "count_valid": 0}
+        real_list_all = SemanticModelsRepository.list_all
+        real_count = SemanticModelsRepository.count_valid
+
+        def _list_all(self, **kw):
+            calls["list_all"] += 1
+            return real_list_all(self, **kw)
+
+        def _count(self):
+            calls["count_valid"] += 1
+            return real_count(self)
+
+        monkeypatch.setattr(SemanticModelsRepository, "list_all", _list_all)
+        monkeypatch.setattr(SemanticModelsRepository, "count_valid", _count)
+
+        r = _query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200, r.text
+        assert calls["count_valid"] == 1
+        assert calls["list_all"] == 0
+
+
+# ── What the warning actually says ────────────────────────────────────────
+
+
+def _two_metric_document() -> dict:
+    return {
+        "name": "retail",
+        "datasets": [{"name": "orders", "source": "db.orders", "fields": [{"name": "amount"}]}],
+        "metrics": [
+            {
+                "name": "revenue",
+                "dataset": "orders",
+                "expression": {"dialects": [{"dialect": "duckdb", "expression": "SUM(amount)"}]},
+            },
+            {
+                "name": "margin",
+                "dataset": "orders",
+                "expression": {"dialects": [{"dialect": "bigquery", "expression": "SUM(amount) * 0.3"}]},
+            },
+        ],
+    }
+
+
+class TestWarningText:
+    def test_only_the_unexecutable_metric_is_named(self, orders_app):
+        """`revenue` composes on DuckDB and `margin` does not — naming both
+        accuses a metric that is perfectly fine."""
+        _seed_raw_model(_two_metric_document())
+        r = _query(
+            orders_app,
+            orders_app["admin_token"],
+            sql="SELECT revenue, amount AS margin FROM orders",
+        )
+        assert r.status_code == 200, r.text
+        sv = r.json()["semantic_validation"]
+        assert sv is not None
+        assert sv["not_executable_metrics"] == ["margin"]
+        dialect_warning = [w for w in sv["warnings"] if "no expression declared" in w]
+        assert len(dialect_warning) == 1, sv["warnings"]
+        assert "margin" in dialect_warning[0]
+        assert "revenue" not in dialect_warning[0], dialect_warning[0]
+
+    def test_the_advisory_says_the_match_is_textual(self, orders_app):
+        """Detection is a best-effort name match, not SQL parsing — a column
+        that happens to share a metric's name matches too. The payload and the
+        warning both say so, or a heuristic hit reads as a confirmed
+        violation."""
+        _seed_model()
+        r = _query(orders_app, orders_app["admin_token"])
+        sv = r.json()["semantic_validation"]
+        assert "text match" in sv["detection"].lower()
+        assert all("best-effort text match" in w for w in sv["warnings"]), sv["warnings"]
+
+
+# ── post-execution checks travel as information ───────────────────────────
+
+
+class TestPostExecutionChecks:
+    def test_they_are_forwarded_but_never_evaluated(self, orders_app):
+        """Issue #1707 decision 7: a rule that cannot be checked before running
+        is allowed, not validated, and surfaced as information. This caller
+        runs AFTER execution, so dropping them threw away the only list the
+        analyst could act on — but it still must not guess a verdict."""
+        document = _document()
+        document["custom_extensions"][0]["data"]["constraints"].append(
+            {
+                "name": "revenue_non_negative",
+                "constraint_type": "value_range",
+                "rule": "revenue >= 0",
+                "severity": "warning",
+                "metrics": ["revenue"],
+            }
+        )
+        _seed_raw_model(document)
+
+        r = _query(orders_app, orders_app["admin_token"])
+        sv = r.json()["semantic_validation"]
+        assert [c["name"] for c in sv["post_execution_checks"]] == ["revenue_non_negative"]
+        # Information, not a verdict: it neither becomes a warning line nor
+        # touches `valid`.
+        assert not any("revenue_non_negative" in w for w in sv["warnings"]), sv["warnings"]
+
+    def test_a_post_execution_check_alone_never_raises_the_advisory(self, orders_app):
+        """Nothing else to say → no field at all. Otherwise the advisory would
+        appear on every query touching a metric with an unverifiable rule, and
+        an agent learns to ignore a field that is always there."""
+        document = _two_metric_document()
+        document["metrics"] = [document["metrics"][0]]  # duckdb-only; executable
+        document["custom_extensions"] = [
+            {
+                "vendor_name": "agnes",
+                "data": {
+                    "constraints": [
+                        {
+                            "name": "revenue_non_negative",
+                            "constraint_type": "value_range",
+                            "rule": "revenue >= 0",
+                            "severity": "warning",
+                            "metrics": ["revenue"],
+                        }
+                    ]
+                },
+            }
+        ]
+        _seed_raw_model(document)
+        r = _query(orders_app, orders_app["admin_token"])
+        assert r.json()["semantic_validation"] is None
+
+
+# ── A failing advisory is a log line, not a traceback per query ────────────
+
+
+class TestFailureLogging:
+    def test_a_systemic_failure_logs_a_warning_not_a_traceback(self, orders_app, monkeypatch, caplog):
+        """The failure mode here is systemic (a half-migrated database, an
+        unreadable document) — it fires on EVERY query. A full traceback per
+        query buries the log it is trying to explain."""
+        import logging
+
+        import app.api.semantic_models as sm_mod
+
+        _seed_model()
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("validator exploded")
+
+        monkeypatch.setattr(sm_mod, "validate_query", _boom)
+        with caplog.at_level(logging.WARNING, logger="app.api.query"):
+            r = _query(orders_app, orders_app["admin_token"])
+        assert r.status_code == 200
+        records = [rec for rec in caplog.records if "semantic validation failed" in rec.getMessage()]
+        assert records, caplog.text
+        assert records[0].levelno == logging.WARNING
+        assert records[0].exc_info is None, "no per-query traceback"
+        assert "validator exploded" in records[0].getMessage(), "the error itself must still be in the line"

@@ -286,7 +286,20 @@ appearing means something. Enforcement is **soft** by design — the rows are
 untouched, the status stays `200`, and a failure of the check itself is
 swallowed (logged, field omitted) rather than costing the caller their
 result. `agnes query` prints each warning to stderr as `[semantic] …`, and the
-MCP `query` tool passes the field through verbatim.
+MCP `query` tools (both transports) pass the field through — shortening, then
+dropping, the advisory rather than letting it push a deliverable result over
+the tool output cap, which raises rather than truncating. An advisory must
+never fail a query.
+
+Read it as a prompt to check, not as proof. Object detection is a
+best-effort text match on declared names, not SQL parsing, so a column or
+alias that happens to share a metric's name matches too; the payload says so
+in `detection` and every warning line repeats it. Only the metrics that are
+actually unexecutable are named (`not_executable_metrics`), never every
+metric the statement mentioned. `post_execution_checks` — rules that cannot
+be checked before running — ride along as **information**: this caller has
+the rows but deliberately does not evaluate a business rule over them, and
+they never raise the advisory on their own.
 
 Constraints have no slot in core Ossie, so they ride `custom_extensions`
 under the Agnes vendor name, and the key naming the rule kind is

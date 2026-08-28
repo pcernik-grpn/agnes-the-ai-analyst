@@ -113,6 +113,22 @@ class TestValidateQuery:
         assert result.exit_code == 0
         assert "not locally executable" in result.output.lower()
 
+    def test_locally_executable_false_names_the_offending_metrics(self):
+        """A vague "one or more used metrics" leaves the analyst to work out
+        which one. The server now returns the names, so print them."""
+        body = {
+            **_VALID_RESULT,
+            "used_metrics": ["revenue", "mrr"],
+            "locally_executable": False,
+            "not_executable_metrics": ["mrr"],
+        }
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT revenue, mrr FROM orders"])
+        assert result.exit_code == 0
+        warning = next(line for line in result.output.splitlines() if "not locally executable" in line.lower())
+        assert "mrr" in warning
+        assert "revenue" not in warning, warning
+
     def test_no_semantic_model_prints_message_without_failing(self):
         body = {
             "available": False,

@@ -39,7 +39,7 @@ from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
@@ -383,7 +383,11 @@ def query(sql: str, limit: int = 1000) -> dict:
         result = api_post_json("/api/query", {"sql": sql, "limit": limit})
     except V2ClientError as exc:
         raise ValueError(_mcp_error("query", exc)) from exc
-    return ensure_output_size(result, "query")
+    # Advisory-aware cap: `semantic_validation` is shortened, then dropped,
+    # before the rows are — an advisory must never fail a query that would
+    # otherwise have returned. Same helper the HTTP foundation tool uses, so
+    # a borderline result behaves identically on both transports.
+    return ensure_query_output_size(result)
 
 
 @tool(read_only=True)

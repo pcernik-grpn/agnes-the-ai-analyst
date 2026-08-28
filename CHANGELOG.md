@@ -26,6 +26,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     semantic layer all return `null`, so the field appearing means something.
     `agnes query` prints each warning to stderr as `[semantic] …` (stdout
     stays machine-parseable), and the MCP `query` tool passes it through.
+    The advisory names only the metrics that actually failed, states in the
+    payload and in every warning line that object detection is a best-effort
+    text match on declared names rather than SQL parsing (a column sharing a
+    metric's name matches too), and forwards `post_execution_checks` as
+    information — rules that cannot be checked before running are surfaced,
+    never evaluated. On both MCP transports the advisory is shortened, then
+    dropped, before the rows are, so an advisory can never push a deliverable
+    result over the tool output cap (which raises rather than truncating).
+  - **`validate-query` says WHICH metric is not executable.** `POST
+    /api/semantic-models/validate-query` and its CLI/MCP wrappers carry a new
+    `not_executable_metrics` list next to the `locally_executable` bool. The
+    bool alone forced a consumer that wanted to warn about it to name every
+    metric the statement touched, turning one unusable metric into an
+    accusation against all of them. `agnes semantic-model validate-query`
+    prints the names instead of "one or more used metrics".
   - **MCP clients are steered to the layer before they write SQL.** The
     server-level instructions both MCP transports advertise now say to read a
     business term's declared definition first (`glossary_search`, then

@@ -28,7 +28,7 @@ from pydantic import Field
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 
 
 def _split_marketplace_id(item_id: str) -> tuple[str, str, str]:
@@ -632,7 +632,9 @@ def register_foundation_tools(
         ``used_metrics``, ``matched_relationships``, ``violations``,
         ``post_execution_checks`` (rules that cannot be checked before
         running — never treated as a violation), ``sql_dialects``,
-        ``mixed_dialect_warning``, ``locally_executable``, ``summary``, plus
+        ``mixed_dialect_warning``, ``locally_executable`` +
+        ``not_executable_metrics`` (which used metrics made it false — name
+        those, not every metric you used), ``summary``, plus
         the ``matched_expected_objects``/``missing_expected_objects``/
         ``unexpected_detected_objects`` trio when ``expected`` was passed.
         When you have no accessible ``status='valid'`` semantic model, this
@@ -1064,7 +1066,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             r.raise_for_status()
-            return ensure_output_size(r.json(), "query")
+            return ensure_query_output_size(r.json())
 
     @tool(read_only=True)
     async def skills() -> dict:

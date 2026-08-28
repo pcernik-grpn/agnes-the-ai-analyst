@@ -1004,11 +1004,7 @@ _NO_MODEL_MESSAGE = (
 
 
 def _accessible_valid_documents(
-    user: dict,
-    conn: duckdb.DuckDBPyConnection,
-    model_refs: set[str] | None = None,
-    *,
-    rows: list[dict[str, Any]] | None = None,
+    user: dict, conn: duckdb.DuckDBPyConnection, model_refs: set[str] | None = None
 ) -> list[dict[str, Any]]:
     """The individual model dicts (``document_json["semantic_model"]``
     entries) of every ``status='valid'`` semantic-model row ``user`` may
@@ -1030,13 +1026,7 @@ def _accessible_valid_documents(
     # Case-folded once, not per row (the match below is case-insensitive like
     # object-id matching).
     refs_cf = {str(r).casefold() for r in model_refs} if model_refs is not None else None
-    # ``rows`` is an optional caller-supplied snapshot of
-    # ``semantic_model_repo().list_all()`` — for a caller that already listed
-    # the rows to decide whether to bother at all (``semantic_validation_
-    # for_query`` below), so the decision and the load share ONE read instead
-    # of hitting the repo twice on a hot path. Semantics are identical; the
-    # status/document filter below still applies to whatever is passed in.
-    for row in semantic_model_repo().list_all() if rows is None else rows:
+    for row in semantic_model_repo().list_all():
         if row.get("status") != "valid" or not row.get("document_json"):
             continue
         if not _can_read_model(user, row, conn):
@@ -1089,6 +1079,18 @@ def _accessible_valid_rows(user: dict, conn: duckdb.DuckDBPyConnection) -> list[
     return rows
 
 
+# Object detection is best-effort text matching over declared names, not SQL
+# parsing (``src/semantic_validation.py``'s own LIMITATIONS). Said out loud in
+# the payload and in every warning line: a column that shares a metric's name
+# matches too, so an unqualified warning would present a heuristic hit as a
+# confirmed violation.
+_DETECTION_NOTE = "best-effort text match"
+_DETECTION_NOTE_LONG = (
+    "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+    "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+)
+
+
 def semantic_validation_for_query(
     sql: str,
     user: dict,
@@ -1117,16 +1119,19 @@ def semantic_validation_for_query(
     RBAC is the same tier as every other read here (``_can_read_model`` via
     ``_accessible_valid_documents``): a model the caller cannot read cannot
     warn them. The cheap existence check runs FIRST — an instance with no
-    valid model at all returns before a single per-model grant lookup, which
-    is the common case and the one that must stay free.
+    valid model at all returns on one ``COUNT(*)``, before a single row's
+    document is loaded or a single per-model grant is resolved. That is the
+    common case, and it is on the latency path of every query on the
+    instance.
     """
-    rows = semantic_model_repo().list_all()
-    # Cheap gate: `any` short-circuits on the first valid row, and no
-    # `_can_read_model` call (resource_grants + package joins, several reads
-    # per model) happens until we know there is something to check.
-    if not any(row.get("status") == "valid" and row.get("document_json") for row in rows):
+    # `count_valid()` is the whole reason this is affordable: the question is
+    # "is there a semantic layer at all?", and `list_all()` would answer it by
+    # dragging `document` + `document_json` for every row. It over-counts
+    # rather than under-counts (see the repo docstring) — an over-count costs
+    # the load below, an under-count would silently switch the advisory off.
+    if semantic_model_repo().count_valid() == 0:
         return None
-    documents = _accessible_valid_documents(user, conn, rows=rows)
+    documents = _accessible_valid_documents(user, conn)
     if not documents:
         return None
 
@@ -1140,22 +1145,44 @@ def semantic_validation_for_query(
     warnings: list[str] = []
     for violation in blocking:
         metrics = ", ".join(str(m) for m in (violation.get("metrics") or [])) or "this query"
-        warnings.append(f"constraint '{violation.get('name')}' on {metrics}: {violation.get('reason')}")
-    if not locally_executable:
-        used = ", ".join(str(m) for m in (result.get("used_metrics") or [])) or "a used metric"
         warnings.append(
-            f"{used}: no expression declared for {target_engine} — this result is not the declared metric, "
-            "check `agnes semantic-model context metric` before reporting it"
+            f"constraint '{violation.get('name')}' on {metrics} ({_DETECTION_NOTE}): {violation.get('reason')}"
+        )
+    if not locally_executable:
+        # Name the metrics that are actually unexecutable, never every metric
+        # the statement mentioned: `revenue` composing fine is not something
+        # to warn about because `margin` next to it does not. The fallback
+        # keeps the sentence honest if the validator ever reports the flag
+        # without the names.
+        offenders = result.get("not_executable_metrics") or result.get("used_metrics") or []
+        used = ", ".join(str(m) for m in offenders) or "a used metric"
+        warnings.append(
+            f"{used} ({_DETECTION_NOTE}): no expression declared for {target_engine} — this result is not the "
+            "declared metric, check `agnes semantic-model context metric` before reporting it"
         )
     return {
         "valid": result.get("valid", True),
         "warnings": warnings,
+        # How the objects above were detected. Named in the payload AND in
+        # every warning line, because the CLI prints only the warnings: a
+        # column that happens to share a metric's name matches too, and
+        # without this a heuristic hit reads as a confirmed violation.
+        "detection": _DETECTION_NOTE_LONG,
         # The raw engine output for the two findings above, so a UI can render
         # more than the prose line. `violations` carries EVERY violation once
         # the advisory exists (see the docstring) — hiding the advisory-
         # severity ones next to a blocking one would misreport the total.
         "violations": violations,
+        # Rules that cannot be checked before running (issue #1707 decision 7:
+        # allowed, not validated, surfaced as information). Forwarded, NEVER
+        # evaluated — this caller has the rows but evaluating a business rule
+        # over them is a different feature with a different failure mode, and
+        # a guessed verdict is exactly what the validator refuses to produce.
+        # They never raise the advisory on their own either (see the trigger
+        # above); they only ride one that already exists.
+        "post_execution_checks": result.get("post_execution_checks") or [],
         "locally_executable": locally_executable,
+        "not_executable_metrics": result.get("not_executable_metrics") or [],
         "used_metrics": result.get("used_metrics") or [],
         "used_datasets": result.get("used_datasets") or [],
         "summary": result.get("summary", ""),

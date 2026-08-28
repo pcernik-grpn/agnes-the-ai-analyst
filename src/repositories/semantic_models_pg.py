@@ -186,6 +186,15 @@ class SemanticModelsPgRepository:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode_row(dict(r)) for r in rows]
 
+    def count_valid(self) -> int:
+        """Postgres twin of the DuckDB ``count_valid`` — same predicate, same
+        superset-not-subset contract (see the sibling's docstring)."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT COUNT(*) FROM semantic_models WHERE status = 'valid' AND document_json IS NOT NULL")
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         with self._engine.begin() as conn:

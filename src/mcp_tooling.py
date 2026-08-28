@@ -9,6 +9,10 @@ budget:
 - ``ensure_output_size`` — hard cap on serialized tool output; over the cap
   the tool raises with actionable narrowing guidance instead of returning a
   payload that would flood the model's context.
+- ``ensure_query_output_size`` — the same cap for a ``/api/query`` response,
+  except the optional ``semantic_validation`` advisory is shortened and then
+  dropped BEFORE the rows are: an advisory must never fail a query that would
+  otherwise have returned.
 """
 
 from __future__ import annotations
@@ -62,6 +66,62 @@ def ensure_output_size(
             f"output cap. Narrow the request: {hint}."
         )
     return payload
+
+
+# How many advisory warnings survive the shrink in
+# ``ensure_query_output_size``. Enough to see the shape of the problem; the
+# full list is one ``validate_semantic_query`` call away, and that call is not
+# competing with the caller's rows for budget.
+ADVISORY_KEPT_WARNINGS = 3
+
+
+def ensure_query_output_size(payload: Any) -> Any:
+    """``ensure_output_size`` for a ``/api/query`` response — but never let the
+    ``semantic_validation`` advisory be what fails the query.
+
+    ``ensure_output_size`` RAISES rather than truncating (no partial data, so
+    an agent never computes over a silently-incomplete result). That contract
+    is right for rows and wrong for an advisory: bolting one onto a
+    borderline-sized result would turn a query that succeeded yesterday into
+    an error today — an advisory that blocks a delivered answer is exactly
+    what "soft enforcement" is not.
+
+    So the advisory gives way first: full payload, else a summary-sized
+    advisory, else no advisory at all. Only when the rows alone still exceed
+    the cap does the original guard fire — unchanged behaviour, and its
+    narrowing hint is then genuinely about the result.
+
+    Shared by both MCP query surfaces (HTTP foundation + CLI stdio) so a
+    borderline result cannot fail on one transport and succeed on the other.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("semantic_validation"), dict):
+        return ensure_output_size(payload, "query")
+    advisory: dict = payload["semantic_validation"]
+    try:
+        return ensure_output_size(payload, "query")
+    except MCPOutputTooLarge:
+        pass
+
+    warnings = list(advisory.get("warnings") or [])
+    shrunk = {
+        "valid": advisory.get("valid"),
+        "warnings": warnings[:ADVISORY_KEPT_WARNINGS],
+        "locally_executable": advisory.get("locally_executable"),
+        # Say it was cut, so a caller never reads a short list as the whole
+        # story.
+        "truncated": True,
+        "truncated_note": (
+            f"advisory shortened to fit the tool output cap ({len(warnings)} warnings total) — "
+            "run `validate_semantic_query` for the full result"
+        ),
+    }
+    try:
+        return ensure_output_size({**payload, "semantic_validation": shrunk}, "query")
+    except MCPOutputTooLarge:
+        pass
+    # The rows are what is big. Drop the advisory entirely and let the
+    # pre-existing guard speak about the result itself.
+    return ensure_output_size({**payload, "semantic_validation": None}, "query")
 
 
 def summarize_docstring(doc: str | None) -> tuple[str, bool]:
