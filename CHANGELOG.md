@@ -87,6 +87,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   directly — every source (native, git, upload, Keboola, Snowflake,
   Databricks) now goes through the same document → projector pipeline.
 
+- **Session files are a side drawer that opens itself when a deliverable
+  lands.** The Files panel was a modal, which covered the very sentence
+  ("I saved it as …") the reader was checking the list against. It now docks
+  to the trailing edge with no backdrop, the conversation stays readable and
+  scrollable beside it, and where there is room (≥1100px) the composer makes
+  way instead of sitting underneath. The header button carries a count, and a
+  turn that writes a new file under `outputs/` opens the drawer on its own —
+  `outputs/` only, so the scratch files an agent touches mid-task do not
+  interrupt the read. The drawer learns which conversation it is looking at
+  when that conversation **opens**, so the first turn of a fresh chat is the
+  one that opens it (deriving the baseline from the first completed turn put
+  that turn's own deliverable into the baseline, and the commonest case —
+  ask, receive a document — never opened anything), and switching
+  conversations resets the count and reloads an open drawer instead of
+  leaving the previous chat's rows on screen with their old download links.
+
 ### Fixed
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
@@ -158,6 +174,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
+- **The session-files list no longer presents the workspace template as
+  session output.** `WorkdirManager.prepare_session_dir` symlinks `.claude`,
+  `scaffolds`, `snapshots`, `scripts` and `CLAUDE.md` into every session dir
+  for every provider, and the listing walked them: on a real conversation the
+  document the user asked for sat below dozens of
+  `scaffolds/nodejs-dashboard/...` rows, and on some turns never made the
+  page at all. Those trees are now excluded at the top level, and `outputs/`
+  sorts ahead of everything else. This also aligns the two sources: the
+  engine's own sandbox browser filters dot-directories for the same reason.
+- **The chat sandbox prompt now says where deliverables go.** It didn't — the
+  `outputs/` convention was real in the harvest code and in the Files panel
+  above, but no prompt ever named it, so the exclusion above could drop the
+  one location skills actually used (`.claude/skills/<name>/`) with nothing
+  pointing anywhere else, and the auto-open had no trigger to fire on. A
+  "Files you produce" section (sandbox render only — a laptop workspace *is*
+  the user's computer) names `outputs/` and says plainly that `.claude/`,
+  `/tmp` and a bare filename are invisible to the reader. The Charts section
+  no longer claims the sandbox has "no way to hand the user a file", which
+  stopped being true when the panel shipped and contradicted the new
+  section; the rule it still needs — a chart belongs inline in the reply, not
+  handed over as a file — is stated in its own right.
+- **The chat header's action buttons no longer drift apart.** `margin-left:
+  auto` was written when Copy transcript was the header's only action; with
+  Files beside it, each button claimed the slack and the free space was split
+  between them, stranding Files mid-header. Only the first action claims it
+  now, so the pair reads as one group at the trailing edge.
 - **Three Corporate Memory governance knobs are wired up; the fourth is
   clearly marked as not yet enforced (#1573).** `corporate_memory.approval_mode:
   "threshold"` used to silently behave exactly like `"review_queue"` — there
