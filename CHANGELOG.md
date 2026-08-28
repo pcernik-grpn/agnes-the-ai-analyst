@@ -245,6 +245,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `config/claude_md_template.txt`) and pinned by drift + retraction guards.
 
 ### Fixed
+- **The MCP OAuth callback now percent-encodes the client's `state`.** It was
+  interpolated raw into the redirect back to the client, so an `&` or `=` inside
+  an opaque `state` split into extra query parameters on the client's callback —
+  including a second `code`. Both the allow and the deny redirect encode it now.
+- **The MCP consent screen tells the truth, and a finished authorization no
+  longer reads as "Authorization request expired".** Connecting Claude Desktop
+  (or any MCP client) showed a single scope token — `read` — and the client then
+  offered dozens of write/delete tools; the page now states in plain language
+  what the connection can do: read what you can already see, act through Agnes
+  tools that create/update/delete (this connection is *not* read-only), and
+  never more than your own RBAC allows. The consent link is single-use while the
+  tab that submitted it stays on the consent URL, so a reload, a double-clicked
+  Allow, or Back-then-Allow re-issued a consumed link and reported an expiry on
+  a connection that had in fact succeeded; a finished consent now leaves a
+  short-lived, subject-less outcome
+  marker (inert as a grant — `exchange_authorization_code` refuses it) so a
+  replay renders "Connected to Agnes" or "Access denied" instead. A genuinely
+  unknown or expired link still answers `400`, now with wording that says what
+  to do (and quotes the real link lifetime rather than a hard-coded "five
+  minutes"). Allow is double-submit guarded client-side, and the guard resets
+  when the page comes back from the browser's back/forward cache, so returning
+  with Back never leaves a dead button. A scope Agnes has no description for is
+  now listed verbatim instead of being dropped from the page. Deny is
+  destructive now (it burns the link so a refused consent cannot be re-submitted
+  as an allow), so it requires the same authenticated Agnes session Allow always
+  did — previously the deny branch ran before the session check.
 - **Session files: the workspace template no longer shows up as session
   output on kai-agent instances.** The exclusion shipped for the host walk,
   but a `chat.provider: kai-agent` session is listed by the ENGINE's own
