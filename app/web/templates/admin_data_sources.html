@@ -876,11 +876,23 @@
   }
   .sp-tree__row:last-child { border-bottom: none; }
   .sp-tree__row:hover { background: var(--ds-surface-sunken); }
+  /* `.sp-tree__row` sets `display: flex` as an author rule, which otherwise
+     always beats the user-agent `[hidden] { display: none }` rule
+     regardless of specificity (UA-origin declarations lose to author-origin
+     ones of ANY specificity) — the client-side filter (#2) relies on
+     toggling `hidden` to actually hide a non-matching row. */
+  .sp-tree__row[hidden] { display: none; }
   .sp-tree__name { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
   .sp-tree__name button { border: none; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--ds-text-primary); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sp-tree__name button:hover { color: var(--ds-primary); }
   .sp-tree__name span.leaf { font-weight: 600; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__name mark { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-radius: 3px; padding: 0 1px; }
   .sp-tree__anon { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; color: var(--ds-text-muted); }
+  .sp-search { margin-bottom: 14px; }
+  .sp-search__row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .sp-search__q { flex: 1 1 240px; min-width: 200px; }
+  .sp-search__mode { flex: 0 0 auto; min-width: 160px; }
+  .sp-search__selectall { display: flex; align-items: center; gap: 6px; padding: 9px 12px; font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--ds-border-light); }
   .sp-badge {
     flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px;
     border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
@@ -1483,13 +1495,53 @@
         <div id="spw-connect-error" class="ds-wizard-error"></div>
       </section>
 
-      {# Step 2: the folder tree — one level per call (sites -> drives -> root
-         children); each selected row shows its collection badge, unselected
-         rows are explicit exclusions, anonymize sits on the same row. #}
+      {# Step 2: the folder tree — sites -> drives -> root children ->
+         arbitrary-depth subfolder children (TCRD-240); each selected row
+         shows its collection badge, unselected rows are explicit
+         exclusions, anonymize sits on the same row. A bounded server-side
+         search (never Graph's own `/search` — TCRD-240) sits above the
+         tree for bulk scope selection ("all folders starting with xxx"),
+         and a client-side instant filter narrows whatever is currently
+         loaded. #}
       <section class="ds-drawer__pane" data-spw-pane="2">
         <p class="ds-wizard-lede">
           Pick the sites, libraries or folders you want indexed. Each one becomes its own Collection.
         </p>
+
+        <div class="sp-search">
+          <div class="sp-search__row">
+            <div class="ds-field sp-search__q">
+              <label for="spw-search-q">Search folders (min 2 characters)</label>
+              <input type="text" id="spw-search-q" placeholder="e.g. contracts" autocomplete="off">
+            </div>
+            <div class="ds-field sp-search__mode">
+              <label for="spw-search-mode">Match</label>
+              <select id="spw-search-mode" class="ds-dropdown-native">
+                <option value="prefix" selected>Starts with</option>
+                <option value="contains">Contains</option>
+                <option value="glob">Pattern (glob)</option>
+              </select>
+              {{ ds.dropdown(
+                id='spw-search-mode-dd', target='spw-search-mode',
+                aria_label='Search match mode', selected='prefix',
+                options=[
+                  {'value': 'prefix', 'label': 'Starts with'},
+                  {'value': 'contains', 'label': 'Contains'},
+                  {'value': 'glob', 'label': 'Pattern (glob)'},
+                ],
+              ) }}
+            </div>
+            <button type="button" class="btn btn-secondary" id="spw-search-btn">Search</button>
+          </div>
+          <div id="spw-search-truncated" class="ds-wizard-error" style="display:none;"></div>
+          <div id="spw-search-error" class="ds-wizard-error"></div>
+          <div id="spw-search-results" class="sp-tree" style="display:none; margin-bottom:12px;"></div>
+        </div>
+
+        <div class="ds-field">
+          <label for="spw-tree-filter">Filter loaded folders</label>
+          <input type="text" id="spw-tree-filter" placeholder="Narrow what's shown below…" autocomplete="off">
+        </div>
         <nav class="sp-crumbs" id="spw-crumbs" aria-label="Browsing"></nav>
         <div id="spw-tree" class="sp-tree"><div class="ds-loading">Loading…</div></div>
         <p class="sp-note">
@@ -5120,12 +5172,14 @@ const SP_DEFAULT_CERT_ENV = "SHAREPOINT_CERT_PRIVATE_KEY";
 
 let spConnId = null;
 let spCertChoice = "upload";
-let spLevel = { site_id: null, drive_id: null };
-let spCrumbs = [];        // [{label, site_id, drive_id}]
+let spLevel = { site_id: null, drive_id: null, item_id: null };
+let spCrumbs = [];        // [{label, site_id, drive_id, item_id}]
 let spItems = [];         // current level's tree items
 let spScopes = {};        // source_scope_id -> scope row (server shape, incl. no_group_warning)
 let spGroups = null;      // cached [{id, name}]
 let spPendingGroups = {}; // source_scope_id -> Set(group_id), locally ticked but not yet applied
+let spTreeFilterQuery = "";   // client-side instant filter (#2) over spItems, reset on navigation
+let spLastSearchMatches = null; // last server-search (#3) result list, or null if none run yet
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -5160,13 +5214,21 @@ function spApi(url, opts) {
 function openSpWizard() {
   spConnId = null;
   spCertChoice = "upload";
-  spLevel = { site_id: null, drive_id: null };
+  spLevel = { site_id: null, drive_id: null, item_id: null };
   spCrumbs = [];
   spItems = [];
   spScopes = {};
   spGroups = null;
   spPendingGroups = {};
+  spTreeFilterQuery = "";
+  spLastSearchMatches = null;
 
+  document.getElementById("spw-tree-filter").value = "";
+  document.getElementById("spw-search-q").value = "";
+  document.getElementById("spw-search-truncated").style.display = "none";
+  document.getElementById("spw-search-results").style.display = "none";
+  document.getElementById("spw-search-results").innerHTML = "";
+  document.getElementById("spw-search-error").style.display = "none";
   document.getElementById("spw-name").value = "";
   document.getElementById("spw-tenant").value = "";
   document.getElementById("spw-client").value = "";
@@ -5239,7 +5301,7 @@ document.getElementById("spw-existing-btn").addEventListener("click", () => {
   spEnableStep(2);
   spEnableStep(3);
   spGoStep(2);
-  spLevel = { site_id: null, drive_id: null };
+  spLevel = { site_id: null, drive_id: null, item_id: null };
   spCrumbs = [];
   spLoadScopesThenTree();
 });
@@ -5280,7 +5342,7 @@ document.getElementById("spw-connect-btn").addEventListener("click", () => {
       btn.textContent = "Connect & validate";
       spEnableStep(2);
       spEnableStep(3);
-      spLevel = { site_id: null, drive_id: null };
+      spLevel = { site_id: null, drive_id: null, item_id: null };
       spCrumbs = [];
       spGoStep(2);
       spLoadScopesThenTree();
@@ -5308,13 +5370,24 @@ function spLoadScopesThenTree() {
   }).catch(() => { spScopes = {}; }).then(spLoadTree);
 }
 
+/* The current browse level, derived from spLevel — one place, since
+   confirm/remove/filter all need to know it to re-render the right rows. */
+function spCurrentLevel() {
+  if (spLevel.drive_id) return "items";
+  if (spLevel.site_id) return "drives";
+  return "sites";
+}
+
 function spLoadTree() {
   spTreeErr("");
+  spTreeFilterQuery = "";
+  document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-tree").innerHTML = '<div class="ds-loading">Loading…</div>';
   spRenderCrumbs();
   const params = new URLSearchParams();
   if (spLevel.site_id) params.set("site_id", spLevel.site_id);
   if (spLevel.drive_id) params.set("drive_id", spLevel.drive_id);
+  if (spLevel.item_id) params.set("item_id", spLevel.item_id);
   const qs = params.toString();
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree${qs ? "?" + qs : ""}`)
     .then((body) => {
@@ -5336,7 +5409,7 @@ function spLoadTree() {
 
 function spRenderCrumbs() {
   const nav = document.getElementById("spw-crumbs");
-  const parts = [{ label: "Sites", site_id: null, drive_id: null }].concat(spCrumbs);
+  const parts = [{ label: "Sites", site_id: null, drive_id: null, item_id: null }].concat(spCrumbs);
   nav.innerHTML = parts.map((c, i) => {
     const last = i === parts.length - 1;
     const btn = `<button type="button" data-spw-crumb="${i}" ${last ? "disabled" : ""}>${spEsc(c.label)}</button>`;
@@ -5345,9 +5418,9 @@ function spRenderCrumbs() {
   nav.querySelectorAll("[data-spw-crumb]").forEach((b) => {
     b.addEventListener("click", () => {
       const i = Number(b.dataset.spwCrumb);
-      const target = ([{ site_id: null, drive_id: null }].concat(spCrumbs))[i];
+      const target = ([{ site_id: null, drive_id: null, item_id: null }].concat(spCrumbs))[i];
       spCrumbs = spCrumbs.slice(0, i);
-      spLevel = { site_id: target.site_id, drive_id: target.drive_id };
+      spLevel = { site_id: target.site_id, drive_id: target.drive_id, item_id: target.item_id };
       spLoadTree();
     });
   });
@@ -5357,14 +5430,57 @@ function spDisplayPath(name) {
   return spCrumbs.map((c) => c.label).concat([name]).join(" / ");
 }
 
+/* ── Client-side instant filter (#2): narrows spItems already loaded at
+   the current level — no server round trip. Case/diacritics-insensitive
+   (unlike the server search's NFC-only compare — see the fold note on
+   spFilterKey), so "elektrina" narrows to "Elektřina". ─────────────────── */
+
+function spFoldDiacritics(s) {
+  // NFD decomposes a precomposed accented letter into base + combining
+  // mark(s); stripping the "Combining Diacritical Marks" block then leaves
+  // just the base letters — "Přehledy" and "Prehledy" fold to the same key.
+  return String(s == null ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function spFilterKey(s) {
+  return spFoldDiacritics(s).toLocaleLowerCase();
+}
+
+function spRowMatchesFilter(name) {
+  if (!spTreeFilterQuery) return true;
+  return spFilterKey(name).indexOf(spFilterKey(spTreeFilterQuery)) !== -1;
+}
+
+/* Wraps the matched substring in <mark>. Falls back to plain escaped text
+   whenever folding changed the string's length (a rare composition case) —
+   a highlight is a nicety, never worth mis-slicing a folder name over. */
+function spHighlight(name) {
+  const raw = String(name == null ? "" : name);
+  if (!spTreeFilterQuery) return spEsc(raw);
+  const foldedName = spFilterKey(raw);
+  const foldedQuery = spFilterKey(spTreeFilterQuery);
+  const idx = foldedName.indexOf(foldedQuery);
+  if (idx === -1 || foldedName.length !== raw.length || !foldedQuery) return spEsc(raw);
+  const before = spEsc(raw.slice(0, idx));
+  const match = spEsc(raw.slice(idx, idx + foldedQuery.length));
+  const after = spEsc(raw.slice(idx + foldedQuery.length));
+  return `${before}<mark>${match}</mark>${after}`;
+}
+
 function spRenderTree(level) {
   const host = document.getElementById("spw-tree");
   if (!spItems.length) {
     host.innerHTML = '<div class="sp-tree__row"><span class="sp-tree__name"><span class="leaf">Nothing here.</span></span></div>';
     return;
   }
-  const navigable = level === "sites" || level === "drives"; // one level per call — items (folders) are leaves
+  let anyVisible = false;
   host.innerHTML = spItems.map((item) => {
+    // Sites/drives are always navigable; an item (folder) at the "items"
+    // level is navigable too (TCRD-240 subfolder browsing) — a FILE never
+    // is, regardless of level.
+    const navigable = level === "sites" || level === "drives" || (level === "items" && item.is_folder);
+    const visible = spRowMatchesFilter(item.name);
+    if (visible) anyVisible = true;
     const scope = spScopes[item.id];
     const checked = !!scope;
     const anon = scope ? !!scope.anonymize : false;
@@ -5374,28 +5490,35 @@ function spRenderTree(level) {
     const anonDeclared = scope ? !!scope.anonymization_declared : false;
     const path = spDisplayPath(item.name);
     const nameHtml = navigable
-      ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spEsc(item.name)}</button>`
-      : `<span class="leaf">${spEsc(item.name)}</span>`;
+      ? `<button type="button" data-spw-drill="${spEsc(item.id)}" data-spw-name="${spEsc(item.name)}">${spHighlight(item.name)}</button>`
+      : `<span class="leaf">${spHighlight(item.name)}</span>`;
     const anonSuffix = anon ? (anonDeclared ? " · anonymized" : " · anon requested") : "";
     const badge = scope && scope.collection
       ? `<span class="sp-badge${anon ? (anonDeclared ? " sp-badge--anon-declared" : " sp-badge--anon") : ""}">&rarr; ${spEsc(scope.collection.slug)}${anonSuffix}</span>`
       : "";
-    return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}">` +
+    return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}"${visible ? "" : " hidden"}>` +
       `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
       `<span class="sp-tree__name">${nameHtml}</span>` +
       `<label class="sp-tree__anon"><input type="checkbox" data-spw-anon="${spEsc(item.id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
       badge +
       `</div>`;
-  }).join("");
+  }).join("") + (anyVisible ? "" : '<div class="ds-empty" data-spw-nomatch>No folders match the filter.</div>');
 
   host.querySelectorAll("[data-spw-drill]").forEach((b) => {
     b.addEventListener("click", () => {
       const id = b.dataset.spwDrill;
       const name = b.dataset.spwName;
-      spCrumbs = spCrumbs.concat([level === "sites"
-        ? { label: name, site_id: id, drive_id: null }
-        : { label: name, site_id: spLevel.site_id, drive_id: id }]);
-      spLevel = level === "sites" ? { site_id: id, drive_id: null } : { site_id: spLevel.site_id, drive_id: id };
+      if (level === "sites") {
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: id, drive_id: null, item_id: null }]);
+        spLevel = { site_id: id, drive_id: null, item_id: null };
+      } else if (level === "drives") {
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: spLevel.site_id, drive_id: id, item_id: null }]);
+        spLevel = { site_id: spLevel.site_id, drive_id: id, item_id: null };
+      } else {
+        // "items" level: drilling into a folder at any depth (TCRD-240).
+        spCrumbs = spCrumbs.concat([{ label: name, site_id: spLevel.site_id, drive_id: spLevel.drive_id, item_id: id }]);
+        spLevel = { site_id: spLevel.site_id, drive_id: spLevel.drive_id, item_id: id };
+      }
       spLoadTree();
     });
   });
@@ -5406,6 +5529,11 @@ function spRenderTree(level) {
     cb.addEventListener("change", () => spOnAnonToggle(cb));
   });
 }
+
+document.getElementById("spw-tree-filter").addEventListener("input", (e) => {
+  spTreeFilterQuery = e.target.value;
+  spRenderTree(spCurrentLevel());
+});
 
 function spOnSelectToggle(cb) {
   const id = cb.dataset.spwSelect;
@@ -5428,6 +5556,14 @@ function spOnAnonToggle(cb) {
   spConfirmScope(id, row.dataset.spwPath, cb.checked);
 }
 
+/* Re-renders both the tree AND the last search result list (if any is on
+   screen) after a scope changes — a confirm/remove reached from either
+   list must update the badge/checkbox state in the OTHER one too. */
+function spRefreshVisibleLists() {
+  spRenderTree(spCurrentLevel());
+  if (spLastSearchMatches) spRenderSearchResults(spLastSearchMatches);
+}
+
 function spConfirmScope(sourceScopeId, displayPath, anonymize) {
   spTreeErr("");
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
@@ -5435,7 +5571,7 @@ function spConfirmScope(sourceScopeId, displayPath, anonymize) {
     body: { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
   }).then((scope) => {
     spScopes[sourceScopeId] = scope;
-    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+    spRefreshVisibleLists();
   }).catch((e) => {
     spTreeErr("Could not confirm that scope: " + e.message);
     spLoadTree(); // resync checkbox state with the server
@@ -5448,12 +5584,130 @@ function spRemoveScope(sourceScopeId) {
     method: "DELETE",
   }).then(() => {
     delete spScopes[sourceScopeId];
-    spRenderTree(spLevel.drive_id ? "items" : (spLevel.site_id ? "drives" : "sites"));
+    spRefreshVisibleLists();
   }).catch((e) => {
     spTreeErr("Could not remove that scope: " + e.message);
     spLoadTree();
   });
 }
+
+/* ── Server search (#3/#4): bounded BFS over the live tree, never Graph's
+   own /search (see graph_client's module docstring). Results enter the
+   SAME scope basket as tree picks — checking a result row is an ordinary
+   spConfirmScope call, so bulk-select is just N ordinary confirms. ────── */
+
+function spSearchErr(msg) {
+  const el = document.getElementById("spw-search-error");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+function spRenderSearchResults(matches) {
+  const host = document.getElementById("spw-search-results");
+  if (!matches.length) {
+    host.innerHTML = '<div class="ds-empty">No folders matched.</div>';
+    host.style.display = "";
+    return;
+  }
+  const rowsHtml = matches.map((m) => {
+    const scope = spScopes[m.item_id];
+    const checked = !!scope;
+    const anon = scope ? !!scope.anonymize : false;
+    const badge = scope && scope.collection
+      ? `<span class="sp-badge${anon ? " sp-badge--anon" : ""}">&rarr; ${spEsc(scope.collection.slug)}${anon ? " · anon" : ""}</span>`
+      : "";
+    return `<div class="sp-tree__row" data-spw-sr="${spEsc(m.item_id)}" data-spw-sr-drive="${spEsc(m.drive_id)}" data-spw-sr-path="${spEsc(m.display_path)}">` +
+      `<input type="checkbox" data-spw-sr-select="${spEsc(m.item_id)}" aria-label="Select ${spEsc(m.display_path)}"${checked ? " checked" : ""}>` +
+      `<span class="sp-tree__name"><span class="leaf">${spEsc(m.display_path)}</span></span>` +
+      `<label class="sp-tree__anon"><input type="checkbox" data-spw-sr-anon="${spEsc(m.item_id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
+      badge +
+      `</div>`;
+  }).join("");
+  host.innerHTML = `<label class="sp-search__selectall"><input type="checkbox" id="spw-search-select-all"> Select all (${matches.length})</label>` + rowsHtml;
+  host.style.display = "";
+
+  document.getElementById("spw-search-select-all").addEventListener("change", (e) => {
+    const want = e.target.checked;
+    host.querySelectorAll("[data-spw-sr-select]").forEach((cb) => {
+      if (cb.checked !== want) { cb.checked = want; cb.dispatchEvent(new Event("change")); }
+    });
+  });
+  host.querySelectorAll("[data-spw-sr-select]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSearchSelectToggle(cb));
+  });
+  host.querySelectorAll("[data-spw-sr-anon]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSearchAnonToggle(cb));
+  });
+}
+
+function spOnSearchSelectToggle(cb) {
+  const id = cb.dataset.spwSrSelect;
+  const row = cb.closest("[data-spw-sr]");
+  const path = row.dataset.spwSrPath;
+  const anonBox = row.querySelector("[data-spw-sr-anon]");
+  if (cb.checked) {
+    anonBox.disabled = false;
+    spConfirmScope(id, path, anonBox.checked);
+  } else {
+    anonBox.disabled = true;
+    spRemoveScope(id);
+  }
+}
+
+function spOnSearchAnonToggle(cb) {
+  const id = cb.dataset.spwSrAnon;
+  if (!spScopes[id]) return;
+  const row = cb.closest("[data-spw-sr]");
+  spConfirmScope(id, row.dataset.spwSrPath, cb.checked);
+}
+
+function spRunSearch() {
+  const q = document.getElementById("spw-search-q").value.trim();
+  document.getElementById("spw-search-truncated").style.display = "none";
+  spSearchErr("");
+  if (q.length < 2) {
+    spSearchErr("Type at least 2 characters.");
+    return;
+  }
+  const mode = document.getElementById("spw-search-mode").value;
+  const params = new URLSearchParams({ q: q, mode: mode });
+  const btn = document.getElementById("spw-search-btn");
+  btn.disabled = true;
+  btn.textContent = "Searching…";
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree/search?${params.toString()}`)
+    .then((body) => {
+      btn.disabled = false;
+      btn.textContent = "Search";
+      spLastSearchMatches = body.matches || [];
+      spRenderSearchResults(spLastSearchMatches);
+      if (body.truncated) {
+        const el = document.getElementById("spw-search-truncated");
+        el.textContent = `Stopped after ${body.visited} folder(s) — refine the pattern or raise the depth/visited limits.`;
+        el.style.display = "block";
+      }
+    })
+    .catch((e) => {
+      btn.disabled = false;
+      btn.textContent = "Search";
+      spLastSearchMatches = null;
+      document.getElementById("spw-search-results").style.display = "none";
+      document.getElementById("spw-search-results").innerHTML = "";
+      if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
+        spSearchErr("No certificate configured yet — " + e.detail.message);
+      } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
+        spSearchErr("SharePoint did not answer: " + e.detail.message);
+      } else if (e.detail && e.detail.error === "invalid_search_pattern") {
+        spSearchErr("That pattern isn't valid: " + e.detail.message);
+      } else {
+        spSearchErr("Search failed: " + e.message);
+      }
+    });
+}
+document.getElementById("spw-search-btn").addEventListener("click", spRunSearch);
+document.getElementById("spw-search-q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); spRunSearch(); }
+});
 
 document.getElementById("spw-scope-continue-btn").addEventListener("click", () => {
   spGoStep(3);

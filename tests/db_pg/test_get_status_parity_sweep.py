@@ -73,6 +73,20 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "facts_ingest_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/facts_ingest_runs_pg.py"
     ),
+    # External SSO login config (design 2026-08-28) — both parameter-free
+    # GETs reach a PG-only repo before any other validation.
+    "GET /api/admin/sso/config": (
+        "sso_config_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/sso_config_pg.py"
+    ),
+    "GET /api/admin/sso/identities": (
+        "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
+        "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
+    ),
+    "GET /api/me/external-identity": (
+        "user_external_identities_repo() is PG-only (A3 ratchet) -- DuckDB has "
+        "no implementation to resolve; see src/repositories/user_external_identities_pg.py"
+    ),
 }
 
 

@@ -1973,6 +1973,26 @@ class TestPrivacyPageSmoke:
 # ---------------------------------------------------------------------------
 
 KNOWN_UNTESTED = {
+    # External SSO login (design 2026-08-28) — PG-only feature covered
+    # depth-first in its own harnesses rather than duplicated here:
+    # tests/db_pg/test_admin_sso_api.py (admin gate, validation matrix,
+    # write-only secret + vault 409, last-login-door guard, identities
+    # pagination, /api/me/external-identity, and the DuckDB typed-501
+    # answer this both-backends sweep would otherwise trip over),
+    # tests/db_pg/test_sso_provider.py (login/callback flow with a faked
+    # authlib client, binding algorithm, test-mode security), and the
+    # parity sweeps' _PG_ONLY_ROUTE_EXEMPTIONS fail-clean assertions.
+    "GET /api/admin/sso/config",
+    "PUT /api/admin/sso/config",
+    "PUT /api/admin/sso/client-secret",
+    "DELETE /api/admin/sso/client-secret",
+    "DELETE /api/admin/sso/config",
+    "POST /api/admin/sso/test-config",
+    "GET /api/admin/sso/identities",
+    "DELETE /api/admin/sso/identities/{user_id}",
+    "GET /api/me/external-identity",
+    "GET /auth/sso/login",
+    "GET /auth/sso/callback",
     # Agent-builder page (paper-theme redesign) — self-contained web page,
     # covered in tests/test_ui_layout_theme.py (chrome/list/auth/actions)
     # rather than duplicated in this PG smoke harness. The builder API it
@@ -3010,6 +3030,12 @@ KNOWN_UNTESTED = {
     # warning, and the corpus-map producer handoff are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Bounded BFS folder search (TCRD-240) over the same live tree — never
+    # Graph's own `/search`. Same "no new schema surface" reasoning as the
+    # sibling `/tree` route above; auth matrix, query-length/mode/glob
+    # validation, subtree scoping, and cap-clamping are all covered by
+    # tests/test_admin_sharepoint.py::TestTreeSearch.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree/search",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",

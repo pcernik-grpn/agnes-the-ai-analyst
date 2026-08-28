@@ -233,3 +233,30 @@ async def get_home_stats(
     analysts.
     """
     return compute_home_stats(user, window)
+
+
+@router.get("/external-identity")
+async def get_external_identity(user: dict = Depends(get_current_user)):
+    """The calling user's linked external identity (design 2026-08-28).
+
+    Live repo lookup, deliberately NOT a JWT claim: link state must stay
+    revocable (an admin unlink takes effect on the next call, not after a
+    30-day stateless token expires). None of the returned fields is a
+    secret — the ``subject`` is the Entra directory object ID the admin
+    identities list shows too. Postgres-only feature: on a DuckDB-backed
+    instance the repo factory raises ``RequiresPostgresBackend`` and the
+    app-wide handler answers the typed 501.
+    """
+    from src.repositories import user_external_identities_repo
+
+    row = user_external_identities_repo().get_by_user_id(user["id"])
+    if row is None:
+        return {"linked": False}
+    return {
+        "linked": True,
+        "provider_type": row["provider_type"],
+        "tenant_id": row["tenant_id"],
+        "subject": row["subject"],
+        "linked_at": row["linked_at"],
+        "last_login_at": row["last_login_at"],
+    }

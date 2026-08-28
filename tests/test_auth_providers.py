@@ -1412,3 +1412,199 @@ class TestSmtpSenderResolution:
 
         monkeypatch.setattr("app.instance_config.get_value", _boom, raising=False)
         assert _common.smtp_from_address() == "noreply@example.com"
+
+
+class TestSsoClaimEvaluation:
+    """Pure-function tests for the sso provider's claim evaluation (design
+    2026-08-28 login flow steps 2-5). No DB, no network."""
+
+    CFG = {
+        "tenant_id": "11111111-2222-3333-4444-555555555555",
+        "allowed_email_domains": ["fabrikam.com"],
+    }
+
+    def _eval(self, userinfo, cfg=None):
+        from app.auth.providers.sso import evaluate_claims
+
+        return evaluate_claims(userinfo, cfg or self.CFG)
+
+    def _userinfo(self, **overrides):
+        info = {
+            "email": "User@Fabrikam.com",
+            "oid": "AAAA0000-1111-2222-3333-444455556666",
+            "tid": "11111111-2222-3333-4444-555555555555",
+        }
+        info.update(overrides)
+        return info
+
+    def test_happy_path_normalizes_email_and_guids(self):
+        error, email, oid, tid = self._eval(self._userinfo())
+        assert error is None
+        assert email == "user@fabrikam.com"
+        assert oid == "aaaa0000-1111-2222-3333-444455556666"
+        assert tid == "11111111-2222-3333-4444-555555555555"
+
+    def test_missing_email_and_ext_upn_refused(self):
+        error, *_ = self._eval(self._userinfo(email="", preferred_username=""))
+        assert error == "sso_no_email"
+        # A B2B guest UPN is not an identity (imported microsoft rule).
+        error, *_ = self._eval(self._userinfo(email="", preferred_username="u_x.com#EXT#@t.onmicrosoft.com"))
+        assert error == "sso_no_email"
+
+    def test_mail_shaped_upn_fallback_accepted(self):
+        error, email, *_ = self._eval(self._userinfo(email="", preferred_username="upn@fabrikam.com"))
+        assert error is None
+        assert email == "upn@fabrikam.com"
+
+    def test_missing_oid_refused_never_falls_back_to_sub(self):
+        error, *_ = self._eval(self._userinfo(oid="", sub="pairwise-sub-value"))
+        assert error == "sso_no_subject"
+
+    def test_missing_tid_refused(self):
+        error, *_ = self._eval(self._userinfo(tid=""))
+        assert error == "sso_wrong_tenant"
+
+    def test_guid_configured_tenant_pins_token_tid(self):
+        error, *_ = self._eval(self._userinfo(tid="99999999-8888-7777-6666-555555555555"))
+        assert error == "sso_wrong_tenant"
+        # Case-insensitive GUID comparison.
+        error, *_ = self._eval(self._userinfo(tid="11111111-2222-3333-4444-555555555555".upper()))
+        assert error is None
+
+    def test_verified_domain_configured_tenant_defers_to_issuer(self):
+        """With a verified-domain tenant string the issuer check is the
+        authority — evaluate_claims does not second-guess the tid, it keys
+        the identity on the TOKEN's tid."""
+        cfg = {"tenant_id": "fabrikam.onmicrosoft.com", "allowed_email_domains": ["fabrikam.com"]}
+        error, _, _, tid = self._eval(self._userinfo(), cfg)
+        assert error is None
+        assert tid == "11111111-2222-3333-4444-555555555555"
+
+    def test_domain_allowlist_fails_closed(self):
+        error, *_ = self._eval(self._userinfo(email="user@evil.example"))
+        assert error == "domain_not_allowed"
+        cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": []}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+        # A missing/None allowlist key must fail closed too — refuse, never
+        # raise (Gemini second-opinion finding: the `or []` fallback was
+        # parsed as `(domain not in X) or []` and could not fire).
+        cfg = {"tenant_id": self.CFG["tenant_id"]}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+        cfg = {"tenant_id": self.CFG["tenant_id"], "allowed_email_domains": None}
+        error, *_ = self._eval(self._userinfo(), cfg)
+        assert error == "domain_not_allowed"
+
+
+class TestSsoAvailabilityOnDuckDB:
+    """The PG-only repos must read as unavailable — never raise — on a
+    DuckDB-backed instance (the registry lockout rescue depends on it)."""
+
+    def test_probes_return_false_without_raising(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("AGNES_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        from app.auth.providers import sso
+
+        assert sso.is_available() is False
+        assert sso.is_configured() is False
+        assert sso.startup_warnings() == []
+        assert sso.login_offering() is None
+
+    def test_registry_probe_reports_not_raised(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("AGNES_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        from app.auth.provider_registry import _probe_availability
+
+        available, raised = _probe_availability("sso")
+        assert available is False
+        assert raised is False  # a raising probe would suppress the lockout rescue
+
+
+class TestProviderEnumerationParity:
+    """Cheap drift insurance: the provider enumeration now lives in five
+    places (registry, login page, doctor, admin lockout validator,
+    availability probes) — they must agree on the provider set."""
+
+    def test_all_enumerations_agree_on_the_provider_set(self):
+        import inspect
+
+        import app.api.admin as admin_api
+        import app.services.instance_doctor as doctor
+        import app.web.router as web_router
+        from app.auth.provider_registry import _AVAILABILITY_PROBES, KNOWN_PROVIDERS, probe_providers
+
+        assert {p["name"] for p in probe_providers()} == set(KNOWN_PROVIDERS)
+        assert set(_AVAILABILITY_PROBES) == set(KNOWN_PROVIDERS) - {"password"}
+
+        login_src = inspect.getsource(web_router.login_page)
+        doctor_src = inspect.getsource(doctor.check_login_door)
+        save_src = inspect.getsource(admin_api._provider_available_after_save)
+        for name in KNOWN_PROVIDERS:
+            assert f'provider_allowed("{name}")' in login_src, f"login_page misses {name}"
+            assert f'"{name}"' in doctor_src, f"instance doctor misses {name}"
+            assert f'"{name}"' in save_src, f"_provider_available_after_save misses {name}"
+
+
+class TestSsoRouteGating:
+    """Normal-mode inline gating matches the require_provider 404 posture."""
+
+    @pytest.fixture
+    def sso_client(self, tmp_path, monkeypatch, shared_app):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
+        return TestClient(shared_app)
+
+    def test_normal_mode_404_when_unavailable(self, sso_client):
+        # DuckDB backend -> is_available() is False -> same 404 a disallowed
+        # provider answers (posture unchanged for users).
+        assert sso_client.get("/auth/sso/login", follow_redirects=False).status_code == 404
+        assert sso_client.get("/auth/sso/callback", follow_redirects=False).status_code == 404
+
+    def test_normal_mode_404_when_excluded_even_if_available(self, sso_client, monkeypatch):
+        import app.auth.providers.sso as sso
+
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "password")
+        monkeypatch.setattr(sso, "is_available", lambda: True)
+        assert sso_client.get("/auth/sso/login", follow_redirects=False).status_code == 404
+
+    def test_sso_only_allowlist_404s_other_providers(self, sso_client, monkeypatch):
+        monkeypatch.setenv("AGNES_AUTH_PROVIDERS", "sso")
+        assert sso_client.get("/auth/microsoft/login", follow_redirects=False).status_code == 404
+        assert sso_client.get("/auth/google/login", follow_redirects=False).status_code == 404
+
+    def test_test_mode_refuses_anonymous_on_duckdb_too(self, sso_client):
+        # Admin gate fires BEFORE any config/backend read.
+        assert sso_client.get("/auth/sso/login?mode=test", follow_redirects=False).status_code == 403
+
+
+class TestAdminSessionPredicateLockstep:
+    """`app.auth.access.is_admin_session` is the boolean form of
+    `require_admin` for optional-user routes (the SSO test mode). Pin the
+    shared primitive set so a check added to one without the other fails
+    loudly instead of drifting silently."""
+
+    PRIMITIVES = ("PRINCIPAL_TYPES", "is_user_admin", "elevation_paused")
+
+    def test_both_gates_compose_the_same_primitives(self):
+        import inspect
+
+        from app.auth import access
+
+        require_src = inspect.getsource(access.require_admin)
+        boolean_src = inspect.getsource(access.is_admin_session)
+        for name in self.PRIMITIVES:
+            assert name in require_src, f"require_admin lost {name} — update the lockstep pin"
+            assert name in boolean_src, f"is_admin_session misses {name} — mirror require_admin"
+
+    def test_sso_test_mode_delegates_to_the_canonical_predicate(self):
+        import inspect
+
+        from app.auth.providers import sso
+
+        src = inspect.getsource(sso._is_admin_session)
+        assert "is_admin_session" in src
+        for name in self.PRIMITIVES:
+            assert name not in src, "sso must delegate, not re-compose the admin checks"
