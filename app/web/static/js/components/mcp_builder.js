@@ -69,9 +69,14 @@
     return r.json().catch(function () { return {}; }).then(function (j) {
       if (!r.ok) {
         var d = j && j.detail;
-        var msg = typeof d === 'string' ? d : (d && (d.hint || d.kind)) || ('HTTP ' + r.status);
+        var msg = typeof d === 'string' ? d : (d && (d.message || d.hint || d.kind)) || ('HTTP ' + r.status);
         var e = new Error(msg);
         e.status = r.status;
+        // The structured half, kept: a caller has to be able to tell WHICH
+        // 409 it got. `grantGroup` reads `error` to separate "already granted"
+        // from "there is nothing to grant" — swallowing both as done is how a
+        // Save reported success over an access change that never happened.
+        e.detail = d;
         throw e;
       }
       return j;
@@ -190,10 +195,20 @@
 
   var savedId = null;
 
+  /* 409 from the source-wide grant is not one thing.
+     `no_tools_registered` means the source has no ENABLED tool row to grant,
+     so nothing was granted and the group has no access — a failure, and the
+     one this builder can actually cause: turn every tool off, pick a group,
+     Save. A blanket "409 means already granted" reported that as success, and
+     re-enabling the tools later does not go back and grant anyone.
+     (Already-granted is not a 409 on this endpoint at all — it answers 200
+     with an `already` count. The swallow stays narrowed rather than deleted so
+     an endpoint that later adds one does not break the resumable Save.) */
   function grantGroup(sourceId, group) {
     return postJson(SOURCES_API + '/' + encodeURIComponent(sourceId) + '/grants', { group_id: group.id })
       .catch(function (e) {
-        if (e && e.status === 409) return null;  // already granted — the end state we wanted
+        var kind = e && e.detail && e.detail.error;
+        if (e && e.status === 409 && kind !== 'no_tools_registered') return null;  // already granted
         throw e;
       });
   }

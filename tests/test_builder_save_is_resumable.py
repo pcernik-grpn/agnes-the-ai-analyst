@@ -525,3 +525,106 @@ def test_a_second_save_does_not_duplicate_the_tool_rows():
     assert res["href"] == "/admin/mcp-sources/src-r", (
         f"the resumed save stalled on a 409 from a tool it had already registered: {res['all']}"
     )
+
+
+# ── MCP source: a 409 is not one thing ───────────────────────────────────────
+#
+# `POST /api/admin/mcp-sources/{id}/grants` answers 409 `no_tools_registered`
+# when the source has no ENABLED tool row — nothing was granted, the group has
+# no access, and re-enabling the tools later does not go back and grant anyone.
+# Already-granted is NOT a 409 on that endpoint at all: it answers 200 with an
+# `already` count.
+#
+# So the blanket "409 means already granted" in `grantGroup` reported a failed
+# access change as success, and the builder can cause exactly that state: turn
+# every introspected tool off, pick a group, Save. Raised by a review bot on
+# PR #1679 against the tool-registration fix.
+#
+# Sibling checked: the linked-apps builder's `grantPair` swallows 409 against
+# `/api/admin/grants`, whose single 409 genuinely is "grant already exists"
+# (app/api/access.py). That one is correct and stays.
+
+
+def test_a_no_tools_registered_409_is_a_failure_not_a_shrug():
+    """Every tool off, a group picked: the grant cannot succeed, and Save must
+    say so rather than redirecting as if access had been granted."""
+    res = _node(
+        _mcp_script(
+            """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-n' } }],
+  'POST /api/admin/mcp-sources/src-n/grants': {
+    status: 409,
+    body: { detail: { error: 'no_tools_registered', message: "Source 'src-n' has no enabled tools to grant. Register them first, then grant." } },
+  },
+}""",
+            r"""
+  // Turn the only tool OFF, then pick a group anyway.
+  fire('click', { 'data-mcp-tool': 'search_crm' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS,
+    tools: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+    href: window.location.href,
+    err: (mount.innerHTML.match(/no enabled tools to grant/) || [''])[0],
+  }));
+""",
+        )
+    )
+    assert res["tools"] == 0, "a tool the admin switched off was registered anyway"
+    assert res["href"] == "", (
+        f"Save redirected as though the group had been granted access it does not have: {res['all']}"
+    )
+    assert res["err"] == "no enabled tools to grant", (
+        "the server's own sentence — which names the fix — never reached the admin"
+    )
+
+
+def test_an_ordinary_409_is_still_read_as_already_granted():
+    """The narrowing must not undo the earlier fix: a 409 that is NOT
+    `no_tools_registered` still counts as the end state Save wanted, so a
+    resumed Save cannot stall on a grant it already made."""
+    res = _node(
+        _mcp_script(
+            """{
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+  },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-a' } }],
+  'POST /api/admin/mcp-sources/src-a/grants': {
+    status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' },
+  },
+}""",
+            r"""
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 20; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS, href: window.location.href }));
+""",
+        )
+    )
+    assert res["href"] == "/admin/mcp-sources/src-a", f"an already-granted 409 broke the save again: {res['all']}"
+
+
+def test_the_structured_detail_survives_to_the_caller():
+    """`grantGroup` decides on `detail.error`, so readJson must carry the
+    object rather than flattening it to a sentence — matching on message text
+    is what breaks the day the wording changes."""
+    src = MCP.read_text(encoding="utf-8")
+    assert "e.detail = d;" in src
+    assert "kind !== 'no_tools_registered'" in src, (
+        "the 409 swallow must exclude no_tools_registered by its stable error code"
+    )

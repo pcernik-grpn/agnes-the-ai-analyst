@@ -216,6 +216,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **A `no_tools_registered` 409 no longer reads as "already granted".** The
+  source-wide grant (`POST /api/admin/mcp-sources/{id}/grants`) answers 409
+  `no_tools_registered` when a source has no *enabled* tool row — nothing was
+  granted, and re-enabling the tools later does not go back and grant anyone.
+  Already-granted is not a 409 there at all (200 with an `already` count), so
+  the MCP builder's blanket "409 means done" reported a failed access change as
+  success, on a state the builder can produce: turn every introspected tool off,
+  pick a group, Save. The swallow is now keyed on the error code rather than the
+  status, so that case surfaces the server's own sentence (which names the fix)
+  and Save does not redirect. Sibling checked and left alone: the linked-apps
+  builder swallows 409 from `/api/admin/grants`, whose single 409 genuinely does
+  mean the grant already exists.
 - **The MCP builder's Save now registers the tools, so the source it hands back
   is actually callable.** A source exposes only the `tool_registry` rows that
   are `passthrough` and enabled (`app/api/mcp/tools_generator.py`), and Save
