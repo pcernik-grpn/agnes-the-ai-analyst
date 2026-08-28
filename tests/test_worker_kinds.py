@@ -599,8 +599,8 @@ class TestCorpusExtractionHandler:
             stdout = ""
             stderr = ""
 
-        def _fake_run(argv, env=None, timeout=None, capture_output=None, text=None, check=None):
-            calls.append({"argv": list(argv), "env": dict(env or {}), "timeout": timeout})
+        def _fake_run(argv, env=None, timeout=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {}), "timeout": timeout, "kwargs": kwargs})
             return _FakeCompleted()
 
         monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
@@ -762,6 +762,71 @@ class TestCorpusExtractionHandler:
 
         with pytest.raises(RuntimeError, match="exited 3"):
             handler({"connection_id": "conn1"})
+
+
+    def test_producer_output_is_not_buffered_in_this_process(self, monkeypatch):
+        """The producer may run for `extraction.timeout_s` (an hour by
+        default) and is an external binary nobody here controls the verbosity
+        of. `capture_output=True` would hold every byte of that in the
+        worker's own memory for the whole run, to serve one DEBUG line on
+        failure — enough to OOM a worker whose container limit is 4g by
+        default (Devin Review on this PR). stdout is discarded outright (this
+        handler never reads it: the producer reports through the ingest API),
+        and stderr streams to a file object, not a pipe."""
+        import subprocess as _sp
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+
+        seen = {}
+
+        class _FakeCompleted:
+            returncode = 0
+
+        def _fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert not seen.get("capture_output"), "capture_output buffers the whole run in this process"
+        assert seen.get("stdout") is _sp.DEVNULL
+        stderr = seen.get("stderr")
+        assert stderr is not _sp.PIPE and hasattr(stderr, "write"), stderr
+
+    def test_failed_producer_logs_only_the_tail_of_its_stderr(self, monkeypatch, caplog):
+        """A bounded tail is the point of the temp file — a producer that
+        wrote a gigabyte before dying must cost a bounded amount of memory to
+        report on."""
+        import logging
+
+        from app.worker import kinds as _kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        monkeypatch.setattr(_kinds, "_PRODUCER_STDERR_TAIL_BYTES", 32)
+
+        class _FakeCompleted:
+            returncode = 3
+
+        def _fake_run(argv, **kwargs):
+            kwargs["stderr"].write(b"A" * 5000 + b"THE-ONLY-PART-THAT-MATTERS")
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        with caplog.at_level(logging.DEBUG, logger="app.worker.kinds"):
+            with pytest.raises(RuntimeError, match="exited 3"):
+                handler({"connection_id": "conn1"})
+
+        tails = [r.getMessage() for r in caplog.records if "producer stderr tail" in r.getMessage()]
+        assert tails, caplog.text
+        assert "THE-ONLY-PART-THAT-MATTERS" in tails[0]
+        assert "A" * 100 not in tails[0], "the whole 5 KB was logged, not a 32-byte tail"
 
 
 class TestJiraWebhookEnqueues:

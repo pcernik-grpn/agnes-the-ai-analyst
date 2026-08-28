@@ -181,6 +181,7 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
 
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
 
@@ -1134,6 +1135,28 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: How much of a failed producer's stderr to keep for the DEBUG line. Enough
+#: for a Python traceback plus context, small enough that it can never be the
+#: reason a worker dies.
+_PRODUCER_STDERR_TAIL_BYTES = 64 * 1024
+
+
+def _tail_text(fh, limit: int) -> str:
+    """Last ``limit`` bytes of an open binary file, decoded leniently.
+
+    Seeks rather than reads forward, so a multi-gigabyte producer log costs
+    one seek. ``errors="replace"`` because the cut can land mid-codepoint and
+    a diagnostic must never raise on its way to the log.
+    """
+    try:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - limit))
+        return fh.read().decode("utf-8", errors="replace")
+    except Exception:  # pragma: no cover - a diagnostic must not mask the failure it describes
+        return "<unreadable>"
+
+
 def _extraction_timeout_seconds() -> int:
     from app.instance_config import get_value
 
@@ -1306,22 +1329,37 @@ def _run_corpus_extraction(payload: dict) -> dict:
         corpus_id,
         timeout_s,
     )
+    # NOT `capture_output=True`: that holds every byte the producer writes in
+    # THIS process's memory for the whole run, and the run may legitimately
+    # last `extraction.timeout_s` (default an hour) crawling a real site. The
+    # captured text is used for exactly one thing — a DEBUG line on failure —
+    # so an hour of a chatty producer's progress output would buy a diagnostic
+    # tail at the price of OOM-killing a worker whose container memory limit is
+    # 4g by default (Devin Review on this PR). stdout goes to /dev/null (this
+    # handler never reads it — the producer reports through the ingest API, not
+    # through its own stdout), and stderr streams to a temp file from which
+    # only the last `_PRODUCER_STDERR_TAIL_BYTES` are read back on failure.
+    # Trading unbounded RSS for bounded RSS plus scratch disk is the right way
+    # round: the memory limit is what kills the worker, and the tail is the
+    # part of a stack trace anyone reads anyway.
     try:
-        result = subprocess.run(
-            argv,
-            env=child_env,
-            timeout=timeout_s,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with tempfile.TemporaryFile(mode="w+b") as stderr_buf:
+            result = subprocess.run(
+                argv,
+                env=child_env,
+                timeout=timeout_s,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_buf,
+                check=False,
+            )
+            stderr_tail = _tail_text(stderr_buf, _PRODUCER_STDERR_TAIL_BYTES) if result.returncode != 0 else ""
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"corpus-extraction: producer timed out after {timeout_s}s") from exc
     except FileNotFoundError as exc:
         raise RuntimeError(f"corpus-extraction: producer command not found: {argv[0]!r}") from exc
 
     if result.returncode != 0:
-        logger.debug("corpus-extraction: producer stderr (connection %s): %s", connection_id, result.stderr)
+        logger.debug("corpus-extraction: producer stderr tail (connection %s): %s", connection_id, stderr_tail)
         raise RuntimeError(f"corpus-extraction: producer exited {result.returncode} for connection {connection_id}")
 
     logger.info("corpus-extraction: producer completed for connection %s", connection_id)
