@@ -1000,8 +1000,9 @@ def _render_consent_page(
     from RFC 7591 dynamic client registration (unauthenticated on the streamable
     MCP endpoint), so it is fully attacker-controlled; rendered unescaped it was
     a stored-XSS sink executing on the Agnes origin in a logged-in victim's
-    session, and there is no app-wide CSP to fall back on — escaping here is the
-    control.
+    session. The app-wide CSP (``app/middleware/security_headers.py``) is a
+    deliberately non-breaking subset with no ``script-src``, so it does not
+    catch injected script — escaping here is the control.
     """
     import html
 
