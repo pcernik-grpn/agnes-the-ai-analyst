@@ -1336,6 +1336,7 @@ and `agnes semantic-model schema <type> [<type> ...] [--json]`. MCP:
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
+- /api/admin/run-retention-prune
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
 

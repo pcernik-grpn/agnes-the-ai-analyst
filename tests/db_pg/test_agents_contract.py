@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -543,3 +544,67 @@ def test_granted_by_is_dropped_on_duckdb(tmp_path):
     repo.set_scope("a1", [("table", "t1")], granted_by="admin1")
     assert repo.get_scope("a1") == [{"item_type": "table", "item_id": "t1", "granted_by": None}]
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Track E3 Slice 1: prune_scope_snapshots_older_than — opt-in
+# agent_scope_snapshots retention
+# ---------------------------------------------------------------------------
+
+
+def _backdate_snapshot(repo, snapshot_id: str, ts) -> None:
+    """Rewrite one snapshot's `created_at` directly — `record_scope_snapshot`
+    always stamps `now()`, so the prune tests need an implementation-specific
+    path to plant an old row (same reasoning as test_audit_contract.py's
+    `_backdate` helper). Detects the backend off the repo object itself
+    (DuckDB repos carry `.conn`, PG repos carry `._engine`) since this
+    fixture yields only the repo, not a backend tag."""
+    if hasattr(repo, "conn"):
+        repo.conn.execute("UPDATE agent_scope_snapshots SET created_at = ? WHERE id = ?", [ts, snapshot_id])
+    else:
+        import sqlalchemy as sa
+
+        with repo._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE agent_scope_snapshots SET created_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": snapshot_id},
+            )
+
+
+def test_prune_scope_snapshots_older_than_deletes_only_old_rows(repo):
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.record_scope_snapshot(id="old-snap", session_id="c1", agent_id="a1", effective_scope='{"tables": []}')
+    repo.record_scope_snapshot(id="new-snap", session_id="c1", agent_id="a1", effective_scope='{"tables": []}')
+    _backdate_snapshot(repo, "old-snap", datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_scope_snapshots_older_than(365)
+
+    assert pruned == 1
+    remaining_ids = {s["id"] for s in repo.list_scope_snapshots("c1")}
+    assert "old-snap" not in remaining_ids
+    assert "new-snap" in remaining_ids
+
+
+def test_prune_scope_snapshots_older_than_returns_zero_when_nothing_qualifies(repo):
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.record_scope_snapshot(id="s1", session_id="c1", agent_id="a1", effective_scope='{"tables": []}')
+
+    pruned = repo.prune_scope_snapshots_older_than(365)
+
+    assert pruned == 0
+    assert len(repo.list_scope_snapshots("c1")) == 1
+
+
+def test_prune_scope_snapshots_older_than_never_touches_live_agent(repo):
+    """A pruned snapshot must not cascade into the owning `agents` row —
+    snapshots are forensic audit trail, not agent state."""
+    repo.create(id="a1", owner_user_id="u1", name="A", slug="x")
+    repo.record_scope_snapshot(id="old-snap", session_id="c1", agent_id="a1", effective_scope='{"tables": []}')
+    _backdate_snapshot(repo, "old-snap", datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_scope_snapshots_older_than(365)
+
+    assert pruned == 1
+    agent = repo.get_by_id("a1")
+    assert agent is not None
+    assert agent["name"] == "A"

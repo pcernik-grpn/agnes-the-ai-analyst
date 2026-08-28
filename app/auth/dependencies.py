@@ -43,6 +43,7 @@ _AUTH_DETAIL_BY_REASON = {
     "no_token": "Invalid or expired token",
     "agent_pat_wrong_surface": "Agent token not valid on this surface",
     "agent_pat_agent_deleted": "Agent deleted",
+    "pat_parent_revoked": "Token revoked",
 }
 
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
@@ -463,6 +464,44 @@ def non_interactive_credential_kind(request: Request) -> Optional[str]:
         if payload.get("typ") in _PAT_LIKE_TYPES:
             return "a PAT"
     return None
+
+
+def revocable_credential_id(request: Request) -> Optional[str]:
+    """Id of the revocable credential authenticating ``request``, or None.
+
+    Returns the ``jti`` of a PAT-like token (``typ`` in
+    ``pat_resolver._PAT_LIKE_TYPES``) — the only credential kinds backed by a
+    ``personal_access_tokens`` row that an operator can actually revoke. Every
+    other kind (browser cookie / session JWT, the chat-runner token, the
+    scheduler shared secret, local-dev bypass, no credential at all) returns
+    None: there is no row to bind to, so a token minted from one is
+    unconstrained exactly as it was before.
+
+    Used by ``app.api.data_apps`` to stamp
+    ``pat_resolver.PARENT_TOKEN_ID_CLAIM`` onto a minted ``data-app-git:``
+    credential, so revoking the PAT that asked for it revokes the credential
+    too. Sibling of ``non_interactive_credential_kind`` in shape and for the
+    same reason: a plain function, not a dependency, so a surface that cannot
+    take a FastAPI ``Depends(...)`` reuses it verbatim instead of growing a
+    hand-rolled copy that silently drifts.
+
+    Classifies the CREDENTIAL, not the caller's authority: it says nothing
+    about whether the token is valid, live, or authorized. Callers must still
+    authenticate the request separately — in practice this runs behind
+    ``get_current_user``, which has already done so.
+    """
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else None
+    if not token:
+        token = request.cookies.get("access_token")
+    if not token:
+        return None
+    from app.auth.pat_resolver import _PAT_LIKE_TYPES
+
+    payload = verify_token(token) or {}
+    if payload.get("typ") not in _PAT_LIKE_TYPES:
+        return None
+    return payload.get("jti") or None
 
 
 def require_session_token(request: Request, user: dict = Depends(get_current_user)) -> dict:

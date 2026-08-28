@@ -658,3 +658,80 @@
     </ul>
 </div>
 {%- endmacro %}
+
+
+{# ─────────────────────────────────────────────────────────────────────
+   Drawer form field — text/textarea/number input inside a `.ds-drawer`
+   step, per the `.ds-drawer__field` vocabulary already defined in
+   drawer.css (#367/#482 design pass). One macro instead of the hand-rolled
+   `<div class="form-group">…` blocks repeated per register-table modal
+   (D4 — one shared registration form); token-only (`--ds-*` via
+   drawer.css), dark-safe by construction.
+
+   `type`     'text' (default) | 'textarea' | 'number'
+   `hint`     optional `.ds-drawer__hint` line below the control
+   `attrs`    raw extra attributes on the control (escape hatch)
+
+   Example:
+       {{ ds.drawer_field(id='rtfViewName', label='View name',
+                           placeholder='orders_recent',
+                           hint='Name analysts use to query the data.') }}
+   ───────────────────────────────────────────────────────────────────── #}
+{% macro drawer_field(id, label, type='text', value='', placeholder='',
+                       hint=None, optional=False, klass='', attrs='') -%}
+<div class="ds-drawer__field {{ klass }}">
+  <label for="{{ id }}">{{ label }}{% if optional %} <span class="ds-drawer__opt">(optional)</span>{% endif %}</label>
+  {%- if type == 'textarea' -%}
+  <textarea id="{{ id }}" name="{{ id }}" placeholder="{{ placeholder }}"
+            {%- if attrs %} {{ attrs | safe }}{% endif %}>{{ value }}</textarea>
+  {%- else -%}
+  <input type="{{ type }}" id="{{ id }}" name="{{ id }}" value="{{ value }}"
+         placeholder="{{ placeholder }}"
+         {%- if attrs %} {{ attrs | safe }}{% endif %}>
+  {%- endif -%}
+  {%- if hint %}
+  <p class="ds-drawer__hint">{{ hint | safe }}</p>
+  {%- endif %}
+</div>
+{%- endmacro %}
+
+
+{# ─────────────────────────────────────────────────────────────────────
+   Drawer select — native `<select>` inside a `.ds-drawer` step. Bare
+   native control (no paired `ds.dropdown` custom widget) so it stays
+   visible under every theme, including `data-theme="paper"`, whose
+   `select.ds-dropdown-native` rule hides an UNPAIRED native select —
+   see paper-skin.css. Callers that build the option list client-side
+   (register_table_form.js) render `<option>`s themselves; `options`
+   here covers the server-rendered case.
+   ───────────────────────────────────────────────────────────────────── #}
+{% macro drawer_select(id, options=[], selected=None, label=None, hint=None, klass='', attrs='') -%}
+<div class="ds-drawer__field ds-drawer__select {{ klass }}">
+  {%- if label %}<label for="{{ id }}">{{ label }}</label>{% endif %}
+  <select id="{{ id }}" name="{{ id }}" {%- if attrs %} {{ attrs | safe }}{% endif %}>
+    {%- for opt in options %}
+    <option value="{{ opt.value }}"{% if opt.value == selected %} selected{% endif %}>{{ opt.label }}</option>
+    {%- endfor %}
+  </select>
+  {%- if hint %}
+  <p class="ds-drawer__hint">{{ hint | safe }}</p>
+  {%- endif %}
+</div>
+{%- endmacro %}
+
+
+{# ─────────────────────────────────────────────────────────────────────
+   Drawer checkbox — a single labeled boolean inside a `.ds-drawer` step.
+   ───────────────────────────────────────────────────────────────────── #}
+{% macro drawer_checkbox(id, label, checked=False, hint=None, klass='', attrs='') -%}
+<div class="ds-drawer__field ds-drawer__checkbox-field {{ klass }}">
+  <label class="ds-drawer__checkbox-label" for="{{ id }}">
+    <input type="checkbox" id="{{ id }}" name="{{ id }}"{% if checked %} checked{% endif %}
+           {%- if attrs %} {{ attrs | safe }}{% endif %}>
+    {{ label }}
+  </label>
+  {%- if hint %}
+  <p class="ds-drawer__hint">{{ hint | safe }}</p>
+  {%- endif %}
+</div>
+{%- endmacro %}

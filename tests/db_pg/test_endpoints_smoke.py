@@ -2682,6 +2682,16 @@ KNOWN_UNTESTED = {
     # behaviour (config gate, logging, audit row) covered single-backend in
     # tests/test_audit_retention.py.
     "POST /api/admin/run-audit-prune",
+    # Track E3 Slice 1 — generalized per-trail retention sweep (sync_history /
+    # llm_usage / agent_scope_snapshots), mirrors run-audit-prune above. The
+    # new repo methods (SyncStateRepository.prune_history_older_than,
+    # LlmUsageRepository.prune_older_than,
+    # AgentsRepository.prune_scope_snapshots_older_than) and their _pg
+    # siblings ARE dual-backend proven, by
+    # tests/db_pg/test_sync_state_contract.py, test_llm_usage_contract.py,
+    # and test_agents_contract.py. Endpoint behaviour (config gate, logging,
+    # audit row) covered single-backend in tests/test_audit_retention.py.
+    "POST /api/admin/run-retention-prune",
     "POST /api/admin/run-bq-metadata-refresh",
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",

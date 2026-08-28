@@ -454,3 +454,21 @@ class AgentsRepository:
             [session_id],
         ).fetchall()
         return self._rows_to_dicts(rows)
+
+    def prune_scope_snapshots_older_than(self, days: int) -> int:
+        """Delete ``agent_scope_snapshots`` rows older than ``days``, by
+        ``created_at``. Returns the deleted-row count.
+
+        Scoped to ``agent_scope_snapshots`` only — never touches the live
+        ``agents`` row an owner is still using; this is forensic audit
+        trail, not agent state.
+
+        The caller (``src/audit_retention.py``) owns the "days<=0 = keep
+        forever, skip entirely" short-circuit — this method always executes
+        the DELETE it's given, no matter the value (mirrors
+        ``AuditRepository.prune_older_than``)."""
+        rows = self.conn.execute(
+            "DELETE FROM agent_scope_snapshots WHERE created_at < (CURRENT_TIMESTAMP - INTERVAL (?) DAY) RETURNING id",
+            [days],
+        ).fetchall()
+        return len(rows)

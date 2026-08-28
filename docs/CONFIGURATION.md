@@ -241,11 +241,23 @@ See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.
 ### Audit trail
 
 See [`observability.md`](observability.md) for the full audit/activity-trail
-inventory and which of the seven trails this retention policy covers.
+inventory and which trails have a retention policy.
+
+`audit_log` keeps its own knob and its own daily job (`audit-prune`). The
+other trails below are pruned by the daily `retention-prune` sweep
+(`POST /api/admin/run-retention-prune`) and all default to `0` — **keep
+forever**, so the sweep deletes nothing until an operator opts a trail in.
+Pruning a trail never touches the live state beside it: `sync_history` is
+pruned while `sync_state` (what the manifest and `agnes pull` read) is not,
+and `agent_scope_snapshots` is pruned while the `agents` rows are not.
 
 | Knob | `instance.yaml` path | Default | Resolver |
 |------|----------------------|---------|----------|
 | `audit_log` retention (days, `0` = keep forever) | `audit.retention_days` | `365` | `get_audit_retention_days()` |
+| `sync_history` retention (days, `0` = keep forever) | `retention.sync_history_days` | `0` | `get_sync_history_retention_days()` |
+| `llm_usage` retention (days, `0` = keep forever) | `retention.llm_usage_days` | `0` | `get_llm_usage_retention_days()` |
+| `agent_scope_snapshots` retention (days, `0` = keep forever) | `retention.agent_scope_snapshots_days` | `0` | `get_agent_scope_snapshots_retention_days()` |
+| `usage_events` retention (days, `0` = keep forever) — `USAGE_EVENTS_RETENTION_DAYS` env var wins when set; pruned by its own `POST /api/admin/usage/prune` job, not the sweep | `retention.usage_events_days` | `0` | `get_usage_events_retention_days()` |
 
 ---
 

@@ -2437,6 +2437,23 @@ def register_foundation_tools(
         Returns ``{"git_clone_url": "..."}`` with an embedded, time-scoped
         push credential. Mirrors ``POST /api/data-apps/{slug}/git-credential``
         and ``agnes app git-credential``.
+
+        Not gated to an interactive session, and deliberately so — note the
+        contrast with ``agent_list`` above, which 403s on this PAT-authenticated
+        SSE transport. The mint is not what grants push authority: the git
+        surface admits a plain PAT for a push directly (``allowed = is_owner or
+        admin`` in ``app/api/data_apps_git.py``, pinned by
+        ``tests/test_data_apps_git.py::test_push_allowed_for_owner``), so the
+        same caller reaches the same repo one ``git push`` away with no tool
+        call at all. Refusing here would break ``agnes app git-credential``
+        (PAT-authenticated) for a boundary that does not exist.
+
+        What the credential no longer is, since the parent-binding fix, is
+        durable past its minter: it carries the caller's own token id and dies
+        when that credential is revoked. Still, the returned URL embeds a live
+        24-hour push credential and a tool result is archived in the
+        conversation transcript — prefer the CLI when a human is at a terminal,
+        and revoke the parent PAT if a transcript leaks.
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(

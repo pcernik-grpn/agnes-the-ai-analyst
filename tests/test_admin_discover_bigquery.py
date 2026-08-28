@@ -5,8 +5,11 @@ Two-step shape: dataset list (no `dataset` query param) → table list (with
 fetches tables only after the operator picks a dataset, avoiding the
 per-dataset `list_tables()` cost on projects with hundreds of datasets.
 """
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
 
 from connectors.bigquery.access import BqAccess, BqProjects
 
@@ -31,6 +34,7 @@ def bq_instance(monkeypatch):
         raising=False,
     )
     from app.instance_config import reset_cache
+
     reset_cache()
     yield fake_cfg
     reset_cache()
@@ -41,9 +45,11 @@ def _stub_bq_with_client(client_mock):
     duckdb_session_factory is unused by the discover endpoint — supply a
     no-op."""
     from contextlib import contextmanager
+
     @contextmanager
     def _noop(_p):
         yield None
+
     return BqAccess(
         BqProjects(billing="my-test-project", data="my-test-project"),
         client_factory=lambda _p: client_mock,
@@ -137,6 +143,7 @@ def test_discover_keboola_branch_unchanged(seeded_app, monkeypatch):
         raising=False,
     )
     from app.instance_config import reset_cache
+
     reset_cache()
 
     # Stub the Keboola client so the test doesn't reach the network.
@@ -174,6 +181,7 @@ def test_discover_bq_not_configured_returns_500(seeded_app, monkeypatch):
         raising=False,
     )
     from app.instance_config import reset_cache
+
     reset_cache()
 
     c = seeded_app["client"]
@@ -189,9 +197,12 @@ def test_discover_bq_not_configured_returns_500(seeded_app, monkeypatch):
 
 
 def test_admin_tables_html_wires_discover_buttons(seeded_app, bq_instance):
-    """Structural — the BQ register modal in the rendered HTML now has the
-    Discover (datasets) and List tables buttons + datalists wired to the
-    endpoint."""
+    """Structural — D4 moved BQ discovery for REGISTRATION into the shared
+    drawer's Browse step (register_table_form.js's `listDatasets`/
+    `discover`, GET /api/admin/discover-tables — same endpoint, a
+    checkbox list instead of a datalist-backed text input). The Discover /
+    List-tables buttons + datalists this test originally checked survive
+    on the EDIT modal only, which D4 left untouched."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/admin/tables", headers=_auth(token))
@@ -199,7 +210,10 @@ def test_admin_tables_html_wires_discover_buttons(seeded_app, bq_instance):
     html = r.text
     assert "discoverBqDatasets" in html
     assert "discoverBqTables" in html
-    assert 'id="bqDatasetList"' in html
-    assert 'id="bqTableList"' in html
-    assert "list=\"bqDatasetList\"" in html
-    assert "list=\"bqTableList\"" in html
+    assert 'id="editBqDatasetList"' in html
+    assert 'id="editBqTableList"' in html
+    assert 'list="editBqDatasetList"' in html
+    assert 'list="editBqTableList"' in html
+
+    js = (Path("app/web/static/js/register_table_form.js")).read_text(encoding="utf-8")
+    assert "/api/admin/discover-tables" in js
