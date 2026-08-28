@@ -52,8 +52,10 @@ user sees there, and when to send them.
 - `/marketplace/format-guide` — reference for the marketplace metadata
   format.
 - `/admin/studio` — the Studio authoring surface for corporate-memory
-  content. Despite the URL prefix it is open to every signed-in user when
-  the instance has Studio enabled.
+  content. Despite the URL prefix it is open to every signed-in user — but
+  **hidden by default** (`studio.enabled`): it redirects home unless the
+  instance turned it back on, and the Library's builders (`/library` →
+  "+ New") are the supported way in.
 
 ## Account & help (user menu)
 
@@ -69,6 +71,8 @@ user sees there, and when to send them.
   walkthrough and links the setup pages.
 - `/setup-advanced` — advanced install paths for the local `agnes` CLI
   workspace.
-- `/news` — in-app news and announcements.
+- `/news` — in-app news and announcements. **Hidden by default**
+  (`features.news_enabled`) — it redirects home, and the account menu shows no
+  News item, unless the instance turned it back on.
 - `/documentation/api` — the REST API guide; interactive Swagger lives at
   `/docs` and the reference at `/redoc`.

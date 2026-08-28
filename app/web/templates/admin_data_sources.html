@@ -725,6 +725,19 @@
     border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
     padding: 2px 14px 8px; margin-bottom: 12px; background: var(--surface, var(--ds-surface));
   }
+  /* "New group…" closes the gap where the audience you want does not exist
+     yet. Styled as an ADD affordance, not a card: dashed, full width, quiet —
+     it belongs to the list above it rather than competing with it. */
+  .ds-wshare-newgroup {
+    display: block; width: 100%; margin-top: 10px; padding: 10px 12px;
+    border: 1px dashed var(--ds-border); border-radius: 10px;
+    background: none; color: var(--ds-text-secondary);
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .ds-wshare-newgroup:hover, .ds-wshare-newgroup:focus-visible {
+    border-style: solid; border-color: var(--ds-primary);
+    color: var(--ds-primary); background: var(--ds-primary-light);
+  }
   .ds-wshare-card__hd { display: flex; align-items: center; gap: 8px; padding: 9px 0 4px; }
   .ds-wshare-card__hd b { font-size: 13.5px; color: var(--ds-text-primary); }
   .ds-wshare-card__hd .m { font-size: 12px; color: var(--ds-text-muted); }
@@ -1499,6 +1512,9 @@
 <div id="ds-toast" class="ds-toast" role="status" aria-live="polite"></div>
 
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
+{# The Share step's "New group…" opens the SAME drawer /admin/access uses, so
+   a group is created in one place rather than in a wizard-shaped copy. #}
+<script src="{{ static_url('js/components/group_drawer.js') }}" defer></script>
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
 const API_REGISTER_TABLE = "/api/admin/register-table";
@@ -4538,7 +4554,14 @@ async function _renderShareStep() {
       ${_wizardGroups.map(row).join("") || '<div class="ds-btray-empty">No groups on this instance yet.</div>'}
     </div>`;
   };
-  host.innerHTML = existingNote + _wizardPackages.map(card).join("");
+  // The audience you want may not exist yet. Without this the only way out of
+  // that is to abandon the wizard, go to Access, make the group, and start
+  // over — so the step that asks "who gets this?" can only be answered with
+  // groups someone thought of earlier.
+  const newGroup =
+    '<button type="button" class="ds-wshare-newgroup" id="ds-wizard-newgroup">' +
+    '<span aria-hidden="true">+</span> New group…</button>';
+  host.innerHTML = existingNote + _wizardPackages.map(card).join("") + newGroup;
 }
 
 async function _shareAndFinish() {
@@ -4928,6 +4951,26 @@ document.getElementById("ds-wizard-step-bundle").addEventListener("input", (e) =
 
 // Step 4 cards: checkbox = share with default Optional; tier segmented.
 document.getElementById("ds-share-cards").addEventListener("click", (e) => {
+  // "New group…" — make the audience without leaving the wizard.
+  //
+  // Reuses AgnesGroupDrawer, the same drawer /admin/access opens, so there is
+  // one place a group comes into existence rather than a wizard-shaped copy
+  // of it. On save the group list is re-fetched and the step re-rendered; the
+  // shares chosen so far live in `_wizardShares`, which this does not touch,
+  // so nothing already ticked is lost.
+  if (e.target.closest("#ds-wizard-newgroup")) {
+    if (!window.AgnesGroupDrawer) return;
+    window.AgnesGroupDrawer.open({
+      onSaved: async () => {
+        try {
+          const r = await fetch("/api/admin/groups", { credentials: "include" });
+          _wizardGroups = r.ok ? await r.json() : _wizardGroups;
+        } catch (err) { /* keep the list we have — the step still works */ }
+        _renderShareStep();
+      },
+    });
+    return;
+  }
   const row = e.target.closest(".ds-wshare-row");
   if (!row) return;
   const pkgLocal = row.dataset.pkg;

@@ -178,7 +178,15 @@ def _resolve_memory_items() -> Optional[Signal]:
 
 
 def _resolve_studio_suggestions() -> Optional[Signal]:
+    from app.instance_config import get_studio_enabled
     from src.repositories import authoring_suggestions_repo
+
+    # The queue page reads this same flag and redirects home when it is off
+    # (Studio is off by DEFAULT since the admin cleanup), so a card here would
+    # be a count nobody can act on pointing at a redirect. Checked before the
+    # count, not after: on a disabled instance there is nothing to ask.
+    if not get_studio_enabled():
+        return None
 
     total = authoring_suggestions_repo().count_pending()
     if not total:
