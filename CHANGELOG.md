@@ -975,6 +975,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+- **Every grantable resource type now declares a family** — `Knowledge`,
+  `Capability` or `Surface` — as a required field on `ResourceTypeSpec`, with
+  the section copy in a matching `RESOURCE_FAMILIES` registry.
+  `/api/admin/access-overview` carries `family` / `family_display` per type
+  (sorted into render order, registry order preserved within a family) and a
+  `families` list, so `/admin/access` can group by the same two families the
+  Library uses without a second copy of the mapping in Jinja or JS. Required,
+  not optional, so a new resource type cannot be registered without someone
+  deciding where it belongs — and the two that belong to neither Library tab
+  (a chat, a Slack channel) are named as `Surface` rather than filed under
+  something they are not. Groundwork for the `/admin/access` redesign
+  (`docs/superpowers/specs/2026-08-28-access-page-definition.md`); no UI
+  change on its own.
 - **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 - **Local-dev audience switch on the chat landing page.** Under
   `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:

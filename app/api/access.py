@@ -216,19 +216,48 @@ async def access_overview(
     # surfaces here, no extra wiring. Disabled types (none as of v19 — see
     # `is_resource_type_enabled`) are skipped so the admin UI does not render
     # a chip for grants the runtime cannot enforce yet.
-    from app.resource_types import enabled_resource_types
+    from app.resource_types import RESOURCE_FAMILIES, enabled_resource_types
 
+    # `family` rides along per type so the page can group by it without a
+    # second copy of the mapping in Jinja or JS — the registry stays the one
+    # place a new resource type gets classified.
+    # Sorted into family render order, keeping each family's types in
+    # registry order. The page renders Knowledge → Capabilities → Surfaces;
+    # sending them interleaved (registry order starts on a capability) would
+    # make the UI re-derive an order the registry already knows.
+    _family_rank = {fam: i for i, fam in enumerate(RESOURCE_FAMILIES)}
     resources = [
         {
             "type_key": spec.key.value,
             "type_display": spec.display_name,
             "type_description": spec.description,
+            "family": spec.family.value,
+            "family_display": RESOURCE_FAMILIES[spec.family].display_name,
             "blocks": spec.list_blocks(),
         }
-        for spec in enabled_resource_types()
+        for spec in sorted(
+            enabled_resource_types(), key=lambda s: _family_rank[s.family]
+        )
+    ]
+    # Section headers travel separately from the types, so a family with
+    # nothing granted still renders as an empty section rather than
+    # vanishing — "no capabilities yet" and "no such section" are different
+    # things to tell an admin.
+    families = [
+        {
+            "key": fam.value,
+            "display_name": fspec.display_name,
+            "blurb": fspec.blurb,
+        }
+        for fam, fspec in RESOURCE_FAMILIES.items()
     ]
 
-    return {"groups": groups, "grants": grants, "resources": resources}
+    return {
+        "groups": groups,
+        "grants": grants,
+        "resources": resources,
+        "families": families,
+    }
 
 
 # ---------------------------------------------------------------------------
