@@ -311,38 +311,101 @@ class TableRegistryRepository:
             params,
         )
 
-    def unregister(self, table_id: str) -> None:
+    # Every dependant a ``table_registry`` row owns, cleared by all three
+    # delete paths below (``unregister``, ``delete_internal_except``,
+    # ``delete_for_corpus``) so a DELETE means the same thing whichever door
+    # it came through and on either backend:
+    #
+    # - ``data_package_tables`` — the DuckDB DDL declares ``REFERENCES
+    #   table_registry(id)`` with no ``ON DELETE`` clause, so deleting a
+    #   table that belongs to a data package raised a constraint violation
+    #   (a raw 500 out of the calling endpoint). Postgres declares no FK on
+    #   that column at all, so the same call succeeded there and left an
+    #   orphan junction row — the package kept "containing" a table that no
+    #   longer exists.
+    # - ``resource_grants`` — Postgres's ``resource_id_table`` FK (migration
+    #   0013) IS ``ON DELETE CASCADE``, while DuckDB enforces no FK for it,
+    #   so a per-table grant outlived the table it named and would silently
+    #   re-apply if that id were ever registered again. Deleting on the
+    #   polymorphic ``(resource_type, resource_id)`` pair also reaches
+    #   legacy rows written before the per-type column existed.
+    #
+    # The Postgres sibling runs the same statements (the grants one
+    # redundant with its own cascade, kept so the two implementations read
+    # alike). A3 PG-first ratchet: this is a code-path fix, not a schema
+    # change — the frozen DuckDB DDL is untouched.
+    #
+    # WHY THESE THREE PATHS DO NOT RUN IN AN EXPLICIT TRANSACTION, where
+    # the Postgres sibling wraps each in one ``engine.begin()`` (the obvious
+    # parity hardening, and DuckDB refuses it — measured on duckdb 1.5.2,
+    # 2026-08-28):
+    #
+    #     con.execute("BEGIN")
+    #     con.execute("DELETE FROM child  WHERE pid = 'b'")
+    #     con.execute("DELETE FROM parent WHERE id  = 'b'")
+    #     -> ConstraintException: Violates foreign key constraint because
+    #        key "pid: b" is still referenced by a foreign key in a
+    #        different table.
+    #
+    # The identical sequence in autocommit succeeds, and swapping the two
+    # DELETEs inside the transaction fails the same way — this is DuckDB's
+    # documented foreign-key limitation (a referenced key deleted in the
+    # same transaction as its referencing rows), not a statement-ordering
+    # bug. Wrapping these methods in BEGIN/COMMIT to buy PG-equivalent
+    # atomicity would therefore reintroduce, unconditionally, the exact
+    # constraint violation the dependant cleanup exists to prevent.
+    #
+    # Residual risk, accepted knowingly: a failure between the dependant
+    # deletes and the registry delete leaves a table stripped of its
+    # memberships/grants but still registered — a half-state the Postgres
+    # sibling (one ``engine.begin()``) cannot reach. It fails CLOSED (access
+    # removed, not granted), it is repairable by re-running the delete, and
+    # the only alternative on this backend is a delete that always fails.
+    # ``tests/db_pg/test_table_registry_contract.py::TestUnregisterCascade``
+    # is the guard: it fails on the DuckDB parameter the moment anyone
+    # re-adds the transaction.
+
+    def _delete_dependants(self, table_ids: List[str]) -> Dict[str, int]:
+        """Clear both dependants for ``table_ids``; return what was removed.
+
+        Autocommit, deliberately — see the note above this method.
+        """
+        if not table_ids:
+            return {"package_memberships_removed": 0, "grants_revoked": 0}
+        placeholders = ",".join("?" for _ in table_ids)
+        memberships = self.conn.execute(
+            f"DELETE FROM data_package_tables WHERE table_id IN ({placeholders}) RETURNING 1",
+            list(table_ids),
+        ).fetchall()
+        grants = self.conn.execute(
+            f"DELETE FROM resource_grants WHERE resource_type = 'table' "
+            f"AND resource_id IN ({placeholders}) RETURNING 1",
+            list(table_ids),
+        ).fetchall()
+        return {
+            "package_memberships_removed": len(memberships),
+            "grants_revoked": len(grants),
+        }
+
+    def unregister(self, table_id: str) -> Dict[str, int]:
         """Delete the registry row, and the rows that depend on it.
 
-        Two dependants, cleared here so the DELETE means the same thing on
-        either backend:
+        Returns ``{"package_memberships_removed": N, "grants_revoked": M}``
+        — the cascade revokes access grants, and an audit row for the
+        deletion that does not say how many is missing the security-relevant
+        half of what happened (precedent:
+        ``app/api/marketplaces.py``'s ``revoked_grants``). Both keys are
+        always present, zero included, so an unregister that found no
+        dependants is distinguishable from one that was never asked to look.
 
-        - ``data_package_tables`` — the DuckDB DDL declares ``REFERENCES
-          table_registry(id)`` with no ``ON DELETE`` clause, so deleting a
-          table that belongs to a data package raised a constraint
-          violation and ``DELETE /api/admin/registry/{id}`` answered a raw
-          500. Postgres declares no FK on that column at all, so the same
-          call succeeded there and left an orphan junction row — the
-          package kept "containing" a table that no longer exists.
-        - ``resource_grants`` — Postgres's ``resource_id_table`` FK
-          (migration 0013) IS ``ON DELETE CASCADE``, while DuckDB enforces
-          no FK for it, so a per-table grant outlived the table it named
-          and would silently re-apply if that id were ever registered
-          again. Deleting on the polymorphic ``(resource_type,
-          resource_id)`` pair also reaches legacy rows written before the
-          per-type column existed.
-
-        The Postgres sibling runs the same two statements (the second
-        redundant with its own cascade, kept so the two implementations
-        read alike). A3 PG-first ratchet: this is a code-path fix, not a
-        schema change — the frozen DuckDB DDL is untouched.
+        The statements run in autocommit rather than one transaction — see
+        the note above ``_delete_dependants`` for the measured reason
+        (DuckDB refuses to delete a referenced key in the same transaction
+        as its referencing rows).
         """
-        self.conn.execute("DELETE FROM data_package_tables WHERE table_id = ?", [table_id])
-        self.conn.execute(
-            "DELETE FROM resource_grants WHERE resource_type = 'table' AND resource_id = ?",
-            [table_id],
-        )
+        removed = self._delete_dependants([table_id])
         self.conn.execute("DELETE FROM table_registry WHERE id = ?", [table_id])
+        return removed
 
     def delete_internal_except(self, keep_ids: List[str]) -> int:
         """Delete every ``source_type='internal'`` row whose id is NOT in
@@ -353,9 +416,24 @@ class TableRegistryRepository:
         agnes_usage → agnes_telemetry) so the old id doesn't linger in
         /catalog forever. ``keep_ids`` is normally the current canonical id
         set from ``INTERNAL_TABLES``.
+
+        Clears each dropped row's dependants first (see
+        ``_delete_dependants``): an internal table that had been added to a
+        data package hit the same DuckDB foreign key ``unregister`` does,
+        and left the same orphan junction row on Postgres. The ids are read
+        before the delete rather than taken from ``RETURNING`` so both
+        backends run the identical sequence.
         """
         keep_ids = list(keep_ids)
         placeholders = ",".join("?" for _ in keep_ids) if keep_ids else "''"
+        doomed = [
+            r[0]
+            for r in self.conn.execute(
+                f"SELECT id FROM table_registry WHERE source_type = 'internal' AND id NOT IN ({placeholders})",
+                keep_ids,
+            ).fetchall()
+        ]
+        self._delete_dependants(doomed)
         rows = self.conn.execute(
             f"""DELETE FROM table_registry
                 WHERE source_type = 'internal' AND id NOT IN ({placeholders})
@@ -371,6 +449,13 @@ class TableRegistryRepository:
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
         caller can clean up derived artefacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
+
+        Clears each dropped row's dependants first (see
+        ``_delete_dependants``): a collection table that had been added to a
+        data package hit the same DuckDB foreign key ``unregister`` does —
+        and this path is called from ``DELETE /api/collections/{id}``, which
+        unlinks the parquet files right after, so the 500 landed with the
+        durable artefacts already half gone.
         """
         rows = self.conn.execute(
             "SELECT id FROM table_registry WHERE source_type = 'collection' AND bucket = ?",
@@ -378,6 +463,7 @@ class TableRegistryRepository:
         ).fetchall()
         ids = [r[0] for r in rows]
         if ids:
+            self._delete_dependants(ids)
             self.conn.execute(
                 "DELETE FROM table_registry WHERE source_type = 'collection' AND bucket = ?",
                 [corpus_id],

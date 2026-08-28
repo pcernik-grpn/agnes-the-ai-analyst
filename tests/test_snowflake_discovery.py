@@ -93,11 +93,16 @@ def test_list_tables_returns_none_when_not_configured(monkeypatch):
 def test_list_tables_refuses_host_outside_allowlist(configured, fake_conn, monkeypatch):
     """Same egress gate the extract build applies: the credential must not be
     shipped to a host the operator did not allow."""
-    _patch_session(monkeypatch, fake_conn)
+    attach = MagicMock()
+    opened = MagicMock()
+    _patch_session(monkeypatch, opened, attach=attach)
     monkeypatch.setattr(discovery, "is_attach_host_allowed", lambda url: False)
 
     with pytest.raises(ValueError, match="ALLOWLIST"):
         discovery.list_tables()
+
+    attach.assert_not_called()
+    opened.execute.assert_not_called()
 
 
 def test_list_tables_closes_session_on_failure(configured, monkeypatch):
@@ -174,12 +179,39 @@ def test_probe_returns_none_when_not_configured(monkeypatch):
 
 def test_probe_refuses_a_host_outside_the_allowlist(configured_for_row, fake_conn, monkeypatch):
     """Same egress gate every other Snowflake path applies — this one ships
-    the same credential."""
+    the same credential.
+
+    A dedicated exception type, not a bare ``ValueError``: the endpoint
+    echoes THIS message to the admin verbatim (it names the env var to fix)
+    and must not extend that treatment to every other ValueError the driver
+    path can raise — an identifier rejection or a PEM parse error carries
+    text the caller has no business seeing unclassified. It still subclasses
+    ``ValueError`` so the pre-existing ``except ValueError`` in the browse
+    endpoint keeps working unchanged.
+    """
+    attach = MagicMock()
+    opened = MagicMock()
+    _patch_session(monkeypatch, opened, attach=attach)
+    monkeypatch.setattr(discovery, "is_attach_host_allowed", lambda url: False)
+
+    with pytest.raises(discovery.RemoteAttachHostNotAllowed, match="ALLOWLIST"):
+        discovery.probe_connection({"id": "conn-1"})
+
+    assert issubclass(discovery.RemoteAttachHostNotAllowed, ValueError)
+    # The point of the gate is that NOTHING went out: no session opened, no
+    # ATTACH attempted, so the credential never left the process. Asserting
+    # only the exception would pass for a refusal raised after the dial-out.
+    attach.assert_not_called()
+    opened.execute.assert_not_called()
+
+
+def test_list_tables_allowlist_refusal_is_the_same_typed_error(configured, fake_conn, monkeypatch):
+    """One type for the one refusal, whichever entry point hit it."""
     _patch_session(monkeypatch, fake_conn)
     monkeypatch.setattr(discovery, "is_attach_host_allowed", lambda url: False)
 
-    with pytest.raises(ValueError, match="ALLOWLIST"):
-        discovery.probe_connection({"id": "conn-1"})
+    with pytest.raises(discovery.RemoteAttachHostNotAllowed):
+        discovery.list_tables()
 
 
 def test_probe_closes_the_session_on_failure(configured_for_row, monkeypatch):

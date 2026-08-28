@@ -1328,8 +1328,7 @@ CLI: `agnes semantic-model coverage tables [--limit N] [--json]`. MCP:
 
 `POST /api/admin/semantic-auto-draft-sweep` (admin; scheduler-driven every
 55 minutes) drafts a semantic model for up to a handful of uncovered tables
-(`tables_without_semantic_coverage`, filtered on `table_registry.
-semantic_draft_pending_at IS NULL`) per tick via a headless
+(`tables_without_semantic_coverage`) per tick via a headless
 `semantic-model-builder` chat session, authenticated as the non-admin
 `semantic-drafter@system.local` system identity so every draft lands in the
 `authoring_suggestions` moderation queue exactly like a human-submitted
@@ -1337,19 +1336,32 @@ proposal — never applied directly. Each selected table's
 `semantic_draft_pending_at` is stamped before its session is invoked (not
 after), so a table can never be double-picked by an overlapping tick; the
 flag clears when an admin resolves the resulting suggestion, approve or
-reject alike. A session hitting the chat manager's concurrency cap is
-counted and skipped, never a 500 — and its stamp is cleared again on the
-way out, since the cap is enforced before the session starts, so no
-suggestion would ever exist to clear it and the table would otherwise be
-excluded from every future sweep permanently. Any OTHER failure from a
-table's session is handled the same way and for the same reason (counted
-in `errored`): the table is un-stamped, logged, and the sweep continues to
-the next table rather than letting one transient error 500 the whole tick
-and abandon the rest of the batch.
+reject alike.
 
-Returns `{"triggered", "applied", "no_apply_call", "skipped_cap",
-"errored", "remaining"}`. No CLI/MCP surface — scheduler/admin maintenance trigger,
-same class as the `/api/admin/run-*` jobs below.
+A table is a candidate again once its stamp is **older than 7 days**
+(`_SWEEP_STAMP_RETRY_AFTER_S`), and never-stamped tables are drafted ahead
+of stale-stamped ones. So a session that ran but filed nothing keeps its
+stamp and retries about once a week instead of on the very next tick — a
+handful of repeatedly-declined tables can no longer hold the whole batch
+and starve everything behind them. A session whose wait hits the per-table
+timeout also keeps its stamp (counted in `timed_out`, not `no_apply_call`):
+the sandbox keeps working on that turn after the sweep stops waiting, so the
+suggestion may still arrive, and un-stamping would re-draft the same table
+on every following tick.
+
+A session hitting the chat manager's concurrency cap is counted and
+skipped, never a 500 — and its stamp *is* cleared again on the way out,
+since the cap is enforced before the session starts, so that session
+provably never ran and cannot file anything later. Any OTHER failure from a
+table's session is handled the same way (counted in `errored`): the table is
+un-stamped, logged, and the sweep continues to the next table rather than
+letting one transient error 500 the whole tick and abandon the rest of the
+batch.
+
+Returns `{"triggered", "applied", "no_apply_call", "timed_out",
+"skipped_cap", "errored", "remaining"}`. No CLI/MCP surface —
+scheduler/admin maintenance trigger, same class as the `/api/admin/run-*`
+jobs below.
 
 Postgres app-state only (A3 PG-first ratchet — the dedup column is a
 Postgres-only addition, no DuckDB migration step exists for it): on a

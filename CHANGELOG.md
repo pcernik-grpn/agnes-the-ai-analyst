@@ -783,7 +783,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   allowlist the extract build uses, reporting `<account>/<database>` on success.
   Every other type (`databricks`, `bigquery`, …) gets an honest
   `{"ok": false, "status": "unsupported", "detail": "connection test is not
-  implemented for <type> yet"}` instead of a misleading failure.
+  implemented for <type> yet"}` instead of a misleading failure. The Snowflake
+  probe is bounded at 45 seconds and reports a timeout as its own answer —
+  neither the DuckDB Snowflake extension nor the ADBC driver takes a connect
+  deadline, so an unreachable account previously held the admin request open
+  until the socket gave up.
 - **Unregistering a table that belongs to a data package no longer fails with a
   server error.** `DELETE /api/admin/registry/{id}` (`agnes admin
   unregister-table`) hit the DuckDB foreign key from `data_package_tables` and
@@ -793,17 +797,31 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   memberships — and its per-table `resource_grants`, which Postgres already
   cascaded away and DuckDB did not — are now removed with the registry row on
   both backends, so a re-registered id can never inherit a deleted table's
-  grants.
+  grants. The same cleanup now covers the two other doors into that delete:
+  `DELETE /api/collections/{id}` (which drops a file collection's derived
+  tables) and the internal-table eviction that runs at startup. How many
+  memberships and grants went with the table is recorded in the
+  `unregister_table` audit row (`package_memberships_removed` /
+  `grants_revoked`).
 - **The semantic auto-draft sweep no longer strands a table it drafted nothing
-  for.** Each selected table is stamped `semantic_draft_pending_at` before its
-  headless drafting session runs, and that stamp is cleared when an admin
-  resolves the suggestion the session filed. A session that ran cleanly but
-  filed no suggestion (`no_apply_call`) left the stamp set with nothing that
-  could ever clear it, so the table was silently excluded from every later
-  sweep tick — permanently, without an admin clearing the flag by hand. It is
-  now un-stamped on the way out, exactly as the concurrency-cap and
-  session-error branches already were, and the table falls back into the
-  candidate pool for a later tick.
+  for — nor re-drafts a slow one every tick.** Each selected table is stamped
+  `semantic_draft_pending_at` before its headless drafting session runs, and
+  that stamp is cleared when an admin resolves the suggestion the session
+  filed. A session that ran cleanly but filed no suggestion left the stamp set
+  with nothing that could ever clear it, so the table was silently excluded
+  from every later sweep tick — permanently, without an admin clearing the flag
+  by hand. A table is now a candidate again once its stamp is **older than 7
+  days**, and never-stamped tables are drafted ahead of stale-stamped ones —
+  rather than the stamp being cleared on the way out of the tick, which would
+  have put the same declined tables at the head of the very next batch and
+  starved everything behind them. `POST
+  /api/admin/semantic-auto-draft-sweep` gains a `timed_out` counter alongside
+  `no_apply_call`: a session whose wait hits the per-table timeout keeps its
+  stamp, because the sandbox keeps working on that turn after the sweep stops
+  waiting — un-stamping it made the sweep re-draft the same table on every
+  following tick and file a duplicate pending suggestion each time. A session
+  refused by the chat concurrency cap is still un-stamped immediately, since
+  that one provably never started.
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser

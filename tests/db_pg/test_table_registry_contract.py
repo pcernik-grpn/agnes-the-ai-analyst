@@ -170,22 +170,26 @@ class TestDeleteInternalExcept:
 
 def _seed_dependants(repos: dict, table_id: str) -> None:
     """Give ``table_id`` one ``data_package_tables`` row and one
-    ``resource_grants`` row, written straight to the tables so the contract
-    below is about ``unregister`` alone.
+    ``resource_grants`` row, written straight to the tables so the contracts
+    below are about the delete methods alone.
 
-    Both parents are seeded too: DuckDB enforces
+    Both parents are seeded too, keyed off ``table_id`` so two tables can
+    each have their own: DuckDB enforces
     ``data_package_tables.package_id -> data_packages(id)`` and
     ``resource_grants.group_id -> user_groups(id)``.
     """
+    pkg = f"pkg-{table_id}"
+    grp = f"grp-{table_id}"
+    grant = f"grant-{table_id}"
     if repos["backend"] == "duckdb":
         conn = repos["conn"]
-        conn.execute("INSERT INTO data_packages (id, slug, name) VALUES (?, ?, ?)", ["pkg-1", "pkg-1", "Pkg"])
-        conn.execute("INSERT INTO data_package_tables (package_id, table_id) VALUES (?, ?)", ["pkg-1", table_id])
-        conn.execute("INSERT INTO user_groups (id, name) VALUES (?, ?)", ["grp-1", "Analysts"])
+        conn.execute("INSERT INTO data_packages (id, slug, name) VALUES (?, ?, ?)", [pkg, pkg, "Pkg"])
+        conn.execute("INSERT INTO data_package_tables (package_id, table_id) VALUES (?, ?)", [pkg, table_id])
+        conn.execute("INSERT INTO user_groups (id, name) VALUES (?, ?)", [grp, f"Analysts {table_id}"])
         conn.execute(
             "INSERT INTO resource_grants (id, group_id, resource_type, resource_id, resource_id_table) "
             "VALUES (?, ?, 'table', ?, ?)",
-            ["grant-1", "grp-1", table_id, table_id],
+            [grant, grp, table_id, table_id],
         )
         return
 
@@ -193,19 +197,23 @@ def _seed_dependants(repos: dict, table_id: str) -> None:
 
     with repos["engine"].begin() as conn:
         conn.execute(
-            sa.text("INSERT INTO data_packages (id, slug, name) VALUES ('pkg-1', 'pkg-1', 'Pkg')"),
+            sa.text("INSERT INTO data_packages (id, slug, name) VALUES (:p, :p, 'Pkg')"),
+            {"p": pkg},
         )
         conn.execute(
-            sa.text("INSERT INTO data_package_tables (package_id, table_id) VALUES ('pkg-1', :t)"),
-            {"t": table_id},
+            sa.text("INSERT INTO data_package_tables (package_id, table_id) VALUES (:p, :t)"),
+            {"p": pkg, "t": table_id},
         )
-        conn.execute(sa.text("INSERT INTO user_groups (id, name) VALUES ('grp-1', 'Analysts')"))
+        conn.execute(
+            sa.text("INSERT INTO user_groups (id, name) VALUES (:g, :n)"),
+            {"g": grp, "n": f"Analysts {table_id}"},
+        )
         conn.execute(
             sa.text(
                 "INSERT INTO resource_grants (id, group_id, resource_type, resource_id, resource_id_table) "
-                "VALUES ('grant-1', 'grp-1', 'table', :t, :t)"
+                "VALUES (:gr, :g, 'table', :t, :t)"
             ),
-            {"t": table_id},
+            {"gr": grant, "g": grp, "t": table_id},
         )
 
 
@@ -288,3 +296,152 @@ class TestUnregisterCascade:
 
         assert repos["registry"].get("orders") is not None
         assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "orders") == 1
+
+
+class TestUnregisterReportsWhatItRemoved:
+    """``unregister`` returns the counts it cleaned up, so the caller can
+    put them in the audit record.
+
+    The cascade revokes ``resource_grants`` — an access-control change — and
+    the audit row for ``unregister_table`` said nothing about it. Precedent
+    for the shape: ``app/api/marketplaces.py``'s plugin-disable logs
+    ``revoked_grants`` alongside the action.
+    """
+
+    def test_reports_both_counts(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+        _seed_dependants(repos, "orders")
+
+        assert repos["registry"].unregister("orders") == {
+            "package_memberships_removed": 1,
+            "grants_revoked": 1,
+        }
+
+    def test_reports_zeroes_for_a_table_with_no_dependants(self, repos):
+        _seed(repos, "orders", "Orders", source_type="keboola")
+
+        assert repos["registry"].unregister("orders") == {
+            "package_memberships_removed": 0,
+            "grants_revoked": 0,
+        }
+
+    def test_reports_zeroes_for_an_unknown_id(self, repos):
+        assert repos["registry"].unregister("nope") == {
+            "package_memberships_removed": 0,
+            "grants_revoked": 0,
+        }
+
+
+class TestDeleteInternalExceptCascade:
+    """``delete_internal_except`` is the second door into the same delete.
+
+    It removed ``table_registry`` rows with no dependant cleanup at all — so
+    an internal table that had been added to a data package hit the very
+    same DuckDB foreign key ``unregister`` was just fixed for, and left the
+    very same orphan junction row on Postgres.
+    """
+
+    def test_removes_the_dropped_rows_package_memberships(self, repos):
+        _seed(repos, "agnes_sessions", "Sessions", source_type="internal")
+        _seed(repos, "agnes_old_name", "Old Telemetry", source_type="internal")
+        _seed_dependants(repos, "agnes_old_name")
+
+        assert repos["registry"].delete_internal_except(["agnes_sessions"]) == 1
+
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "agnes_old_name") == 0
+
+    def test_revokes_the_dropped_rows_grants(self, repos):
+        _seed(repos, "agnes_sessions", "Sessions", source_type="internal")
+        _seed(repos, "agnes_old_name", "Old Telemetry", source_type="internal")
+        _seed_dependants(repos, "agnes_old_name")
+
+        repos["registry"].delete_internal_except(["agnes_sessions"])
+
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "agnes_old_name",
+            )
+            == 0
+        )
+
+    def test_leaves_a_kept_rows_dependants_alone(self, repos):
+        _seed(repos, "agnes_sessions", "Sessions", source_type="internal")
+        _seed(repos, "agnes_old_name", "Old Telemetry", source_type="internal")
+        _seed_dependants(repos, "agnes_sessions")
+        _seed_dependants(repos, "agnes_old_name")
+
+        repos["registry"].delete_internal_except(["agnes_sessions"])
+
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "agnes_sessions") == 1
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "agnes_sessions",
+            )
+            == 1
+        )
+
+
+class TestDeleteForCorpusCascade:
+    """``delete_for_corpus`` is the third door — the one behind
+    ``DELETE /api/collections/{id}`` (``app/api/collections.py``).
+
+    A collection table added to a data package hit the identical DuckDB
+    foreign key (a raw 500 out of the collection delete, with the parquet
+    files already unlinked) / Postgres orphan row.
+    """
+
+    def _seed_corpus_table(self, repos, table_id, corpus_id="col_1"):
+        repos["registry"].register(
+            id=table_id,
+            name=table_id,
+            source_type="collection",
+            bucket=corpus_id,
+        )
+
+    def test_removes_the_dropped_rows_package_memberships(self, repos):
+        self._seed_corpus_table(repos, "col_1_doc")
+        _seed_dependants(repos, "col_1_doc")
+
+        assert repos["registry"].delete_for_corpus("col_1") == ["col_1_doc"]
+
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "col_1_doc") == 0
+
+    def test_revokes_the_dropped_rows_grants(self, repos):
+        self._seed_corpus_table(repos, "col_1_doc")
+        _seed_dependants(repos, "col_1_doc")
+
+        repos["registry"].delete_for_corpus("col_1")
+
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "col_1_doc",
+            )
+            == 0
+        )
+
+    def test_leaves_another_corpus_dependants_alone(self, repos):
+        self._seed_corpus_table(repos, "col_1_doc", corpus_id="col_1")
+        self._seed_corpus_table(repos, "col_2_doc", corpus_id="col_2")
+        _seed_dependants(repos, "col_2_doc")
+
+        repos["registry"].delete_for_corpus("col_1")
+
+        assert repos["registry"].get("col_2_doc") is not None
+        assert _count(repos, "SELECT COUNT(*) FROM data_package_tables WHERE table_id = :t", "col_2_doc") == 1
+        assert (
+            _count(
+                repos,
+                "SELECT COUNT(*) FROM resource_grants WHERE resource_type = 'table' AND resource_id = :t",
+                "col_2_doc",
+            )
+            == 1
+        )
+
+    def test_empty_corpus_is_still_a_no_op(self, repos):
+        assert repos["registry"].delete_for_corpus("col_nonexistent") == []

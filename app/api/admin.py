@@ -6851,6 +6851,13 @@ async def unregister_table(
     something different on DuckDB (a foreign-key violation surfacing as a
     raw 500) than on Postgres (an orphan junction row). See that repo
     method's docstring.
+
+    How many of each went with it is recorded in the audit row
+    (`package_memberships_removed` / `grants_revoked`, both always present
+    even at zero — same shape as the plugin-disable precedent in
+    `app/api/marketplaces.py`). Revoking grants is an access-control
+    change, and without the counts the audit log cannot answer "who lost
+    access to what" for the event that caused it.
     """
     repo = table_registry_repo()
     existing = repo.get(table_id)
@@ -6862,7 +6869,7 @@ async def unregister_table(
     source_type = existing.get("source_type") or ""
     name = existing.get("name") or table_id
 
-    repo.unregister(table_id)
+    cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the
@@ -6932,6 +6939,7 @@ async def unregister_table(
                 "source_type": existing.get("source_type"),
                 "bucket": existing.get("bucket"),
                 "source_table": existing.get("source_table"),
+                **cascade,
             }
         ),
     )

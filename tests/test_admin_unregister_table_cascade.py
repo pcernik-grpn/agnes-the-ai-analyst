@@ -95,3 +95,82 @@ class TestGrantedTable:
         assert r.status_code == 204, r.text
 
         assert resource_grants_repo().list_all(resource_type="table") == []
+
+
+class TestAuditTrail:
+    """The cascade revokes ``resource_grants`` — an access-control change.
+
+    An audit row for ``unregister_table`` that records only the table's
+    identity says nothing about the grants that were revoked with it, so
+    "who lost access to what, and when" is unanswerable from the audit log
+    for exactly the event that caused it. Precedent for the shape:
+    ``app/api/marketplaces.py``'s plugin-disable logs ``revoked_grants``
+    next to the action.
+    """
+
+    def _params_for(self, action: str, resource: str) -> dict:
+        import json
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action=action, resource=resource, limit=50)
+        assert rows, f"no {action} audit row for {resource}"
+        params = rows[0]["params"]
+        return json.loads(params) if isinstance(params, str) else (params or {})
+
+    def test_it_records_what_the_cascade_removed(self, seeded_app, packaged_table):
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        group_id = user_groups_repo().create(name="Analysts", created_by="admin@example.com")["id"]
+        resource_grants_repo().create(
+            group_id=group_id,
+            resource_type="table",
+            resource_id="orders",
+            assigned_by="admin@example.com",
+        )
+
+        c = seeded_app["client"]
+        r = c.delete("/api/admin/registry/orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 204, r.text
+
+        params = self._params_for("unregister_table", "orders")
+        assert params["package_memberships_removed"] == 1
+        assert params["grants_revoked"] == 1
+
+    def test_both_counts_are_logged_even_when_zero(self, seeded_app):
+        """A delete that revoked nothing and a delete nobody counted must not
+        produce identical audit rows — same reasoning as the marketplace
+        precedent's always-logged pair."""
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().register(id="orders", name="orders", source_type="keboola", query_mode="local")
+
+        c = seeded_app["client"]
+        r = c.delete("/api/admin/registry/orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 204, r.text
+
+        params = self._params_for("unregister_table", "orders")
+        assert params["package_memberships_removed"] == 0
+        assert params["grants_revoked"] == 0
+
+    def test_it_still_records_the_tables_identity(self, seeded_app):
+        """The pre-existing fields must survive the addition."""
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().register(
+            id="orders",
+            name="orders",
+            source_type="keboola",
+            bucket="in.c-main",
+            source_table="orders",
+            query_mode="local",
+        )
+
+        c = seeded_app["client"]
+        r = c.delete("/api/admin/registry/orders", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 204, r.text
+
+        params = self._params_for("unregister_table", "orders")
+        assert params["name"] == "orders"
+        assert params["source_type"] == "keboola"
+        assert params["bucket"] == "in.c-main"

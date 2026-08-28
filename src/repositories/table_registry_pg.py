@@ -229,52 +229,86 @@ class TableRegistryPgRepository:
                 params,
             )
 
-    def unregister(self, table_id: str) -> None:
+    @staticmethod
+    def _delete_dependants(conn, table_ids: List[str]) -> Dict[str, int]:
+        """Postgres mirror of ``TableRegistryRepository._delete_dependants``
+        — see that docstring for what each dependant is and why both are
+        spelled out here.
+
+        Runs on a caller-supplied connection so the cleanup shares the
+        caller's ``engine.begin()`` transaction — this backend CAN be
+        atomic here, and is. The DuckDB sibling runs in autocommit because
+        DuckDB refuses to delete a referenced key in the same transaction
+        as its referencing rows; see the long note above that method for
+        the measurement and the residual risk it accepts.
+        """
+        if not table_ids:
+            return {"package_memberships_removed": 0, "grants_revoked": 0}
+        memberships = conn.execute(
+            sa.text("DELETE FROM data_package_tables WHERE table_id = ANY(:ids)"),
+            {"ids": list(table_ids)},
+        ).rowcount
+        grants = conn.execute(
+            sa.text("DELETE FROM resource_grants WHERE resource_type = 'table' AND resource_id = ANY(:ids)"),
+            {"ids": list(table_ids)},
+        ).rowcount
+        return {
+            "package_memberships_removed": int(memberships or 0),
+            "grants_revoked": int(grants or 0),
+        }
+
+    def unregister(self, table_id: str) -> Dict[str, int]:
         """Postgres mirror of ``TableRegistryRepository.unregister`` —
-        see that docstring for why the dependants are cleared explicitly.
+        see that docstring for why the dependants are cleared explicitly
+        and why the counts come back.
 
         ``resource_grants`` would go anyway (its ``resource_id_table`` FK
         is ``ON DELETE CASCADE``); ``data_package_tables`` would NOT — that
         column carries no FK here, so without this the junction row simply
         outlived the table. Both statements are spelled out so the two
-        backends read alike and neither can drift.
+        backends read alike and neither can drift — and so the reported
+        ``grants_revoked`` is a real count on both, not a cascade nobody
+        counted.
         """
         with self._engine.begin() as conn:
-            conn.execute(
-                sa.text("DELETE FROM data_package_tables WHERE table_id = :id"),
-                {"id": table_id},
-            )
-            conn.execute(
-                sa.text("DELETE FROM resource_grants WHERE resource_type = 'table' AND resource_id = :id"),
-                {"id": table_id},
-            )
+            removed = self._delete_dependants(conn, [table_id])
             conn.execute(
                 sa.text("DELETE FROM table_registry WHERE id = :id"),
                 {"id": table_id},
             )
+        return removed
 
     def delete_internal_except(self, keep_ids: List[str]) -> int:
         """Postgres mirror of
-        ``TableRegistryRepository.delete_internal_except``."""
+        ``TableRegistryRepository.delete_internal_except``, dependant
+        cleanup included — without it a dropped internal table left an
+        orphan ``data_package_tables`` row behind exactly as ``unregister``
+        used to."""
         keep_ids = list(keep_ids)
         with self._engine.begin() as conn:
             if keep_ids:
-                rows = conn.execute(
-                    sa.text(
-                        """DELETE FROM table_registry
-                            WHERE source_type = 'internal' AND id NOT IN :keep_ids
-                            RETURNING 1"""
-                    ).bindparams(sa.bindparam("keep_ids", expanding=True)),
-                    {"keep_ids": keep_ids},
-                ).fetchall()
+                select = sa.text(
+                    "SELECT id FROM table_registry WHERE source_type = 'internal' AND id NOT IN :keep_ids"
+                ).bindparams(sa.bindparam("keep_ids", expanding=True))
+                delete = sa.text(
+                    """DELETE FROM table_registry
+                        WHERE source_type = 'internal' AND id NOT IN :keep_ids
+                        RETURNING 1"""
+                ).bindparams(sa.bindparam("keep_ids", expanding=True))
+                params = {"keep_ids": keep_ids}
             else:
-                rows = conn.execute(
-                    sa.text(
-                        """DELETE FROM table_registry
-                            WHERE source_type = 'internal' AND id NOT IN ('')
-                            RETURNING 1"""
-                    )
-                ).fetchall()
+                select = sa.text(
+                    "SELECT id FROM table_registry WHERE source_type = 'internal' AND id NOT IN ('')"
+                )
+                delete = sa.text(
+                    """DELETE FROM table_registry
+                        WHERE source_type = 'internal' AND id NOT IN ('')
+                        RETURNING 1"""
+                )
+                params = {}
+            doomed = [r[0] for r in conn.execute(select, params).fetchall()]
+            self._delete_dependants(conn, doomed)
+            rows = conn.execute(delete, params).fetchall()
         return len(rows)
 
     def delete_for_corpus(self, corpus_id: str) -> List[str]:
@@ -284,6 +318,10 @@ class TableRegistryPgRepository:
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
         caller can clean up derived artefacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
+
+        Dependant cleanup included, mirroring the DuckDB sibling — without
+        it a packaged collection table left an orphan
+        ``data_package_tables`` row behind.
         """
         with self._engine.begin() as conn:
             rows = conn.execute(
@@ -292,6 +330,7 @@ class TableRegistryPgRepository:
             ).fetchall()
             ids = [r[0] for r in rows]
             if ids:
+                self._delete_dependants(conn, ids)
                 conn.execute(
                     sa.text("DELETE FROM table_registry WHERE source_type = 'collection' AND bucket = :corpus_id"),
                     {"corpus_id": corpus_id},

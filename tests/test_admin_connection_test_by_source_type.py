@@ -157,9 +157,10 @@ class TestSnowflake:
     def test_a_host_outside_the_allowlist_is_reported_verbatim(self, seeded_app, snowflake_conn, monkeypatch):
         """An operator misconfiguration, not an upstream fault — the message
         names the allowlist so it points somewhere useful."""
+        from connectors.snowflake.discovery import RemoteAttachHostNotAllowed
 
         def _refuse(connection=None):
-            raise ValueError("Snowflake host is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST")
+            raise RemoteAttachHostNotAllowed("Snowflake host is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST")
 
         monkeypatch.setattr("connectors.snowflake.discovery.probe_connection", _refuse)
         c = seeded_app["client"]
@@ -170,6 +171,68 @@ class TestSnowflake:
         body = r.json()
         assert body["ok"] is False
         assert "ALLOWLIST" in body["error"]
+
+    def test_an_unrelated_value_error_is_classified_not_echoed(self, seeded_app, snowflake_conn, monkeypatch):
+        """Verbatim pass-through is for the allowlist refusal ONLY.
+
+        The probe path raises ``ValueError`` for several other reasons — a
+        rejected identifier, a key that will not parse — and echoing those
+        unclassified hands the admin raw library text (and, for a PEM
+        failure, text derived from the credential itself) instead of the
+        one-sentence classification every other driver failure gets.
+        """
+
+        def _boom(connection=None):
+            raise ValueError("Could not deserialize key data: bad base64 in PEM body")
+
+        monkeypatch.setattr("connectors.snowflake.discovery.probe_connection", _boom)
+        c = seeded_app["client"]
+
+        r = c.post(f"{BASE}/{snowflake_conn}/test", headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is False
+        assert "PEM" not in body["error"]
+        assert "base64" not in body["error"]
+        assert body["error"]
+
+    def test_a_hanging_probe_is_bounded_and_reported_as_a_timeout(self, seeded_app, snowflake_conn, monkeypatch):
+        """The Snowflake branch had no timeout at all, where the Keboola one
+        is 10s-bounded: an unreachable account (a dropped SYN, a wedged
+        warehouse) held the admin request — and a worker — open indefinitely.
+        """
+        import threading
+        import time
+
+        import app.api.admin_source_connections as asc
+
+        release = threading.Event()
+
+        def _hang(connection=None):
+            # Bounded so the abandoned worker thread cannot outlive the test
+            # run; the endpoint must answer long before this returns.
+            release.wait(30)
+            return {"account": "a", "database": "d", "warehouse": "w"}
+
+        monkeypatch.setattr("connectors.snowflake.discovery.probe_connection", _hang)
+        monkeypatch.setattr(asc, "_SNOWFLAKE_PROBE_TIMEOUT_S", 0.2)
+        c = seeded_app["client"]
+
+        started = time.monotonic()
+        try:
+            r = c.post(f"{BASE}/{snowflake_conn}/test", headers=_auth(seeded_app["admin_token"]))
+        finally:
+            release.set()
+        elapsed = time.monotonic() - started
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is False
+        assert "timed out" in body["error"]
+        # A structured failure, not "it eventually errored": the answer has
+        # to arrive on the timeout, not when the probe finally returns.
+        assert elapsed < 10, elapsed
 
     def test_it_never_asks_for_a_stack_url(self, seeded_app, snowflake_conn, monkeypatch):
         """The regression this whole branch exists for: a Snowflake row has no

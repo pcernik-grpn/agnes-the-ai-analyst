@@ -45,6 +45,26 @@ logger = logging.getLogger(__name__)
 _EXCLUDED_SCHEMAS = ("INFORMATION_SCHEMA",)
 
 
+class RemoteAttachHostNotAllowed(ValueError):
+    """The resolved Snowflake host is outside
+    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — an operator misconfiguration,
+    raised BEFORE any session is opened, so no credential left the process.
+
+    Its own type rather than a bare ``ValueError`` because callers treat
+    this one differently from every other failure: the message names the
+    env var to fix and is passed to the admin verbatim, where a driver
+    error is classified into one generic sentence first. ``except
+    ValueError`` catches far more than this — the connector path also
+    raises ``ValueError`` for a rejected identifier and for a key that will
+    not parse, and echoing those unclassified leaks library text (and, for
+    a PEM failure, text derived from the credential itself).
+
+    Subclasses ``ValueError`` on purpose: the browse endpoint
+    (``app/api/admin_source_discovery.py``) has caught ``ValueError`` for
+    this refusal since before the type existed, and keeps working unchanged.
+    """
+
+
 def list_tables(
     schema: Optional[str] = None,
     *,
@@ -59,9 +79,10 @@ def list_tables(
     configured user can see is returned. ``attach_fn`` is a test seam mirroring
     ``extract_init.init_extract``'s.
 
-    Raises ``ValueError`` when the resolved host is outside
-    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — the same egress gate the extract
-    build applies, since this path ships the same credential. Any driver /
+    Raises :class:`RemoteAttachHostNotAllowed` (a ``ValueError``) when the
+    resolved host is outside ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST`` — the
+    same egress gate the extract build applies, since this path ships the
+    same credential. Any driver /
     catalog failure propagates to the caller (which maps it to a 502): a
     swallowed failure here would render as an empty account, and "your account
     has no tables" is a worse lie than "listing failed".
@@ -79,7 +100,7 @@ def list_tables(
         settings.get("role") or "",
     )
     if not is_attach_host_allowed(url):
-        raise ValueError(
+        raise RemoteAttachHostNotAllowed(
             f"Snowflake host {url!r} is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; "
             "refusing to send credential while listing tables"
         )
@@ -144,8 +165,8 @@ def probe_connection(
     new credential path: resolution, the attach URL and the egress gate are
     the ones the extract build and the table picker already use.
 
-    Raises ``ValueError`` when the resolved host is outside
-    ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST``; any driver/auth failure
+    Raises :class:`RemoteAttachHostNotAllowed` when the resolved host is
+    outside ``AGNES_REMOTE_ATTACH_HOST_ALLOWLIST``; any driver/auth failure
     propagates to the caller, which classifies it. Returns the coordinates
     the session actually reached (``account``/``database``/``warehouse``)
     so the caller can echo WHICH account answered — a green check against
@@ -169,7 +190,7 @@ def probe_connection(
         settings.get("role") or "",
     )
     if not is_attach_host_allowed(url):
-        raise ValueError(
+        raise RemoteAttachHostNotAllowed(
             f"Snowflake host {url!r} is not in AGNES_REMOTE_ATTACH_HOST_ALLOWLIST; "
             "refusing to send credential while testing the connection"
         )

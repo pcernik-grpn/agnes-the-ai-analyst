@@ -56,7 +56,17 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        kind=master is keboola-only and validated
                                                        live via a verify_token preflight
   DELETE /api/admin/source-connections/{id}/secret  — clear vault secret (?kind=storage|master)
-  POST   /api/admin/source-connections/{id}/test    — verify connectivity; timeout 10s
+  POST   /api/admin/source-connections/{id}/test    — verify connectivity, per source type:
+                                                       ``keboola`` verifies the storage token against
+                                                       ``{stack_url}/v2/storage/tokens/verify`` (10s);
+                                                       ``snowflake`` opens a session against the account
+                                                       and reads one row of metadata
+                                                       (``_test_snowflake_connection``, bounded by
+                                                       ``_SNOWFLAKE_PROBE_TIMEOUT_S``); every other type
+                                                       answers ``{ok: false, status: "unsupported"}``
+                                                       naming the type. Failure is HTTP 200 with
+                                                       ``ok: false`` throughout — only an unknown
+                                                       connection is a status code (404).
   GET    /api/admin/source-connections/{id}/tables  — list buckets/tables for the "add data
                                                        source" wizard; keboola only, REST-only
                                                        admin-UI helper (see _EXEMPT classification
@@ -111,6 +121,16 @@ router = APIRouter(prefix="/api/admin/source-connections", tags=["admin"])
 # stalled download turns into the endpoint's 502-with-retry-hint instead of an
 # admin request that never returns.
 CHAT_TOOLS_INTROSPECT_TIMEOUT_S = 300.0
+
+# Ceiling on the Snowflake connectivity probe behind `POST .../{id}/test`.
+# The Keboola branch of the same endpoint has always been 10s-bounded (its
+# `httpx.AsyncClient(timeout=10)`); the Snowflake branch had no bound at all,
+# because neither the DuckDB Snowflake extension nor the ADBC driver takes a
+# connect deadline — an unreachable account held the admin request open until
+# the OS gave up on the socket. Larger than the Keboola figure on purpose: a
+# cold container has to INSTALL and LOAD a community extension before it can
+# dial at all (`discovery._default_attach_fn`), which the HTTP probe does not.
+_SNOWFLAKE_PROBE_TIMEOUT_S = 45.0
 
 # The exact keyword surface of the repos' `upsert`s. A rollback replays rows it
 # read with `get`/`list_for_source`, and those carry `created_at`/`updated_at`
@@ -1845,7 +1865,22 @@ async def _test_snowflake_connection(connection_id: str, row: Dict[str, Any]) ->
     the connector's own credential resolution, attach URL and
     host-allowlist gate, no new credential path. Blocking DuckDB + ADBC
     driver work, so it runs off the event loop exactly as the table picker
-    does.
+    does — and bounded by ``_SNOWFLAKE_PROBE_TIMEOUT_S``, since neither the
+    DuckDB extension nor the ADBC driver takes a connect deadline of its own.
+
+    Three failure classes, kept apart on purpose:
+
+    - :class:`~connectors.snowflake.discovery.RemoteAttachHostNotAllowed` —
+      an operator misconfiguration whose message already names the env var
+      to fix, so it passes through verbatim. This used to be a bare
+      ``except ValueError``, which also swallowed the rejected-identifier
+      and unparseable-key ``ValueError``s from the same call path and
+      echoed their raw library text to the admin unclassified.
+    - a wait timeout — reported as its own sentence, because "we gave up
+      waiting" and "the account said no" point the operator at completely
+      different things.
+    - everything else — classified to one sentence, full driver text to the
+      log only.
 
     Same answer shape as the Keboola branch (``{ok, project_name}`` /
     ``{ok, error}``). ``project_name`` carries ``<account>/<database>``:
@@ -1853,19 +1888,46 @@ async def _test_snowflake_connection(connection_id: str, row: Dict[str, Any]) ->
     the one failure worth ruling out.
     """
     from connectors.snowflake import discovery
+    from connectors.snowflake.discovery import RemoteAttachHostNotAllowed
 
     try:
-        probe = await run_in_threadpool(discovery.probe_connection, row)
-    except ValueError as exc:
-        # The host-allowlist refusal — an operator misconfiguration whose
-        # message already names the env var to fix, so it passes through.
+        probe = await asyncio.wait_for(
+            run_in_threadpool(discovery.probe_connection, row),
+            timeout=_SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # The worker thread is abandoned, not killed — the driver keeps
+        # dialling until its own socket gives up, and its result is
+        # discarded. Bounding the WAIT is the part that matters: it is what
+        # stops one unreachable account from holding an admin request (and
+        # a worker) open indefinitely, and it is all that can be bounded
+        # from here, since the DuckDB/ADBC call takes no deadline.
+        # `:g` so a whole-number ceiling reads "45s", not "45.0s" — the
+        # constant is a float because `asyncio.wait_for` takes one.
+        logger.warning(
+            "connection test for %s (snowflake): timed out after %gs",
+            connection_id,
+            _SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+        return {
+            "ok": False,
+            "error": (
+                f"connection test timed out after {_SNOWFLAKE_PROBE_TIMEOUT_S:g}s — the account did not "
+                "answer. Check the account identifier, the warehouse state and network reachability, "
+                "then try again."
+            ),
+        }
+    except RemoteAttachHostNotAllowed as exc:
+        # Raised before any session is opened, so nothing went out; the
+        # message names the allowlist env var, so it is worth showing as-is.
         logger.info("connection test for %s (snowflake): refused — %s", connection_id, exc)
         return {"ok": False, "error": str(exc)[:300]}
     except Exception as exc:  # noqa: BLE001 — reported, never raised
         # The full driver text (SQLSTATE, Snowflake error code, request id)
         # is what an operator needs and goes to the log; the caller gets the
         # classified one-sentence version, same split the browse endpoint
-        # makes (`app/api/admin_source_discovery.py`).
+        # makes (`app/api/admin_source_discovery.py`). Plain `ValueError`s
+        # land here too, deliberately — see the docstring.
         from app.api.admin_source_discovery import _classify_snowflake_error
 
         logger.warning("connection test for %s (snowflake): failed — %s", connection_id, exc)
