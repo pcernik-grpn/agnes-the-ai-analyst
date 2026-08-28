@@ -1242,6 +1242,99 @@
     .ax-colhd > :nth-child(3) { display: none; }
     .ax-fam__n { grid-column: 2; }
   }
+  /* ══ Calm pass ═════════════════════════════════════════════════════════
+     The structure was right and the page was still hard to read, for four
+     reasons: too many things at the same weight competing on the group row;
+     three horizontal rules inside ninety pixels; rows that were two or three
+     lines tall depending on whether provenance existed; and a repeated
+     constant label in the last column. Spacing carries the hierarchy here —
+     rules are spent only where two different KINDS of thing meet. ── */
+
+  /* ── Page header: the description is orientation, not content ── */
+  .apg-sec-desc, .page-hero__sub, .ds-page__lede { font-size: 13.5px; }
+
+  /* ── Toolbar: New group is a secondary action, not a full-width panel ── */
+  .ax-onebar .ax-gnew {
+    width: auto; flex: 0 0 auto; margin: 0; padding: 7px 12px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn, 4px);
+    background: var(--ds-surface); color: var(--ds-text-secondary);
+    font-size: 13px; font-weight: 500;
+  }
+  .ax-onebar .ax-gnew:hover { border-color: var(--ds-text-muted); color: var(--ds-text-primary); }
+  .ax-onebar .ax-gnew__plus { font-size: 14px; margin-right: 2px; }
+
+  /* ── Group row: name, identity, breakdown. Three things, not seven ── */
+  .ax-gs__hd { padding: 10px 12px 10px 6px; gap: 12px; }
+  .ax-gs__id { gap: 8px; }
+  .ax-gs__reach { font-size: 12px; color: var(--ds-text-muted); }
+  .ax-gs__counts { gap: 18px; }
+  .ax-gs__cnt { min-width: 4.75rem; }
+
+  /* ── Expanded body: subordinate, and spaced rather than ruled ── */
+  .ax-gs__body { padding: 2px 0 22px 46px; }
+  /* The identity strip repeats what the row above already said, so it is the
+     quietest line on the page — there for the created date and the upstream
+     address, not to be read on the way past. */
+  .ax-gs__body .ax-gh { padding: 8px 0 2px; }
+  .ax-gs__body .ax-gh__facts { font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
+  /* A group that reaches nobody is worth flagging — it keeps the warn ink,
+     and loses the bold, so it informs from the corner of the eye instead of
+     competing with the group's own name a line above it. */
+  .ax-gs__body .ax-gh__facts .warn { font-weight: 500; }
+
+  /* People / Access: weight and space, no rules. Two rules plus the column
+     header's put three lines inside ninety pixels, which is what made the
+     top of an open group feel like a stack of bars. */
+  .ax-gs__body .dsec-head { padding: 16px 0 4px; border-bottom: 0; }
+  .ax-gs__body #ax-sec-people > summary h3,
+  .ax-gs__body #ax-sec-access > summary h3 { font-size: 12.5px; font-weight: 700; }
+  .ax-gs__body #ax-sec-people { margin-bottom: 2px; }
+
+  /* ── The table ── */
+  .ax-colhd {
+    padding: 6px 8px 6px 0; border-bottom: 1px solid var(--ds-border);
+    font-size: 10px; letter-spacing: .06em; color: var(--ds-text-muted); font-weight: 600;
+  }
+
+  /* Category band: the tint IS the separator, so it carries no border. The
+     blurb is a definition — present, and a level below the data. */
+  .ax-fam__hd {
+    padding: 6px 8px 6px 0; border-bottom: 0;
+    background: var(--ds-surface-dim);
+  }
+  .ax-fam__nm { font-size: 10.5px; letter-spacing: .07em; }
+  .ax-fam__sub { font-size: 11.5px; color: var(--ds-text-muted); }
+  .ax-fam__n { font-size: 10.5px; }
+
+  /* Row: exactly two lines, every time. Height stopped depending on whether
+     a description or a provenance happened to exist. */
+  .ax-r { padding: 9px 8px 9px 0; min-height: 0; align-items: start; }
+  .ax-r__kd { margin-top: 1px; }        /* aligns to the name's cap-height, not the row's middle */
+  .ax-r__nm { font-size: 13.5px; line-height: 1.45; }
+  .ax-r__d {
+    font-size: 12px; color: var(--ds-text-muted); margin-top: 1px; line-height: 1.45;
+    min-height: 1.45em;                  /* a row with no description keeps the rhythm */
+  }
+  /* Visible enough to read as a separator: at --ds-text-disabled it
+     vanished and the two clauses looked like one string with a double
+     space in it. */
+  .ax-r__sep { color: var(--ds-text-muted); opacity: .6; }
+  /* Inline, not block: an earlier rule put provenance on its own line, which
+     is what made a row two or three lines tall depending on whether anyone
+     had recorded who wrote the grant. */
+  .ax-r__who { display: inline; color: var(--ds-text-muted); font-size: inherit; margin: 0; }
+
+  /* Reads: the value is the content; the label repeats the column header on
+     every row, so it drops to the quietest step rather than disappearing. */
+  .ax-r__rd { font-size: 13px; font-weight: 600; line-height: 1.45; }
+  .ax-r__rd b { font-size: 10px; color: var(--ds-text-muted); font-weight: 400; margin-bottom: 0; }
+
+  /* Controls: findable, not loud. */
+  .ax-r__ctl { padding-top: 1px; }
+  .sw b, .fbar-seg.ax-tier .fbar-seg__btn { font-size: 12px; padding: 3px 10px; }
+  .ax-revoke { font-size: 12px; padding: 3px 10px; }
+
+  .ax-add { margin-top: 12px; padding: 10px 0; }
 </style>
 {% endblock %}
 
@@ -1816,7 +1909,6 @@
             <span class="ax-gs__reach">${esc(meta)}</span>
           </span>
           <span class="ax-gs__counts">${familyCounts(g.id)}</span>
-          <button type="button" class="ax-gs__sim" data-by="person">See it as a person</button>
           ${isEditable(g) ? `
           <button type="button" class="ax-gkebab" data-gmenu="${esc(g.id)}"
                   aria-haspopup="true" aria-expanded="false"
@@ -2042,8 +2134,9 @@
       <div class="ax-r" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
         <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
-          ${i.description ? `<span class="ax-r__d">${esc(String(i.description).slice(0, 110))}</span>` : ""}
-          ${who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}
+          <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
+            i.description && who ? `<span class="ax-r__sep"> · </span>` : ""}${
+            who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}</span>
         </span>
         <span class="ax-r__ctl">${control}</span>
         <span class="ax-r__rd">${readsLabelled(t.type_key, tier)}</span>

@@ -182,6 +182,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **`/admin/access` visual refinement — calmer, and uniform to scan.** Still
+  no behaviour or IA change. *See it as a person* leaves the group row (the
+  person view is a position in the switch), so the row carries three things
+  rather than seven. Every access row is now **exactly two lines** —
+  description and provenance share one line — where before a row was two or
+  three tall depending on whether anyone had recorded who wrote the grant,
+  which is what broke the vertical rhythm. The kind chip aligns to the name's
+  cap-height instead of floating in the row's middle. Three horizontal rules
+  inside the top of an open group become one: People and Access are separated
+  by weight and space, and the category band's tint is its own separator.
+  *New group* stops being a full-width dashed panel and becomes a normal
+  secondary button in the toolbar. Text steps down in four clear levels, with
+  the repeated per-row "In their Library" label at the quietest step rather
+  than competing with the value it labels, and an empty group's *Nobody*
+  keeping its warn ink but losing its bold.
 - **Visual polish on `/admin/access` — hierarchy, contrast, scanning.** No
   behaviour, IA or vocabulary changed. Four levels now differ in kind rather
   than by a few pixels: the open **group** row is tinted with an ink left
