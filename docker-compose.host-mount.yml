@@ -68,6 +68,11 @@ services:
       - /data:/data
       - ./config:/app/config:ro
 
+  extraction-worker:
+    volumes: !override
+      - /data:/data
+      - ./config:/app/config:ro
+
   # NOTE: data-migrate override moved to docker-compose.postgres-host-mount.yml
   # because referencing data-migrate here breaks validation when this file is
   # loaded without docker-compose.postgres.yml (data-migrate is defined only

@@ -12,7 +12,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 
@@ -101,6 +101,47 @@ def publish_markdown(
         typer.echo(str(e), err=True)
         raise typer.Exit(1)
     typer.echo(f"Published: id={body['id']} name={body['name']} version={body['version']}")
+    if body.get("visibility_status") == "pending":
+        typer.echo(f"Held for automated review — check progress with: agnes store status {body['id']} --wait")
+
+
+@store_app.command("compose")
+def compose_plugin(
+    name: str = typer.Argument(..., help="Plugin name (lowercase, digits, dashes)"),
+    add: List[str] = typer.Option(
+        ...,
+        "--add",
+        help="Entity id to bundle in. Repeat for each one (skills and agent templates only).",
+    ),
+    description: Optional[str] = typer.Option(None, "--description"),
+    category: Optional[str] = typer.Option(
+        None,
+        "--category",
+        help="Category (case-insensitive). One of: " + ", ".join(STORE_CATEGORIES),
+    ),
+):
+    """Bundle items you already published into one plugin — no ZIP needed.
+
+    Every Library item already installs on its own, so this is not how a single
+    skill is shipped: it is how several are handed over in ONE install. The
+    server merges each item's bundle and runs the result through the same
+    guardrail + review pipeline as `agnes store upload`.
+
+        agnes store compose team-toolkit --add <id> --add <id>
+
+    Find the ids with `agnes store mine` or `agnes marketplace search`.
+    """
+    payload: dict = {"name": name, "components": list(add)}
+    if description:
+        payload["description"] = description
+    if category:
+        payload["category"] = category
+    try:
+        body = api_post_json("/api/store/entities/from-components", payload)
+    except V2ClientError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Composed: id={body['id']} name={body['name']} version={body['version']}")
     if body.get("visibility_status") == "pending":
         typer.echo(f"Held for automated review — check progress with: agnes store status {body['id']} --wait")
 

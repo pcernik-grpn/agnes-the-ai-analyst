@@ -240,11 +240,60 @@ def logout():
     typer.echo("Logged out.")
 
 
+def _whoami_sandbox() -> None:
+    """`agnes auth whoami` inside a chat sandbox (AGNES_SESSION_ID set, no token).
+
+    The sandbox deliberately holds no credential — the loopback relay attaches
+    a broker ticket per request and the server replays the call under the
+    session user's identity (see app/chat/relay.py + app/api/broker.py). So
+    "no local token" is the HEALTHY state here, and the old "Not logged in"
+    answer misled the in-sandbox agent into thinking auth was broken. Verify
+    the brokered identity with a live self-service call instead.
+    """
+    import os
+
+    from cli.client import api_get
+
+    email = os.environ.get("AGNES_USER_EMAIL", "unknown")
+    try:
+        resp = api_get("/api/me/effective-access")
+    except Exception as exc:
+        typer.echo(f"Email: {email} (from sandbox environment, unverified)")
+        typer.echo(f"Server: {get_server_url()}")
+        typer.echo("Auth: brokered session identity (chat sandbox) — no local token by design")
+        typer.echo(f"Warning: could not verify with the server: {exc}", err=True)
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        typer.echo(f"Email: {email} (from sandbox environment, unverified)")
+        typer.echo(f"Server: {get_server_url()}")
+        typer.echo("Auth: brokered session identity (chat sandbox) — no local token by design")
+        typer.echo(f"Warning: server verification returned HTTP {resp.status_code}", err=True)
+        raise typer.Exit(1)
+    payload = resp.json()
+    # Still the environment's value: /api/me/effective-access answers is_admin
+    # + grants, not an identity, so nothing here confirmed the ADDRESS. Say so
+    # — this command exists because the sandbox was misinforming the agent
+    # about its own identity, and an unqualified line would be the same fault
+    # one level down.
+    typer.echo(f"Email: {email} (from sandbox environment)")
+    typer.echo(f"Server: {get_server_url()}")
+    typer.echo("Auth: brokered session identity (chat sandbox) — per-request credential, no local token")
+    if payload.get("is_admin"):
+        typer.echo("Admin: yes — read-only admin commands work here; admin mutations need the /admin web UI")
+    else:
+        typer.echo("Admin: no")
+
+
 @auth_app.command()
 def whoami():
     """Show current user info."""
+    import os
+
     token = get_token()
     if not token:
+        if os.environ.get("AGNES_SESSION_ID"):
+            _whoami_sandbox()
+            return
         typer.echo("Not logged in. Run: agnes login")
         raise typer.Exit(1)
 

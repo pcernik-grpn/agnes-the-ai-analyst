@@ -267,13 +267,17 @@ class TestSkillUploadDialogDestinations:
         assert "Upload a Skill, Agent, or Plugin" in body
 
 
-def test_studio_page_keeps_chat_nav_tab(api_client: TestClient, logged_in_user):
+def test_studio_page_keeps_chat_nav_tab(api_client: TestClient, logged_in_user, monkeypatch):
     """Regression: the Studio landing page (``/admin/studio``) renders via the
     reduced-context ``_chrome_ctx`` builder, which used to omit ``can_chat``.
     The header's ``{% if can_chat %}`` gate then evaluated undefined→falsy and
     the Chat nav tab disappeared the moment you clicked Studio — even though the
     user had chat access (patched True by the autouse fixture). It must stay.
     """
+    # Studio is off by default since the admin cleanup, and the route then
+    # redirects home — this regression is about the CHROME the page renders,
+    # so it needs the page to render at all.
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
     r = api_client.get("/admin/studio")
     assert r.status_code == 200
     # Chat destination present (the thing that regressed) …

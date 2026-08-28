@@ -86,18 +86,25 @@ def test_mcp_connect_linked_from_ai_connector_page(seeded_app):
     assert 'href="/mcp-connect"' in resp.text
 
 
-def test_news_link_in_user_dropdown_for_non_admin(seeded_app):
+def test_news_link_in_user_dropdown_for_non_admin(seeded_app, monkeypatch):
     """`/news`'s other two entry points are both conditional: /home's "What's
     new" strip needs a published version AND `home_route == '/home'`, and the
     command palette bails out unless `#adminMenu` is in the DOM. On the
     `/dashboard` default that left a non-admin unable to reach the page at all
-    (Devin Review on #1159), so it gets a dropdown entry like the others."""
+    (Devin Review on #1159), so it gets a dropdown entry like the others.
+
+    Scoped to an instance that HAS news: the surface is hidden by default since
+    the admin cleanup, and the rail item is behind the same `can_news` flag as
+    the route — a link to a redirect would be worse than no link. The property
+    defended here is that whenever the page exists, a non-admin can reach it.
+    `tests/test_retired_admin_surfaces.py` owns the hidden direction."""
+    monkeypatch.setenv("AGNES_NEWS_ENABLED", "1")
     c = seeded_app["client"]
     body = c.get("/dashboard", headers=_auth(seeded_app["analyst_token"])).text
     assert 'href="/news">News</a>' in body
 
 
-def test_command_palette_is_admin_only_so_it_cannot_be_the_entry_point(seeded_app):
+def test_command_palette_is_admin_only_so_it_cannot_be_the_entry_point(seeded_app, monkeypatch):
     """Pins WHY the dropdown entries above have to exist.
 
     The palette is a convenience for admins, not a reachability guarantee: its
@@ -105,6 +112,8 @@ def test_command_palette_is_admin_only_so_it_cannot_be_the_entry_point(seeded_ap
     rows alone would pass for a non-admin — the `<script>` body is emitted for
     everyone — while the surface never initializes, which is false assurance of
     exactly the property these tests exist to defend."""
+    # Same reason as the test above — the /news row is behind `can_news`.
+    monkeypatch.setenv("AGNES_NEWS_ENABLED", "1")
     c = seeded_app["client"]
     body = c.get("/dashboard", headers=_auth(seeded_app["analyst_token"])).text
     # the rows ship to everyone …

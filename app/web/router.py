@@ -45,6 +45,9 @@ from app.instance_config import (
     get_custom_scripts,
     get_data_apps_config,
     get_studio_enabled,
+    get_news_enabled,
+    get_knowledge_digests_ui_enabled,
+    get_contribute_skill_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -939,9 +942,9 @@ async def login_page(request: Request):
                 conn.close()
         # Fall through to the normal login form so the missing-seed error is visible.
 
-    next_path = request.query_params.get("next", "")
-    if not next_path.startswith("/") or next_path.startswith("//"):
-        next_path = ""
+    from app.auth._common import safe_next_path
+
+    next_path = safe_next_path(request.query_params.get("next", ""), default="")
 
     from app.auth.provider_registry import provider_allowed
 
@@ -1042,9 +1045,9 @@ async def login_password_page(request: Request):
 
     if not provider_allowed("password"):
         raise HTTPException(status_code=404, detail="Not Found")
-    next_path = request.query_params.get("next", "")
-    if not next_path.startswith("/") or next_path.startswith("//"):
-        next_path = ""
+    from app.auth._common import safe_next_path
+
+    next_path = safe_next_path(request.query_params.get("next", ""), default="")
     google_ok = False
     try:
         from app.auth.providers.google import is_available as google_available
@@ -1214,9 +1217,15 @@ async def home_page(
 
     # Pull the latest published news intro for the bottom-of-page section.
     # Template renders the section only when intro is non-empty, so an
-    # instance that has never published news shows nothing extra.
-    news = news_template_repo().get_current_published()
-    news_intro = news["intro"] if (news and news.get("intro")) else ""
+    # instance that has never published news shows nothing extra — and with
+    # the news surface hidden (features.news_enabled, off by default since the
+    # admin cleanup) we skip the read entirely rather than render a strip whose
+    # "Read more" link redirects home.
+    if get_news_enabled():
+        news = news_template_repo().get_current_published()
+        news_intro = news["intro"] if (news and news.get("intro")) else ""
+    else:
+        news_intro = ""
 
     # Homepage status frame (Last sync, Sessions, Prompts, Tokens, Projects).
     # Gated on (a) operator flag instance.home.show_status_frame /
@@ -1560,6 +1569,14 @@ async def news_page(
     """Permalink page for the latest published news. Renders empty-state
     copy when no version is published. Authed-only (same as /home).
     """
+    # Hidden with the rest of the news surface (features.news_enabled, off by
+    # default since the admin cleanup). Redirect rather than 404: this page's
+    # entry points are a rail item and a palette row, and a bookmarked link
+    # from before the flip should land somewhere useful. Same shape as the
+    # /me/ai-connector gate above.
+    if not get_news_enabled():
+        return RedirectResponse("/", status_code=302)
+
     news = news_template_repo().get_current_published()
     ctx = _build_context(
         request,
@@ -1580,6 +1597,9 @@ async def admin_news_editor(
     """Admin authoring surface — current published banner, draft editor,
     versions table. JS hits the /api/admin/news/* endpoints for the
     write paths."""
+    if not get_news_enabled():
+        return RedirectResponse("/", status_code=302)
+
     repo = news_template_repo()
     ctx = _build_context(
         request,
@@ -3502,94 +3522,23 @@ async def agents_page(
 ):
     """Agents — build a focused assistant out of the caller's own stack.
 
-    Work-in-progress surface (rail item carries a WIP badge). The builder's
-    ingredient lists are REAL and RBAC-scoped: knowledge sources are the data
-    packages + memory domains resolved from the caller's stack (same
-    ``StackResolver`` reads as /stack), and capabilities hydrate client-side
-    from ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).
-    Agent definitions themselves persist in the browser for now — a server
-    registry is the next iteration, so the page states that plainly rather
-    than pretending drafts are shared."""
+    Two panes: a conversation that fills the configuration in
+    (``POST /api/agents/{id}/builder/turn``) and the configuration itself,
+    hand-editable throughout. Agents persist server-side in the ``agents``
+    registry behind ``/api/agents``.
+
+    The builder's ingredient lists are REAL and RBAC-scoped:
+    ``knowledge_sources_for`` resolves the caller's own data packages, memory
+    domains and artefact collections — the same list the builder assistant is
+    given as its candidate set, so it can never offer access the picker does
+    not — and capabilities hydrate client-side from
+    ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins)."""
     if not get_agent_profiles_enabled():
         return RedirectResponse("/", status_code=302)
 
-    from app.services.stack_resolver import StackResolver
-    from app.resource_types import ResourceType
+    from app.services.agent_ingredients import knowledge_sources_for
 
-    resolver = StackResolver()
-    knowledge_sources: list = []
-    try:
-        pkg_repo = data_packages_repo()
-        for e in resolver.stack(user["id"], ResourceType.DATA_PACKAGE):
-            tables = 0
-            try:
-                tables = len(pkg_repo.list_tables(e.id))
-            except Exception:
-                tables = 0
-            knowledge_sources.append(
-                {
-                    "id": e.id,
-                    "kind": "data",
-                    "name": e.name,
-                    "description": e.description or "",
-                    "meta": f"{tables} table{'' if tables == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve data stack: %s", e)
-    try:
-        domains_repo = memory_domains_repo()
-        for e in resolver.stack(user["id"], ResourceType.MEMORY_DOMAIN):
-            items_count = 0
-            try:
-                items_count = len(domains_repo.list_items_of_domain(e.id, limit=10000))
-            except Exception:
-                items_count = 0
-            knowledge_sources.append(
-                {
-                    "id": e.id,
-                    "kind": "memory",
-                    "name": e.name,
-                    "description": e.description or "",
-                    "meta": f"{items_count} item{'' if items_count == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve memory stack: %s", e)
-    # Artefacts (file collections) the caller can reach — owned ∪ shared with a
-    # group they belong to (admin → all). These are a third knowledge kind the
-    # agent can be grounded in, alongside governed data + memory. Same access
-    # resolution the /artefacts page uses, so the builder never offers a file
-    # the caller can't actually open.
-    try:
-        from app.auth.access import accessible_collection_ids
-
-        allowed = accessible_collection_ids(user)  # None => admin sees all
-        cf_repo = corpus_files_repo()
-        # TODO: the per-collection file count below is an N+1 (one query per
-        # reachable collection, so per *every* collection for an admin). It was
-        # incidentally bounded while this read the 200-capped list(); switching
-        # to list_all() to stop hiding reachable collections removes that
-        # ceiling. A bulk `counts_by_corpus()` on both corpus_files backends
-        # would collapse it into one query.
-        for col in file_corpora_repo().list_all():
-            if allowed is not None and col["id"] not in allowed:
-                continue
-            try:
-                fcount = len(cf_repo.list_for_corpus(col["id"]))
-            except Exception:
-                fcount = 0
-            knowledge_sources.append(
-                {
-                    "id": col["id"],
-                    "kind": "file",
-                    "name": col.get("name") or col.get("slug"),
-                    "description": col.get("description") or "",
-                    "meta": f"{fcount} file{'' if fcount == 1 else 's'}",
-                }
-            )
-    except Exception as e:
-        logger.warning("/agents: could not resolve artefacts: %s", e)
+    knowledge_sources = knowledge_sources_for(user)
 
     ctx = _build_context(
         request,
@@ -4893,6 +4842,36 @@ async def memory_domain_detail(
     return templates.TemplateResponse(request, "memory_domain_detail.html", ctx)
 
 
+#: The three audiences the local-dev switch can render as. `None` is the
+#: caller's real one — an admin looking at their own instance.
+DEV_PREVIEW_MODES = ("member", "admin", "empty")
+
+
+def _dev_preview_enabled() -> bool:
+    """Whether the audience switch may render at all.
+
+    Gated on LOCAL_DEV_MODE, under which the whole auth layer is already
+    bypassed — so this adds no reachable surface to a real deployment, and on
+    any instance without it the parameter is inert rather than half-honoured.
+    """
+    from app.auth.dependencies import is_local_dev_mode
+
+    return is_local_dev_mode()
+
+
+def _resolve_dev_preview(request: Request) -> Optional[str]:
+    """Which audience this render is pretending to be for, or None.
+
+    Changes only what is RENDERED. No authority, no grant and no repo read is
+    faked, which is why it must never be read as a role-switcher: an admin
+    previewing `member` still has every permission they had.
+    """
+    if not _dev_preview_enabled():
+        return None
+    value = request.query_params.get("preview")
+    return value if value in DEV_PREVIEW_MODES else None
+
+
 def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
     """Single owner of every chrome-level template-context key (#996).
 
@@ -4911,9 +4890,28 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
     (``/admin/studio/{domain}``) sets it explicitly, the same way
     ``_build_context`` callers do.
     """
+    # Local-dev audience preview, resolved ONCE for every page that renders
+    # chrome. It used to live in the /chat route, which is why the switch only
+    # worked there — the parameter was inert everywhere else, so following a
+    # link out of /chat silently dropped you back to the admin view.
+    _preview = _resolve_dev_preview(request)
     return {
         "request": request,
         "user": _flex(user) if user else _FlexDict(),
+        "dev_preview": _preview,
+        # The switch is chrome, so whether to render it is chrome's business.
+        # LOCAL-DEV-ONLY here; the admin half of the rule is enforced in
+        # `_dev_preview.html`, against the `session.user.is_admin` this dict
+        # already carries — `_chrome_ctx` deliberately does not compute
+        # `is_admin` (see the docstring above: an uncached lookup on every
+        # page nobody asked for), and the partial gets the answer for free.
+        #
+        # This used to read `_preview is not None or _dev_preview_enabled()`,
+        # whose first clause cannot be true without the second —
+        # `_resolve_dev_preview` returns None unless dev mode is on — so it
+        # was dead, and it made the expression look like it had a second way
+        # to become available.
+        "dev_preview_available": _dev_preview_enabled(),
         "now": datetime.now,
         "get_flashed_messages": lambda **kw: [],
         "url_for": lambda endpoint, **kw: _url_for_shim(endpoint, **kw),
@@ -4937,6 +4935,15 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         # survives on pages that render via _chrome_ctx — including the studio
         # pages themselves and the command palette.
         "can_studio": get_studio_enabled(),
+        # The three surfaces retired alongside Studio in the admin cleanup.
+        # Same rule as can_studio: the hard gate is on each route, these only
+        # decide whether an ENTRY POINT is drawn (the admin sidebar's `when`
+        # rows, the rail's News item, the palette). Set here rather than only
+        # in _build_context so the palette on a _chrome_ctx page agrees with
+        # the palette everywhere else.
+        "can_news": get_news_enabled(),
+        "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
+        "can_contribute_skill": get_contribute_skill_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -6253,6 +6260,73 @@ async def admin_hub(
         journey=resolve_journey(),
     )
     return templates.TemplateResponse(request, "admin_hub.html", ctx)
+
+
+@router.get("/admin/linked-apps/new", response_class=HTMLResponse)
+async def admin_linked_apps_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Publish externally-hosted apps into the Library, in the builder shell.
+
+    /admin/linked-apps stays as the wizard for now; this is the path the
+    Library's "+ Add" reaches. What it fixes is the two things that made the
+    wizard an operator-hostile surface: step 1 asked which MCP source to read
+    apps from, with a dead end under it ("Not registered yet? Register one
+    first, then come back"), and step 2 asked for a projection map — which
+    response field is the app's name, which is its URL.
+
+    A projection map is an integration author's artifact. The adapter already
+    falls back to alias guesses (src/data_apps/keboola_adapter.py), so the
+    mapping is an escape hatch shown only when a row came back that the aliases
+    could not read, and the source and its lister tool are detected rather than
+    chosen.
+    """
+    return templates.TemplateResponse(request, "admin_linked_apps_builder.html", _build_context(request, user=user))
+
+
+@router.get("/admin/mcp-sources/new", response_class=HTMLResponse)
+async def admin_mcp_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Connect a tool server, in the same builder shell the other four use.
+
+    /admin/mcp-sources stays the LIST. What moved here is the create path,
+    which was the least builder-shaped surface in the product: a modal with
+    eleven fields, then a second page to introspect, curate the tools and grant
+    them — an order the admin was expected to know, with no way to find out
+    whether the server was even reachable until step three.
+
+    It suits the shell better than it looks. The procedure is fixed, so the
+    conversation sequences work and reports what the server said rather than
+    inventing anything; the exact values still arrive by paste, into fields,
+    because a URL and an env var name are values from another system.
+    """
+    return templates.TemplateResponse(request, "admin_mcp_builder.html", _build_context(request, user=user))
+
+
+@router.get("/admin/data-packages/new", response_class=HTMLResponse)
+async def admin_package_builder(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Author a data package, in the same builder shell /agents and /skills use.
+
+    A PAGE, not the drawer. The drawer is right where it is used — mid-sentence
+    on /admin/tables, assigning a table to a package that does not exist yet —
+    because it opens over the lens you are standing on and gives it back. A
+    workspace is the opposite: it is where you have gone to do the thing, and
+    it should look like the other two places you go to do the thing.
+
+    The FORM is still the drawer component's; this route only gives it a page
+    to render into (`mount`), so there is one implementation of a package's
+    fields and grants rather than two that drift.
+    """
+    # _build_context, not a bare dict — it is what supplies the rail, the
+    # theme and the rest of the app chrome. Without it the page renders as a
+    # builder floating on nothing.
+    return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
 
 
 @router.get("/admin/data-packages", response_class=HTMLResponse)
@@ -8309,6 +8383,13 @@ async def admin_contribute_skill_page(
     marketplace. This is the landing target for an external "Load skill to
     Agnes" button: the external tool copies the skill to the clipboard and
     opens this page (optionally with ?prefill=1 to auto-read the clipboard)."""
+    # Hidden since the admin cleanup (features.contribute_skill_enabled, off by
+    # default) — the Library's skill builder is the supported path. Both POSTs
+    # below carry the same gate: an external "Load skill to Agnes" button that
+    # still points here must not be able to publish past a hidden page.
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from src.repositories import user_groups_repo
 
     ctx = _build_context(request, user=user)
@@ -8337,6 +8418,9 @@ def admin_contribute_skill_submit(
     on it from the event-loop thread would freeze every concurrent request, so
     the blocking work must run off-loop — same rationale as ``trigger_sync_all``
     (app/api/marketplaces.py)."""
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.marketplace_server.packager import invalidate_etag_cache
     from src.skill_contribution import SkillContributionError, contribute_skill
 
@@ -8382,6 +8466,9 @@ def admin_contribute_skill_delete(
     import shutil
 
     from fastapi.responses import RedirectResponse
+
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
 
     from app.marketplace_server.packager import invalidate_etag_cache
     from app.utils import get_marketplaces_dir
@@ -8504,6 +8591,13 @@ async def admin_knowledge_digests_page(
     user: dict = Depends(require_admin),
 ):
     """List page for admin-defined maintained digests."""
+    # PAGE gate only (features.knowledge_digests_enabled, off by default since
+    # the admin cleanup). The API, `agnes admin digest`, the scheduler job and
+    # `agnes pull`'s digest delivery are deliberately untouched — an instance
+    # already running digests keeps running them while the page is hidden.
+    if not get_knowledge_digests_ui_enabled():
+        return RedirectResponse("/", status_code=302)
+
     ctx = _build_context(request, user=user)
     return templates.TemplateResponse(request, "admin_knowledge_digests.html", ctx)
 
@@ -9318,25 +9412,147 @@ async def chat_page(
 
     if not can_access(user["id"], ResourceType.CHAT.value, "chat", conn):
         return RedirectResponse("/")
-    # Rail pre-conversation state = the Dashboard (issue #896): greeting,
-    # the real composer, a "Using N knowledge sources and M capabilities
-    # from your stack" context line, activity panels, and
-    # guided task starters — rendered by chat.html's rail empty-state
-    # blocks and hidden the moment a conversation starts. The counts are
-    # the caller's ACTUAL Stack contents (same reads as the /stack page
-    # the line links to), not everything RBAC lets them browse. Best-
-    # effort: a repo failure degrades them to 0 (the context line hides)
-    # instead of taking down the page.
-    try:
-        knowledge_source_count = _stack_knowledge_source_count(user)
-    except Exception:
-        logger.exception("chat empty state: knowledge source count failed")
-        knowledge_source_count = 0
-    try:
-        capability_count = _stack_capability_count(conn, user)
-    except Exception:
-        logger.exception("chat empty state: capability count failed")
-        capability_count = 0
+    # No Stack counts here any more. They fed one line under the composer
+    # ("Using N knowledge sources and M capabilities from your Stack"), which is
+    # retired — it reported a number the reader could not act on. Nothing else
+    # consumed them, and they were not free: two StackResolver reads plus an
+    # RBAC plugin resolve on every /chat render. The helpers went with them; git
+    # history holds the "actual Stack, not the whole catalog" reasoning if the
+    # line ever comes back.
+
+    # Admin first landing — ONE line, not a checklist.
+    #
+    # A six-step setup panel lived here and was removed as misleading: it read
+    # as onboarding (hero slot, "0 of 6 done"), it only existed before the first
+    # message, and being gated on "chain incomplete" it vanished for good at 6
+    # of 6 — the moment an admin might still want another source. Setup is
+    # recurring work and its home is /admin, where the chain is one collapsible
+    # card among many.
+    #
+    # What is left is the single claim that is a FACT about the instance rather
+    # than a milestone in a sequence: with nothing registered, no answer can be
+    # grounded in company data. Note the scope — asking still WORKS in this
+    # state and the answer arrives from general knowledge, which is why the copy
+    # this gates says "answers from general knowledge rather than your company's
+    # data" and not "it can answer nothing" (it could, and a reader would find
+    # that out on their first question). So the gate is "no tables registered",
+    # not "chain unfinished" — true whenever it is true, and silent as soon as
+    # there is data, without ever implying the work is finished.
+    #
+    # Still read off resolve_journey() rather than a new query, so the notice
+    # and the /admin chain cannot disagree about what "registered" means; the
+    # `tables` step already carries exactly that boolean, and the first
+    # unfinished step supplies the action to offer. Best-effort: the journey
+    # does six areas' worth of repo reads and none is worth taking chat down
+    # for.
+    #
+    # `?preview=member` is a LOCAL-DEV-ONLY switch for looking at the other
+    # audience's landing page without a second account: it suppresses the panel
+    # so an admin sees exactly what a member sees. Gated on
+    # ``is_local_dev_mode()`` — under LOCAL_DEV_MODE the whole auth layer is
+    # already bypassed, so this adds no reachable surface to a real deployment,
+    # and on any instance without it the parameter is inert rather than
+    # half-honoured. It changes only which hero renders: no authority, no grant
+    # and no other page behaviour is faked, so it must not be read as a
+    # role-switcher (`_dev_preview` is passed to the template purely so the
+    # toggle can render and say which view you are looking at).
+    #
+    # `_resolve_dev_preview` applies that gate — this route no longer imports
+    # `is_local_dev_mode` itself, since the only thing that used it was the
+    # duplicate `dev_preview_available` below.
+
+    # `empty` is the third value: it forces the "nothing registered" notice on
+    # so the state can be reviewed without registering or deleting real tables
+    # to reach it. It fakes only the RENDER — no repo read is bypassed, nothing
+    # is written, and the instance keeps whatever data it has.
+    #
+    # Resolved by the shared helper, not re-derived here: this used to be the
+    # only page that understood `?preview=`, which is exactly why the switch
+    # worked nowhere else.
+    _dev_preview = _resolve_dev_preview(request)
+
+    admin_notice = None
+    admin_setup = None
+    if _dev_preview != "member" and is_user_admin(user["id"], conn):
+        try:
+            from app.services.admin_dashboard import resolve_journey
+
+            _setup = resolve_journey().get("setup") or {}
+            _steps = _setup.get("steps") or []
+            _tables = next((s for s in _steps if s.get("key") == "tables"), None)
+            # A step whose repo read RAISED reports `failed`, and is neither
+            # done nor a safe thing to assert about — staying silent is the
+            # honest reading of "we could not check", not "there is no data".
+            _nothing_registered = bool(_tables) and not _tables.get("done") and not _tables.get("failed")
+            if _nothing_registered or _dev_preview == "empty":
+                _next = next((s for s in _steps if not s.get("done") and not s.get("failed")), None)
+                if _next:
+                    admin_notice = {"cta": _next["cta"], "href": _next["href"]}
+                elif _dev_preview == "empty":
+                    # Forced preview on an instance that is fully set up: there
+                    # is no real "next step" to borrow, so name the first one.
+                    admin_notice = {"cta": "Connect a source", "href": "/admin/data-sources?add=1"}
+            # Progress, for EVERY admin rather than only an empty instance: the
+            # "Set up {brand}" card is on the page whether or not there is data,
+            # and on a running instance its whole job is saying how far along the
+            # chain this instance actually is. Two counts, no step list — the
+            # steps themselves live on /admin, which is where the card points.
+            if _setup.get("total"):
+                admin_setup = {
+                    "done": _setup.get("done_count") or 0,
+                    "total": _setup["total"],
+                    "complete": bool(_setup.get("complete")),
+                }
+        except Exception:
+            logger.exception("chat empty state: admin setup notice failed")
+
+    # The first move an admin can actually make, named after the connector this
+    # instance is configured for. `openWizard(connector)` in
+    # admin_data_sources.html already pre-selects its source from an argument,
+    # so `?add=<type>` opens the wizard ON that connector rather than on its
+    # picker — which is what lets the chip name a system instead of saying
+    # "connect a source" and landing somewhere generic.
+    #
+    # Only the configured type is offered plus one neutral escape: listing every
+    # connector Agnes can theoretically speak to would be a menu of things this
+    # instance has no credentials for.
+    connect_options: list[dict] = []
+    if admin_notice:
+        _source_labels = {
+            "keboola": "Connect a Keboola project",
+            "bigquery": "Connect BigQuery",
+            "databricks": "Connect Databricks",
+            "snowflake": "Connect Snowflake",
+        }
+        # `local` is the DEFAULT type (get_data_source_type falls back to it), so
+        # leaving it out of the map left the commonest instance with no first
+        # move at all. It gets a label but no `?add=<type>` pre-scope: there is
+        # no external system to pre-select, so it opens the picker.
+        _plain_types = {"local", "csv"}
+        try:
+            from app.instance_config import get_data_source_type
+
+            _configured = (get_data_source_type() or "").strip().lower()
+            if _configured in _source_labels:
+                connect_options.append(
+                    {
+                        "label": _source_labels[_configured],
+                        "href": f"/admin/data-sources?add={_configured}",
+                        "primary": True,
+                    }
+                )
+            elif _configured in _plain_types:
+                connect_options.append(
+                    {"label": "Add your first data", "href": "/admin/data-sources?add=1", "primary": True}
+                )
+        except Exception:
+            logger.exception("chat empty state: data source type lookup failed")
+        # A neutral way in, unless the primary already opens the same picker —
+        # two chips pointing at one URL is a choice that isn't one.
+        if not any(o["href"] == "/admin/data-sources?add=1" for o in connect_options):
+            connect_options.append(
+                {"label": "See all the ways in", "href": "/admin/data-sources?add=1", "primary": False}
+            )
 
     ctx = _build_context(
         request,
@@ -9344,10 +9560,32 @@ async def chat_page(
         conn=conn,
         current_user=user,
         greeting=_time_of_day_greeting(),
-        knowledge_source_count=knowledge_source_count,
-        capability_count=capability_count,
+        admin_notice=admin_notice,
+        connect_options=connect_options,
+        admin_setup=admin_setup,
+        # The DEPLOYING ORGANIZATION (`instance.name`), used only to say whose
+        # company Agnes knows nothing about yet. Suppressed when it matches the
+        # product brand: operators who leave `name` at a product-shaped default
+        # would otherwise get "It knows nothing about AI Data Analyst yet",
+        # which reads as a bug. Falling back to "your company" is always true.
+        instance_org=_chat_instance_org(),
+        dev_preview=_dev_preview,  # same value chrome resolved; kept explicit for this page's own branches
+        # `dev_preview_available` is NOT set here. It used to be, narrowed to
+        # `is_local_dev_mode() and is_user_admin(...)` because a connection was
+        # already open — which left the key with two definitions, this one and
+        # `_chrome_ctx`'s, and only one of them corrected when the dead clause
+        # came out. The admin half was redundant either way: `_dev_preview.html`
+        # is the key's only consumer and gates on `session.user.is_admin`
+        # itself, so a member never saw the switch through either route. One
+        # definition, in chrome, where the switch is chrome.
     )
     ctx["chat_capabilities"] = _chat_capability_snapshot(conn, user)
+    if _dev_preview == "empty":
+        # Render-only, matching the heading it accompanies: without this the
+        # forced preview showed "it knows nothing about your company" above four
+        # suggestions that all need data — a combination no real instance can be
+        # in. No repo read is bypassed and nothing is written.
+        ctx["chat_capabilities"] = {**ctx["chat_capabilities"], "tables_total": 0, "tables_by_source": {}}
     # Deep link: /chat?session=<id>. We DO NOT validate the id here (no
     # 404 on unknown/forbidden) — the page always renders and RBAC is
     # enforced when chat.js calls the session-scoped endpoints
@@ -9356,6 +9594,31 @@ async def chat_page(
     # surfaces an error status in the UI; the page itself still renders.
     ctx["initial_session_id"] = request.query_params.get("session")
     return templates.TemplateResponse(request, "chat.html", ctx)
+
+
+def _chat_instance_org() -> str:
+    """The deploying organization's name, or "" when there isn't a usable one.
+
+    ``instance.name`` is documented as the deploying organization and
+    ``instance.brand`` as the product (config/instance.yaml.example), but
+    nothing enforces the distinction — plenty of instances leave ``name`` at
+    something product-shaped like "AI Data Analyst". Saying "it knows nothing
+    about AI Data Analyst yet" would read as a bug, so an org name that matches
+    the brand (or is absent) resolves to "" and the caller says "your company"
+    instead, which is true on every instance.
+    """
+    try:
+        from app.instance_config import get_value
+
+        org = (get_value("instance", "name", default="") or "").strip()
+        brand = (get_value("instance", "brand", default="") or "").strip()
+        short = (get_value("instance", "brand_short", default="") or "").strip()
+        if not org or org.casefold() in {brand.casefold(), short.casefold()}:
+            return ""
+        return org
+    except Exception:
+        logger.exception("chat empty state: instance org lookup failed")
+        return ""
 
 
 def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> dict:
@@ -9411,60 +9674,13 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     return {
         "tables_total": tables_total,
         "tables_by_source": by_source,
+        # Who the zero-data state should offer what to: an admin can connect a
+        # source, a member can only ask for access. Resolved here because the
+        # snapshot is the one thing the dashboard JS already reads.
+        "is_admin": is_user_admin(user["id"], conn),
         "plugins": plugin_summaries,
         "marketplace_count": marketplace_count,
     }
-
-
-def _stack_knowledge_source_count(user: dict) -> int:
-    """Count of knowledge sources actually IN the caller's Stack — data
-    packages + memory domains through the same ``StackResolver.stack()``
-    reads the /stack page renders, so the number agrees with the page the
-    context line links to. (Replaces the retired /ask landing count, which
-    summed everything the caller could *browse* — admin god-mode counted
-    every package in the instance — plus the Library surfaces; those
-    numbers never matched /stack.)
-
-    No ``conn``: like the /stack route, the resolver goes through the
-    factory repos so it observes just-written subscription rows.
-
-    Best-effort per resource type: a repo failure counting one type must
-    not blank the whole line, so each block is logged rather than
-    propagated.
-    """
-    from app.services.stack_resolver import StackResolver
-    from app.resource_types import ResourceType
-
-    resolver = StackResolver()
-    total = 0
-    for rt in (ResourceType.DATA_PACKAGE, ResourceType.MEMORY_DOMAIN):
-        try:
-            total += len(resolver.stack(user["id"], rt))
-        except Exception:
-            logger.warning("chat empty state: stack count failed for %s", rt.value)
-    return total
-
-
-def _stack_capability_count(conn: duckdb.DuckDBPyConnection, user: dict) -> int:
-    """Count of capabilities actually IN the caller's Stack — the same
-    roster ``GET /api/marketplace/items?tab=my`` serves to the Library's
-    Plugins section: curated plugins the caller subscribed to (or is
-    required into via a group grant), intersected with what RBAC actually
-    resolves for them, plus their Store installs. NOT
-    ``resolve_allowed_plugins`` alone — that is everything the caller
-    *could* add, not what's in the Stack.
-    """
-    from src.marketplace_filter import required_plugin_keys, resolve_allowed_plugins
-    from src.repositories import user_curated_subscriptions_repo, user_store_installs_repo
-
-    granted = resolve_allowed_plugins(conn, user)
-    # Same (rbac ∩ (subscriptions ∪ required)) composition as
-    # ``resolve_user_marketplace`` — but counted per item (each Store
-    # install counts one), matching the ?tab=my card count.
-    in_stack = user_curated_subscriptions_repo().subscribed_set(user["id"]) | required_plugin_keys(conn, user["id"])
-    curated = sum(1 for p in granted if (p["marketplace_id"], p["original_name"]) in in_stack)
-    store = len(user_store_installs_repo().list_for_user(user["id"]))
-    return curated + store
 
 
 @router.get("/ask", include_in_schema=False)
@@ -9475,9 +9691,9 @@ async def ask_landing(user: dict = Depends(get_current_user)):
     lands users on the working chat (``/chat``) or the Library, so ``/ask``
     has no job. Kept as a 302 to ``/`` (not deleted) so any bookmarked/linked
     ``/ask`` resolves through the canonical home route instead of 404ing.
-    Its context-line idea lives on in ``/chat``'s empty state, now counting
-    the caller's actual Stack (``_stack_knowledge_source_count`` /
-    ``_stack_capability_count``) instead of everything browsable.
+    Its context-line idea outlived it in ``/chat``'s empty state for a while and
+    is retired there too — a count of the caller's Stack was a number with no
+    action attached.
     """
     return RedirectResponse(url="/", status_code=302)
 

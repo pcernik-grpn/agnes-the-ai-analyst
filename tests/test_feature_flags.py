@@ -86,11 +86,15 @@ class TestFeatureFlagsRegistry:
         names = {f.name for f in ic.FEATURE_FLAGS}
         assert names == {
             "studio",
+            "news",
+            "knowledge_digests",
+            "contribute_skill",
             "guardrails",
             "chat",
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -109,6 +113,7 @@ class TestFeatureFlagsRegistry:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -130,9 +135,24 @@ class TestFeatureFlagsRegistry:
 
     def test_grandfathered_flags_default_on(self):
         by_name = {f.name: f for f in ic.FEATURE_FLAGS}
-        assert by_name["studio"].default is True
         assert by_name["guardrails"].default is True
         assert by_name["agent_profiles"].default is True
+
+    def test_retired_surfaces_default_off(self):
+        """The four surfaces the admin cleanup hid: Studio (with its
+        suggestions queue), news, the digests admin page, contribute-a-skill.
+
+        `studio` used to be asserted alongside `guardrails` above as
+        grandfathered-on. It moved here deliberately, not by accident: the
+        Library builders do its authoring jobs now, so an upgrade turning it
+        off is the intended behavior change. The pages still exist — every one
+        of these is one flag away from coming back.
+        """
+        by_name = {f.name: f for f in ic.FEATURE_FLAGS}
+        assert by_name["studio"].default is False
+        assert by_name["news"].default is False
+        assert by_name["knowledge_digests"].default is False
+        assert by_name["contribute_skill"].default is False
 
     def test_new_flags_default_off(self):
         by_name = {f.name: f for f in ic.FEATURE_FLAGS}
@@ -195,10 +215,11 @@ class TestFeatureFlagsRegistry:
 
 
 class TestStudioEnabledBehaviorPreserved:
-    def test_default_true(self, monkeypatch):
+    def test_default_false(self, monkeypatch):
+        """Off by default since the admin cleanup — was True before it."""
         monkeypatch.delenv("AGNES_STUDIO_ENABLED", raising=False)
         monkeypatch.setattr(ic, "get_value", lambda *keys, default=None: default)
-        assert ic.get_studio_enabled() is True
+        assert ic.get_studio_enabled() is False
 
     def test_yaml_false(self, monkeypatch):
         monkeypatch.delenv("AGNES_STUDIO_ENABLED", raising=False)
@@ -272,11 +293,15 @@ class TestServerConfigFeatureFlagsInventory:
         assert names == {
             "instance.experience",
             "studio",
+            "news",
+            "knowledge_digests",
+            "contribute_skill",
             "guardrails",
             "chat",
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -294,6 +319,7 @@ class TestServerConfigFeatureFlagsInventory:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

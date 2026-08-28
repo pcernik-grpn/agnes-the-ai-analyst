@@ -9,7 +9,7 @@ import secrets
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import exc as sa_exc
 
 from app.auth.access import require_resource_access
@@ -94,6 +94,14 @@ def _consume_ticket(ticket: str) -> tuple[str, str] | None:
         return None
 
 
+class PreviewSkill(BaseModel):
+    """A draft skill to make invokable for one session. Both fields are
+    untrusted; see the note on CreateSessionBody.preview_skill."""
+
+    name: str = Field(default="", max_length=120)
+    body: str = Field(default="", max_length=40_000)
+
+
 class CreateSessionBody(BaseModel):
     surface: str = "web"
     title: str | None = None
@@ -106,6 +114,22 @@ class CreateSessionBody(BaseModel):
     #: ``POST /api/v1/agents/{slug}/sessions`` uses); web chat was simply never
     #: wired to it, which is why agents could be configured but not used.
     agent_slug: str | None = None
+    #: A draft SKILL to make invokable in this session only — what backs the
+    #: /skills builder's Preview. The skills catalog reports what is on disk
+    #: in the session's project scope, so previewing a skill that exists
+    #: nowhere but the author's browser means writing it into that scope.
+    #:
+    #: Untrusted on both fields. The name becomes a DIRECTORY name and is
+    #: replaced rather than sanitized (WorkdirManager.safe_skill_dirname); the
+    #: body is capped here and again at the write. The write is contained to
+    #: the session's own `.claude`, which is forced to a copy so a draft can
+    #: never reach the author's shared workspace — see
+    #: tests/test_preview_skill_containment.py.
+    #:
+    #: Nothing is persisted: it lives in memory for the life of the session,
+    #: because a preview that outlived the tab would be a copy of unfinished
+    #: work nobody asked us to keep.
+    preview_skill: "PreviewSkill | None" = None
 
 
 def _get_manager(request: Request) -> ChatManager:
@@ -193,6 +217,7 @@ async def create_session(
             title=body.title,
             profile=body.profile,
             agent_id=agent_id,
+            preview_skill=body.preview_skill.model_dump() if body.preview_skill else None,
         )
     except ConcurrencyCapHit as exc:
         raise HTTPException(status_code=429, detail={"kind": "concurrency_cap", "hint": str(exc)})

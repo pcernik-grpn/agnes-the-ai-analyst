@@ -78,8 +78,8 @@ Job-queue + worker metrics (task 2):
 - Cardinality guards: `kind` is bounded to `app.worker.registry.JOB_KINDS`
   (anything else collapses to `"other"` — e.g. a job row inserted with a
   since-deregistered kind, or between-process registry drift); `lane` is
-  bounded to `heavy`/`light` (the caller's own value, already constrained by
-  `JobKind.lane` validation in `app/worker/registry.py`); `outcome` is
+  bounded to `heavy`/`light`/`extraction` (the caller's own value, already
+  constrained by `JobKind.lane` validation in `app/worker/registry.py`); `outcome` is
   `done`/`failed`; the failure `reason` label is capped defensively
   (`_MAX_REASON_LEN`) and falls back to `"other"` for anything empty or
   implausibly long, even though in practice it's always a short exception

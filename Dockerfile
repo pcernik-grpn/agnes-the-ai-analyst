@@ -1,4 +1,12 @@
-FROM python:3.13-slim
+# Multi-stage: `base` builds the whole app image exactly as before; `app`
+# (the default/last stage, so a plain `docker build .` — CI and the release
+# workflow — is completely unaffected) is `base` verbatim; `worker` is an
+# ADDITIONAL stage for the extraction worker lane (spec §7.5 / §16 step 7 of
+# docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md),
+# built only when explicitly requested via `--target worker` (see the
+# `extraction-worker` service in docker-compose.yml). Never built by
+# default, so it costs nothing to every existing deployment.
+FROM python:3.13-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
 
@@ -145,3 +153,56 @@ RUN /app/scripts/install-adbc-driver.sh /app
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+
+# ---------------------------------------------------------------------------
+# worker — extraction worker lane image (spec §7.5 / §16 step 7)
+# ---------------------------------------------------------------------------
+# Same image as `base`/`app` above, plus an EXTENSION POINT for bundling an
+# extraction producer's runtime deps (crawl/convert/anonymize/extract —
+# adopted from the operator's own producer repository per spec §7.1, NEVER vendored into
+# this repo). The entrypoint is IDENTICAL to `app` — one-image,
+# one-entrypoint still holds; `AGNES_ROLE=worker` + `AGNES_WORKER_LANES
+# =extraction` (set by the `extraction-worker` compose service, not baked
+# into the image) select the behavior at runtime, not a different CMD here.
+#
+# The `corpus-extraction` job kind (app/worker/kinds.py) shells out to
+# whatever `extraction.producer.command`/`.module` names in instance.yaml —
+# this stage is where a deployment that wants that command to actually
+# exist bakes it in, via:
+#
+#   docker build --target worker \
+#     --build-arg EXTRACTION_PRODUCER_INSTALL="uv pip install --system git+https://github.com/<org>/<producer-repo>@<ref>" \
+#     -t agnes-extraction-worker .
+#
+# Left empty by default — building this target with no build-arg produces a
+# worker image with the extraction LANE wired up but no producer to invoke;
+# `corpus-extraction` fails clean (a config error, not a crash) until the
+# operator either sets the build-arg above or points `extraction.producer`
+# at a command already on PATH some other way.
+FROM base AS worker
+
+ARG EXTRACTION_PRODUCER_INSTALL=""
+# Root only for this install step — `base` already dropped to the non-root
+# `agnes` user, and most producer runtime deps (apt packages, pip installs
+# writing outside `/app`) need root to install. Re-drops to `agnes`
+# immediately after, same posture as `base`'s own `USER agnes` (C13).
+USER root
+RUN if [ -n "$EXTRACTION_PRODUCER_INSTALL" ]; then \
+        echo "worker: installing extraction producer runtime: $EXTRACTION_PRODUCER_INSTALL" && \
+        sh -c "$EXTRACTION_PRODUCER_INSTALL"; \
+    else \
+        echo "worker: EXTRACTION_PRODUCER_INSTALL not set — building the lane with no producer bundled"; \
+    fi
+USER agnes
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+
+# ---------------------------------------------------------------------------
+# app — the default target (MUST stay last: `docker build .` with no
+# `--target` builds whichever stage is last in this file, and both CI
+# (`docker build -t data-analyst:test .`) and the release workflow
+# (`docker/build-push-action@v7`, no `target:`) rely on that being this
+# stage, unchanged from before `worker` existed).
+# ---------------------------------------------------------------------------
+FROM base AS app

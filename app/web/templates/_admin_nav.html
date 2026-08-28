@@ -39,11 +39,21 @@
 {% set _active_href = admin_nav_active_href(_admin_path) %}
 {% set _active_section_key = admin_nav_active_section_key(_admin_path) %}
 {% import "macros/_icon.html" as ico %}
-{# Flags addressable by an item's `when` key. `can_studio` is
-   `get_studio_enabled()`, put on every context by `_build_context`;
-   `default(false)` so a context that somehow lacks it hides the row rather
-   than raising. #}
-{% set _nav_flags = {'can_studio': can_studio | default(false)} %}
+{# Flags addressable by an item's `when` key — each one a `get_*_enabled()`
+   put on every context by `_build_context` (and by `_chrome_ctx`, so the
+   palette agrees with this column). `default(false)` so a context that
+   somehow lacks one hides the row rather than raising.
+
+   All four surfaces here are hidden by DEFAULT since the admin cleanup and
+   their routes redirect home when the flag is off, so failing closed is also
+   the truthful direction: a row rendered past a missing flag would be a link
+   to a redirect. #}
+{% set _nav_flags = {
+     'can_studio': can_studio | default(false),
+     'can_news': can_news | default(false),
+     'can_knowledge_digests': can_knowledge_digests | default(false),
+     'can_contribute_skill': can_contribute_skill | default(false),
+   } %}
 {# The head is a page-level heading that also answers "which instance am I
    changing": under the rail this column is the primary navigation of the page
    and the rail beside it is a glyph strip.
@@ -142,8 +152,9 @@
             </button>
             <div class="admin-nav__group-body" id="admin-nav-body-{{ section['key'] }}"{% if not _sec_open %} hidden{% endif %}>
                 {# `when` (optional) names a flag in `_nav_flags` that must be
-                   truthy for the row to render — see admin_nav.py. Only Studio
-                   uses it. A row naming a flag that isn't in the map is
+                   truthy for the row to render — see admin_nav.py. Studio, its
+                   suggestions queue, Knowledge digests, News and Contribute a
+                   skill use it. A row naming a flag that isn't in the map is
                    DROPPED, not shown: `when` gates surfaces that can be
                    disabled instance-wide, so failing closed is the safe
                    direction. Add a supported flag by extending `_nav_flags`
