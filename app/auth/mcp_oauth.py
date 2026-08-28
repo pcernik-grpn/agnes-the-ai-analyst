@@ -49,7 +49,7 @@ import logging
 import secrets
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from pydantic import AnyUrl
 from starlette.requests import Request
@@ -569,7 +569,7 @@ async def _consent_submit(request: Request) -> Response:
         sep = "&" if "?" in redirect_uri else "?"
         deny_url = f"{redirect_uri}{sep}error=access_denied"
         if state:
-            deny_url += f"&state={state}"
+            deny_url += f"&state={quote(state, safe='')}"
         return RedirectResponse(url=deny_url, status_code=302)
 
     user = _get_session_user(request)
@@ -593,9 +593,12 @@ async def _consent_submit(request: Request) -> Response:
     oauth_clients_repo().delete_auth_code(pending)
 
     sep = "&" if "?" in redirect_uri else "?"
-    final_url = f"{redirect_uri}{sep}code={real_code}"
+    # The client's state is opaque and echoed verbatim, so it has to be
+    # percent-encoded on the way out: an unencoded "&" or "=" in it would
+    # otherwise split into extra query parameters of the client's callback.
+    final_url = f"{redirect_uri}{sep}code={quote(real_code, safe='')}"
     if state:
-        final_url += f"&state={state}"
+        final_url += f"&state={quote(state, safe='')}"
     return RedirectResponse(url=final_url, status_code=302)
 
 
@@ -741,17 +744,12 @@ def _login_url(request: Request, pending: str) -> str:
     from app.auth.providers.google import is_available as google_available
 
     if google_available() and provider_allowed("google"):
-        from urllib.parse import quote
-
         return f"{base}/auth/google/login?next={quote(consent_path)}"
 
     from app.auth.providers.keboola import is_available as keboola_available
 
     if keboola_available() and provider_allowed("keboola"):
-        from urllib.parse import quote
-
         return f"{base}/auth/keboola/login?next={quote(consent_path)}"
-    from urllib.parse import quote
 
     return f"{base}/login?next={quote(consent_path)}"
 
@@ -813,11 +811,12 @@ def _record_consent_outcome(pending: str, *, action: str, client_name: str) -> N
 def _finished_or_expired_response(pending: str) -> Response:
     """Response for a pending token that is no longer live.
 
-    A consent link is single-use, and the browser keeps offering it after the
-    flow is over: the client takes the redirect (often into a custom scheme, so
-    the tab never navigates), the user reloads or clicks Allow twice, and the
-    second request finds the row gone. Reporting that as "Authorization request
-    expired" told users their connection had failed when it had just succeeded.
+    A consent link is single-use, but the browser keeps the page around after
+    the flow is over — the tab that submitted it is still sitting on this URL,
+    so a reload, a double-clicked Allow, or Back-then-Allow re-issues the
+    request and finds the row already consumed. Reporting that as
+    "Authorization request expired" told users their connection had failed when
+    it had in fact just succeeded.
     """
     from src.repositories import oauth_clients_repo
 
@@ -845,7 +844,8 @@ def _finished_or_expired_response(pending: str) -> Response:
                 title="Access denied",
                 body=(
                     f"<span class='app-name'>{_esc(client_name)}</span> was not given access to Agnes. "
-                    "You can close this window."
+                    "You can close this window. If you meant to allow it, start the connection "
+                    "again from the app."
                 ),
             )
         )
@@ -853,7 +853,8 @@ def _finished_or_expired_response(pending: str) -> Response:
         _render_notice_page(
             title="This authorization link is no longer valid",
             body=(
-                "It was already used, or it sat unused for more than five minutes. "
+                "It was already used, or it sat unused for more than "
+                f"{_AUTH_CODE_TTL // 60} minutes. "
                 "If the app is already connected, nothing is wrong — just close this window. "
                 "Otherwise start the connection again from the app."
             ),
@@ -955,16 +956,23 @@ def _render_notice_page(title: str, body: str) -> str:
     ``body`` may contain markup produced here; every caller-supplied value in it
     is escaped by the caller.
     """
+    # "Connected to Agnes — Agnes" reads as a stutter in the tab strip.
+    tab_title = title if "Agnes" in title else f"{title} — Agnes"
     return _page_shell(
-        f"{title} — Agnes",
+        tab_title,
         f"""    <h1>{_esc(title)}</h1>
     <p class="sub">{body}</p>""",
     )
 
 
 def _access_summary(scopes: list[str]) -> list[str]:
-    """Plain-language capability lines for the consent screen."""
-    lines = [_SCOPE_DESCRIPTIONS[s] for s in scopes if s in _SCOPE_DESCRIPTIONS]
+    """Plain-language capability lines for the consent screen.
+
+    A scope with no description is listed verbatim rather than dropped: this
+    page exists because it under-described what the connection could do, and
+    silently swallowing an unrecognised scope would be the same bug again.
+    """
+    lines = [_SCOPE_DESCRIPTIONS.get(s) or f"Scope requested by the app: {s}" for s in scopes]
     if not lines:
         lines.append(_SCOPE_DESCRIPTIONS["read"])
     lines.append(_WRITE_CAPABILITY)
@@ -994,7 +1002,9 @@ def _render_consent_page(
     esc_pending = html.escape(pending or "", quote=True)
     capability_items = "".join(f"<li>{html.escape(line)}</li>" for line in _access_summary(list(scopes or [])))
     return _page_shell(
-        f"Authorize {esc_client} — Agnes",
+        # NB: the raw name — _page_shell escapes the title itself, and passing
+        # the pre-escaped value double-escaped it in the browser tab.
+        f"Authorize {client_name or ''} — Agnes",
         f"""    <h1>Authorize access</h1>
     <p class="sub">
       <span class="app-name">{esc_client}</span>
@@ -1007,12 +1017,38 @@ def _render_consent_page(
       Agnes issues one connection for the whole MCP toolset, so the app sees both
       read and write tools. Access ends when you disconnect the app.
     </p>
-    <form method="post" action="/api/mcp/oauth/consent" onsubmit="this.dataset.sent && event.preventDefault(); this.dataset.sent = 1;">
+    <form id="consent-form" method="post" action="/api/mcp/oauth/consent">
       <input type="hidden" name="pending" value="{esc_pending}">
       <div class="actions">
         <button type="submit" name="action" value="deny" class="btn-deny">Deny</button>
         <button type="submit" name="action" value="allow" class="btn-allow">Allow</button>
       </div>
     </form>
-    <p class="user">Signed in as {esc_email}</p>""",
+    <p class="user">Signed in as {esc_email}</p>
+    <script>
+    (function () {{
+      var form = document.getElementById('consent-form');
+      var buttons = form.querySelectorAll('button');
+      var sent = false;
+      form.addEventListener('submit', function (event) {{
+        if (sent) {{ event.preventDefault(); return; }}
+        sent = true;
+        // Deferred: disabling the submitter synchronously drops its
+        // name/value from the body the browser is about to serialise,
+        // and `action` is what tells allow from deny.
+        setTimeout(function () {{
+          for (var i = 0; i < buttons.length; i++) {{ buttons[i].disabled = true; }}
+        }}, 0);
+      }});
+      // Returning to this page with Back restores it from the bfcache with the
+      // buttons still disabled. Re-enable them: the link may already be spent,
+      // but then the POST answers "Connected to Agnes" — which is the whole
+      // point of this change — and a dead button explains nothing.
+      window.addEventListener('pageshow', function (event) {{
+        if (!event.persisted) {{ return; }}
+        sent = false;
+        for (var i = 0; i < buttons.length; i++) {{ buttons[i].disabled = false; }}
+      }});
+    }})();
+    </script>""",
     )
