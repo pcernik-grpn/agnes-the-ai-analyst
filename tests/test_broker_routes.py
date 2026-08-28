@@ -1750,7 +1750,7 @@ def vertex_chat_config(broker_app, monkeypatch):
     broker_app.state.chat_config = prev
 
 
-def _post_vertex(broker_app, subpath, ticket_label, body: bytes = b'{"model":"x"}'):
+def _post_vertex(broker_app, subpath, ticket_label, body: bytes = b'{"model":"x"}', extra_headers=None):
     _HeaderCapturingClient._captured = {}
     _UrlCapturingClient._captured_url = ""
     _BodyCapturingClient._captured_body = b""
@@ -1761,7 +1761,7 @@ def _post_vertex(broker_app, subpath, ticket_label, body: bytes = b'{"model":"x"
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             return await c.post(
                 f"/api/broker/anthropic{subpath}",
-                headers={"Authorization": f"Bearer {tok}"},
+                headers={"Authorization": f"Bearer {tok}", **(extra_headers or {})},
                 content=body,
             )
 
@@ -1867,6 +1867,52 @@ def test_vertex_messages_compat_non_streaming_rawpredict(broker_app, monkeypatch
     r = _post_vertex(broker_app, "/v1/messages", "chat_vx7", body=body)
     assert r.status_code == 200, r.text
     assert _UrlCapturingClient._captured_url.endswith("/models/claude-sonnet-4-6:rawPredict")
+
+
+def test_vertex_strips_first_party_only_beta_headers(broker_app, monkeypatch, vertex_chat_config):
+    """Vertex 400s the whole request on an ``anthropic-beta`` value it does
+    not recognize (the first-party API ignores unknowns), and the kai-agent
+    engine's SDK sends first-party-only betas — the broker must filter the
+    header down to Vertex-recognized values before signing and forwarding."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 4}).encode()
+    r = _post_vertex(
+        broker_app,
+        "/v1/messages",
+        "chat_vx8",
+        body=body,
+        extra_headers={"anthropic-beta": "advisor-tool-2026-03-01, interleaved-thinking-2025-05-14"},
+    )
+    assert r.status_code == 200, r.text
+    h = _lower_keys(_UrlCapturingClient._captured)
+    assert h.get("anthropic-beta") == "interleaved-thinking-2025-05-14"
+
+
+def test_vertex_omits_beta_header_when_nothing_survives(broker_app, monkeypatch, vertex_chat_config):
+    """All-unsupported inbound betas leave NO ``anthropic-beta`` header at
+    all — an empty value is still a value Vertex would refuse."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _BodyCapturingClient)
+
+    body = _json.dumps({"model": "claude-sonnet-4-6", "max_tokens": 4}).encode()
+    r = _post_vertex(
+        broker_app,
+        "/v1/messages",
+        "chat_vx9",
+        body=body,
+        extra_headers={"anthropic-beta": "advisor-tool-2026-03-01"},
+    )
+    assert r.status_code == 200, r.text
+    h = _lower_keys(_UrlCapturingClient._captured)
+    assert "anthropic-beta" not in h
 
 
 def test_vertex_messages_compat_invalid_body_400(broker_app, monkeypatch, vertex_chat_config):

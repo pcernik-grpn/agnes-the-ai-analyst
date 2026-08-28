@@ -61,6 +61,7 @@ from app.api.broker_vertex import (
     count_tokens_to_vertex,
     messages_to_vertex,
     parse_vertex_path,
+    sanitize_beta_header,
     validate_vertex_target,
     vertex_upstream_base,
 )
@@ -1000,6 +1001,22 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                 pass
             raise HTTPException(status_code=502, detail="vertex credential resolution failed") from exc
         headers["Authorization"] = f"Bearer {google_token}"
+        # Vertex VALIDATES ``anthropic-beta`` and 400s the whole request on
+        # any value it does not recognize (the first-party API ignores
+        # unknowns). The kai-agent engine's SDK speaks first-party and sends
+        # betas Vertex has never heard of — filter to the values Vertex
+        # accepts (renaming where its spelling differs) and drop the rest.
+        # Header names/values carry no secrets, so the drop is loggable.
+        for _beta_key in list(headers.keys()):
+            if _beta_key.lower() == "anthropic-beta":
+                kept_betas, dropped_betas = sanitize_beta_header(headers.pop(_beta_key))
+                if kept_betas:
+                    headers["anthropic-beta"] = kept_betas
+                if dropped_betas:
+                    logger.info(
+                        "vertex mode: dropped anthropic-beta value(s) the Vertex endpoint does not accept: %s",
+                        ", ".join(dropped_betas),
+                    )
     elif use_dispatcher:
         # strip() guards against trailing newlines/spaces from secret managers
         # (same normalization the URL gets above) — an invisible \n in the key
