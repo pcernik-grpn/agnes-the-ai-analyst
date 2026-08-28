@@ -423,6 +423,76 @@ class TestNoGroupWarning:
         assert r.json()["detail"]["error"] == "invalid_group_id"
 
 
+class TestCertificateMetadata:
+    """`GET /connections/{id}/certificate` — read-only certificate metadata
+    for the source card / an admin's own comparison against the identity
+    provider, derived at request time from the connection's already-stored
+    PEM. See `connectors.sharepoint.graph_client.certificate_metadata` for
+    the derivation itself; this class covers the endpoint's plumbing:
+    auth gating, connection resolution, and the typed-absence paths."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/certificate", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/certificate")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_returns_metadata_for_a_configured_certificate(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reason"] is None
+        cert = body["certificate"]
+        assert cert["subject"] == "CN=agnes-test"
+        assert cert["issuer"] == "CN=agnes-test"
+        assert cert["thumbprint_x5t"]
+        assert len(cert["thumbprint_sha1_hex"]) == 40
+        assert cert["status"] in ("ok", "expiring_soon", "expired")
+        assert isinstance(cert["expires_in_days"], int)
+
+    def test_response_never_contains_private_key_material(self, seeded_app, monkeypatch):
+        """HARD CONSTRAINT: metadata only, never the private key — even
+        though the stored PEM is a combined cert+key bundle."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-nokey-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert "PRIVATE KEY" not in r.text
+        assert "BEGIN CERTIFICATE" not in r.text
+
+    def test_no_certificate_configured_is_a_clean_200_not_a_500(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("SHAREPOINT_CERT_PRIVATE_KEY", raising=False)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-missing-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["certificate"] is None
+        assert body["reason"]
+
+    def test_unparseable_certificate_is_a_clean_200_not_a_500(self, seeded_app, monkeypatch):
+        monkeypatch.setenv(
+            "SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN CERTIFICATE-----\nbm90LXJlYWw=\n-----END CERTIFICATE-----\n"
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-garbage-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["certificate"] is None
+        assert body["reason"].startswith("certificate_unparseable")
+
+
 class TestCorpusMap:
     def test_corpus_map_is_the_flat_scope_to_collection_mapping(self, seeded_app):
         c = seeded_app["client"]

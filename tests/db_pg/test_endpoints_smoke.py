@@ -3014,6 +3014,12 @@ KNOWN_UNTESTED = {
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Certificate metadata (thumbprint/subject/issuer/expiry) — derived at
+    # request time from the connection's own stored PEM, no new schema
+    # surface. Auth matrix + typed-absence paths covered by
+    # tests/test_admin_sharepoint.py::TestCertificateMetadata; not
+    # duplicated in this PG smoke sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/certificate",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

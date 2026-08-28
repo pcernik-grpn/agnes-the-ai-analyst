@@ -25,6 +25,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -80,6 +81,17 @@ def _split_pem_blocks(pem_text: str) -> Dict[str, str]:
     return blocks
 
 
+def _x5t_thumbprint(cert: x509.Certificate) -> str:
+    """Base64url SHA-1 thumbprint of ``cert``, no padding — the exact value
+    Entra's certificate-credential flow expects in the JWT assertion's
+    ``x5t`` header, and so the value an admin should compare against the
+    certificate uploaded on the app registration. Canonical computation —
+    :func:`build_client_assertion` and :func:`certificate_metadata` both
+    call this rather than each hashing the certificate their own way.
+    """
+    return base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip("=")
+
+
 def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str) -> str:
     """Sign the JWT bearer client assertion for Entra's certificate-credential
     ``client_credentials`` flow.
@@ -103,7 +115,7 @@ def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str)
     except Exception as exc:  # noqa: BLE001 — malformed PEM; message names no secret material
         raise SharePointGraphError(f"sharepoint certificate material could not be parsed: {exc}") from exc
 
-    thumbprint = base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip("=")
+    thumbprint = _x5t_thumbprint(cert)
     now = int(time.time())
     audience = f"{LOGIN_BASE}/{tenant_id}/oauth2/v2.0/token"
     claims = {
@@ -115,6 +127,71 @@ def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str)
         "exp": now + 300,  # Entra ignores anything over ~10 minutes; 5 is comfortable for one call.
     }
     return pyjwt.encode(claims, private_key, algorithm="RS256", headers={"x5t": thumbprint})
+
+
+#: A certificate within this many days of ``not_after`` is flagged
+#: ``expiring_soon`` rather than ``ok`` — the admin's early-warning window
+#: for the "certificate expires silently, auth breaks with no warning"
+#: failure mode :func:`certificate_metadata` exists to catch.
+_EXPIRING_SOON_DAYS = 30
+
+
+def certificate_metadata(private_key_pem: str) -> Dict[str, Any]:
+    """Read-only metadata about the CERTIFICATE half of ``private_key_pem``
+    (the combined cert+key PEM :func:`connectors.sharepoint.settings.
+    resolve_sharepoint_settings` returns) — for an admin to compare the
+    thumbprint against the identity provider's app registration and catch
+    an expiring certificate before auth breaks.
+
+    SECURITY: the private key half is never parsed, touched, or referenced
+    here — only the ``CERTIFICATE`` PEM block is read out of ``blocks``, so
+    no key material can reach the return value even if a caller serializes
+    it verbatim into an API response.
+
+    Never raises. A missing ``CERTIFICATE`` block or a block that fails to
+    parse both come back as ``{"certificate": None, "reason": "..."}`` — a
+    typed absence, not a 500 — so a caller (the admin API, the source card)
+    never needs its own try/except to stay off one.
+    """
+    blocks = _split_pem_blocks(private_key_pem)
+    cert_pem = blocks.get("CERTIFICATE")
+    if not cert_pem:
+        return {"certificate": None, "reason": "no_certificate_configured"}
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode())
+    except Exception as exc:  # noqa: BLE001 — malformed PEM; message names no secret material
+        return {"certificate": None, "reason": f"certificate_unparseable: {exc}"}
+
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
+    now = datetime.now(timezone.utc)
+    expires_in_days = int((not_after - now).total_seconds() // 86400)
+    if not_after <= now:
+        status = "expired"
+    elif expires_in_days <= _EXPIRING_SOON_DAYS:
+        status = "expiring_soon"
+    else:
+        status = "ok"
+
+    return {
+        "certificate": {
+            # The value the client actually presents as the JWT `x5t`
+            # header — what an admin compares against the identity
+            # provider's app registration (module docstring).
+            "thumbprint_x5t": _x5t_thumbprint(cert),
+            # The conventional uppercase-hex SHA-1 fingerprint, the form
+            # most identity-provider UIs (incl. Entra's app registration
+            # certificate list) display next to an uploaded certificate.
+            "thumbprint_sha1_hex": cert.fingerprint(hashes.SHA1()).hex().upper(),
+            "subject": cert.subject.rfc4514_string(),
+            "issuer": cert.issuer.rfc4514_string(),
+            "not_before": not_before.isoformat(),
+            "not_after": not_after.isoformat(),
+            "expires_in_days": expires_in_days,
+            "status": status,
+        },
+        "reason": None,
+    }
 
 
 async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str) -> str:

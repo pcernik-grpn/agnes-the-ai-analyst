@@ -28875,6 +28875,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/certificate": {
+      "get": {
+        "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
+        "operationId": "certificate_api_admin_sharepoint_connections__connection_id__certificate_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Certificate",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
         "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
