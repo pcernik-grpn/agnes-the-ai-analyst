@@ -197,14 +197,23 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     protocol error (never split across requests, per §7.2). ``documents``
     may be omitted only when every evidence ``doc_id`` already resolves
     through a prior upload's ``corpus_file_sources`` mapping — otherwise
-    400 with the unresolved ids itemized. Everything else — the verbatim
-    gate, deferred-vs-rejected, union vs `full_documents` replace, alias/
-    edge resolution, correction re-attachment, the post-ingest orphan
-    sweep — happens in :meth:`FactsPgRepository.ingest_batch`; this
+    400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)
+    can anchor more than one ``corpus_file_sources`` row for the same
+    ``doc_id``; resolution is corpus-scoped and deterministic (indexed
+    copies preferred, ``corpus_file_id`` as tiebreak) — never an arbitrary
+    cross-collection pick, since that would mis-scope a claim's visibility.
+    Everything else — the verbatim gate, deferred-vs-rejected, union vs
+    `full_documents` replace, alias/edge resolution, correction
+    re-attachment, the post-ingest orphan sweep — happens in
+    :meth:`FactsPgRepository.ingest_batch`; this
     handler only translates its typed exceptions to HTTP status codes.
     Response IS the run report: ``{claims_written, claims_rejected:
     [{row, reason}], deferred: [...], subjects_created, subjects_deleted,
-    corrections_active: [...], review_items: [...]}``.
+    corrections_active: [...], review_items: [...], claims_resolved_global}``.
+    ``claims_resolved_global`` counts claims whose ``doc_id`` resolved
+    outside every corpus this batch's ``documents[]`` declared (the
+    unrestricted global fallback) — non-zero surfaces an ambiguous
+    resolution rather than silently picking one.
 
     A copy of that same report is ALSO persisted to ``facts_ingest_runs``
     (``GET /api/facts/ingest-runs``, the source card's pipeline strip and

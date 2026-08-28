@@ -980,6 +980,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   four sign-in paths (OAuth, magic-link, password form, login pages) resolve
   `next` through the one implementation that knows about app origins.
 
+- **Facts ingest resolves a duplicate `doc_id` deterministically and within its declaring collection, instead of picking an arbitrary copy across ALL collections (TCRD-241).** A byte-identical SharePoint copy shares its sha-derived `doc_id` with every other copy of the same file, so more than one `corpus_file_sources` row can legally anchor the same `doc_id` — possibly in a different Collection. `FactsPgRepository.ingest_batch` previously resolved evidence with an unscoped `SELECT … WHERE source_doc_id = :doc_id LIMIT 1`, which could attach a claim to whichever collection's copy happened to sort first — mis-scoping the claim's visibility onto the wrong collection's grants and, on `full_documents` replace, leaving a stale claim behind on the copy that didn't win. Resolution is now corpus-scoped and deterministic (indexed copies preferred, `corpus_file_id` as a tiebreak): a claim resolves within the Collection its `documents[]` entry declared; an omitted doc_id is first looked up within the corpora this batch already touched, and only then falls back to an unrestricted global scan — counted separately in the run report as `claims_resolved_global` so an ambiguous cross-collection resolution is visible rather than silent. Replace mode now purges claims off every anchored copy within the declaring collection, not just the one resolution currently prefers.
+
 ### Removed
 
 ### Internal
