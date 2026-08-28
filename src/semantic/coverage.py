@@ -405,9 +405,29 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     terms = glossary_repo().list(limit=100_000)
 
     bound_tables = _metric_tables(metrics)
+
+    # Registration paths for some source types (e.g. Snowflake, before this
+    # fix) can leave `connection_id` NULL on a table that nonetheless has a
+    # real connection backing its source_type — the same fallback
+    # `src/connection_resolver.py::resolve_connection` uses at query time
+    # (NULL -> the source_type's default connection). Without it, every
+    # such table lands in the synthetic "no connection" bucket below and a
+    # real, populated connection incorrectly reports no tables. Built from
+    # the already-fetched `connections` list (not `get_default()` per table)
+    # to avoid N extra repo round-trips; mirrors `get_default()`'s own
+    # `ORDER BY created_at LIMIT 1` tie-break.
+    default_conn_id_by_source_type: Dict[str, str] = {}
+    for conn in sorted(connections, key=lambda c: c.get("created_at") or ""):
+        source_type = conn.get("source_type")
+        if conn.get("is_default") and source_type and source_type not in default_conn_id_by_source_type:
+            default_conn_id_by_source_type[source_type] = conn["id"]
+
     tables_by_connection: Dict[Optional[str], List[Dict[str, Any]]] = {}
     for table in tables:
-        tables_by_connection.setdefault(table.get("connection_id"), []).append(table)
+        conn_id = table.get("connection_id")
+        if conn_id is None:
+            conn_id = default_conn_id_by_source_type.get(table.get("source_type"))
+        tables_by_connection.setdefault(conn_id, []).append(table)
 
     # `glossary_terms.source_ref` carries TWO namespaces, and reading it as one
     # made this column lie. The Keboola metastore sync stamps the

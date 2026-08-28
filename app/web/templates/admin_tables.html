@@ -2575,6 +2575,20 @@
                                 </label>
                             </div>
                         </div>
+                        {# Per-connection picker (#347 follow-up, Snowflake), mirroring
+                           the Keboola picker above: populated client-side from
+                           GET /api/admin/source-connections?source_type=snowflake, so it
+                           needs no new server context here. Hidden by default and shown by
+                           _populateKbProjectPicker() only when that call returns at least
+                           one connection. The chosen id rides along in the register payload
+                           (see _buildSnowflakePayload) so the table isn't provenance-less. #}
+                        <div class="form-group" id="sfProjectPickerGroup" style="display:none;">
+                            <label class="form-label" for="sfProjectSelect">Snowflake connection</label>
+                            <select class="form-select ds-dropdown-native" id="sfProjectSelect"></select>
+                            {{ ds.dropdown(id='sfProjectSelect-dd', target='sfProjectSelect', aria_label='Snowflake connection', options=[]) }}
+                            <div class="form-hint">Pins this table to the selected connection.</div>
+                        </div>
+
                         <div class="form-group sf-source-table">
                             <label class="form-label" for="sfSchema">Schema (or database.schema)</label>
                             <input type="text" class="form-input" id="sfSchema" placeholder="e.g. PUBLIC">
@@ -4941,6 +4955,7 @@
         var serverOnly = document.getElementById('sfServerOnly');
         if (serverOnly) serverOnly.checked = false;
         onSfAccessModeChange();
+        _populateKbProjectPicker('sf', null, 'snowflake');
         var btn = document.getElementById('registerSnowflakeSubmitBtn');
         btn.disabled = false;
         btn.textContent = 'Register Table';
@@ -5315,18 +5330,29 @@
     // Populates + shows the per-project picker from the registry, so the
     // Register/Edit modals need no new server-rendered context for it.
     // Hidden (and the form falls back to the legacy instance-level path)
-    // when the registry has zero Keboola connections — today's behaviour
-    // on a single-source instance, unchanged. `preselectId` re-selects a
-    // row's own connection when re-opening Edit on it. Also unconditional —
-    // called from the modal-open handlers, which run on every instance.
-    async function _populateKbProjectPicker(prefix, preselectId) {
+    // when the registry has zero connections of `sourceType` — today's
+    // behaviour on a single-source instance, unchanged. `preselectId`
+    // re-selects a row's own connection when re-opening Edit on it. Also
+    // unconditional — called from the modal-open handlers, which run on
+    // every instance. `sourceType` defaults to 'keboola' so the original
+    // call sites (`_populateKbProjectPicker('kb')` /
+    // `_populateKbProjectPicker('editKb', preselectId)`) keep working
+    // unchanged; other source types (e.g. 'snowflake') pass it explicitly.
+    async function _populateKbProjectPicker(prefix, preselectId, sourceType) {
+        sourceType = sourceType || 'keboola';
         var group = document.getElementById(prefix + 'ProjectPickerGroup');
         var select = document.getElementById(prefix + 'ProjectSelect');
         if (!group || !select) return;
         select.innerHTML = '';
         var rows = [];
+        // Keboola keeps its own literal URL (rather than always building it
+        // from `sourceType`) so this stays byte-for-byte the endpoint the
+        // original picker always hit.
+        var url = sourceType === 'keboola'
+            ? '/api/admin/source-connections?source_type=keboola'
+            : '/api/admin/source-connections?source_type=' + encodeURIComponent(sourceType);
         try {
-            var r = await fetch('/api/admin/source-connections?source_type=keboola', { credentials: 'include' });
+            var r = await fetch(url, { credentials: 'include' });
             if (r.ok) rows = await r.json();
         } catch (e) {
             rows = [];
@@ -5345,7 +5371,8 @@
         // modal to open by default": the /api/admin/discover-tables legacy
         // path routes by it, not by the registry, so it alone decides
         // whether that fallback is actually reachable as an option here.
-        if (DATA_SOURCE_TYPE === 'keboola') {
+        // Only Keboola has this legacy instance-level path.
+        if (sourceType === 'keboola' && DATA_SOURCE_TYPE === 'keboola') {
             var legacy = document.createElement('option');
             legacy.value = '';
             legacy.textContent = 'Instance-level Keboola (legacy)';
@@ -5666,8 +5693,10 @@
         // Preselect the row's own project so Discover/List/Use-as-base look
         // at the project this table actually came from, not whichever the
         // picker happened to default to. Informational only — saving does
-        // not change a row's connection_id (the PUT schema has no field for
-        // that today).
+        // not change a row's connection_id: `UpdateTableRequest` accepts the
+        // field (an admin can re-pin a row via `agnes admin update-table
+        // --connection-id` or a direct PUT), but this Edit modal doesn't
+        // wire the picker's selection into `_buildKeboolaEditPayload` yet.
         _populateKbProjectPicker('editKb', table.connection_id || null);
         var bucket = table.bucket || '';
         var sourceTable = table.source_table || '';
@@ -6297,6 +6326,11 @@
         var sfSourceTableEl = document.getElementById('sfSourceTable');
         var schema = sfSchemaEl.value.trim();
         var sourceTable = sfSourceTableEl.value.trim();
+        // Pins the row to the connection the operator selected (see the
+        // picker in the modal above) — null when the picker is hidden,
+        // which the backend already treats as "use the default connection
+        // for this source_type" (unchanged behaviour).
+        var connectionId = _kbSelectedConnectionId('sf');
 
         if (accessMode === 'synced' && syncMode === 'custom') {
             var sfSourceQueryEl = document.getElementById('sfSourceQuery');
@@ -6315,6 +6349,7 @@
                 source_query: sfSourceQuery,
                 profile_after_sync: false,
                 server_only: serverOnly,
+                connection_id: connectionId,
                 description: description,
                 folder: folder,
                 sync_schedule: syncSchedule,
@@ -6336,6 +6371,7 @@
                 source_query: 'SELECT * FROM sf."' + schema.replace(/"/g, '""') + '"."' + sourceTable.replace(/"/g, '""') + '"',
                 profile_after_sync: false,
                 server_only: serverOnly,
+                connection_id: connectionId,
                 description: description,
                 folder: folder,
                 sync_schedule: syncSchedule,
@@ -6348,6 +6384,7 @@
             bucket: schema,
             source_table: sourceTable,
             profile_after_sync: false,
+            connection_id: connectionId,
             description: description,
             folder: folder,
             sync_schedule: syncSchedule,

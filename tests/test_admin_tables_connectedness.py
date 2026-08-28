@@ -342,4 +342,38 @@ class TestPerProjectDiscover:
         c = seeded_app["client"]
         html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
         assert "Instance-level Keboola (legacy)" in html
-        assert "if (DATA_SOURCE_TYPE === 'keboola') {" in html
+
+
+class TestSnowflakePerProjectDiscover:
+    """Snowflake analog of TestPerProjectDiscover: every Snowflake
+    registration path previously left `connection_id` NULL because neither
+    the CLI nor the web UI ever sent it (`table_registry.connection_id`
+    bug). This is the web-UI half of that fix — a connection picker on the
+    register modal, wired into `_buildSnowflakePayload`."""
+
+    def test_project_selector_present_in_register_modal(self, seeded_app):
+        c = seeded_app["client"]
+        html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+        assert 'id="sfProjectSelect"' in html
+        assert 'id="sfProjectPickerGroup"' in html
+
+    def test_project_picker_populated_from_registry_endpoint(self, seeded_app):
+        c = seeded_app["client"]
+        html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+        # Reuses the shared helper (generalized to take a sourceType param)
+        # rather than a hardcoded Keboola-only literal.
+        assert "function _populateKbProjectPicker(" in html
+        assert "_populateKbProjectPicker('sf', null, 'snowflake')" in html
+        start = html.index("function _populateKbProjectPicker")
+        end = html.index("function ", start + len("function _populateKbProjectPicker"))
+        body = html[start:end]
+        assert "'/api/admin/source-connections?source_type=' + encodeURIComponent(sourceType)" in body
+
+    def test_register_payload_carries_connection_id_when_project_selected(self, seeded_app):
+        c = seeded_app["client"]
+        html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+        start = html.index("function _buildSnowflakePayload")
+        end = html.index("function ", start + len("function _buildSnowflakePayload"))
+        body = html[start:end]
+        assert "_kbSelectedConnectionId('sf')" in body
+        assert "connection_id: connectionId" in body

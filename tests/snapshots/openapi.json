@@ -10529,6 +10529,18 @@
             ],
             "title": "Bucket"
           },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pin this table to a named source connection (source_connections.id). NULL uses the default connection for the row's source_type. The referenced connection must exist; an unknown id returns 400.",
+            "title": "Connection Id"
+          },
           "description": {
             "anyOf": [
               {
@@ -11612,7 +11624,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.71.60"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {

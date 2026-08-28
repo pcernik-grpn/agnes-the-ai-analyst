@@ -668,6 +668,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   metrics unbound even after a correctly-shaped identifier matched in every
   other respect.
 
+- **Snowflake table registrations were never linking `connection_id`**, so
+  `compute_cross_domain_coverage` bucketed every Snowflake table under the
+  synthetic "no connection" group and a Snowflake connection with registered
+  tables still reported `not_applicable`/no tables. The CLI (`agnes admin
+  register-table` / `update-table`) and the `/admin/tables` register modal
+  now send `--connection-id` / a connection picker for Snowflake, matching
+  the Keboola flow. `PUT /api/admin/registry/{id}` also newly accepts
+  `connection_id`, so an existing NULL row can be re-pinned without delete +
+  recreate. `compute_cross_domain_coverage` additionally falls back a NULL
+  `connection_id` to its source_type's default connection (same rule
+  `src/connection_resolver.py::resolve_connection` uses at query time),
+  reducing blast radius for any other source type hitting the same gap.
+
 - Semantic-layer health's `orphaned_models` check no longer flags every
   Keboola- and legacy-Databricks-sourced model as disconnected. It compared
   every non-manual model's `source_ref` against `semantic_sources.id`, but

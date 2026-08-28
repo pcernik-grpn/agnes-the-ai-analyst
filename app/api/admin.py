@@ -4138,6 +4138,18 @@ class UpdateTableRequest(BaseModel):
     access_policy_sql: Optional[str] = None
     access_policy_note: Optional[str] = None
     policy_mapping: Optional[bool] = None
+    # v79 — see RegisterTableRequest.connection_id. PUT lets an admin pin (or
+    # re-pin) an already-registered row to a named connection — including
+    # fixing a row that was registered before this field existed and is
+    # sitting on a NULL connection_id.
+    connection_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type. "
+            "The referenced connection must exist; an unknown id returns 400."
+        ),
+    )
 
     @field_validator("access_policy_sql", mode="before")
     @classmethod
@@ -5534,6 +5546,21 @@ async def update_table(
     existing = repo.get(table_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Table not found")
+
+    # v79 — validate connection_id FK before persisting, mirroring
+    # register_table. Checked directly against the request field (not
+    # `updates`) so an explicit `connection_id: null` (meaning "use the
+    # default connection") is treated the same as omission -- both skip
+    # the FK lookup, and an omitted field never clobbers the stored value
+    # once `updates`/`merged` below apply exclude_unset=True.
+    if request.connection_id is not None:
+        from src.repositories import source_connections_repo
+
+        if source_connections_repo().get(request.connection_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"connection_id '{request.connection_id}' not found in source_connections",
+            )
 
     # `exclude_unset=True` honors the PUT-shape distinction between
     # "field omitted from body" (keep existing) vs "field sent as null"
