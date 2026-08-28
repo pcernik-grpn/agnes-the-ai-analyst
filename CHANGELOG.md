@@ -43,6 +43,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+- **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 
 ## [0.91.0] - 2026-08-28
 
