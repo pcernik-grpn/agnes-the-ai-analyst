@@ -277,6 +277,23 @@ auth:
   #   allow_token_header: false     # X-StorageApi-Token API auth; see docs/feature-flags.md
   #   multi_project_mode: disabled  # disabled | select | auto; see docs/feature-flags.md
 
+  # --- Microsoft Entra ID group sync (optional) ---
+  # Mirrors the signed-in user's Entra ID group memberships into
+  # user_group_members (source='microsoft_sync') on every Microsoft
+  # sign-in, the way Google sync mirrors Workspace groups. Off by default:
+  # enabling it also widens the OAuth consent scope requested at
+  # /auth/microsoft/login to the delegated Graph permission
+  # GroupMember.Read.All, which needs its own admin-consent grant in the
+  # Entra app registration — see docs/auth-microsoft-oauth.md before
+  # turning this on.
+  # microsoft:
+  #   group_sync_enabled: false     # AGNES_MICROSOFT_GROUP_SYNC_ENABLED env override
+  #
+  # AGNES_MICROSOFT_GROUP_PREFIX (env-only, like Google's
+  # AGNES_GOOGLE_GROUP_PREFIX — neither has an instance.yaml key): when set,
+  # only mirror/allow groups whose identifier starts with this
+  # (case-insensitive) prefix.
+
 # --- Security (optional) ---
 # security:
 #   # Hostnames exempt from the private/reserved-network SSRF guard on admin-
