@@ -201,6 +201,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **Access rows adopt the Library's row states.** Hover is the same grey the
+  rail uses for "the thing I am pointing at", so a row here and a destination
+  in the sidebar do not answer one gesture in two colours. Keyboard focus gets
+  the Library's treatment too — the row's own kind as an 8% wash plus a 2px
+  rail on the leading edge (`.lib-row:focus-within`) — so tabbing through the
+  table is as legible as pointing at it. Both views' tables are the same
+  surface, frame and header.
 - **A kind is the same colour in the admin table as in the Library.** Each row's
   kind chip resolves one variable — `--kind: var(--ds-kind-<kind>)` — exactly as
   the detail hero (`macros/_detail.html`) and the Library's bands (`--lib-kind`)

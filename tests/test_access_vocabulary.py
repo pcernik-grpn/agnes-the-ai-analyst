@@ -161,7 +161,9 @@ class TestRowsAndTheirHandlerAgree:
         never have been caught by using that view.
         """
         src = self._source()
-        assert src.count('class="ax-r" data-type=') == 2   # one per view
+        # Rows now carry their kind too (the keyboard rail wears it), so the
+        # attribute order differs — match on the class plus the row id.
+        assert src.count('<div class="ax-r" data-kind=') == 2   # one per view
         assert "<tr data-type=" not in src
         assert 'class="ax-gs ax-gs--bb' in src             # a bundle is a group-shaped row
 

@@ -1516,6 +1516,51 @@
      category above it rather than to the table at large. */
   .ax-r { padding-left: 10px; }
   .ax-colhd > :first-child { padding-left: 0; }
+  /* ══ The table is a surface, as it is in the Library ════════════════════
+     The rows had a hover the whole time and nobody could see it: the page
+     ground is `--ds-bg` (#f3f6fa) and the hover is `--ds-surface-dim`
+     (#f5f7fb), two units apart. The Library's rows read because its list
+     sits on `--ds-surface` — white — and the dim grey lands ON that.
+
+     So the TABLE gets the Library's surface and frame (`.lib-list`), while
+     the rest of an open group stays on the page ground. That is the
+     distinction: a card around the whole group was the thing that read as a
+     separate page; a surface under a table is what makes a table a table. */
+  .ax-table {
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-lg, 8px);
+    overflow: clip;
+  }
+  .ax-table .ax-colhd { padding-left: 12px; }
+  .ax-table .ax-fam__hd { padding-left: 12px; }
+  .ax-table .ax-r { padding-left: 12px; padding-right: 12px; }
+  .ax-table .ax-fam:last-child .ax-r:last-child { border-bottom: 0; }
+
+  /* Row states, in the Library's order and its greys — hover is the same
+     grey the rail uses for "the thing I am pointing at", so a row here and a
+     destination in the sidebar do not answer one gesture in two colours. */
+  .ax-table .ax-r:hover { background-color: var(--ds-surface-dim); }
+  /* Keyboard parity: the focused row wears its kind as a wash plus a rail on
+     the leading edge, exactly as `.lib-row:focus-within` does. */
+  .ax-r[data-kind="data"], .ax-r__kd[data-kind="data"]       { --kind: var(--ds-kind-data); }
+  .ax-r[data-kind="memory"], .ax-r__kd[data-kind="memory"]   { --kind: var(--ds-kind-memory); }
+  .ax-r[data-kind="recipe"], .ax-r__kd[data-kind="recipe"]   { --kind: var(--ds-kind-recipe); }
+  .ax-r[data-kind="library"], .ax-r__kd[data-kind="library"] { --kind: var(--ds-kind-library); }
+  .ax-r[data-kind="file"], .ax-r__kd[data-kind="file"]       { --kind: var(--ds-kind-file); }
+  .ax-r[data-kind="app"], .ax-r__kd[data-kind="app"]         { --kind: var(--ds-kind-app); }
+  .ax-r[data-kind="plugin"], .ax-r__kd[data-kind="plugin"]   { --kind: var(--ds-kind-plugin); }
+  .ax-r[data-kind="skill"], .ax-r__kd[data-kind="skill"]     { --kind: var(--ds-kind-skill); }
+  .ax-r[data-kind="agent"], .ax-r__kd[data-kind="agent"]     { --kind: var(--ds-kind-agent); }
+  .ax-table .ax-r:focus-within {
+    background-color: color-mix(in srgb, var(--kind, var(--ds-text-muted)) 8%, transparent);
+    box-shadow: inset 2px 0 0 var(--kind, var(--ds-text-muted));
+  }
+
+  /* The band sits on the table's own surface now, so its fill is the
+     primitive's header grey rather than a tint over the page. */
+  .ax-fam__hd { background: var(--ds-surface-dim); }
+  .ax-colhd { border-bottom: 1px solid var(--ds-border-light); }
 </style>
 {% endblock %}
 
@@ -2328,7 +2373,7 @@
           ? tierControl(tier, true)
           : `<span class="ax-ctl"><button type="button" class="ax-revoke" data-revoke>Revoke</button></span>`;
       return `
-      <div class="ax-r" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
+      <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}">
         <span class="ax-r__kd" data-kind="${esc(kindToken(t))}">${esc(kindWord(t))}</span>
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
           <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
@@ -2403,7 +2448,8 @@
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const painted = (addRow + colhd + sections) || (fq
+    const table = sections ? `<div class="ax-table">${colhd}${sections}</div>` : "";
+    const painted = (addRow + table) || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
       : `<div class="dsec-empty"><strong>This group has nothing granted yet</strong>
@@ -3071,7 +3117,7 @@
       const who = whoGranted(grant);
       const tiered = TIERED.has(r.t.type_key);
       return `
-      <div class="ax-r" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}">
+      <div class="ax-r" data-kind="${esc(kindToken(r.t))}" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}">
         <span class="ax-r__nm">${esc(titleOf(g))}</span>
         <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
@@ -3120,11 +3166,13 @@
           </button>
           ${nobody
             ? `<div class="ax-empty">Authored, then never handed to anyone.</div>`
-            : `<div class="ax-colhd">
-                 <span>Group</span><span>Who that reaches</span>
-                 <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
-               </div>
-               ${r.held.map((grant) => groupRow(r, grant)).join("")}`}
+            : `<div class="ax-table">
+                 <div class="ax-colhd">
+                   <span>Group</span><span>Who that reaches</span>
+                   <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
+                 </div>
+                 ${r.held.map((grant) => groupRow(r, grant)).join("")}
+               </div>`}
         </div>
       </details>`;
     };
