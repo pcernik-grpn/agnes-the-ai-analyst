@@ -1265,31 +1265,41 @@ def _anonymize_marked_scope_map(connection: dict) -> dict[str, str]:
 
 def _resolve_anonymization_key() -> str:
     """Resolve this instance's per-instance anonymization HMAC key (spec
-    §9.2), the SAME pattern ``connectors.sharepoint.settings`` uses for the
-    SharePoint certificate: an admin-configurable env var NAME
+    §9.2): an admin-configurable env var NAME
     (``extraction.anonymization.hmac_key_env``, default
-    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against the shared token-env
-    allowlist (:func:`src.orchestrator_security.is_token_env_allowed`)
-    BEFORE the value is read. That allowlist gate matters here for the same
-    reason it matters for the certificate: the env var NAME is
-    admin-writable config, so without it an admin could point
-    ``hmac_key_env`` at an unrelated instance secret (``ANTHROPIC_API_KEY``,
-    ``JWT_SECRET_KEY``, ...) and have it forwarded to the external producer
-    as if it were the anonymization key. Raises
-    :class:`AnonymizationKeyError` (never returns a fallback/empty key) when
-    the name is disallowed or unset — see that class's docstring for why.
+    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against
+    :func:`src.orchestrator_security.is_producer_key_env_allowed` BEFORE the
+    value is read. The env var NAME is admin-writable config, so without a
+    gate an admin could point ``hmac_key_env`` at an unrelated instance
+    secret (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``, ...) and have it
+    forwarded to the external producer as if it were the anonymization key.
+
+    Deliberately uses ``is_producer_key_env_allowed`` — a SEPARATE, narrower
+    allowlist from ``is_token_env_allowed`` (the connector-ATTACH `token_env`
+    gate) — NOT the same function the SharePoint certificate resolver uses.
+    Sharing the certificate's allowlist would additionally make this key a
+    legal `token_env` for a connector-written `_remote_attach` row (a
+    SECOND, unrelated consumer of that allowlist in ``src/orchestrator.py``
+    / ``src/db.py``), letting a malicious connector exfiltrate the resolved
+    key value via ``ATTACH ... TOKEN`` to a connector-chosen URL (RBAC
+    review, 2026-08-28). See ``_PRODUCER_KEY_ENVS``'s docstring in
+    ``src/orchestrator_security.py`` for the full trust-boundary argument.
+
+    Raises :class:`AnonymizationKeyError` (never returns a fallback/empty
+    key) when the name is disallowed or unset — see that class's docstring
+    for why.
     """
     from app.instance_config import get_value
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_producer_key_env_allowed
 
     env_name = str(get_value("extraction", "anonymization", "hmac_key_env", default="") or "").strip()
     env_name = env_name or _ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
 
-    if not is_token_env_allowed(env_name):
+    if not is_producer_key_env_allowed(env_name):
         raise AnonymizationKeyError(
-            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed credential "
-            "variable. Add it to AGNES_REMOTE_ATTACH_TOKEN_ENVS if the deployment really uses "
-            "that name for the anonymization key, or use the default AGNES_ANONYMIZATION_HMAC_KEY."
+            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed anonymization "
+            f"key variable. Use the default name, {_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT}, or leave "
+            "hmac_key_env empty."
         )
 
     value = os.environ.get(env_name)

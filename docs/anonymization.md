@@ -64,14 +64,20 @@ extraction:
     hmac_key_env: ""   # empty = use the default name below
 ```
 
-`hmac_key_env` names the environment variable holding the key — resolved
-the SAME way `connectors/sharepoint/settings.py` resolves the SharePoint
-certificate: the name is checked against the shared token-env allowlist
-(`AGNES_REMOTE_ATTACH_TOKEN_ENVS`, default includes
-`AGNES_ANONYMIZATION_HMAC_KEY`) *before* the value is read, because the
-config value is admin-writable and an unchecked name could be pointed at an
-unrelated instance secret. Leave `hmac_key_env` empty to use the default
-name, `AGNES_ANONYMIZATION_HMAC_KEY`.
+`hmac_key_env` names the environment variable holding the key — checked
+against an allowlist *before* the value is read, because the config value
+is admin-writable and an unchecked name could be pointed at an unrelated
+instance secret. Leave `hmac_key_env` empty (or set it to
+`AGNES_ANONYMIZATION_HMAC_KEY`) to use the default name; any other name is
+refused.
+
+That allowlist is **deliberately its own, separate list** — NOT the
+connector-ATTACH `token_env` allowlist (`AGNES_REMOTE_ATTACH_TOKEN_ENVS`)
+the SharePoint certificate and other data-source credentials use. A
+`_remote_attach` row in a connector's `extract.duckdb` can never reference
+`AGNES_ANONYMIZATION_HMAC_KEY` as its `token_env`, because the two
+allowlists never share membership — see `src/orchestrator_security.py`'s
+`_PRODUCER_KEY_ENVS` for the full reasoning.
 
 Generate a random value once per instance and never reuse it across
 deployments:

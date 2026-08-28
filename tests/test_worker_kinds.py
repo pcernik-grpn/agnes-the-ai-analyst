@@ -899,10 +899,39 @@ class TestCorpusExtractionHandler:
         self._fake_run_capturing(monkeypatch, calls)
         handler = self._register()
 
-        with pytest.raises(RuntimeError, match="not an allowed credential"):
+        with pytest.raises(RuntimeError, match="not an allowed anonymization key variable"):
             handler({"connection_id": "conn1"})
         assert calls == []
 
+    def test_anonymize_key_env_cannot_reuse_the_attach_token_allowlist(self, monkeypatch):
+        """RBAC review, 2026-08-28: a name that IS on the connector-ATTACH
+        token-env allowlist (e.g. the SharePoint certificate's own name)
+        must NOT thereby be usable as the anonymization key env — the two
+        allowlists are deliberately disjoint (see
+        src/orchestrator_security.py's ``_PRODUCER_KEY_ENVS`` docstring)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "leaked-if-not-gated")
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {
+                    "extraction": {
+                        "enabled": True,
+                        "producer": {"command": "python -m fake_producer"},
+                        "timeout_s": 60,
+                        "anonymization": {"hmac_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
+                    }
+                }
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+
+        calls: list = []
+        self._fake_run_capturing(monkeypatch, calls)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="not an allowed anonymization key variable"):
+            handler({"connection_id": "conn1"})
+        assert calls == []
 
     def test_producer_output_is_not_buffered_in_this_process(self, monkeypatch):
         """The producer may run for `extraction.timeout_s` (an hour by
