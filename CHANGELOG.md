@@ -819,6 +819,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   the documented strict-deny on a path-shaped literal (`WHERE c =
   'bq.unreg.tbl'`) is unchanged — masking those would trade one evasion for
   another. `dbx` gates on a parse rather than a regex and was never affected.
+- **One vocabulary for empty vs blocked vs forbidden (TCRD-207).** Nine
+  design reviews independently found the same collapse: a search that ran and
+  matched nothing, an access denial, and a request that never completed all
+  rendered as the same quiet state on different surfaces, in different words.
+  Investigation found most of the nine already patched piecemeal (collections
+  search, `/admin/linked-apps`, `/admin/semantic-layer`, `/chat` sources,
+  `/me/connections`, `/admin/data-sources`, the corporate-memory review
+  queue) — each with its own wording, none sharing a component. One still-live
+  bug remained: `/chat`'s conversation list (both the rail's renderer and the
+  chat page's own boot path) caught a failed `GET /api/chat/sessions` and
+  showed the exact same "No conversations yet." a genuinely empty account
+  gets — indistinguishable from "your account cannot see the conversation
+  list," even though the conversations were still saved. Fixed with a new
+  shared component, `state.panel()` (`app/web/templates/macros/_state.html`,
+  `app/web/static/css/state_panel.css`) covering four states — nothing
+  matched a query, the collection is genuinely empty, a disclosed access
+  block, and a failed request — each visually distinct (neutral / warn /
+  danger tone, distinct icon), applied to the chat conversation list (adding
+  the missing FAILED state with a Retry action) and the admin moderation
+  queues. The remaining surfaces, `/library` among them, follow separately —
+  they already tell their states apart in copy; what they lack is the shared
+  component. Decision + the security tradeoff
+  on acknowledging blocked-vs-absent:
+  `docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md`.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
