@@ -607,3 +607,18 @@ def test_test_mode_predicts_identity_conflict(sso_pg, monkeypatch):
     assert r.status_code == 200
     assert "sso_identity_conflict" in r.text
     assert "every check passed" not in r.text
+
+
+def test_test_mode_predicts_stale_binding_replacement(sso_pg, monkeypatch):
+    """A user holding a stale binding from a re-pointed tenant: the real
+    callback REPLACES it — the test page must say so, not claim a plain
+    first-time attach."""
+    client, admin_token = sso_pg
+    _bind(subject="oid-old", tenant_id=OTHER_TENANT)  # stale, other tenant
+
+    fake = _install_fake_client(monkeypatch, token={"userinfo": _userinfo()})
+    client.cookies.set("access_token", admin_token)
+    client.get("/auth/sso/login?mode=test", follow_redirects=False)
+    r = client.get(f"/auth/sso/callback?code=x&state={fake.last_state}", follow_redirects=False)
+    assert r.status_code == 200
+    assert "replacing its stale binding" in r.text

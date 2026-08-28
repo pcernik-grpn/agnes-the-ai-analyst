@@ -69,6 +69,8 @@
                 sign in as {{ binding_account_email }} (already linked to this external identity)
                 {% elif binding_outcome == 'attach' %}
                 link existing account {{ binding_account_email }} (first SSO sign-in attaches by email)
+                {% elif binding_outcome == 'replace' %}
+                sign in as {{ binding_account_email }}, replacing its stale binding from a previously configured tenant
                 {% elif binding_outcome == 'create' %}
                 create a NEW account for {{ resolved_email }}
                 {% elif binding_outcome == 'refused' %}

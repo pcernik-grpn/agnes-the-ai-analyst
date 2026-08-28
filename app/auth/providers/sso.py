@@ -248,7 +248,9 @@ def _audit_linked(user_id: str, subject: str, replaced_subject: Optional[str] = 
     if replaced_subject:
         params["replaced_subject"] = replaced_subject
     try:
-        _repositories.audit_repo().log(user_id=user_id, action="sso.identity.linked", resource=f"user:{user_id}", params=params)
+        _repositories.audit_repo().log(
+            user_id=user_id, action="sso.identity.linked", resource=f"user:{user_id}", params=params
+        )
     except Exception:
         logger.warning("audit log failed for sso.identity.linked")
 
@@ -392,7 +394,10 @@ def preview_binding(*, subject: str, tenant_id: str, email: str) -> dict[str, An
 
     Returns ``{"outcome", "refusal", "account_email"}`` where ``outcome`` is
     ``sign_in`` (subject already bound), ``attach`` (first SSO sign-in links
-    an existing account), ``create`` (a new account would be provisioned), or
+    an existing account), ``replace`` (the account holds a stale binding
+    from a re-pointed tenant/protocol which a real sign-in replaces —
+    barring a concurrent-login race, which the real flow resolves by
+    refusing), ``create`` (a new account would be provisioned), or
     ``refused`` (with ``refusal`` carrying the same error code the real
     callback would redirect with). Kept in lockstep with the binding
     algorithm — a rule added there belongs here too, or the test page lies.
@@ -415,8 +420,13 @@ def preview_binding(*, subject: str, tenant_id: str, email: str) -> dict[str, An
     if not bool(existing_user.get("active", True)):
         return {"outcome": "refused", "refusal": "deactivated", "account_email": existing_user["email"]}
     row = ids_repo.get_by_user_id(existing_user["id"])
-    if row and (row["provider_type"], row["tenant_id"]) == (PROVIDER_TYPE, tenant_id) and row["subject"] != subject:
-        return {"outcome": "refused", "refusal": "sso_identity_conflict", "account_email": existing_user["email"]}
+    if row:
+        if (row["provider_type"], row["tenant_id"]) != (PROVIDER_TYPE, tenant_id):
+            # Stale binding from a config that no longer exists — the real
+            # callback replaces it (the binding algorithm's replacement rule).
+            return {"outcome": "replace", "refusal": None, "account_email": existing_user["email"]}
+        if row["subject"] != subject:
+            return {"outcome": "refused", "refusal": "sso_identity_conflict", "account_email": existing_user["email"]}
     return {"outcome": "attach", "refusal": None, "account_email": existing_user["email"]}
 
 
