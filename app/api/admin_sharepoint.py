@@ -84,8 +84,13 @@ class ConfirmScopeBody(BaseModel):
     display_path: str = Field(..., min_length=1)
     anonymize: bool = False
     # Step 3: applied as ordinary `resource_grants` rows on the collection —
-    # never stored on the scope row itself (see module docstring).
-    group_ids: List[str] = Field(default_factory=list)
+    # never stored on the scope row itself (see module docstring). ``None``
+    # (the field omitted) and ``[]`` mean DIFFERENT things: omitted is "this
+    # call is not about sharing" (step 2 confirming a scope, a rename, an
+    # anonymize toggle), while an explicit empty list is the admin unticking
+    # the last group — the very state the row's "indexed but invisible"
+    # warning describes, so it has to be honoured rather than read as silence.
+    group_ids: Optional[List[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -252,10 +257,15 @@ async def confirm_scope(
     ``source_scope_id`` reuses that same collection (idempotent) and updates
     ``display_path``/``anonymize`` in place — a rename or move in the source
     does not fork a second collection (§6 applied to the wizard's own
-    bookkeeping). ``group_ids``, if given, are applied as ordinary
-    ``resource_grants`` rows on the collection (step 3) — additive, never
-    replacing grants set elsewhere (e.g. the collection detail page,
-    ``/admin/access``).
+    bookkeeping). ``group_ids``, **if the field is present**, is the complete
+    set of groups for this collection (step 3): listed groups are granted,
+    and any other group's grant on this collection is revoked. The wizard's
+    checkboxes are pre-checked from the grants that exist and its row warns
+    the moment the last one is unticked, so the screen already promises that
+    unticking removes access — making the handler additive-only meant the
+    admin was shown a revocation that never happened. Omitting the field
+    touches no grant at all, which is what keeps a rename or an anonymize
+    toggle from stripping access as a side effect.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -291,13 +301,21 @@ async def confirm_scope(
     new_config = {**(row.get("config") or {}), "scopes": scopes}
     source_connections_repo().update(connection_id, config=new_config)
 
-    for group_id in body.group_ids:
-        resource_grants_repo().ensure_grant(
-            group_id,
-            ResourceType.COLLECTION.value,
-            collection_id,
-            assigned_by=user.get("id"),
-        )
+    if body.group_ids is not None:
+        wanted = set(body.group_ids)
+        grants = resource_grants_repo()
+        for group_id in wanted:
+            grants.ensure_grant(
+                group_id,
+                ResourceType.COLLECTION.value,
+                collection_id,
+                assigned_by=user.get("id"),
+            )
+        # Revoke what was unticked. Scoped to grants on THIS collection, so a
+        # group's access to anything else is untouched.
+        for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
+            if grant.get("resource_id") == collection_id and grant.get("group_id") not in wanted:
+                grants.delete(grant["id"])
 
     logger.info(
         "sharepoint connection %s: scope %s confirmed -> collection %s",

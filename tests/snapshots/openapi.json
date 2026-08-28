@@ -1752,11 +1752,18 @@
             "type": "string"
           },
           "group_ids": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Group Ids",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Ids"
           },
           "source_scope_id": {
             "minLength": 1,
@@ -28135,7 +28142,7 @@
         ]
       },
       "post": {
-        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, if given, are applied as ordinary\n``resource_grants`` rows on the collection (step 3) \u2014 additive, never\nreplacing grants set elsewhere (e.g. the collection detail page,\n``/admin/access``).",
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize`` in place \u2014 a rename or move in the source\ndoes not fork a second collection (\u00a76 applied to the wizard's own\nbookkeeping). ``group_ids``, **if the field is present**, is the complete\nset of groups for this collection (step 3): listed groups are granted,\nand any other group's grant on this collection is revoked. The wizard's\ncheckboxes are pre-checked from the grants that exist and its row warns\nthe moment the last one is unticked, so the screen already promises that\nunticking removes access \u2014 making the handler additive-only meant the\nadmin was shown a revocation that never happened. Omitting the field\ntouches no grant at all, which is what keeps a rename or an anonymize\ntoggle from stripping access as a side effect.",
         "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
         "parameters": [
           {

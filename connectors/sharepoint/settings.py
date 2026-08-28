@@ -111,8 +111,15 @@ def _vault_secret_updated_at(connection_id: str) -> Optional[datetime]:
     try:
         from src.repositories import connection_secrets_repo
 
-        return connection_secrets_repo().updated_at(connection_id)
-    except Exception:  # pragma: no cover — no vault configured, or no such row
+        raw = connection_secrets_repo().updated_at(connection_id)
+        if raw is None or isinstance(raw, datetime):
+            return raw
+        # Both backends return ``str(row[0])`` — "2026-08-20 12:00:00[.ffffff]"
+        # — while this field is a datetime its one consumer calls
+        # ``.isoformat()`` on. Parse here rather than widen the repo contract,
+        # which every other caller reads as a display string.
+        return datetime.fromisoformat(str(raw))
+    except Exception:  # no vault configured, no such row, or an unreadable stamp
         logger.debug("sharepoint: no vault set-date for connection %s", connection_id, exc_info=True)
         return None
 

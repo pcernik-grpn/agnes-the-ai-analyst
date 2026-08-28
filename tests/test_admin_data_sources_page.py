@@ -1395,6 +1395,43 @@ class TestSharePointSourceCard:
         finally:
             source_connections_repo().delete(conn_id)
 
+    def test_a_vault_certificate_reports_its_set_date_not_an_error(self, seeded_app, monkeypatch):
+        """The vault leg had no end-to-end cover here, and that is where it
+        broke: the repos hand back ``str(row[0])`` while this cell calls
+        ``.isoformat()``, so the AttributeError landed in the block's own
+        ``except`` and a working certificate rendered as unconfigured with a
+        stray Python error in its place.
+        """
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Vault SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+
+        class _VaultRepo:
+            def get(self, connection_id):
+                return "-----BEGIN PRIVATE KEY-----\nvalue\n-----END PRIVATE KEY-----"
+
+            def updated_at(self, connection_id):
+                return "2026-08-20 12:00:00"
+
+        monkeypatch.setattr("src.repositories.connection_secrets_repo", lambda: _VaultRepo())
+        try:
+            cert = _source_inventory()["pipelines"][conn_id]["file_source"]["certificate"]
+            assert cert["error"] is None, f"a resolvable vault credential must not report an error: {cert}"
+            assert cert["origin"] == "vault"
+            assert cert["set_at"] and cert["set_at"].startswith("2026-08-20T12:00:00")
+            assert "-----BEGIN PRIVATE KEY-----" not in str(cert)
+        finally:
+            source_connections_repo().delete(conn_id)
+
     def test_certificate_row_never_carries_the_value(self, seeded_app, monkeypatch):
         import uuid
 

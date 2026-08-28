@@ -329,6 +329,87 @@ class TestNoGroupWarning:
         assert confirmed.json()["no_group_warning"] is False
         assert confirmed.json()["group_ids"] == [group_id]
 
+    def test_unchecking_a_group_in_the_share_step_revokes_its_access(self, seeded_app):
+        """The wizard's step-3 checkboxes are pre-checked from the grants that
+        exist and the row re-renders its "indexed but invisible — no group
+        yet" warning the moment the last one is unticked, so the UI states an
+        outcome. It only ever POSTed the *checked* ids into a handler that only
+        ever added, so unticking left the group's access in place while the
+        screen said it was gone. ``group_ids`` is a SET for this collection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="revoke-conn")
+
+        keep = c.post("/api/admin/groups", json={"name": "sp-keep"}, headers=_auth(token)).json()["id"]
+        drop = c.post("/api/admin/groups", json={"name": "sp-drop"}, headers=_auth(token)).json()["id"]
+
+        first = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:rev", "display_path": "Rev", "group_ids": [keep, drop]},
+            headers=_auth(token),
+        )
+        assert first.status_code == 201, first.text
+        assert sorted(first.json()["group_ids"]) == sorted([keep, drop])
+
+        # Re-confirm with `drop` unticked — the shape the finish button posts.
+        again = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:rev", "display_path": "Rev", "group_ids": [keep]},
+            headers=_auth(token),
+        )
+        assert again.status_code == 201, again.text
+        assert again.json()["group_ids"] == [keep], "unchecking must revoke, not just stop re-adding"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["group_ids"] == [keep]
+
+    def test_unticking_the_last_group_is_honoured_not_ignored(self, seeded_app):
+        """An empty list is a real answer here — it is exactly the state the
+        row's own ⚠ warning describes — so it must revoke rather than be read
+        as "nothing to say about sharing"."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="revoke-all-conn")
+        gid = c.post("/api/admin/groups", json={"name": "sp-last"}, headers=_auth(token)).json()["id"]
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:none", "display_path": "None", "group_ids": [gid]},
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:none", "display_path": "None", "group_ids": []},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["group_ids"] == []
+        assert r.json()["no_group_warning"] is True
+
+    def test_omitting_group_ids_leaves_existing_grants_alone(self, seeded_app):
+        """The other half of the contract, and the reason revoking keys on the
+        field being PRESENT rather than on the list being empty: step 2
+        confirms a scope without saying anything about sharing, and a rename
+        or an anonymize toggle must never strip access as a side effect."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="omit-conn")
+        gid = c.post("/api/admin/groups", json={"name": "sp-omit"}, headers=_auth(token)).json()["id"]
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:omit", "display_path": "Omit", "group_ids": [gid]},
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:omit", "display_path": "Renamed"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["group_ids"] == [gid], "an omitted field must not revoke"
+        assert r.json()["display_path"] == "Renamed"
+
     def test_unknown_group_id_rejected(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]

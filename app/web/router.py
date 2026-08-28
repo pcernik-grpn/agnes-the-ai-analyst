@@ -7602,6 +7602,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "error": None,
         }
     except Exception as e:
+        # Logged, not just rendered: this block swallowed a real type bug
+        # (a str set-date reaching .isoformat()) for as long as its only
+        # signal was the word "unconfigured" on a card.
+        logger.warning(
+            "source card: sharepoint certificate row for connection %s failed to resolve",
+            conn.get("id"),
+            exc_info=True,
+        )
         cell["certificate"] = {"origin": None, "env_name": None, "set_at": None, "error": str(e)}
 
     # ── identity: grants across scope collections — "N groups matched /
