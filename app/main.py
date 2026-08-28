@@ -2012,7 +2012,7 @@ async def lifespan(app):
     # canary task above (started here, in the uvicorn worker process, not
     # create_app() — the --reload master must not touch the DB).
     from app.worker.kinds import register_all_kinds
-    from app.worker.runtime import default_worker_id, worker_loop
+    from app.worker.runtime import default_worker_id, selected_lanes, worker_loop
 
     # Populate the process-wide JOB_KINDS registry before the loop starts
     # claiming work — a lane slot that claims a job whose kind isn't yet
@@ -2025,6 +2025,13 @@ async def lifespan(app):
 
     _worker_task = None
     if role_enabled(Role.WORKER):
+        # Fail fast, synchronously, on a bad AGNES_WORKER_LANES token — same
+        # posture as the AGNES_ROLE check `role_enabled()` above already
+        # depends on (`app.roles.active_roles()` raises at first call).
+        # `worker_loop()` re-derives the same value once it actually starts
+        # running as a task; calling it here too means a typo'd lane crashes
+        # startup instead of merely failing an unawaited background task.
+        selected_lanes()
         _worker_task = asyncio.create_task(worker_loop(worker_id=default_worker_id()), name="worker-loop")
 
     async with streamable_session_manager_lifespan(app):

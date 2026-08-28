@@ -1122,6 +1122,52 @@ facts:
   single_valued_edges: ["owned_by", "for_client"]
 
 
+# --- Document extraction worker lane (optional, off by default) ---
+# Runs document extraction (crawl -> convert -> anonymize -> extract ->
+# ingest against POST /api/facts/ingest) as its OWN worker lane, driven by
+# the `corpus-extraction` job kind (app/worker/kinds.py) — its own process
+# when run via the `extraction-worker` compose service / the Dockerfile's
+# `worker` build target, so a corpus re-extraction never competes with, or
+# blocks, ordinary table syncs (spec §7.5 "Extraction inside Agnes (later)",
+# §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
+# collections-design.md).
+#
+# Agnes does NOT ship the producer (crawl/convert/anonymize/extract) — this
+# block only configures HOW to invoke whatever producer command the
+# deployment provides. The producer is keboola/cuesta-star-graph, adopted
+# per spec §7.1; it is never vendored into this repo. A plain `docker
+# compose up` (no `--target worker` build, no EXTRACTION_PRODUCER_INSTALL
+# build-arg) has nothing to invoke here — `corpus-extraction` fails clean
+# with a config error rather than a crash until a producer is configured.
+#
+# Plain instance data (not a switch — no admin UI toggle exists for this
+# yet), read directly via get_value: enabling it is a config-file/env-var
+# operator action, same posture as `initial_workspace:` above.
+extraction:
+  enabled: false
+  producer:
+    # Full command line for the producer entrypoint, e.g.:
+    #   command: "python -m cuesta_star_graph.run"
+    # OR, when the worker image installed it as a package (see the
+    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
+    #   module: cuesta_star_graph.run
+    # `command` wins when both are set. Either form MAY be a YAML list
+    # instead of a string, taken verbatim (no shell-splitting needed then).
+    command: ""
+    module: ""
+  # Hard ceiling on one producer run, in seconds — the subprocess is killed
+  # at this timeout and the job fails (no automatic retry: a failed
+  # producer run usually needs an operator to look at it).
+  timeout_s: 3600
+  # SECURITY: credentials are NEVER configured here. The producer's
+  # SharePoint tenant/client id + certificate are resolved from the
+  # connection's own vault slot, or the server's SHAREPOINT_CERT_PRIVATE_KEY
+  # env var — the SAME resolution connectors/sharepoint/settings.py already
+  # does for the SharePoint admin UI — and reach the producer ONLY via its
+  # child process environment (AGNES_SHAREPOINT_TENANT_ID / _CLIENT_ID /
+  # _PRIVATE_KEY / AGNES_EXTRACTION_CORPUS_ID), never on argv, never logged.
+
+
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
 # agents, data packages, connections, and corporate memory). On by default.
 # Set to false — or export AGNES_STUDIO_ENABLED=0 (the infra/Terraform .env

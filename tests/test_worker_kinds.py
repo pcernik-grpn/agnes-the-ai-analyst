@@ -87,6 +87,7 @@ class TestRegisterAllKinds:
         "analytics-rebuild",
         "collections-purge",
         "webhook-deliver",
+        "corpus-extraction",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -103,7 +104,7 @@ class TestRegisterAllKinds:
 
     def test_lanes_are_correct(self):
         from app.worker.kinds import register_all_kinds
-        from app.worker.registry import HEAVY_LANE, JOB_KINDS, LIGHT_LANE
+        from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE
 
         register_all_kinds()
 
@@ -118,6 +119,7 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["webhook-deliver"].lane == LIGHT_LANE
         assert JOB_KINDS["analytics-rebuild"].lane == HEAVY_LANE
         assert JOB_KINDS["collections-purge"].lane == HEAVY_LANE
+        assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a
@@ -450,6 +452,223 @@ class _FakeAgentWebhooksRepo:
 
     def get(self, webhook_id):
         return self._row
+
+
+class _FakeSourceConnectionsRepo:
+    def __init__(self, row):
+        self._row = row
+
+    def get(self, connection_id):
+        return self._row
+
+
+def _config_get_value(config: dict):
+    """A drop-in ``app.instance_config.get_value`` fake driven by a plain
+    nested dict, so tests never need a real ``instance.yaml`` on disk."""
+
+    def _get(*keys, default=None):
+        current = config
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return default
+        return current
+
+    return _get
+
+
+class TestCorpusExtractionHandler:
+    """``corpus-extraction`` (spec §7.5 / §16 step 7) — the producer-
+    invocation seam. No test here launches a real subprocess
+    (``subprocess.run`` is monkeypatched) or touches a real vault — these
+    cover only the handler's OWN responsibilities: the ``extraction.enabled``
+    / producer-config gate, credential resolution through the EXISTING
+    SharePoint settings resolver, secrets landing in the child env (never
+    argv), and timeout/failure handling."""
+
+    _ENABLED_CONFIG = {
+        "extraction": {
+            "enabled": True,
+            "producer": {"command": "python -m fake_producer"},
+            "timeout_s": 60,
+        }
+    }
+
+    def _register(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        return JOB_KINDS["corpus-extraction"].handler
+
+    def test_disabled_by_default_refuses_to_run(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="extraction.enabled"):
+            handler({"connection_id": "conn1"})
+
+    def test_missing_producer_config_raises(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="no producer configured"):
+            handler({"connection_id": "conn1"})
+
+    def test_missing_connection_id_raises(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="connection_id"):
+            handler({})
+
+    def test_unknown_connection_raises(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: _FakeSourceConnectionsRepo(row=None))
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="conn1"):
+            handler({"connection_id": "conn1"})
+
+    def test_non_sharepoint_connection_raises(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: _FakeSourceConnectionsRepo(row={"id": "conn1", "source_type": "keboola"}),
+        )
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="conn1"):
+            handler({"connection_id": "conn1"})
+
+    def test_settings_resolution_failure_is_wrapped(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: _FakeSourceConnectionsRepo(row={"id": "conn1", "source_type": "sharepoint", "config": {}}),
+        )
+        from connectors.sharepoint.settings import SharePointSettingsError
+
+        def _boom(connection):
+            raise SharePointSettingsError("certificate not configured")
+
+        monkeypatch.setattr("connectors.sharepoint.settings.resolve_sharepoint_settings", _boom)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="certificate not configured"):
+            handler({"connection_id": "conn1"})
+
+    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material"):
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: _FakeSourceConnectionsRepo(row={"id": "conn1", "source_type": "sharepoint", "config": {}}),
+        )
+        from connectors.sharepoint.settings import SharePointSettings
+
+        fake_settings = SharePointSettings(
+            tenant_id="tenant-1",
+            client_id="client-1",
+            private_key=private_key,
+            credential_source="vault",
+        )
+        monkeypatch.setattr("connectors.sharepoint.settings.resolve_sharepoint_settings", lambda conn: fake_settings)
+        return fake_settings
+
+    def test_resolves_credentials_and_builds_argv_with_no_secret_on_argv(self, monkeypatch):
+        """The core security assertion (playbook F7): the resolved
+        certificate never appears on the subprocess argv — only in the
+        child process's environment."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, private_key="super-secret-pem-material")
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, timeout=None, capture_output=None, text=None, check=None):
+            calls.append({"argv": list(argv), "env": dict(env or {}), "timeout": timeout})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        result = handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
+
+        assert result == {"connection_id": "conn1", "corpus_id": "corpus-9", "returncode": 0}
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["argv"] == ["python", "-m", "fake_producer"]
+        assert call["timeout"] == 60
+        # The secret must never be on argv.
+        assert "super-secret-pem-material" not in " ".join(call["argv"])
+        # It must be reachable via the child env instead.
+        assert call["env"]["AGNES_SHAREPOINT_TENANT_ID"] == "tenant-1"
+        assert call["env"]["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
+        assert call["env"]["AGNES_SHAREPOINT_PRIVATE_KEY"] == "super-secret-pem-material"
+        assert call["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+
+    def test_producer_module_config_builds_python_dash_m_argv(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value(
+                {"extraction": {"enabled": True, "producer": {"module": "fake_producer.run"}, "timeout_s": 30}}
+            ),
+        )
+        self._stub_connection_and_settings(monkeypatch)
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls == [[sys.executable, "-m", "fake_producer.run"]]
+
+    def test_producer_timeout_raises(self, monkeypatch):
+        import subprocess
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+
+        def _fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            handler({"connection_id": "conn1"})
+
+    def test_producer_nonzero_exit_raises(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+
+        class _FakeCompleted:
+            returncode = 3
+            stdout = ""
+            stderr = "boom"
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", lambda argv, **kwargs: _FakeCompleted())
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="exited 3"):
+            handler({"connection_id": "conn1"})
 
 
 class TestJiraWebhookEnqueues:
