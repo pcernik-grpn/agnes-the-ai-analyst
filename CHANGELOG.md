@@ -201,6 +201,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The toolbar follows the Library's, in order and in parts.** Tabs above;
+  then one row with the search and the **Filter** button grouped at the left
+  (it had drifted to the far right, where it read as a page control rather
+  than the list's); then the chip row, which now leads with the count —
+  `1 of 5 groups` — before the chips and `Clear all`, exactly as the Library
+  reads `1 of 6 items`. **The filter now narrows the list it sits above.** In
+  *By group* that list is groups, and the control had been filtering the rows
+  *inside* a group instead — invisible unless one happened to be open, which
+  is what made it feel pointless there. Picking *Data packages* now shows the
+  groups that hold one.
 - **The kind filter is a Filter button with applied chips, not a row of
   segments.** A row of segments reads as tabs, and tabs say *this is what the
   list is of*; a filter says *this is what I have hidden*, and that difference

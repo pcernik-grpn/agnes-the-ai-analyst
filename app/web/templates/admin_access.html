@@ -693,7 +693,9 @@
   .ax-onebar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
-  .ax-onebar .fbar__search { flex: 1 1 22rem; min-width: 0; }
+  .ax-onebar { align-items: center; gap: 10px; }
+  .ax-onebar .fbar__search { flex: 0 1 26rem; min-width: 0; }
+  .ax-filter { margin-right: auto; }
   .ax-onebar .ax-gnew { margin: 0; white-space: nowrap; }
 
   .ax-gs { border-top: 1px solid var(--ds-border); }
@@ -1877,6 +1879,15 @@
     font: inherit; font-size: 12.5px; font-weight: 600; color: var(--ds-text-link);
   }
   .fbar-chip__val { font-weight: 600; }
+  /* The chip row, the Library's way round: what is showing, the filters
+     doing the showing, then the way out. */
+  .ax-chiprow {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin: 10px 0 0;
+  }
+  .ax-chiprow[hidden] { display: none; }
+  .ax-chiprow__n { font-size: 13px; color: var(--ds-text-muted); font-variant-numeric: tabular-nums; }
+  .ax-chiprow .fbar-chips { margin: 0; }
 </style>
 {% endblock %}
 
@@ -1977,7 +1988,13 @@
   <div class="ax-one">
     {# The applied filters, restated under the bar — a filter you cannot see
        is a filter you forget you set, and then the list is simply wrong. #}
-    <div class="fbar-chips ax-chips" id="ax-chips" hidden></div>
+    {# The Library's chip row: what is showing, then the filters doing the
+       showing, then the way out of them. The count leads because a filtered
+       list that does not say it is filtered is a list that is simply wrong. #}
+    <div class="ax-chiprow" id="ax-chiprow" hidden>
+      <span class="ax-chiprow__n" id="ax-count"></span>
+      <div class="fbar-chips ax-chips" id="ax-chips"></div>
+    </div>
     <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
 
     {# ONE panel, three regions divided by hairlines. It was a single
@@ -2442,7 +2459,13 @@
     const holdsMatch = (g) => grantsFor(g.id).some((gr) =>
       (itemText.get(`${gr.resource_type}:${gr.resource_id}`) || "").includes(q));
     const nameHit = (g) => hay(g).includes(q);
-    const groups = q ? all.filter((g) => nameHit(g) || holdsMatch(g)) : all;
+    const kindHit = (g) => !listKind
+      || grantsFor(g.id).some((x) => x.resource_type === listKind);
+    /* The filter narrows the list it sits above, and in this view that list
+       is GROUPS — so it shows the groups holding that kind, not just the
+       rows inside a group somebody happens to have opened. Filtering rows
+       nobody can see was the reason this control felt pointless here. */
+    const groups = (q ? all.filter((g) => nameHit(g) || holdsMatch(g)) : all).filter(kindHit);
     if (!groups.length) {
       // A miss says it is a miss. An admin sees every grant on the instance,
       // so "nothing matched" can never be a permission problem here — and
@@ -3457,6 +3480,26 @@
     nBadge.textContent = listKind ? "1" : "0";
     nBadge.hidden = !listKind;
     btn.classList.toggle("is-on", !!listKind);
+
+    const row = el("ax-chiprow");
+    const countEl = el("ax-count");
+    if (countEl) {
+      // "N of M" — the shape the Library uses, and the only honest way to
+      // report a filtered list.
+      const total = viewMode === "bundle"
+        ? new Set((overview.grants || []).filter((g) => BUNDLE_LEAD.has(g.resource_type))
+            .map((g) => `${g.resource_type}:${g.resource_id}`)).size
+        : (overview.groups || []).length;
+      const shown = viewMode === "bundle"
+        ? new Set((overview.grants || [])
+            .filter((g) => BUNDLE_LEAD.has(g.resource_type) && (!listKind || g.resource_type === listKind))
+            .map((g) => `${g.resource_type}:${g.resource_id}`)).size
+        : (overview.groups || []).filter((g) => !listKind
+            || grantsFor(g.id).some((x) => x.resource_type === listKind)).length;
+      const noun = viewMode === "bundle" ? "bundles" : "groups";
+      countEl.textContent = listKind ? `${shown} of ${total} ${noun}` : `${total} ${noun}`;
+    }
+    if (row) row.hidden = false;
 
     chips.innerHTML = listKind ? `
       <span class="fbar-chip">
