@@ -749,6 +749,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   shows the tenant (shortened GUID) and a scope summary, e.g. `a1b2c3d4… ·
   2 scopes · Communication site`, or `N sites` when the selected scopes span
   more than one site.
+- The data-app git surface (`/data-apps.git/<slug>/…`) no longer answers a
+  restricted principal's credential with a raw 500. An agent-session or
+  co-session token resolves to a frozen principal dataclass with no single
+  caller identity; the route's owner/admin checks raised `AttributeError` on
+  it and surfaced as an unhandled server error (#1656). Such a caller now
+  fails closed with a clean 403 — the git surface is owner-authority, and a
+  restricted principal has no sound identity to run that check against.
 - **Security: config-resolution secrets are no longer valid connector-ATTACH
   `token_env`s.** The single token-env allowlist fed two independent trust
   boundaries: the settings resolvers that read a secret named in admin-written
