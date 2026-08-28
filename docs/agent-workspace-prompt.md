@@ -88,6 +88,7 @@ PUT validation time, so the admin is notified immediately.
 | `metrics.count` | int | Total metric definitions in DB |
 | `metrics.categories` | list[str] | Sorted unique category names |
 | `semantic_layer.has_models` | bool | `True` iff the calling user can read at least one valid semantic model |
+| `facts.enabled` | bool | `True` iff the `facts` feature switch is on for this instance. Gates the "Facts — entity and relationship questions" section that steers who/what/relationship/aggregation questions to `fact_search`/`fact_neighbors`/`fact_claims` before SQL or document search |
 | `marketplaces` | list[dict] | RBAC-filtered `{slug, name, plugins:[{name}]}` |
 | `user.id` | string | Analyst user ID |
 | `user.email` | string | Analyst email |

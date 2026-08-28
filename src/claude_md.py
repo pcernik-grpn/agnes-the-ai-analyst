@@ -10,7 +10,8 @@ Available placeholders: instance.{name,subtitle}, server.{url,hostname},
 sync_interval, data_source.{type,source_types}, tables (list of
 {name,description,query_mode,source_type}), metrics.{count,categories},
 semantic_layer.has_models (True iff the calling user can read >=1 valid
-semantic model), marketplaces (RBAC-filtered list),
+semantic model), facts.enabled (True iff the `facts` feature switch is on
+for this instance), marketplaces (RBAC-filtered list),
 user.{id,email,name,is_admin,groups}, now, today, chat_icons (inline icon
 names the chat UI renders — see src/chat_icons.py).
 
@@ -177,6 +178,21 @@ def _has_semantic_layer(conn: duckdb.DuckDBPyConnection | None, *, user: dict[st
         return False
 
 
+def _facts_enabled() -> bool:
+    """True iff this instance has the `facts` feature switched on.
+
+    Gates the "Facts — entity and relationship questions" CLAUDE.md section:
+    an instance with the feature off must not steer its agent toward tools
+    that would all 404 (``app.auth.access.require_facts_enabled``). No RBAC
+    narrowing here — the section only teaches WHEN to reach for the fact
+    tools; the tools themselves (`facts_repo()`) enforce per-caller
+    visibility on every call regardless of what this file says.
+    """
+    from app.instance_config import feature_enabled
+
+    return feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+
+
 def _marketplaces_for_user(conn: duckdb.DuckDBPyConnection | None, user: dict[str, Any]) -> list[dict[str, Any]]:
     """Return marketplaces with the plugins the user is allowed to see.
 
@@ -280,6 +296,7 @@ def build_claude_md_context(
         "tables": tables,
         "metrics": _metrics_summary(conn, user=user),
         "semantic_layer": {"has_models": _has_semantic_layer(conn, user=user)},
+        "facts": {"enabled": _facts_enabled()},
         "marketplaces": _marketplaces_for_user(conn, user),
         "user": {
             "id": user.get("id", ""),

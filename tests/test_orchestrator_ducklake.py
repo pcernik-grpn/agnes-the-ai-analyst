@@ -262,6 +262,52 @@ class TestDucklakeRebuild:
                             f"rebuild_source('src_a') must not touch src_b's schema, found: {entry}"
                         )
 
+    def test_rebuild_source_invalid_name_raises(self, ducklake_env):
+        """rebuild_source() validates the identifier BEFORE any backend
+        dispatch, so an invalid name fails loudly the same way on the
+        ducklake backend as on legacy — see
+        tests/test_orchestrator.py::test_rebuild_source_invalid_name_raises."""
+        from src.orchestrator import InvalidSourceNameError, SyncOrchestrator
+
+        orch = SyncOrchestrator()
+        with pytest.raises(InvalidSourceNameError):
+            orch.rebuild_source("bad-name")
+
+    def test_rebuild_records_invalid_source_name_as_error(self, ducklake_env):
+        """A full rebuild() on the ducklake backend must attribute a
+        skipped invalid-identifier source directory via
+        last_rebuild_errors — not just a log WARNING — while still
+        ingesting every valid source in the same batch. DuckLake
+        counterpart to
+        tests/test_orchestrator.py::test_rebuild_records_invalid_source_name_as_error."""
+        from src.orchestrator import SyncOrchestrator
+
+        extracts_dir = ducklake_env["extracts_dir"]
+        _create_ducklake_extract(extracts_dir, "src_a", [{"name": "orders", "data": [{"id": "1"}]}])
+
+        bad_dir = extracts_dir / "bad-name"
+        bad_dir.mkdir()
+        (bad_dir / "data").mkdir()
+        conn = duckdb.connect(str(bad_dir / "extract.duckdb"))
+        try:
+            conn.execute(
+                """CREATE TABLE _meta (
+                    table_name VARCHAR, description VARCHAR, rows BIGINT,
+                    size_bytes BIGINT, extracted_at TIMESTAMP,
+                    query_mode VARCHAR DEFAULT 'local'
+                )"""
+            )
+        finally:
+            conn.close()
+
+        orch = SyncOrchestrator()
+        result = orch.rebuild()
+
+        assert "bad-name" not in result
+        assert "bad-name" in orch.last_rebuild_errors
+        assert "must match" in orch.last_rebuild_errors["bad-name"]
+        assert "src_a" in result
+
     def test_view_name_collision_honors_ownership(self, ducklake_env):
         """Two sources both publish a table named 'shared'. First-come-
         first-served (alphabetical iteration order): src_a wins, src_b's

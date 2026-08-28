@@ -85,6 +85,19 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
     ),
+    # Ontology builder draft persistence (spec §13.2). `name` defaults, so an
+    # empty body reaches ontology_drafts_repo().create() before any other
+    # validation -- DuckDB -> typed 501, Postgres -> 201 (a fresh empty
+    # draft). `PUT`/`DELETE .../drafts/{id}` and the `/import`/`/save`
+    # sub-routes are path-param routes, out of scope for this sweep by
+    # construction. `POST /api/admin/ontology/dry-run` is NOT listed --
+    # `collection_id`/`file_id` have no default, so an empty body 422s
+    # identically on both backends before ontology_drafts_repo() (which it
+    # doesn't even call) is ever reached.
+    "POST /api/admin/ontology/drafts": (
+        "ontology_drafts_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/ontology_drafts_pg.py"
+    ),
 }
 
 
