@@ -1363,11 +1363,11 @@ class TestRailChatsDestination:
         assert 'id="rail-pinned"' not in rail
 
     def test_the_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
-        """It measures the ANALYST's journey — connect your tools, ask your first
-        question — and it is the only element in the rail with a coloured progress
-        arc, so it pulls hardest of anything on screen while you are registering a
-        table. Nothing is lost: the checklist is still reachable from the account
-        menu and from the chat dashboard's own hero."""
+        """It measures the ANALYST's journey — take Agnes to your tools, ask your
+        first question — and it is the only element in the rail with a coloured
+        progress arc, so it pulls hardest of anything on screen while you are
+        registering a table. Nothing is lost: the checklist is still reachable from
+        the account menu and from the chat dashboard's "Set up Agnes" door."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
         admin_rail = self._rail(web_client, admin_cookie, "/admin/users")

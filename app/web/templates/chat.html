@@ -1,7 +1,6 @@
 {% extends 'base_ds.html' %}
 {% import "macros/_icon.html" as ico %}
 {% import "macros/_agnes_orb.html" as agnes_orb %}
-{% from "macros/_knowledge_layer.html" import knowledge_layer_banner, knowledge_hub_label with context %}
 
 {# Cloud chat page. Extends the canonical Agnes design-system base so
    the Agnes top nav, footer, and shared design tokens (colors, type,
@@ -198,11 +197,12 @@
          section break (see the scale in chat.css), so the two regions would stop
          separating.
 
-         A <div>, not a <p>. `knowledge_hub_label` emits a <div>, and a <div>
-         inside a <p> makes the parser CLOSE the paragraph before it — so this
-         element ended up empty, its children became block-level siblings of
+         A <div>, not a <p>. The caption inside it used to be a <div> too, and a
+         <div> inside a <p> makes the parser CLOSE the paragraph before it — so
+         this element ended up empty, its children became block-level siblings of
          whatever surrounded it, and the `justify-content: center` meant to centre
-         them applied to nothing. #}
+         them applied to nothing. The caption is a <span> now, but the wrapper
+         stays a <div> — it also holds the separator and the link. #}
       {# The greeting, shared by both intro branches. Extracted for the same
          reason as the trust line below: the zero state had its OWN opener — an
          "{instance} · Admin" eyebrow — so the two states greeted the reader
@@ -231,7 +231,15 @@
       {% endset %}
       {% set _trust_line %}
         <div class="cld-trust">
-          {{ knowledge_hub_label(show_title=False) }}
+          {# Inlined rather than a macro. It was `knowledge_hub_label()` in
+             macros/_knowledge_layer.html, which existed to let the retired hero
+             and this line share one caption; with the hero gone the file held
+             one macro with one caller, and its `title`/`show_title` half was
+             dead — every call passed show_title=False. #}
+          <span class="cld-trust-claim">
+            <svg class="cld-trust-lock" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.7"/></svg>
+            Secure. Private. Always in sync.
+          </span>
           <span class="cld-trust-sep" aria-hidden="true"></span>
           <a class="cld-trust-link" href="/how-it-works">
             {{ ico.icon('info', 14) }}

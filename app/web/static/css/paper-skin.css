@@ -15,8 +15,8 @@
  *     tight 8px radius.
  *   - Nothing labelled is pill-shaped — not buttons, not inputs.
  *     Fully-round is the badge/tag/counter language. The one carve-out
- *     is the pair of connect-banner CTAs (`.cbn-cta`, `.klb-cta`),
- *     marketing surfaces that stay round under every theme.
+ *     is the connect-banner CTA (`.cbn-cta`), a marketing surface
+ *     that stays round under every theme.
  *   - Category tags use the `--ds-kind-*` sticker palette, never the
  *     brand primary, so categories can't be mistaken for actions.
  */
@@ -219,17 +219,14 @@
 
 /* ── Agnes-platform "connect / knowledge" surfaces keep emerald ──────
    The app primary is now sky blue, but the surfaces that speak for
-   the Agnes *platform* — the "same knowledge, everywhere" connect banner,
-   the Knowledge Layer hero's "Connect your tools" CTA, and the whole AI
-   Connector page — keep the emerald brand green. Scope-override the primary
-   trio on those containers so their CTAs/accents stay green without touching
-   the app. (Backgrounds/orbit already ride --ds-agnes, which stays emerald.)
-   Scoped to the connect banner's CTA rather than the whole `.cbn` container —
-   the same shape as `.klb-cta` below — so the shared knowledge-surface fill it
-   now paints (style-custom.css) resolves --ds-primary to the app sky, pixel-for-
-   pixel identical to the Knowledge Layer hero it matches. */
+   the Agnes *platform* — the "same knowledge, everywhere" connect banner and
+   the whole AI Connector page — keep the emerald brand green. Scope-override
+   the primary trio on those containers so their CTAs/accents stay green
+   without touching the app. (Backgrounds/orbit already ride --ds-agnes, which
+   stays emerald.) Scoped to the connect banner's CTA rather than the whole
+   `.cbn` container, so the knowledge-surface fill the container paints
+   (style-custom.css) resolves --ds-primary to the app sky. */
 [data-theme="paper"] .cbn-cta,
-[data-theme="paper"] .klb-cta,
 [data-theme="paper"] .aic-flow {
     --ds-primary: #10b981;
     --ds-primary-dark: #059669;
@@ -237,11 +234,11 @@
     --ds-brand-accent: #a7f3d0;
 }
 
-/* …and they keep their SHAPE too. Both banner CTAs are authored fully-round
-   (style-custom.css) — the marketing idiom these two connect surfaces are
-   built on — and paper no longer squares them down to `--ds-radius-btn`. The
-   pill is what marks them as the product-model banner rather than another
-   labelled page button, so it stays under every theme. */
+/* …and it keeps its SHAPE too. The banner CTA is authored fully-round
+   (style-custom.css) — the marketing idiom the connect surface is built on —
+   and paper no longer squares it down to `--ds-radius-btn`. The pill is what
+   marks it as the product-model banner rather than another labelled page
+   button, so it stays under every theme. */
 
 /* ── Hero — the light paper hero card ──────────────────────────────
    The canonical `.page-header--hero` assumes a dark gradient and

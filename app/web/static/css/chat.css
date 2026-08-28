@@ -2179,15 +2179,6 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   flex: 0 0 auto;
   margin: 12px 0 0;
 }
-/* The trust caption ("Secure. Private. Always in sync.") sits centered just
-   below the hero banner, leading the "Ask Agnes anything" heading. */
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead {
-  margin: 0;
-}
-html[data-ui-layout="rail"] #chat-capabilities .klb-hub-label--lead .klb-hub-caption {
-  justify-content: center;
-}
-
 /* Footer credit — pinned to the very bottom (margin-top:auto). No divider. */
 html[data-ui-layout="rail"] .cloud-chat-empty-foot {
   flex: 0 0 auto;

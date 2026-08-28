@@ -900,11 +900,12 @@ function _buildPopover(step, index, total) {
       markUseAnywhereDone();
       _endTour(true);
       // /how-it-works#connect is the per-tool MCP guide (Claude Code · Cursor ·
-      // VS Code · …) that matches this button's intent and the main-page
-      // "Connect your tools" CTA. It was the standalone /me/ai-connector page
-      // until that was absorbed into the consolidated orientation page, which
-      // still 302s here. /setup is the narrower CLI-install page, reached from
-      // getting-started, not from here.
+      // VS Code · …) that matches this button's intent — the same destination
+      // the chat landing's "Take Agnes to your tools" door and the rail's "Use
+      // Agnes elsewhere" row point at. It was the standalone /me/ai-connector
+      // page until that was absorbed into the consolidated orientation page,
+      // which still 302s here. /setup is the narrower CLI-install page, reached
+      // from getting-started, not from here.
       window.location.href = '/how-it-works#connect';
     });
 
