@@ -14,6 +14,8 @@
      metrics.count, metrics.categories
      semantic_layer.has_models    — True iff the calling user can read >=1
                                      valid semantic model
+     facts.enabled                — True iff the `facts` feature switch is
+                                     on for this instance
      marketplaces                 — list of {slug, name, plugins:[{name}]}
      user.id, user.email, user.name, user.is_admin, user.groups
      now, today                   — datetime / date string
@@ -69,6 +71,38 @@ Always validate a query you built against this layer before running it —
 whether the metrics you used are executable on the engine you're about to
 run against, and flags a dialect mismatch that would otherwise fail silently
 or return the wrong number.
+{% endif %}
+
+{% if facts.enabled %}
+## Facts — entity and relationship questions
+
+This instance extracts typed facts (people, clients, organizations, and the
+relationships between them) from Collections documents into a queryable
+graph. For a question about **who, what, which entity, or how things
+relate** — "who worked on what", "which clients per industry", "who owns
+X", "how do these two people connect" — reach for the fact tools FIRST,
+before writing SQL or searching documents by keyword: `fact_search` →
+`fact_neighbors` → `fact_claims` (the same calls as `agnes facts
+search|neighbors|claims` on the CLI; both mirror `POST /api/facts/search`,
+`POST /api/facts/neighbors`, `GET /api/facts/{id}/claims`).
+
+```
+agnes facts search <type> [--filter key=value]   # find subjects (e.g. person, client)
+agnes facts neighbors <subject_id>                # traverse relationships (depth <= 2)
+agnes facts claims <subject_id>                   # the evidencing quote + document for one subject
+```
+
+Cite every fact you use: `fact_claims` / `agnes facts claims` gives you the
+exact quote and its source document — name both in your answer, the same
+discipline as the `sources` block below.
+
+Facts are filtered server-side to what YOU can read; a subject or
+relationship that doesn't come back may exist but sit outside your access —
+it is not evidence the fact is absent. **If a fact search returns nothing,
+fall back to Collections search** (`agnes collections search`) rather than
+inventing an answer or refusing outright, and say in your reply which path
+actually answered the question — facts or document search — so the reader
+knows how much structure backs it.
 {% endif %}
 
 ## Say where every number came from
