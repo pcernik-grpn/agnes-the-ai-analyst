@@ -36,6 +36,25 @@ def is_workspace_shaped(p: Path) -> bool:
         return False
 
 
+def workspace_anchor() -> Optional[Path]:
+    """The configured ``workspace_root`` anchor, resolved (raw, not
+    shape-checked).
+
+    Distinct from the anchor branch inside ``resolve_data_workspace()``
+    (which additionally requires the anchor to still look workspace-shaped
+    before trusting it for reads). This helper exists purely for
+    DIVERGENCE LABELING (issue #1312) — comparing "what directory a command
+    actually used" against "what `workspace_root` says my workspace is" —
+    not for deciding whether to read from it. `agnes pull` and `agnes
+    status` each need exactly this comparison; sharing one read here keeps
+    a third caller from re-deriving it ad hoc (the drift #1312 flags).
+    """
+    root = get_workspace_root()
+    if not root:
+        return None
+    return Path(root).resolve()
+
+
 def resolve_data_workspace() -> Optional[Path]:
     # `if env_dir:` — an EMPTY `AGNES_LOCAL_DIR` falls through to the chain
     # below rather than meaning cwd, which the old inline

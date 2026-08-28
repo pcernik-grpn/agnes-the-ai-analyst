@@ -1022,7 +1022,11 @@ class TestFileUpsert:
         _seed_collection_grant(corpus_id, "analyst1")
         return corpus_id
 
-    def test_reupload_same_path_replaces_row(self, seeded_app):
+    def test_reupload_same_path_preserves_row_id(self, seeded_app):
+        """fact-graph-over-Collections §6: ANY match through this code path
+        preserves the existing row id — content is updated in place, not
+        delete+insert — so anything anchored to that id (a future claim)
+        survives a re-upload."""
         c = seeded_app["client"]
         corpus_id = self._create_and_grant(seeded_app, "Upsert Replace")
 
@@ -1044,18 +1048,133 @@ class TestFileUpsert:
         )
         assert second.status_code == 201, second.text
         fid2 = second.json()[0]["file_id"]
-        assert fid2 != fid1  # replaced, not updated-in-place
+        assert fid2 == fid1  # updated in place, id preserved
 
         listing = c.get(
             f"/api/collections/{corpus_id}/files",
             headers=_auth(seeded_app["analyst_token"]),
         )
         files = listing.json()["files"]
-        # Exactly one row survives for that path — the new one.
+        # Exactly one row survives for that path — the same row, refreshed.
         assert len(files) == 1
-        assert files[0]["file_id"] == fid2
+        assert files[0]["file_id"] == fid1
         assert files[0]["path"] == "docs/a.md"
         assert files[0]["size_bytes"] == len(b"bravo beta gamma")
+
+    def test_reupload_same_path_unchanged_content_skips_reprocessing(self, seeded_app):
+        """Unchanged sha256 short-circuits: no chunk purge, no status reset —
+        a byte-identical re-upload (or a pure rename) leaves the row's
+        processing state exactly as it was."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Upsert Short Circuit")
+
+        first = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"same bytes"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert first.status_code == 201, first.text
+        fid1 = first.json()[0]["file_id"]
+
+        from src.repositories import corpus_files_repo
+
+        corpus_files_repo().set_status(fid1, status="indexed", detail={"chunk_count": 3})
+
+        second = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"same bytes"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert second.status_code == 201, second.text
+        assert second.json()[0]["file_id"] == fid1
+        # processing_status untouched — the short-circuit never reset it.
+        assert second.json()[0]["processing_status"] == "indexed"
+        assert second.json()[0]["processing_detail"]["chunk_count"] == 3
+
+    def test_reupload_same_path_unchanged_content_retries_a_failed_row(self, seeded_app):
+        """The unchanged-sha256 short-circuit must not strand a row whose
+        ingest never completed. Re-uploading the identical bytes is the
+        obvious way a user retries a `rejected` file (an extractor was
+        missing, a dependency was installed since), so an unchanged match on
+        a NON-`indexed` row still resets to `pending` and re-schedules
+        ingestion — only `indexed` means "derived data is present and
+        current" (Devin Review on #1655)."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Upsert Failed Retry")
+
+        first = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"retry me"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert first.status_code == 201, first.text
+        fid1 = first.json()[0]["file_id"]
+
+        from src.repositories import corpus_files_repo
+
+        # Simulate a prior ingest that failed and left the row unusable.
+        corpus_files_repo().set_status(fid1, status="rejected", detail={"reason": "ingest_error: boom"})
+
+        second = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"retry me"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert second.status_code == 201, second.text
+        assert second.json()[0]["file_id"] == fid1
+        # The response tells the caller a retry was accepted, not that the
+        # row is still rejected.
+        assert second.json()[0]["processing_status"] == "pending"
+        # ...and the ingest really re-ran (TestClient drains BackgroundTasks).
+        row = corpus_files_repo().get(fid1)
+        assert row["processing_status"] != "rejected"
+
+    def test_reupload_same_path_unchanged_content_retries_a_pending_row(self, seeded_app):
+        """Same rule for a row the runner deliberately parked in `pending`
+        (a tier-2 image left "awaiting vision (no model/key)"): once the
+        model is configured, re-uploading the same bytes must pick it up."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Upsert Pending Retry")
+
+        first = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"park me"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert first.status_code == 201, first.text
+        fid1 = first.json()[0]["file_id"]
+
+        from src.repositories import corpus_files_repo
+
+        corpus_files_repo().set_status(fid1, status="pending", detail={"note": "awaiting vision (no model/key)"})
+
+        called: list[str] = []
+        import src.ingest.runner as _runner
+
+        real_ingest = _runner.ingest_file
+
+        def _spy(file_id):
+            called.append(file_id)
+            return real_ingest(file_id)
+
+        _runner.ingest_file = _spy
+        try:
+            second = c.post(
+                f"/api/collections/{corpus_id}/files",
+                files={"files": ("a.md", io.BytesIO(b"park me"), "text/markdown")},
+                data={"paths": "docs/a.md"},
+                headers=_auth(seeded_app["analyst_token"]),
+            )
+        finally:
+            _runner.ingest_file = real_ingest
+        assert second.status_code == 201, second.text
+        assert second.json()[0]["file_id"] == fid1
+        assert called == [fid1], "unchanged re-upload of a non-indexed row must re-schedule ingest"
 
     def test_uploads_without_path_do_not_upsert(self, seeded_app):
         c = seeded_app["client"]
@@ -1229,6 +1348,173 @@ class TestFileUpsert:
             headers=_auth(seeded_app["analyst_token"]),
         )
         assert listing.json()["files"] == []
+
+
+class TestSourceAnchoredUpsert:
+    """`source_stable_ids` (+ optional `source_doc_ids`, `source_sha256s`,
+    `document_dates`) — the crawler-anchor upsert prerequisite for the
+    fact-graph-over-Collections design (§6). The mapping table is
+    Postgres-only; these tests exercise the DuckDB-backed default app, where
+    every one of these fields is either omitted (byte-identical to today) or
+    triggers the typed 501 before any file is touched. End-to-end PG-backed
+    behavior (stable-id matching, mapping upserts) lives in
+    tests/db_pg/test_collections_upsert_pg.py."""
+
+    def _create_and_grant(self, seeded_app, name: str = "Source Upsert Target"):
+        c = seeded_app["client"]
+        cr = c.post(
+            "/api/collections",
+            json={"name": name},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        corpus_id = cr.json()["id"]
+        _seed_collection_grant(corpus_id, "analyst1")
+        return corpus_id
+
+    def test_source_stable_ids_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+            ],
+            data={"source_stable_ids": "graph:only-one"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_stable_ids_length_mismatch" in resp.text
+
+    def test_source_doc_ids_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+            ],
+            data={
+                "source_stable_ids": ["graph:a", "graph:b"],
+                "source_doc_ids": ["doc-a"],
+            },
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_doc_ids_length_mismatch" in resp.text
+
+    def test_source_sha256s_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[("files", ("a.md", io.BytesIO(b"a"), "text/markdown"))],
+            data={"source_sha256s": ["sha-a", "sha-b"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "source_sha256s_length_mismatch" in resp.text
+
+    def test_document_dates_length_mismatch_rejected(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[("files", ("a.md", io.BytesIO(b"a"), "text/markdown"))],
+            data={"document_dates": ["2026-01-01", "2026-01-02"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "document_dates_length_mismatch" in resp.text
+
+    def test_source_stable_ids_on_duckdb_backend_yields_typed_501(self, seeded_app):
+        """The mapping table is PG-only — supplying `source_stable_ids` on a
+        DuckDB-backed instance must fail clean (typed 501), before any file
+        is written, never a raw 500 or a silent partial upload."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+            data={"source_stable_ids": "graph:abc123"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 501, resp.text
+        body = resp.json()
+        assert body["error"] == "requires_postgres_backend"
+
+        # Nothing was created — the 501 fired before any file was touched.
+        listing = c.get(
+            f"/api/collections/{corpus_id}/files",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert listing.json()["files"] == []
+
+    def test_duplicate_source_stable_id_in_same_batch_rejected(self, seeded_app):
+        """Two files in one request sharing a `source_stable_id` would have
+        the second resolve to — and update in place — the first's row: the
+        first file's bytes are lost and both response entries carry the same
+        `file_id`. Same failure mode as `duplicate_path_in_batch`, so the
+        same up-front 400 (Devin Review on #1655).
+
+        Runs on the DuckDB-backed app on purpose: the guard is request
+        validation and fires BEFORE the PG-only mapping repo is resolved, so
+        a malformed batch is rejected identically on either backend.
+        """
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Duplicate Stable Id Batch")
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+            ],
+            data={"source_stable_ids": ["graph:same", "graph:same"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "duplicate_source_stable_id_in_batch" in resp.text
+        # Nothing was created — the guard fires before any file is stored.
+        listing = c.get(
+            f"/api/collections/{corpus_id}/files",
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert listing.json()["files"] == []
+
+    def test_distinct_and_blank_source_stable_ids_are_not_duplicates(self, seeded_app):
+        """Only NON-BLANK stable ids collide — several files may legitimately
+        carry no stable id at all in the same batch (mirrors the `paths`
+        guard, which ignores blanks). Reaching the PG-only 501 proves the
+        duplicate guard did not fire."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app, "Blank Stable Ids Batch")
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files=[
+                ("files", ("a.md", io.BytesIO(b"a"), "text/markdown")),
+                ("files", ("b.md", io.BytesIO(b"b"), "text/markdown")),
+                ("files", ("c.md", io.BytesIO(b"c"), "text/markdown")),
+            ],
+            data={"source_stable_ids": ["graph:a", "", "  "]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 501, resp.text
+        assert resp.json()["error"] == "requires_postgres_backend"
+
+    def test_omitting_source_stable_ids_is_byte_identical_to_today(self, seeded_app):
+        """Omitting the field entirely never resolves the PG-only repo — the
+        plain `paths` upsert flow keeps working on a DuckDB-backed instance."""
+        c = seeded_app["client"]
+        corpus_id = self._create_and_grant(seeded_app)
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+            data={"paths": "docs/a.md"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()[0]["path"] == "docs/a.md"
 
 
 # ---------------------------------------------------------------------------

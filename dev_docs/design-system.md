@@ -1,3 +1,17 @@
+> [!WARNING]
+> **Superseded — do not follow this document for new work.**
+>
+> This is a pre-`paper` capture, scraped from a rendered login page. It predates
+> the `--ds-*` token system, the `paper` theme (default since Wave 0, 2026-08) and
+> the rail chrome. Its `--font-primary` / `--text-*` names are **not** the tokens
+> the app uses today.
+>
+> The binding visual standard is
+> [`.claude/skills/agnes-conventions/references/design-system.md`](../.claude/skills/agnes-conventions/references/design-system.md).
+> See also `CLAUDE.md` → *Visual standard (binding for ALL UI work)*.
+>
+> Kept only as a record of the pre-unification look.
+
 # Design System
 
 Extracted from:

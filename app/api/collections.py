@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -58,6 +58,7 @@ from src.file_storage import delete_corpus_file, store_corpus_file
 from src.sql_ident import quote_ident
 from src.repositories import (
     corpus_chunks_repo,
+    corpus_file_sources_repo,
     corpus_files_repo,
     file_corpora_repo,
     table_registry_repo,
@@ -625,18 +626,357 @@ def _purge_file_row(collection_id: str, row: dict, *, keep_blob_path: str | None
             delete_corpus_file(blob)
 
 
-def _replace_existing_by_path(collection_id: str, path: str | None, *, keep_blob_path: str | None) -> None:
-    """Upsert helper: purge any existing file sharing ``(collection_id, path)``.
+def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
+    """Post-step (outside the deleting transaction, spec §6) after a
+    ``corpus_files`` row is hard-deleted here: its claims already cascaded
+    (``claims.corpus_file_id`` -> ``corpus_files.id`` ``ON DELETE CASCADE``),
+    which can leave a subject with zero claims — sweep it and log the count,
+    attributed to ``trigger``, exactly like the ingest run report does for
+    the same sweep on its own write path.
 
-    No-op when ``path`` is None (plain-insert upload) or nothing matches.
-    Called only AFTER the replacement blob is safely stored, so a failed
-    re-upload never destroys the existing file.
+    Skips entirely — no DB round trip at all — when the ``facts`` feature
+    flag is off (the default), which is the vast majority of instances and
+    of every existing collections test. When it IS on but the backend is
+    still DuckDB, ``facts_repo()`` raises ``RequiresPostgresBackend``; that
+    is swallowed here (not surfaced as a 501) because a DuckDB-backed
+    instance can never have facts claims to begin with — this is routine
+    file-delete housekeeping, not a caller-facing facts API call.
     """
-    if not path:
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
         return
-    existing = corpus_files_repo().get_by_path(collection_id, path)
-    if existing:
-        _purge_file_row(collection_id, existing, keep_blob_path=keep_blob_path)
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        deleted = facts_repo().sweep_orphans()
+    except RequiresPostgresBackend:
+        return
+    except Exception:
+        logger.warning("facts orphan sweep failed after %s", trigger, exc_info=True)
+        return
+    if deleted:
+        logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
+
+
+def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
+    """Drop a file's claims when its CONTENT is replaced in place (spec §6,
+    "content changed"). Returns the number deleted (0 when facts is off).
+
+    Why at replace time and not "on the next extraction": a claim's ``quote``
+    is a verbatim span validated against THIS file's chunks at ingest (§8).
+    The moment ``corpus_files.sha256`` moves, the bytes that span was checked
+    against are gone — the old blob is refcount-deleted right below — so the
+    claim is not merely stale, it is unverifiable. Nothing in the read path
+    filters it: ``claims.file_sha256`` is written on every claim and compared
+    by no query, and ``facts_pg.claims()`` joins ``corpus_files`` for the
+    document's CURRENT name/path, so an old quote would be served under the
+    new document's identity while its subject stays alive in ``search`` /
+    ``neighbors``. Deferring to the producer's next replace-mode ingest also
+    assumes a producer exists — a file replaced by hand through the UI has
+    none, so "next ingest" can be never.
+
+    Before #1655 this happened for free: a content change deleted the
+    ``corpus_files`` row and the claims cascaded. Preserving the row id (the
+    point of §6) must not also preserve evidence for deleted text.
+
+    Same flag/backend tolerance as ``_sweep_facts_orphans_after_delete``:
+    a no-op with zero DB round trips when the ``facts`` flag is off, and a
+    DuckDB-backed instance can never have claims to begin with.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return 0
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        return facts_repo().delete_claims_for_file(file_id)
+    except RequiresPostgresBackend:
+        return 0
+    except Exception:
+        logger.warning("facts claim purge failed for replaced file %s", file_id, exc_info=True)
+        return 0
+
+
+def _purge_children_and_content(collection_id: str, row: dict, *, defer_row_purge: bool = False) -> None:
+    """Purge a matched row's zip-bundle children (fully — they are
+    regenerated on the next ingest) plus the row's OWN chunks, derived
+    tables and fact claims, ahead of an in-place content update that reuses
+    ``row``'s id.
+
+    ``row`` itself, and its own blob, are left for the caller
+    (``_upsert_corpus_file``): ``row`` still carries its OLD ``storage_path``
+    at this point, so cleaning up that blob must happen AFTER
+    ``update_in_place`` repoints the row at the new one — otherwise the row
+    would still count as a live reference to its own old blob and the
+    refcount check would wrongly skip deleting it.
+
+    ``defer_row_purge`` withholds ONLY the row's own derived-table purge, for
+    a caller that is going to re-ingest this same row and must therefore run
+    purge-then-ingest as one ordered unit (see ``upload_files``). The
+    bundle-children purges above are unaffected: those child rows are
+    hard-deleted here, so the next ingest mints fresh child ids and fresh
+    ``table_id``s — there is nothing for a later purge to collide with.
+    """
+    cf_repo = corpus_files_repo()
+    chunks_repo = corpus_chunks_repo()
+
+    children: list[dict] = []
+    stack = [row["id"]]
+    while stack:
+        for child in cf_repo.list_children(stack.pop()):
+            children.append(child)
+            stack.append(child["id"])
+
+    child_blob_paths = {c.get("storage_path") for c in children if c.get("storage_path")}
+    for child in children:
+        _schedule_derived_purge(collection_id, child["id"])
+        chunks_repo.delete_for_file(child["id"])
+        cf_repo.delete(child["id"])
+    for blob in child_blob_paths:
+        if cf_repo.count_by_storage_path(collection_id, blob) == 0:
+            delete_corpus_file(blob)
+
+    if not defer_row_purge:
+        _schedule_derived_purge(collection_id, row["id"])
+    chunks_repo.delete_for_file(row["id"])
+
+    # Claims are derived from the content too, and the content is being
+    # replaced — see `_purge_facts_claims_for_replaced_file`. The children
+    # deleted above cascade THEIR claims away via the FK, so the orphan
+    # sweep below covers both paths; it runs as its own step outside the
+    # deleting work, exactly as `delete_file` does (spec §6). Once per
+    # REPLACED file (not per uploaded file), and skipped entirely with the
+    # facts flag off, which is the default.
+    purged = _purge_facts_claims_for_replaced_file(row["id"])
+    if purged or children:
+        _sweep_facts_orphans_after_delete(trigger=f"replace_file:{row['id']}")
+    if purged:
+        logger.info(
+            "facts claims purged on content replace collection=%s file_id=%s claims=%d",
+            collection_id,
+            row["id"],
+            purged,
+        )
+
+
+def _ingest_incomplete(row: dict) -> bool:
+    """True when a matched row's ingest never finished, so an unchanged-content
+    re-upload should still (re-)schedule it.
+
+    ``indexed`` is the ONLY status meaning "derived data is present and
+    current" — the runner parks a row in ``rejected`` (extractor missing,
+    ingest error), ``needs_review`` (extraction produced no chunks) or even
+    ``pending`` (tier-2 image "awaiting vision (no model/key)") when the run
+    did not produce usable output. Re-uploading the identical bytes is the
+    obvious way a user retries such a file once the cause is fixed, so the
+    content-hash short-circuit must not swallow it.
+
+    A row genuinely mid-ingest (``processing``, not stale) is the one
+    exception: leave it alone rather than race the in-flight run — the same
+    rule ``reingest_file`` applies with its 409.
+    """
+    status = row.get("processing_status") or "pending"
+    if status == "indexed":
+        return False
+    if status == "processing" and not _is_stale_processing(row):
+        return False
+    return True
+
+
+def _upsert_corpus_file(
+    collection_id: str,
+    *,
+    path: str | None,
+    stable_id: str | None,
+    source_doc_id: str | None,
+    source_sha256_meta: str | None,
+    filename: str,
+    sha256: str,
+    file_type: str | None,
+    size_bytes: int | None,
+    storage_path: str | None,
+    sources_repo: Any,
+    defer_row_purge: bool = False,
+) -> tuple[str, bool]:
+    """Match-then-insert-or-update-in-place for one uploaded file.
+
+    Match order (fact-graph-over-Collections design §6, "Prerequisite change
+    to Collections"): ``(collection_id, stable_id)`` via
+    ``corpus_file_sources`` first, then ``(collection_id, path)``. ANY match
+    through this code path preserves the existing ``corpus_files.id`` —
+    including a manual path re-upload of a file the crawler anchored, so a
+    hand upload can no longer cascade a document's (future) claims away.
+
+    An unchanged-``sha256`` match against an ``indexed`` row only refreshes
+    ``filename``/``path``/``storage_path`` (rename/move) — chunks and
+    ``processing_status`` are left untouched, skipping re-chunking entirely.
+    An unchanged-``sha256`` match against a row whose ingest never completed
+    (``rejected``/``needs_review``/``pending``/stale ``processing``) still
+    resets to 'pending' and re-schedules ingestion, so a byte-identical
+    re-upload is a working retry (see ``_ingest_incomplete``). A
+    changed-``sha256`` match purges chunks/children and resets
+    ``processing_status`` to 'pending' on the SAME row. No match inserts a
+    new row.
+
+    ``sources_repo`` is the already-resolved ``corpus_file_sources`` repo
+    (``None`` when this request never supplied ``source_stable_ids`` at
+    all — see ``upload_files``, which resolves it once up front so a
+    DuckDB-backed instance fails clean with a 501 before any file is
+    touched, never partway through a batch).
+
+    Returns ``(file_id, needs_processing)`` — ``needs_processing`` is False
+    only for the unchanged-content short-circuit on an already-``indexed``
+    row, so the caller knows whether to (re)schedule ingestion.
+    """
+    cf_repo = corpus_files_repo()
+
+    existing = None
+    if stable_id and sources_repo is not None:
+        existing_id = sources_repo.resolve(collection_id, stable_id)
+        if existing_id:
+            existing = cf_repo.get(existing_id)
+    if existing is None and path:
+        existing = cf_repo.get_by_path(collection_id, path)
+
+    if existing is not None:
+        file_id = existing["id"]
+        content_changed = existing.get("sha256") != sha256
+        old_blob = existing.get("storage_path")
+        if content_changed:
+            _purge_children_and_content(collection_id, existing, defer_row_purge=defer_row_purge)
+        cf_repo.update_in_place(
+            file_id,
+            filename=filename,
+            sha256=sha256,
+            file_type=file_type,
+            size_bytes=size_bytes,
+            storage_path=storage_path,
+            path=path,
+        )
+        # Unchanged content skips re-chunking only when the row actually
+        # REACHED a usable state; a failed/parked row is retried instead of
+        # being stranded (see `_ingest_incomplete`). No purge for that case —
+        # a row that never indexed has nothing to purge, and the ingest
+        # itself is idempotent over chunks.
+        needs_processing = content_changed or _ingest_incomplete(existing)
+        if needs_processing:
+            cf_repo.set_status(file_id, status="pending")
+        # The old blob is cleaned up whenever the row's storage_path moved,
+        # not only when content changed: storage paths are content-addressed
+        # as {sha256}{ext} with ext derived from the FILENAME, so an
+        # extension-only rename keeps the sha yet allocates a new blob —
+        # skipping cleanup there leaked the old file on disk (the replaced
+        # delete+insert path cleaned unconditionally).
+        if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
+            delete_corpus_file(old_blob)
+    else:
+        needs_processing = True  # brand new row always needs processing
+        file_id = cf_repo.add(
+            corpus_id=collection_id,
+            filename=filename,
+            sha256=sha256,
+            file_type=file_type,
+            size_bytes=size_bytes,
+            storage_path=storage_path,
+            path=path,
+        )
+
+    if stable_id and sources_repo is not None:
+        sources_repo.upsert(
+            corpus_file_id=file_id,
+            corpus_id=collection_id,
+            source_stable_id=stable_id,
+            source_doc_id=source_doc_id,
+            source_sha256=source_sha256_meta,
+        )
+
+    return file_id, needs_processing
+
+
+def _nth_field(values: Optional[List[str]], idx: int) -> str | None:
+    """One positionally-paired form field for file ``idx``; blank -> None."""
+    if not values or idx >= len(values) or not values[idx]:
+        return None
+    return values[idx].strip() or None
+
+
+def _preflight_source_anchored_batch(
+    collection_id: str,
+    *,
+    n_files: int,
+    paths: Optional[List[str]],
+    source_stable_ids: Optional[List[str]],
+    sources_repo: Any,
+    cf_repo: Any,
+) -> None:
+    """Resolve every file's TARGET row exactly as ``_upsert_corpus_file``
+    will, before a single byte is stored, and refuse two collisions the
+    per-key duplicate guards above cannot see.
+
+    They cannot see them because both guards compare one key against itself,
+    while the match is `stable_id` FIRST, then `path` — so the damage crosses
+    the two key spaces:
+
+    * **Cross-anchor collision.** File 1 carries `stable_id` S (anchored to
+      row R); file 2 carries `path` P, which is R's own path. Both resolve to
+      R and update it in place, so file 1's bytes are lost and the response
+      returns R's id twice — the exact failure `duplicate_path_in_batch`
+      exists to prevent, one key space over. Rejected with **400**
+      ``duplicate_target_row_in_batch``.
+    * **Re-path onto an occupied path.** A `stable_id` match resolves row R
+      while the upload's `path` is already held by a DIFFERENT row; the
+      unconditional ``UPDATE`` in ``update_in_place`` then violates the
+      ``(corpus_id, path)`` unique index — an unhandled IntegrityError, i.e.
+      a **500** after earlier files in the batch were already written.
+      Rejected with **409** ``path_owned_by_another_file`` instead, naming
+      the occupying row so a doc-sync client can act on it.
+
+    Only runs for source-anchored batches: without `source_stable_ids` a
+    file's only anchor is its path, two distinct paths can never resolve to
+    one row, and `duplicate_path_in_batch` already covers the rest — which is
+    what keeps the plain-`paths` flow byte-identical (and DuckDB untouched).
+
+    Read-only and up front, so a rejected batch stores nothing. It is not a
+    lock: a concurrent request could still take a path between this check and
+    the write, which the unique index remains the backstop for.
+    """
+    seen_targets: dict[str, int] = {}
+    for idx in range(n_files):
+        stable_id = _nth_field(source_stable_ids, idx)
+        path = _nth_field(paths, idx)
+
+        target: str | None = None
+        if stable_id:
+            resolved = sources_repo.resolve(collection_id, stable_id)
+            if resolved:
+                target = resolved
+                if path:
+                    holder = cf_repo.get_by_path(collection_id, path)
+                    if holder and holder["id"] != resolved:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"path_owned_by_another_file: '{path}' belongs to {holder['id']}, "
+                                f"but source_stable_id '{stable_id}' resolves to {resolved}"
+                            ),
+                        )
+        if target is None and path:
+            row = cf_repo.get_by_path(collection_id, path)
+            if row:
+                target = row["id"]
+
+        if target is not None:
+            if target in seen_targets:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"duplicate_target_row_in_batch: files {seen_targets[target]} and {idx} "
+                        f"both resolve to {target}"
+                    ),
+                )
+            seen_targets[target] = idx
 
 
 @router.post("/{collection_id}/files", status_code=201)
@@ -645,6 +985,10 @@ async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     paths: Optional[List[str]] = Form(None),
+    source_stable_ids: Optional[List[str]] = Form(None),
+    source_doc_ids: Optional[List[str]] = Form(None),
+    source_sha256s: Optional[List[str]] = Form(None),
+    document_dates: Optional[List[str]] = Form(None),
     user=Depends(require_collection_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
@@ -666,15 +1010,49 @@ async def upload_files(
 
     **Upsert:** an optional ``paths`` form field (repeated, paired positionally
     with ``files``) gives each file a caller-supplied logical identity. When a
-    file with the same ``(collection_id, path)`` already exists, it is REPLACED
-    (old blob/chunks/derived tables purged) instead of inserting a duplicate —
-    so a doc-sync client can re-upload idempotently. Files without a ``path``
-    keep the legacy plain-insert behavior. The purge runs only after the
-    replacement is safely stored, so a failed re-upload never destroys the
-    existing file. When ``paths`` is supplied it MUST have exactly one entry
-    per file (positional pairing), else the request is rejected with **400** —
-    a short/misaligned list would silently assign paths to the wrong files.
-    The ``(corpus_id, path)`` invariant is also enforced by a unique index.
+    file with the same ``(collection_id, path)`` already exists, its row is
+    updated IN PLACE (id preserved) — chunks/derived tables purged and
+    ``processing_status`` reset only when the content actually changed;
+    unchanged content against an ``indexed`` row just refreshes filename/path
+    (a rename/move) and skips re-chunking entirely. Unchanged content against
+    a row whose ingest never completed (``rejected``, ``needs_review``, or
+    ``pending``) is treated as a **retry**: the row resets to ``pending`` and
+    ingestion is re-scheduled, so re-uploading the same bytes after fixing
+    the cause works without a separate ``…/reingest`` call. Files without a
+    ``path`` keep the legacy plain-insert behavior. The update runs only
+    after the replacement blob is safely stored, so a failed re-upload never
+    destroys the existing file. When ``paths`` is supplied it MUST have
+    exactly one entry per file (positional pairing), else the request is
+    rejected with **400** — a short/misaligned list would silently assign
+    paths to the wrong files; two files sharing a non-blank ``path`` in one
+    batch are likewise rejected (**400** ``duplicate_path_in_batch``). The
+    ``(corpus_id, path)`` invariant is also enforced by a unique index.
+
+    **Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+
+    optional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,
+    each paired positionally with ``files`` exactly like ``paths``) lets a
+    doc-sync client supply the producer's own delta key (e.g.
+    ``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``
+    is tried FIRST, before the ``path`` match — and, like a path match, ANY
+    match preserves the row's id, including a manual (no-``source_stable_ids``)
+    path re-upload of a file a crawler previously anchored, so a hand upload
+    can no longer cascade a document's derived data away. Two files sharing a
+    non-blank ``source_stable_id`` in one batch are rejected with **400**
+    ``duplicate_source_stable_id_in_batch`` — the second would otherwise
+    overwrite the first's row in place and silently drop its bytes — and a
+    read-only pre-flight resolves every file's target row before anything is
+    stored to catch the two collisions that cross the two key spaces: two
+    files landing on the SAME existing row through different anchors (**400**
+    ``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is
+    already held by another row, which would otherwise violate the
+    ``(corpus_id, path)`` unique index and 500 mid-batch (**409**
+    ``path_owned_by_another_file``). The mapping table
+    is Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed
+    instance answers **501** before any file is touched; omitting the field
+    keeps this endpoint byte-identical to the plain ``paths`` behavior above.
+    ``document_dates`` is accepted and pairing-validated for forward
+    compatibility with the doc-sync wire format but is not yet persisted
+    here — it belongs to a claim, written by the (future) fact-ingest API.
 
     Returns a list of ``{file_id, filename, path, processing_status, …}`` for
     every uploaded file (in upload order).
@@ -690,20 +1068,73 @@ async def upload_files(
             status_code=400,
             detail=f"paths_length_mismatch: {len(paths)} paths for {len(files)} files",
         )
+    for field_name, values in (
+        ("source_stable_ids", source_stable_ids),
+        ("source_doc_ids", source_doc_ids),
+        ("source_sha256s", source_sha256s),
+        ("document_dates", document_dates),
+    ):
+        if values is not None and len(values) != len(files):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name}_length_mismatch: {len(values)} entries for {len(files)} files",
+            )
 
     # A duplicate non-blank path within the same batch would replace an
     # earlier file in this same request with a later one — the earlier
-    # file's row (and blob) get purged by `_replace_existing_by_path`
-    # after its `_file_out` entry and ingest task were already queued, so
-    # the response would reference a file_id that no longer exists and
-    # schedule a no-op ingest. Reject up front instead of silently
-    # dropping a file.
+    # file's row (and blob) get purged by `_upsert_corpus_file` after its
+    # `_file_out` entry and ingest task were already queued, so the response
+    # would reference a file_id that no longer exists and schedule a no-op
+    # ingest. Reject up front instead of silently dropping a file.
     if paths is not None:
         non_blank = [p.strip() for p in paths if p and p.strip()]
         if len(non_blank) != len(set(non_blank)):
             raise HTTPException(status_code=400, detail="duplicate_path_in_batch")
 
+    # Same failure mode, one key up: `source_stable_id` is matched BEFORE
+    # `path`, so two files in one batch sharing a stable id have the second
+    # resolve to the first's row and update it in place — the first file's
+    # bytes are gone (its blob is refcount-deleted) after its `_file_out`
+    # entry and ingest task were already queued, and the response hands back
+    # the same `file_id` twice. Reject up front, exactly like a duplicate
+    # path. Deliberately BEFORE the PG-only repo resolution below, so a
+    # malformed batch is rejected identically on either backend.
+    if source_stable_ids is not None:
+        non_blank_ids = [s.strip() for s in source_stable_ids if s and s.strip()]
+        if len(non_blank_ids) != len(set(non_blank_ids)):
+            raise HTTPException(status_code=400, detail="duplicate_source_stable_id_in_batch")
+
+    # Resolve the (PG-only) source-mapping repo ONCE, up front, when this
+    # request actually uses it — so a DuckDB-backed instance fails clean
+    # with a 501 before any file is stored, never partway through a batch.
+    # Omitting `source_stable_ids` entirely never touches this repo at all,
+    # which is what keeps the plain-`paths` flow byte-identical on DuckDB.
+    sources_repo = corpus_file_sources_repo() if source_stable_ids is not None else None
+
     cf_repo = corpus_files_repo()
+    if sources_repo is not None:
+        _preflight_source_anchored_batch(
+            collection_id,
+            n_files=len(files),
+            paths=paths,
+            source_stable_ids=source_stable_ids,
+            sources_repo=sources_repo,
+            cf_repo=cf_repo,
+        )
+
+    # A content-changed match now keeps the row's id, and the derived
+    # `table_id` is computed from that id — so on a process WITHOUT the worker
+    # role the enqueued derived purge and an in-process `ingest_file` would
+    # target the SAME table and could land in either order, letting the purge
+    # delete the table the re-ingest just rebuilt. (The replaced delete+insert
+    # path was immune: the new row got a fresh id, hence a different
+    # `table_id`.) So on that plane the row's purge is withheld here and both
+    # halves ride one ordered `collections-purge` job with
+    # `reingest_after_purge=True`, exactly as `reingest_file` does.
+    from app.roles import Role, role_enabled
+
+    _defer_purge_to_ordered_job = not role_enabled(Role.WORKER)
+
     results = []
     any_rejected = False
     _to_ingest: List[str] = []
@@ -712,9 +1143,15 @@ async def upload_files(
         fname = upload.filename or "unknown"
         tier = classify(fname)
         # Optional per-file logical identity for upsert, paired positionally
-        # with `files`. Blank/missing → None (legacy plain-insert).
-        path = paths[idx].strip() if (paths and idx < len(paths) and paths[idx]) else None
-        path = path or None
+        # with `files`. Blank/missing → None (legacy plain-insert). Read via
+        # the same helper the pre-flight above uses, so the target a batch is
+        # validated against can never diverge from the one it writes.
+        path = _nth_field(paths, idx)
+        stable_id = _nth_field(source_stable_ids, idx)
+        source_doc_id = _nth_field(source_doc_ids, idx)
+        source_sha256_meta = _nth_field(source_sha256s, idx)
+        # document_dates[idx] is validated for pairing above but not read
+        # here — see the docstring's "Source-anchored upsert" paragraph.
 
         if tier is None:
             # Unsupported type — store raw bytes but record as rejected.
@@ -734,17 +1171,22 @@ async def upload_files(
                 ext = fname.rsplit(".", 1)[-1] if "." in fname else ""
 
             # Upsert only when the blob was actually stored; a failed store
-            # must not destroy an existing file, and its row carries no path.
+            # must not destroy an existing file, and its row carries no
+            # path/source anchor.
             effective_path = path if storage_path is not None else None
-            _replace_existing_by_path(collection_id, effective_path, keep_blob_path=storage_path)
-            file_id = cf_repo.add(
-                corpus_id=collection_id,
+            effective_stable_id = stable_id if storage_path is not None else None
+            file_id, _ = _upsert_corpus_file(
+                collection_id,
+                path=effective_path,
+                stable_id=effective_stable_id,
+                source_doc_id=source_doc_id,
+                source_sha256_meta=source_sha256_meta,
                 filename=fname,
                 sha256=sha,
                 file_type=ext or None,
                 size_bytes=size or None,
                 storage_path=storage_path,
-                path=effective_path,
+                sources_repo=sources_repo,
             )
             cf_repo.set_status(
                 file_id,
@@ -780,23 +1222,27 @@ async def upload_files(
                 any_rejected = True
                 continue
 
-            # Replace any existing file sharing this logical path (no-op when
-            # path is None). keep_blob_path guards the content-addressed blob
-            # we just stored in case the replacement is byte-identical.
-            _replace_existing_by_path(collection_id, path, keep_blob_path=stored.storage_path)
-            file_id = cf_repo.add(
-                corpus_id=collection_id,
+            # Match-then-insert-or-update-in-place. `needs_processing` is
+            # False only for the unchanged-content short-circuit (rename/
+            # move) — that row keeps whatever chunks/status it already had.
+            file_id, needs_processing = _upsert_corpus_file(
+                collection_id,
+                path=path,
+                stable_id=stable_id,
+                source_doc_id=source_doc_id,
+                source_sha256_meta=source_sha256_meta,
                 filename=fname,
                 sha256=stored.sha256,
                 file_type=stored.ext.lstrip(".") or None,
                 size_bytes=stored.size_bytes,
                 storage_path=stored.storage_path,
-                path=path,
+                sources_repo=sources_repo,
+                defer_row_purge=_defer_purge_to_ordered_job,
             )
-            # Default status is 'pending' (set by the repo on insert).
             row = cf_repo.get(file_id)
             results.append(_file_out(row))
-            _to_ingest.append(file_id)
+            if needs_processing:
+                _to_ingest.append(file_id)
             logger.info(
                 "corpus_file uploaded collection=%s file_id=%s sha=%s tier=%s",
                 collection_id,
@@ -805,12 +1251,32 @@ async def upload_files(
                 tier,
             )
 
-    # Kick off Tier-1 ingestion in the background (tabular → registered DuckDB
-    # table; documents → chunks). Rejected/unsupported files are not scheduled.
-    from src.ingest.runner import ingest_file
+    # Kick off Tier-1 ingestion (tabular → registered DuckDB table; documents
+    # → chunks). Rejected/unsupported files are not scheduled.
+    #
+    # Worker-role process (single-box `all`) → in-process BackgroundTask, and
+    # any derived purge already ran inline before it, so the order holds.
+    # Process WITHOUT the worker role → one ordered `collections-purge` job
+    # per file carrying `reingest_after_purge=True`, so the worker plane
+    # purges and re-ingests in that order inside a single job. The purge half
+    # is a no-op for a file that had nothing to purge (a new row, or an
+    # unchanged-content retry), and the idempotency key is the same one
+    # `_schedule_derived_purge` would have used, so this replaces the bare
+    # purge rather than racing it.
+    if _defer_purge_to_ordered_job:
+        from src.repositories import jobs_repo
 
-    for fid in _to_ingest:
-        background_tasks.add_task(ingest_file, fid)
+        for fid in _to_ingest:
+            jobs_repo().enqueue(
+                "collections-purge",
+                payload={"corpus_id": collection_id, "file_id": fid, "reingest_after_purge": True},
+                idempotency_key=f"collections-purge:{collection_id}:{fid}",
+            )
+    else:
+        from src.ingest.runner import ingest_file
+
+        for fid in _to_ingest:
+            background_tasks.add_task(ingest_file, fid)
 
     if any_rejected:
         # Return 422 with full result list so clients know which files
@@ -922,6 +1388,7 @@ async def delete_file(
         collection_id,
         user.get("id") if isinstance(user, dict) else "?",
     )
+    _sweep_facts_orphans_after_delete(trigger=f"delete_file:{file_id}")
 
 
 def _is_stale_processing(row: dict) -> bool:
