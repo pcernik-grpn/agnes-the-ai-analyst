@@ -33,7 +33,7 @@ import typer
 
 from cli.client import api_get, api_post
 from cli.commands import admin_semantic as _admin
-from cli.deprecation import deprecated_alias
+from cli.deprecation import deprecated_alias, deprecation_notice
 
 semantic_model_app = typer.Typer(
     help="The semantic layer: find models, read their documents, validate queries, propose changes"
@@ -688,12 +688,8 @@ def _coverage_alias(
 ):
     """(deprecated alias of `agnes admin semantic coverage`)"""
     sub = ctx.invoked_subcommand
-    new = f"admin semantic coverage{' ' + sub if sub else ''}"
-    typer.echo(
-        f"Deprecated: `agnes semantic-model coverage{' ' + sub if sub else ''}` is now `agnes {new}`. "
-        "The old path still works this release and will be removed in a later one.",
-        err=True,
-    )
+    suffix = f" {sub}" if sub else ""
+    deprecation_notice(f"semantic-model coverage{suffix}", f"admin semantic coverage{suffix}")
     if sub is not None:
         return
     _admin.coverage_show(source=source, as_json=as_json)
