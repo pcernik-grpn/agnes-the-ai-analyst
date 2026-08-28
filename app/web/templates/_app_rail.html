@@ -718,8 +718,15 @@
                    has no other one (the /home "What's new" strip and the
                    command palette are both conditional). Mirrors the topnav
                    `_app_header.html` row; label "News", not the page's
-                   "What's new" heading (tests/test_web_news_page.py). #}
+                   "What's new" heading (tests/test_web_news_page.py).
+
+                   Now behind `can_news` (features.news_enabled, off by default
+                   since the admin cleanup): with the surface hidden the route
+                   redirects home, and this row is the one entry point that
+                   would otherwise still advertise it. #}
+                {% if can_news %}
                 <a class="app-user-menu-item {% if _path.startswith('/news') %}is-active{% endif %}" role="menuitem" href="/news">News</a>
+                {% endif %}
 
                 {# ── Get your bearings ──────────────────────────────────────
                    Two items, one job, hence their own group behind a separator.

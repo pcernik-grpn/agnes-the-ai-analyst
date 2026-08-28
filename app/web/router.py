@@ -45,6 +45,9 @@ from app.instance_config import (
     get_custom_scripts,
     get_data_apps_config,
     get_studio_enabled,
+    get_news_enabled,
+    get_knowledge_digests_ui_enabled,
+    get_contribute_skill_enabled,
     get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
     feature_enabled,
@@ -1214,9 +1217,15 @@ async def home_page(
 
     # Pull the latest published news intro for the bottom-of-page section.
     # Template renders the section only when intro is non-empty, so an
-    # instance that has never published news shows nothing extra.
-    news = news_template_repo().get_current_published()
-    news_intro = news["intro"] if (news and news.get("intro")) else ""
+    # instance that has never published news shows nothing extra — and with
+    # the news surface hidden (features.news_enabled, off by default since the
+    # admin cleanup) we skip the read entirely rather than render a strip whose
+    # "Read more" link redirects home.
+    if get_news_enabled():
+        news = news_template_repo().get_current_published()
+        news_intro = news["intro"] if (news and news.get("intro")) else ""
+    else:
+        news_intro = ""
 
     # Homepage status frame (Last sync, Sessions, Prompts, Tokens, Projects).
     # Gated on (a) operator flag instance.home.show_status_frame /
@@ -1560,6 +1569,14 @@ async def news_page(
     """Permalink page for the latest published news. Renders empty-state
     copy when no version is published. Authed-only (same as /home).
     """
+    # Hidden with the rest of the news surface (features.news_enabled, off by
+    # default since the admin cleanup). Redirect rather than 404: this page's
+    # entry points are a rail item and a palette row, and a bookmarked link
+    # from before the flip should land somewhere useful. Same shape as the
+    # /me/ai-connector gate above.
+    if not get_news_enabled():
+        return RedirectResponse("/", status_code=302)
+
     news = news_template_repo().get_current_published()
     ctx = _build_context(
         request,
@@ -1580,6 +1597,9 @@ async def admin_news_editor(
     """Admin authoring surface — current published banner, draft editor,
     versions table. JS hits the /api/admin/news/* endpoints for the
     write paths."""
+    if not get_news_enabled():
+        return RedirectResponse("/", status_code=302)
+
     repo = news_template_repo()
     ctx = _build_context(
         request,
@@ -4906,6 +4926,15 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         # survives on pages that render via _chrome_ctx — including the studio
         # pages themselves and the command palette.
         "can_studio": get_studio_enabled(),
+        # The three surfaces retired alongside Studio in the admin cleanup.
+        # Same rule as can_studio: the hard gate is on each route, these only
+        # decide whether an ENTRY POINT is drawn (the admin sidebar's `when`
+        # rows, the rail's News item, the palette). Set here rather than only
+        # in _build_context so the palette on a _chrome_ctx page agrees with
+        # the palette everywhere else.
+        "can_news": get_news_enabled(),
+        "can_knowledge_digests": get_knowledge_digests_ui_enabled(),
+        "can_contribute_skill": get_contribute_skill_enabled(),
         # "My agents" nav entry visibility — instance-level toggle, mirrors
         # can_studio (the hard gate lives on the /agents route + the API
         # routers, this only hides the entry point).
@@ -8112,6 +8141,13 @@ async def admin_contribute_skill_page(
     marketplace. This is the landing target for an external "Load skill to
     Agnes" button: the external tool copies the skill to the clipboard and
     opens this page (optionally with ?prefill=1 to auto-read the clipboard)."""
+    # Hidden since the admin cleanup (features.contribute_skill_enabled, off by
+    # default) — the Library's skill builder is the supported path. Both POSTs
+    # below carry the same gate: an external "Load skill to Agnes" button that
+    # still points here must not be able to publish past a hidden page.
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from src.repositories import user_groups_repo
 
     ctx = _build_context(request, user=user)
@@ -8140,6 +8176,9 @@ def admin_contribute_skill_submit(
     on it from the event-loop thread would freeze every concurrent request, so
     the blocking work must run off-loop — same rationale as ``trigger_sync_all``
     (app/api/marketplaces.py)."""
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
+
     from app.marketplace_server.packager import invalidate_etag_cache
     from src.skill_contribution import SkillContributionError, contribute_skill
 
@@ -8185,6 +8224,9 @@ def admin_contribute_skill_delete(
     import shutil
 
     from fastapi.responses import RedirectResponse
+
+    if not get_contribute_skill_enabled():
+        return RedirectResponse("/", status_code=302)
 
     from app.marketplace_server.packager import invalidate_etag_cache
     from app.utils import get_marketplaces_dir
@@ -8307,6 +8349,13 @@ async def admin_knowledge_digests_page(
     user: dict = Depends(require_admin),
 ):
     """List page for admin-defined maintained digests."""
+    # PAGE gate only (features.knowledge_digests_enabled, off by default since
+    # the admin cleanup). The API, `agnes admin digest`, the scheduler job and
+    # `agnes pull`'s digest delivery are deliberately untouched — an instance
+    # already running digests keeps running them while the page is hidden.
+    if not get_knowledge_digests_ui_enabled():
+        return RedirectResponse("/", status_code=302)
+
     ctx = _build_context(request, user=user)
     return templates.TemplateResponse(request, "admin_knowledge_digests.html", ctx)
 

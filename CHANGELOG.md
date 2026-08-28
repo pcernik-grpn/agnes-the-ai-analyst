@@ -225,6 +225,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **BREAKING: four admin surfaces are hidden by default — Studio, News, Knowledge
+  digests, and Contribute a skill.** The admin sidebar drops all four rows (plus
+  the Studio suggestions row, which reads the same flag its route always did),
+  the rail's News item and the news + Studio command-palette entries; every one
+  of the routes redirects home, including both `/admin/contribute-skill` POSTs so
+  a stale external "Load skill to Agnes" button cannot publish past a hidden
+  page. Nothing is deleted — the pages, templates and APIs are intact and each
+  surface is one flag away: `studio.enabled` / `AGNES_STUDIO_ENABLED` (was `true`,
+  now `false`), and three new flags `features.news_enabled` /
+  `AGNES_NEWS_ENABLED`, `features.knowledge_digests_enabled` /
+  `AGNES_KNOWLEDGE_DIGESTS_ENABLED`, `features.contribute_skill_enabled` /
+  `AGNES_CONTRIBUTE_SKILL_ENABLED`. **Breaking for an instance that used Studio
+  or news without setting the flag: it turns off on upgrade** (the Library
+  builders at `/library` → "+ New" do the Studio's authoring jobs). Two gates
+  stay deliberately narrow: the digests flag hides the ADMIN PAGE only —
+  `/api/admin/knowledge-digests/*`, `agnes admin digest`, the digest scheduler
+  job and `agnes pull`'s digest delivery keep working, so an instance already
+  running digests keeps running them headlessly — and the news flag hides UI
+  only, leaving `/api/admin/news/*` and any published version untouched, so
+  turning it back on restores the surface with its content intact.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the

@@ -915,6 +915,10 @@ the `/admin/studio/{domain}` builder; admins approve/reject (guarded state
 transitions — turning an approved suggestion into the real resource is a deferred
 follow-up that must re-validate through the domain endpoint, never replay).
 
+The Studio is **hidden by default** since the admin cleanup (`studio.enabled` /
+`AGNES_STUDIO_ENABLED`), and these endpoints answer `403` while it is off. See
+[feature-flags.md](feature-flags.md).
+
 - /api/studio/suggestions
 - /api/studio/suggestions/mine
 - /api/admin/authoring-suggestions
@@ -1159,6 +1163,8 @@ Deliberately not MCP-exposed (credential-provisioning exemption, `CONTRIBUTING.m
 ### `/api/admin/contributed-skills` — Contributed skill management
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
+
+These endpoints are NOT gated by `features.contribute_skill_enabled` — that flag hides the `/admin/contribute-skill` WEB PAGE only (off by default since the admin cleanup; the Library's skill builder is the supported path). The API, CLI and MCP surfaces keep working, so automation that publishes contributed skills is unaffected.
 
 - /api/admin/contributed-skills
 - /api/admin/contributed-skills/{name}

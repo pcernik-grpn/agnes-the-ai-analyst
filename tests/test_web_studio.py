@@ -4,6 +4,20 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def studio_on(monkeypatch):
+    """Studio is OFF by default since the admin cleanup retired the surface.
+
+    Every test in this module is about what the surface DOES when exposed, so
+    they turn it on rather than assert against the shipped default. The two
+    tests that check the disabled behavior override this — one by patching
+    `app.web.router.get_studio_enabled`, which wins over the env var because it
+    replaces the reader itself, the other by setting the env var it owns.
+    """
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
+
+
 DOMAINS = ["data-package", "mcp", "marketplace", "corporate-memory"]
 
 
@@ -514,8 +528,8 @@ def test_studio_enabled_env_override(monkeypatch):
     monkeypatch.setenv("AGNES_STUDIO_ENABLED", "true")
     assert ic.get_studio_enabled() is True
     monkeypatch.delenv("AGNES_STUDIO_ENABLED", raising=False)
-    # No env, no yaml studio block → defaults on.
-    assert ic.get_studio_enabled() is True
+    # No env, no yaml studio block → defaults OFF since the admin cleanup.
+    assert ic.get_studio_enabled() is False
 
 
 def test_studio_enabled_yaml_fallback_and_precedence(monkeypatch):

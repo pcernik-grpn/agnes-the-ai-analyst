@@ -131,11 +131,36 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "default": "",
     },
     {
+        # False since the admin cleanup retired the Studio surface — keep this
+        # in step with the switch's `default`, or `_source_for` infers `yaml`
+        # from `current != default` and reports a Studio nobody configured as
+        # deliberately set (the trap documented on `instance_theme` above).
         "key": "studio_enabled",
         "resolver": "get_studio_enabled",
         "env_var": "AGNES_STUDIO_ENABLED",
         "yaml_path": "studio.enabled",
-        "default": True,
+        "default": False,
+    },
+    {
+        "key": "news_enabled",
+        "resolver": "get_news_enabled",
+        "env_var": "AGNES_NEWS_ENABLED",
+        "yaml_path": "features.news_enabled",
+        "default": False,
+    },
+    {
+        "key": "knowledge_digests_ui_enabled",
+        "resolver": "get_knowledge_digests_ui_enabled",
+        "env_var": "AGNES_KNOWLEDGE_DIGESTS_ENABLED",
+        "yaml_path": "features.knowledge_digests_enabled",
+        "default": False,
+    },
+    {
+        "key": "contribute_skill_enabled",
+        "resolver": "get_contribute_skill_enabled",
+        "env_var": "AGNES_CONTRIBUTE_SKILL_ENABLED",
+        "yaml_path": "features.contribute_skill_enabled",
+        "default": False,
     },
     {
         "key": "agent_profiles_enabled",
