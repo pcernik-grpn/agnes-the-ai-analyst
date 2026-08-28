@@ -1,4 +1,5 @@
 {% extends "base_ds.html" %}
+{% import "macros/_icon.html" as ico %}
 
 {# One noun in both chromes: the former /artefacts surface WAS renamed to
    Library and took over the route (see the back-link comment below), so the
@@ -260,7 +261,7 @@
       {# Conflicts render WHERE THE FACT LIVES — never a detached queue. #}
       {% for c in f.conflicts %}
       <div class="fact-conflict">
-        <span class="fact-conflict__key">⚠ "{{ c.key }}" disagrees across documents</span>
+        <span class="fact-conflict__key">{{ ico.icon('warning', 14) }} "{{ c.key }}" disagrees across documents</span>
         <ul class="fact-conflict__values">
           {% for e in c.entries %}
           <li><strong>{{ e.value }}</strong> — {{ e.document_name }}{% if e.document_date %} ({{ e.document_date }}){% endif %}</li>
@@ -290,7 +291,7 @@
     <h3 class="facts-review__title">Review items</h3>
     {% for item in facts_summary.review_items %}
     {% if item.kind == 'single_valued_conflict' %}
-    <div class="fact-review-row">⚠ {{ item.src.display_name }} has {{ item.dsts|length }} conflicting "{{ item.type }}" values: {{ item.dsts | map(attribute='display_name') | join(', ') }}</div>
+    <div class="fact-review-row">{{ ico.icon('warning', 14) }} {{ item.src.display_name }} has {{ item.dsts|length }} conflicting "{{ item.type }}" values: {{ item.dsts | map(attribute='display_name') | join(', ') }}</div>
     {% else %}
     <div class="fact-review-row">{{ item.a.display_name }} &harr; {{ item.b.display_name }}</div>
     {% endif %}
