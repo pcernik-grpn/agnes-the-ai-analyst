@@ -179,6 +179,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 - **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
+- **Vocabulary pass (D5, v1): the same concept now has one name across UI,
+  CLI and MCP help text — the old name keeps working as a deprecated
+  alias.** `agnes connectors`/`agnes connector` → **`agnes tools`**
+  (optional MCP tool connectors — Asana, Atlassian, … — were colliding with
+  "Connector" = data source used throughout the docs); `agnes stack
+  artefacts` → **`agnes stack collections`**, and its `corpus_id` argument
+  is now documented as a collection id ("Collection" is the established
+  canonical name for a file corpus — see `agnes collections` — the
+  `stack_artefact_*` MCP tool descriptions now lead with "collection" too).
+  `agnes agent`'s help text drops "agent profile" in favor of "agent"; the
+  agent builder's schedules panel says "agents are disabled" instead of
+  "agent profiles are disabled". The semantic-model CLI (`agnes admin
+  semantic-model`, `agnes semantic-model apply`) drops "Ossie document" in
+  favor of "semantic model document" (`agnes semantic-model schema`, which
+  prints the actual vendored Apache Ossie JSON Schema, keeps naming the
+  standard — that reference is accurate, not the retired synonym).
+  `/admin/data-sources`' browser tab title is now "Connections" (the hero
+  and nav tab stay "Data"/"Sources"). No REST route paths changed.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending
