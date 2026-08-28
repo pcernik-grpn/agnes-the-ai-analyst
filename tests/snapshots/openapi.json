@@ -8473,6 +8473,22 @@
         "title": "SemanticModelCreate",
         "type": "object"
       },
+      "SemanticModelPackageIds": {
+        "properties": {
+          "package_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Package Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "package_ids"
+        ],
+        "title": "SemanticModelPackageIds",
+        "type": "object"
+      },
       "SemanticModelPackageLink": {
         "properties": {
           "package_id": {
@@ -28048,7 +28064,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SemanticModelPackageIds"
+                }
               }
             },
             "description": "Successful Response"
@@ -28078,7 +28096,7 @@
     },
     "/api/admin/semantic-models/{slug}/packages/{package_id}": {
       "delete": {
-        "description": "Unlink a semantic model from a Data Package.\n\nIdempotent on an already-unlinked pair or an unknown ``package_id`` \u2014\nthe junction delete is a no-op either way, mirroring\n``remove_table_from_package``'s junction-row semantics\n(``app/api/data_packages.py``). Only ``slug`` 404s.",
+        "description": "Unlink a semantic model from a Data Package.\n\nIdempotent on an already-unlinked pair or an unknown ``package_id`` \u2014\nthe junction delete is a no-op either way, mirroring\n``remove_table_from_package``'s junction-row semantics\n(``app/api/data_packages.py``). Only ``slug`` 404s.\n\nDeliberately returns 200 with the remaining ``package_ids`` rather than\n204 (see ``_DELETE_200_WITH_BODY_ALLOWLIST`` in\n``tests/test_api_design_rules.py``) \u2014 symmetric with the linking POST\nabove, and the CLI's ``unlink-package`` echoes the remaining packages\nwithout a follow-up GET.",
         "operationId": "unlink_semantic_model_package_api_admin_semantic_models__slug__packages__package_id__delete",
         "parameters": [
           {
@@ -28120,7 +28138,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SemanticModelPackageIds"
+                }
               }
             },
             "description": "Successful Response"

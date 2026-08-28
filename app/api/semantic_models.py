@@ -96,6 +96,10 @@ class SemanticModelPackageLink(BaseModel):
     package_id: str
 
 
+class SemanticModelPackageIds(BaseModel):
+    package_ids: list[str]
+
+
 class SemanticQueryValidate(BaseModel):
     sql: str
     expected: list[dict] | None = None
@@ -786,7 +790,7 @@ async def reattach_semantic_model(model_id: str, body: ReattachRequest, user: di
     return updated
 
 
-@router.post("/api/admin/semantic-models/{slug}/packages")
+@router.post("/api/admin/semantic-models/{slug}/packages", response_model=SemanticModelPackageIds)
 async def link_semantic_model_package(
     slug: str,
     body: SemanticModelPackageLink,
@@ -818,7 +822,7 @@ async def link_semantic_model_package(
     return {"package_ids": repo.list_packages_for_model(model["id"])}
 
 
-@router.delete("/api/admin/semantic-models/{slug}/packages/{package_id}")
+@router.delete("/api/admin/semantic-models/{slug}/packages/{package_id}", response_model=SemanticModelPackageIds)
 async def unlink_semantic_model_package(
     slug: str,
     package_id: str,
@@ -830,6 +834,12 @@ async def unlink_semantic_model_package(
     the junction delete is a no-op either way, mirroring
     ``remove_table_from_package``'s junction-row semantics
     (``app/api/data_packages.py``). Only ``slug`` 404s.
+
+    Deliberately returns 200 with the remaining ``package_ids`` rather than
+    204 (see ``_DELETE_200_WITH_BODY_ALLOWLIST`` in
+    ``tests/test_api_design_rules.py``) — symmetric with the linking POST
+    above, and the CLI's ``unlink-package`` echoes the remaining packages
+    without a follow-up GET.
     """
     repo = semantic_model_repo()
     model = repo.get_by_slug(slug)
