@@ -2054,8 +2054,13 @@ the engine exposes nothing.
   answer as SSE). The brokered identity is a short-lived `mcp-oauth` access
   token minted for the ticket's user, so the engine reaches exactly the tools
   and RBAC a Claude Desktop connector would — the broker adds no authority.
-  Point the engine's `HOST_BROKER_MCP_URL` here and set
-  `KAI_BROKER_MCP_ENABLED`.
+  A session bound to a scope-limited agent (or an agent whose session user is
+  not its owner) instead gets a registered `agent_session` token: the
+  resolver rebuilds owner-grants ∩ agent-scope live per request
+  (`AgentPrincipal`), the same narrowed identity the native broker replay
+  mints. A co-session is refused (`403 mcp_not_available_to_co_session`)
+  rather than resolved to its stored owner. Point the engine's
+  `HOST_BROKER_MCP_URL` here and set `KAI_BROKER_MCP_ENABLED`.
 - /api/kai/workspace — `GET`, authenticated by the session credential (the
   engine's *server* calls it once per SDK process spawn; the sandbox never
   sees it). Returns `200` with a gzipped tar of the caller's workspace tree,
@@ -2075,9 +2080,14 @@ the engine exposes nothing.
   verbatim (the git override and the admin Workspace Prompt are mutually
   exclusive by design — see
   [initial-workspace-override.md](initial-workspace-override.md)), and a
-  co-session or a session bound to a scope-limited agent gets the un-filtered
-  bundled text, because the rendered document describes the *owner's*
-  reachable tables and skills. The payload is therefore per-session, but stays
+  co-session gets the un-filtered bundled text, because the rendered document
+  describes one identity's reachable tables and skills and a co-session has
+  no single one. A session bound to an agent additionally carries the agent
+  overlay — the persona `CLAUDE.md` (which replaces the rendered prompt,
+  native parity with `WorkdirManager._materialize_profile`), the identity
+  skill, and the active memories at `.claude/agent-memory.md`; its flattened
+  marketplace components are intersection-filtered for a scope-limited
+  agent. The payload is therefore per-session, but stays
   byte-stable for a given session and configuration, which is what the
   engine's re-fetch on every SDK respawn relies on. Per *session* rather than
   per caller because the rendered document carries a date (`{{ today }}` in

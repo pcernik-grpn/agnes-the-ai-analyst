@@ -78,6 +78,20 @@ async def _run_and_cancel(coro, duration_s: float) -> None:
     assert task.done()
 
 
+async def _lane_task_names(coro, duration_s: float) -> set[str]:
+    """Like ``_run_and_cancel``, but snapshots every OTHER live task's name
+    right before cancelling — used to assert exactly which lane slots
+    ``worker_loop`` spawned (``worker-heavy-N`` / ``worker-light-N`` /
+    ``worker-extraction-N``, see ``worker_loop``'s task-naming)."""
+    outer = asyncio.create_task(coro)
+    await asyncio.sleep(duration_s)
+    names = {t.get_name() for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+    outer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer
+    return names
+
+
 # ---------------------------------------------------------------------------
 # registry
 # ---------------------------------------------------------------------------
@@ -100,6 +114,84 @@ def test_register_kind_rejects_unknown_lane():
         register_kind(JobKind(name="bad", handler=lambda payload: None, lane="medium"))
 
 
+def test_register_kind_accepts_extraction_lane():
+    """The extraction lane (spec §7.5 / §16 step 7) is a valid ``JobKind``
+    lane, same as heavy/light."""
+    from app.worker.registry import EXTRACTION_LANE, JOB_KINDS, JobKind, register_kind
+
+    register_kind(JobKind(name="extraction_sanity", handler=lambda payload: None, lane=EXTRACTION_LANE))
+    assert JOB_KINDS["extraction_sanity"].lane == EXTRACTION_LANE
+
+
+def test_kinds_for_lane_returns_extraction_kinds():
+    from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JobKind, register_kind
+    from app.worker.runtime import _kinds_for_lane
+
+    register_kind(JobKind(name="extraction_sanity", handler=lambda payload: None, lane=EXTRACTION_LANE))
+    register_kind(JobKind(name="heavy_sanity", handler=lambda payload: None, lane=HEAVY_LANE))
+
+    assert _kinds_for_lane(EXTRACTION_LANE) == ["extraction_sanity"]
+    assert "extraction_sanity" not in _kinds_for_lane(HEAVY_LANE)
+
+
+# ---------------------------------------------------------------------------
+# selected_lanes() / AGNES_WORKER_LANES
+# ---------------------------------------------------------------------------
+
+
+class TestSelectedLanes:
+    def test_unset_returns_heavy_and_light_only_not_extraction(self, monkeypatch):
+        """Backward compatibility: unset is the exact set worker_loop always
+        spawned before the extraction lane existed — extraction is opt-in."""
+        monkeypatch.delenv("AGNES_WORKER_LANES", raising=False)
+        from app.worker.registry import HEAVY_LANE, LIGHT_LANE
+        from app.worker.runtime import selected_lanes
+
+        assert selected_lanes() == (HEAVY_LANE, LIGHT_LANE)
+
+    def test_empty_string_is_treated_as_unset(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", "  ")
+        from app.worker.registry import HEAVY_LANE, LIGHT_LANE
+        from app.worker.runtime import selected_lanes
+
+        assert selected_lanes() == (HEAVY_LANE, LIGHT_LANE)
+
+    def test_extraction_only(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", "extraction")
+        from app.worker.registry import EXTRACTION_LANE
+        from app.worker.runtime import selected_lanes
+
+        assert selected_lanes() == (EXTRACTION_LANE,)
+
+    def test_heavy_and_light(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", "heavy,light")
+        from app.worker.registry import HEAVY_LANE, LIGHT_LANE
+        from app.worker.runtime import selected_lanes
+
+        assert selected_lanes() == (HEAVY_LANE, LIGHT_LANE)
+
+    def test_whitespace_and_duplicates_are_tolerated_order_preserved(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", " light , heavy ,light")
+        from app.worker.registry import HEAVY_LANE, LIGHT_LANE
+        from app.worker.runtime import selected_lanes
+
+        assert selected_lanes() == (LIGHT_LANE, HEAVY_LANE)
+
+    def test_unknown_token_raises_value_error_naming_valid_lanes(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", "medium")
+        from app.worker.runtime import selected_lanes
+
+        with pytest.raises(ValueError, match="medium"):
+            selected_lanes()
+
+    def test_unknown_token_error_lists_every_valid_lane(self, monkeypatch):
+        monkeypatch.setenv("AGNES_WORKER_LANES", "medium")
+        from app.worker.runtime import selected_lanes
+
+        with pytest.raises(ValueError, match=r"heavy.*light.*extraction"):
+            selected_lanes()
+
+
 # ---------------------------------------------------------------------------
 # worker_loop
 # ---------------------------------------------------------------------------
@@ -109,6 +201,54 @@ def test_default_worker_id_is_hostname_colon_pid():
     from app.worker.runtime import default_worker_id
 
     assert default_worker_id() == f"{socket.gethostname()}:{os.getpid()}"
+
+
+def test_worker_loop_default_spawns_heavy_and_light_but_not_extraction(worker_db, monkeypatch):
+    """Backward compatibility: unset ``AGNES_WORKER_LANES`` must reproduce
+    the pre-extraction-lane spawn set exactly — one heavy slot, two light
+    slots, no extraction slot."""
+    monkeypatch.delenv("AGNES_WORKER_LANES", raising=False)
+    from app.worker.runtime import worker_loop
+
+    names = asyncio.run(_lane_task_names(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.2))
+
+    assert sum(n.startswith("worker-heavy-") for n in names) == 1
+    assert sum(n.startswith("worker-light-") for n in names) == 2
+    assert sum(n.startswith("worker-extraction-") for n in names) == 0
+
+
+def test_worker_loop_spawns_extraction_only_lane_selected(worker_db, monkeypatch):
+    monkeypatch.setenv("AGNES_WORKER_LANES", "extraction")
+    from app.worker.runtime import worker_loop
+
+    names = asyncio.run(_lane_task_names(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.2))
+
+    assert sum(n.startswith("worker-extraction-") for n in names) == 1
+    assert sum(n.startswith("worker-heavy-") for n in names) == 0
+    assert sum(n.startswith("worker-light-") for n in names) == 0
+
+
+def test_worker_loop_spawns_all_three_lanes_when_selected(worker_db, monkeypatch):
+    monkeypatch.setenv("AGNES_WORKER_LANES", "heavy,light,extraction")
+    from app.worker.runtime import worker_loop
+
+    names = asyncio.run(_lane_task_names(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.2))
+
+    assert sum(n.startswith("worker-heavy-") for n in names) == 1
+    assert sum(n.startswith("worker-light-") for n in names) == 2
+    assert sum(n.startswith("worker-extraction-") for n in names) == 1
+
+
+def test_worker_loop_invalid_lane_raises_before_spawning_anything(worker_db, monkeypatch):
+    monkeypatch.setenv("AGNES_WORKER_LANES", "bogus")
+    from app.worker.runtime import worker_loop
+
+    async def _run():
+        task = asyncio.create_task(worker_loop(worker_id="test-worker", poll_interval_s=0.05))
+        with pytest.raises(ValueError):
+            await task
+
+    asyncio.run(_run())
 
 
 def test_heavy_lane_serializes_while_light_lane_proceeds_concurrently(worker_db):
