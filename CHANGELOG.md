@@ -156,6 +156,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   conversations resets the count and reloads an open drawer instead of
   leaving the previous chat's rows on screen with their old download links.
 
+- **The chat agent's file-handover rule now covers the case that actually
+  failed: a skill writing its output next to its own scaffolds.** The
+  sandbox-only `Files you produce` section already named `outputs/` as the
+  place to write a deliverable; what it did not say is that a skill whose
+  scaffolds live under `.claude/skills/<name>/` must still write its *output*
+  to `outputs/` — which is exactly what the repro did, producing a file no
+  surface could show. `outputs/` is the one location all three collectors
+  agree on: the agent-API harvest scans `/work/outputs`, the engine's sandbox
+  file browser lists the workspace tree while filtering dot-directories, and
+  the host walk lists the session dir. The section also now tells the agent
+  not to promise a download control it cannot see from inside the sandbox, and
+  keeps the chart/document split explicit. Sandbox surface only — on a laptop
+  workspace the filesystem IS the user's machine and naming the path is the
+  delivery. Mirrored across both prompt files
+  (`app/initial_workspace_default/CLAUDE.md` and
+  `config/claude_md_template.txt`) and pinned by drift + retraction guards.
+
 ### Fixed
 - **Dark theme: several light-hex backgrounds that never flipped now use
   `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
