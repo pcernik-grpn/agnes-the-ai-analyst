@@ -101,7 +101,7 @@ async def run_databricks_semantic_layer_refresh(
             status = 400 if (exc.status is not None and 400 <= exc.status < 500) else 502
             raise HTTPException(status_code=status, detail=str(exc)) from exc
         except RuntimeError as exc:
-            # DatabricksSemanticAdapter.extract() raises a plain RuntimeError
+            # DatabricksMetricViewAdapter.extract() raises a plain RuntimeError
             # for everything the admin controls — not configured, no catalog.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not swallowed

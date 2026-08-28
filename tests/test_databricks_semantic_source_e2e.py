@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from connectors.databricks.semantic_ossie import DatabricksSemanticAdapter
+from connectors.databricks.semantic_ossie import DatabricksMetricViewAdapter
 from tests.test_databricks_semantic_ossie import _SETTINGS, FakeStatementClient
 
 
@@ -25,7 +25,7 @@ def _register_source(source_id: str = "ss_dbx_test") -> str:
         id=source_id,
         kind="connection",
         name="Databricks metric views",
-        adapter="databricks_semantic",
+        adapter="databricks_metric_views",
         config={},
     )
     return source_id
@@ -39,7 +39,7 @@ def test_databricks_source_syncs_into_semantic_models_and_metric_definitions(e2e
 
     with (
         patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
-        patch.object(DatabricksSemanticAdapter, "_client", lambda self, settings: FakeStatementClient()),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: FakeStatementClient()),
     ):
         report = import_source(source_id)
 
@@ -72,7 +72,7 @@ def test_second_sync_of_an_unchanged_workspace_is_a_no_op(e2e_env):
     source_id = _register_source()
     with (
         patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
-        patch.object(DatabricksSemanticAdapter, "_client", lambda self, settings: FakeStatementClient()),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: FakeStatementClient()),
     ):
         import_source(source_id)
         second = import_source(source_id)
@@ -91,14 +91,14 @@ def test_sync_prunes_a_measure_removed_upstream(e2e_env):
     source_id = _register_source()
     with (
         patch("connectors.databricks.semantic_layer.resolve_databricks_settings", return_value=_SETTINGS),
-        patch.object(DatabricksSemanticAdapter, "_client", lambda self, settings: FakeStatementClient()),
+        patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: FakeStatementClient()),
     ):
         import_source(source_id)
         assert metric_repo().get(f"ossie_connection/{source_id}/main.sales.orders_metrics/Order Count") is not None
 
         one_measure_yaml = "version: 1.1\nsource: t\nmeasures:\n  - name: Total Revenue\n    expr: SUM(x)\n"
         shrunk_client = FakeStatementClient(yaml_by_view={"orders_metrics": one_measure_yaml})
-        with patch.object(DatabricksSemanticAdapter, "_client", lambda self, settings: shrunk_client):
+        with patch.object(DatabricksMetricViewAdapter, "_client", lambda self, settings: shrunk_client):
             import_source(source_id)
 
     assert metric_repo().get(f"ossie_connection/{source_id}/main.sales.orders_metrics/Order Count") is None

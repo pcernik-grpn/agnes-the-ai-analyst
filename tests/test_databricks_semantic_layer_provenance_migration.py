@@ -24,7 +24,7 @@ class TestEnsureSemanticSource:
         row = semantic_source_repo().get(source_id)
         assert row is not None
         assert row["kind"] == "connection"
-        assert row["adapter"] == "databricks_semantic"
+        assert row["adapter"] == "databricks_metric_views"
 
     def test_is_idempotent_and_does_not_overwrite_an_existing_row(self, e2e_env):
         from src.repositories import semantic_source_repo

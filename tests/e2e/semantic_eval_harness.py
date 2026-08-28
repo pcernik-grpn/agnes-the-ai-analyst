@@ -366,6 +366,10 @@ def render_workspace_prompt(*, has_models: bool) -> str:
             "categories": sorted({m.split("/")[0] for m in METRICS}) if has_models else [],
         },
         "semantic_layer": semantic_layer,
+        # The eval only varies semantic_layer.has_models (see docstring) — the
+        # facts feature is off for both arms, same as an instance that hasn't
+        # enabled it.
+        "facts": {"enabled": False},
         "marketplaces": [],
         "user": {
             "id": "u-eval",
