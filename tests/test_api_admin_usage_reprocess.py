@@ -1,7 +1,7 @@
 """POST /api/admin/telemetry/reprocess and /prune."""
+
 from __future__ import annotations
 
-import pytest
 from datetime import datetime, timezone, timedelta
 
 
@@ -57,12 +57,8 @@ def test_reprocess_clears_usage_state_only(seeded_app, admin_user):
 
     # Verification state untouched
     conn = get_system_db()
-    v = conn.execute(
-        "SELECT COUNT(*) FROM session_processor_state WHERE processor_name='verification'"
-    ).fetchone()[0]
-    u = conn.execute(
-        "SELECT COUNT(*) FROM session_processor_state WHERE processor_name='usage'"
-    ).fetchone()[0]
+    v = conn.execute("SELECT COUNT(*) FROM session_processor_state WHERE processor_name='verification'").fetchone()[0]
+    u = conn.execute("SELECT COUNT(*) FROM session_processor_state WHERE processor_name='usage'").fetchone()[0]
     n_events = conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
     conn.close()
     assert v == 1
@@ -78,9 +74,7 @@ def test_reprocess_writes_audit_log(seeded_app, admin_user):
     conn.close()
     seeded_app["client"].post("/api/admin/telemetry/reprocess", headers=admin_user)
     conn = get_system_db()
-    n = conn.execute(
-        "SELECT COUNT(*) FROM audit_log WHERE action='usage.reprocess'"
-    ).fetchone()[0]
+    n = conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='usage.reprocess'").fetchone()[0]
     conn.close()
     assert n >= 1
 
@@ -154,9 +148,7 @@ def test_prune_writes_audit_log(seeded_app, admin_user, monkeypatch):
     conn.close()
     seeded_app["client"].post("/api/admin/telemetry/prune", headers=admin_user)
     conn = get_system_db()
-    n = conn.execute(
-        "SELECT COUNT(*) FROM audit_log WHERE action='usage.prune'"
-    ).fetchone()[0]
+    n = conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='usage.prune'").fetchone()[0]
     conn.close()
     assert n >= 1
 
@@ -164,3 +156,36 @@ def test_prune_writes_audit_log(seeded_app, admin_user, monkeypatch):
 def test_prune_admin_only(seeded_app, analyst_user):
     resp = seeded_app["client"].post("/api/admin/telemetry/prune", headers=analyst_user)
     assert resp.status_code in (401, 403)
+
+
+def test_prune_respects_retention_config_key_when_env_var_unset(seeded_app, admin_user, monkeypatch):
+    """Track E3 Slice 1 reconciliation: retention.usage_events_days in
+    instance.yaml is honored when USAGE_EVENTS_RETENTION_DAYS is unset —
+    the config-file path, not just the legacy env var."""
+    import app.instance_config as ic
+
+    monkeypatch.delenv("USAGE_EVENTS_RETENTION_DAYS", raising=False)
+
+    def _get_value(*keys, default=None):
+        return 7 if keys == ("retention", "usage_events_days") else default
+
+    monkeypatch.setattr(ic, "get_value", _get_value)
+
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    conn.execute(
+        """INSERT INTO usage_events
+        (id, session_id, session_file, username, event_type, tool_name,
+         is_error, source, occurred_at, processor_version)
+        VALUES ('cfg-old', 's', 'a/x.jsonl', 'a', 'tool_use', 'Bash', false, 'builtin', ?, 1)""",
+        [datetime.now(timezone.utc) - timedelta(days=10)],
+    )
+    conn.close()
+
+    resp = seeded_app["client"].post("/api/admin/telemetry/prune", headers=admin_user)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["retention_days"] == 7
+    assert body["deleted"] == 1

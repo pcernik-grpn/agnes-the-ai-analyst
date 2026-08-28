@@ -180,3 +180,16 @@ class LlmUsagePgRepository:
                 .all()
             )
         return [dict(r) for r in rows]
+
+    def prune_older_than(self, days: int) -> int:
+        """Mirrors ``LlmUsageRepository.prune_older_than``."""
+        with self._engine.begin() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "DELETE FROM llm_usage "
+                    "WHERE created_at < (CURRENT_TIMESTAMP - (:days * INTERVAL '1 day')) "
+                    "RETURNING 1"
+                ),
+                {"days": days},
+            ).all()
+        return len(rows)

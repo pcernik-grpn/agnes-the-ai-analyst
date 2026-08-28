@@ -228,3 +228,22 @@ class SyncStateRepository:
             [table_id],
         ).fetchall()
         return len(removed)
+
+    def prune_history_older_than(self, days: int) -> int:
+        """Delete ``sync_history`` rows older than ``days``, by
+        ``synced_at``. Returns the deleted-row count.
+
+        Scoped to ``sync_history`` only — never touches ``sync_state``, the
+        live per-table snapshot (``last_sync``/``rows``/``hash``/``status``)
+        that the manifest and `agnes pull` read. That row is current state,
+        not a trail entry, and must survive regardless of history retention.
+
+        The caller (``src/audit_retention.py``) owns the "days<=0 = keep
+        forever, skip entirely" short-circuit — this method always executes
+        the DELETE it's given, no matter the value (mirrors
+        ``AuditRepository.prune_older_than``)."""
+        rows = self.conn.execute(
+            "DELETE FROM sync_history WHERE synced_at < (CURRENT_TIMESTAMP - INTERVAL (?) DAY) RETURNING id",
+            [days],
+        ).fetchall()
+        return len(rows)
