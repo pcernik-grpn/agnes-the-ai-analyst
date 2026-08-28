@@ -302,6 +302,29 @@ def test_no_request_fails_closed(client):
 # --------------------------------------------------------------------------
 
 
+def test_documented_allowlist_names_exist():
+    """Every `_DATA_APP_ALLOWED_*` name the module's prose points at must
+    resolve.
+
+    Renaming the allowlist left two comments pointing at a
+    `_DATA_APP_ALLOWED_PREFIXES` that no longer existed — the reader is sent
+    to a symbol they cannot find, which is the same class of defect as a
+    guard whose message names the wrong fix.
+    """
+    import re
+
+    from pathlib import Path
+
+    import app.auth.pat_resolver as mod
+
+    text = Path("app/auth/pat_resolver.py").read_text(encoding="utf-8")
+    referenced = set(re.findall(r"[`\"']{1,2}(_DATA_APP_ALLOWED_[A-Z_]+)[`\"']{1,2}", text))
+    assert referenced, "guard is looking for the wrong pattern — no names found at all"
+
+    missing = sorted(n for n in referenced if not hasattr(mod, n))
+    assert not missing, f"prose in pat_resolver.py names non-existent allowlist symbols: {missing}"
+
+
 def test_the_admitted_route_set_is_pinned(client, shared_app):
     """Walk the REAL route table and pin every route the allowlist admits.
 

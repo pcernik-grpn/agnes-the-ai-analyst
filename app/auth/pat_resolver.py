@@ -125,8 +125,9 @@ DATA_APP_PREVIEW_SCOPE_PREFIX = "data-app-preview:"
 # Unlike its two siblings above, this credential legitimately needs MANY
 # endpoints — it is a data client, "exactly like the CLI and MCP surfaces"
 # (spec `2026-07-21-data-apps-design.md`) — so a per-surface boolean does not
-# fit. It is gated the way agent PATs are instead: a fail-closed path-prefix
-# allowlist, `_DATA_APP_ALLOWED_PREFIXES` below.
+# fit. It is gated the way agent PATs are instead: a fail-closed path
+# allowlist — `_DATA_APP_ALLOWED_EXACT` + `_DATA_APP_ALLOWED_SUBTREES` below,
+# applied by `_data_app_path_allowed`.
 #
 # Note the prefixes do not overlap: `"data-app-git:x".startswith("data-app:")`
 # is False (`-` vs `:` at index 8), so a clone credential still falls to its
@@ -248,8 +249,9 @@ def resolve_token_to_user(
     The third data-app scope, ``data-app:<slug>`` (the runtime service token
     minted by ``app.api.data_apps._mint_service_token``), has no boolean
     because it is not confined to one surface — it is a data client. It is
-    gated instead by the ``_DATA_APP_ALLOWED_PREFIXES`` path allowlist, so
-    there is no parameter to pass: every caller gets the same enforcement.
+    gated instead by the ``_DATA_APP_ALLOWED_EXACT`` /
+    ``_DATA_APP_ALLOWED_SUBTREES`` path allowlist, so there is no parameter
+    to pass: every caller gets the same enforcement.
     """
     if not token:
         return None, "no_token"
