@@ -227,3 +227,39 @@ class TestTheWizardCanMakeAnAudience:
     def test_a_failed_refresh_still_leaves_a_usable_step(self, page):
         block = re.search(r"#ds-wizard-newgroup.*?\n  \}", page, re.S)
         assert "catch" in block.group(0)
+
+
+class TestTheFlagHasExactlyOneDefinition:
+    """Raised by a review bot on PR #1679: the router computed
+    `dev_preview_available` twice — `_dev_preview_enabled()` in `_chrome_ctx`,
+    and `is_local_dev_mode() and is_user_admin(...)` as a `_build_context`
+    kwarg on `/chat`. Two definitions of one key, only one of which was
+    corrected when the dead clause came out; the next edit would have had to
+    find both.
+
+    The `/chat` half was redundant on its own terms — `_dev_preview.html` is
+    the key's only consumer and gates on `session.user.is_admin` itself, so a
+    member never saw the switch through either route. It is gone; chrome owns
+    the flag, because the switch is chrome.
+    """
+
+    def test_only_chrome_assigns_it(self):
+        router = ROUTER.read_text(encoding="utf-8")
+        assigns = [
+            line.strip()
+            for line in router.splitlines()
+            if "dev_preview_available" in line and not line.strip().startswith("#")
+        ]
+        assert assigns == ['"dev_preview_available": _dev_preview_enabled(),'], (
+            f"dev_preview_available must be set in exactly one place (_chrome_ctx); found: {assigns}"
+        )
+
+    def test_the_admin_half_lives_in_the_partial_not_the_context(self, partial):
+        """Where the two halves live is the point: chrome answers "is the
+        switch honoured here", the partial answers "does this reader have an
+        admin view to switch away from" — for free, off a context key it
+        already has. Folding the second into the flag is what created the
+        duplicate, and would cost an uncached `is_user_admin()` on every page."""
+        router = ROUTER.read_text(encoding="utf-8")
+        assert "dev_preview_available=is_local_dev_mode()" not in router
+        assert "session.user.is_admin" in partial

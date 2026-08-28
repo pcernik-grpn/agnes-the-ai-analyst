@@ -9440,7 +9440,10 @@ async def chat_page(
     # and no other page behaviour is faked, so it must not be read as a
     # role-switcher (`_dev_preview` is passed to the template purely so the
     # toggle can render and say which view you are looking at).
-    from app.auth.dependencies import is_local_dev_mode
+    #
+    # `_resolve_dev_preview` applies that gate — this route no longer imports
+    # `is_local_dev_mode` itself, since the only thing that used it was the
+    # duplicate `dev_preview_available` below.
 
     # `empty` is the third value: it forces the "nothing registered" notice on
     # so the state can be reviewed without registering or deleting real tables
@@ -9551,13 +9554,14 @@ async def chat_page(
         # which reads as a bug. Falling back to "your company" is always true.
         instance_org=_chat_instance_org(),
         dev_preview=_dev_preview,  # same value chrome resolved; kept explicit for this page's own branches
-        # The toggle renders only where the switch is honoured, and only for
-        # someone who has an admin view to switch away from — a member seeing
-        # "Admin | Member" would be offered a view they can never get.
-        # Narrowed to an admin here, where a connection is already open —
-        # `_chrome_ctx` deliberately does not do an `is_user_admin()` lookup of
-        # its own for every page (see its docstring on `is_admin`).
-        dev_preview_available=is_local_dev_mode() and is_user_admin(user["id"], conn),
+        # `dev_preview_available` is NOT set here. It used to be, narrowed to
+        # `is_local_dev_mode() and is_user_admin(...)` because a connection was
+        # already open — which left the key with two definitions, this one and
+        # `_chrome_ctx`'s, and only one of them corrected when the dead clause
+        # came out. The admin half was redundant either way: `_dev_preview.html`
+        # is the key's only consumer and gates on `session.user.is_admin`
+        # itself, so a member never saw the switch through either route. One
+        # definition, in chrome, where the switch is chrome.
     )
     ctx["chat_capabilities"] = _chat_capability_snapshot(conn, user)
     if _dev_preview == "empty":

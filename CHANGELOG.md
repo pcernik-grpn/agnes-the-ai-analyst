@@ -216,6 +216,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **`dev_preview_available` had two definitions.** `_chrome_ctx` computed it as
+  `_dev_preview_enabled()`; `/chat` also passed it to `_build_context` as
+  `is_local_dev_mode() and is_user_admin(...)`. Only the first was corrected
+  when the flag's dead clause came out, and the `/chat` half was redundant on
+  its own terms — `_dev_preview.html` is the key's only consumer and gates on
+  `session.user.is_admin` itself, so a member never saw the switch through
+  either route. The duplicate is gone; chrome owns the flag, and one fewer
+  uncached `is_user_admin()` runs per chat render.
 - **A partial `surfaces` patch from the agent builder no longer switches the
   other surfaces off.** `surfaces` is one opaque JSON column and both writers
   replace it wholesale — `update_agent` `json.dumps`es the patch, and the
