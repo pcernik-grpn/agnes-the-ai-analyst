@@ -141,7 +141,15 @@ materialized into its sandbox pre-spawn; owners inspect/approve/archive/
 delete via `/api/v1/agents/{id}/memories`, `agnes agent memory …`, or the
 `/agents` builder panel. `agnes chat <slug>` is a streaming terminal client
 over the multi-turn session API (AG-UI SSE) — a pure `/api/v1` caller, no
-privileged backchannel. Design:
+privileged backchannel. A live, user-driven agent turn can also mid-turn
+**@delegate** one sub-request to another agent the caller may run (depth-1,
+one delegation per turn) — a `delegate_to_agent` in-sandbox tool reaches
+`POST /api/v1/agents/{slug}/delegate`, which spawns the delegate as a fresh
+child session under the ORIGINAL CALLER's identity
+(`ChatManager.handle_delegation`), never A's or B's owner, so the delegate's
+row-level access policies bind to the caller, never a wider identity —
+the exact `AgentPrincipal` mechanism above, reused rather than reinvented.
+Design:
 [`docs/superpowers/specs/2026-07-21-agent-profiles-and-agent-api-design.md`](docs/superpowers/specs/2026-07-21-agent-profiles-and-agent-api-design.md).
 
 ## Configuration

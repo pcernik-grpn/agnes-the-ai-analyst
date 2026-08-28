@@ -33,7 +33,7 @@ from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.coordination.leases import default_holder_id
-from src.repositories import ticket_repo, usage_repo, users_repo
+from src.repositories import agents_repo, llm_usage_repo, ticket_repo, usage_repo, users_repo
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,19 @@ class SessionNotFound(Exception):
     pass
 
 
+#: Track C7 (@delegation MVP) — depth-1 only. A session already at this
+#: ``LiveSession.delegation_depth`` (i.e. itself a delegate target) may not
+#: delegate further.
+_MAX_DELEGATION_DEPTH = 1
+
+#: Bounded wait for a delegated agent's turn to complete
+#: (``ChatManager.handle_delegation``). Kept comfortably under the idle-turn
+#: watchdog's default ``AGNES_TURN_IDLE_SECONDS`` (300s, ``app/chat/runner.py``)
+#: so a delegation that runs long degrades on its OWN bound rather than
+#: tripping the delegating turn's idle-timeout error.
+_DELEGATION_TIMEOUT_S = 180
+
+
 @dataclass
 class SinkEntry:
     """One output target for a live session's frames. Duck-typed sink:
@@ -291,6 +304,16 @@ class LiveSession:
     #: question-typed frames, not approval-typed ones.
     pending_questions: dict = field(default_factory=dict)
     turn_in_flight: bool = False
+    #: Track C7 (@delegation MVP) — depth-1 guard. 0 for an ordinary,
+    #: user-driven session; set to 1 by ``ChatManager.handle_delegation``
+    #: (via ``_pending_child_delegation_depth`` / ``_spawn_live``) for a
+    #: session THIS process spawned as a delegate target, so that a
+    #: delegate-target session can never itself delegate further.
+    delegation_depth: int = 0
+    #: Track C7 — one delegation per turn. Set the moment a delegation
+    #: request clears the depth guard (``handle_delegation``); reset when
+    #: the NEXT user turn starts (``_deliver_local_user_message``).
+    delegated_this_turn: bool = False
     # Linger task: fires _linger_then_pause after the last sink detaches.
     linger_task: Optional[asyncio.Task] = None
     # Session workdir; set at spawn/resume so helpers can access it.
@@ -511,6 +534,17 @@ class ChatManager:
         # which bounds worst-case memory instead of chasing full
         # eviction-time safety with no clean way to prove it.
         self._session_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+        # Track C7 (@delegation MVP): chat_id -> delegation_depth for a
+        # child session `handle_delegation` has just created via
+        # `create_session` but not yet `attach()`ed. Consumed (popped) by
+        # `_spawn_live` when it constructs that child's LiveSession — see
+        # `handle_delegation`'s docstring for why the depth cannot simply be
+        # a `create_session` kwarg (attach()'s spawn happens on a SEPARATE
+        # call, after this dict is populated). In-memory / per-process only,
+        # matching `pending_approvals`/`turn_in_flight` — acceptable for an
+        # MVP where a delegation is resolved entirely within one gateway's
+        # process.
+        self._pending_child_delegation_depth: dict[str, int] = {}
 
     @staticmethod
     def _daily_token_keys(user_email: str) -> tuple[str, str]:
@@ -745,6 +779,14 @@ class ChatManager:
 
     def list_live(self) -> list[LiveSession]:
         return list(self._live.values())
+
+    def get_live(self, chat_id: str) -> Optional[LiveSession]:
+        """The live session for ``chat_id`` in THIS process, or ``None`` —
+        public accessor for callers outside ``app.chat`` (e.g.
+        ``app.api.agent_delegation``) that need a single session's
+        bookkeeping (delegation depth/turn state) without enumerating
+        every live session via :meth:`list_live`."""
+        return self._live.get(chat_id)
 
     async def wait_until_live(self, chat_id: str, *, timeout: float = 30.0) -> bool:
         """Block until ``chat_id`` is registered with a live, usable handle.
@@ -1093,6 +1135,10 @@ class ChatManager:
                 participant_emails=emails,
                 session_dir=session_dir,
                 active_since=_t.monotonic(),
+                # Track C7: consume this chat_id's pending delegation depth
+                # tag, if `handle_delegation` set one before calling
+                # attach() — 0 (an ordinary session) otherwise.
+                delegation_depth=self._pending_child_delegation_depth.pop(chat_id, 0),
             )
             self._live[chat_id] = live
             await self._claim_routing_lease(chat_id)
@@ -2564,6 +2610,8 @@ class ChatManager:
         live.turn_in_flight = True
         live.last_activity = datetime.now(timezone.utc)
         live.state = SessionState.ACTIVE
+        # Track C7: a fresh turn gets its own one-delegation budget.
+        live.delegated_this_turn = False
 
     async def deliver_approval_decision(
         self,
@@ -2869,6 +2917,189 @@ class ChatManager:
             )
             return
         live.last_activity = datetime.now(timezone.utc)
+
+    async def handle_delegation(
+        self,
+        chat_id: str,
+        *,
+        target_slug: str,
+        message: str,
+        caller_user_id: str,
+        caller_email: str,
+    ) -> dict:
+        """Track C7 MVP — server-side agent-to-agent delegation.
+
+        Called from ``POST /api/v1/agents/{slug}/delegate``
+        (``app.api.agent_delegation``), itself reachable ONLY from within a
+        live agent turn's own in-process tool call — never a bare user
+        request. ``chat_id`` is the DELEGATING session (A); ``target_slug``
+        names the agent to delegate to (B), resolved exactly as
+        ``require_agent_runtime_principal`` resolves a runtime target
+        (``agents_repo().get_runnable_by_slug`` — owned, or reachable via a
+        ``ResourceType.AGENT`` grant): the caller's OWN runnable set, never
+        A's owner's.
+
+        THE SECURITY INVARIANT: B is spawned as a fresh CHILD session via
+        ``self.create_session(user_email=<the ORIGINAL caller>, agent_id=B)``
+        — never A's owner, never B's owner. This is the exact C2.3
+        shared-agent-runtime mechanism (``app.auth.pat_resolver``'s
+        ``agent_session`` JWT type / the broker's ``_mint_identity_jwt``):
+        B's own authority (``resolve_agent_authority(B)``) still applies to
+        WHICH tables/tools B can reach, but every row-level access policy
+        (``src/access_policy.py``) binds ``$user_email``/``$user_id`` to the
+        child session's stored ``user_email`` — the caller — so A can never
+        launder a wider view of the data through B than the caller already
+        has. See ``tests/test_agent_delegation.py`` for the guard test
+        (both backends).
+
+        Depth-1: a child session spawned by THIS method is tagged
+        ``delegation_depth = live.delegation_depth + 1`` before it is ever
+        attached (``_pending_child_delegation_depth`` / ``_spawn_live``) —
+        a delegation request against THAT session is refused before any
+        RBAC/budget work runs, so B can never itself delegate to a C.
+
+        One-delegate-per-turn: ``live.delegated_this_turn`` is set the
+        moment a request clears the depth guard (regardless of whether the
+        RBAC/budget checks that follow allow or deny it) and is reset only
+        when the delegating session's NEXT user turn starts
+        (``_deliver_local_user_message``).
+
+        Returns a JSON-serializable result dict — ``{"status": "ok"|
+        "denied"|"degraded", "reason": str | None, "agent_slug": str,
+        "answer": str | None, "message": str | None}``. Never raises for an
+        expected denial/degrade path (RBAC denial, budget exhaustion, the
+        per-user concurrency cap, a delegate that never answered in time):
+        a delegation the caller cannot run, or that B could not complete,
+        degrades the RESULT — it must never crash A's turn.
+        """
+        live = self._live.get(chat_id)
+        if live is None:
+            return {
+                "status": "denied",
+                "reason": "session_not_live",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": "The delegating session is no longer live.",
+            }
+
+        if live.delegation_depth >= _MAX_DELEGATION_DEPTH:
+            return {
+                "status": "denied",
+                "reason": "depth_exceeded",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": "Delegation is depth-1 only — an agent you were delegated to cannot itself delegate.",
+            }
+        if live.delegated_this_turn:
+            return {
+                "status": "denied",
+                "reason": "already_delegated_this_turn",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": "Only one delegation is allowed per turn.",
+            }
+        # Marked BEFORE the RBAC/budget checks below: a structurally valid
+        # request consumes the turn's one delegation regardless of whether
+        # the target turns out to be runnable — see the docstring.
+        live.delegated_this_turn = True
+
+        target = agents_repo().get_runnable_by_slug(caller_user_id, target_slug)
+        if target is None:
+            write_audit(
+                user_email=caller_email,
+                action="chat.delegation_denied",
+                details={"session_id": chat_id, "target_slug": target_slug, "reason": "agent_not_runnable"},
+            )
+            return {
+                "status": "denied",
+                "reason": "agent_not_runnable",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": f"You are not permitted to run agent '{target_slug}'.",
+            }
+
+        from app.api.broker_agent_policy import check_budget
+
+        year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        month_total = llm_usage_repo().usage_breakdown_for_month(target["id"], year_month)["total_tokens"]
+        if check_budget(target, month_total) == "budget_exhausted":
+            write_audit(
+                user_email=caller_email,
+                action="chat.delegation_denied",
+                details={"session_id": chat_id, "target_slug": target_slug, "reason": "budget_exhausted"},
+            )
+            return {
+                "status": "degraded",
+                "reason": "budget_exhausted",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": f"Agent '{target_slug}' has exhausted its monthly token budget; continuing without it.",
+            }
+
+        try:
+            child = await self.create_session(user_email=caller_email, surface=Surface.API, agent_id=target["id"])
+        except ConcurrencyCapHit:
+            return {
+                "status": "degraded",
+                "reason": "concurrency_cap",
+                "agent_slug": target_slug,
+                "answer": None,
+                "message": f"Agent '{target_slug}' could not be started right now (too many active sessions).",
+            }
+
+        # Tag the CHILD's depth before it is ever attached/spawned — read
+        # (and consumed) by _spawn_live when it constructs the LiveSession.
+        # Popped in `finally` too, defensively: if attach() never reaches
+        # _spawn_live (e.g. it fails earlier in its lock/decision tree),
+        # nothing must be left behind for a later, unrelated chat_id reuse.
+        self._pending_child_delegation_depth[child.id] = live.delegation_depth + 1
+
+        from app.chat.headless import HeadlessSink, _wait_for_sink
+
+        sink = HeadlessSink()
+        try:
+            await self.attach(child.id, sink, is_primary=True)
+            await self.send_user_message(child.id, message, sender_email=caller_email)
+            timed_out = await _wait_for_sink(
+                self,
+                child.id,
+                sink,
+                _DELEGATION_TIMEOUT_S,
+                agent_id=target["id"],
+                owner_user_id=caller_user_id,
+            )
+        finally:
+            self._pending_child_delegation_depth.pop(child.id, None)
+
+        answer = sink.answer
+        write_audit(
+            user_email=caller_email,
+            action="chat.delegation",
+            details={
+                "session_id": chat_id,
+                "child_session_id": child.id,
+                "target_agent_id": target["id"],
+                "target_slug": target_slug,
+                "timed_out": timed_out,
+            },
+        )
+        if timed_out and not answer:
+            return {
+                "status": "degraded",
+                "reason": "timeout",
+                "agent_slug": target_slug,
+                "answer": None,
+                "child_session_id": child.id,
+                "message": f"Agent '{target_slug}' did not answer in time.",
+            }
+        return {
+            "status": "ok",
+            "reason": None,
+            "agent_slug": target_slug,
+            "answer": answer,
+            "child_session_id": child.id,
+            "message": None,
+        }
 
     async def _ensure_slack_sink(self, live: "LiveSession", slack_origin: dict) -> None:
         """Make sure ``live`` has a ``SlackSinkBridge`` for the Slack

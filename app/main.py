@@ -497,6 +497,7 @@ from app.api.tokens import router as tokens_router, admin_router as tokens_admin
 from app.api.agents_admin import router as agents_admin_router
 from app.api.agent_runtime import router as agent_runtime_router  # noqa: E402
 from app.api.agent_sessions import router as agent_sessions_router  # noqa: E402
+from app.api.agent_delegation import router as agent_delegation_router  # noqa: E402
 from app.api.agent_webhooks import router as agent_webhooks_router  # noqa: E402
 from app.api.agent_memory import router as agent_memory_router  # noqa: E402
 from app.api.agent_schedules import router as agent_schedules_router  # noqa: E402
@@ -2893,6 +2894,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_admin_router)
     app.include_router(agent_runtime_router)
     app.include_router(agent_sessions_router)
+    app.include_router(agent_delegation_router)
     app.include_router(agent_webhooks_router)
     app.include_router(agent_memory_router)
     app.include_router(agent_schedules_router)
