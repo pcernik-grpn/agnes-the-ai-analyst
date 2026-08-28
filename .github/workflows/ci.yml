@@ -2,9 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**", "ci/update-test-durations-*"]
+    # `integration` is the shared staging branch every contributor merges
+    # into before anything reaches `main`. It needs the same push-side gate
+    # as `main`: the merge commit itself must be tested, not just each PR
+    # in isolation.
+    branches: [main, integration, "feature/**", "ci/update-test-durations-*"]
   pull_request:
-    branches: [main]
+    # PRs targeting `integration` must run the full suite too — without
+    # this filter GitHub fires no workflow at all for them and the PR shows
+    # a green rollup that asserted nothing.
+    branches: [main, integration]
   schedule:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:

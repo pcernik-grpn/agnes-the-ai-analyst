@@ -66,6 +66,14 @@ def test_semantic_context_and_schema_tools_are_foundation_tools():
         assert name in FOUNDATION_TOOL_NAMES
 
 
+def test_activity_tool_is_a_foundation_tool():
+    """Unified Activity Center timeline (E3 slice 2) — CLI/REST/web had no
+    MCP counterpart before this."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    assert "activity" in FOUNDATION_TOOL_NAMES
+
+
 def test_data_apps_tools_are_foundation_tools():
     from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
 
