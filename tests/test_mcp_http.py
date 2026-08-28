@@ -128,6 +128,38 @@ class TestAuthMiddleware:
         asyncio.run(middleware(scope, None, None))
         assert reached, "?token= param did not reach inner app"
 
+    def test_query_param_token_still_yields_an_authorization_header(self, seeded_app):
+        """Every foundation tool gets its credential from `headers_fn()`, and
+        the facts tools additionally resolve a caller out of it
+        (`_facts_caller`). Both would break for a `?token=`-authenticated SSE
+        session if the middleware left that path without an Authorization
+        header — so pin that it normalizes the query param into the same
+        `_current_token` the header path sets, which is what `_headers()`
+        synthesizes from (raised as a question in review on #1652)."""
+        import asyncio
+
+        from app.api.mcp.foundation_tools import _facts_caller
+        from app.api.mcp_http import _AuthMiddleware, _headers
+
+        tok = seeded_app["analyst_token"]
+        seen: dict = {}
+
+        async def _inner_app(scope, receive, send):
+            seen["headers"] = _headers()
+            seen["caller_id"] = (_facts_caller(_headers) or {}).get("id")
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/mcp/sse",
+            "query_string": f"token={tok}".encode(),
+            "headers": [],
+        }
+        asyncio.run(_AuthMiddleware(_inner_app)(scope, None, None))
+
+        assert seen["headers"]["Authorization"] == f"Bearer {tok}"
+        assert seen["caller_id"] == "analyst1", "facts tools must authenticate a ?token= session"
+
     def test_query_param_token_can_be_disabled(self, seeded_app, monkeypatch):
         """`mcp.allow_query_param_token=false` turns the fallback off (401).
 
