@@ -207,6 +207,63 @@ def test_resync_same_stable_id_rename_only_updates_path(pg_repos):
     assert row["processing_status"] == "indexed"
 
 
+def test_extension_only_rename_cleans_up_the_old_blob(pg_repos, tmp_path):
+    """Storage paths are content-addressed as ``{sha256}{ext}`` with the
+    extension taken from the FILENAME — so a rename that changes only the
+    extension keeps the sha yet allocates a NEW blob path. The old blob must
+    be unlinked even though ``content_changed`` is False; nesting the
+    cleanup under the content-changed branch leaked it on disk (found in
+    review — the replaced delete+insert path cleaned unconditionally)."""
+    from app.api.collections import _upsert_corpus_file
+
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+
+    old_blob = tmp_path / "same-sha.htm"
+    new_blob = tmp_path / "same-sha.html"
+    old_blob.write_text("same content")
+    new_blob.write_text("same content")
+
+    file_id, _ = _upsert_corpus_file(
+        CORPUS_ID,
+        path="site/page.htm",
+        stable_id="graph:ext-rename",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="page.htm",
+        sha256="same-sha",
+        file_type="htm",
+        size_bytes=12,
+        storage_path=str(old_blob),
+        sources_repo=sources_repo,
+    )
+    # Stage the row as fully ingested so the second call really takes the
+    # unchanged-content short-circuit — a row still `pending` from its first
+    # upsert is deliberately re-scheduled (see `_ingest_incomplete`), which
+    # would make `needs_processing is False` below assert nothing.
+    cf_repo.set_status(file_id, status="indexed", detail={"chunk_count": 1})
+
+    file_id2, needs_processing = _upsert_corpus_file(
+        CORPUS_ID,
+        path="site/page.html",
+        stable_id="graph:ext-rename",
+        source_doc_id=None,
+        source_sha256_meta=None,
+        filename="page.html",
+        sha256="same-sha",
+        file_type="html",
+        size_bytes=12,
+        storage_path=str(new_blob),
+        sources_repo=sources_repo,
+    )
+
+    assert file_id2 == file_id
+    assert needs_processing is False
+    assert cf_repo.get(file_id)["storage_path"] == str(new_blob)
+    assert not old_blob.exists(), "old blob leaked after extension-only rename"
+    assert new_blob.exists()
+
+
 def test_resync_same_stable_id_content_changed_resets_and_purges(pg_repos):
     """Content changed -> same row, new sha; status reset to 'pending' so a
     fresh extraction pass runs (old chunks purged)."""
@@ -375,3 +432,130 @@ def test_upload_files_endpoint_with_source_stable_id_end_to_end(pg_engine, monke
     import src.repositories as factory
 
     assert factory.corpus_file_sources_repo().resolve(corpus_id, "graph:e2e-1") == file_id
+
+
+def _e2e_client(pg_engine, monkeypatch, tmp_path):
+    from ._parity_sweep_util import build_seeded_client
+
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    auth = {"Authorization": f"Bearer {admin_token}"}
+    cr = client.post("/api/collections", json={"name": "PG Preflight"}, headers=auth)
+    assert cr.status_code == 201, cr.text
+    return client, auth, cr.json()["id"]
+
+
+def test_cross_anchor_collision_in_one_batch_rejected(pg_engine, monkeypatch, tmp_path):
+    """The per-key guards compare `paths` against itself and
+    `source_stable_ids` against itself, but the match is stable_id FIRST then
+    path — so a batch where file 1's stable id and file 2's path resolve to
+    the SAME existing row slips through both, and the second overwrites the
+    first in place: file 1's bytes lost, one `file_id` returned twice. The
+    read-only pre-flight resolves each file's target row up front and refuses
+    the batch (Devin Review on #1655)."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"original"), "text/markdown")},
+        data={"source_stable_ids": "graph:cross", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    anchored_id = first.json()[0]["file_id"]
+
+    # File 1 targets the row by stable id; file 2 targets the SAME row by its
+    # path. Neither per-key guard fires: the stable ids differ (one is blank)
+    # and the paths differ (one is blank).
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files=[
+            ("files", ("a.md", io.BytesIO(b"via stable id"), "text/markdown")),
+            ("files", ("a.md", io.BytesIO(b"via path"), "text/markdown")),
+        ],
+        data={"source_stable_ids": ["graph:cross", ""], "paths": ["", "docs/a.md"]},
+        headers=auth,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "duplicate_target_row_in_batch" in resp.text
+
+    # Nothing was written: the anchored row still holds its original bytes.
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    rows = listing.json()["files"]
+    assert [r["file_id"] for r in rows] == [anchored_id]
+    assert rows[0]["size_bytes"] == len(b"original")
+
+
+def test_stable_id_match_onto_a_path_owned_by_another_row_is_refused(pg_engine, monkeypatch, tmp_path):
+    """A stable-id match resolves row R while the upload's `path` is already
+    held by a DIFFERENT row: `update_in_place` issues an unconditional UPDATE
+    and violates the `(corpus_id, path)` unique index — an unhandled
+    IntegrityError, i.e. a 500 with earlier files in the batch already
+    written. The pre-flight answers a typed 409 naming both rows instead
+    (Devin Review on #1655)."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    anchored = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"anchored"), "text/markdown")},
+        data={"source_stable_ids": "graph:mover", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert anchored.status_code == 201, anchored.text
+
+    occupier = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("b.md", io.BytesIO(b"occupier"), "text/markdown")},
+        data={"paths": "docs/b.md"},
+        headers=auth,
+    )
+    assert occupier.status_code == 201, occupier.text
+    occupier_id = occupier.json()[0]["file_id"]
+
+    # The crawler now reports graph:mover living at docs/b.md — a path
+    # another row already owns.
+    resp = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"moved"), "text/markdown")},
+        data={"source_stable_ids": "graph:mover", "paths": "docs/b.md"},
+        headers=auth,
+    )
+    assert resp.status_code == 409, resp.text
+    assert "path_owned_by_another_file" in resp.text
+    assert occupier_id in resp.text
+
+    # Both rows survive untouched — no partial write, no 500.
+    listing = client.get(f"/api/collections/{corpus_id}/files", headers=auth)
+    by_path = {r["path"]: r for r in listing.json()["files"]}
+    assert by_path["docs/a.md"]["size_bytes"] == len(b"anchored")
+    assert by_path["docs/b.md"]["size_bytes"] == len(b"occupier")
+
+
+def test_preflight_allows_a_stable_id_move_onto_a_free_path(pg_engine, monkeypatch, tmp_path):
+    """Negative control: the ordinary crawler move — same stable id, new path
+    nobody holds — must still succeed and keep the row id."""
+    import io
+
+    client, auth, corpus_id = _e2e_client(pg_engine, monkeypatch, tmp_path)
+
+    first = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+        data={"source_stable_ids": "graph:free", "paths": "docs/a.md"},
+        headers=auth,
+    )
+    assert first.status_code == 201, first.text
+    file_id = first.json()[0]["file_id"]
+
+    moved = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("a.md", io.BytesIO(b"content"), "text/markdown")},
+        data={"source_stable_ids": "graph:free", "paths": "docs/moved/a.md"},
+        headers=auth,
+    )
+    assert moved.status_code == 201, moved.text
+    assert moved.json()[0]["file_id"] == file_id
+    assert moved.json()[0]["path"] == "docs/moved/a.md"

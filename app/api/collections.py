@@ -762,9 +762,14 @@ def _upsert_corpus_file(
         needs_processing = content_changed or _ingest_incomplete(existing)
         if needs_processing:
             cf_repo.set_status(file_id, status="pending")
-        if content_changed:
-            if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
-                delete_corpus_file(old_blob)
+        # The old blob is cleaned up whenever the row's storage_path moved,
+        # not only when content changed: storage paths are content-addressed
+        # as {sha256}{ext} with ext derived from the FILENAME, so an
+        # extension-only rename keeps the sha yet allocates a new blob —
+        # skipping cleanup there leaked the old file on disk (the replaced
+        # delete+insert path cleaned unconditionally).
+        if old_blob and old_blob != storage_path and cf_repo.count_by_storage_path(collection_id, old_blob) == 0:
+            delete_corpus_file(old_blob)
     else:
         needs_processing = True  # brand new row always needs processing
         file_id = cf_repo.add(
@@ -787,6 +792,90 @@ def _upsert_corpus_file(
         )
 
     return file_id, needs_processing
+
+
+def _nth_field(values: Optional[List[str]], idx: int) -> str | None:
+    """One positionally-paired form field for file ``idx``; blank -> None."""
+    if not values or idx >= len(values) or not values[idx]:
+        return None
+    return values[idx].strip() or None
+
+
+def _preflight_source_anchored_batch(
+    collection_id: str,
+    *,
+    n_files: int,
+    paths: Optional[List[str]],
+    source_stable_ids: Optional[List[str]],
+    sources_repo: Any,
+    cf_repo: Any,
+) -> None:
+    """Resolve every file's TARGET row exactly as ``_upsert_corpus_file``
+    will, before a single byte is stored, and refuse two collisions the
+    per-key duplicate guards above cannot see.
+
+    They cannot see them because both guards compare one key against itself,
+    while the match is `stable_id` FIRST, then `path` — so the damage crosses
+    the two key spaces:
+
+    * **Cross-anchor collision.** File 1 carries `stable_id` S (anchored to
+      row R); file 2 carries `path` P, which is R's own path. Both resolve to
+      R and update it in place, so file 1's bytes are lost and the response
+      returns R's id twice — the exact failure `duplicate_path_in_batch`
+      exists to prevent, one key space over. Rejected with **400**
+      ``duplicate_target_row_in_batch``.
+    * **Re-path onto an occupied path.** A `stable_id` match resolves row R
+      while the upload's `path` is already held by a DIFFERENT row; the
+      unconditional ``UPDATE`` in ``update_in_place`` then violates the
+      ``(corpus_id, path)`` unique index — an unhandled IntegrityError, i.e.
+      a **500** after earlier files in the batch were already written.
+      Rejected with **409** ``path_owned_by_another_file`` instead, naming
+      the occupying row so a doc-sync client can act on it.
+
+    Only runs for source-anchored batches: without `source_stable_ids` a
+    file's only anchor is its path, two distinct paths can never resolve to
+    one row, and `duplicate_path_in_batch` already covers the rest — which is
+    what keeps the plain-`paths` flow byte-identical (and DuckDB untouched).
+
+    Read-only and up front, so a rejected batch stores nothing. It is not a
+    lock: a concurrent request could still take a path between this check and
+    the write, which the unique index remains the backstop for.
+    """
+    seen_targets: dict[str, int] = {}
+    for idx in range(n_files):
+        stable_id = _nth_field(source_stable_ids, idx)
+        path = _nth_field(paths, idx)
+
+        target: str | None = None
+        if stable_id:
+            resolved = sources_repo.resolve(collection_id, stable_id)
+            if resolved:
+                target = resolved
+                if path:
+                    holder = cf_repo.get_by_path(collection_id, path)
+                    if holder and holder["id"] != resolved:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"path_owned_by_another_file: '{path}' belongs to {holder['id']}, "
+                                f"but source_stable_id '{stable_id}' resolves to {resolved}"
+                            ),
+                        )
+        if target is None and path:
+            row = cf_repo.get_by_path(collection_id, path)
+            if row:
+                target = row["id"]
+
+        if target is not None:
+            if target in seen_targets:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"duplicate_target_row_in_batch: files {seen_targets[target]} and {idx} "
+                        f"both resolve to {target}"
+                    ),
+                )
+            seen_targets[target] = idx
 
 
 @router.post("/{collection_id}/files", status_code=201)
@@ -849,8 +938,14 @@ async def upload_files(
     can no longer cascade a document's derived data away. Two files sharing a
     non-blank ``source_stable_id`` in one batch are rejected with **400**
     ``duplicate_source_stable_id_in_batch`` — the second would otherwise
-    overwrite the first's row in place and silently drop its bytes. The
-    mapping table
+    overwrite the first's row in place and silently drop its bytes — and a
+    read-only pre-flight resolves every file's target row before anything is
+    stored to catch the two collisions that cross the two key spaces: two
+    files landing on the SAME existing row through different anchors (**400**
+    ``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is
+    already held by another row, which would otherwise violate the
+    ``(corpus_id, path)`` unique index and 500 mid-batch (**409**
+    ``path_owned_by_another_file``). The mapping table
     is Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed
     instance answers **501** before any file is touched; omitting the field
     keeps this endpoint byte-identical to the plain ``paths`` behavior above.
@@ -916,6 +1011,16 @@ async def upload_files(
     sources_repo = corpus_file_sources_repo() if source_stable_ids is not None else None
 
     cf_repo = corpus_files_repo()
+    if sources_repo is not None:
+        _preflight_source_anchored_batch(
+            collection_id,
+            n_files=len(files),
+            paths=paths,
+            source_stable_ids=source_stable_ids,
+            sources_repo=sources_repo,
+            cf_repo=cf_repo,
+        )
+
     results = []
     any_rejected = False
     _to_ingest: List[str] = []
@@ -924,27 +1029,13 @@ async def upload_files(
         fname = upload.filename or "unknown"
         tier = classify(fname)
         # Optional per-file logical identity for upsert, paired positionally
-        # with `files`. Blank/missing → None (legacy plain-insert).
-        path = paths[idx].strip() if (paths and idx < len(paths) and paths[idx]) else None
-        path = path or None
-        stable_id = (
-            source_stable_ids[idx].strip()
-            if (source_stable_ids and idx < len(source_stable_ids) and source_stable_ids[idx])
-            else None
-        )
-        stable_id = stable_id or None
-        source_doc_id = (
-            source_doc_ids[idx].strip()
-            if (source_doc_ids and idx < len(source_doc_ids) and source_doc_ids[idx])
-            else None
-        )
-        source_doc_id = source_doc_id or None
-        source_sha256_meta = (
-            source_sha256s[idx].strip()
-            if (source_sha256s and idx < len(source_sha256s) and source_sha256s[idx])
-            else None
-        )
-        source_sha256_meta = source_sha256_meta or None
+        # with `files`. Blank/missing → None (legacy plain-insert). Read via
+        # the same helper the pre-flight above uses, so the target a batch is
+        # validated against can never diverge from the one it writes.
+        path = _nth_field(paths, idx)
+        stable_id = _nth_field(source_stable_ids, idx)
+        source_doc_id = _nth_field(source_doc_ids, idx)
+        source_sha256_meta = _nth_field(source_sha256s, idx)
         # document_dates[idx] is validated for pairing above but not read
         # here — see the docstring's "Source-anchored upsert" paragraph.
 
