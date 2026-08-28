@@ -743,6 +743,43 @@
      what an open group shows. The scope segment beside it stays — "all" vs
      "granted" is a different question from "which one". */
   .ax-frow .fbar__search { display: none; }
+  /* ── By bundle ───────────────────────────────────────────────────────
+     One section per grantable thing, one row per group that holds it. */
+  .ax-by { flex: 0 0 auto; }
+  .ax-bb { border-top: 1px solid var(--ds-border); padding-bottom: 12px; }
+  .ax-bb__hd {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 12px 4px 8px;
+  }
+  .ax-bb__nm { font-weight: 600; font-size: 14px; min-width: 0; }
+  .ax-bb__sub {
+    display: block; font-weight: 400; font-size: 12px;
+    color: var(--ds-text-muted); margin-top: 2px;
+  }
+  .ax-bb__cnt {
+    margin-left: auto; font-size: 12px; color: var(--ds-text-muted); white-space: nowrap;
+  }
+  .ax-bb__cnt b { color: var(--ds-text-primary); font-weight: 600; }
+  .ax-bb__fam {
+    display: inline-block; margin-left: 8px; font-size: 11px;
+    color: var(--ds-text-muted); text-transform: uppercase; letter-spacing: .1em;
+  }
+  /* Authored, then handed to nobody. Marked, not hidden — it is the one
+     state nobody goes looking for. */
+  .ax-bb__none { color: var(--ds-text-primary); font-weight: 600; }
+  .ax-bb.is-nobody .ax-bb__hd { background: var(--ds-surface-dim); }
+  .ax-nobody { border-top: 1px solid var(--ds-border); margin-top: 12px; }
+  .ax-nobody > summary {
+    padding: 12px 4px; cursor: pointer; font-size: 13px;
+    color: var(--ds-text-muted); list-style: none;
+    display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  }
+  .ax-nobody > summary::-webkit-details-marker { display: none; }
+  .ax-nobody > summary:hover { background: var(--ds-surface-dim); }
+  .ax-nobody > summary b { color: var(--ds-text-primary); font-weight: 600; }
+  .ax-nobody__hint { color: var(--ds-text-muted); }
+  .ax-nobody__more { margin-left: auto; color: var(--ds-text-link); font-weight: 600; }
+  .ax-nobody[open] .ax-nobody__more { visibility: hidden; }
 </style>
 {% endblock %}
 
@@ -796,6 +833,14 @@
          selected in this list the moment it exists — the thought never
          leaves the page. It sits at the foot of the list because that is
          where a list you have just read to the end of ends. #}
+      {# One list, read three ways. By group answers "what does this group
+         get"; by bundle answers "who gets this", which the group view
+         structurally cannot show — including the bundles granted to NOBODY,
+         which simply never appear when you are looking one group at a time. #}
+      <span class="fbar-seg ax-by" id="ax-by" role="group" aria-label="How to group the list">
+        <button type="button" class="fbar-seg__btn is-active" data-by="group">By group</button>
+        <button type="button" class="fbar-seg__btn" data-by="bundle">By bundle</button>
+      </span>
       <button type="button" class="ax-gnew" id="ax-new-group">
         <span class="ax-gnew__plus" aria-hidden="true">+</span> New group
       </button>
@@ -967,6 +1012,9 @@
 
   let overview = null;   // {groups, grants, resources}
   let selectedGroup = null;
+  //: "group" | "bundle" — which way the one list is read. Rides the URL so a
+  //: link can hand someone the view that answers their question.
+  let viewMode = new URLSearchParams(window.location.search).get("by") === "bundle" ? "bundle" : "group";
   let users = [];        // Simulate's picker only — never the member search
 
   const el = (id) => document.getElementById(id);
@@ -1083,6 +1131,36 @@
      There is no "N groups" count above the card any more: it restated the
      list directly beneath it. When a filter is on, the list says how much
      of the set it is showing, which is the only case the count answered. */
+  /* What this row becomes in the granted person's Library. The admin sets
+     a tier while looking at the sentence it writes on the other end —
+     which is the only place the vocabulary can be kept honest, because
+     nothing in the repo tests language. Words are the Library's, not
+     invented here. */
+  const READS = {
+    data_package:       { required: "Required by your admin", available: "Keep a local copy" },
+    memory_domain:      { required: "Required by your admin", available: "Keep a local copy" },
+    memory_item:        { required: "Required by your admin", available: "Keep a local copy" },
+    marketplace_plugin: { required: "Installed · required",   available: "Install" },
+    store_entity:       { required: "Installed · required",   available: "Install" },
+    recipe:             { any: "Ask Agnes" },
+    data_app:           { any: "Open" },
+    agent:              { any: "Use as template" },
+    semantic_model:     { any: "shapes the answer", quiet: true },
+    collection:         { any: "citable", quiet: true },
+    corpus_file:        { any: "citable", quiet: true },
+    knowledge_digest:   { any: "citable", quiet: true },
+    table:              { any: "reached through a package", quiet: true },
+    chat:               { any: "not a Library row", quiet: true },
+    slack_channel:      { any: "not a Library row", quiet: true },
+  };
+  const readsFor = (typeKey, tier) => {
+    if (!tier) return `<span class="ax-reads__off">not granted</span>`;
+    const m = READS[typeKey];
+    if (!m) return "";
+    const text = m.any || m[tier] || "";
+    return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
+  };
+
   /* The three numbers a collapsed row is worth reading for. Derived from the
      same grants payload the checkboxes read, so a count can never disagree
      with the rows underneath it. */
@@ -1437,36 +1515,6 @@
         ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this — indexed but invisible.">&#9888; nobody</span>`
         : "";
 
-    /* What this row becomes in the granted person's Library. The admin sets
-       a tier while looking at the sentence it writes on the other end —
-       which is the only place the vocabulary can be kept honest, because
-       nothing in the repo tests language. Words are the Library's, not
-       invented here. */
-    const READS = {
-      data_package:       { required: "Required by your admin", available: "Keep a local copy" },
-      memory_domain:      { required: "Required by your admin", available: "Keep a local copy" },
-      memory_item:        { required: "Required by your admin", available: "Keep a local copy" },
-      marketplace_plugin: { required: "Installed · required",   available: "Install" },
-      store_entity:       { required: "Installed · required",   available: "Install" },
-      recipe:             { any: "Ask Agnes" },
-      data_app:           { any: "Open" },
-      agent:              { any: "Use as template" },
-      semantic_model:     { any: "shapes the answer", quiet: true },
-      collection:         { any: "citable", quiet: true },
-      corpus_file:        { any: "citable", quiet: true },
-      knowledge_digest:   { any: "citable", quiet: true },
-      table:              { any: "reached through a package", quiet: true },
-      chat:               { any: "not a Library row", quiet: true },
-      slack_channel:      { any: "not a Library row", quiet: true },
-    };
-    const readsAs = (typeKey, tier) => {
-      if (!tier) return `<span class="ax-reads__off">not granted</span>`;
-      const m = READS[typeKey];
-      if (!m) return "";
-      const text = m.any || m[tier] || "";
-      return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
-    };
-
     const itemRow = (t, i) => {
       const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
       const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
@@ -1487,7 +1535,7 @@
             <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required" title="required">Required</button>
           </span>
         </td>
-        <td class="ax-reads">${readsAs(t.type_key, tier)}</td>
+        <td class="ax-reads">${readsFor(t.type_key, tier)}</td>
       </tr>`;
     };
 
@@ -1634,11 +1682,11 @@
     });
   }
 
-  async function writeGrant(type, resourceId, requirement) {
+  async function writeGrant(type, resourceId, requirement, groupId) {
     const r = await fetch(GRANTS_API, {
       method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ group_id: selectedGroup, resource_type: type, resource_id: resourceId, requirement }),
+      body: JSON.stringify({ group_id: groupId || selectedGroup, resource_type: type, resource_id: resourceId, requirement }),
     });
     if (!r.ok) {
       const b = await r.json().catch(() => ({}));
@@ -1646,7 +1694,7 @@
     }
     const created = await r.json();
     overview.grants.push({
-      id: created.id, group_id: selectedGroup,
+      id: created.id, group_id: groupId || selectedGroup,
       resource_type: type, resource_id: resourceId, requirement,
     });
   }
@@ -2082,10 +2130,132 @@
   // about which group is open.
   async function repaint() {
     syncQuery();
+    if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
     renderGroups();
     await renderMembers();
     bindFind();
     renderResources();
+  }
+
+  //: Repaint whatever view is on. Grant writes happen in both.
+  function repaintView() {
+    if (viewMode === "bundle") { renderBundles(); return; }
+    renderResources();
+    renderGroups();
+  }
+
+  /* ── By bundle ────────────────────────────────────────────────────────
+     The same grants, read the other way: one section per grantable thing,
+     one row per group that holds it. Two things only this direction can
+     show — the same bundle held by two groups (the comparison the two-pane
+     layout made impossible), and the bundles granted to NOBODY, which in
+     the group view are invisible by construction because you are always
+     looking at one group's holdings. */
+  function renderBundles() {
+    const host = el("ax-groups");
+    parkWork();
+    const q = groupFilter.trim().toLowerCase();
+    const groupsById = new Map((overview.groups || []).map((g) => [g.id, g]));
+    const famName = new Map((overview.families || []).map((f) => [f.key, f.display_name]));
+
+    // Only the kinds an admin hands out as a unit lead this view. The rest
+    // are reachable in the group view; leading with 600 tables would bury
+    // the four rows that carry the decision.
+    const LEAD = new Set(["data_package", "memory_domain", "semantic_model", "recipe",
+                          "marketplace_plugin", "store_entity", "data_app", "agent", "collection"]);
+
+    const rows = [];
+    for (const t of (overview.resources || [])) {
+      if (!LEAD.has(t.type_key)) continue;
+      for (const b of (t.blocks || [])) {
+        for (const i of (b.items || [])) {
+          const hay = `${i.name || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          if (q && !hay.includes(q)) continue;
+          const held = (overview.grants || []).filter(
+            (g) => g.resource_type === t.type_key && g.resource_id === i.resource_id);
+          rows.push({ t, b, i, held });
+        }
+      }
+    }
+    if (!rows.length) {
+      host.innerHTML = `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
+        Every bundle on the instance was searched.</div>`;
+      return;
+    }
+    /* Granted-to-nobody is the one state nobody goes looking for — but it
+       is also, on a real instance, most of the list: every draft agent
+       template anyone ever made. Floating them to the top buries the rows
+       that carry a decision under a wall of ids. So they come OUT of the
+       list and collect behind one line at the foot, counted by kind. */
+    const byName = (a, c) => String(a.i.name || a.i.resource_id)
+      .localeCompare(String(c.i.name || c.i.resource_id));
+    const nobody = rows.filter((r) => !r.held.length).sort(byName);
+    const held = rows.filter((r) => r.held.length).sort(byName);
+
+    const groupRow = (r, grant) => {
+      const g = groupsById.get(grant.group_id);
+      if (!g) return "";
+      const tier = grant.requirement === "required" ? "required" : "available";
+      return `
+      <tr data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}" class="is-granted">
+        <td class="ax-chk"><input type="checkbox" checked aria-label="Revoke from ${esc(titleOf(g))}"></td>
+        <td class="ax-name"><b>${esc(titleOf(g))}</b>
+          <span class="blk"> · ${esc(String(g.member_count ?? 0))} ${(g.member_count ?? 0) === 1 ? "person" : "people"}</span></td>
+        <td class="ax-acc">
+          <span class="fbar-seg ax-tier" role="group" aria-label="Access tier">
+            <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
+            <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
+          </span>
+        </td>
+        <td class="ax-reads">${readsFor(r.t.type_key, tier)}</td>
+      </tr>`;
+    };
+
+    const section = (r) => {
+      const reach = r.held.reduce((n, g) => n + (groupsById.get(g.group_id)?.member_count ?? 0), 0);
+      const nobody = !r.held.length;
+      return `
+      <section class="ax-bb${nobody ? " is-nobody" : ""}">
+        <div class="ax-bb__hd">
+          <span class="ax-tag">${esc(r.t.type_display)}</span>
+          <span class="ax-bb__nm">${esc(r.i.name || r.i.resource_id)}
+            ${r.i.description ? `<span class="ax-bb__sub">${esc(String(r.i.description).slice(0, 110))}</span>` : ""}
+          </span>
+          <span class="ax-bb__cnt">${nobody
+            ? `<b class="ax-bb__none">granted to nobody</b>`
+            : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"} · <b>${reach}</b> ${reach === 1 ? "person" : "people"}`}
+            <span class="ax-bb__fam">${esc(famName.get(r.t.family) || "")}</span></span>
+        </div>
+        ${nobody
+          ? `<div class="ax-empty" style="padding-left:22px;">Authored, then never handed to anyone. Open it in the group view to grant it.</div>`
+          : `<table class="data-table data-table--compact">
+               <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Group</th><th class="ax-acc">Admin control</th><th class="ax-reads">What the person reads</th></tr></thead>
+               <tbody>${r.held.map((grant) => groupRow(r, grant)).join("")}</tbody>
+             </table>`}
+      </section>`;
+    };
+
+    // "2 data packages, 4 agents" — counted by kind, because "9 things" is
+    // not a sentence anyone can act on.
+    const tally = new Map();
+    for (const r of nobody) {
+      const k = r.t.type_display;
+      tally.set(k, (tally.get(k) || 0) + 1);
+    }
+    const nobodyLine = nobody.length ? `
+      <details class="ax-nobody">
+        <summary>
+          <b>Granted to nobody:</b>
+          ${[...tally].map(([k, n]) => `${n} ${esc(String(k).toLowerCase())}`).join(", ")}.
+          <span class="ax-nobody__hint">Authored, then never handed to anyone.</span>
+          <span class="ax-nobody__more">Show them</span>
+        </summary>
+        <div>${nobody.map(section).join("")}</div>
+      </details>` : "";
+
+    host.innerHTML = (held.length
+      ? held.map(section).join("")
+      : `<div class="ax-empty">Nothing on this instance is granted to anyone yet.</div>`) + nobodyLine;
   }
 
   el("ax-new-group").addEventListener("click", () => openGroupDrawer(null));
@@ -2204,6 +2374,24 @@
   document.addEventListener("click", async (e) => {
     if (e.target.closest("[data-clear-rfind]")) { clearResourceFilter(); return; }
 
+    const byBtn = e.target.closest("[data-by]");
+    if (byBtn) {
+      const next = byBtn.dataset.by === "bundle" ? "bundle" : "group";
+      if (next !== viewMode) {
+        viewMode = next;
+        // The view rides the URL, so a link can hand someone the direction
+        // that answers their question rather than the one that answers mine.
+        const u = new URL(window.location.href);
+        if (viewMode === "bundle") u.searchParams.set("by", "bundle");
+        else u.searchParams.delete("by");
+        history.replaceState(null, "", u);
+        el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
+          b.classList.toggle("is-active", b.dataset.by === viewMode));
+        await repaint();
+      }
+      return;
+    }
+
     /* Opening a section is selecting the group. One at a time: two open
        groups would mean two grant trees on screen with one toolbar between
        them, and the row you clicked scrolled off. The neighbours stay as
@@ -2280,7 +2468,11 @@
     }
 
     const row = e.target.closest("tr[data-rid]");
-    if (!row || !selectedGroup) return;
+    if (!row) return;
+    // By bundle renders one row per GROUP, so the row carries its own; the
+    // group view has none and falls back to the open section.
+    const rowGroup = row.dataset.gid || selectedGroup;
+    if (!rowGroup) return;
     const type = row.dataset.type;
     const rid = row.dataset.rid;
 
@@ -2288,10 +2480,10 @@
       const box = e.target;
       box.disabled = true;
       try {
-        const grant = grantOf(selectedGroup, type, rid);
+        const grant = grantOf(rowGroup, type, rid);
         if (box.checked && !grant) {
-          await writeGrant(type, rid, "available");
-          toast("Granted (optional)", true);
+          await writeGrant(type, rid, "available", rowGroup);
+          toast("Granted — available", true);
         } else if (!box.checked && grant) {
           await deleteGrant(grant);
           toast("Grant removed", true);
@@ -2301,25 +2493,24 @@
         toast("Could not save: " + err.message, false);
       } finally {
         box.disabled = false;
-        renderResources();
-        renderGroups();
+        repaintView();
       }
       return;
     }
 
     const tierBtn = e.target.closest("[data-tier]");
     if (tierBtn) {
-      const grant = grantOf(selectedGroup, type, rid);
+      const grant = grantOf(rowGroup, type, rid);
       if (!grant || grant.requirement === tierBtn.dataset.tier) return;
       try {
         await updateGrant(grant, tierBtn.dataset.tier);
         toast(tierBtn.dataset.tier === "required"
-          ? "Automatic — lands in members' workspaces on the next sync"
-          : "Optional — members add it themselves", true);
+          ? "Required — permanent, and always downloaded"
+          : "Available — each person chooses whether to keep a local copy", true);
       } catch (err) {
         toast("Could not save: " + err.message, false);
       }
-      renderResources();
+      repaintView();
     }
   });
 
@@ -2688,6 +2879,8 @@
     const wantedRes = PICK && known(recalledSelection()) ? recalledSelection() : null;
     selectedGroup = known(wanted) ? wanted : wantedRes;
     rememberSelection(selectedGroup);
+    el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
+      b.classList.toggle("is-active", b.dataset.by === viewMode));
     // A `?resource=` arrival lands with the tree already narrowed to what the
     // caller came to grant — the filter is pre-filled rather than merely
     // suggested, so the row is on screen before anything is clicked.
