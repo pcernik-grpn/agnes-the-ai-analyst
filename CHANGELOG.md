@@ -708,6 +708,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- The group picker on `/admin/users/{id}` ("Add to group") showed only its
+  first option under themes that render the custom dropdown: the section
+  card's `overflow: hidden` clipped the popover at the card's bottom edge,
+  leaving every option past it invisible with no scroll or affordance. The
+  card's clip now yields while a dropdown menu inside it is open
+  (`section_card.css`), which fixes every ds-dropdown near the bottom of any
+  section card, not just this picker.
 - **MCP foundation-tool errors now carry the server's remedy, and the chat
   approval card says what it is approving.** Every foundation tool used a bare
   `raise_for_status()`, so a 4xx surfaced to the model as a generic
