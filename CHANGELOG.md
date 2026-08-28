@@ -979,6 +979,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   held a third copy of the same rule and now calls `safe_next_path` too. All
   four sign-in paths (OAuth, magic-link, password form, login pages) resolve
   `next` through the one implementation that knows about app origins.
+- **Magic-link login now JIT-provisions first-time accounts on an allowed
+  domain, instead of silently sending nothing.** Requesting a sign-in link
+  for an address with no account used to render the normal "Check Your
+  Email" page but never deliver a mail — the person waited for a link that
+  would never arrive, with no way to tell whether they mistyped, aren't
+  invited, or the system is broken (#1683). A first-time request now creates
+  the account (mirroring the Google/Microsoft OAuth callbacks' existing
+  `ensure_user` provisioning) when the address's domain matches
+  `auth.allowed_domain`, then mints and sends a real link; addresses outside
+  the allowlist — or on an instance that never configured one — keep the
+  prior existing-users-only silence. The visible response and its shape are
+  unchanged either way (anti-enumeration): the caller cannot tell from the
+  answer whether the account pre-existed, was just created, or doesn't
+  qualify.
 
 ### Removed
 
