@@ -2293,8 +2293,21 @@ async def library_page(
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
+    _all_cols = fc_repo.list()
+    # One batch call for every card, not one call per card: each singular
+    # count re-resolved the caller's readable-collection set (a grants query
+    # plus a full owned-collections scan), so the page cost grew with the
+    # number of collections the caller can see. The batch resolves that set
+    # once — visibility still decided inside the repo, never here.
+    _fact_counts: dict = {}
+    if facts_repo_ is not None:
+        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        try:
+            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+        except Exception as e:
+            logger.warning("/library: fact counts failed: %s", e)
     try:
-        for col in fc_repo.list():
+        for col in _all_cols:
             owned = col.get("created_by") == uid
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
@@ -2311,12 +2324,7 @@ async def library_page(
                     "file_type": f0.get("file_type"),
                     "size_bytes": f0.get("size_bytes"),
                 }
-            fact_count = 0
-            if facts_repo_ is not None:
-                try:
-                    fact_count = facts_repo_.count_visible_facts_for_collection(user, col["id"])
-                except Exception as e:
-                    logger.warning("/library: fact count failed for %s: %s", col["id"], e)
+            fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
                     "id": col["id"],

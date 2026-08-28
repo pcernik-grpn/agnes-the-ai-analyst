@@ -1154,16 +1154,40 @@ class FactsPgRepository:
         access to `corpus_id` at all (not gated here — the caller of this
         method is expected to have already confirmed collection access)
         would still see only `revealed` subjects, if any."""
+        return self.count_visible_facts_for_collections(caller, [corpus_id]).get(corpus_id, 0)
+
+    def count_visible_facts_for_collections(self, caller, corpus_ids: List[str]) -> Dict[str, int]:
+        """Batch form of :meth:`count_visible_facts_for_collection` — same
+        per-collection numbers, but the caller's readable set is resolved
+        **once** for the whole batch.
+
+        That resolution is the expensive half. ``_readable_ids`` delegates to
+        ``accessible_collection_ids``, which for a non-admin runs a grants
+        query plus a full owned-collections scan; calling the singular method
+        in a loop (the Library page renders one card per collection) repeated
+        that scan per card, so the page cost grew with the number of
+        collections the caller can see. The count query itself is one
+        indexed-``corpus_id`` lookup and stays per collection, now over a
+        single shared connection.
+
+        Visibility still resolves entirely in here — callers pass ids, never
+        a precomputed readable set, so no route can widen what it sees
+        (spec §5).
+        """
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
-        params: Dict[str, Any] = {"corpus_id": corpus_id}
-        if not is_admin:
-            params["readable"] = list(readable)
+        base: Dict[str, Any] = {} if is_admin else {"readable": list(readable)}
         sql = sa.text(f"WITH {self._visible_facts_for_corpus_cte(is_admin, all_evidence)} SELECT COUNT(*) FROM visible")
+
+        out: Dict[str, int] = {}
+        if not corpus_ids:
+            return out
         with self._engine.connect() as conn:
-            row = conn.execute(sql, params).first()
-        return int(row[0]) if row else 0
+            for corpus_id in corpus_ids:
+                row = conn.execute(sql, {**base, "corpus_id": corpus_id}).first()
+                out[corpus_id] = int(row[0]) if row else 0
+        return out
 
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
