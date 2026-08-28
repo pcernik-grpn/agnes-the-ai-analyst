@@ -1,0 +1,75 @@
+frozen: '2026-08-27'
+source: eval_scoring_workbook_v0.2.xlsx, Rubric sheet, owner Shan Wang
+scale_note: 'Scale note: each dimension is scored 0/1/2, not 0-5. Weights below are the original 0-5 weights rescaled ×2.5 so the composite still tops out at 100 and every dimension''s maximum contribution (weight × 2) is unchanged from v0.1 — only the granularity within each dimension got coarser, not the relative importance of the dimensions.'
+composite_formula: composite = Correct×12.5 + Complete×10 + Precision×7.5 + Ground×7.5 + Disambig×5 + Action×5 + Consist×2.5   (each dimension scored 0/1/2, max 100)
+governance_gate: Governance gate FAIL overrides everything above → composite = 0 for that question, no exceptions.
+two_grader_disagreement_rule: If two graders score the same output more than 1 point apart on a 5-point scale, the anchor text above is too vague — fix the anchor, don't average the two scores.
+worked_example:
+  note: Illustrative only. Blue text on cream = what a human grader actually types in. This is not a real scored run.
+  scores:
+    correct: 1
+    complete: 2
+    precision: 2
+    ground: 1
+    disambig: 1
+    action: 2
+    consist: 2
+  composite: 75
+  check: 'Check: 1×12.5 + 2×10 + 2×7.5 + 1×7.5 + 1×5 + 2×5 + 2×2.5 = 75.0 / 100. This is what the Scoring sheet''s COMPOSITE column computes automatically — you only ever type the seven 0/1/2 scores on the left.'
+dimensions:
+- key: correctness
+  name: 1. Correctness
+  weight: 12.5
+  question: Are the factual claims true?
+  anchors:
+    '2': All material claims verifiable against source. Trivial details (a date off by a month) don't cost a point.
+    '1': One or more material claims wrong — an honest miss, not invented.
+    '0': Fabricated. Confident, specific, and untrue. Reserved specifically for invention, not just for being wrong — wrong is recoverable, invented looks correct at a glance and is not.
+- key: completeness
+  name: 2. Completeness / recall
+  weight: 10
+  question: Did it find everything a thorough search would find?
+  anchors:
+    '2': Finds the substantial majority of what a thorough search would find (roughly ≥70%).
+    '1': Partial — finds some real items but misses others a thorough search would have caught.
+    '0': Finds nothing relevant, OR claims nothing exists when things do — the second case is worse than the first, because it ends the conversation instead of prompting a follow-up.
+- key: precision
+  name: 3. Precision
+  weight: 7.5
+  question: Did it include things that should not be there?
+  anchors:
+    '2': No false positives.
+    '1': One or two false positives, minor or defensible.
+    '0': Majority of returned items do not belong — output is mostly noise.
+- key: grounding
+  name: 4. Grounding / traceability
+  weight: 7.5
+  question: Can each claim be traced to a real source?
+  anchors:
+    '2': Every material claim cites a specific, checkable document or engagement.
+    '1': Some citation present but incomplete, vague (“based on past projects”), or imprecise (names a folder, not a file).
+    '0': No sourcing at all, OR — worse — a citation that points at a document that doesn't actually support the claim. A fabricated citation manufactures false confidence and survives a casual spot-check, so it scores the same as no sourcing, not better.
+- key: disambiguation
+  name: 5. Disambiguation behavior
+  weight: 5
+  question: Does it handle an ambiguous question well? (The “June revenue” problem.)
+  anchors:
+    '2': Names the ambiguity, states the interpretation used and why, then answers.
+    '1': Picks an interpretation silently (defensible or not) without flagging it as a choice, or asks a clarifying question instead of attempting an answer.
+    '0': Invents a definition, or answers a different question than the one asked.
+- key: actionability
+  name: 6. Actionability
+  weight: 5
+  question: Is the output usable without rework?
+  anchors:
+    '2': Usable as-is — right shape, right level of detail, right length.
+    '1': Correct but needs rework — trimming, restructuring, or a minor edit.
+    '0': Does not address the question asked, or is technically responsive but practically useless.
+- key: consistency
+  name: 7. Consistency
+  weight: 2.5
+  question: Score ONCE per arm+prompt across the three runs, then copy to all three rows.
+  anchors:
+    '2': Three runs materially identical in substance.
+    '1': Same substance but wording or a minor detail differs across runs.
+    '0': Runs disagree on substance — different items returned, or runs contradict each other.

@@ -499,7 +499,7 @@ Platform-wide settings live here, including the data source connection configura
 
 `POST /api/admin/server-config` accepts a `sections` object keyed by section name
 (`instance`, `data_source`, `email`, `telegram`, `jira`, `theme`, `server`, `auth`,
-`ai`, `openmetadata`, `desktop`, `corporate_memory`, `materialize`, `guardrails`,
+`ai`, `desktop`, `corporate_memory`, `materialize`, `guardrails`,
 `marketplace`). Sections outside this allowlist are rejected with 400.
 
 Sections `auth` and `server` are "danger zones" — mutating them requires sending
@@ -1142,6 +1142,71 @@ source lands with **no** `tool_grants`, so nothing is exposed until an admin
 grants the tools to a group. CLI: `agnes admin connection chat-tools [--disable]`.
 Deliberately not MCP-exposed (credential-provisioning exemption, `CONTRIBUTING.md`).
 
+### `/api/admin/sharepoint/connections/{connection_id}` — SharePoint connect wizard (spec 2026-08-27 §13.2)
+
+Admin-only surface behind the "connect → scope → share" file-source wizard on
+`/admin/data-sources`. The SharePoint connection itself is an ordinary
+`source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
+client id, certificate via vault secret or `config.cert_private_key_env`);
+these three routes are the wizard's own steps 2/3.
+
+- /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/scopes
+- /api/admin/sharepoint/connections/{connection_id}/corpus-map
+
+`GET …/tree` browses the live Microsoft Graph folder tree one level per call
+(no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
+libraries; both → the drive's root children) using the connection's resolved
+certificate. A missing/unresolvable certificate is a typed `409
+sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
+rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+
+`GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
+site/library/folder, stored as `{source_scope_id, display_path, anonymize,
+collection_id}` inside the connection's own `config.scopes` (no new table).
+`POST` confirms a scope: creates its collection on first confirmation and
+reuses the same collection on every re-confirmation of the same
+`source_scope_id` (idempotent — a rename/move in the source updates
+`display_path` in place rather than forking a second collection), and
+optionally applies group grants (ordinary `resource_grants` rows on the
+collection — never duplicated onto the scope row itself). The response's
+`no_group_warning` flags a collection with no granted group ("indexed but
+invisible"). `DELETE` (`?source_scope_id=`) unselects a scope — an explicit
+exclusion — without touching its already-created collection.
+
+`GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
+collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
+crawling moves inside Agnes.
+
+Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
+document surface is `agnes facts …`.
+
+### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
+
+Admin-only, behind the `facts` feature flag. The builder shell on
+`/admin/ontology` authors the entity/relationship types the fact graph
+extracts against. Everything fills an **unsaved draft**; only `save`
+materializes it — conversation and import never apply on their own.
+
+- /api/admin/ontology/drafts
+- /api/admin/ontology/drafts/{draft_id}
+- /api/admin/ontology/drafts/{draft_id}/import
+- /api/admin/ontology/drafts/{draft_id}/save
+- /api/admin/ontology/dry-run
+
+`POST/GET /drafts` create and list drafts; `GET/PUT/DELETE /drafts/{id}` read,
+edit and discard one. `POST …/import` translates a pasted or uploaded
+ontology (the producer's YAML) into the draft, reporting the leftovers the
+translator could not place structurally (mirrors the allowlisted
+`/api/admin/metrics/import`). `POST …/save` validates the frozen draft against
+the vendored Ossie schema and materializes it into a semantic model through
+the same path `agnes admin semantic-model import` uses. `POST /dry-run` runs
+the draft's current types over one selected document through the server-side
+LLM and returns proposed facts/edges plus a **not-captured** block; it is a
+typed `501` when no LLM provider is configured. Admin-only authoring with no
+analyst CLI/MCP analogue (the ontology is consumed as a semantic model, which
+has its own surface).
+
 ### `/api/admin/contributed-skills` — Contributed skill management
 
 Admin-only CRUD for the Agnes Contributed marketplace. `POST` wraps a pasted `SKILL.md` in a one-skill plugin and publishes it; `GET` lists contributed plugins with their granted group; `DELETE` removes a plugin and clears its grants. Mirrors the `/admin/contribute-skill` web form, `agnes admin skill list/contribute/delete` CLI, and `list_contributed_skills`/`contribute_skill`/`delete_contributed_skill` MCP tools.
@@ -1566,6 +1631,7 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-knowledge-migration
 - /api/admin/run-knowledge-packaging
 - /api/admin/run-reap-stuck-reviews
+- /api/admin/run-retention-prune
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
 
@@ -1651,6 +1717,75 @@ viewable by the person it was shared with.
 - /api/collections/{collection_id}/files/{file_id}/preview
 - /api/collections/{collection_id}/files/{file_id}/raw
 - /api/collections/{collection_id}/files/{file_id}/reingest
+
+### `/api/facts` — Fact graph over Collections
+
+Typed subjects (facts/edges) extracted from Collections documents, each
+claim carrying its evidencing document, a verbatim quote and a date. Behind
+the `facts` feature flag (off by default; `404` on the whole router when
+disabled) and Postgres-only (A3 ratchet — a DuckDB-backed instance answers a
+typed `501`). See
+`docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md`.
+
+**Read surface** (build order steps 2+3+6) — any authenticated caller, no
+admin gate; visibility is enforced entirely server-side, per caller, from
+readable collection grants (§4/§5). `search` and `neighbors` project
+attributes and traverse edges from readable claims only; `claims` returns
+the caller's readable evidence for one subject, `404` (never `403`) when it
+does not exist or has no readable claim. Triple-surface: `agnes facts
+search|neighbors|claims` (CLI) and `fact_search`/`fact_neighbors`/
+`fact_claims` (MCP foundation tools) call the same repository directly —
+facts have no local scope, so every result is labeled `[server]` on the
+CLI's stderr, a deliberate deviation from the `--scope auto|local|server`
+convention (spec §12).
+
+**Write surface** (build order step 4) — scheduler token or admin PAT, no
+CLI/MCP by design (a producer contract, not an analyst command). `ingest`
+is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
+`413`; a single document's evidence alone over the claim cap is a `422`
+`document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
+must be a substring of one chunk of the evidencing document's extracted
+text), union vs `full_documents` replace mode, alias/edge resolution,
+`wrong`-correction re-attachment across a subject's delete-then-recreate,
+and a post-ingest orphan sweep (zero-claim subjects deleted and counted).
+`review_items` mixes two self-describing shapes (a `kind` discriminator on
+each) — `possible_duplicate_of` entity-resolution candidates, and (§7.3)
+`single_valued_conflict`: a functionally single-valued edge type
+(`facts.single_valued_edges` in instance.yaml, default `owned_by`/
+`for_client`) whose src carries >1 distinct dst with a live claim — pre-
+existing edges included, nothing persisted, so it clears the moment a
+dst's claims are gone. Same detection re-runs at read time in
+`collection_facts_summary` (surfaced on the collection detail page),
+caller-scoped: a dst the caller cannot independently read (its own claim
+AND the edge's own claim both readable, the same discipline
+`possible_duplicate_of` review items get) never appears. Response is the
+run report: `{claims_written, claims_rejected: [{row,
+reason}], deferred: [...], subjects_created, subjects_deleted,
+corrections_active: [...], review_items: [...]}`. `documents` may be
+omitted only when every evidence `doc_id` already resolves through a prior
+upload's `corpus_file_sources` mapping — otherwise `400` with the
+unresolved ids itemized. Corrections management
+(`PUT`/`DELETE /api/facts/corrections/{subject_kind}/{subject_id}`,
+`wrong`/`restricted`/`revealed`, each reasoned and audit-logged) and the
+producer export (`GET /api/facts/corrections` — every `wrong` subject's
+natural keys, spec §7.4) round out the write surface.
+
+Every successful ingest batch also persists a copy of its run report to
+`facts_ingest_runs` — written AFTER the ingest transaction commits, so a
+report-write failure never rolls back or fails the ingest itself (see
+`app/api/facts.py::facts_ingest`). `GET /api/facts/ingest-runs?limit=`
+(admin, default `20`, max `200`) lists them newest-first: this is what the
+`/admin/data-sources` source card (spec §13.2) reads for its pipeline-strip
+counts and per-category error badges — an admin-only, UI-internal surface,
+not an analyst query (no CLI/MCP analogue).
+
+- /api/facts/search
+- /api/facts/neighbors
+- /api/facts/{subject_id}/claims
+- /api/facts/ingest
+- /api/facts/ingest-runs
+- /api/facts/corrections
+- /api/facts/corrections/{subject_kind}/{subject_id}
 
 ### `/api/connectors` — Connector manifest
 

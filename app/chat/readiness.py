@@ -55,12 +55,24 @@ def secret_status(chat_config: Any) -> dict:
     docker_needed = enabled and provider == "docker"
     kai_agent_needed = enabled and provider == "kai-agent"
     # In workload_identity mode there is intentionally NO static ANTHROPIC_API_KEY
-    # — don't flag it as a missing secret in the admin UI.
+    # — don't flag it as a missing secret in the admin UI. Same in vertex mode:
+    # no Anthropic credential exists at all (Google ADC signs upstream calls).
     llm_auth = getattr(chat_config, "llm_auth", "api_key")
-    anthropic_key_needed = enabled and llm_auth != "workload_identity"
+    llm_provider = getattr(chat_config, "llm_provider", "anthropic") or "anthropic"
+    vertex_needed = enabled and llm_provider == "vertex"
+    anthropic_key_needed = enabled and llm_auth != "workload_identity" and not vertex_needed
 
     jwt_val = os.environ.get(ENV_JWT, "")
     jwt_ok = len(jwt_val.encode()) >= _JWT_MIN_BYTES
+
+    # Probe Google ADC only when vertex actually needs it — the resolver can
+    # touch the metadata server, and non-vertex deployments must never pay
+    # that latency on an admin poll (the helper memoizes successes anyway).
+    google_creds_ok = False
+    if vertex_needed:
+        from app.auth.vertex_gcp import credentials_resolvable
+
+        google_creds_ok, _ = credentials_resolvable()
 
     secrets = {
         "anthropic_api_key": {"set": _is_set(ENV_ANTHROPIC), "required": anthropic_key_needed},
@@ -76,6 +88,17 @@ def secret_status(chat_config: Any) -> dict:
         # requirement (_chat_kai_agent_ok mirrors this) — without it every
         # session mint 503s, so the admin banner must show it as missing.
         "kai_host_jwt_secret": {"set": _is_set("KAI_HOST_JWT_SECRET"), "required": kai_agent_needed},
+        # Vertex mode: not secrets, but the readiness banner must show a
+        # missing project/region/ADC the same way it shows a missing key.
+        "vertex_project_id": {
+            "set": bool(getattr(chat_config, "vertex_project_id", "")),
+            "required": vertex_needed,
+        },
+        "vertex_region": {
+            "set": bool(getattr(chat_config, "vertex_region", "")),
+            "required": vertex_needed,
+        },
+        "google_credentials": {"set": google_creds_ok, "required": vertex_needed},
     }
     missing = sorted(k for k, v in secrets.items() if v["required"] and not v["set"])
 
@@ -99,6 +122,7 @@ def secret_status(chat_config: Any) -> dict:
     return {
         "enabled": enabled,
         "provider": provider,
+        "llm_provider": llm_provider,
         "secrets": secrets,
         "missing": missing,
         "ready": enabled and not missing,
@@ -316,3 +340,59 @@ async def test_wif_credentials(*, timeout: float = 8.0) -> dict:
     import asyncio
 
     return await asyncio.to_thread(_test_wif_sync, timeout)
+
+
+def _test_vertex_sync(project_id: str, region: str, timeout: float) -> dict:
+    """Resolve a Google token, then confirm Vertex serves Claude for this
+    project/region with a 1-token completion. Returns {ok, detail}."""
+    from app.auth.vertex_gcp import VertexAuthError, clear_token_cache, get_vertex_access_token
+
+    if not project_id or not region:
+        return {
+            "ok": False,
+            "detail": "vertex not configured — set chat.llm.vertex.project_id and chat.llm.vertex.region",
+        }
+    try:
+        get_vertex_access_token()
+    except VertexAuthError as exc:
+        return {"ok": False, "detail": f"google credential resolution failed: {exc}"}
+    try:
+        import anthropic
+
+        vertex_client_cls = anthropic.AnthropicVertex
+    except (ImportError, AttributeError):  # pragma: no cover — SDK is a hard dep for chat
+        return {"ok": True, "detail": "google token minted (anthropic SDK unavailable for full probe)"}
+    from app.chat.auto_title import _TITLE_MODEL
+    from connectors.llm.vertex_provider import to_vertex_model_id
+
+    try:
+        client = vertex_client_cls(project_id=project_id, region=region, timeout=timeout)
+        client.messages.create(
+            model=to_vertex_model_id(_TITLE_MODEL),
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except Exception as exc:  # noqa: BLE001 — classify, never raise to the admin
+        # The cached token may be scope-limited or revoked — drop it so a later
+        # probe/request re-resolves rather than reusing a known-bad token.
+        clear_token_cache()
+        return {
+            "ok": False,
+            "detail": (
+                f"google token minted but Vertex call failed: {_classify(exc)} — "
+                "check the Claude model is enabled in Model Garden for this "
+                "project/region and the identity has roles/aiplatform.user"
+            ),
+        }
+    return {"ok": True, "detail": "vertex credentials valid"}
+
+
+async def test_vertex_credentials(project_id: str, region: str, *, timeout: float = 8.0) -> dict:
+    """Live-probe ``chat.llm.provider: vertex``: resolve Google ADC and run a
+    1-token completion through ``anthropic.AnthropicVertex``. Returns
+    ``{ok, detail}``; blocking work runs on a worker thread. Takes explicit
+    project/region so both the chat config and the server-side ``ai.vertex``
+    block can drive it."""
+    import asyncio
+
+    return await asyncio.to_thread(_test_vertex_sync, project_id, region, timeout)

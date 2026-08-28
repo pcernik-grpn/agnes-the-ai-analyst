@@ -26,7 +26,6 @@ from app.instance_config import (
     get_instance_name,
     get_instance_subtitle,
     get_theme_css_overrides,
-    get_corporate_memory_config,
     get_home_route,
     get_home_automode_visibility,
     get_instance_brand,
@@ -1733,6 +1732,26 @@ def _data_package_entry_dict(
     return out
 
 
+def _facts_repo_if_available() -> Optional[Any]:
+    """The facts repo when the ``facts`` feature flag is on AND the active
+    backend is Postgres, else ``None`` — the single "is the facts UI even
+    reachable" gate every facts-aware web surface uses (spec §13.2: "flag
+    off / DuckDB backend / zero facts -> the section simply absent, no
+    error, no empty shell"). Swallows ``RequiresPostgresBackend`` (frozen
+    DuckDB app-state) and any other resolution error so a facts-adjacent
+    page never 500s over what is, this round, an optional surface."""
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return None
+    try:
+        from src.repositories import facts_repo
+
+        return facts_repo()
+    except Exception:
+        return None
+
+
 # ── Unified catalog-card normalizers ─────────────────────────────────
 # Adapt an entry dict -> the single `c` contract consumed by the reusable
 # catalog_card() macro (templates/macros/_catalog_card.html) and its JS
@@ -1752,8 +1771,16 @@ def _catalog_card_upload(c: dict) -> dict:
       ``N files`` meta, label "Collection").
 
     Artefacts aren't stack-toggled (they're owned files); the action opens the
-    detail page, where adding a second file promotes a File into a Collection."""
+    detail page, where adding a second file promotes a File into a Collection.
+
+    ``fact_count`` (spec §13.2 "Library" — a collection card reads "N files ·
+    M facts"), when > 0, is appended to the meta line on both branches. It is
+    the caller-scoped `facts` count the route already computed via
+    `count_visible_facts_for_collection` (feature-flagged, PG-only, absent
+    entirely when there are no facts) — never re-derived here."""
     n = c.get("file_count", 0) or 0
+    fact_count = c.get("fact_count", 0) or 0
+    fact_suffix = f" · {fact_count} fact{'s' if fact_count != 1 else ''}" if fact_count else ""
     ff = c.get("first_file") or None
     if n == 1 and ff:
         size = _human_size(ff.get("size_bytes") or 0)
@@ -1762,7 +1789,7 @@ def _catalog_card_upload(c: dict) -> dict:
         # filename — otherwise several single-file artefacts with distinct
         # names all render as the same filename. The filename + size move to
         # the meta line so the file's identity stays visible.
-        meta = f"{fname} · {size}" if fname else size
+        meta = (f"{fname} · {size}" if fname else size) + fact_suffix
         return {
             "kind": "library",
             "glyph": "doc",  # single-document glyph — see kind_glyph()
@@ -1788,7 +1815,7 @@ def _catalog_card_upload(c: dict) -> dict:
         "description": c.get("description") or "A private collection of files — searchable by your agents.",
         "tags": [],
         "meta_icon": "doc",
-        "meta_text": f"{n} file{'s' if n != 1 else ''}",
+        "meta_text": f"{n} file{'s' if n != 1 else ''}" + fact_suffix,
         "action": {"mode": "link", "href": f"/library/{c['slug']}", "label": "Open"},
     }
 
@@ -2261,8 +2288,26 @@ async def library_page(
     # ── Artefacts (file_corpora) ──────────────────────────────────────────
     fc_repo = file_corpora_repo()
     cf_repo = corpus_files_repo()
+    # Resolved ONCE, not per collection: the flag/backend check is the same
+    # for every row, and a fresh count query per row is only worth paying
+    # when the surface is actually on (spec §13.2 "Library" — "N files ·
+    # M facts").
+    facts_repo_ = _facts_repo_if_available()
+    _all_cols = fc_repo.list()
+    # One batch call for every card, not one call per card: each singular
+    # count re-resolved the caller's readable-collection set (a grants query
+    # plus a full owned-collections scan), so the page cost grew with the
+    # number of collections the caller can see. The batch resolves that set
+    # once — visibility still decided inside the repo, never here.
+    _fact_counts: dict = {}
+    if facts_repo_ is not None:
+        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        try:
+            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+        except Exception as e:
+            logger.warning("/library: fact counts failed: %s", e)
     try:
-        for col in fc_repo.list():
+        for col in _all_cols:
             owned = col.get("created_by") == uid
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
@@ -2279,6 +2324,7 @@ async def library_page(
                     "file_type": f0.get("file_type"),
                     "size_bytes": f0.get("size_bytes"),
                 }
+            fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
                     "id": col["id"],
@@ -2287,6 +2333,7 @@ async def library_page(
                     "slug": col.get("slug"),
                     "file_count": file_count,
                     "first_file": first_file,
+                    "fact_count": fact_count,
                 }
             )
             shared = col["id"] in shared_ids
@@ -3825,13 +3872,13 @@ async def semantic_layer_detail(
     """
     from app.web.semantic_layer_view import (
         agnes_extension_payload,
-        dialect_skipped_count,
         is_imported,
         model_constraints,
         model_glossary,
         model_of,
         object_counts,
         source_label,
+        warehouse_only_metric_count,
     )
 
     row = _readable_model_by_slug(slug, user, conn)
@@ -3960,7 +4007,7 @@ async def semantic_layer_detail(
         relationships=relationships,
         glossary=glossary,
         counts=object_counts(model),
-        dialect_skipped_count=dialect_skipped_count(model),
+        warehouse_only_metric_count=warehouse_only_metric_count(model),
     )
     # F3: the detach/re-attach toolbar buttons POST via fetch(). Their
     # targets are `/api/admin/**` JSON routes, so the CSRF defense that
@@ -4247,10 +4294,17 @@ async def library_file_detail(
     return templates.TemplateResponse(request, "library_file_detail.html", ctx)
 
 
+# Facts section page size (spec §13.2 "Collection detail" — a paged per-fact
+# row list). Small on purpose: each row can carry a conflict block, so the
+# page stays a state read-out, not a data dump.
+_FACTS_SECTION_PAGE_SIZE = 20
+
+
 @router.get("/library/{slug}", response_class=HTMLResponse)
 async def library_detail(
     slug: str,
     request: Request,
+    facts_page: int = 1,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -4276,6 +4330,29 @@ async def library_detail(
     # surface that stated neither, so "who can see this folder?" was only
     # answerable from the Library table it was opened from.
     owner_id = col.get("created_by")
+
+    # Facts section (spec §13.2 "Collection detail" — state, not settings):
+    # flag off / DuckDB backend / zero facts -> `facts_summary` stays None and
+    # the template simply omits the section, no error, no empty shell. Scoped
+    # to the ACTUAL CALLER (`user`), never `owner_id` — a caller who can open
+    # this page via a group grant must see exactly what their own grants
+    # cover, not the owner's.
+    facts_summary = None
+    facts_repo_ = _facts_repo_if_available()
+    if facts_repo_ is not None:
+        try:
+            page = max(1, facts_page)
+            summary = facts_repo_.collection_facts_summary(
+                user,
+                col["id"],
+                limit=_FACTS_SECTION_PAGE_SIZE,
+                offset=(page - 1) * _FACTS_SECTION_PAGE_SIZE,
+            )
+            if summary["total"] > 0:
+                facts_summary = {**summary, "page": page, "page_size": _FACTS_SECTION_PAGE_SIZE}
+        except Exception as e:
+            logger.warning("/library/%s: facts summary failed: %s", slug, e)
+
     ctx = _build_context(
         request,
         user=user,
@@ -4286,6 +4363,7 @@ async def library_detail(
         owner_name=(_resolve_owner_display(owner_id) if owner_id else None),
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
+        facts_summary=facts_summary,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 
@@ -5295,7 +5373,6 @@ async def corporate_memory_admin(
             "contradictions": len(contradictions),
             "duplicates": duplicates_count,
         },
-        governance=get_corporate_memory_config(),
         groups=user_groups_for_ui,
         edit_categories=edit_categories,
         edit_tags=edit_tags,
@@ -7014,7 +7091,11 @@ async def admin_data_sources_page(
     # fact. Status lives at /admin/semantic-layer.
     # Per-connection pipeline strip: connected → synced → semantic → feeding
     # whom, in one glance on each source card. See `_source_pipelines`.
-    inventory = _source_inventory()
+    # `user` is threaded through ONLY for the sharepoint file-source cell
+    # (`_sharepoint_pipeline_cell`) — its facts/edges counts are genuinely
+    # caller-scoped (spec §5), and this admin's own identity is what proves
+    # them admin-omniscient; every other cell is caller-independent.
+    inventory = _source_inventory(user=user)
     ctx["source_pipelines"] = inventory["pipelines"]
     # Connectors that are live on this instance but keep no connection row —
     # BigQuery, Jira, uploaded files. Rendered as cards in the SAME list, so
@@ -7089,16 +7170,20 @@ _DERIVED_SOURCES: dict[str, dict] = {
 }
 
 
-def _source_pipelines() -> dict:
+def _source_pipelines(user: dict | None = None) -> dict:
     """The pipeline strip for every source card, keyed by connection id.
 
     Thin wrapper over `_source_inventory()` — kept because the strip is the
-    part other callers and the guards name.
+    part other callers and the guards name. ``user`` is optional and used
+    ONLY by the sharepoint file-source cell's caller-scoped facts/edges
+    counts (see `_sharepoint_pipeline_cell`) — every other cell is
+    caller-independent, so every pre-existing call site (including every
+    test that calls this with no arguments) is unaffected.
     """
-    return _source_inventory()["pipelines"]
+    return _source_inventory(user=user)["pipelines"]
 
 
-def _source_inventory() -> dict:
+def _source_inventory(user: dict | None = None) -> dict:
     """Every source on this instance: its pipeline strip, and the cards that
     have no connection row of their own.
 
@@ -7362,6 +7447,14 @@ def _source_inventory() -> dict:
                     "title": "Databricks queries run on the SQL warehouse. Remote results are capped at the scan limit and materialized rows are refused above the materialize cap. Editable in server config.",
                 }
 
+        # ── File source (sharepoint): a DIFFERENT pipeline shape entirely —
+        # crawl → text extraction + scan transcription → facts → graph, not
+        # tables/sync (spec §13.2 "Source card"). See
+        # `_sharepoint_pipeline_cell` for what each sub-block means and its
+        # honesty notes (placeholder cost, interim scope heuristic).
+        if stype == "sharepoint":
+            cells["file_source"] = _sharepoint_pipeline_cell(conn, user)
+
         # ── Feeds: packages holding this source's tables → groups granted →
         # people reached. The end of the chain the redesign cares about; a
         # source with tables in no package reads "0 packages", which is the
@@ -7389,6 +7482,181 @@ def _source_inventory() -> dict:
 
         out[cid] = cells
     return {"pipelines": out, "derived": derived}
+
+
+# Not a real cost model: Agnes has no visibility into the producer's LLM
+# extraction cost per item (that spend happens entirely outside this
+# instance, in the crawler's own pipeline). This constant only keeps the
+# source card's cost cell from being blank — spec §13.2 asks for "the
+# queue's cost in $" but the only honest input Agnes holds is a rejected/
+# deferred item COUNT from the last run report, not a $ figure. Replace once
+# the producer reports real per-item cost.
+_FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
+
+
+def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
+    """The file-source pipeline strip + card rows for a SharePoint connection
+    (spec §13.2 "Source card"): crawl → text extraction + scan transcription
+    → facts → graph counts, a queue-cost PLACEHOLDER (see the constant
+    above), the static schedule line, the certificate row (origin + set-date,
+    never the value), the identity-matching row, and the LAST persisted
+    ingest run's error badges — each carrying its itemized detail for the
+    admin's filtered drawer.
+
+    **"Scope collections" is an interim heuristic**
+    (`facts_ingest_runs_repo().distinct_corpus_ids()` — see that method's
+    own docstring): every collection this instance has EVER ingested facts
+    into, because there is no persisted connection → collection mapping yet
+    (the connect wizard's step 2 owns that; a sibling, independent effort).
+    Two sharepoint connections on one instance would not be told apart by
+    this alone — acceptable for a single-connection instance, named here so
+    it is not rediscovered as a surprise later.
+
+    **Error badge categories are a deliberate, narrower simplification** of
+    spec §13.2's illustrative four (unsupported type / model error / deleted
+    / rejected quote) — those live in the CRAWLER's own per-document error
+    log, which Agnes never receives. The three badges below are the ones
+    Agnes's own ingest run report actually carries: `rejected_quotes` (the
+    verbatim gate, spec §8, doing its job), `deferred` (a claim whose file
+    was not yet `indexed` — free retry once it is), and `protocol_errors`
+    (every OTHER `claims_rejected` reason — unresolved doc id, malformed
+    edge, alias type conflict, …).
+
+    Every sub-block degrades independently on its own `try/except` — a
+    repo call that raises (PG-only `RequiresPostgresBackend` on a
+    DuckDB-backed instance, a misconfigured certificate, no vault) yields a
+    partial/empty shape for that block, never a 500 for the whole page.
+    """
+    cell: dict[str, Any] = {}
+
+    scope_ids: list[str] = []
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        scope_ids = facts_ingest_runs_repo().distinct_corpus_ids()
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: could not resolve scope collections: %s", e)
+
+    # ── crawl / extract: corpus_files across scope collections, bucketed by
+    # processing_status (the five-state lifecycle: pending | processing |
+    # indexed | needs_review | rejected).
+    documents = 0
+    extracted: dict[str, int] = {}
+    if scope_ids:
+        try:
+            from src.repositories import corpus_files_repo
+
+            cf_repo = corpus_files_repo()
+            for scope_id in scope_ids:
+                for f in cf_repo.list_for_corpus(scope_id):
+                    documents += 1
+                    status = f.get("processing_status") or "pending"
+                    extracted[status] = extracted.get(status, 0) + 1
+        except Exception as e:
+            logger.warning("sharepoint pipeline cell: could not list corpus files: %s", e)
+    cell["crawl"] = {"documents": documents}
+    cell["extract"] = extracted
+
+    # ── facts / graph: caller-scoped (spec §5) — needs the real admin `user`
+    # this request authenticated as; with none supplied (a legacy call site)
+    # the numbers are simply unavailable, same "degrade, don't guess" rule.
+    facts_count = 0
+    edges_count = 0
+    if scope_ids and user is not None:
+        try:
+            from src.repositories import facts_repo
+
+            fr = facts_repo()
+            facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
+            edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
+        except Exception as e:
+            logger.debug("sharepoint pipeline cell: facts/edges counts unavailable: %s", e)
+    cell["graph"] = {"facts": facts_count, "edges": edges_count}
+
+    # ── the last persisted run report (see facts_ingest_runs_pg.py) — the
+    # error badges' source, and this cell's only input for the cost
+    # placeholder above.
+    last_run = None
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        runs = facts_ingest_runs_repo().list_recent(limit=1)
+        last_run = runs[0] if runs else None
+    except Exception as e:
+        logger.debug("sharepoint pipeline cell: run report history unavailable: %s", e)
+
+    if last_run is not None:
+        claims_rejected = last_run.get("claims_rejected") or []
+        deferred = last_run.get("deferred") or []
+        rejected_quotes = [r for r in claims_rejected if r.get("reason") == "verbatim_gate_failed"]
+        protocol_errors = [r for r in claims_rejected if r.get("reason") != "verbatim_gate_failed"]
+        queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
+        cell["cost_estimate"] = {
+            "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
+            "placeholder": True,
+        }
+        cell["last_run"] = {
+            "id": last_run.get("id"),
+            "created_at": last_run.get("created_at"),
+            "rejected_quotes": rejected_quotes,
+            "deferred": deferred,
+            "protocol_errors": protocol_errors,
+        }
+    else:
+        cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
+        cell["last_run"] = None
+
+    # ── schedule: static text — the crawl runs externally, so this is
+    # honestly a label, never live state (spec §13.2's "hourly delta · 03:00
+    # full check · extraction in its own lane" collapsed to one line here).
+    cell["schedule"] = {"text": "external producer · hourly delta"}
+
+    # ── certificate: origin + set-date from resolve_sharepoint_settings,
+    # NEVER the value (spec §13.2). A resolution error (missing identity
+    # fields, an unset/disallowed env var) is shown as its own message
+    # rather than raised — this is a status row, not a gate.
+    try:
+        from connectors.sharepoint.settings import resolve_sharepoint_settings
+
+        settings = resolve_sharepoint_settings(conn)
+        cell["certificate"] = {
+            "origin": settings.credential_source,
+            "env_name": settings.credential_env,
+            "set_at": settings.credential_set_at.isoformat() if settings.credential_set_at else None,
+            "error": None,
+        }
+    except Exception as e:
+        # Logged, not just rendered: this block swallowed a real type bug
+        # (a str set-date reaching .isoformat()) for as long as its only
+        # signal was the word "unconfigured" on a card.
+        logger.warning(
+            "source card: sharepoint certificate row for connection %s failed to resolve",
+            conn.get("id"),
+            exc_info=True,
+        )
+        cell["certificate"] = {"origin": None, "env_name": None, "set_at": None, "error": str(e)}
+
+    # ── identity: grants across scope collections — "N groups matched /
+    # collections with no group", fail-closed (an ungranted collection is
+    # invisible to everyone, spec §13.1's "under-sharing looks like a bug"
+    # made visible as a count rather than discovered by an analyst).
+    groups_matched = 0
+    collections_no_group = 0
+    if scope_ids:
+        try:
+            from src.repositories import resource_grants_repo
+
+            by_collection: dict[str, set] = {}
+            for g in resource_grants_repo().list_all(resource_type="collection"):
+                if g["resource_id"] in scope_ids:
+                    by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
+            groups_matched = len({gid for gids in by_collection.values() for gid in gids})
+            collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
+        except Exception as e:
+            logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
+    cell["identity"] = {"groups_matched": groups_matched, "collections_no_group": collections_no_group}
+
+    return cell
 
 
 def _bq_cap(key: str, default: int) -> int:
@@ -7684,6 +7952,32 @@ async def admin_semantic_sources_page(
     """List page for registered semantic sources."""
     ctx = _build_context(request, user=user)
     return templates.TemplateResponse(request, "admin_semantic_sources.html", ctx)
+
+
+@router.get("/admin/ontology", response_class=HTMLResponse)
+async def admin_ontology_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Ontology builder (fact-graph-over-Collections §13.2) — a semantic
+    model authored through the shared builder shell: Create | Preview left,
+    numbered sections right, the right panel the source of truth, Save the
+    only write. Zero new navigation (spec §13.2) — the only entry point is
+    the link on ``/admin/semantic-layer``; this route carries no admin-nav
+    entry of its own.
+
+    When the ``facts`` flag is off, or the active backend is DuckDB (drafts
+    are PG-only, A3 ratchet — the builder cannot persist a draft without
+    Postgres), renders an explanatory empty state instead of 404ing, same
+    posture as ``/apps`` when ``data_apps`` is disabled.
+    """
+    from app.instance_config import feature_enabled
+    from src.repositories import use_pg
+
+    ctx = _build_context(request, user=user)
+    ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+    ctx["pg_backend"] = use_pg()
+    return templates.TemplateResponse(request, "ontology_builder.html", ctx)
 
 
 @router.get("/admin/database", response_class=HTMLResponse)

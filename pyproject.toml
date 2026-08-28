@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.89.1"
+version = "0.91.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -49,7 +49,7 @@ dependencies = [
     # is imported by services/{corporate_memory, verification_detector} which
     # the scheduler drives in production. Promoted from [dev] in #176 to fix
     # ModuleNotFoundError boot loops on default Compose deploys.
-    "anthropic>=0.30.0",
+    "anthropic[vertex]>=0.30.0",
     "openai>=1.30.0",
     # CommonMark markdown renderer. Already pulled in transitively via `rich`
     # (rich.markdown depends on markdown-it-py>=2.2.0), so declaring it here
@@ -426,7 +426,7 @@ dev-dependencies = [
     "pytest-xdist>=3.0.0",
     "pytest-split>=0.9.0",
     "faker>=24.0.0",
-    "anthropic>=0.30.0",
+    "anthropic[vertex]>=0.30.0",
     "openai>=1.30.0",
     "fastapi-debug-toolbar>=0.6.3",
     "playwright>=1.40.0",

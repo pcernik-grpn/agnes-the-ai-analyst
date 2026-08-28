@@ -24,7 +24,7 @@ and FAILS when a NEW one appears. Two further invariants keep it honest:
 
 NOTE on legitimacy: a grandfathered entry is NOT automatically a bug. Some are
 genuinely DuckDB-only by design (analytics rebuild in ``src/orchestrator.py`` /
-``src/profiler.py`` / ``src/catalog_export.py``; cloud-chat PG-only persistence;
+``src/profiler.py``; cloud-chat PG-only persistence;
 DuckDB-only CLI maintenance commands). The migration is "done" when every
 remaining entry is one of those — verified by deleting entries as their callers
 are routed through the factory (or confirmed DuckDB-only) until only the
@@ -187,6 +187,8 @@ _GRANDFATHERED_DIRECT_INSTANTIATION: dict[str, set[str]] = {
     # The DuckDB-only binding-code tables stay on repo._conn by design.
     # Entries removed.
     # src/catalog_export.py — migrated to table_registry_repo(); entry removed.
+    # Later deleted entirely (dead OpenMetadata export, D6c) — never
+    # re-added since deletion.
     # src/claude_md.py — render_claude_md moved off direct instantiation onto
     # resolve_prompt() (#622); entry removed.
     # src/initial_workspace.py — resolve_prompt() binds the DuckDB repo to the

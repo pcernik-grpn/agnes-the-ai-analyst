@@ -19,18 +19,31 @@ import pathlib
 
 import pytest
 
-TEMPLATE = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "app"
-    / "web"
-    / "templates"
-    / "admin_tables.html"
+TEMPLATE = pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_tables.html"
+
+# D4 — one registration flow: the "Live from BigQuery" register form (and
+# its project-override field) moved out of admin_tables.html's own markup
+# into the shared drawer partial, rendered generically across all four
+# connectors and populated by register_table_form.js.
+REGISTER_PARTIAL = (
+    pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "_register_table_form.html"
 )
+REGISTER_JS = pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "register_table_form.js"
 
 
 @pytest.fixture(scope="module")
 def template_source() -> str:
     return TEMPLATE.read_text()
+
+
+@pytest.fixture(scope="module")
+def register_partial_source() -> str:
+    return REGISTER_PARTIAL.read_text()
+
+
+@pytest.fixture(scope="module")
+def register_js_source() -> str:
+    return REGISTER_JS.read_text()
 
 
 class TestServerConfigKnownFields:
@@ -69,20 +82,26 @@ class TestServerConfigKnownFields:
 
 
 class TestRegistrationFormExposesProject:
-    def test_form_has_a_project_input(self, template_source):
-        assert 'id="bqProject"' in template_source
+    """D4 — one registration flow: the "Live from BigQuery" form (and its
+    project-override field) moved out of admin_tables.html's own markup
+    into the shared drawer, rendered generically — `#rtfProject`, not a
+    BQ-only `#bqProject` clone — and populated by
+    `CONNECTORS.bigquery.buildPayload` (register_table_form.js)."""
 
-    def test_payload_builder_reads_the_project_input(self, template_source):
-        assert "bqProject" in template_source
+    def test_form_has_a_project_input(self, register_partial_source):
+        assert 'id="rtfProject"' in register_partial_source
+
+    def test_payload_builder_reads_the_project_input(self, register_js_source):
+        assert "getElementById('rtfProject')" in register_js_source
         # It must reach the payload, not just exist as a stray input.
-        assert "bq_fqn" in template_source
+        assert "bq_fqn" in register_js_source
 
-    def test_project_input_is_marked_optional(self, template_source):
+    def test_project_input_is_marked_optional(self, register_partial_source):
         """Leaving it blank must keep the legacy dataset+table behaviour, so
         the field has to read as optional rather than required."""
-        idx = template_source.index('id="bqProject"')
+        idx = register_partial_source.index('id="rtfProject"')
         # The "(optional)" marker sits in the <label>, which precedes the
         # <input>, so look both ways around the field.
-        window = template_source[max(0, idx - 400) : idx + 900]
+        window = register_partial_source[max(0, idx - 400) : idx + 900]
         assert "required" not in window
         assert "optional" in window.lower()

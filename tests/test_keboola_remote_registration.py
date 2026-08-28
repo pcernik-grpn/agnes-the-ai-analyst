@@ -93,35 +93,37 @@ def test_register_keboola_remote_rejects_server_only(seeded_app, keboola_instanc
 
 
 def test_keboola_modal_offers_live_remote_option(seeded_app, keboola_instance):
-    """The `/admin/tables` Keboola register modal must offer a fourth
-    "What to sync?" radio — Live (remote), `value="remote"` — matching the
-    interaction pattern already used by BigQuery (`bqAccessMode`),
-    Databricks (`dbxAccessMode`) and Snowflake (`sfAccessMode`)."""
-    c = seeded_app["client"]
-    html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    """D4 — one registration flow: the Keboola register modal this test
+    scraped is gone. Its four "What to sync?" modes — including "Live
+    (remote)" — now live in `CONNECTORS.keboola.modes`
+    (register_table_form.js), rendered through the same generic
+    `#rtfModeGroup` every connector shares (BigQuery/Databricks/Snowflake
+    included) rather than a per-connector radio-group clone."""
+    from pathlib import Path
 
-    kb_modal_start = html.index('id="registerKeboolaModal"')
-    next_modal_idx = html.find('id="editKeboolaModal"', kb_modal_start)
-    kb_tab = html[kb_modal_start:next_modal_idx] if next_modal_idx > 0 else html[kb_modal_start:]
+    js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+    kb_start = js.index("keboola: {")
+    kb_end = js.index("\n    bigquery: {", kb_start)
+    kb_config = js[kb_start:kb_end]
 
-    assert 'name="kbSyncMode"' in kb_tab
-    assert 'value="whole"' in kb_tab
-    assert 'value="direct"' in kb_tab
-    assert 'value="custom"' in kb_tab
-    # The new live option.
-    assert 'value="remote"' in kb_tab
-    assert "Live" in kb_tab
+    assert "value: 'whole'" in kb_config
+    assert "value: 'direct'" in kb_config
+    assert "value: 'custom'" in kb_config
+    # The live option.
+    assert "value: 'remote'" in kb_config
+    assert "Live" in kb_config
 
 
 def test_keboola_payload_builder_maps_remote_mode(seeded_app, keboola_instance):
-    """`_buildKeboolaPayload`'s remote branch must post `query_mode: 'remote'`
-    (not fold into the materialized/local branches)."""
-    c = seeded_app["client"]
-    html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    """`CONNECTORS.keboola.buildPayload`'s remote branch must post
+    `query_mode: 'remote'` (not fold into the materialized/local
+    branches)."""
+    from pathlib import Path
 
-    start = html.index("function _buildKeboolaPayload(")
-    end = html.index("\n    function ", start + len("function _buildKeboolaPayload("))
-    body = html[start:end]
+    js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+    kb_start = js.index("keboola: {")
+    kb_end = js.index("\n    bigquery: {", kb_start)
+    kb_config = js[kb_start:kb_end]
 
-    assert "mode === 'remote'" in body
-    assert "query_mode: 'remote'" in body
+    assert "mode === 'remote'" in kb_config
+    assert "query_mode: 'remote'" in kb_config

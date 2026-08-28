@@ -509,3 +509,14 @@ class ConnectionSecretsRepository:
     def has(self, connection_id: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM connection_secrets WHERE connection_id = ?", [connection_id]).fetchone()
         return row is not None
+
+    def updated_at(self, connection_id: str) -> Optional[str]:
+        """When this connection's vault secret was last set/rotated, or
+        ``None`` if no row exists. Never touches ``ciphertext`` — a set-date
+        badge (the SharePoint wizard's / source card's certificate row, spec
+        §13.2) can show "set 2026-08-14" without ever reading ``get()``."""
+        row = self.conn.execute(
+            "SELECT updated_at FROM connection_secrets WHERE connection_id = ?",
+            [connection_id],
+        ).fetchone()
+        return str(row[0]) if row and row[0] is not None else None

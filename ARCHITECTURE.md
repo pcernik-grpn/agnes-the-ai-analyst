@@ -66,7 +66,6 @@ DuckDB-backed data orchestration and state management.
 | `src/remote_query.py` | RemoteQueryEngine — hybrid queries joining local + BigQuery data |
 | `src/repositories/` | DuckDB-backed CRUD (sync_state, table_registry, users, knowledge, etc.) |
 | `src/profiler.py` | Data profiling for catalog UI |
-| `src/catalog_export.py` | OpenMetadata catalog export |
 | `src/scheduler.py` | Schedule parsing (`every 15m`, `daily 03:00`) and `is_table_due()` |
 | `src/rbac.py` | Dataset-access helpers (`can_access_table`, `get_accessible_tables`) |
 | `src/marketplace.py` | Marketplace git-clone/sync + plugin manifest parsing |
@@ -94,7 +93,6 @@ Each connector produces an `extract.duckdb` following a standard contract.
 | `connectors/keboola/` | Batch pull | DuckDB Keboola extension → parquet files |
 | `connectors/bigquery/` | Remote attach | DuckDB BQ extension → views to BigQuery |
 | `connectors/jira/` | Real-time push | Webhooks → incremental parquet updates |
-| `connectors/openmetadata/` | Catalog | httpx client to OpenMetadata API |
 | `connectors/llm/` | LLM routing | OpenAI-compatible API client |
 
 #### extract.duckdb Contract

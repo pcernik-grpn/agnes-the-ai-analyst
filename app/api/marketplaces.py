@@ -568,11 +568,19 @@ async def delete_marketplace(
 
 
 @router.post("/{marketplace_id}/sync")
-async def trigger_sync(
+def trigger_sync(
     marketplace_id: str,
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
+    """Sync one marketplace on demand ("Sync now" in the admin UI).
+
+    Declared ``def`` (not ``async def``) for the same reason as
+    :func:`trigger_sync_all` below — ``sync_one`` does blocking I/O
+    (subprocess git clone/fetch, DuckDB writes, the module-wide sync lock)
+    and would freeze the event loop for the duration of the sync if it ran
+    on the asyncio thread.
+    """
     try:
         result = sync_one(marketplace_id)
     except MarketplaceNotFound:

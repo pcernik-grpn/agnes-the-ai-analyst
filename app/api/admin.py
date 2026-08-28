@@ -517,7 +517,6 @@ _STATIC_EDITABLE_SECTIONS: tuple[str, ...] = (
     "server",
     "auth",
     "ai",
-    "openmetadata",
     "corporate_memory",
     "materialize",
     "marketplace",
@@ -570,6 +569,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "features": "live",  # matches its switch
     "mcp": "live",  # matches all five switches under it
     "access_policies": "live",  # matches its switch
+    "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -579,7 +579,6 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "telegram": "restart",  # services/telegram_bot/bot.py reads instance.yaml ONCE at module import, in a separate process — restarting the API alone does not refresh it
     "data_source": "restart",  # cross-process: THIS process reads it live (resolved per call; reset_cache() explicitly clears connectors.bigquery.access.get_bq_access's cache), but reset_cache() drops only the in-process overlay — under a role-split deployment (api/gateway/worker as separate processes, a documented mode) the scheduler and workers keep extracting against the pre-save coordinates until they are bounced, so a connection-settings save must not be reported as fully live; same reasoning as telegram above. NARROWED scope since D2.2/D2.3: this classification covers writes to THIS yaml overlay only — the Add-data wizard's Snowflake/Databricks panes (and every Keboola/BigQuery connection edit) now write the `source_connections` ROW instead (PUT/POST /api/admin/source-connections*), which every process reads live straight off the DB with no cache to bounce, so those saves carry no restart notice at all. A hand-edited `data_source.snowflake.*`/`data_source.databricks.*` yaml block is IGNORED (not merely stale) once a row of that type exists — connections_seed.py's own deprecation-warning pattern, not this restart flag — but still reachable (and still genuinely restart-classified) on an un-migrated instance with no row yet, or for a source this section still owns end-to-end (keboola's stack_url predates the registry too, though its own CRUD long since moved to source_connections as well).
     "corporate_memory": "restart",  # partial: most keys (distribution_mode/approval_mode/sources.*) are read fresh via get_corporate_memory_config() per page render, but corporate_memory.confidence is applied ONCE at startup via services/corporate_memory/confidence.configure() (app/main.py) — conservative for the whole section, same reasoning as auth
-    "openmetadata": "live",  # src/catalog_export.py reads instance config fresh at each invocation (a standalone job, not a long-lived cached client)
 }
 
 #: Rank used to pick the "strongest" effect among a section's baseline and
@@ -750,6 +749,35 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "a table that already carries one stays protected — and the "
                 "distribution interlock stays enforced — regardless of this "
                 "flag's later state. New feature — off by default."
+            ),
+        },
+    },
+    "facts": {
+        "enabled": {
+            "kind": "bool",
+            "default": _flag_default("facts", "enabled", False),
+            "hint": (
+                "Fact graph over Collections — typed subjects (facts/edges) extracted "
+                "from Collections documents, each claim carrying its evidencing "
+                "document, verbatim quote and date. Gates the whole /api/facts* router "
+                "(404 when off). Postgres-only (A3 ratchet) — a DuckDB-backed instance "
+                "answers a typed 501 regardless of this flag. Covers both the read "
+                "surface (search/neighbors/claims — any authenticated caller, over "
+                "REST, `agnes facts` and the MCP foundation tools) and the write "
+                "surface (ingest + corrections, scheduler-token-or-admin, REST only "
+                "by design). New feature — off by default."
+            ),
+        },
+        "visibility_mode": {
+            "kind": "select",
+            "options": ["any_evidence", "all_evidence"],
+            "default": _switch_default_path(("facts", "visibility_mode"), "any_evidence"),
+            "hint": (
+                "Fact-graph subject existence rule. any_evidence (default): a subject "
+                "is visible if at least one of its claims is in a readable collection. "
+                "all_evidence: visible only if ALL of its claims are readable — hides "
+                "strictly more within one grant snapshot. Facts and edges use the same "
+                "rule."
             ),
         },
     },
@@ -1372,29 +1400,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             ),
         },
     },
-    "openmetadata": {
-        "url": {
-            "kind": "string",
-            "hint": "Base URL of your OpenMetadata server (e.g. https://catalog.example.com).",
-        },
-        "token": {
-            "kind": "secret",
-            "hint": ("JWT bearer token. Use ${OPENMETADATA_TOKEN} env-var reference (don't paste secret directly)."),
-        },
-        "cache_ttl_seconds": {
-            "kind": "int",
-            "default": 3600,
-            "hint": "How long to cache catalog responses in-process. Default 3600s (1h).",
-        },
-        "verify_ssl": {
-            "kind": "bool",
-            "default": True,
-            "hint": (
-                "TLS verification. Default true. Set false ONLY for internal CAs / "
-                "self-signed certs — sends the JWT over an unverified channel."
-            ),
-        },
-    },
     # corporate_memory governance — optional. When the section is missing
     # from instance.yaml the system runs in legacy democratic-wiki mode
     # (no admin review). Schema mirrors config/instance.yaml.example
@@ -1407,7 +1412,11 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "hint": (
                 "How knowledge reaches users. mandatory_only = admin-only; "
                 "admin_curated = admin + user voting as feedback; "
-                "hybrid = default (mandatory from admin + optional from user voting)."
+                "hybrid = default (mandatory from admin + optional from user "
+                "voting). NOT YET ENFORCED (#1573): GET /api/memory/bundle "
+                "currently ships every approved item to every user in all "
+                "three modes — changing this value has no effect on "
+                "distribution yet, only on what this field records."
             ),
         },
         "approval_mode": {
@@ -1418,6 +1427,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "How AI-extracted items enter the system. review_queue = admin "
                 "approval required (default); auto_publish = live immediately; "
                 "threshold = high-confidence auto, low-confidence to queue."
+            ),
+        },
+        "auto_publish_min_confidence": {
+            "kind": "float",
+            "default": 0.80,
+            "hint": (
+                "Only used when approval_mode='threshold'. Items with a "
+                "confidence score >= this auto-publish; below it, they go "
+                "to the review queue. Compare against "
+                "corporate_memory.confidence.base to pick a realistic cutoff "
+                "per source type — the default (0.80) is above every "
+                "un-tuned base score, so threshold behaves like "
+                "review_queue until you tune one or the other."
             ),
         },
         "review_period_months": {
@@ -8634,6 +8656,55 @@ async def run_audit_prune(
         action="run_audit_prune",
         resource="job:audit-prune",
         params={"retention_days": retention_days, **result},
+    )
+    return {"ok": True, "details": result}
+
+
+# ---------------------------------------------------------------------------
+# Track E3 Slice 1: scheduled retention pruning of the other unbounded
+# audit/activity trails (sync_history, llm_usage, agent_scope_snapshots)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run-retention-prune")
+async def run_retention_prune(
+    user: dict = Depends(require_admin),
+):
+    """Trigger the opt-in retention sweep for ``sync_history``,
+    ``llm_usage``, and ``agent_scope_snapshots``.
+
+    Wraps :func:`src.audit_retention.run_retention_sweep`. The scheduler
+    service hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as
+    ``run-audit-prune``); admins can also run it on demand.
+
+    Every trail's window comes from ``retention.<trail>_days`` in
+    ``instance.yaml`` and defaults to 0 (keep forever) — nothing is pruned
+    until an admin explicitly sets a window. ``audit_log`` has its own
+    standalone job (``run-audit-prune`` above, unchanged); ``usage_events``
+    keeps its own standalone job (``POST /api/admin/usage/prune``) — see
+    ``src/audit_retention.py``'s module docstring for why those two aren't
+    folded into this sweep.
+    """
+    from app.instance_config import (
+        get_agent_scope_snapshots_retention_days,
+        get_llm_usage_retention_days,
+        get_sync_history_retention_days,
+    )
+    from src.audit_retention import run_retention_sweep
+
+    windows = {
+        "sync_history": get_sync_history_retention_days(),
+        "llm_usage": get_llm_usage_retention_days(),
+        "agent_scope_snapshots": get_agent_scope_snapshots_retention_days(),
+    }
+    result = run_retention_sweep(windows)
+
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="run_retention_prune",
+        resource="job:retention-prune",
+        params={"windows": windows, **result},
     )
     return {"ok": True, "details": result}
 

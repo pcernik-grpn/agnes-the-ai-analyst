@@ -43,6 +43,7 @@ _AUTH_DETAIL_BY_REASON = {
     "no_token": "Invalid or expired token",
     "agent_pat_wrong_surface": "Agent token not valid on this surface",
     "agent_pat_agent_deleted": "Agent deleted",
+    "pat_parent_revoked": "Token revoked",
 }
 
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
@@ -416,6 +417,93 @@ def get_optional_user(
         return None
 
 
+def non_interactive_credential_kind(request: Request) -> Optional[str]:
+    """Name the non-interactive credential kind on ``request``, or None.
+
+    Returns a short noun phrase — ``"a Storage API token"``, ``"a service
+    token"``, ``"a PAT"`` — naming why this request must not be treated as
+    an interactive session, or ``None`` when it carries one (a browser
+    cookie / session JWT) or no credential at all.
+
+    This is the single definition of the rule ``require_session_token``
+    enforces. It is a plain function, not a dependency, so surfaces that
+    CANNOT take a FastAPI ``Depends(...)`` — the plain-Starlette OAuth
+    consent bridge in ``app.auth.mcp_oauth``, which is deliberately kept off
+    the documented JSON-API surface — apply the identical classification
+    instead of growing a second, silently drifting hand-rolled copy. A
+    hand-rolled copy is exactly how the MCP-OAuth consent route came to
+    accept a plain PAT for minting a 30-day refresh token.
+
+    Note this classifies the CREDENTIAL, not the caller's authority: it says
+    nothing about whether the token is valid, live, or authorized. Callers
+    must still authenticate the request separately.
+    """
+    auth = request.headers.get("authorization", "")
+    token = None
+    if auth.startswith("Bearer "):
+        token = auth.removeprefix("Bearer ")
+    if not token and request:
+        token = request.cookies.get("access_token")
+    if not token and request.headers.get("x-storageapi-token"):
+        # A request authenticated by the X-StorageApi-Token header is a
+        # non-interactive service credential (get_current_user resolved it) —
+        # it must never mint PATs, connect MCP, or manage agents, exactly
+        # like a PAT. Without this check the header path would be classified
+        # as an interactive session because only Authorization/cookie are
+        # inspected here.
+        return "a Storage API token"
+    if token:
+        from app.auth.scheduler_token import is_scheduler_token
+
+        if is_scheduler_token(token):
+            return "a service token"
+        from app.auth.jwt import verify_token
+        from app.auth.pat_resolver import _PAT_LIKE_TYPES
+
+        payload = verify_token(token) or {}
+        if payload.get("typ") in _PAT_LIKE_TYPES:
+            return "a PAT"
+    return None
+
+
+def revocable_credential_id(request: Request) -> Optional[str]:
+    """Id of the revocable credential authenticating ``request``, or None.
+
+    Returns the ``jti`` of a PAT-like token (``typ`` in
+    ``pat_resolver._PAT_LIKE_TYPES``) — the only credential kinds backed by a
+    ``personal_access_tokens`` row that an operator can actually revoke. Every
+    other kind (browser cookie / session JWT, the chat-runner token, the
+    scheduler shared secret, local-dev bypass, no credential at all) returns
+    None: there is no row to bind to, so a token minted from one is
+    unconstrained exactly as it was before.
+
+    Used by ``app.api.data_apps`` to stamp
+    ``pat_resolver.PARENT_TOKEN_ID_CLAIM`` onto a minted ``data-app-git:``
+    credential, so revoking the PAT that asked for it revokes the credential
+    too. Sibling of ``non_interactive_credential_kind`` in shape and for the
+    same reason: a plain function, not a dependency, so a surface that cannot
+    take a FastAPI ``Depends(...)`` reuses it verbatim instead of growing a
+    hand-rolled copy that silently drifts.
+
+    Classifies the CREDENTIAL, not the caller's authority: it says nothing
+    about whether the token is valid, live, or authorized. Callers must still
+    authenticate the request separately — in practice this runs behind
+    ``get_current_user``, which has already done so.
+    """
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else None
+    if not token:
+        token = request.cookies.get("access_token")
+    if not token:
+        return None
+    from app.auth.pat_resolver import _PAT_LIKE_TYPES
+
+    payload = verify_token(token) or {}
+    if payload.get("typ") not in _PAT_LIKE_TYPES:
+        return None
+    return payload.get("jti") or None
+
+
 def require_session_token(request: Request, user: dict = Depends(get_current_user)) -> dict:
     """Like get_current_user but rejects every non-interactive token kind —
     for endpoints that must not be callable via a long-lived service or CI
@@ -437,44 +525,19 @@ def require_session_token(request: Request, user: dict = Depends(get_current_use
        ``POST /auth/tokens`` that survive a secret rotation. Explicit
        check here closes that bypass.
 
+    The classification itself lives in ``non_interactive_credential_kind``
+    so non-FastAPI surfaces can reuse it verbatim.
+
     Plain ``def`` (not ``async def``) so FastAPI offloads it to the anyio
     thread pool — the body is sync token inspection + the sync RBAC read in
     the ``get_current_user`` dependency it depends on (Tier 1, PR #188).
     """
-    auth = request.headers.get("authorization", "")
-    token = None
-    if auth.startswith("Bearer "):
-        token = auth.removeprefix("Bearer ")
-    if not token and request:
-        token = request.cookies.get("access_token")
-    if not token and request.headers.get("x-storageapi-token"):
-        # A request authenticated by the X-StorageApi-Token header is a
-        # non-interactive service credential (get_current_user resolved it) —
-        # it must never mint PATs, connect MCP, or manage agents, exactly
-        # like a PAT. Without this check the header path would be classified
-        # as an interactive session because only Authorization/cookie are
-        # inspected here.
+    kind = non_interactive_credential_kind(request)
+    if kind is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint requires an interactive session, not a Storage API token",
+            detail=f"This endpoint requires an interactive session, not {kind}",
         )
-    if token:
-        from app.auth.scheduler_token import is_scheduler_token
-
-        if is_scheduler_token(token):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="This endpoint requires an interactive session, not a service token",
-            )
-        from app.auth.jwt import verify_token
-        from app.auth.pat_resolver import _PAT_LIKE_TYPES
-
-        payload = verify_token(token) or {}
-        if payload.get("typ") in _PAT_LIKE_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="This endpoint requires an interactive session, not a PAT",
-            )
     return user
 
 

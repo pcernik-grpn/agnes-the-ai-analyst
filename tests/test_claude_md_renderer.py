@@ -191,6 +191,7 @@ def test_context_exposes_all_documented_keys(conn):
         "user",
         "now",
         "today",
+        "facts",
     ):
         assert key in ctx, f"missing context key: {key}"
 
@@ -621,6 +622,40 @@ class TestSemanticLayerSection:
         assert "semantic/<slug>/" in out
         assert "content_hash" in out
         assert "ttl_seconds" in out
+
+
+class TestFactsSection:
+    """`facts.enabled` — CLAUDE.md section steering entity/relationship/
+    aggregation questions to the fact tools BEFORE SQL or document search
+    (Run P ablation finding, docs/superpowers/runs/2026-08-28-run-p-planted.md:
+    facts-on never fabricated but stalled on an aggregation question by
+    reaching for SQL-table tools instead of the readable graph data)."""
+
+    def test_absent_by_default(self, conn, monkeypatch):
+        monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["facts"]["enabled"] is False
+
+    def test_present_when_flag_on(self, conn, monkeypatch):
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        ctx = build_claude_md_context(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert ctx["facts"]["enabled"] is True
+
+    def test_rendered_section_present_when_flag_on(self, conn, monkeypatch):
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "## Facts" in out
+        assert "fact_search" in out
+        assert "fact_neighbors" in out
+        assert "fact_claims" in out
+        assert "agnes facts search" in out
+        assert "agnes collections search" in out
+
+    def test_rendered_section_absent_by_default(self, conn, monkeypatch):
+        monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+        out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
+        assert "## Facts" not in out
+        assert "fact_search" not in out
 
 
 # ---------------------------------------------------------------------------

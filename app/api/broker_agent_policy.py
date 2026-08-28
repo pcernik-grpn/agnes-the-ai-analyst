@@ -70,25 +70,62 @@ DEFAULT_FLUSH_INTERVAL_S = 30.0
 # ---------------------------------------------------------------------------
 
 
-def check_model(
-    body_bytes: bytes,
-    agent_row: Dict[str, Any],
-    utility_models: Optional[List[str]],
-) -> Optional[str]:
-    """``"model_not_allowed"`` if the request body's ``model`` field is
-    outside the agent's allowed set, else ``None``.
+def canonical_model_id(model: str) -> str:
+    """Canonical form for model-id comparison across platform spellings.
+
+    Vertex AI spells dated snapshots with an ``@`` separator
+    (``claude-sonnet-4-5@20250929``) where the first-party API uses a dash
+    (``claude-sonnet-4-5-20250929``). Operators may write either form in
+    ``agents.model`` / ``chat.agent_api_utility_models``; both compare
+    equal here. Undated ids pass through unchanged.
+    """
+    m = (model or "").strip()
+    return m.replace("@", "-") if "@" in m else m
+
+
+def check_model_value(
+    model: str | None,
+    agent_row: dict[str, Any],
+    utility_models: list[str] | None,
+) -> str | None:
+    """``"model_not_allowed"`` if ``model`` is outside the agent's allowed
+    set, else ``None``.
 
     An agent with ``model IS NULL`` has NO model policy — the owner never
-    pinned one, so every model is allowed and the body isn't even
-    inspected. Once a model is pinned, allowed set =
-    ``{agent_row["model"]} ∪ utility_models``.
+    pinned one, so every model is allowed. Once a model is pinned, allowed
+    set = ``{agent_row["model"]} ∪ utility_models``, compared in canonical
+    space (:func:`canonical_model_id`) so first-party and Vertex spellings
+    of the same snapshot interchange freely.
 
-    A non-JSON body, a non-object JSON body, or a body with no ``model``
-    key is NOT a policy failure — it returns ``None`` and lets the
-    upstream Anthropic API reject the malformed request on its own terms.
+    A falsy ``model`` is NOT a policy failure — the upstream API rejects
+    the malformed request on its own terms.
     """
     pinned_model = agent_row.get("model")
     if not pinned_model:
+        return None
+    if not model:
+        return None
+    allowed = {canonical_model_id(pinned_model)}
+    allowed.update(canonical_model_id(u) for u in utility_models or [])
+    if canonical_model_id(model) not in allowed:
+        return "model_not_allowed"
+    return None
+
+
+def check_model(
+    body_bytes: bytes,
+    agent_row: dict[str, Any],
+    utility_models: list[str] | None,
+) -> str | None:
+    """Body-reading wrapper over :func:`check_model_value`.
+
+    A non-JSON body, a non-object JSON body, or a body with no ``model``
+    key is NOT a policy failure — it returns ``None`` and lets the
+    upstream API reject the malformed request on its own terms. (Vertex
+    native paths carry the model in the URL instead; the broker calls
+    :func:`check_model_value` directly there.)
+    """
+    if not agent_row.get("model"):
         return None
     try:
         body = json.loads(body_bytes) if body_bytes else None
@@ -99,11 +136,11 @@ def check_model(
     model = body.get("model")
     if not model:
         return None
-    allowed = {pinned_model}
-    allowed.update(utility_models or [])
-    if model not in allowed:
+    if not isinstance(model, str):
+        # A truthy non-string model was never in the allowed set before the
+        # canonicalization refactor either — keep denying it.
         return "model_not_allowed"
-    return None
+    return check_model_value(model, agent_row, utility_models)
 
 
 # ---------------------------------------------------------------------------

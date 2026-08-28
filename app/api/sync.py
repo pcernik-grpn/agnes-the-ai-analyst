@@ -1445,6 +1445,23 @@ def _run_sync(
             file=_sys.stderr,
             flush=True,
         )
+        # A source directory whose name fails identifier validation is
+        # skipped by the orchestrator's scan (see InvalidSourceNameError's
+        # docstring) — it never appears in `views` above, which otherwise
+        # would look like a clean run. Feed it into the same per-run
+        # operator alert every other per-table/per-pass sync failure uses.
+        # getattr: several tests substitute a minimal orchestrator stub that
+        # only implements rebuild() — treat "no attribute" the same as "no
+        # errors" rather than requiring every stub to grow the field.
+        rejected_sources = getattr(orch, "last_rebuild_errors", None)
+        if rejected_sources:
+            print(
+                f"[SYNC] Orchestrator rebuild rejected {len(rejected_sources)} source(s): {rejected_sources}",
+                file=_sys.stderr,
+                flush=True,
+            )
+            for rejected_source, reason in rejected_sources.items():
+                collected_errors.append({"table": f"(source: {rejected_source})", "error": reason})
 
         # Auto-profile synced tables (best-effort, don't fail sync on profile error).
         #

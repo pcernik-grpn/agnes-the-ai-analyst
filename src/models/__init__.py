@@ -23,11 +23,12 @@ from src.models.agents import (
 from src.models.audit import AuditLog
 from src.models.chat import ChatMessage, ChatSession, UserWorkdir
 from src.models.chat_broker_tickets import ChatBrokerTicket
-from src.models.collections import CorpusChunk, CorpusFile, FileCorpus
+from src.models.collections import CorpusChunk, CorpusFile, CorpusFileSource, FileCorpus
 from src.models.config import GlossaryTerm, InstanceTemplate, MetricDefinition, PersonalAccessToken
 from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
+from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, IngestRun
 from src.models.knowledge import (
     KnowledgeContradiction,
     KnowledgeItem,
@@ -98,6 +99,7 @@ from src.models.rbac import (
     UserGroupMember,
 )
 from src.models.oauth import OAuthAccessToken, OAuthAuthCode, OAuthClient, OAuthRefreshToken
+from src.models.ontology_drafts import OntologyDraft
 from src.models.semantic import DataPackageSemanticModel, SemanticModel, SemanticSource
 from src.models.semantic_coverage import ResourceSourceTag
 from src.models.semantic_feedback import SemanticFeedback
@@ -118,10 +120,13 @@ __all__ = [
     "ChatBrokerTicket",
     "ChatMessage",
     "ChatSession",
+    "Claim",
     "ColumnMetadata",
     "ConnectionSecret",
+    "Correction",
     "CorpusChunk",
     "CorpusFile",
+    "CorpusFileSource",
     "FileCorpus",
     "DataApp",
     "DataPackage",
@@ -129,7 +134,11 @@ __all__ = [
     "DataPackageSemanticModel",
     "DataPackageTable",
     "DataPackageTool",
+    "Edge",
+    "Fact",
+    "FactAlias",
     "IdempotencyKey",
+    "IngestRun",
     "InstanceTemplate",
     "Job",
     "KnowledgeContradiction",
@@ -201,4 +210,5 @@ __all__ = [
     "OAuthAuthCode",
     "OAuthClient",
     "OAuthRefreshToken",
+    "OntologyDraft",
 ]

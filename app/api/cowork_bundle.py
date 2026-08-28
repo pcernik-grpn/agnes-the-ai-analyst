@@ -65,7 +65,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.auth.dependencies import _get_db, get_current_user, reject_keboola_header_credential
+from app.auth.dependencies import _get_db, get_current_user, require_session_token
 from app.auth.jwt import create_access_token
 from src.repositories import (
     access_token_repo,
@@ -1418,11 +1418,10 @@ class SetupTokenItem(BaseModel):
 @user_router.post(
     "/cowork-bundle",
     status_code=200,
-    dependencies=[Depends(reject_keboola_header_credential)],
 )
 def generate_bundle(
     request: Request,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_session_token),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Generate a Cowork Setup Bundle ZIP for the calling user.
@@ -1434,6 +1433,17 @@ def generate_bundle(
     bootstrap their workspace in one step.
 
     Rate-limited: max 5 active (unexpired, unused) setup tokens per user.
+
+    Session-only (``require_session_token``, #1292): this route mints two
+    durable follow-on credentials — a pre-baked PAT inline in the ZIP, and a
+    setup token that ``POST /api/auth/exchange-setup-token`` (unauthenticated
+    by design — the setup token IS the credential) trades for a fresh 90-day
+    PAT. Gating it on ``get_current_user`` alone let a caller holding only a
+    PAT mint a new 90-day one that outlives revoking the original — the same
+    class of hole ``require_session_token`` already closes for ``POST
+    /auth/tokens`` and agent-PAT issuance. ``require_session_token`` also
+    rejects the ``X-StorageApi-Token`` header credential (PR #1288's narrower
+    fix, now subsumed), the scheduler shared secret, and an agent PAT.
     """
     repo = setup_tokens_repo()
 

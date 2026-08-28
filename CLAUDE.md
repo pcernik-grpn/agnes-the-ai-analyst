@@ -26,7 +26,6 @@ Full step-by-step (local dev, Docker, TLS) lives in [`docs/QUICKSTART.md`](docs/
 │   ├── orchestrator.py     # SyncOrchestrator — ATTACHes extract.duckdb files
 │   ├── repositories/       # DuckDB-backed CRUD (sync_state, table_registry, users, etc.)
 │   ├── profiler.py         # Data profiling
-│   ├── catalog_export.py   # OpenMetadata catalog export
 │   └── data_apps/          # Hosted data-apps registry: config.json + container spec builders
 ├── app/                    # FastAPI application
 │   ├── main.py             # App setup, router registration

@@ -188,6 +188,9 @@ Set the env var in `.env`/Terraform, or the YAML path in `instance.yaml`.
 | Data source type (`keboola`/`bigquery`/`local`) — the one knob in this table where the overlay wins over env, not the reverse (D1 residual, 2026-08) | `DATA_SOURCE` (fallback only, consulted when `data_source.type` is unset) | `data_source.type` | `local` | `get_data_source_type()` |
 | Public base URL (used by Slack bot to mint **absolute** `/slack/bind` magic-link + `/chat` deep links — request-less code paths can't synthesize a base URL otherwise) | `PUBLIC_URL` | `server.public_url` | unset (links degrade to root-relative) | `get_public_url()` |
 | Inbound Slack transport (`http`/`socket`) | `SLACK_TRANSPORT` | `chat.slack.transport` | `http` | `get_slack_transport()` |
+| Chat LLM platform (`anthropic`/`vertex`) — vertex runs Claude through Google Vertex AI with Google ADC signing at the broker; see [`cloud-chat.md`](cloud-chat.md#llm-provider-google-vertex-ai) | — | `chat.llm.provider` | `anthropic` | `load_chat_config()` |
+| Vertex GCP project for chat (required when `chat.llm.provider: vertex`; pinned server-side by the broker) | — | `chat.llm.vertex.project_id` | unset | `load_chat_config()` |
+| Vertex region for chat (`global` or a specific region; required when `chat.llm.provider: vertex`) | — | `chat.llm.vertex.region` | unset | `load_chat_config()` |
 | Allowed login email domains | — | `auth.allowed_domain` | `[]` | `get_allowed_domains()` |
 | Full auth block | — | `auth` | `{}` | `get_auth_config()` |
 | SSRF allowlist — hostnames exempt from the private/reserved-network guard on **all** admin URLs routed through the shared validator (marketplace + initial-workspace clone URLs, Keboola `stack_url`, server-config URL fields), not just clone URLs; use for an internal git host on a private network (e.g. on-prem GitHub Enterprise). List or comma-string. Empty = guard fail-closed. | `AGNES_SSRF_ALLOWED_HOSTS` | `security.ssrf_allowed_hosts` | `""` (fail-closed) | `get_ssrf_allowed_hosts()` |
@@ -235,11 +238,23 @@ See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.
 ### Audit trail
 
 See [`observability.md`](observability.md) for the full audit/activity-trail
-inventory and which of the seven trails this retention policy covers.
+inventory and which trails have a retention policy.
+
+`audit_log` keeps its own knob and its own daily job (`audit-prune`). The
+other trails below are pruned by the daily `retention-prune` sweep
+(`POST /api/admin/run-retention-prune`) and all default to `0` — **keep
+forever**, so the sweep deletes nothing until an operator opts a trail in.
+Pruning a trail never touches the live state beside it: `sync_history` is
+pruned while `sync_state` (what the manifest and `agnes pull` read) is not,
+and `agent_scope_snapshots` is pruned while the `agents` rows are not.
 
 | Knob | `instance.yaml` path | Default | Resolver |
 |------|----------------------|---------|----------|
 | `audit_log` retention (days, `0` = keep forever) | `audit.retention_days` | `365` | `get_audit_retention_days()` |
+| `sync_history` retention (days, `0` = keep forever) | `retention.sync_history_days` | `0` | `get_sync_history_retention_days()` |
+| `llm_usage` retention (days, `0` = keep forever) | `retention.llm_usage_days` | `0` | `get_llm_usage_retention_days()` |
+| `agent_scope_snapshots` retention (days, `0` = keep forever) | `retention.agent_scope_snapshots_days` | `0` | `get_agent_scope_snapshots_retention_days()` |
+| `usage_events` retention (days, `0` = keep forever) — `USAGE_EVENTS_RETENTION_DAYS` env var wins when set; pruned by its own `POST /api/admin/usage/prune` job, not the sweep | `retention.usage_events_days` | `0` | `get_usage_events_retention_days()` |
 
 ---
 
@@ -399,8 +414,11 @@ values. Never commit `.env`.
 | `SMTP_PASSWORD` | SMTP password |
 | `SMTP_FROM` | Sender address for outgoing auth mail (default `noreply@example.com`). Legacy `EMAIL_FROM_ADDRESS` is honored as a fallback |
 | `TELEGRAM_BOT_TOKEN` | For Telegram notifications |
-| `ANTHROPIC_API_KEY` | For Corporate Memory AI extraction AND `agnes admin ask` (LLM text-to-SQL on telemetry). Without this, both features show a clear 503 error and skip silently. |
+| `ANTHROPIC_API_KEY` | For Corporate Memory AI extraction AND `agnes admin ask` (LLM text-to-SQL on telemetry). Without this, both features show a clear 503 error and skip silently. Not needed when the instance runs LLM calls through Vertex (`ai.provider: vertex` / `chat.llm.provider: vertex`). |
 | `LLM_API_KEY` | API key for LLM proxy (LiteLLM, OpenRouter, etc.) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a GCP service-account JSON — one way to provide Application Default Credentials for the Vertex LLM provider (the others: gcloud user ADC, or a GCE/GKE attached service account) |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project hosting Claude on Vertex AI — env fallback for `ai.vertex.project_id` (server-side utility calls). Chat uses `chat.llm.vertex.project_id` in `instance.yaml` |
+| `CLOUD_ML_REGION` | Vertex AI region (`global`, `us-east5`, `europe-west1`, …) — env fallback for `ai.vertex.region`; defaults to `global` |
 | `JIRA_DOMAIN` | Jira Cloud site domain (e.g. `acme.atlassian.net`) |
 | `JIRA_EMAIL` | Jira account email paired with `JIRA_API_TOKEN` |
 | `JIRA_WEBHOOK_SECRET` | For Jira webhook integration |

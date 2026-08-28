@@ -18,8 +18,13 @@ Flow summary
 2. MCP client redirects user browser to the SDK's ``authorize`` endpoint.
    The SDK's ``AuthorizationHandler`` calls ``provider.authorize()``,
    which:
-   a. Checks for an active Agnes session (``Authorization`` header or
-      the ``access_token`` cookie set by the browser login flow).
+   a. Checks for an active INTERACTIVE Agnes session (``Authorization``
+      header or the ``access_token`` cookie set by the browser login
+      flow). Non-interactive credentials — a PAT, an agent PAT, the
+      scheduler secret, an ``X-StorageApi-Token``, or any agent-surface
+      session JWT — are refused: the consent POST mints a 30-day refresh
+      token, so accepting one would launder it into a durable successor
+      credential that survives revoking it (see ``_get_session_user``).
    b. If no session: redirects to ``/auth/google/login?next=…`` (or
       the email-magic-link login page) so the user authenticates with
       the identity provider they already use for Agnes.
@@ -595,8 +600,52 @@ def _base_url(*, request: Request | None = None) -> str:
 
 
 def _get_session_user(request: Request) -> dict | None:
-    """Return the logged-in Agnes user from a session JWT / cookie, or None."""
+    """Return the INTERACTIVE Agnes session behind this request, or None.
+
+    "Interactive" is the load-bearing word, and it is enforced, not assumed.
+    Both callers sit on the consent bridge, whose POST mints an OAuth
+    authorization code that the client immediately exchanges for an access
+    token **and a 30-day refresh token**. A credential accepted here is
+    therefore laundered into a durable successor that outlives revoking the
+    original — the same escalation class ``require_session_token`` exists to
+    stop on ``POST /auth/tokens``, ``/api/mcp-connect/token`` and agent-PAT
+    issuance.
+
+    Two independent rejections, both fail-closed:
+
+    1. ``non_interactive_credential_kind`` — the verbatim
+       ``require_session_token`` classification (plain PAT, agent PAT,
+       scheduler shared secret, ``X-StorageApi-Token``). Applied BEFORE
+       resolution, so a PAT never even reaches the consent page. Previously
+       this function handed the ``Authorization: Bearer`` header straight to
+       ``resolve_token_to_user``, which happily accepts a plain PAT and
+       returns a user dict carrying ``"id"`` — so the only filter here (the
+       ``"id" not in user`` co-session exclusion) passed it through, and a
+       stolen PAT could mint a refresh token that survived revoking it.
+    2. ``credential_surface`` — a credential resolved onto a NARROWED
+       data-read surface (``'stack'``) is an AGENT credential, not a person
+       at a browser: the web-chat sandbox JWT (``scope="chat"``), the
+       brokered replay identity, and an MCP-OAuth connector token itself
+       (``scope="mcp-oauth"``) all carry it. Without this an 8-hour
+       connector token could re-consent itself an endless chain of fresh
+       30-day refresh tokens, and a chat sandbox could mint a durable
+       connector credential for its user. A genuine browser session JWT
+       carries no ``scope`` claim, hence no ``credential_surface`` key at
+       all, which reads as ``'all'`` — the same convention as
+       ``src/rbac.py``'s ``_credential_surface`` — so the real login flow is
+       untouched.
+
+    This mirrors ``require_session_token`` rather than depending on it
+    because these are plain Starlette routes (an HTML consent page and a
+    302), deliberately kept off the FastAPI JSON-API surface, and a
+    Starlette handler cannot take a ``Depends(...)``. The classification
+    itself is imported, not re-implemented, so the two cannot drift.
+    """
+    from app.auth.dependencies import non_interactive_credential_kind
     from app.auth.pat_resolver import resolve_token_to_user
+
+    if non_interactive_credential_kind(request) is not None:
+        return None
 
     # Try Authorization header first (API clients).
     auth = request.headers.get("authorization", "")
@@ -617,6 +666,9 @@ def _get_session_user(request: Request) -> dict | None:
         return None
     # SessionPrincipal has no "id" key; exclude co-session tokens.
     if not isinstance(user, dict) or "id" not in user:
+        return None
+    surface = user.get("credential_surface")
+    if surface is not None and surface != "all":
         return None
     return user
 

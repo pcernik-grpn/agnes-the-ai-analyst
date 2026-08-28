@@ -192,7 +192,18 @@ _LOCK_PATH = Path(os.environ.get("DATA_DIR", "/data")) / "state" / "db-migration
 # the process. ``write_backend_state()`` still resets the cache so an
 # in-process write (and every test that writes-then-reads) is observed, and
 # ``reset_backend_state_cache()`` is the explicit invalidation hook.
-_STATE_CACHE: "tuple[BackendState, str | None] | None" = None
+#
+# The cached tuple carries a third element, ``declared`` — whether the
+# overlay's ``database`` key EXPLICITLY set ``backend`` (as opposed to the
+# key being absent and ``backend_str`` defaulting to "duckdb" below). This
+# is what lets :func:`is_backend_explicitly_declared` and
+# ``src.repositories.use_pg`` tell "the operator declared DuckDB" apart from
+# "the overlay exists for an unrelated reason and never mentions the
+# database backend at all" — the PG-backend-revert bug: an
+# ``/admin/server-config`` save that touches only e.g. ``data_source``
+# creates instance.yaml with no ``database`` key, and pre-fix that was
+# indistinguishable from an explicit DuckDB declaration.
+_STATE_CACHE: "tuple[BackendState, str | None, bool] | None" = None
 
 
 def reset_backend_state_cache() -> None:
@@ -209,18 +220,13 @@ def reset_backend_state_cache() -> None:
     _STATE_CACHE = None
 
 
-def read_backend_state() -> tuple[BackendState, str | None]:
-    """Read current backend + url from instance.yaml overlay.
-
-    Memoized for the life of the process; see the module note on
-    ``_STATE_CACHE``. Returns (BackendState.DUCKDB, None) when the overlay
-    is missing or the ``database`` key is absent — a safe zero-config
-    fallback, NOT the fresh-install default (since A1 a VM-provisioned
-    fresh install writes ``backend: side_car`` into the overlay before the
-    app ever starts — see ``infra/modules/customer-instance/startup-script.sh.tpl``).
-    This branch only fires when no state is configured at all (e.g. local
-    dev without ``instance.yaml``); it deliberately does not assume
-    Postgres, since nothing here confirms one is actually reachable.
+def _read_backend_state_full() -> tuple[BackendState, str | None, bool]:
+    """Parse (or return cached) overlay state, including whether
+    ``database.backend`` was EXPLICITLY present — the third element,
+    ``declared``. Shared implementation behind :func:`read_backend_state`
+    and :func:`is_backend_explicitly_declared` so the overlay is parsed
+    (and any malformed-YAML warning logged) at most once per cache
+    lifetime, not once per public accessor.
     """
     global _STATE_CACHE
     cached = _STATE_CACHE
@@ -228,7 +234,7 @@ def read_backend_state() -> tuple[BackendState, str | None]:
         return cached
 
     if not _OVERLAY_PATH.exists():
-        result: "tuple[BackendState, str | None]" = (BackendState.DUCKDB, None)
+        result: "tuple[BackendState, str | None, bool]" = (BackendState.DUCKDB, None, False)
         _STATE_CACHE = result
         return result
     try:
@@ -251,16 +257,62 @@ def read_backend_state() -> tuple[BackendState, str | None]:
             _OVERLAY_PATH,
             e,
         )
-        return BackendState.DUCKDB, None
-    db = data.get("database") or {}
+        return BackendState.DUCKDB, None, False
+    db_raw = data.get("database")
+    # ``declared`` is True only when the overlay's ``database`` key is a
+    # dict that actually sets ``backend`` — NOT merely because the
+    # ``database`` key exists (e.g. `{url: ...}` with no backend) and NOT
+    # merely because the overlay file exists at all (it may exist purely
+    # because an unrelated /admin/server-config save created it — see the
+    # PG-backend-revert fix).
+    declared = isinstance(db_raw, dict) and "backend" in db_raw
+    db = db_raw if isinstance(db_raw, dict) else {}
     backend_str = db.get("backend", "duckdb")
     try:
         state = BackendState(backend_str)
     except ValueError:
         state = BackendState.DUCKDB
-    result = (state, db.get("url"))
+    result = (state, db.get("url"), declared)
     _STATE_CACHE = result
     return result
+
+
+def read_backend_state() -> tuple[BackendState, str | None]:
+    """Read current backend + url from instance.yaml overlay.
+
+    Memoized for the life of the process; see the module note on
+    ``_STATE_CACHE``. Returns (BackendState.DUCKDB, None) when the overlay
+    is missing or the ``database`` key is absent — a safe zero-config
+    fallback, NOT the fresh-install default (since A1 a VM-provisioned
+    fresh install writes ``backend: side_car`` into the overlay before the
+    app ever starts — see ``infra/modules/customer-instance/startup-script.sh.tpl``).
+    This branch only fires when no state is configured at all (e.g. local
+    dev without ``instance.yaml``); it deliberately does not assume
+    Postgres, since nothing here confirms one is actually reachable.
+
+    This DUCKDB fallback value is NOT the same thing as an explicit
+    ``database: {backend: duckdb}`` declaration — callers that need to tell
+    the two apart (i.e. ``src.repositories.use_pg``, so an overlay written
+    for an unrelated reason never overrides the ``DATABASE_URL`` env
+    fallback) must consult :func:`is_backend_explicitly_declared` too.
+    """
+    state, url, _declared = _read_backend_state_full()
+    return state, url
+
+
+def is_backend_explicitly_declared() -> bool:
+    """True iff instance.yaml's overlay EXPLICITLY sets ``database.backend``.
+
+    Distinguishes "an admin/migrator/first-boot-seed declared a backend" from
+    "the overlay merely exists (e.g. because an unrelated
+    ``/admin/server-config`` save created it) without ever touching the
+    ``database`` section" — the two collapse to the same
+    ``read_backend_state() == (BackendState.DUCKDB, None)`` answer, which is
+    exactly the conflation behind the PG-backend-revert bug:
+    ``use_pg()`` must only short-circuit to DuckDB on an EXPLICIT
+    declaration, never merely because the overlay file exists.
+    """
+    return _read_backend_state_full()[2]
 
 
 def write_backend_state(target: BackendState, *, url: "str | None" = ...) -> None:  # type: ignore[assignment]

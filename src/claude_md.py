@@ -14,7 +14,8 @@ semantic model), semantic_layer.models (list of {slug,name,description}
 for every model the user can read — the one-line catalog),
 semantic_layer.cache_ttl_hours (the TTL `agnes pull` stamps into every
 rendered `semantic/<slug>/…` cache file's header,
-src/semantic/cache_render.py), marketplaces (RBAC-filtered list),
+src/semantic/cache_render.py), facts.enabled (True iff the `facts` feature
+switch is on for this instance), marketplaces (RBAC-filtered list),
 user.{id,email,name,is_admin,groups}, now, today, chat_icons (inline icon
 names the chat UI renders — see src/chat_icons.py).
 
@@ -184,6 +185,21 @@ def _semantic_layer_models(conn: duckdb.DuckDBPyConnection | None, *, user: dict
         return []
 
 
+def _facts_enabled() -> bool:
+    """True iff this instance has the `facts` feature switched on.
+
+    Gates the "Facts — entity and relationship questions" CLAUDE.md section:
+    an instance with the feature off must not steer its agent toward tools
+    that would all 404 (``app.auth.access.require_facts_enabled``). No RBAC
+    narrowing here — the section only teaches WHEN to reach for the fact
+    tools; the tools themselves (`facts_repo()`) enforce per-caller
+    visibility on every call regardless of what this file says.
+    """
+    from app.instance_config import feature_enabled
+
+    return feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
+
+
 def _marketplaces_for_user(conn: duckdb.DuckDBPyConnection | None, user: dict[str, Any]) -> list[dict[str, Any]]:
     """Return marketplaces with the plugins the user is allowed to see.
 
@@ -300,6 +316,7 @@ def build_claude_md_context(
             # prose here can never drift from what the CLI actually writes.
             "cache_ttl_hours": DEFAULT_TTL_SECONDS // 3600,
         },
+        "facts": {"enabled": _facts_enabled()},
         "marketplaces": _marketplaces_for_user(conn, user),
         "user": {
             "id": user.get("id", ""),
