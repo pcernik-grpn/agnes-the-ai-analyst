@@ -1027,6 +1027,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+- **`test-pg` splits across 4 jobs instead of 2, roughly halving every CI
+  cycle's critical path.** Measured over four consecutive `integration` runs,
+  the eight main shards finished in 11-17 min while both `test-pg` jobs sat at
+  26-34 min — so every run in the repo waited on `test-pg` no matter how fast
+  the rest was. Widening the split is close to free: a job's step timings show
+  **26.3 of its 27 minutes is the pytest run itself** (checkout, setup-python
+  and uv are cached to ~0.1 min), and the committed `.test_durations` cut four
+  ways balances at 11.2 min per group, predicting ~13 min wall. The published
+  check names change from `test-pg (1..2)` to `test-pg (1..4)`;
+  `CONTRIBUTING.md`'s "confirm the check names are present" note is updated to
+  match, and the `test` aggregator needs no change because it depends on the
+  matrix result, not on individual groups.
 - **Every pull request runs the test suite, whatever branch it targets
   (#1636).** `ci.yml`'s `pull_request` trigger was filtered to `main` and
   `integration`, so a PR into a stack base — `mf/semantic-layer-v0`, a
