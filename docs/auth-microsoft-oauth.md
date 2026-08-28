@@ -59,8 +59,12 @@ auth:
    `MICROSOFT_TENANT_ID` / `MICROSOFT_CLIENT_ID`.
 
 The requested scopes are `openid email profile` — no admin consent needed, no
-Microsoft Graph permissions. Turning on Entra group sync (below) widens this
-to include `GroupMember.Read.All`, which DOES need admin consent — see that
+Microsoft Graph permissions. "No admin consent needed" means the sign-in works
+without one, not that nobody is asked: absent an organization-wide grant, each
+user clicks through a consent prompt on their first sign-in. To skip that, an
+admin grants consent once under Enterprise applications → Permissions → *Grant
+admin consent*. Turning on Entra group sync (below) widens the scopes to
+include `GroupMember.Read.All`, which DOES need admin consent — see that
 section for the extra app-registration step.
 
 ## Entra group sync (off by default)

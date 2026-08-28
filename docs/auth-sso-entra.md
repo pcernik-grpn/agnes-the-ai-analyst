@@ -42,6 +42,13 @@ Assignment:    on the app's Enterprise Application, set Properties →
                unassigned users — any account in the tenant could
                authenticate (Agnes's domain allowlist still applies, but
                the tenant-side gate would be open)
+Consent:       optional but recommended — grant admin consent once for the
+               organization (Enterprise applications → Permissions →
+               "Grant admin consent for <tenant>"). The scopes above need
+               no admin approval to work; without the grant every user
+               simply clicks through a consent prompt on their first
+               sign-in. Requires Privileged Role Administrator or Global
+               Administrator — an Application Developer cannot do it
 ```
 
 **Customer IdP admin → you** (entered into the admin panel or `agnes admin sso set`):
@@ -54,7 +61,13 @@ Assignment:    on the app's Enterprise Application, set Properties →
 - **Client secret value** + its expiry date (calendar the rotation — an
   expired secret surfaces as `/login?error=sso_oauth_failed` only).
 - **The email domain(s) to permit** — the customer's own domains only. See
-  the trust model below; this list is the whole game.
+  the trust model below; this list is the whole game. What matters is the
+  domain the tenant actually puts in the `email` claim, which is not
+  necessarily the organization's public domain — a tenant that has never
+  had its vanity domain verified asserts `<user>@<tenant>.onmicrosoft.com`.
+  Guessing it from the customer's website or from the address you exchange
+  mail with fails closed as `domain_not_allowed`; the test sign-in in step 4
+  below prints the resolved email, so run it before you settle the list.
 
 ## Configure, prove, enable
 
@@ -129,6 +142,15 @@ domain-allowlist refusal.
 every other way in (password, Google, magic link — whatever the instance
 offers). There is no SSO enforcement or lockout; the external IdP's
 MFA/conditional-access posture protects only the SSO door.
+
+That cuts both ways: a JIT-created SSO user holds no password, but nothing
+stops them from *acquiring* one. The password-reset and magic-link doors
+resolve an account by address and check only that it is active — neither asks
+whether the account has a password today, nor whether it carries an external
+identity. A user who sets a password before leaving the customer's tenant
+therefore keeps a way in that survives their offboarding there, and closing it
+is the Agnes operator's move (`users.active`), not the customer admin's.
+Narrow `auth.providers` if that matters more than the convenience.
 
 **Accepted risks (v1), documented rather than mitigated:** first-login email
 attach itself (same semantics as every Agnes provider); no session revocation
