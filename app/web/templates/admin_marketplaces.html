@@ -603,7 +603,9 @@ function renderMarketplaces() {
               : `<button class="icon-btn primary" data-action="sync" data-id="${esc(m.id)}">Sync now</button>`}
           <button class="icon-btn" data-action="details" data-id="${esc(m.id)}" data-name="${esc(m.name || m.id)}">Details</button>
           <button class="icon-btn" data-action="edit" data-id="${esc(m.id)}">Edit</button>
-          <button class="icon-btn danger" data-action="delete" data-id="${esc(m.id)}" data-name="${esc(m.name || m.id)}">Delete</button>
+          ${m.is_builtin
+              ? ``
+              : `<button class="icon-btn danger" data-action="delete" data-id="${esc(m.id)}" data-name="${esc(m.name || m.id)}">Delete</button>`}
         </div>
       </td>`;
     tbody.appendChild(tr);
