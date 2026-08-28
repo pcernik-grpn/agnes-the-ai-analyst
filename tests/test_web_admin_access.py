@@ -27,16 +27,26 @@ def _auth(token: str) -> dict:
 
 
 class TestAccessPage:
-    def test_admin_sees_both_tabs(self, seeded_app):
-        """TWO tabs. There were three while "Groups" was a separate list page
-        over the same rows the workspace's left column carries — a section
-        whose first two tabs were both "here are the groups"."""
+    def test_the_page_has_one_switch_and_no_tab_strip(self, seeded_app):
+        """Replaces `test_admin_sees_both_tabs`.
+
+        Three ways to read one set of grants — by group, by bundle, by
+        person — are three positions in one switch, not two tabs plus a
+        switch. Two navigation models on one page is what made "Groups" read
+        as a destination when it had become a grouping.
+        """
         c = seeded_app["client"]
         resp = c.get("/admin/access", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
-        assert "Groups" in resp.text
-        assert "Simulate a person" in resp.text
-        assert "Who can use what" not in resp.text
+        body = resp.text
+        assert 'data-by="group"' in body
+        assert 'data-by="bundle"' in body
+        assert 'data-by="person"' in body
+        assert 'class="admin-tabs"' not in body
+        # The lens URL still lands on the person view — links into Simulate
+        # outnumber the tab that used to point at it.
+        assert c.get("/admin/access?lens=simulate",
+                     headers=_auth(seeded_app["admin_token"])).status_code == 200
 
     def test_non_admin_is_refused(self, seeded_app):
         c = seeded_app["client"]
@@ -147,13 +157,14 @@ class TestAccessIsInTheNav:
         access = next((s for s in ADMIN_NAV_SECTIONS if s["key"] == "access"), None)
         assert access is not None, "the Access section is missing from the nav inventory"
         assert access["href"] == "/admin/access"
-        assert [t["label"] for t in access["tabs"]] == [
-            "Groups",
-            "Simulate a person",
-        ]
-        # The row lands where its first tab does — see the guard in
-        # test_web_admin_nav.py::test_a_destination_row_lands_on_its_own_first_tab.
-        assert access["tabs"][0]["href"] == access["href"]
+        # No tabs and no items: the section is one page read three ways,
+        # and it owns its own match prefixes because there is no child left
+        # to carry them.
+        assert "tabs" not in access
+        assert "/admin/access" in access["match"]
+        # With no tabs, the row lands on the section's own href — there is no
+        # first tab for it to agree with any more.
+        assert access["href"] == "/admin/access"
 
         # Every path sits in the section, including the two redirects — a 308
         # is followed by the browser, but anything resolving a section from a
@@ -163,12 +174,11 @@ class TestAccessIsInTheNav:
         assert resolve_active_section_key("/admin/grants") == "access"
 
         # The strip lights exactly one tab per page.
-        for path, query, lit in (
-            ("/admin/access", "", "Groups"),
-            ("/admin/access", "lens=simulate", "Simulate a person"),
-        ):
-            active = [t["label"] for t in resolve_section_tabs(path, query) if t["active"]]
-            assert active == [lit], (path, query, active)
+        # The tab strip is gone: `resolve_section_tabs` returns nothing for
+        # this section, and which of the three readings is showing is the
+        # page's own switch (`?by=`), not a nav concern.
+        for path, query in (("/admin/access", ""), ("/admin/access", "lens=simulate")):
+            assert resolve_section_tabs(path, query) == [], (path, query)
 
     def test_the_page_renders_the_nav_row_as_active(self, seeded_app):
         c = seeded_app["client"]
@@ -179,12 +189,14 @@ class TestAccessIsInTheNav:
         assert nav.count("is-active") == 1
         assert 'class="admin-nav__link admin-nav__link--dest is-active"' in nav
         assert 'href="/admin/access"' in nav
-        # The page renders the SECTION's strip — not the local button strip the
-        # two lenses used to be. `data-tab="…"` was that strip's pane-switch
-        # hook, on the buttons AND on the one handler that clicked them; both
-        # are gone, so Simulate is reached by URL and by nothing else.
-        assert 'class="admin-tabs"' in body
-        assert 'href="/admin/access?lens=simulate"' in body
+        # No strip at all now: the page's three readings are one switch on
+        # the list. The sidebar row is still the thing that says where you
+        # are, and it lights off the section key rather than an entry href.
+        assert 'class="admin-tabs"' not in body
+        # Simulate is reached from the switch and from each group's row, not
+        # from a link in the page chrome. `?lens=simulate` still resolves —
+        # covered by test_the_page_has_one_switch_and_no_tab_strip.
+        assert 'data-by="person"' in body
         assert 'data-tab="' not in body
 
     def test_the_simulate_lens_opens_server_side(self, seeded_app):

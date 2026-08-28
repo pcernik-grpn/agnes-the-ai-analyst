@@ -689,6 +689,7 @@
      navigation used for two seconds. Groups are sections of one full-width
      list now; the search does the navigating. */
   .ax-one { display: flex; flex-direction: column; gap: 12px; }
+  .ax-toolbar { margin-bottom: 12px; }
   .ax-onebar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
@@ -721,7 +722,10 @@
   .ax-gs__cnt { font-size: 11px; color: var(--ds-text-muted); white-space: nowrap; }
   .ax-gs__cnt b { font-weight: 600; color: var(--ds-text-muted); }
   .ax-gs__cnt.is-held b { color: var(--ds-text-primary); }
-  .ax-gs__sim { font-size: 12px; color: var(--ds-text-link); white-space: nowrap; text-decoration: none; }
+  .ax-gs__sim {
+    font-size: 12px; color: var(--ds-text-link); white-space: nowrap;
+    text-decoration: none; background: none; border: 0; cursor: pointer; padding: 0;
+  }
   .ax-gs__sim:hover { text-decoration: underline; }
   .ax-gs__body { padding: 0 0 16px; }
   .ax-gs__body .ax-work { border: 0; box-shadow: none; padding-top: 0; }
@@ -1067,20 +1071,16 @@
 
    `_lens` picks the pane the SERVER opens, so a deep link paints the right one
    on first byte instead of flashing the editor on its way to Simulate. #}
-{% include "_admin_tabs.html" %}
+{# No tab strip: the three ways of reading these grants — by group, by
+   bundle, by person — are one switch on the list itself, not two tabs and a
+   switch. `?lens=simulate` still lands on the person view. #}
 {% set _lens = 'sim' if request.query_params.get('lens') == 'simulate' else 'edit' %}
 
-{# ── Editor: groups on the left, what they can use on the right ── #}
-<div class="ax-pane{% if _lens == 'edit' %} is-on{% endif %}" data-axpane="edit">
-  {# "Granting access to <resource> — pick a group." /admin/tables' per-row
-     Manage-access button deep-links here as `?resource=<type>:<id>`. Grants
-     key on the group, so the operator still picks the group first; what
-     changed is that picking one no longer costs a page load, and the
-     resource rides straight into the filter on the right. Filled by JS from
-     the query string; empty (and so `display:none`) otherwise. #}
-  <div class="ax-pin" id="ax-pick" role="status"></div>
-  <div class="ax-one">
-    <div class="ax-onebar">
+{# The toolbar sits ABOVE the panes, not inside the editor: it carries the
+   switch that moves between them, and a control that hides the pane it
+   lives in cannot bring you back. #}
+<div class="ax-toolbar">
+  <div class="ax-onebar">
       {# The shared search input. Present from the start rather than appearing
          past some group count: a control that materializes when a list grows
          is a control nobody knows exists until the day they need it.
@@ -1108,11 +1108,24 @@
       <span class="fbar-seg ax-by" id="ax-by" role="group" aria-label="How to group the list">
         <button type="button" class="fbar-seg__btn is-active" data-by="group">By group</button>
         <button type="button" class="fbar-seg__btn" data-by="bundle">By bundle</button>
+        <button type="button" class="fbar-seg__btn" data-by="person">By person</button>
       </span>
       <button type="button" class="ax-gnew" id="ax-new-group">
         <span class="ax-gnew__plus" aria-hidden="true">+</span> New group
       </button>
     </div>
+</div>
+
+{# ── The list: groups, or bundles ── #}
+<div class="ax-pane{% if _lens == 'edit' %} is-on{% endif %}" data-axpane="edit">
+  {# "Granting access to <resource> — pick a group." /admin/tables' per-row
+     Manage-access button deep-links here as `?resource=<type>:<id>`. Grants
+     key on the group, so the operator still picks the group first; what
+     changed is that picking one no longer costs a page load, and the
+     resource rides straight into the filter on the right. Filled by JS from
+     the query string; empty (and so `display:none`) otherwise. #}
+  <div class="ax-pin" id="ax-pick" role="status"></div>
+  <div class="ax-one">
     <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
 
     {# ONE panel, three regions divided by hairlines. It was a single
@@ -1277,7 +1290,13 @@
   let selectedGroup = null;
   //: "group" | "bundle" — which way the one list is read. Rides the URL so a
   //: link can hand someone the view that answers their question.
-  let viewMode = new URLSearchParams(window.location.search).get("by") === "bundle" ? "bundle" : "group";
+  /* Three ways to read one set of grants. `?lens=simulate` is kept as an
+     alias for `?by=person` so every existing link into Simulate — including
+     each group row's "See it as a person" — still lands where it always
+     did. */
+  const _q0 = new URLSearchParams(window.location.search);
+  let viewMode = _q0.get("lens") === "simulate" ? "person"
+    : (["bundle", "person"].includes(_q0.get("by")) ? _q0.get("by") : "group");
   let users = [];        // Simulate's picker only — never the member search
 
   const el = (id) => document.getElementById(id);
@@ -1340,7 +1359,9 @@
      "where I am in this sitting", and a group remembered from last Tuesday
      would silently decide what an admin edits today. ── */
   const SELECTED_KEY = "agnes.admin.access.group";
-  const LENS = document.querySelector(".ax-pane.is-on[data-axpane='sim']") ? "sim" : "edit";
+  //: Kept as a name because several later branches read it, but it is the
+  //: switch's mode now, not the pane the server happened to open.
+  const LENS = viewMode === "person" ? "sim" : "edit";
   if (LENS === "sim") loadUsers();
 
   function rememberSelection(groupId) {
@@ -1591,7 +1612,7 @@
             <span class="ax-gs__reach">${esc(meta)}</span>
           </span>
           <span class="ax-gs__counts">${familyCounts(g.id)}</span>
-          <a class="ax-gs__sim" href="/admin/access?lens=simulate">See it as a person</a>
+          <button type="button" class="ax-gs__sim" data-by="person">See it as a person</button>
           ${isEditable(g) ? `
           <button type="button" class="ax-gkebab" data-gmenu="${esc(g.id)}"
                   aria-haspopup="true" aria-expanded="false"
@@ -2356,7 +2377,26 @@
   // One repaint for every path that changes the group or the selection, so
   // the four regions (list, identity, audience, grants) can never disagree
   // about which group is open.
+  /* The person view is its own pane (the reason chain and the Library
+     preview); the other two are the list. One function decides which is on
+     so the switch cannot leave both showing. */
+  function showPane(mode) {
+    const person = mode === "person";
+    document.querySelectorAll("[data-axpane]").forEach((p) => {
+      p.classList.toggle("is-on", p.dataset.axpane === (person ? "sim" : "edit"));
+    });
+    /* The search narrows a list of groups and bundles, and + New group makes
+       an audience; neither means anything while you are reading one person's
+       access. A control that is present but inert is worse than an absent
+       one — it invites a click that does nothing. */
+    const find = el("ax-group-find");
+    if (find) find.closest(".fbar__search").hidden = person;
+    const nu = el("ax-new-group");
+    if (nu) nu.hidden = person;
+  }
+
   async function repaint() {
+    if (viewMode === "person") { showPane("person"); return; }
     syncQuery();
     if (viewMode === "bundle") { renderBundles(); bindFind(); return; }
     renderGroups();
@@ -2644,15 +2684,19 @@
 
     const byBtn = e.target.closest("[data-by]");
     if (byBtn) {
-      const next = byBtn.dataset.by === "bundle" ? "bundle" : "group";
+      const next = ["bundle", "person"].includes(byBtn.dataset.by) ? byBtn.dataset.by : "group";
       if (next !== viewMode) {
         viewMode = next;
         // The view rides the URL, so a link can hand someone the direction
         // that answers their question rather than the one that answers mine.
         const u = new URL(window.location.href);
-        if (viewMode === "bundle") u.searchParams.set("by", "bundle");
-        else u.searchParams.delete("by");
+        u.searchParams.delete("lens");
+        if (viewMode === "group") u.searchParams.delete("by");
+        else u.searchParams.set("by", viewMode);
         history.replaceState(null, "", u);
+        showPane(viewMode);
+        // Arriving by URL is no longer the only way into the person view.
+        if (viewMode === "person") loadUsers();
         el("ax-by").querySelectorAll("[data-by]").forEach((b) =>
           b.classList.toggle("is-active", b.dataset.by === viewMode));
         await repaint();
