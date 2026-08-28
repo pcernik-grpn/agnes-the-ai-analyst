@@ -846,10 +846,11 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     """Is the semantic layer trustworthy right now (admin only)?
 
     Sync failures, models whose source was deleted or renamed away from under
-    them, documents that failed validation, three static quality checks (a
-    metric with no description, one name defined twice with a different
-    formula, a cross-dataset metric with no declared relationship), a roll-up
-    of `coverage`'s missing/partial counts, and every active mute.
+    them, metric bindings and profiled columns left pointing at a deleted or
+    renamed table, documents that failed validation, three static quality
+    checks (a metric with no description, one name defined twice with a
+    different formula, a cross-dataset metric with no declared relationship),
+    a roll-up of `coverage`'s missing/partial counts, and every active mute.
 
     Mirrors `GET /api/admin/semantic-layer/health` and the MCP
     `semantic_layer_health` tool.
@@ -877,6 +878,21 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
         typer.echo(f"Models whose source is gone ({len(orphaned)}):")
         for m in orphaned:
             typer.echo(f"  {m.get('slug') or m['model_id']} (source_ref={m.get('source_ref')})")
+        typer.echo("")
+
+    # Block 5 of #1707: a table delete (or a rename that landed under a new
+    # id/name) left a metric binding or a profiled column pointing at
+    # nothing. `binding` names which half of `src/semantic/orphans.py`
+    # produced the finding.
+    table_bindings = body.get("orphaned_table_bindings") or []
+    if table_bindings:
+        typer.echo(f"Semantic objects bound to a deleted/renamed table ({len(table_bindings)}):")
+        for f in table_bindings:
+            if f.get("binding") == "metric":
+                missing = ", ".join(f.get("missing_tables") or [])
+                typer.echo(f"  metric {f.get('name') or f['metric_id']} -> missing table(s): {missing}")
+            else:
+                typer.echo(f"  table {f.get('table_id')}: {f.get('column_count')} profiled column(s) orphaned")
         typer.echo("")
 
     invalid = body.get("invalid_models") or []
@@ -914,5 +930,5 @@ def health(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON")):
     if mutes_list:
         typer.echo(f"Muted ({len(mutes_list)} of the above are silenced — see `agnes semantic-model mutes`)")
 
-    if not (failed or orphaned or invalid or missing_desc or dupes or missing_rel):
+    if not (failed or orphaned or table_bindings or invalid or missing_desc or dupes or missing_rel):
         typer.echo("No sync failures, disconnected models, or invalid documents.")

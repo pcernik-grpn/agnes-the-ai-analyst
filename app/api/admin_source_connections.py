@@ -50,7 +50,9 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        registrations — resend with
                                                        ``?confirm_connection_change=true`` to apply (RBAC
                                                        review second round, 2026-08-26; see
-                                                       ``_guard_default_repoint``).
+                                                       ``_guard_default_repoint``). Success (204) carries an
+                                                       ``X-Semantic-References-Count`` header — informational
+                                                       only, never blocks the delete (Block 5 of #1707).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
@@ -75,7 +77,7 @@ from uuid import uuid4
 
 import httpx
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -1019,9 +1021,40 @@ def _resync_derived_chat_tools(connection_id: str) -> None:
         )
 
 
+def _semantic_reference_count(connection_id: str) -> int:
+    """Semantic sources linked to this connection, plus the models fed by
+    them — informational only (Block 5 of #1707's non-destructive-warning
+    leg for the connection-delete surface; see ``src/semantic/orphans.py``
+    for the analogous, also non-blocking, table-delete check).
+
+    A model is credited to the connection two ways, mirroring
+    ``src/semantic/coverage.py``'s own graph: through a linked
+    ``semantic_sources`` row (``config.connection_id == connection_id``,
+    the path every native adapter — Snowflake, Databricks, uploads/git —
+    takes), or directly (``model.source_ref == connection_id``), which is
+    what the Keboola metastore sync stamps
+    (``source='keboola_metastore'``) since it never creates a
+    ``semantic_sources`` row at all.
+    """
+    from src.repositories import semantic_model_repo, semantic_source_repo
+
+    linked_source_ids = {
+        s["id"]
+        for s in semantic_source_repo().list_all()
+        if (s.get("config") or {}).get("connection_id") == connection_id
+    }
+    model_count = sum(
+        1
+        for m in semantic_model_repo().list_all()
+        if m.get("source_ref") in linked_source_ids or m.get("source_ref") == connection_id
+    )
+    return len(linked_source_ids) + model_count
+
+
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
+    response: Response,
     confirm_connection_change: bool = False,
     _user: dict = Depends(require_admin),
 ):
@@ -1031,6 +1064,12 @@ async def delete_connection(
     (``connection_change_affects_registrations`` — second RBAC review round,
     2026-08-26; ``?confirm_connection_change=true`` to apply). See
     :func:`_guard_default_repoint`.
+
+    Success carries an ``X-Semantic-References-Count`` header — the number
+    of semantic sources/models tied to this connection (Block 5 of #1707).
+    A header, not a body field: the response is ``204 No Content`` (pinned
+    by ``test_delete_returns_204``), and this is informational only — it
+    never blocks the delete, unlike the pinned-tables 409 above.
     """
     repo = source_connections_repo()
     row = repo.get(connection_id)
@@ -1078,6 +1117,15 @@ async def delete_connection(
         connection_secrets_repo().delete(master_secret_key(connection_id))
     except Exception:
         logger.debug("no master vault secret for connection %s (expected)", connection_id)
+    # Informational only (Block 5 of #1707) — a broken read here must not
+    # turn an otherwise-successful delete into a 500; the row is already
+    # gone by this point, and there is nothing left to retry.
+    try:
+        response.headers["X-Semantic-References-Count"] = str(_semantic_reference_count(connection_id))
+    except Exception:
+        logger.warning(
+            "could not compute semantic-reference count for deleted connection %s", connection_id, exc_info=True
+        )
 
 
 async def _store_connection_secret(connection_id: str, row: Dict[str, Any], value: str, kind: str) -> None:

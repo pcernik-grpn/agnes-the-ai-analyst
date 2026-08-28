@@ -519,6 +519,67 @@ class TestSourceConnectionsDelete:
         resp = c.delete(f"{BASE}/nonexistent-id-xyz", headers=_auth(token))
         assert resp.status_code == 404
 
+    def test_delete_reports_no_semantic_references_when_there_are_none(self, seeded_app):
+        """Informational only (Block 5 of #1707) — the header never blocks
+        the delete; ``test_delete_returns_204`` already pins the 204/no-body
+        contract, so the count rides as a header rather than a body."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "test-keboola-no-refs",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=_auth(token),
+        )
+        conn_id = resp.json()["id"]
+
+        resp2 = c.delete(f"{BASE}/{conn_id}", headers=_auth(token))
+        assert resp2.status_code == 204
+        assert resp2.headers.get("X-Semantic-References-Count") == "0"
+
+    def test_delete_reports_a_semantic_source_and_the_model_it_fed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            BASE,
+            json={
+                "name": "test-keboola-with-refs",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=_auth(token),
+        )
+        conn_id = resp.json()["id"]
+
+        from src.repositories import semantic_model_repo, semantic_source_repo
+
+        semantic_source_repo().create(
+            id="src-linked", kind="upload", name="Linked", adapter="native", config={"connection_id": conn_id}
+        )
+        semantic_model_repo().upsert(
+            id="model-1",
+            slug="model-1",
+            name="model-1",
+            description=None,
+            document="{}",
+            document_json=None,
+            spec_version="0.2.0",
+            content_hash="h1",
+            source="upload",
+            source_ref="src-linked",
+            status="valid",
+            validation_errors=None,
+            validated_at=None,
+        )
+
+        resp2 = c.delete(f"{BASE}/{conn_id}", headers=_auth(token))
+        assert resp2.status_code == 204
+        # 1 semantic source + 1 model fed by it.
+        assert resp2.headers.get("X-Semantic-References-Count") == "2"
+
     def test_delete_in_use_returns_409(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
