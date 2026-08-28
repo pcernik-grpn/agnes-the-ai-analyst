@@ -134,6 +134,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rebuilds every other valid source, but now attributes the skip
   (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
   operator alert now surfaces too.
+- **A full chat host no longer locks every other user out for a week.** Paused
+  sandboxes count against `chat.docker_max_total_sandboxes` (a paused container
+  still holds its memory) but survive until `chat.paused_ttl_seconds` — 7 days
+  by default — so on an instance with a small cap a handful of parked
+  conversations filled the host and every subsequent attach failed with
+  `docker_max_total_sandboxes reached`, with no path back short of an operator
+  deleting containers by hand. The docker provider now raises a typed
+  `SandboxCapacityError`, and ChatManager answers it by destroying the
+  least-recently-paused sandbox (the paused-TTL sweep's own teardown, triggered
+  by pressure instead of by the clock — the evicted transcript is untouched and
+  respawns on its owner's next message) and retrying, up to three reclaims per
+  spawn. A session this process is actively serving is never evicted — and
+  neither is one being brought back: `_resume_live` holds a per-session lock
+  across `provider.resume()` + runner install while the session is still
+  PAUSED with a stale `sandbox_paused_at`, so both the reclaim and the
+  long-standing paused-TTL sweep now take that same lock, which closes a
+  window where either could have destroyed the sandbox of a conversation a
+  user was actively resuming. Any other spawn failure still propagates
+  untouched.
 
 ### Removed
 
