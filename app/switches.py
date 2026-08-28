@@ -265,6 +265,25 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
+        name="chat_broker_admin_reads",
+        config_keys=("chat", "broker_admin_reads"),
+        env_var="AGNES_CHAT_BROKER_ADMIN_READS",
+        kind="bool",
+        default=True,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Replay read-only (GET/HEAD) admin API routes through the chat secret broker "
+            "(`agnes admin list-users`/`list-tables`/… inside a chat sandbox). The replay "
+            "runs under the session user's own identity and the route's live `require_admin` "
+            "still decides — non-admin users and agent principals get 403 regardless. Admin "
+            "MUTATIONS are always refused from sandboxes, independent of this switch. Read "
+            "live per request by `app/api/broker.py` (no restart needed), unlike the other "
+            "chat.* switches that resolve through `load_chat_config` at boot."
+        ),
+    ),
+    Switch(
         name="data_apps",
         config_keys=("data_apps", "enabled"),
         env_var="AGNES_DATA_APPS_ENABLED",
@@ -635,6 +654,30 @@ SWITCHES: tuple[Switch, ...] = (
             "collection (default). `all_evidence` — visible only if ALL of its claims "
             "are readable; hides strictly more within one grant snapshot. Facts and "
             "edges use the same rule."
+        ),
+    ),
+    Switch(
+        name="extraction",
+        config_keys=("extraction", "enabled"),
+        env_var="AGNES_EXTRACTION_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=False,
+        lock_reason=(
+            "The flag itself is read per request, but the `corpus-extraction` job kind "
+            "it gates needs a configured `extraction.producer` command AND a worker "
+            "process actually polling the `extraction` lane (AGNES_WORKER_LANES, e.g. "
+            "the `extraction-worker` Compose profile) — enabling this alone surfaces a "
+            "feature whose backend is absent. Enable the profile/producer and this flag "
+            "together."
+        ),
+        description=(
+            "Document extraction (spec §7.5 'Extraction inside Agnes (later)') as its "
+            "own worker lane — gates the `corpus-extraction` job kind's handler, which "
+            "shells out to the operator-configured `extraction.producer` command/module. "
+            "New feature — off by default."
         ),
     ),
 )

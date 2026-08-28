@@ -198,7 +198,7 @@ def test_admin_tail_rejects_anonymous_ws(api_client: TestClient, logged_in_admin
 def test_admin_tail_accepts_valid_ticket(api_client: TestClient, logged_in_admin):
     """A freshly-issued admin ticket opens the WS; we receive a sentinel frame."""
     c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
-    tk = api_client.get(f"/admin/chat/{c['id']}/tail-ticket")
+    tk = api_client.post(f"/admin/chat/{c['id']}/tail-ticket")
     assert tk.status_code == 200
     ticket = tk.json()["ticket"]
     with api_client.websocket_connect(f"/admin/chat/{c['id']}/tail?ticket={ticket}") as ws:
@@ -212,7 +212,7 @@ def test_admin_tail_rejects_non_admin_ticket_request(api_client_non_admin: TestC
     """Non-admin cannot mint a tail-ticket."""
     # Non-admin can still POST a session for themselves
     c = api_client_non_admin.post("/api/chat/sessions", json={"surface": "web"}).json()
-    r = api_client_non_admin.get(f"/admin/chat/{c['id']}/tail-ticket")
+    r = api_client_non_admin.post(f"/admin/chat/{c['id']}/tail-ticket")
     assert r.status_code == 403
 
 
@@ -251,7 +251,7 @@ def test_admin_tail_closes_4503_on_coordination_unavailable(api_client: TestClie
     from app.coordination.base import CoordinationUnavailable
 
     c = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()
-    tk = api_client.get(f"/admin/chat/{c['id']}/tail-ticket")
+    tk = api_client.post(f"/admin/chat/{c['id']}/tail-ticket")
     ticket = tk.json()["ticket"]
 
     def _raise(_ticket: str):

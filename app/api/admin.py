@@ -741,6 +741,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Resolved from the same overlay-only source as chat.enabled."
             ),
         },
+        "broker_admin_reads": {
+            "kind": "bool",
+            "default": _flag_default("chat", "broker_admin_reads", True),
+            "hint": (
+                "ON by default: read-only (GET/HEAD) admin API routes are replayed "
+                "through the chat secret broker under the session user's own "
+                "identity, so `agnes admin list-users`/`list-tables` work for an "
+                "actual admin inside a chat sandbox — the route's live "
+                "require_admin still refuses everyone else, and admin MUTATIONS "
+                "are always refused from sandboxes regardless of this switch. "
+                "Read live per request by the broker; no restart needed."
+            ),
+        },
     },
     "studio": {
         "enabled": {

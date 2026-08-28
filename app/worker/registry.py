@@ -20,8 +20,17 @@ from typing import Callable, Optional
 #: source of truth for it.
 HEAVY_LANE = "heavy"
 LIGHT_LANE = "light"
+#: A third lane (spec §7.5 / §16 step 7, docs/superpowers/specs/
+#: 2026-08-27-fact-graph-over-collections-design.md) for document
+#: extraction (the ``corpus-extraction`` kind, ``app/worker/kinds.py``) —
+#: kept off the HEAVY lane deliberately: a corpus re-extraction sharing
+#: HEAVY's concurrency-1 slot with ``data-refresh``/``jira-refresh`` would
+#: block every table sync for its whole duration. Concurrency for this lane
+#: (``_EXTRACTION_CONCURRENCY``) lives in ``app/worker/runtime.py`` next to
+#: the other two lane-concurrency constants.
+EXTRACTION_LANE = "extraction"
 
-_VALID_LANES = (HEAVY_LANE, LIGHT_LANE)
+_VALID_LANES = (HEAVY_LANE, LIGHT_LANE, EXTRACTION_LANE)
 
 
 @dataclass

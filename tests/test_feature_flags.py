@@ -94,6 +94,7 @@ class TestFeatureFlagsRegistry:
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -112,6 +113,7 @@ class TestFeatureFlagsRegistry:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -299,6 +301,7 @@ class TestServerConfigFeatureFlagsInventory:
             "chat_provider",
             "chat_approvals",
             "chat_bootstrap_marketplace",
+            "chat_broker_admin_reads",
             "data_apps",
             "data_apps_allow_same_origin",
             "library_show_unverified_trust",
@@ -316,6 +319,7 @@ class TestServerConfigFeatureFlagsInventory:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
+            "extraction",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

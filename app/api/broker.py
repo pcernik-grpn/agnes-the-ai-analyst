@@ -16,10 +16,21 @@ opaque, short-lived ticket (``src/repositories/ticket.py``). These routes:
   live as a direct call — the broker adds no privilege of its own.
 
 Ticket scope ("main" vs "mcp") must match the route: a ticket minted for one
-CLI cannot be replayed against the other's route. Admin-mutation paths
-(``/api/admin/*``) are hard-rejected — the broker only ever re-authenticates
-the interactive-parity flows (catalog reads, queries, MCP tool calls), never
-privileged admin writes, regardless of the resolved identity's own grants.
+CLI cannot be replayed against the other's route. Admin-*mutation* paths
+(``/api/admin/*`` and any route gated by ``require_admin``) are hard-rejected —
+the broker only ever re-authenticates the interactive-parity flows (catalog
+reads, queries, MCP tool calls), never privileged admin writes, regardless of
+the resolved identity's own grants. Read-only (``GET``/``HEAD``) admin routes
+ARE replayed for ``main``-scoped tickets only (the CLI's leg — the MCP
+subprocess's narrower ticket keeps the full refusal), switchable via
+``chat.broker_admin_reads`` (default on): the
+replay runs under the ticket's resolved identity and the route's own
+``require_admin`` still decides live — a non-admin caller (or an
+``AgentPrincipal``, which ``require_admin`` hard-denies) gets the route's own
+403, and the broker never adds privilege. Every secret-shaped value on those
+GET surfaces is masked server-side (``GET /api/admin/server-config`` redacts
+via ``_public_view``), and the repo-wide "never mutate on GET" invariant is
+what makes the method the correct read/write boundary here.
 """
 
 from __future__ import annotations
@@ -83,6 +94,27 @@ router = APIRouter(prefix="/api/broker", tags=["broker"])
 # (e.g. `/api/users/*`, `/auth/admin/tokens/*`) — a bare path-prefix check
 # missed those (Devin/agnes-review on #846, §11).
 _ADMIN_PATH_PREFIX = "/api/admin/"
+
+#: Read-only methods a brokered admin route may be replayed with. Safe as the
+#: read/write boundary because "never mutate on GET" is a repo-wide security
+#: invariant (see .claude/skills/agnes-conventions/references/security.md) —
+#: state-changing web/API handlers are POST/PUT/PATCH/DELETE by contract.
+_ADMIN_READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _broker_admin_reads_enabled() -> bool:
+    """Operator switch for replaying read-only admin routes (`chat_broker_admin_reads`).
+
+    Read live per request (`effect="live"` in the switch registry) so an
+    operator can turn the surface off without a restart. Default on: the
+    replay still runs under the ticket's resolved identity and the route's
+    own ``require_admin`` decides — non-admin users and restricted principals
+    (AgentPrincipal/SessionPrincipal) get the route's own 403, so the switch
+    only widens what an *actual admin's* interactive session may read.
+    """
+    from app.instance_config import feature_enabled
+
+    return feature_enabled("chat", "broker_admin_reads", env_var="AGNES_CHAT_BROKER_ADMIN_READS", default=True)
 
 
 def _dependant_calls(dependant: Any) -> set:
@@ -381,8 +413,19 @@ async def _replay(request: Request, row: Dict[str, Any], body: Dict[str, Any]) -
     # Admin mutations are never brokered — refuse before touching identity,
     # regardless of whether the resolved identity is itself an admin. The
     # `/api/admin/` prefix is a fast-path; route introspection is the real
-    # gate and catches admin routes at any path (§11).
-    if match_path.startswith(_ADMIN_PATH_PREFIX) or _route_requires_admin(request.app, method, match_path):
+    # gate and catches admin routes at any path (§11). Read-only (GET/HEAD)
+    # admin routes are the deliberate exception (switchable): they replay
+    # under the resolved identity and the route's own `require_admin` decides
+    # live — so `agnes admin list-users`/`list-tables` work for an actual
+    # admin in chat, while a non-admin or an AgentPrincipal still gets 403
+    # from the route itself, and mutations stay interactive-only. The
+    # allowance is scoped to the MAIN ticket (the CLI's leg): the MCP
+    # subprocess has no admin commands, so its narrower ticket keeps the
+    # pre-existing full refusal — least privilege over symmetry (Devin
+    # review on this PR).
+    is_admin_route = match_path.startswith(_ADMIN_PATH_PREFIX) or _route_requires_admin(request.app, method, match_path)
+    admin_read_allowed = method in _ADMIN_READ_METHODS and row.get("scope") == "main" and _broker_admin_reads_enabled()
+    if is_admin_route and not admin_read_allowed:
         try:
             audit_repo().log(
                 action="broker_admin_route_rejected",
@@ -393,6 +436,18 @@ async def _replay(request: Request, row: Dict[str, Any], body: Dict[str, Any]) -
         except Exception:
             pass
         raise HTTPException(status_code=403, detail="admin_mutations_require_interactive_auth")
+    if is_admin_route:
+        # Allowed read — keep the same audit trail the deny path has, so an
+        # operator can see exactly which admin surfaces a sandbox session read.
+        try:
+            audit_repo().log(
+                action="broker_admin_read_replayed",
+                params={"path": match_path, "method": method, "session_id": row.get("session_id")},
+                result="success",
+                client_kind="broker",
+            )
+        except Exception:
+            pass
 
     jwt_token = _mint_identity_jwt(row["session_id"])
     transport = httpx.ASGITransport(app=request.app)
