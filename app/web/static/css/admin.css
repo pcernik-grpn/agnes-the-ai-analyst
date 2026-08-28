@@ -1,13 +1,16 @@
 /* Minimal admin dashboard styling — topbar + tables + buttons.
- * Loaded by app/web/templates/admin_chat.html (and chat.html via the
- * shared `.admin-body` class on the dashboard page).
+ * Historically loaded by app/web/templates/admin_chat.html and chat.html;
+ * both have since migrated onto the design-system base (base_admin_page.html
+ * / base_ds.html) and no longer reference `.admin-body`. Kept on disk
+ * (test_web_static_assets.py pins its presence) and tokenized in step with
+ * the rest of the app in case it is re-wired.
  */
 
 .admin-body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   margin: 0;
-  background: #fff;
-  color: #111;
+  background: var(--ds-surface);
+  color: var(--ds-text-primary);
 }
 
 .admin-body h1 {
@@ -26,27 +29,27 @@
 .admin-body th,
 .admin-body td {
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--ds-border-light);
   text-align: left;
   vertical-align: top;
 }
 
 .admin-body th {
-  background: #fafafa;
+  background: var(--ds-surface-dim);
   font-weight: 600;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid var(--ds-border);
 }
 
 .admin-body button {
   padding: 0.25rem 0.75rem;
   margin-right: 0.25rem;
   cursor: pointer;
-  border: 1px solid #ccc;
-  background: #f5f5f5;
+  border: 1px solid var(--ds-border);
+  background: var(--ds-surface-dim);
   border-radius: 3px;
   font: inherit;
 }
 
 .admin-body button:hover {
-  background: #ebebeb;
+  background: var(--ds-surface-sunken);
 }

@@ -12,8 +12,17 @@ def _auth(token: str) -> dict:
 
 @pytest.mark.journey
 class TestMemoryJourney:
-    def test_create_list_vote_approve(self, seeded_app):
-        """Full corporate memory lifecycle from creation to approval."""
+    def test_create_list_vote_approve(self, seeded_app, monkeypatch):
+        """Full corporate memory lifecycle from creation to approval.
+
+        Exercises the review-queue path specifically, so the instance is
+        explicitly configured for it (#1573: with no corporate_memory
+        config at all, items auto-approve in the documented legacy mode —
+        see TestMemoryCreateRespectsApprovalMode in test_memory_api.py)."""
+        import app.instance_config as ic
+
+        monkeypatch.setattr(ic, "get_corporate_memory_config", lambda: {"approval_mode": "review_queue"})
+
         c = seeded_app["client"]
         admin_h = _auth(seeded_app["admin_token"])
         analyst_h = _auth(seeded_app["analyst_token"])
@@ -57,7 +66,7 @@ class TestMemoryJourney:
         assert resp.json()["status"] == "approved"
 
         # Step 5: Verify status in listing
-        resp = c.get(f"/api/memory?status_filter=approved", headers=analyst_h)
+        resp = c.get("/api/memory?status_filter=approved", headers=analyst_h)
         assert resp.status_code == 200
         approved_ids = [i["id"] for i in resp.json()["items"]]
         assert item_id in approved_ids
@@ -118,8 +127,16 @@ class TestMemoryJourney:
         )
         assert resp.status_code == 400
 
-    def test_memory_stats_endpoint(self, seeded_app):
-        """Memory stats reflect created items."""
+    def test_memory_stats_endpoint(self, seeded_app, monkeypatch):
+        """Memory stats reflect created items.
+
+        Configures review_queue explicitly (#1573) so the created item
+        lands in the "pending" bucket this test asserts on, rather than
+        relying on the no-config legacy default (auto-approve)."""
+        import app.instance_config as ic
+
+        monkeypatch.setattr(ic, "get_corporate_memory_config", lambda: {"approval_mode": "review_queue"})
+
         c = seeded_app["client"]
         admin_h = _auth(seeded_app["admin_token"])
 

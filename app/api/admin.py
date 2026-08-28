@@ -1410,7 +1410,11 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "hint": (
                 "How knowledge reaches users. mandatory_only = admin-only; "
                 "admin_curated = admin + user voting as feedback; "
-                "hybrid = default (mandatory from admin + optional from user voting)."
+                "hybrid = default (mandatory from admin + optional from user "
+                "voting). NOT YET ENFORCED (#1573): GET /api/memory/bundle "
+                "currently ships every approved item to every user in all "
+                "three modes — changing this value has no effect on "
+                "distribution yet, only on what this field records."
             ),
         },
         "approval_mode": {
@@ -1421,6 +1425,19 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "How AI-extracted items enter the system. review_queue = admin "
                 "approval required (default); auto_publish = live immediately; "
                 "threshold = high-confidence auto, low-confidence to queue."
+            ),
+        },
+        "auto_publish_min_confidence": {
+            "kind": "float",
+            "default": 0.80,
+            "hint": (
+                "Only used when approval_mode='threshold'. Items with a "
+                "confidence score >= this auto-publish; below it, they go "
+                "to the review queue. Compare against "
+                "corporate_memory.confidence.base to pick a realistic cutoff "
+                "per source type — the default (0.80) is above every "
+                "un-tuned base score, so threshold behaves like "
+                "review_queue until you tune one or the other."
             ),
         },
         "review_period_months": {

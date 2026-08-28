@@ -13,7 +13,8 @@ This folder contains documentation for **developers and server administrators** 
 
 ### Application Development
 - `telegram_bot.md` — Telegram notification bot technical docs
-- `design-system.md` — UI/UX design system for web applications
+- `design-system.md` — **superseded** pre-`paper` capture, kept for history. The binding
+  visual standard is `.claude/skills/agnes-conventions/references/design-system.md`.
 - `insights.md` — Activity Center dashboard feature documentation
 - `session_explore.md` — session exploration tooling
 

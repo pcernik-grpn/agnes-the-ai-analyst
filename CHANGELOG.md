@@ -62,6 +62,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **Admin and workspace pages now use the plain page header.** 25 templates that
+  are lists, tables or editors switch from the bordered gradient hero panel to the
+  plain title + lede that `/library`, `/agents` and `/chats` already render, via the
+  existing `page_hero_plain` opt-in in `_page_hero.html` — no new CSS or components.
+  This closes the most visible reason admin read as an older product than the rest of
+  the app. The hero is kept on `mcp_connect` and `admin_session_detail`, which
+  introduce themselves rather than being workspace pages, and eyebrows are retained
+  everywhere: they carry the admin grouping (Agent Experience, Users & Access).
 - **BREAKING: Databricks Unity Catalog metric views now flow through the
   semantic-source adapter contract, like Snowflake — no more direct
   `metric_definitions` writer.** A new `databricks_semantic` adapter
@@ -94,16 +102,56 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   alongside the existing `paths` field. A match is tried on
   `(collection_id, source_stable_id)` first, then on `(collection_id, path)`
   as before; either way, the existing `corpus_files` row is now updated IN
-  PLACE — a content-unchanged match (a rename/move) only refreshes
-  filename/path and skips re-chunking entirely, while a changed-content
-  match purges chunks/derived tables and resets `processing_status` on the
-  SAME row. A manual `paths`-only re-upload of a file previously anchored by
-  a stable id now also preserves that row's id, so a hand upload can no
-  longer orphan anything referencing it. The stable-id mapping table is
-  Postgres-only: supplying `source_stable_ids` on a DuckDB-backed instance
-  returns `501`; omitting the field keeps today's flow unchanged.
+  PLACE — a content-unchanged match against an already-`indexed` row (a
+  rename/move) only refreshes filename/path and skips re-chunking entirely,
+  while a changed-content match purges chunks/derived tables and resets
+  `processing_status` on the SAME row. Content-unchanged against a row whose
+  ingest never completed (`rejected`, `needs_review`, or a parked `pending`)
+  counts as a **retry** instead: the row resets to `pending` and ingestion is
+  re-scheduled, so re-uploading the same bytes after fixing the cause works
+  without a separate `…/reingest` call — a row mid-ingest is left alone. A
+  manual `paths`-only re-upload of a file previously anchored by a stable id
+  now also preserves that row's id, so a hand upload can no longer orphan
+  anything referencing it. Two files sharing a non-blank `source_stable_id`
+  in one batch are rejected up front (`400
+  duplicate_source_stable_id_in_batch`), matching the existing
+  `duplicate_path_in_batch` guard — the second would otherwise overwrite the
+  first's row in place and silently drop its bytes. The stable-id mapping
+  table is Postgres-only: supplying `source_stable_ids` on a DuckDB-backed
+  instance returns `501`; omitting the field keeps today's flow unchanged.
+
+- **Session files are a side drawer that opens itself when a deliverable
+  lands.** The Files panel was a modal, which covered the very sentence
+  ("I saved it as …") the reader was checking the list against. It now docks
+  to the trailing edge with no backdrop, the conversation stays readable and
+  scrollable beside it, and where there is room (≥1100px) the composer makes
+  way instead of sitting underneath. The header button carries a count, and a
+  turn that writes a new file under `outputs/` opens the drawer on its own —
+  `outputs/` only, so the scratch files an agent touches mid-task do not
+  interrupt the read. The drawer learns which conversation it is looking at
+  when that conversation **opens**, so the first turn of a fresh chat is the
+  one that opens it (deriving the baseline from the first completed turn put
+  that turn's own deliverable into the baseline, and the commonest case —
+  ask, receive a document — never opened anything), and switching
+  conversations resets the count and reloads an open drawer instead of
+  leaving the previous chat's rows on screen with their old download links.
 
 ### Fixed
+- **Dark theme: several light-hex backgrounds that never flipped now use
+  `--ds-*` tokens.** `style-custom.css` (news-post callouts and the whole
+  `.news-content` renderer, `.btn-danger`, several `.group-chip` variants),
+  `home.css` (the "setup script copied" confirmation modal), `admin.css`,
+  and `stack_card.css` (`.stack-card__btn--remove/--required`,
+  `.admin-only-hint`) previously pinned a light background under theme-aware
+  ink — the same invisible-text shape as #656 and #1193, now widened into a
+  guard (`tests/test_design_system_contract.py::test_no_raw_hex_light_background_outside_theme_scope`)
+  that scans every shipped stylesheet, not just the templates a past sweep
+  happened to touch. The guard's documented exemption for rules that already
+  declare a per-theme value now actually covers the media-query half of it:
+  the CSS walker used to discard at-rule preludes, so a fill inside
+  `@media (prefers-color-scheme: dark)` reached the check as a bare selector
+  and was reported as an offender, while a plain `@media (max-width: …)`
+  still is. Part of #1625.
 - **A PAT could mint itself a fresh, longer-lived PAT through the Cowork setup
   bundle.** `POST /api/user/cowork-bundle` mints two durable follow-on
   credentials — a pre-baked PAT inline in the ZIP, and a setup token that
@@ -159,6 +207,71 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **Jira connector: an unrecognized dtype in a schema dict now fails loudly instead of silently producing a string column.** `get_pyarrow_schema` and `apply_schema` (`connectors/jira/transform.py`) both raise `ValueError` — naming the column, the offending dtype, and the accepted set — before any row data is touched, so a typo'd dtype fails the one schema dict that carries it rather than shipping a wrong-typed parquet column to analysts.
 
+- **The session-files list no longer presents the workspace template as
+  session output.** `WorkdirManager.prepare_session_dir` symlinks `.claude`,
+  `scaffolds`, `snapshots`, `scripts` and `CLAUDE.md` into every session dir
+  for every provider, and the listing walked them: on a real conversation the
+  document the user asked for sat below dozens of
+  `scaffolds/nodejs-dashboard/...` rows, and on some turns never made the
+  page at all. Those trees are now excluded at the top level, and `outputs/`
+  sorts ahead of everything else. This also aligns the two sources: the
+  engine's own sandbox browser filters dot-directories for the same reason.
+- **The chat sandbox prompt now says where deliverables go.** It didn't — the
+  `outputs/` convention was real in the harvest code and in the Files panel
+  above, but no prompt ever named it, so the exclusion above could drop the
+  one location skills actually used (`.claude/skills/<name>/`) with nothing
+  pointing anywhere else, and the auto-open had no trigger to fire on. A
+  "Files you produce" section (sandbox render only — a laptop workspace *is*
+  the user's computer) names `outputs/` and says plainly that `.claude/`,
+  `/tmp` and a bare filename are invisible to the reader. The Charts section
+  no longer claims the sandbox has "no way to hand the user a file", which
+  stopped being true when the panel shipped and contradicted the new
+  section; the rule it still needs — a chart belongs inline in the reply, not
+  handed over as a file — is stated in its own right.
+- **The chat header's action buttons no longer drift apart.** `margin-left:
+  auto` was written when Copy transcript was the header's only action; with
+  Files beside it, each button claimed the slack and the free space was split
+  between them, stranding Files mid-header. Only the first action claims it
+  now, so the pair reads as one group at the trailing edge.
+- **Three Corporate Memory governance knobs are wired up; the fourth is
+  clearly marked as not yet enforced (#1573).** `corporate_memory.approval_mode:
+  "threshold"` used to silently behave exactly like `"review_queue"` — there
+  was no confidence cutoff to compare against. It now compares each item's
+  confidence score against the new `corporate_memory.auto_publish_min_confidence`
+  knob (default `0.80`); an unrecognized `approval_mode` value is logged as a
+  warning instead of silently degrading. `corporate_memory.notify_on_new_items`
+  (default on) now actually notifies — every Admin-group member with a live
+  desktop session gets a notification when a collection run queues new items
+  for review. The count is what *that run* added, never the standing backlog:
+  the catalog is rebuilt by full refresh and preserved items keep their old
+  `pending` status, so counting the whole queue would re-announce it (as
+  "new") on every run where any watched file changed. It is also what
+  actually reached the review queue: the queue admins open is the
+  `knowledge_items` table, not `knowledge.json`, so the count comes from the
+  rows this run inserted. Counting the rebuilt catalog instead announced
+  items whose DB write had failed — sending admins to a queue that did not
+  contain them — and then went silent on the retry run that finally landed
+  the row, because by then the item was a *preserved* catalog entry rather
+  than a new one. The run stats now carry all three numbers —
+  `items_pending` (queue size), `items_pending_new` (this run's catalog
+  additions) and `items_pending_queued` (rows actually inserted as pending,
+  the one that is notified). `POST /api/memory` (the "add what you know" button)
+  used to hardcode `status="pending"` regardless of configuration; it now
+  respects `approval_mode` the same way the CLAUDE.local.md collector does —
+  **on an instance with no `corporate_memory:` block at all** (the documented
+  legacy "no admin review" default, and the common case today) items now
+  auto-approve immediately instead of sitting in the pending queue forever
+  with no notification. `distribution_mode` remains inert — `GET
+  /api/memory/bundle` still ships every approved item to every user
+  regardless of the configured mode — and is now labeled "NOT YET ENFORCED"
+  in its `/admin/server-config` hint and in `config/instance.yaml.example`
+  rather than silently doing nothing; wiring it up touches the JSON bundle
+  route, the per-domain markdown route `agnes pull` writes, and the
+  sync-manifest md5 those two must agree with, and is left as open work.
+  Also removed a dead `GOVERNANCE_MODE` JS constant on the admin Corporate
+  Memory page that always evaluated to `null` (the template read
+  `governance_mode`, the route passed `governance`) and had no other
+  reference in the page.
 - The "Add data source" wizard's Snowflake table picker no longer renders a
   raw, three-layer-wrapped driver exception when the connection itself can't
   authenticate (e.g. an expired temporary password) — a routine first-connect

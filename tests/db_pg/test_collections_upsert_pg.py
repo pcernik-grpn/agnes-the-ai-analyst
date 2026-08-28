@@ -123,6 +123,46 @@ def test_resync_same_stable_id_unchanged_content_short_circuits(pg_repos):
     assert row["processing_detail"]["chunk_count"] == 5
 
 
+def test_resync_same_stable_id_unchanged_content_retries_a_failed_row(pg_repos):
+    """The crawler-sync counterpart of the short-circuit above: a row the
+    previous ingest left `rejected` (or `needs_review`, or parked in
+    `pending`) is NOT considered done, so the next re-sync of the identical
+    bytes resets it to `pending` and reports `needs_processing`. Without
+    this, a doc-sync source could never recover a file whose ingest failed
+    for an environmental reason — the crawler re-sends the same bytes
+    forever and nothing re-runs (Devin Review on #1655)."""
+    from app.api.collections import _upsert_corpus_file
+
+    sources_repo = pg_repos.corpus_file_sources_repo()
+    cf_repo = pg_repos.corpus_files_repo()
+
+    def _sync():
+        return _upsert_corpus_file(
+            CORPUS_ID,
+            path=None,
+            stable_id="graph:retry1",
+            source_doc_id="doc-retry",
+            source_sha256_meta=None,
+            filename="a.md",
+            sha256="same-sha",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/same-sha.md",
+            sources_repo=sources_repo,
+        )
+
+    file_id, _ = _sync()
+    for failed_status in ("rejected", "needs_review", "pending"):
+        cf_repo.set_status(file_id, status=failed_status, detail={"reason": "ingest_error: boom"})
+        file_id2, needs_processing = _sync()
+        assert file_id2 == file_id, failed_status
+        assert needs_processing is True, f"{failed_status} row must be retried by an unchanged re-sync"
+        assert cf_repo.get(file_id)["processing_status"] == "pending", failed_status
+
+    # ...and the mapping still points at the same row (no duplicate anchor).
+    assert sources_repo.resolve(CORPUS_ID, "graph:retry1") == file_id
+
+
 def test_resync_same_stable_id_rename_only_updates_path(pg_repos):
     """Lifecycle row C4: rename/move -> same source_stable_id -> same row,
     path updated; claims untouched (still no re-processing)."""
