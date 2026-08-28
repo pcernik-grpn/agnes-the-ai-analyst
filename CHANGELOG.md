@@ -182,6 +182,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The release-cut moves out of feature PRs and into one daily cut PR.**
+  The old rule — whichever PR happened to land last with content under
+  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
+  section — raced two PRs against the same version number and produced a
+  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
+  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
+  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
+  the new `.github/workflows/daily-cut.yml` (minor bump by default,
+  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
+  labeled `release-cut` that a human reviews and merges — the workflow
+  never merges or tags anything itself. The cut arithmetic is pure
+  functions in `scripts/release_cut.py` (unit-tested in
+  `tests/test_release_cut.py`, including a guard against the known
+  3-way-merge duplicate-heading failure class), reused for the emergency
+  manual path when Actions dispatch isn't available. See
+  `docs/RELEASING.md` for the full ritual and the train-driver operating
+  rule.
+
 - **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
 - **Vocabulary pass (D5, v1): the same concept now has one name across UI,
   CLI and MCP help text — the old name keeps working as a deprecated
@@ -2334,25 +2352,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   "Adding a PG-only feature" recipe; the `repo-parity.md` / `migration.md`
   agnes-conventions playbooks and the `agnes-builder` / `agnes-reviewer-parity`
   dev-kit agents are updated to match.
-- **The release-cut moves out of feature PRs and into one daily cut PR.**
-  The old rule — whichever PR happened to land last with content under
-  `[Unreleased]` also bumped `pyproject.toml`/`server.json` and renamed the
-  section — raced two PRs against the same version number and produced a
-  duplicated `## [X.Y.Z]` CHANGELOG heading on merge (a recurring failure
-  mode across 15–25 hand-cut releases/day). A feature/fix PR now only ever
-  adds an `[Unreleased]` bullet; the cut itself is computed once a day by
-  the new `.github/workflows/daily-cut.yml` (minor bump by default,
-  `patch`/`major` on manual dispatch for a hotfix/milestone) into a PR
-  labeled `release-cut` that a human reviews and merges — the workflow
-  never merges or tags anything itself. The cut arithmetic is pure
-  functions in `scripts/release_cut.py` (unit-tested in
-  `tests/test_release_cut.py`, including a guard against the known
-  3-way-merge duplicate-heading failure class), reused for the emergency
-  manual path when Actions dispatch isn't available. See
-  `docs/RELEASING.md` for the full ritual and the train-driver operating
-  rule.
-
-### Added
 
 - **CHANGELOG integrity CI guard** (`tests/test_changelog_integrity.py`).
   A fast, pure-file-parse test that catches the recurring silent-rebase
