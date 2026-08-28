@@ -657,17 +657,17 @@
      it groups the types, it does not compete with them. A family whose
      types are all filtered out is dropped entirely (see renderResources) —
      a header over nothing is not part of an answer. */
-  .ax-fam { margin-top: var(--ds-space-5); }
+  .ax-fam { margin-top: 20px; }
   .ax-fam:first-child { margin-top: 0; }
   .ax-fam__hd {
-    display: flex; align-items: baseline; gap: var(--ds-space-2);
-    flex-wrap: wrap; padding-bottom: var(--ds-space-2);
-    border-bottom: 1px solid var(--ds-border-subtle);
-    margin-bottom: var(--ds-space-2);
+    display: flex; align-items: baseline; gap: 8px;
+    flex-wrap: wrap; padding-bottom: 8px;
+    border-bottom: 1px solid var(--ds-border-light);
+    margin-bottom: 8px;
   }
   .ax-fam__nm {
     font-size: 11px; font-weight: 700; letter-spacing: .12em;
-    text-transform: uppercase; color: var(--ds-text);
+    text-transform: uppercase; color: var(--ds-text-primary);
   }
   .ax-fam__sub { font-size: 12px; color: var(--ds-text-muted); }
 
@@ -676,11 +676,73 @@
      the tier is always set beside the sentence it writes. */
   .ax-reads {
     text-align: right; white-space: nowrap;
-    font-size: 12px; color: var(--ds-text);
+    font-size: 12px; color: var(--ds-text-primary);
   }
-  .ax-reads__off { color: var(--ds-text-subtle); }
+  .ax-reads__off { color: var(--ds-text-muted); }
   .ax-reads__q { color: var(--ds-text-muted); font-style: italic; }
   @media (max-width: 900px) { .ax-reads { display: none; } }
+  /* ── One list, no second column ──────────────────────────────────────
+     The two-pane workspace answered one of the three questions an admin
+     arrives with — "what does THIS group get" — and made the other two
+     ("who gets this bundle", "why can she see it") start with a hunt for the
+     right row to click. It also spent a fifth of the width permanently on
+     navigation used for two seconds. Groups are sections of one full-width
+     list now; the search does the navigating. */
+  .ax-one { display: flex; flex-direction: column; gap: 12px; }
+  .ax-onebar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .ax-onebar .fbar__search { flex: 1 1 22rem; min-width: 0; }
+  .ax-onebar .ax-gnew { margin: 0; white-space: nowrap; }
+
+  .ax-gs { border-top: 1px solid var(--ds-border); }
+  .ax-gs[open] { border-top-color: var(--ds-text-primary); border-top-width: 2px; }
+  .ax-gs__hd {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 4px;
+    cursor: pointer; list-style: none; flex-wrap: wrap;
+  }
+  .ax-gs__hd::-webkit-details-marker { display: none; }
+  .ax-gs__hd:hover { background: var(--ds-surface-dim); }
+  .ax-gs__hd:focus-visible { outline: var(--ds-focus-outline); outline-offset: -2px; }
+  .ax-gs__car {
+    font-size: 13px; color: var(--ds-text-muted); width: 12px;
+    transition: transform 120ms ease;
+  }
+  @media (prefers-reduced-motion: reduce) { .ax-gs__car { transition: none; } }
+  .ax-gs[open] .ax-gs__car { transform: rotate(90deg); }
+  .ax-gs__id { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; }
+  .ax-gs__reach { font-size: 12px; color: var(--ds-text-muted); }
+
+  /* The three counts are what make a closed row worth reading. A family the
+     group holds nothing of stays visible and says zero — an absent count and
+     a zero count are different answers. */
+  .ax-gs__counts { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .ax-gs__cnt { font-size: 11px; color: var(--ds-text-muted); white-space: nowrap; }
+  .ax-gs__cnt b { font-weight: 600; color: var(--ds-text-muted); }
+  .ax-gs__cnt.is-held b { color: var(--ds-text-primary); }
+  .ax-gs__sim { font-size: 12px; color: var(--ds-text-link); white-space: nowrap; text-decoration: none; }
+  .ax-gs__sim:hover { text-decoration: underline; }
+  .ax-gs__body { padding: 0 0 16px; }
+  .ax-gs__body .ax-work { border: 0; box-shadow: none; padding-top: 0; }
+  /* The panel's sticky identity header existed because the group name
+     scrolled away above a tall grant tree. The summary is that name now, and
+     it is the row you opened — so the header stops repeating it and keeps
+     only what the summary does NOT say: the description, the upstream
+     address, the age. */
+  .ax-gs__body .ax-gh { position: static; padding-top: 0; }
+  .ax-gs__body .ax-gh__ava,
+  .ax-gs__body .ax-gh__name { display: none; }
+
+  @media (max-width: 720px) {
+    .ax-gs__counts { width: 100%; margin-left: 24px; }
+    .ax-gs__sim { display: none; }
+  }
+
+  /* The second search is gone: the header one filters the list and narrows
+     what an open group shows. The scope segment beside it stays — "all" vs
+     "granted" is a different question from "which one". */
+  .ax-frow .fbar__search { display: none; }
 </style>
 {% endblock %}
 
@@ -712,8 +774,8 @@
      resource rides straight into the filter on the right. Filled by JS from
      the query string; empty (and so `display:none`) otherwise. #}
   <div class="ax-pin" id="ax-pick" role="status"></div>
-  <div class="ax-cols">
-    <div class="ds-card ax-card--list">
+  <div class="ax-one">
+    <div class="ax-onebar">
       {# The shared search input. Present from the start rather than appearing
          past some group count: a control that materializes when a list grows
          is a control nobody knows exists until the day they need it.
@@ -725,9 +787,8 @@
          toolbar job, sitting between the reader and the two cards. #}
       <div class="fbar__search ax-glist__find">
         <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-        <input type="search" id="ax-group-find" placeholder="Find a group…" autocomplete="off" aria-label="Find a group">
+        <input type="search" id="ax-group-find" placeholder="Search groups, bundles or people…" autocomplete="off" aria-label="Search groups, bundles or people">
       </div>
-      <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
       {# The audience that does not exist yet. "Grant this to the finance
          team" is one thought, and it used to break in half here: no Finance
          group meant leaving for the group list, creating it there, coming
@@ -739,6 +800,7 @@
         <span class="ax-gnew__plus" aria-hidden="true">+</span> New group
       </button>
     </div>
+    <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
 
     {# ONE panel, three regions divided by hairlines. It was a single
        undifferentiated flow (identity, avatars, a disclosure, a
@@ -747,7 +809,14 @@
        floating cards — which fixed the boundary and replaced it with
        fragmentation: three borders and two page gutters for one subject.
        Sections still collapse; the card chrome is drawn once. #}
-    <div class="ax-work">
+  </div>
+
+  {# The panel is ONE node that moves into whichever group section is open —
+     not a template re-rendered per group. Every id, handler and render
+     function below keeps working untouched; only its parent changes. It is
+     parked here whenever nothing is open. #}
+  <div id="ax-work-park" hidden></div>
+  <div class="ax-work" id="ax-work">
       {# STICKY identity. The question this page answered worst was "which
          group am I editing?" — the name scrolled away the moment you reached
          the grant tree, which is the tallest thing on the page. The fact
@@ -839,7 +908,6 @@
           <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
         </div>
       </details>
-    </div>
   </div>
 </div>
 
@@ -1015,8 +1083,41 @@
      There is no "N groups" count above the card any more: it restated the
      list directly beneath it. When a filter is on, the list says how much
      of the set it is showing, which is the only case the count answered. */
+  /* The three numbers a collapsed row is worth reading for. Derived from the
+     same grants payload the checkboxes read, so a count can never disagree
+     with the rows underneath it. */
+  function familyCounts(gid) {
+    const famOf = new Map((overview.resources || []).map((t) => [t.type_key, t.family || "knowledge"]));
+    const tally = new Map();
+    for (const gr of grantsFor(gid)) {
+      const fam = famOf.get(gr.resource_type);
+      if (!fam) continue;
+      tally.set(fam, (tally.get(fam) || 0) + 1);
+    }
+    const fams = (overview.families || []);
+    if (!fams.length) return "";
+    return fams.map((f) => {
+      const n = tally.get(f.key) || 0;
+      return `<span class="ax-gs__cnt${n ? " is-held" : ""}">${esc(f.display_name.toLowerCase())} <b>${n}</b></span>`;
+    }).join("");
+  }
+
+  /* The panel is one node, moved. Re-rendering the list would otherwise
+     destroy it (and every handler bound inside), so it is parked before the
+     list is rewritten and re-homed after. */
+  function parkWork() {
+    const w = el("ax-work"), park = el("ax-work-park");
+    if (w && park && w.parentElement !== park) park.appendChild(w);
+  }
+  function homeWork(gid) {
+    const w = el("ax-work");
+    const body = gid ? document.querySelector(`[data-gsbody="${window.CSS && CSS.escape ? CSS.escape(gid) : gid}"]`) : null;
+    if (w && body) body.appendChild(w);
+  }
+
   function renderGroups() {
     const host = el("ax-groups");
+    parkWork();
     const all = sortedGroups();
     if (!all.length) {
       // The old copy sent the reader to the group list to create one. The
@@ -1025,15 +1126,42 @@
       host.innerHTML = `<div class="ax-empty">No groups yet — every grant needs one. Start with <b>New group</b> below.</div>`;
       return;
     }
-    // Name AND description AND the Workspace address — the retired list
-    // searched name + description, and a synced group is often known to the
-    // admin by the email rather than by either.
+    /* One search, and it reads both ways. Name, description and the
+       Workspace address find a group; the name of anything the group HOLDS
+       finds it too, because "who gets Revenue Core" is one of the three
+       questions people arrive with and it used to answer "no group matches
+       revenue" — technically true, useless, and the exact shape of the
+       empty-vs-denied confusion this page should not add to. */
     const q = groupFilter.trim().toLowerCase();
     const hay = (g) => `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`.toLowerCase();
-    const groups = q ? all.filter((g) => hay(g).includes(q)) : all;
+    const itemText = new Map();
+    for (const t of (overview.resources || [])) {
+      for (const b of (t.blocks || [])) {
+        for (const i of (b.items || [])) {
+          itemText.set(`${t.type_key}:${i.resource_id}`,
+            `${i.name || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase());
+        }
+      }
+    }
+    const holdsMatch = (g) => grantsFor(g.id).some((gr) =>
+      (itemText.get(`${gr.resource_type}:${gr.resource_id}`) || "").includes(q));
+    const nameHit = (g) => hay(g).includes(q);
+    const groups = q ? all.filter((g) => nameHit(g) || holdsMatch(g)) : all;
     if (!groups.length) {
-      host.innerHTML = `<div class="ax-empty">No group matches “${esc(groupFilter)}”.</div>`;
+      // A miss says it is a miss. An admin sees every grant on the instance,
+      // so "nothing matched" can never be a permission problem here — and
+      // saying so is the difference between refining a search and giving up.
+      host.innerHTML = `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
+        ${esc(String(all.length))} groups searched, and everything granted in them.</div>`;
       return;
+    }
+    // Typing opens what it found: a hit inside a collapsed section reads as
+    // "no such thing". The first match opens unless something already is.
+    if (q && !groups.some((g) => g.id === selectedGroup)) {
+      selectedGroup = groups[0].id;
+      resourceFilter = nameHit(groups[0]) ? "" : groupFilter.trim();
+      const rf = el("ax-rfind");
+      if (rf) rf.value = resourceFilter;
     }
 
     const row = (g) => {
@@ -1052,29 +1180,36 @@
          gives the menu its positioning context and keeps both controls real.
          Only editable rows get one: `Admin` and `Everyone` are renamed and
          deleted where they are owned, in the seed or in Workspace. */
+      const open = selectedGroup === g.id;
+      /* A COLLAPSED row still has to answer something, or it is a shutter
+         over hidden content rather than a summary — the state the Library
+         redesign removed and should not come back through this page. So it
+         carries origin, reach, and a count per family: enough to decide a
+         group needs no opening. */
       return `
-      <div class="ax-grow" data-grow="${esc(g.id)}">
-        <button type="button" class="ax-g ${everyone ? "is-everyone" : ""} ${selectedGroup === g.id ? "is-on" : ""}"
-                data-group="${esc(g.id)}" aria-pressed="${selectedGroup === g.id ? "true" : "false"}"
-                title="${esc(g.description || label)}">
+      <details class="ax-gs" data-gs="${esc(g.id)}" ${open ? "open" : ""}>
+        <summary class="ax-gs__hd" title="${esc(g.description || label)}">
+          <span class="ax-gs__car" aria-hidden="true">›</span>
           <span class="ax-g__ava">${esc(String(label || "?").charAt(0).toUpperCase())}</span>
-          <span class="ax-g__body">
+          <span class="ax-gs__id">
             <span class="ax-g__name">${esc(label)}</span>
-            <span class="ax-g__meta">
-              <span>${esc(meta)}</span>
-              ${origin !== "custom" ? `<span class="ax-orig ax-orig--${esc(origin)}">${esc(origin.replace("_", " "))}</span>` : ""}
-            </span>
+            ${origin !== "custom" ? `<span class="ax-orig ax-orig--${esc(origin)}">${esc(origin.replace("_", " "))}</span>` : ""}
+            <span class="ax-gs__reach">${esc(meta)}</span>
           </span>
-        </button>
+          <span class="ax-gs__counts">${familyCounts(g.id)}</span>
+          <a class="ax-gs__sim" href="/admin/access?lens=simulate">See it as a person</a>
+          ${isEditable(g) ? `
+          <button type="button" class="ax-gkebab" data-gmenu="${esc(g.id)}"
+                  aria-haspopup="true" aria-expanded="false"
+                  aria-label="Actions for ${esc(label)}">⋯</button>` : ""}
+        </summary>
         ${isEditable(g) ? `
-        <button type="button" class="ax-gkebab" data-gmenu="${esc(g.id)}"
-                aria-haspopup="true" aria-expanded="false"
-                aria-label="Actions for ${esc(label)}">⋯</button>
         <ul class="ax-menu" data-gmenu-for="${esc(g.id)}" role="menu" hidden>
           <li role="none"><button type="button" role="menuitem" data-grename="${esc(g.id)}">Rename group</button></li>
           <li role="none"><button type="button" role="menuitem" class="danger" data-gdelete="${esc(g.id)}">Delete group</button></li>
         </ul>` : ""}
-      </div>`;
+        <div class="ax-gs__body" data-gsbody="${esc(g.id)}"></div>
+      </details>`;
     };
 
     // Only label the halves when BOTH exist. On a fresh instance every group
@@ -1090,6 +1225,7 @@
     host.innerHTML = (custom.length && system.length)
       ? label("System") + system.map(row).join("") + label("Groups") + custom.map(row).join("")
       : groups.map(row).join("");
+    homeWork(selectedGroup);
   }
 
   /* ── The group itself, pinned ─────────────────────────────────────────
@@ -1182,6 +1318,22 @@
   function setAccessHead(text) {
     const sum = el("ax-access-sum");
     if (sum) sum.textContent = text || "";
+  }
+
+  /* One control. The header search filters the group list AND narrows what
+     an open group shows — except when the group's own name is what matched,
+     where narrowing its rows to the group name would empty a group you just
+     found. Typing is also what opens things: a hit inside a collapsed
+     section reads as "no such thing", which is the opposite of the answer. */
+  function syncQuery() {
+    const q = groupFilter.trim();
+    if (PICK) return;                     // a ?resource= arrival asked for its own narrowing
+    const g = (overview.groups || []).find((x) => x.id === selectedGroup);
+    const nameHit = !!(g && `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`
+      .toLowerCase().includes(q.toLowerCase()));
+    resourceFilter = (!q || nameHit) ? "" : q;
+    const rf = el("ax-rfind");
+    if (rf) rf.value = resourceFilter;
   }
 
   function renderResources() {
@@ -1929,6 +2081,7 @@
   // the four regions (list, identity, audience, grants) can never disagree
   // about which group is open.
   async function repaint() {
+    syncQuery();
     renderGroups();
     await renderMembers();
     bindFind();
@@ -2051,11 +2204,21 @@
   document.addEventListener("click", async (e) => {
     if (e.target.closest("[data-clear-rfind]")) { clearResourceFilter(); return; }
 
-    const groupBtn = e.target.closest("[data-group]");
-    if (groupBtn) {
-      selectedGroup = groupBtn.dataset.group;
-      rememberSelection(selectedGroup);
-      await repaint();
+    /* Opening a section is selecting the group. One at a time: two open
+       groups would mean two grant trees on screen with one toolbar between
+       them, and the row you clicked scrolled off. The neighbours stay as
+       lines, which is the whole reason the pane went away. */
+    const sum = e.target.closest(".ax-gs__hd");
+    if (sum && !e.target.closest("[data-gmenu]") && !e.target.closest(".ax-gs__sim")) {
+      const sec = sum.closest("[data-gs]");
+      const gid = sec && sec.dataset.gs;
+      if (gid) {
+        e.preventDefault();
+        const wasOpen = selectedGroup === gid && sec.hasAttribute("open");
+        selectedGroup = wasOpen ? null : gid;
+        rememberSelection(selectedGroup);
+        await repaint();
+      }
       return;
     }
 
@@ -2515,9 +2678,15 @@
     const groups = sortedGroups();
     const known = (id) => !!(id && groups.some((g) => g.id === id));
     const wanted = params.get("group");
-    selectedGroup = known(wanted) ? wanted
-      : known(recalledSelection()) ? recalledSelection()
-      : (groups.length ? groups[0].id : null);
+    /* COLLAPSED ON ARRIVAL. The page opens as a list of groups, each one
+       line, each answering whether it needs you — not on somebody's group
+       with the tree already unrolled. Only a deep link opens one: `?group=`,
+       or the `?resource=` hand-off from /admin/tables, which arrives knowing
+       what it came to grant. A remembered selection no longer auto-opens —
+       "where I was last time" is not a reason to unroll the tallest thing on
+       the page for someone who came to check something else. */
+    const wantedRes = PICK && known(recalledSelection()) ? recalledSelection() : null;
+    selectedGroup = known(wanted) ? wanted : wantedRes;
     rememberSelection(selectedGroup);
     // A `?resource=` arrival lands with the tree already narrowed to what the
     // caller came to grant — the filter is pre-filled rather than merely
