@@ -8,9 +8,9 @@
 
    So this page, and deliberately NOT a new pattern for it: it is the Library's
    structure with conversations in the rows — prominent search in the header, one
-   control row, a sectionless scannable table with sortable column headers, and
-   the same table ⇄ grid switch. Two inventories, one shape; someone who has used
-   /library already knows how to use this.
+   control row, and a sectionless scannable list. Two inventories, one shape;
+   someone who has used /library already knows how to use this. It stops short
+   of the Library's table ⇄ grid switch — see the toolbar's own note below.
 
    What it adds that the Library has no need for:
      · FOUR segments (All · Pinned · Shared · Archived) instead of an ownership
@@ -76,8 +76,8 @@
          Row 1 (#ch-chips) — removable chips for the applied facets. ABOVE the
            controls: they are the current STATE, the row below is the machinery
            that changes it. Hidden until a facet is applied.
-         Row 2 (.fbar) — search · the four views · Filter · sort · list⇄grid ·
-           New chat.
+         Row 2 (.fbar) — search · the four views · Filter · sort · New chat.
+           No list⇄grid control: this page has one view.
        Everything the dock opens (the Filter menu and its category popovers)
        opens UPWARD — see `.fbar-dock` in filter_toolbar.css.
 
@@ -226,16 +226,11 @@
         ) }}
       </div>
 
-      {# List ⇄ grid toggle — the same shared control as the Library and My
-         Stack. List is the default; the choice persists in localStorage. #}
-      <div class="fbar-view" role="group" aria-label="View">
-        <button type="button" class="fbar-view__btn is-active" data-view="table" aria-label="List view" aria-pressed="true" title="List view">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"></path></svg>
-        </button>
-        <button type="button" class="fbar-view__btn" data-view="grid" aria-label="Grid view" aria-pressed="false" title="Grid view">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"></rect><rect x="13" y="4" width="7" height="7" rx="1.5"></rect><rect x="4" y="13" width="7" height="7" rx="1.5"></rect><rect x="13" y="13" width="7" height="7" rx="1.5"></rect></svg>
-        </button>
-      </div>
+      {# No list ⇄ grid switch here. A conversation is a title you read plus two
+         facts you glance at, and a card spends a whole tile saying that much —
+         so the list is the ONLY view, and the shared `view` config is absent
+         from the engine in chats_page.js rather than defaulted. The Library
+         keeps its own switch: an asset there has a thumbnail worth a tile. #}
 
     {# The call to action closes the row. A link, not a button: it navigates to
        /chat, which IS the new-conversation surface. No `id="new-chat"` — that id
@@ -275,13 +270,14 @@
      on the right edge. No card border, no header row, no zebra.
 
      What the header row did carry — sorting — moves to the toolbar's own Sort
-     control, which is now visible in BOTH views (there are no column headers to
-     yield to any more, so `sort.headers`/`sort.wrap` are gone from the engine
-     config in chats_page.js).
+     control, which is always visible (there are no column headers to yield to
+     any more, so `sort.headers`/`sort.wrap` are gone from the engine config in
+     chats_page.js, along with the `view` block that projected these rows into
+     cards).
 
      Every row keeps its `data-*` exactly as before: the filter engine works over
-     any element set, not over table rows, so search, the four views, sorting
-     and the grid projection are untouched by the change of tag. ── #}
+     any element set, not over table rows, so search, the four views and sorting
+     are untouched by the change of tag. ── #}
   <div class="ch-list" id="ch-list" role="list">
     {% for c in chat_rows %}
     <div class="ch-row{% if c.pinned %} is-pinned{% endif %}{% if c.archived %} is-archived{% endif %}"
@@ -363,11 +359,6 @@
     </div>
     {% endfor %}
   </div>
-  {# Grid view — cards projected client-side from the rows above, so the list
-     stays the single source of truth and the grid inherits filtering, sorting
-     and every in-place update for free. #}
-  <div class="fbar-grid ch-grid" id="ch-grid" hidden></div>
-
   {# No-results state — shown by the engine when the filters exclude every row. #}
   <div class="ch-empty" id="ch-noresults" hidden>
     <h3>Nothing matches these filters</h3>

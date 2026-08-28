@@ -25,7 +25,7 @@ from app.chat.frame_seq import stamp_frame
 from app.chat.message_parts import build_message_parts, parts_to_tool_calls
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
-from app.chat.provider import SandboxHandle, SandboxProvider
+from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
@@ -117,6 +117,13 @@ _PAUSED_SWEEP_LEASE_TTL_SEC = 90
 # row for a short moment — 120s is far beyond that window while still reaping
 # a crashed gateway's leftovers on the following tick.
 _ORPHAN_SWEEP_MIN_AGE_SEC = 120
+
+# How many times a spawn may free a slot and try again before giving up
+# (`_spawn_with_capacity_reclaim`). Each attempt reclaims exactly one
+# sandbox, so this bounds how much of a full host one attach may evict —
+# a handful covers the racing-spawns case without letting one user's
+# attach sweep every parked conversation off the box.
+_SPAWN_RECLAIM_MAX_ATTEMPTS = 3
 
 # Session routing lease (wave-2F task 1 — see app/chat/routing.py). Claimed
 # for `chat:{chat_id}` when a session becomes live in this process's
@@ -417,6 +424,12 @@ class ChatManager:
         # map is empty, but the profile is already materialized on disk in the
         # session workdir, so resume still resolves the persona + skill.
         self._session_profiles: dict[str, str] = {}
+        #: Draft skills being PREVIEWED, keyed by session id. Same shape and
+        #: lifetime as `_session_profiles`: set at create, read once at spawn,
+        #: dropped with the session. In memory only and never persisted — the
+        #: draft belongs to the author's browser, and a preview that outlived
+        #: the tab would be a copy of unfinished work nobody asked us to keep.
+        self._session_preview_skills: dict[str, dict] = {}
         # Chat sandbox secret broker: chat_ids this process has itself pushed
         # a current-protocol ticket to (see RELAY_PROTOCOL_VERSION /
         # _push_ticket_frame). Tier 1 (restart-invariant reuse): the
@@ -615,6 +628,7 @@ class ChatManager:
         title: Optional[str] = None,
         profile: Optional[str] = None,
         agent_id: Optional[str] = None,
+        preview_skill: Optional[dict] = None,
     ) -> ChatSession:
         if not self._config.enabled:
             raise RuntimeError("chat.enabled is false")
@@ -652,6 +666,8 @@ class ChatManager:
         )
         if profile is not None:
             self._session_profiles[created.id] = profile
+        if preview_skill:
+            self._session_preview_skills[created.id] = preview_skill
         # Garbage-collect orphan empty sessions for this user on every
         # web-surface create. Clicking "+ New chat" repeatedly was
         # accumulating ten-plus 'Untitled chat' rows in the sidebar
@@ -1028,6 +1044,21 @@ class ChatManager:
                     dynamic_prof = None
             prof = dynamic_prof or prof
             session_dir = self._workdir_mgr.prepare_session_dir(session.user_email, chat_id, profile=prof)
+            # A draft skill being previewed. Written into THIS session's own
+            # .claude (forced to a copy, never the shared workspace) so the
+            # skills catalog reports it and the agent can actually load it —
+            # see WorkdirManager.materialize_preview_skill for the containment
+            # this depends on. A failure here must not take the session down
+            # with it: the preview degrades to a chat without the skill, which
+            # is worth more than an error page.
+            draft = self._session_preview_skills.get(chat_id)
+            if draft:
+                try:
+                    self._workdir_mgr.materialize_preview_skill(
+                        session_dir, session.user_email, draft.get("name", ""), draft.get("body", "")
+                    )
+                except Exception:
+                    logger.exception("preview skill materialization failed for session=%s", chat_id)
 
         # V1c Task 3: materialize this agent's active memories into the
         # workdir BEFORE spawn — the same host-dir-then-uploaded seam
@@ -1984,7 +2015,7 @@ class ChatManager:
         # the host's installed package — there is no ``app.chat.runner``
         # module inside the sandbox.
         argv = ["python3", "/work/runner.py", "--session-id", session.id]
-        handle = await self._provider.spawn(workdir=session_dir, env=env, argv=argv)
+        handle = await self._spawn_with_capacity_reclaim(workdir=session_dir, env=env, argv=argv)
         # Provider-mediated file staging — runs for EVERY provider, including
         # the ones that mount the workspace themselves.
         await self._stage_boot_files(handle, session)
@@ -3394,6 +3425,7 @@ class ChatManager:
         # Spawn-time profile is no longer needed once the session is torn down;
         # drop it so the map doesn't grow unboundedly with studio usage.
         self._session_profiles.pop(chat_id, None)
+        self._session_preview_skills.pop(chat_id, None)
         self._known_protocol_sessions.discard(chat_id)
         # Revoke any broker tickets for this session so the rows don't linger
         # in the DB until TTL expiry (the raw values only ever lived in the
@@ -3748,6 +3780,120 @@ class ChatManager:
             )
         return reaped
 
+    async def _reclaim_paused_sandbox(self) -> bool:
+        """Free one sandbox slot by destroying the least-recently-paused one.
+
+        This is the paused-TTL sweep's teardown (destroy, clear the refs, drop
+        the in-memory entry, release the routing lease) triggered by capacity
+        pressure instead of by the clock. Everything it costs the evicted
+        session is what that sweep would have cost it anyway at
+        ``paused_ttl_seconds``: the transcript is untouched, only the parked
+        sandbox goes, and the user's next message spawns a fresh one.
+
+        Least-recently-paused first — the conversation nobody has come back to
+        is the cheapest to take. A session this process is actively serving is
+        never a candidate: its row can still carry a stale
+        ``sandbox_paused_at`` between a resume and the write that clears it,
+        so ``self._live`` is the authority on "in use", not the row.
+
+        "In use" has to include *being brought back into use*.
+        ``_resume_live`` holds ``live._resume_lock`` across
+        ``provider.resume()`` + ``_install_runner`` — real I/O, seconds — and
+        the session stays PAUSED with its ``sandbox_paused_at`` still set for
+        that whole window, so the state check alone would happily destroy the
+        sandbox of a conversation a user is actively bringing online (Devin
+        Review on this PR). Taking the same lock is what makes this safe, and
+        a candidate whose lock is already held is skipped rather than waited
+        on: the spawning user should get the next-oldest slot now, not queue
+        behind someone else's resume.
+
+        Returns True when a slot was actually freed. Never raises.
+        """
+        try:
+            paused = self._repo.list_paused_sessions(paused_before=datetime.now(timezone.utc))
+        except Exception:
+            logger.exception("capacity reclaim: listing paused sessions failed")
+            return False
+        candidates = [s for s in (paused or []) if s.sandbox_id and s.sandbox_paused_at is not None]
+        candidates.sort(key=lambda s: s.sandbox_paused_at)
+        for session in candidates:
+            live = self._live.get(session.id)
+            if live is None:
+                if await self._evict_paused_sandbox(session):
+                    return True
+                return False
+            if live.state != SessionState.PAUSED or live._resume_lock.locked():
+                continue
+            async with live._resume_lock:
+                # Re-check under the lock: a resume may have won the race for
+                # it between the fast skip above and this acquire, in which
+                # case the session is no longer ours to take.
+                if live.state != SessionState.PAUSED or self._live.get(session.id) is not live:
+                    continue
+                if await self._evict_paused_sandbox(session):
+                    return True
+                return False
+        return False
+
+    async def _evict_paused_sandbox(self, session) -> bool:
+        """Destroy one paused sandbox and clear everything pointing at it.
+
+        Split out of ``_reclaim_paused_sandbox`` only so the eviction itself
+        reads the same whether or not the caller had a ``LiveSession`` lock to
+        take. Returns True when the slot is genuinely free.
+        """
+        try:
+            await self._provider.destroy(sandbox_id=session.sandbox_id)
+        except Exception:
+            # Already gone is a success for our purposes — the slot is
+            # free either way, and the refs below still need clearing.
+            logger.debug("capacity reclaim: destroy failed for %s (already gone?)", session.sandbox_id)
+        try:
+            self._repo.clear_sandbox_ref(session.id)
+        except Exception:
+            # The container is gone but the row still points at it; leaving
+            # the row would make the owner's next attach try to resume a
+            # sandbox that no longer exists. Do not claim the slot.
+            logger.exception("capacity reclaim: clearing sandbox ref failed for %s", session.id)
+            return False
+        self._live.pop(session.id, None)
+        try:
+            await self._release_routing_lease(session.id)
+        except Exception:
+            logger.debug("capacity reclaim: routing lease release failed for %s", session.id)
+        logger.info(
+            "capacity reclaim: freed sandbox %s (session %s, paused since %s) to admit a new one",
+            session.sandbox_id,
+            session.id,
+            session.sandbox_paused_at,
+        )
+        return True
+
+    async def _spawn_with_capacity_reclaim(self, *, workdir, env, argv) -> SandboxHandle:
+        """``provider.spawn``, but a full host frees a parked slot and retries.
+
+        A provider with a host-wide ceiling (the docker one) refuses to spawn
+        once that many sandboxes exist, and paused sandboxes count against it
+        while surviving until ``paused_ttl_seconds`` — 7 days by default. With
+        a small ``docker_max_total_sandboxes`` those two defaults deadlock each
+        other: a few parked conversations fill the host and every other user
+        gets a failed attach for a week, with no path back short of an operator
+        deleting containers by hand. Evicting the least-recently-paused sandbox
+        is strictly better than refusing a live user, and costs the evicted
+        session only what the TTL sweep would have cost it later anyway.
+
+        Any other spawn failure propagates untouched — a broken spawn must not
+        be answered by tearing down someone else's sandbox.
+        """
+        attempts = 0
+        while True:
+            try:
+                return await self._provider.spawn(workdir=workdir, env=env, argv=argv)
+            except SandboxCapacityError:
+                attempts += 1
+                if attempts > _SPAWN_RECLAIM_MAX_ATTEMPTS or not await self._reclaim_paused_sandbox():
+                    raise
+
     async def _idle_reaper_loop(self) -> None:
         # Startup reconciliation: containers a crashed predecessor left behind
         # are orphaned the moment this process starts, not 60 s later.
@@ -3914,6 +4060,19 @@ class ChatManager:
                     logger.exception("reaper: list_paused_sessions failed; skipping paused sweep this cycle")
                     paused_sessions = []
                 for session in paused_sessions:
+                    # A session this process is bringing back online is not
+                    # expired, whatever its row says: _resume_live holds
+                    # `live._resume_lock` across provider.resume() +
+                    # _install_runner while the session is still PAUSED with
+                    # its stale sandbox_paused_at, so a tick landing inside
+                    # that window would destroy the sandbox out from under the
+                    # user. Same window the capacity reclaim closes with the
+                    # same lock — rarer here (it needs a resume to coincide
+                    # with the TTL expiring) but the same bug. It resumes; the
+                    # next tick, 60s later, will find its timestamp cleared.
+                    live = self._live.get(session.id)
+                    if live is not None and live._resume_lock.locked():
+                        continue
                     # #867: guard the whole per-session teardown — a destroy
                     # failure was already tolerated, but a failing
                     # clear_sandbox_ref (DB hiccup) previously aborted the

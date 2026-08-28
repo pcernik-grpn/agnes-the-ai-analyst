@@ -25,6 +25,7 @@ from app.chat.docker_provider import (
     DockerSandboxProvider,
     container_name,
 )
+from app.chat.provider import SandboxCapacityError
 
 
 class FakeStream:
@@ -859,3 +860,24 @@ def test_provider_satisfies_the_sandbox_provider_protocol():
 
     prov = _provider(_fake_client())
     assert isinstance(prov, SandboxProvider)
+
+
+def test_spawn_cap_raises_the_typed_capacity_error(tmp_path: Path):
+    """The cap is a "this host is full" signal, not a broken spawn.
+
+    ChatManager reclaims a paused sandbox and retries on this specific
+    error, so it has to be distinguishable from every other RuntimeError
+    spawn can raise. Still a RuntimeError subclass — callers that only
+    catch the base class keep working.
+    """
+
+    async def _run():
+        client = _fake_client()
+        client.list_sandboxes = AsyncMock(
+            return_value=[{"name": f"agnes-chatsbx-x{i}", "chat_id": f"x{i}"} for i in range(2)]
+        )
+        prov = _provider(client, max_total_sandboxes=2)
+        with pytest.raises(SandboxCapacityError):
+            await prov.spawn(workdir=_session_dir(tmp_path), env=dict(ENV), argv=list(ARGV))
+
+    asyncio.run(_run())

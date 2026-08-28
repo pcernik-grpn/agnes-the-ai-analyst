@@ -229,10 +229,13 @@ class TestChatsPage:
         # The active view is named on the Filter button, which is the one thing the
         # tabs said at rest.
         assert 'id="ch-filter-view"' in html
-        # Search, sort, view toggle.
+        # Search and sort — and NO view toggle: this page has one projection, so
+        # `.fbar-view` is absent from the bar and `view` from the engine config.
         assert 'id="ch-search"' in html
         assert 'id="ch-sort"' in html
-        assert 'data-view="grid"' in html and 'data-view="table"' in html
+        assert "fbar-view" not in html
+        assert 'data-view="grid"' not in html and 'data-view="table"' not in html
+        assert 'id="ch-grid"' not in html
         # Sorting is the toolbar's <select> — there are no column headers to
         # click, because the list is not a table.
         for order in ("updated_desc", "name_asc", "agent_asc"):
@@ -448,27 +451,32 @@ class TestRailWorkingSet:
         _enable_chat(web_client, monkeypatch)
         rail = web_client.get("/library", cookies=admin_cookie).text
         rail = rail.split('<nav class="rail"', 1)[1].split("</nav>", 1)[0]
-        # The section says it is a slice, or it repeats the destination row above.
-        assert '<span class="rail-chatsec-txt">Recent</span>' in rail
-        assert '<span class="rail-chatsec-txt">Pinned</span>' in rail
-        # One way out, to the page — a DESTINATION ROW, and it NAVIGATES; it is
-        # not the "Show more" in-place expander the rail used to carry.
+        # One unlabelled list — what says the feed is a slice is the row that
+        # closes it, not a header over it.
+        assert "rail-chatsec-txt" not in rail
+        assert ">Recent<" not in rail and ">Pinned<" not in rail
+        # One way out, to the page — and it NAVIGATES; it is not the "Show more"
+        # in-place expander the rail used to carry.
+        assert "Show less" not in rail and "rail-history-more" not in rail
+        # Expanded, the way out CLOSES the lists: a quiet link at the foot of the
+        # scroll box, after both sections.
+        assert '<a class="rail-history-all" href="/chats">View all chats</a>' in rail
+        link_at = rail.index('class="rail-history-all"')
+        assert rail.index('id="rail-pinned"') < link_at
+        assert rail.index('id="rail-chats"') < link_at, "the link closes the lists"
+        assert link_at < rail.index('class="rail-nav rail-nav-bottom"'), "…and stays inside the chat zone"
+        # Collapsed, the same destination is the Chats row in the nav zone — the
+        # scroll box is text-only, so the 56px strip cannot show it, and a way to
+        # a page cannot live only in the part of the rail that collapse hides.
         assert 'id="nav-chats"' in rail
         assert 'href="/chats"' in rail
-        assert "Show less" not in rail and "rail-history-more" not in rail
-        # It sits ABOVE the lists, in the nav zone with New chat — not at the foot
-        # of the scroll box. That is the whole fix: the scroll box is text-only, so
-        # the collapsed rail hides it, and the collapsed rail is the default on
-        # /admin — a "View all chats" link in there left /chats with no reachable
-        # entry point at all from an admin page.
-        assert 'id="rail-view-all-chats"' not in rail
-        assert "View all chats" not in rail
         chats_at = rail.index('id="nav-chats"')
-        assert chats_at < rail.index('class="rail-history"'), "Chats leads the lists, it does not close them"
         assert rail.index('id="new-chat"') < chats_at, "verb then noun: New chat, then Chats"
-        # And it lives in the nav zone, so it survives the collapse the lists don't.
         zone = rail[rail.index('class="rail-nav rail-nav-top"') : rail.index('class="rail-history"')]
-        assert 'id="nav-chats"' in zone
+        assert 'id="nav-chats"' in zone, "the stand-in must survive the collapse the lists don't"
+        # The two are complements, not a pair on screen at once: the row folds
+        # away wherever the lists render.
+        assert "rail-i--collapsed-only" in zone
 
     def test_chats_row_is_active_on_the_page_it_leads_to(self, web_client, admin_cookie, monkeypatch):
         """`.on` in the rail means "you are looking at this". /chats is a

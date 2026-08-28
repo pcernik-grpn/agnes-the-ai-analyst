@@ -4,6 +4,20 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def studio_on(monkeypatch):
+    """Studio is OFF by default since the admin cleanup retired the surface.
+
+    Every test in this module is about what the surface DOES when exposed, so
+    they turn it on rather than assert against the shipped default. The two
+    tests that check the disabled behavior override this — one by patching
+    `app.web.router.get_studio_enabled`, which wins over the env var because it
+    replaces the reader itself, the other by setting the env var it owns.
+    """
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
+
+
 DOMAINS = ["data-package", "mcp", "marketplace", "corporate-memory"]
 
 
@@ -184,14 +198,18 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     assert "var TYPE_ORDER = ['skill', 'plugin', 'agent'];" in body
     for kind in ("skill", "plugin", "agent"):
         assert f"key: '{kind}'," in body
-    # Type is a COLLAPSING step inside the form, not a separate picker screen:
-    # one numbering sequence (1 Type → 2 Identity → 3 content), and answering
-    # it collapses to a summary + Change rather than navigating away.
+    # Type is NOT a step. It used to be section 1 — a card with a tick where
+    # every other section has a number, spending the top of the panel
+    # re-asking what "+ Add → Build a skill" already answered. It is identity,
+    # so it rides in the header beside the title, with Change one click away;
+    # the sections are the configuration, numbered 1..3 with no gap.
+    assert "typeBadgeHtml" in body, "the type is no longer shown beside the title"
+    assert "sk-typechip" in body
     assert "data-sk-change" in body
     assert ">Change<" in body
-    assert "sk-sec--done" in body
     for n in ("1", "2", "3"):
-        assert f'class="sk-sec-no">{n}<' in body or f'"sk-sec-no">{n}<' in body
+        assert f"no: {n}," in body, f"step {n} is not numbered in the shell sections"
+    assert "no: 4," not in body, "the sections should end at 3 now that Type is not one"
     # Access is a required choice before saving: Private or the whole org.
     assert 'name="sk-access"' in body
     assert 'value="private"' in body
@@ -510,8 +528,8 @@ def test_studio_enabled_env_override(monkeypatch):
     monkeypatch.setenv("AGNES_STUDIO_ENABLED", "true")
     assert ic.get_studio_enabled() is True
     monkeypatch.delenv("AGNES_STUDIO_ENABLED", raising=False)
-    # No env, no yaml studio block → defaults on.
-    assert ic.get_studio_enabled() is True
+    # No env, no yaml studio block → defaults OFF since the admin cleanup.
+    assert ic.get_studio_enabled() is False
 
 
 def test_studio_enabled_yaml_fallback_and_precedence(monkeypatch):

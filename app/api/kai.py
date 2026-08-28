@@ -1227,6 +1227,48 @@ def _with_approved_mcp_servers(settings_bytes: Optional[bytes], names: "list[str
     return (json.dumps(base, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def _preview_skill_dir(session: Any) -> "Optional[Path]":
+    """The one draft-skill directory in this session's workspace, if any.
+
+    A preview session has exactly one (``WorkdirManager.materialize_preview_
+    skill`` writes it), and it is the only thing under the session's own
+    ``.claude/skills`` that is not also in the shared workspace. Returning the
+    directory rather than the file keeps a multi-file skill (``references/``)
+    intact.
+
+    Everything here is defensive: this runs inside the archive builder, whose
+    contract is 200-or-204, so a missing directory is a None and never a
+    raise.
+    """
+    from pathlib import Path as _Path
+
+    sid = getattr(session, "id", None)
+    email = getattr(session, "user_email", None)
+    if not sid or not email:
+        return None
+    # Same derivation WorkdirManager uses — imported rather than reimplemented,
+    # so a change to the on-disk layout cannot leave these two disagreeing.
+    from app.chat.workdir import _safe_email_dir
+
+    root = _Path(os.getenv("DATA_DIR", "data")) / "users" / _safe_email_dir(email) / "sessions" / str(sid)
+    skills = root / ".claude" / "skills"
+    if not skills.is_dir():
+        return None
+    marker = skills / ".preview"
+    if not marker.is_file():
+        return None
+    name = marker.read_text(encoding="utf-8").strip()
+    if not name:
+        return None
+    candidate = skills / name
+    # Containment again at the read side: the name came off disk, but this
+    # path is built from it and the check costs nothing.
+    resolved = candidate.resolve()
+    if skills.resolve() not in resolved.parents:
+        return None
+    return candidate if candidate.is_dir() else None
+
+
 def _build_workspace_archive(
     session: Any = None,
     *,
@@ -1291,6 +1333,27 @@ def _build_workspace_archive(
         shadowed = {"/".join(arcname.split("/")[:3]) for arcname in overlay if arcname.startswith(".claude/skills/")}
         paths = {k: v for k, v in paths.items() if not any(k.startswith(f"{root}/") for root in shadowed)}
         paths.update(overlay)
+
+    # A draft SKILL being previewed by the /skills builder. The native
+    # providers get it because WorkdirManager wrote it into the session
+    # directory they mount; this provider mounts nothing — the tarball IS its
+    # project scope — so without this the preview would silently do nothing
+    # here while working on docker. That asymmetry is exactly the bug #1552
+    # was: a skill the menu advertises and the sandbox has never heard of.
+    #
+    # Read from the session directory rather than from the manager's memory,
+    # so both delivery paths carry the same bytes from the same source. Best
+    # effort, like everything else in this archive: a preview that fails to
+    # pack must degrade to a chat without the skill, never to a failed turn.
+    try:
+        preview_root = _preview_skill_dir(session)
+        if preview_root is not None:
+            for path in preview_root.rglob("*"):
+                if path.is_file():
+                    rel = path.relative_to(preview_root.parent.parent.parent)
+                    paths[rel.as_posix()] = path
+    except Exception:
+        logger.exception("kai workspace: preview skill overlay failed")
 
     # Synthesized members: the rendered prompt, plus the two config files a
     # flattened plugin needs (its hooks and MCP servers have no installed plugin

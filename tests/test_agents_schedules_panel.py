@@ -35,6 +35,16 @@ def markup() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def builder_css() -> str:
+    """The builder workspace's rules. The schedules panel is a section BODY
+    inside that workspace, so its status accents travelled with the shell when
+    it was extracted out of the page's inline <style>."""
+    return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "builder.css").read_text(
+        encoding="utf-8"
+    )
+
+
 class TestPanelExists:
     def test_schedules_is_a_builder_section(self, markup):
         assert re.search(r"section\('schedules',\s*\d+,\s*'Schedules'", markup)
@@ -56,8 +66,8 @@ class TestBackloggedIsAWarning:
     def test_backlogged_has_its_own_status_class(self, markup):
         assert "ag-sch-status--backlogged" in markup
 
-    def test_backlogged_wears_the_warn_accent(self, markup):
-        rule = re.search(r"\.ag-sch-status--backlogged\s*\{([^}]*)\}", markup)
+    def test_backlogged_wears_the_warn_accent(self, builder_css):
+        rule = re.search(r"\.ag-sch-status--backlogged\s*\{([^}]*)\}", builder_css)
         assert rule, "backlogged status rule not found"
         body = rule.group(1)
         assert "--ds-accent-warn-ink" in body
@@ -68,9 +78,9 @@ class TestBackloggedIsAWarning:
         is still queued because nothing is claiming agent_response jobs."""
         assert "no worker is picking up agent_response jobs" in markup
 
-    def test_the_other_statuses_do_not_share_the_warn_treatment(self, markup):
+    def test_the_other_statuses_do_not_share_the_warn_treatment(self, builder_css):
         for cls in ("ag-sch-status--enqueued", "ag-sch-status--failed"):
-            rule = re.search(r"\." + re.escape(cls) + r"\s*\{([^}]*)\}", markup)
+            rule = re.search(r"\." + re.escape(cls) + r"\s*\{([^}]*)\}", builder_css)
             assert rule, f"{cls} rule not found"
             assert "warn" not in rule.group(1)
 

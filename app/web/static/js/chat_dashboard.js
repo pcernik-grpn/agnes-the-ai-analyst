@@ -30,6 +30,9 @@ const $ = (id) => document.getElementById(id);
 
 // Handler handed over by chat.js in initChatDashboard.
 let _submitPrompt = null;
+// The server-rendered capability snapshot (chat.js passes it in). Null means
+// "unknown", never "empty" — see buildSuggestedActions().
+let _capabilities = null;
 
 // ---- Greeting -------------------------------------------------------------
 // The server renders the salutation from ITS clock; re-derive from the
@@ -38,7 +41,13 @@ function fixGreeting() {
   const el = $("rdb-greeting-tod");
   if (!el) return;
   const h = new Date().getHours();
+  const evening = h < 5 || h >= 18;
   el.textContent = h >= 5 && h < 12 ? "Good morning" : h >= 12 && h < 18 ? "Good afternoon" : "Good evening";
+  // The sun/moon glyph rides the same correction — both are in the DOM and
+  // `data-tod` shows one (see `.cld-greet` in style-custom.css), so the words
+  // and the picture can never disagree about what time it is.
+  const greet = el.closest("[data-tod]");
+  if (greet) greet.setAttribute("data-tod", evening ? "night" : "day");
 }
 
 // ---- Guided task definitions ------------------------------------------------
@@ -120,6 +129,127 @@ const TASKS = [
   },
 ];
 
+// ---- Zero-data starters ---------------------------------------------------
+//
+// Every entry in TASKS above needs company data to succeed: "Compare revenue
+// trends" against an instance with no reachable tables cannot do anything but
+// apologise. Offering all four anyway is the page's last dishonest offer, so
+// when the caller can reach nothing these take their place.
+//
+// Split by what the caller can actually DO about it. An admin can connect a
+// source; a member cannot, and telling them to would be a dead end — their
+// route is asking whoever can. Both sets stay answerable with no data at all:
+// they ask Agnes about itself and about this workspace, not about numbers.
+
+const ADMIN_ZERO_TASKS = [
+  {
+    id: "zero-how-to-connect",
+    title: "How do I connect our data?",
+    description: "What Agnes needs from your warehouse, and in what order",
+    icon: ICONS.doc,
+    available: true,
+    opener:
+      "I am an admin setting this instance up and nothing is connected yet. Walk me through "
+      + "connecting our data: ask which system it lives in, then tell me what you need from me, "
+      + "what happens after the connection exists, and what I still have to do before anyone on "
+      + "my team can ask a question. Be concrete about the order.",
+  },
+  {
+    id: "zero-what-possible",
+    title: "What will people be able to ask?",
+    description: "What Agnes can answer once data is connected",
+    icon: ICONS.chat,
+    available: true,
+    opener:
+      "Nothing is connected here yet. Explain what my team will be able to ask you once our data "
+      + "is connected and shared — the kinds of questions you can answer well, and the kinds you "
+      + "cannot. Be honest about the limits.",
+  },
+];
+
+const MEMBER_ZERO_TASKS = [
+  {
+    id: "zero-what-is-here",
+    title: "What is in this workspace?",
+    description: "What exists here, and what you can reach",
+    icon: ICONS.search,
+    available: true,
+    opener:
+      "I cannot reach any company data here yet. Tell me what this workspace contains, what I "
+      + "personally have access to, and what I would need access to before I can ask real "
+      + "questions about our numbers.",
+  },
+  {
+    id: "zero-get-access",
+    title: "How do I get access?",
+    description: "Who grants it, and what to ask them for",
+    icon: ICONS.person,
+    available: true,
+    opener:
+      "I do not have access to any data here. Explain how access works in Agnes — who grants it, "
+      + "what the unit of access is called, and exactly what I should ask my admin for. Do not "
+      + "guess at a person's name unless you can find one.",
+  },
+];
+
+// ---- Admin starters, on an instance that HAS data -------------------------
+//
+// The four member starters are about the numbers; an admin's own questions are
+// about who can reach them. These are the governance gaps that actually bite —
+// a table in no package cannot be shared or pulled, and a package granted to
+// nobody is invisible to every analyst — both of which instances discover late.
+//
+// Each opener tells Agnes to CHECK rather than assert, and to say so when it
+// cannot: an admin acting on an invented access answer is worse served than one
+// told the question needs the admin pages.
+
+const ADMIN_TASKS = [
+  {
+    id: "admin-who-sees-what",
+    title: "Who can see what?",
+    description: "Which groups reach which packages, and who is in them",
+    icon: ICONS.person,
+    available: true,
+    opener:
+      "Give me an access picture of this instance: which data packages exist, which groups are "
+      + "granted each one, and roughly how many people are in those groups. Check the real state "
+      + "rather than guessing, and tell me plainly if you cannot read some of it.",
+  },
+  {
+    id: "admin-unreachable",
+    title: "What can nobody reach?",
+    description: "Tables in no package, and packages granted to no group",
+    icon: ICONS.search,
+    available: true,
+    opener:
+      "Find the things nobody can reach in this instance: registered tables that are in no data "
+      + "package, and packages that are granted to no group. Both are invisible to analysts. List "
+      + "what you find and say which fix each one needs — and if you cannot check, say so.",
+  },
+  {
+    id: "admin-definitions",
+    title: "What are we missing definitions for?",
+    description: "Metrics people will ask about that have no canonical answer",
+    icon: ICONS.chart,
+    available: true,
+    opener:
+      "Look at what data is registered here and tell me which important metrics have no canonical "
+      + "definition in the catalog yet — the ones where two people would compute a different "
+      + "number. Do not invent definitions; just tell me where the gaps are.",
+  },
+  {
+    id: "admin-try-as-analyst",
+    title: "What would an analyst see?",
+    description: "The same workspace from a member's side",
+    icon: ICONS.compare,
+    available: true,
+    opener:
+      "Describe what someone on my team with ordinary (non-admin) access would find in this "
+      + "workspace right now — what they could ask about, and what they would hit a wall on. Base "
+      + "it on the real grants, not on what is theoretically installed.",
+  },
+];
+
 // ---- Suggested next actions — the personalization boundary -----------------
 //
 // TODO(personalization): replace buildSuggestedActions() with a backend
@@ -147,7 +277,25 @@ const TASKS = [
  *  fixed set of guided tasks, and resuming a past conversation lives in the
  *  rail's Chats history, so there is no per-session "resume" card here. */
 function buildSuggestedActions(_sessions) {
-  return TASKS.map((task, i) => ({
+  // With no reachable tables the data starters cannot succeed, so the honest
+  // set depends on who is looking. `_capabilities` is null when the snapshot
+  // was absent or unparseable — that is not evidence of an empty instance, so
+  // it falls through to the normal set rather than accusing a working
+  // workspace of being empty.
+  const total = _capabilities ? (_capabilities.tables_total || 0) : null;
+  const isAdmin = !!(_capabilities && _capabilities.is_admin);
+  let tasks;
+  if (total === 0) {
+    // Nothing reachable: the data starters can only apologise. Split by what
+    // the caller can act on — an admin can connect a source, a member cannot.
+    tasks = isAdmin ? ADMIN_ZERO_TASKS : MEMBER_ZERO_TASKS;
+  } else if (isAdmin) {
+    // Data exists, and an admin's own questions are about who reaches it.
+    tasks = ADMIN_TASKS;
+  } else {
+    tasks = TASKS;
+  }
+  return tasks.map((task, i) => ({
     id: task.id,
     kind: "task",
     task,
@@ -242,9 +390,10 @@ export function updateDashboardSuggestions(sessions) {
  *  guided-action cards immediately so they paint with the page (no loading
  *  flash); chat.js may call updateDashboardSuggestions() again — it's
  *  idempotent. `openSession` is accepted for call-site compatibility. */
-export function initChatDashboard({ submitPrompt }) {
+export function initChatDashboard({ submitPrompt, capabilities }) {
   if (!$("rdb-actions")) return;
   _submitPrompt = submitPrompt;
+  _capabilities = capabilities || null;
   fixGreeting();
   updateDashboardSuggestions(null);
 }
