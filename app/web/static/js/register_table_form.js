@@ -261,6 +261,15 @@
     snowflake: {
       label: 'Snowflake',
       browseMode: 'full',
+      // Same generic picker Keboola uses (#347 follow-up, generalized):
+      // pins the registered row to the selected `source_connections` row
+      // so `table_registry.connection_id` isn't left NULL. Table listing
+      // itself stays connection-agnostic — there is no per-connection
+      // Snowflake browse endpoint (`/api/admin/data-sources/snowflake/
+      // tables` always reads the instance's single configured connection,
+      // see app/api/admin_source_discovery.py) — the picker only tags the
+      // payload, exactly as it did pre-D4.
+      hasConnectionPicker: true,
       bucketLabel: 'Schema',
       tableLabel: 'Source table / view',
       modes: [
@@ -293,6 +302,7 @@
       buildPayload(row, mode, s) {
         var base = {
           name: row.name, source_type: 'snowflake', profile_after_sync: false,
+          connection_id: s.connectionId,
           description: s.description, folder: s.folder, sync_schedule: s.syncSchedule,
         };
         if (mode === 'synced_custom') {

@@ -366,32 +366,41 @@ class TestSnowflakePerProjectDiscover:
     """Snowflake analog of TestPerProjectDiscover: every Snowflake
     registration path previously left `connection_id` NULL because neither
     the CLI nor the web UI ever sent it (`table_registry.connection_id`
-    bug). This is the web-UI half of that fix — a connection picker on the
-    register modal, wired into `_buildSnowflakePayload`."""
+    bug).
 
-    def test_project_selector_present_in_register_modal(self, seeded_app):
+    D4 — one registration flow: the register-side Snowflake project picker
+    (formerly `#sfProjectSelect` / `#sfProjectPickerGroup` on the
+    now-removed per-connector `#registerSnowflakeModal`) moved into the
+    shared drawer as the same generic `#rtfConnectionPicker` /
+    `#rtfConnectionPickerField` Keboola uses — `hasConnectionPicker` in
+    `CONNECTORS.snowflake`, not a Snowflake-only clone of the field. There
+    is no separate Snowflake edit-modal picker to preserve (unlike
+    Keboola's `#editKbProjectSelect`) — the register wizard was the only
+    place it ever lived."""
+
+    def test_connection_picker_is_generic_and_covers_snowflake(self, seeded_app):
         c = seeded_app["client"]
         html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
-        assert 'id="sfProjectSelect"' in html
-        assert 'id="sfProjectPickerGroup"' in html
+        assert 'id="rtfConnectionPicker"' in html
+        assert 'id="rtfConnectionPickerField"' in html
+        js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+        sf_start = js.index("snowflake: {")
+        sf_end = js.index("\n    },\n  };", sf_start)
+        sf_config = js[sf_start:sf_end]
+        assert "hasConnectionPicker: true" in sf_config
 
     def test_project_picker_populated_from_registry_endpoint(self, seeded_app):
-        c = seeded_app["client"]
-        html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
-        # Reuses the shared helper (generalized to take a sourceType param)
-        # rather than a hardcoded Keboola-only literal.
-        assert "function _populateKbProjectPicker(" in html
-        assert "_populateKbProjectPicker('sf', null, 'snowflake')" in html
-        start = html.index("function _populateKbProjectPicker")
-        end = html.index("function ", start + len("function _populateKbProjectPicker"))
-        body = html[start:end]
-        assert "'/api/admin/source-connections?source_type=' + encodeURIComponent(sourceType)" in body
+        # Same generic populator Keboola's connection picker uses — scoped
+        # to whichever `sourceType` the drawer was opened with.
+        js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+        assert "async function _populateConnectionPicker()" in js
+        assert "/api/admin/source-connections?source_type=" in js
 
-    def test_register_payload_carries_connection_id_when_project_selected(self, seeded_app):
-        c = seeded_app["client"]
-        html = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
-        start = html.index("function _buildSnowflakePayload")
-        end = html.index("function ", start + len("function _buildSnowflakePayload"))
-        body = html[start:end]
-        assert "_kbSelectedConnectionId('sf')" in body
-        assert "connection_id: connectionId" in body
+    def test_register_payload_carries_connection_id_when_project_selected(self):
+        js = Path("app/web/static/js/register_table_form.js").read_text(encoding="utf-8")
+        sf_start = js.index("snowflake: {")
+        sf_end = js.index("\n    },\n  };", sf_start)
+        sf_config = js[sf_start:sf_end]
+        assert "connection_id: s.connectionId" in sf_config
+        # `s.connectionId` is `state.connectionId` (set by onConnectionChange
+        # reading #rtfConnectionPicker), collected in _collectSettings.
