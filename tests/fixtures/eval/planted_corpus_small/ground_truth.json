@@ -1,0 +1,1580 @@
+{
+  "generator": {
+    "name": "scripts/eval/corpus_gen.py",
+    "version": "1.0.0",
+    "seed": 20260827,
+    "mode": "small",
+    "generated_at": "2026-08-27T20:56:23.826701+00:00"
+  },
+  "groups": [
+    "principal",
+    "associate",
+    "secret-group-c"
+  ],
+  "sites": {
+    "delivery-archive": {
+      "libraries": {
+        "active-engagements": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "completed-engagements": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "client-feedback": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        }
+      }
+    },
+    "proposals-and-pursuits": {
+      "libraries": {
+        "sow-drafts": {
+          "groups": [
+            "principal"
+          ]
+        },
+        "won-proposals": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "pricing-sheets": {
+          "groups": [
+            "secret-group-c"
+          ]
+        }
+      }
+    },
+    "client-services": {
+      "libraries": {
+        "account-notes": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "escalations": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        }
+      }
+    },
+    "firm-operations": {
+      "libraries": {
+        "skills-registry": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "tooling-notes": {
+          "groups": [
+            "principal",
+            "associate"
+          ]
+        },
+        "legal-secret": {
+          "groups": [
+            "secret-group-c"
+          ]
+        }
+      }
+    }
+  },
+  "documents": [
+    {
+      "doc_id": "document:88b5d64187616227",
+      "stable_id": "local:delivery-archive/active-engagements/vantable-systems/ai-value-backlog/sow.md",
+      "name": "sow.md",
+      "path": "delivery-archive/active-engagements/vantable-systems/ai-value-backlog/sow.md",
+      "site": "delivery-archive",
+      "drive": "active-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 776,
+      "created": "2025-11-03T09:00:00+00:00",
+      "modified": "2025-11-03T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "88b5d641876162278d37b2d9e757bc9c8ecd3726361b37d34bcc34165cfe7cdf",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2025-11-03",
+      "doc_type": "sow",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "core-vantable-sow"
+    },
+    {
+      "doc_id": "document:713cbd2d69eb4215",
+      "stable_id": "local:delivery-archive/active-engagements/vantable-systems/ai-value-backlog/kickoff-notes.md",
+      "name": "kickoff-notes.md",
+      "path": "delivery-archive/active-engagements/vantable-systems/ai-value-backlog/kickoff-notes.md",
+      "site": "delivery-archive",
+      "drive": "active-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 276,
+      "created": "2025-11-12T09:00:00+00:00",
+      "modified": "2025-11-12T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "713cbd2d69eb42156e959fd59a3e4c986f58d0b6a74a50c7576db07f7ec81305",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2025-11-12",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": true,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "core-vantable-kickoff"
+    },
+    {
+      "doc_id": "document:9d1c994b95f6c230",
+      "stable_id": "local:delivery-archive/active-engagements/corundum-foods/sell-side-it-dd/summary.md",
+      "name": "summary.md",
+      "path": "delivery-archive/active-engagements/corundum-foods/sell-side-it-dd/summary.md",
+      "site": "delivery-archive",
+      "drive": "active-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 494,
+      "created": "2026-01-05T09:00:00+00:00",
+      "modified": "2026-01-05T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "9d1c994b95f6c230815a4439ef6b4430a9ad9ff0de43a1189a053fd440fb226d",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-01-05",
+      "doc_type": "deliverable",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "core-corundum-dd-summary"
+    },
+    {
+      "doc_id": "document:ac67892af5503545",
+      "stable_id": "local:client-services/account-notes/corundum-foods/client-feedback.md",
+      "name": "client-feedback.md",
+      "path": "client-services/account-notes/corundum-foods/client-feedback.md",
+      "site": "client-services",
+      "drive": "account-notes",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 154,
+      "created": "2026-01-20T09:00:00+00:00",
+      "modified": "2026-01-20T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "ac67892af55035451562e1f0a87ba641a8d57be41e98564c15a06e1fa9d5e4c0",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-01-20",
+      "doc_type": "feedback",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "core-corundum-feedback"
+    },
+    {
+      "doc_id": "document:fd7b800f155d5352",
+      "stable_id": "local:client-services/escalations/corundum-foods/risk-note.md",
+      "name": "risk-note.md",
+      "path": "client-services/escalations/corundum-foods/risk-note.md",
+      "site": "client-services",
+      "drive": "escalations",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 209,
+      "created": "2026-01-22T09:00:00+00:00",
+      "modified": "2026-01-22T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "fd7b800f155d5352bb984dedb6ebd22357c7822d748588cd79872b47db22dfce",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-01-22",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "core-corundum-risk"
+    },
+    {
+      "doc_id": "document:58910be38fe74735",
+      "stable_id": "local:delivery-archive/completed-engagements/osprey-fulfillment-group/ai-value-backlog/delivery-summary.md",
+      "name": "delivery-summary.md",
+      "path": "delivery-archive/completed-engagements/osprey-fulfillment-group/ai-value-backlog/delivery-summary.md",
+      "site": "delivery-archive",
+      "drive": "completed-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 605,
+      "created": "2026-02-20T09:00:00+00:00",
+      "modified": "2026-02-20T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "58910be38fe747358c54bc09960bd42b0f8936ab9f6aa7070b49a269b5c2564b",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-02-20",
+      "doc_type": "deliverable",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": true,
+      "format_shape": "deck",
+      "trap": null,
+      "doc_key": "core-osprey-delivery"
+    },
+    {
+      "doc_id": "document:6e609b2556760c1b",
+      "stable_id": "local:firm-operations/legal-secret/engagement-addenda/vantable-systems-scope-extension.md",
+      "name": "vantable-systems-scope-extension.md",
+      "path": "firm-operations/legal-secret/engagement-addenda/vantable-systems-scope-extension.md",
+      "site": "firm-operations",
+      "drive": "legal-secret",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 133,
+      "created": "2026-04-01T09:00:00+00:00",
+      "modified": "2026-04-01T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "6e609b2556760c1becc3b60bf570dbb50728a7ad0f612cedbeb4a29157ae83cb",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-04-01",
+      "doc_type": "notes",
+      "groups": [
+        "secret-group-c"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "s1-secret-codename"
+    },
+    {
+      "doc_id": "document:29e10f4722690706",
+      "stable_id": "local:proposals-and-pursuits/pricing-sheets/osprey-fulfillment-group/ai-value-backlog-price.md",
+      "name": "ai-value-backlog-price.md",
+      "path": "proposals-and-pursuits/pricing-sheets/osprey-fulfillment-group/ai-value-backlog-price.md",
+      "site": "proposals-and-pursuits",
+      "drive": "pricing-sheets",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 236,
+      "created": "2026-02-15T09:00:00+00:00",
+      "modified": "2026-02-15T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "29e10f47226907060b9af496a84815f1d8730bc834d8c35b3df3e4d3e794cc0c",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-02-15",
+      "doc_type": "other",
+      "groups": [
+        "secret-group-c"
+      ],
+      "format": "md",
+      "format_fallback": true,
+      "format_shape": "table-heavy",
+      "trap": null,
+      "doc_key": "s2-secret-price"
+    },
+    {
+      "doc_id": "document:f1371df279019c06",
+      "stable_id": "local:firm-operations/legal-secret/performance/priya-shenvi-review-2026.md",
+      "name": "priya-shenvi-review-2026.md",
+      "path": "firm-operations/legal-secret/performance/priya-shenvi-review-2026.md",
+      "site": "firm-operations",
+      "drive": "legal-secret",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 146,
+      "created": "2026-04-10T09:00:00+00:00",
+      "modified": "2026-04-10T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "f1371df279019c060db76d7cfdb5d424f6fb2d6901a84eeda8f0dbb30a891bc5",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-04-10",
+      "doc_type": "notes",
+      "groups": [
+        "secret-group-c"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "s3-secret-priya-review"
+    },
+    {
+      "doc_id": "document:95f5dfadf5596c63",
+      "stable_id": "local:delivery-archive/active-engagements/halyard-precision/erp-rollout/kickoff-notes.md",
+      "name": "kickoff-notes.md",
+      "path": "delivery-archive/active-engagements/halyard-precision/erp-rollout/kickoff-notes.md",
+      "site": "delivery-archive",
+      "drive": "active-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 227,
+      "created": "2026-03-05T09:00:00+00:00",
+      "modified": "2026-03-05T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "95f5dfadf5596c63a431492ba7fe30e62a503736582045aef3fb4780b1c623fb",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-05",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "s4-halyard-kickoff-readable"
+    },
+    {
+      "doc_id": "document:0dbb33e8459f8ac5",
+      "stable_id": "local:firm-operations/legal-secret/confidential/halyard-precision-manufacturing-client-brief.md",
+      "name": "halyard-precision-manufacturing-client-brief.md",
+      "path": "firm-operations/legal-secret/confidential/halyard-precision-manufacturing-client-brief.md",
+      "site": "firm-operations",
+      "drive": "legal-secret",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 271,
+      "created": "2026-03-06T09:00:00+00:00",
+      "modified": "2026-03-06T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "0dbb33e8459f8ac5639681a17866a2c4ae0f9d2ab2da1f6367eb28cfedcffb41",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-06",
+      "doc_type": "notes",
+      "groups": [
+        "secret-group-c"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "s4-halyard-client-secret"
+    },
+    {
+      "doc_id": "document:26c98825f0d69e9e",
+      "stable_id": "local:firm-operations/tooling-notes/signoffs/osprey-scope-signoff-scan.pdf",
+      "name": "osprey-scope-signoff-scan.pdf",
+      "path": "firm-operations/tooling-notes/signoffs/osprey-scope-signoff-scan.pdf",
+      "site": "firm-operations",
+      "drive": "tooling-notes",
+      "source": "local",
+      "mime": "application/pdf",
+      "size": 20288,
+      "created": "2026-02-25T09:00:00+00:00",
+      "modified": "2026-02-25T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "26c98825f0d69e9e03ba36626035ee87d321e4ef1fa4669315629415c83ddd1d",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-02-25",
+      "doc_type": "other",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "pdf",
+      "format_fallback": false,
+      "format_shape": "scan",
+      "trap": "scan",
+      "doc_key": "trap-scan-signoff"
+    },
+    {
+      "doc_id": "document:16bf90bc7fe22c45",
+      "stable_id": "local:delivery-archive/completed-engagements/osprey-fulfillment-group/ai-value-backlog/retro.md",
+      "name": "retro.md",
+      "path": "delivery-archive/completed-engagements/osprey-fulfillment-group/ai-value-backlog/retro.md",
+      "site": "delivery-archive",
+      "drive": "completed-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 189,
+      "created": "2026-03-15T09:00:00+00:00",
+      "modified": "2026-03-15T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "16bf90bc7fe22c45ff20b160c7b9d44da28d083a701a1691e6da4f64d5c47c54",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-15",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "duplicate",
+      "doc_key": "trap-duplicate-a"
+    },
+    {
+      "doc_id": "document:16bf90bc7fe22c45",
+      "stable_id": "local:client-services/account-notes/osprey-fulfillment-group/retro-copy.md",
+      "name": "retro-copy.md",
+      "path": "client-services/account-notes/osprey-fulfillment-group/retro-copy.md",
+      "site": "client-services",
+      "drive": "account-notes",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 189,
+      "created": "2026-03-15T09:00:00+00:00",
+      "modified": "2026-03-15T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "16bf90bc7fe22c45ff20b160c7b9d44da28d083a701a1691e6da4f64d5c47c54",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-15",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "duplicate",
+      "doc_key": "trap-duplicate-b"
+    },
+    {
+      "doc_id": "document:9e6a7797df9a61e3",
+      "stable_id": "local:delivery-archive/active-engagements/corundum-foods/sell-side-it-dd/status-jan.md",
+      "name": "status-jan.md",
+      "path": "delivery-archive/active-engagements/corundum-foods/sell-side-it-dd/status-jan.md",
+      "site": "delivery-archive",
+      "drive": "active-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 120,
+      "created": "2026-01-15T09:00:00+00:00",
+      "modified": "2026-01-15T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "9e6a7797df9a61e39678b23445e7c71acb15c3f6104417e98fd27427e5f76b1e",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-01-15",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "succession",
+      "doc_key": "trap-succession-v1"
+    },
+    {
+      "doc_id": "document:c5a75cb1db7bbdbc",
+      "stable_id": "local:delivery-archive/completed-engagements/corundum-foods/sell-side-it-dd/status-may.md",
+      "name": "status-may.md",
+      "path": "delivery-archive/completed-engagements/corundum-foods/sell-side-it-dd/status-may.md",
+      "site": "delivery-archive",
+      "drive": "completed-engagements",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 113,
+      "created": "2026-05-20T09:00:00+00:00",
+      "modified": "2026-05-20T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "c5a75cb1db7bbdbcb03ccb102d3902a4f9e669eeb4f9d03afa6c5181267d5780",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-05-20",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "succession",
+      "doc_key": "trap-succession-v2"
+    },
+    {
+      "doc_id": "document:e90b0de33c27541d",
+      "stable_id": "local:client-services/account-notes/osprey-fulfillment-group/ownership-note-a.md",
+      "name": "ownership-note-a.md",
+      "path": "client-services/account-notes/osprey-fulfillment-group/ownership-note-a.md",
+      "site": "client-services",
+      "drive": "account-notes",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 105,
+      "created": "2026-03-01T09:00:00+00:00",
+      "modified": "2026-03-01T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "e90b0de33c27541d48d2db3e4da5f98577fcc5aa056820e2802d1fe937cf6fa2",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-01",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "contradiction",
+      "doc_key": "trap-contradiction-a"
+    },
+    {
+      "doc_id": "document:759834613640bd4e",
+      "stable_id": "local:client-services/escalations/osprey-fulfillment-group/ownership-note-b.md",
+      "name": "ownership-note-b.md",
+      "path": "client-services/escalations/osprey-fulfillment-group/ownership-note-b.md",
+      "site": "client-services",
+      "drive": "escalations",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 130,
+      "created": "2026-03-01T09:00:00+00:00",
+      "modified": "2026-03-01T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "759834613640bd4eeca96268818ec0f1385d4ea18f80321b21e041d42a100032",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-03-01",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "contradiction",
+      "doc_key": "trap-contradiction-b"
+    },
+    {
+      "doc_id": "document:49b055c74b60773e",
+      "stable_id": "local:proposals-and-pursuits/won-proposals/corundum-foods-inc/phase-2-kickoff.md",
+      "name": "phase-2-kickoff.md",
+      "path": "proposals-and-pursuits/won-proposals/corundum-foods-inc/phase-2-kickoff.md",
+      "site": "proposals-and-pursuits",
+      "drive": "won-proposals",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 141,
+      "created": "2026-06-01T09:00:00+00:00",
+      "modified": "2026-06-01T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "49b055c74b60773e38f4bd3fc9d7cc805eaec0d276787f8cb5de8b1439a33d9a",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-06-01",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "entity_resolution",
+      "doc_key": "trap-er-corundum-variant"
+    },
+    {
+      "doc_id": "document:0f11ca3ad678d626",
+      "stable_id": "local:firm-operations/tooling-notes/postmortems/vantable-ai-value-backlog-postmortem.md",
+      "name": "vantable-ai-value-backlog-postmortem.md",
+      "path": "firm-operations/tooling-notes/postmortems/vantable-ai-value-backlog-postmortem.md",
+      "site": "firm-operations",
+      "drive": "tooling-notes",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 195,
+      "created": "2026-06-10T09:00:00+00:00",
+      "modified": "2026-06-10T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "0f11ca3ad678d62647cda8ca0253ce1cffeac9abb0726ee1fdaddfb79dddb92b",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-06-10",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": "fabrication",
+      "doc_key": "trap-fabrication-postmortem"
+    },
+    {
+      "doc_id": "document:25e610dce18e6333",
+      "stable_id": "local:client-services/account-notes/vantable-systems/kickoff-attendees.md",
+      "name": "kickoff-attendees.md",
+      "path": "client-services/account-notes/vantable-systems/kickoff-attendees.md",
+      "site": "client-services",
+      "drive": "account-notes",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 133,
+      "created": "2025-11-11T09:00:00+00:00",
+      "modified": "2025-11-11T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "25e610dce18e633370441e7748deb19a9ceb2979acf5354a5d523ba7cc345c7c",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2025-11-11",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": null,
+      "trap": null,
+      "doc_key": "an1-canary-contact"
+    },
+    {
+      "doc_id": "document:3e608a3ba2d269a8",
+      "stable_id": "local:firm-operations/skills-registry/staff/tomas-padrak-workshop-note.md",
+      "name": "tomas-padrak-workshop-note.md",
+      "path": "firm-operations/skills-registry/staff/tomas-padrak-workshop-note.md",
+      "site": "firm-operations",
+      "drive": "skills-registry",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 131,
+      "created": "2026-04-15T09:00:00+00:00",
+      "modified": "2026-04-15T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "3e608a3ba2d269a8433a74a077ecbabe78f7df2c42fcbfb703cd85f146520f47",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-04-15",
+      "doc_type": "notes",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": "czech-diacritics",
+      "trap": null,
+      "doc_key": "an2-czech-workshop-nominative"
+    },
+    {
+      "doc_id": "document:b6bc0f71bd98f373",
+      "stable_id": "local:firm-operations/skills-registry/staff/tomas-padrak-feedback-dative.md",
+      "name": "tomas-padrak-feedback-dative.md",
+      "path": "firm-operations/skills-registry/staff/tomas-padrak-feedback-dative.md",
+      "site": "firm-operations",
+      "drive": "skills-registry",
+      "source": "local",
+      "mime": "text/markdown",
+      "size": 109,
+      "created": "2026-04-22T09:00:00+00:00",
+      "modified": "2026-04-22T09:00:00+00:00",
+      "author": "delivery-team@meridianpeak.example",
+      "last_editor": "delivery-team@meridianpeak.example",
+      "sha256": "b6bc0f71bd98f373c9e46e6b3e6908d94adc4f05b2917f9c8f1408de17a74305",
+      "extracted_path": null,
+      "extract_status": "ok",
+      "crawled_at": null,
+      "document_date": "2026-04-22",
+      "doc_type": "feedback",
+      "groups": [
+        "principal",
+        "associate"
+      ],
+      "format": "md",
+      "format_fallback": false,
+      "format_shape": "czech-diacritics",
+      "trap": null,
+      "doc_key": "an2-czech-feedback-dative"
+    }
+  ],
+  "nodes": [
+    {
+      "claim_key": "core-1",
+      "id": "engagement:vantable-systems-ai-value-backlog",
+      "type": "engagement",
+      "attrs": {
+        "name": "Vantable Systems \u2014 AI Value Backlog",
+        "sow_date": "2025-11-03"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Meridian Peak Advisors will deliver the AI Value Backlog engagement for Vantable Systems, with a signed SOW date of November 3, 2025."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-2",
+      "id": "client:vantable-systems",
+      "type": "client",
+      "attrs": {
+        "name": "Vantable Systems",
+        "revenue_usd_estimate": 210000000,
+        "ownership": "PE-owned"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Vantable Systems is a PE-owned industrial manufacturer with an estimated $210M in annual revenue."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-8",
+      "id": "finding:vantable-aivb-headline",
+      "type": "finding",
+      "attrs": {
+        "finding_type": "headline",
+        "text": "The AI Value Backlog identified $1.4M in annualized automation opportunity across three business units."
+      },
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "The AI Value Backlog identified $1.4M in annualized automation opportunity across three business units."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-12",
+      "id": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "engagement",
+      "attrs": {
+        "name": "Corundum Foods \u2014 Sell-side IT Due Diligence",
+        "sow_date": "2026-01-05"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Meridian Peak Advisors completed a Sell-side IT Due Diligence engagement for Corundum Foods, a food manufacturer with roughly $96M in estimated revenue."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-13",
+      "id": "client:corundum-foods",
+      "type": "client",
+      "attrs": {
+        "name": "Corundum Foods",
+        "revenue_usd_estimate": 96000000,
+        "ownership": "PE-owned"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Meridian Peak Advisors completed a Sell-side IT Due Diligence engagement for Corundum Foods, a food manufacturer with roughly $96M in estimated revenue."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-16",
+      "id": "industry:food-manufacturing",
+      "type": "industry",
+      "attrs": {
+        "name": "Food Manufacturing",
+        "parent": "Manufacturing"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Corundum Foods sits in the Food Manufacturing industry, a subsegment of Manufacturing."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-20",
+      "id": "finding:corundum-dd-client-feedback",
+      "type": "finding",
+      "attrs": {
+        "finding_type": "client_feedback",
+        "text": "\"The due diligence team gave us a clear-eyed view of the technology risk before we signed.\" \u2014 Corundum Foods, CFO"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:ac67892af5503545",
+          "quote": "\"The due diligence team gave us a clear-eyed view of the technology risk before we signed.\" \u2014 Corundum Foods, CFO"
+        }
+      ]
+    },
+    {
+      "claim_key": "core-22",
+      "id": "finding:corundum-dd-edi-risk",
+      "type": "finding",
+      "attrs": {
+        "finding_type": "risk",
+        "text": "Legacy EDI integration remains a single point of failure through the transition period."
+      },
+      "evidence": [
+        {
+          "doc_id": "document:fd7b800f155d5352",
+          "quote": "Legacy EDI integration remains a single point of failure through the transition period."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-25",
+      "id": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "engagement",
+      "attrs": {
+        "name": "Osprey Fulfillment Group \u2014 AI Value Backlog"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Meridian Peak Advisors kicked off the AI Value Backlog engagement for Osprey Fulfillment Group in February 2026."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-29",
+      "id": "finding:osprey-aivb-headline",
+      "type": "finding",
+      "attrs": {
+        "finding_type": "headline",
+        "text": "Consolidating fulfillment reporting onto Snowflake cut month-end close by four days."
+      },
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Consolidating fulfillment reporting onto Snowflake cut month-end close by four days."
+        }
+      ]
+    },
+    {
+      "claim_key": "s1-1",
+      "id": "engagement:vantable-systems-ai-value-backlog",
+      "type": "engagement",
+      "attrs": {
+        "price_note": "Internally codenamed Project Umbra-Kestrel for the follow-on phase."
+      },
+      "evidence": [
+        {
+          "doc_id": "document:6e609b2556760c1b",
+          "quote": "The confidential follow-on phase is internally codenamed Project Umbra-Kestrel."
+        }
+      ]
+    },
+    {
+      "claim_key": "s2-1",
+      "id": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "engagement",
+      "attrs": {
+        "price_usd": 412000
+      },
+      "evidence": [
+        {
+          "doc_id": "document:29e10f4722690706",
+          "quote": "The Osprey Fulfillment Group AI Value Backlog engagement is priced at $412,000."
+        }
+      ]
+    },
+    {
+      "claim_key": "s4-1",
+      "id": "engagement:halyard-precision-manufacturing-erp-rollout",
+      "type": "engagement",
+      "attrs": {
+        "name": "Halyard Precision Manufacturing \u2014 ERP Rollout",
+        "start_date": "2026-03-01"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:95f5dfadf5596c63",
+          "quote": "Dax Okonkwo-Reyes is the lead consultant on the ERP Rollout engagement that began March 1, 2026."
+        }
+      ]
+    },
+    {
+      "claim_key": "s4-5",
+      "id": "client:halyard-precision-manufacturing",
+      "type": "client",
+      "attrs": {
+        "name": "Halyard Precision Manufacturing"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:0dbb33e8459f8ac5",
+          "quote": "Halyard Precision Manufacturing has asked that its name not be shared outside the deal team until the transaction closes."
+        }
+      ]
+    },
+    {
+      "claim_key": "trap-succession-1",
+      "id": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "engagement",
+      "attrs": {
+        "status": "active"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:9e6a7797df9a61e3",
+          "quote": "The Corundum Foods Sell-side IT Due Diligence engagement is currently active."
+        }
+      ]
+    },
+    {
+      "claim_key": "trap-succession-2",
+      "id": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "engagement",
+      "attrs": {
+        "status": "completed"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:c5a75cb1db7bbdbc",
+          "quote": "The Corundum Foods Sell-side IT Due Diligence engagement is now completed."
+        }
+      ]
+    },
+    {
+      "claim_key": "trap-er-1",
+      "id": "client:corundum-foods-inc",
+      "type": "client",
+      "attrs": {
+        "name": "Corundum Foods, Inc."
+      },
+      "evidence": [
+        {
+          "doc_id": "document:49b055c74b60773e",
+          "quote": "Corundum Foods, Inc. engaged Meridian Peak Advisors for a second phase of NetSuite rollout work."
+        }
+      ]
+    },
+    {
+      "claim_key": "an2-1",
+      "id": "person:tomas-padrak",
+      "type": "person",
+      "attrs": {
+        "name": "Tom\u00e1\u0161 Padr\u00e1k",
+        "org": "Meridian Peak Advisors",
+        "title": "Data Architect"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:3e608a3ba2d269a8",
+          "quote": "Tom\u00e1\u0161 Padr\u00e1k vedl intern\u00ed workshop o datov\u00e9 architektu\u0159e pro t\u00fdm Corundum Foods."
+        }
+      ]
+    },
+    {
+      "claim_key": "an2-2",
+      "id": "person:tomas-padrak",
+      "type": "person",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:b6bc0f71bd98f373",
+          "quote": "Zp\u011btn\u00e1 vazba z workshopu byla zasl\u00e1na Tom\u00e1\u0161i Padr\u00e1kovi k p\u0159ipom\u00ednk\u00e1m."
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "claim_key": "core-3",
+      "src": "client:vantable-systems",
+      "type": "in_industry",
+      "dst": "industry:manufacturing",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Vantable Systems operates in the Manufacturing industry."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-4",
+      "src": "client:vantable-systems",
+      "type": "owned_by",
+      "dst": "sponsor:anchorstone-capital",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Vantable Systems is a portfolio company of Anchorstone Capital."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-5",
+      "src": "engagement:vantable-systems-ai-value-backlog",
+      "type": "of_type",
+      "dst": "service_offering:ai-value-backlog",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "This engagement is scoped as an AI Value Backlog under Meridian Peak Advisors' standard service catalog."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-6",
+      "src": "person:priya-shenvi",
+      "type": "worked_on",
+      "dst": "engagement:vantable-systems-ai-value-backlog",
+      "attrs": {
+        "role": "Engagement Lead"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Priya Shenvi is the Engagement Lead on the Vantable Systems AI Value Backlog engagement."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-7",
+      "src": "person:priya-shenvi",
+      "type": "has_skill",
+      "dst": "skill:data-architecture",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "Priya Shenvi brings deep Data Architecture experience to the engagement."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-9",
+      "src": "engagement:vantable-systems-ai-value-backlog",
+      "type": "has_finding",
+      "dst": "finding:vantable-aivb-headline",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:88b5d64187616227",
+          "quote": "The AI Value Backlog identified $1.4M in annualized automation opportunity across three business units."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-10",
+      "src": "engagement:vantable-systems-ai-value-backlog",
+      "type": "used_tool",
+      "dst": "tool:keboola",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:713cbd2d69eb4215",
+          "quote": "The delivery team will use Keboola to build the data pipelines for this engagement."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-11",
+      "src": "client:vantable-systems",
+      "type": "uses_technology",
+      "dst": "tool:netsuite",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:713cbd2d69eb4215",
+          "quote": "Vantable Systems already runs NetSuite as its core ERP platform."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-14",
+      "src": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "for_client",
+      "dst": "client:corundum-foods",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Meridian Peak Advisors completed a Sell-side IT Due Diligence engagement for Corundum Foods, a food manufacturer with roughly $96M in estimated revenue."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-15",
+      "src": "client:corundum-foods",
+      "type": "in_industry",
+      "dst": "industry:food-manufacturing",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Corundum Foods sits in the Food Manufacturing industry, a subsegment of Manufacturing."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-17",
+      "src": "client:corundum-foods",
+      "type": "owned_by",
+      "dst": "sponsor:redwater-partners",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Corundum Foods is owned by Redwater Partners."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-18",
+      "src": "person:dax-okonkwo-reyes",
+      "type": "worked_on",
+      "dst": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "attrs": {
+        "role": "Senior Consultant"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Dax Okonkwo-Reyes served as Senior Consultant on the Corundum Foods engagement."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-19",
+      "src": "person:dax-okonkwo-reyes",
+      "type": "has_skill",
+      "dst": "skill:netsuite",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:9d1c994b95f6c230",
+          "quote": "Dax Okonkwo-Reyes has hands-on NetSuite implementation experience."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-21",
+      "src": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "has_finding",
+      "dst": "finding:corundum-dd-client-feedback",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:ac67892af5503545",
+          "quote": "\"The due diligence team gave us a clear-eyed view of the technology risk before we signed.\" \u2014 Corundum Foods, CFO"
+        }
+      ]
+    },
+    {
+      "claim_key": "core-23",
+      "src": "engagement:corundum-foods-sell-side-it-due-diligence",
+      "type": "has_finding",
+      "dst": "finding:corundum-dd-edi-risk",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:fd7b800f155d5352",
+          "quote": "Legacy EDI integration remains a single point of failure through the transition period."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-24",
+      "src": "person:dax-okonkwo-reyes",
+      "type": "has_skill",
+      "dst": "skill:risk-assessment",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:fd7b800f155d5352",
+          "quote": "Dax Okonkwo-Reyes flagged the integration risk based on his Risk Assessment background."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-26",
+      "src": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "for_client",
+      "dst": "client:osprey-fulfillment-group",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Meridian Peak Advisors kicked off the AI Value Backlog engagement for Osprey Fulfillment Group in February 2026."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-27",
+      "src": "client:osprey-fulfillment-group",
+      "type": "in_industry",
+      "dst": "industry:logistics",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Osprey Fulfillment Group operates in the Logistics industry."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-28",
+      "src": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "of_type",
+      "dst": "service_offering:ai-value-backlog",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "This work follows Meridian Peak Advisors' standard AI Value Backlog service offering."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-30",
+      "src": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "has_finding",
+      "dst": "finding:osprey-aivb-headline",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Consolidating fulfillment reporting onto Snowflake cut month-end close by four days."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-31",
+      "src": "client:osprey-fulfillment-group",
+      "type": "uses_technology",
+      "dst": "tool:snowflake",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "Consolidating fulfillment reporting onto Snowflake cut month-end close by four days."
+        }
+      ]
+    },
+    {
+      "claim_key": "core-32",
+      "src": "engagement:osprey-fulfillment-group-ai-value-backlog",
+      "type": "used_tool",
+      "dst": "tool:keboola",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:58910be38fe74735",
+          "quote": "The delivery team used Keboola for the underlying data integration work."
+        }
+      ]
+    },
+    {
+      "claim_key": "s3-1",
+      "src": "person:priya-shenvi",
+      "type": "has_skill",
+      "dst": "skill:netsuite",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:f1371df279019c06",
+          "quote": "Priya Shenvi also demonstrated strong NetSuite configuration skills during the review period."
+        }
+      ]
+    },
+    {
+      "claim_key": "s4-2",
+      "src": "person:dax-okonkwo-reyes",
+      "type": "worked_on",
+      "dst": "engagement:halyard-precision-manufacturing-erp-rollout",
+      "attrs": {
+        "role": "Lead Consultant"
+      },
+      "evidence": [
+        {
+          "doc_id": "document:95f5dfadf5596c63",
+          "quote": "Dax Okonkwo-Reyes is the lead consultant on the ERP Rollout engagement that began March 1, 2026."
+        }
+      ]
+    },
+    {
+      "claim_key": "s4-3",
+      "src": "engagement:halyard-precision-manufacturing-erp-rollout",
+      "type": "of_type",
+      "dst": "service_offering:erp-rollout",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:95f5dfadf5596c63",
+          "quote": "This engagement follows Meridian Peak Advisors' ERP Rollout service offering."
+        }
+      ]
+    },
+    {
+      "claim_key": "s4-4",
+      "src": "engagement:halyard-precision-manufacturing-erp-rollout",
+      "type": "for_client",
+      "dst": "client:halyard-precision-manufacturing",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:0dbb33e8459f8ac5",
+          "quote": "The ERP Rollout engagement is being delivered for Halyard Precision Manufacturing."
+        }
+      ]
+    },
+    {
+      "claim_key": "trap-contradiction-1",
+      "src": "client:osprey-fulfillment-group",
+      "type": "owned_by",
+      "dst": "sponsor:anchorstone-capital",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:e90b0de33c27541d",
+          "quote": "Osprey Fulfillment Group is owned by Anchorstone Capital."
+        }
+      ]
+    },
+    {
+      "claim_key": "trap-contradiction-2",
+      "src": "client:osprey-fulfillment-group",
+      "type": "owned_by",
+      "dst": "sponsor:redwater-partners",
+      "attrs": {},
+      "evidence": [
+        {
+          "doc_id": "document:759834613640bd4e",
+          "quote": "Osprey Fulfillment Group is a portfolio company of Redwater Partners."
+        }
+      ]
+    }
+  ],
+  "prepared_false_claims": [
+    {
+      "claim_key": "trap-fabrication-1",
+      "subject_kind": "fact",
+      "subject_id": "client:vantable-systems",
+      "attrs": {
+        "revenue_usd_estimate": 999000000
+      },
+      "doc_id": "document:0f11ca3ad678d626",
+      "quote": "Vantable Systems reported prior-year revenue of $999 million.",
+      "reason": "quote is not a substring of the document's text \u2014 the verbatim gate (EQ1) must reject it"
+    }
+  ],
+  "planted_elements": {
+    "s_fixtures": {
+      "S1": {
+        "description": "A secret-group-c-only value contributes nothing to a principal/associate caller.",
+        "planted_value": "Project Umbra-Kestrel",
+        "doc_key": "s1-secret-codename",
+        "doc_id": "document:6e609b2556760c1b",
+        "claim_key": "s1-1"
+      },
+      "S2": {
+        "description": "One engagement fact, two claims: existence readable, price_usd secret.",
+        "readable_claim_key": "core-25",
+        "secret_claim_key": "s2-1",
+        "attribute": "price_usd",
+        "value": 412000
+      },
+      "S3": {
+        "description": "has_skill edge whose only claim is secret, between two independently readable facts.",
+        "claim_key": "s3-1",
+        "src": "person:priya-shenvi",
+        "dst": "skill:netsuite"
+      },
+      "S4": {
+        "description": "A -[worked_on]-> B -[for_client]-> C chain; C's evidence (node + incoming edge) is entirely secret.",
+        "a": "person:dax-okonkwo-reyes",
+        "b": "engagement:halyard-precision-manufacturing-erp-rollout",
+        "c": "client:halyard-precision-manufacturing",
+        "readable_claim_keys": [
+          "s4-1",
+          "s4-2",
+          "s4-3"
+        ],
+        "secret_claim_keys": [
+          "s4-4",
+          "s4-5"
+        ]
+      }
+    },
+    "traps": {
+      "scan": {
+        "description": "Image-only PDF; text exists only as pixels.",
+        "doc_key": "trap-scan-signoff",
+        "doc_id": "document:26c98825f0d69e9e",
+        "planted_text": "Signed off by Priya Shenvi on 2026-02-25: Osprey Fulfillment Group engagement scope approved."
+      },
+      "duplicate": {
+        "description": "Byte-identical content at two paths -> same sha256 / doc_id, distinct stable_id.",
+        "doc_keys": [
+          "trap-duplicate-a",
+          "trap-duplicate-b"
+        ],
+        "doc_ids": [
+          "document:16bf90bc7fe22c45",
+          "document:16bf90bc7fe22c45"
+        ]
+      },
+      "succession": {
+        "description": "Same subject, different document_date, changed value -> later wins as current, earlier stays queryable as history, no conflict entry.",
+        "subject_id": "engagement:corundum-foods-sell-side-it-due-diligence",
+        "attribute": "status",
+        "claim_keys": [
+          "trap-succession-1",
+          "trap-succession-2"
+        ],
+        "earlier_value": "active",
+        "later_value": "completed"
+      },
+      "contradiction": {
+        "description": "Same subject, same document_date, incompatible values -> both kept, review item, no silent pick.",
+        "subject_id": "client:osprey-fulfillment-group",
+        "edge_type": "owned_by",
+        "claim_keys": [
+          "trap-contradiction-1",
+          "trap-contradiction-2"
+        ],
+        "document_date": "2026-03-01",
+        "values": [
+          "sponsor:anchorstone-capital",
+          "sponsor:redwater-partners"
+        ]
+      },
+      "entity_resolution": {
+        "description": "Punctuation/spacing variant of the same real client -> expected merge, reversible.",
+        "canonical_id": "client:corundum-foods",
+        "variant_id": "client:corundum-foods-inc",
+        "claim_key": "trap-er-1"
+      },
+      "fabrication": {
+        "description": "A prepared false claim whose quote is NOT a substring of the document's text -> the verbatim gate (EQ1) must reject it.",
+        "doc_key": "trap-fabrication-postmortem",
+        "doc_id": "document:0f11ca3ad678d626",
+        "claim_key": "trap-fabrication-1"
+      }
+    },
+    "anonymization": {
+      "AN1_canary": {
+        "description": "A unique planted name that must appear nowhere in Agnes once the anonymizer runs ahead of ingestion.",
+        "value": "Bartholomew Quillfeather Ashgrove",
+        "doc_key": "an1-canary-contact",
+        "doc_id": "document:25e610dce18e6333"
+      },
+      "AN2_pair": {
+        "description": "Same invented Czech person in two inflected surface forms across two documents -> expected one subject.",
+        "canonical_id": "person:tomas-padrak",
+        "canonical_name": "Tom\u00e1\u0161 Padr\u00e1k",
+        "surface_forms": {
+          "nominative": "Tom\u00e1\u0161 Padr\u00e1k",
+          "dative": "Tom\u00e1\u0161i Padr\u00e1kovi"
+        },
+        "doc_keys": [
+          "an2-czech-workshop-nominative",
+          "an2-czech-feedback-dative"
+        ],
+        "doc_ids": [
+          "document:3e608a3ba2d269a8",
+          "document:b6bc0f71bd98f373"
+        ],
+        "claim_keys": [
+          "an2-1",
+          "an2-2"
+        ]
+      }
+    }
+  },
+  "counts": {
+    "documents": 23,
+    "planted_documents": 23,
+    "filler_documents": 0,
+    "sites": 4,
+    "nodes": 19,
+    "edges": 28
+  }
+}

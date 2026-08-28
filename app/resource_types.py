@@ -659,12 +659,23 @@ def _collection_blocks() -> List[Block]:
     Collections are bring-your-files containers (v77). One synthetic block
     ``"Collections"`` holds all live (non-soft-deleted) corpora; the
     ``resource_id`` is ``file_corpora.id``.
+
+    Each item carries ``grant_count`` — the number of groups (any group, not
+    just the one the admin has selected) currently granted this collection —
+    computed ONCE here rather than per-consumer, so every list built from
+    this projection agrees on which collections have zero grants (spec
+    §13.2: "a collection with no granted group carries a visible '⚠ nobody'
+    badge in every list that shows it"). The admin /access page renders the
+    badge off this field for `type_key === 'collection'`.
     """
-    from src.repositories import file_corpora_repo
+    from src.repositories import file_corpora_repo, resource_grants_repo
 
     rows = file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT)
     if not rows:
         return []
+    grant_counts: dict[str, int] = {}
+    for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value):
+        grant_counts[g["resource_id"]] = grant_counts.get(g["resource_id"], 0) + 1
     return [
         {
             "id": "collections",
@@ -675,6 +686,7 @@ def _collection_blocks() -> List[Block]:
                     "name": r["name"],
                     "slug": r.get("slug"),
                     "description": r.get("description"),
+                    "grant_count": grant_counts.get(r["id"], 0),
                 }
                 for r in rows
             ],

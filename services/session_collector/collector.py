@@ -15,9 +15,10 @@ Design principles:
 
 TODO(scheduler-v2): In docker-compose.yml this service is a one-shot process
 restarted by Docker (`restart: unless-stopped`), which is effectively a tight
-boot loop. Replace with proper cadence: either an internal `while True: scan;
-sleep(N)` loop, or wire into services/scheduler/__main__.py JOBS list with an
-admin endpoint /api/admin/collect-sessions.
+boot loop (tracked in #221). The other half of this TODO — wiring into
+services/scheduler/__main__.py's JOBS list and exposing an admin endpoint —
+has landed: see the "session-collector" job kind in the scheduler and
+POST /api/admin/run-session-collector in app/api/admin.py.
 """
 
 import logging
@@ -138,9 +139,7 @@ def run(dry_run: bool = False, verbose: bool = False) -> tuple[int, dict]:
     # populate /home/*/, and the data-ops warning there is load-bearing
     # for catching missing-group mis-deploys.
     if os.environ.get("AGNES_SKIP_LEGACY_COLLECTOR", "").strip() in ("1", "true", "TRUE"):
-        logger.debug(
-            "AGNES_SKIP_LEGACY_COLLECTOR set; skipping legacy /home/*/user/sessions/ scan"
-        )
+        logger.debug("AGNES_SKIP_LEGACY_COLLECTOR set; skipping legacy /home/*/user/sessions/ scan")
         return 0, {
             "users_processed": 0,
             "files_copied": 0,

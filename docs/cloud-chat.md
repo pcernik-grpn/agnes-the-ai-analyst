@@ -665,6 +665,40 @@ docstring):
 - **Single-gateway deployments only** (like the docker provider): the
   cross-gateway takeover path assumes a destroyable remote sandbox, which
   this provider does not have.
+- **Session files are served from the engine, when the engine exposes
+  them.** The chat's **Files** button lists the engine sandbox's files by
+  proxying the engine's own file browser with the session JWT (wire
+  contract below); an engine build without those routes degrades to an
+  in-UI "the engine doesn't expose session files yet" notice — never to the
+  host session dir, which under this provider holds only workspace-template
+  symlinks, not session output. Note the engine's browser deliberately
+  hides dotfile trees (`.claude`, `.git`, …), so a skill must write
+  deliverables to the workspace root or an `outputs/` directory to make
+  them downloadable.
+
+### Session files — engine wire contract
+
+What Agnes calls (`app/chat/kai_engine_files.py`; the stub in
+`services/kai_engine_stub` is the executable form of this contract):
+
+```
+GET {kai_agent_url}/api/chat/{chat_id}/sandbox/files?path=<rel dir>
+    Auth: Authorization: Bearer <session JWT>   (HS256, KAI_HOST_JWT_SECRET,
+          same iss/aud as every engine call; the engine binds the token's
+          scope_id claim to the chat id for host-JWT callers)
+    200 → {"entries": [{"name", "path", "type": "file"|"dir", "size"?}]}
+          (one directory level per call, engine-side filtered)
+    404 → unknown chat, or an engine build without the routes — Agnes
+          deliberately collapses both into supported:false, no body sniffing
+
+GET {kai_agent_url}/api/chat/{chat_id}/sandbox/file/download?path=<rel path>
+    Auth: same.
+    200 → raw bytes. The engine's Content-Type/-Disposition are advisory:
+          Agnes re-derives the media type from the filename (active content
+          pinned to application/octet-stream) and always serves
+          attachment + nosniff.
+    404 → unknown chat or path.
+```
 
 ## Choosing a provider
 
@@ -683,6 +717,7 @@ agent loop and the sandbox live.
 | Egress control | the engine's own sandbox policy | `docker_egress_mode: open / none / allowlist` |
 | Host prerequisites | engine sidecar + `KAI_HOST_JWT_SECRET` | Docker daemon + apps-runner sidecar + operator-built image |
 | Marketplace delivery | flattened project components | real Claude Code plugins |
+| Session files ("Files" button) | proxied from the engine's sandbox file browser (degrades honestly on an engine without the routes) | host session dir |
 | Multi-gateway | single-gateway only | single-gateway only |
 
 Rules of thumb: run the default `kai-agent` when the deployment already
@@ -753,6 +788,32 @@ hard-coded Sonnet prices in `app/chat/manager.py` — under Vertex this stays
 the same approximation it is on the first-party API.
 
 ## Operator setup details
+
+### Rolling out an engine upgrade (kai-agent provider)
+
+The engine is not part of this repository or its release train, so a feature
+that spans both sides (the session-files download route is the canonical
+example) is **two independent rollouts**:
+
+- **Agnes half** rides the normal release process — daily cut → tag →
+  instance auto-upgrade. Nothing manual.
+- **Engine half, per deployment.** The canonical image is built by the
+  engine repository's own CI into its own registry, which Agnes VMs cannot
+  pull from. Each deployment's infra repo **mirrors the pinned tag** into a
+  registry the VM's service account can read and pins the full image ref via
+  the `customer-instance` module's `kai_agent_image`. Upgrading =
+  `docker pull` the new tag from the canonical registry, retag + push into
+  the deployment's mirror (keep the upstream tag name for traceability),
+  bump the pin, `terraform apply`. **Immutable pins only** — the VM's
+  auto-upgrade tick re-pulls every cycle, so a floating tag makes rollouts
+  non-reproducible.
+- Deployments where the engine also serves other hosts (a platform
+  assistant) are owned by the engine repository's own CI/CD and need nothing
+  from here.
+- **Version skew between the two halves is expected and safe by design**:
+  Agnes features degrade when the engine predates a route (session-file
+  downloads 404, the listing reports `supported: false`), so the merge and
+  rollout order of the two repositories does not matter.
 
 ### Keep the sandbox image fresh (docker provider)
 

@@ -1,6 +1,5 @@
 """Tests for corporate memory API — knowledge items, voting, governance."""
 
-import pytest
 from src.repositories.knowledge import KnowledgeRepository
 
 
@@ -10,6 +9,8 @@ def _auth(token):
 
 class TestMemoryCreate:
     def test_create_knowledge_item(self, seeded_app):
+        """No corporate_memory config is set in the test env — legacy mode,
+        matching the documented 'no admin review' default (#1573)."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         resp = c.post(
@@ -20,7 +21,7 @@ class TestMemoryCreate:
         assert resp.status_code == 201
         data = resp.json()
         assert "id" in data
-        assert data["status"] == "pending"
+        assert data["status"] == "approved"
 
     def test_create_with_tags(self, seeded_app):
         c = seeded_app["client"]
@@ -97,6 +98,56 @@ class TestMemoryCreate:
         assert ok.status_code == 201
 
 
+class TestMemoryCreateRespectsApprovalMode:
+    """#1573 finding 4: POST /api/memory used to hardcode status='pending'
+    regardless of corporate_memory.approval_mode. Every test here sets a
+    DIFFERENT approval_mode and asserts a DIFFERENT resulting status —
+    proving the endpoint actually branches on the config, not just that a
+    schema default round-trips."""
+
+    def _post(self, seeded_app, monkeypatch, governance_config: dict):
+        import app.instance_config as ic
+
+        monkeypatch.setattr(ic, "get_corporate_memory_config", lambda: governance_config)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        return c.post(
+            "/api/memory",
+            json={"title": "Governed item", "content": "Some fact.", "category": "engineering"},
+            headers=_auth(token),
+        )
+
+    def test_review_queue_is_pending(self, seeded_app, monkeypatch):
+        resp = self._post(seeded_app, monkeypatch, {"approval_mode": "review_queue"})
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "pending"
+
+    def test_auto_publish_is_approved(self, seeded_app, monkeypatch):
+        resp = self._post(seeded_app, monkeypatch, {"approval_mode": "auto_publish"})
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "approved"
+
+    def test_no_governance_config_auto_approves(self, seeded_app, monkeypatch):
+        """Legacy mode (empty config, same as an instance with no
+        corporate_memory: block at all) auto-approves — matches the
+        documented 'no admin review' default."""
+        resp = self._post(seeded_app, monkeypatch, {})
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "approved"
+
+    def test_persisted_status_matches_response(self, seeded_app, monkeypatch):
+        """The response status isn't just cosmetic — it's what landed in the DB."""
+        from src.db import get_system_db
+        from src.repositories.knowledge import KnowledgeRepository
+
+        resp = self._post(seeded_app, monkeypatch, {"approval_mode": "auto_publish"})
+        item_id = resp.json()["id"]
+        conn = get_system_db()
+        item = KnowledgeRepository(conn).get_by_id(item_id)
+        conn.close()
+        assert item["status"] == "approved"
+
+
 class TestMemoryList:
     def _create_item(self, c, token, title="Test Item", category="engineering"):
         resp = c.post(
@@ -158,8 +209,16 @@ class TestMemoryList:
 
         conn = get_system_db()
         repo = KnowledgeRepository(conn)
-        repo.create(id="srch_fin", title="Finance SearchKeyword", content="x", category="data_analysis", domain="finance")
-        repo.create(id="srch_eng", title="Engineering SearchKeyword", content="x", category="data_analysis", domain="engineering")
+        repo.create(
+            id="srch_fin", title="Finance SearchKeyword", content="x", category="data_analysis", domain="finance"
+        )
+        repo.create(
+            id="srch_eng",
+            title="Engineering SearchKeyword",
+            content="x",
+            category="data_analysis",
+            domain="engineering",
+        )
         conn.close()
 
         resp = seeded_app["client"].get(
@@ -213,9 +272,12 @@ class TestMemoryStats:
     def test_get_stats_does_not_load_all_items(self, seeded_app):
         """Stats endpoint uses SQL aggregation, not list_items()."""
         from unittest.mock import patch
+
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
-        with patch.object(KnowledgeRepository, "list_items", side_effect=AssertionError("list_items should not be called")):
+        with patch.object(
+            KnowledgeRepository, "list_items", side_effect=AssertionError("list_items should not be called")
+        ):
             resp = c.get("/api/memory/stats", headers=_auth(token))
             assert resp.status_code == 200
 
@@ -601,8 +663,7 @@ class TestAdminContradictionsExcludePersonal:
             """INSERT INTO knowledge_items
                (id, title, content, category, source_user, is_personal, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [item_id, title, f"content of {title}", "test", "admin@test.com",
-             is_personal, "approved", now, now],
+            [item_id, title, f"content of {title}", "test", "admin@test.com", is_personal, "approved", now, now],
         )
         conn.close()
 
@@ -625,8 +686,7 @@ class TestAdminContradictionsExcludePersonal:
         self._make_item("item_priv", "Private item", is_personal=True)
         self._make_contradiction("kc_test1", "item_pub", "item_priv")
 
-        r = c.get("/api/memory/admin/contradictions",
-                  headers=_auth(seeded_app["admin_token"]))
+        r = c.get("/api/memory/admin/contradictions", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         data = r.json()
         contra = next(c for c in data["contradictions"] if c["id"] == "kc_test1")
@@ -664,8 +724,7 @@ class TestAdminContradictionsExcludePersonal:
         self._make_item("item_pub4", "Public B")
         self._make_contradiction("kc_test3", "item_pub3", "item_pub4")
 
-        r = c.get("/api/memory/admin/contradictions",
-                  headers=_auth(seeded_app["admin_token"]))
+        r = c.get("/api/memory/admin/contradictions", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         data = r.json()
         contra = next(c for c in data["contradictions"] if c["id"] == "kc_test3")
@@ -681,13 +740,13 @@ class TestAudienceDistribution:
 
     def _seed_item(self, conn, item_id: str, title: str, audience: str | None = None):
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
         conn.execute(
             """INSERT INTO knowledge_items
                (id, title, content, category, source_user, audience, status, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [item_id, title, f"content {title}", "test", "admin@test.com",
-             audience, "approved", now, now],
+            [item_id, title, f"content {title}", "test", "admin@test.com", audience, "approved", now, now],
         )
 
     def test_mandate_persists_audience(self, seeded_app):
@@ -695,6 +754,7 @@ class TestAudienceDistribution:
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         from src.db import get_system_db
+
         conn = get_system_db()
         self._seed_item(conn, "aud_item1", "Finance policy")
         conn.close()
@@ -707,10 +767,9 @@ class TestAudienceDistribution:
         assert r.status_code == 200
 
         from src.db import get_system_db
+
         conn = get_system_db()
-        row = conn.execute(
-            "SELECT audience, is_required FROM knowledge_items WHERE id = 'aud_item1'"
-        ).fetchone()
+        row = conn.execute("SELECT audience, is_required FROM knowledge_items WHERE id = 'aud_item1'").fetchone()
         conn.close()
         assert row[0] == "group:finance"
         # v49: mandate flips ``is_required`` (Required tier); status stays
@@ -722,6 +781,7 @@ class TestAudienceDistribution:
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         from src.db import get_system_db
+
         conn = get_system_db()
         self._seed_item(conn, "aud_item2", "Eng item")
         conn.close()
@@ -734,10 +794,9 @@ class TestAudienceDistribution:
         assert r.status_code == 200
 
         from src.db import get_system_db
+
         conn = get_system_db()
-        row = conn.execute(
-            "SELECT audience FROM knowledge_items WHERE id = 'aud_item2'"
-        ).fetchone()
+        row = conn.execute("SELECT audience FROM knowledge_items WHERE id = 'aud_item2'").fetchone()
         conn.close()
         assert row[0] == "group:engineering"
 
@@ -747,9 +806,8 @@ class TestAudienceDistribution:
         creating the group_name row if it doesn't exist yet. Pre-v13 the test
         seeded a JSON list on users.groups; that column was dropped."""
         import uuid as _uuid
-        existing = conn.execute(
-            "SELECT id FROM user_groups WHERE name = ?", [group_name]
-        ).fetchone()
+
+        existing = conn.execute("SELECT id FROM user_groups WHERE name = ?", [group_name]).fetchone()
         if existing is None:
             group_id = str(_uuid.uuid4())
             conn.execute(
@@ -793,7 +851,6 @@ class TestAudienceDistribution:
 
     def test_user_not_in_group_cannot_see_group_items(self, seeded_app):
         """A user without 'finance' group does not see audience='group:finance' items."""
-        import json
         from src.db import get_system_db
         from src.repositories.users import UserRepository
         from app.auth.jwt import create_access_token
@@ -822,9 +879,7 @@ class TestAudienceDistribution:
         self._seed_item(conn, "aud_eng3", "Eng exclusive", audience="group:engineering")
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         ids = {i["id"] for i in r.json()["items"]}
         assert "aud_fin3" in ids
@@ -833,15 +888,12 @@ class TestAudienceDistribution:
     def test_null_audience_visible_to_all(self, seeded_app):
         """Items with no audience set are visible to all authenticated users."""
         from src.db import get_system_db
-        from app.auth.jwt import create_access_token
 
         conn = get_system_db()
         self._seed_item(conn, "aud_null2", "Global fact", audience=None)
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory", headers=_auth(seeded_app["analyst_token"])
-        )
+        r = seeded_app["client"].get("/api/memory", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
         ids = {i["id"] for i in r.json()["items"]}
         assert "aud_null2" in ids
@@ -861,13 +913,13 @@ class TestAudienceDistribution:
         # Item is restricted by audience to a group the analyst is NOT in,
         # but tagged with domain=engineering via the v49 junction.
         self._seed_item(
-            conn, "dom_eng1", "Eng-only via domain grant",
+            conn,
+            "dom_eng1",
+            "Eng-only via domain grant",
             audience="group:admins-only",
         )
         # v49: domain lives in the junction; resolve slug → id.
-        eng_row = conn.execute(
-            "SELECT id FROM memory_domains WHERE slug = 'engineering'"
-        ).fetchone()
+        eng_row = conn.execute("SELECT id FROM memory_domains WHERE slug = 'engineering'").fetchone()
         eng_id = eng_row[0]
         conn.execute(
             "INSERT INTO knowledge_item_domains(item_id, domain_id, added_by) "
@@ -908,8 +960,7 @@ class TestAudienceDistribution:
         assert r.status_code == 200, r.text
         ids = {i["id"] for i in r.json()["items"]}
         assert "dom_eng1" in ids, (
-            "MEMORY_DOMAIN/engineering grant must make engineering items "
-            "visible regardless of audience filter"
+            "MEMORY_DOMAIN/engineering grant must make engineering items visible regardless of audience filter"
         )
 
 
@@ -967,17 +1018,26 @@ class TestBundle:
         it to ``approved`` + ``is_required=True`` so the bundle path picks
         the item up via the new boolean filter."""
         from src.repositories.knowledge import KnowledgeRepository
+
         repo = KnowledgeRepository(conn)
         if status == "mandatory":
             repo.create(
-                id=item_id, title=title, content=f"Content for {title}",
-                category="engineering", status="approved",
-                confidence=confidence, is_required=True,
+                id=item_id,
+                title=title,
+                content=f"Content for {title}",
+                category="engineering",
+                status="approved",
+                confidence=confidence,
+                is_required=True,
             )
         else:
             repo.create(
-                id=item_id, title=title, content=f"Content for {title}",
-                category="engineering", status=status, confidence=confidence,
+                id=item_id,
+                title=title,
+                content=f"Content for {title}",
+                category="engineering",
+                status=status,
+                confidence=confidence,
             )
             repo.update_status(item_id, status)
 
@@ -987,9 +1047,7 @@ class TestBundle:
 
     def test_bundle_empty(self, seeded_app):
         """Bundle returns empty lists when no mandatory/approved items exist."""
-        r = seeded_app["client"].get(
-            "/api/memory/bundle", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         data = r.json()
         assert data["mandatory"] == []
@@ -1006,9 +1064,7 @@ class TestBundle:
         self._seed_item(conn, "bnd_a1", "Approved Fact", "approved", confidence=0.8)
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory/bundle", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         data = r.json()
         mandatory_ids = {i["id"] for i in data["mandatory"]}
@@ -1025,17 +1081,20 @@ class TestBundle:
         huge_content = "X" * (BUNDLE_TOKEN_BUDGET * _CHARS_PER_TOKEN + 100)
         conn = get_system_db()
         from src.repositories.knowledge import KnowledgeRepository
+
         repo = KnowledgeRepository(conn)
         repo.create(
-            id="bnd_huge", title="Huge Item", content=huge_content,
-            category="engineering", status="approved", confidence=1.0,
+            id="bnd_huge",
+            title="Huge Item",
+            content=huge_content,
+            category="engineering",
+            status="approved",
+            confidence=1.0,
         )
         repo.update_status("bnd_huge", "approved")
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory/bundle", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         approved_ids = {i["id"] for i in r.json()["approved"]}
         assert "bnd_huge" not in approved_ids
@@ -1048,9 +1107,7 @@ class TestBundle:
         self._seed_item(conn, "bnd_p1", "Pending Fact", "pending")
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory/bundle", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         data = r.json()
         all_ids = {i["id"] for i in data["mandatory"]} | {i["id"] for i in data["approved"]}
@@ -1064,20 +1121,26 @@ class TestBundle:
         conn = get_system_db()
         repo = KnowledgeRepository(conn)
         repo.create(
-            id="bnd_zero", title="Zero Confidence", content="content",
-            category="engineering", status="approved", confidence=0.0,
+            id="bnd_zero",
+            title="Zero Confidence",
+            content="content",
+            category="engineering",
+            status="approved",
+            confidence=0.0,
         )
         repo.update_status("bnd_zero", "approved")
         repo.create(
-            id="bnd_high", title="High Confidence", content="content",
-            category="engineering", status="approved", confidence=0.9,
+            id="bnd_high",
+            title="High Confidence",
+            content="content",
+            category="engineering",
+            status="approved",
+            confidence=0.9,
         )
         repo.update_status("bnd_high", "approved")
         conn.close()
 
-        r = seeded_app["client"].get(
-            "/api/memory/bundle", headers=_auth(seeded_app["admin_token"])
-        )
+        r = seeded_app["client"].get("/api/memory/bundle", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         approved = r.json()["approved"]
         ids_in_order = [i["id"] for i in approved]
@@ -1141,11 +1204,6 @@ class TestAutoTopicTagging:
 
         monkeypatch.setattr(tagger_module, "auto_tag_items", _fake_auto_tag)
 
-        # Also patch load_instance_config so the try-block reaches auto_tag_items
-        import app.api.memory as mem_module
-
-        original_create = mem_module.create_knowledge
-
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
 
@@ -1192,9 +1250,13 @@ def _seed_relation_via_repo(seeded_app, item_a_id, item_b_id, score=0.5):
     ``test_corporate_memory_relations``)."""
     from src.db import get_system_db
     from src.repositories.knowledge import KnowledgeRepository
+
     conn = get_system_db()
     KnowledgeRepository(conn).create_relation(
-        item_a_id, item_b_id, "likely_duplicate", score=score,
+        item_a_id,
+        item_b_id,
+        "likely_duplicate",
+        score=score,
     )
     conn.close()
 
@@ -1302,8 +1364,7 @@ class TestTreeEndpoint:
             "domain": kwargs.get("domain"),
             "tags": kwargs.get("tags"),
         }
-        resp = c.post("/api/memory", json={k: v for k, v in body.items() if v is not None},
-                      headers=_auth(token))
+        resp = c.post("/api/memory", json={k: v for k, v in body.items() if v is not None}, headers=_auth(token))
         assert resp.status_code == 201
         return resp.json()["id"]
 
@@ -1345,9 +1406,18 @@ class TestTreeEndpoint:
         assert resp.status_code == 401
 
     @staticmethod
-    def _seed_item_direct(conn, item_id, title, *, audience=None, source_type="user_verification",
-                           status="approved", domain=None, category="business_logic",
-                           source_user="admin@test.com"):
+    def _seed_item_direct(
+        conn,
+        item_id,
+        title,
+        *,
+        audience=None,
+        source_type="user_verification",
+        status="approved",
+        domain=None,
+        category="business_logic",
+        source_user="admin@test.com",
+    ):
         """Direct insert — POST /api/memory doesn't accept audience/source_type/status.
 
         v49: ``domain`` is no longer a scalar column on knowledge_items —
@@ -1356,21 +1426,31 @@ class TestTreeEndpoint:
         ``is_required``; pass ``status='mandatory'`` to flip both fields.
         """
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
-        is_required = (status == "mandatory")
+        is_required = status == "mandatory"
         effective_status = "approved" if is_required else status
         conn.execute(
             """INSERT INTO knowledge_items
                (id, title, content, category, source_user, audience,
                 status, source_type, is_required, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [item_id, title, f"content {title}", category, source_user,
-             audience, effective_status, source_type, is_required, now, now],
+            [
+                item_id,
+                title,
+                f"content {title}",
+                category,
+                source_user,
+                audience,
+                effective_status,
+                source_type,
+                is_required,
+                now,
+                now,
+            ],
         )
         if domain:
-            row = conn.execute(
-                "SELECT id FROM memory_domains WHERE slug = ?", [domain]
-            ).fetchone()
+            row = conn.execute("SELECT id FROM memory_domains WHERE slug = ?", [domain]).fetchone()
             if not row:
                 raise ValueError(f"Unknown memory domain slug {domain!r}")
             conn.execute(
@@ -1387,17 +1467,12 @@ class TestTreeEndpoint:
         from app.auth.jwt import create_access_token
 
         conn = get_system_db()
-        self._seed_item_direct(conn, "tree_aud_fin", "Finance fact",
-                               audience="group:finance", domain="finance")
-        self._seed_item_direct(conn, "tree_aud_eng", "Eng fact",
-                               audience="group:engineering", domain="engineering")
-        self._seed_item_direct(conn, "tree_aud_all", "All-users fact",
-                               audience="all", domain="data")
-        self._seed_item_direct(conn, "tree_aud_null", "Null-audience fact",
-                               audience=None, domain="data")
+        self._seed_item_direct(conn, "tree_aud_fin", "Finance fact", audience="group:finance", domain="finance")
+        self._seed_item_direct(conn, "tree_aud_eng", "Eng fact", audience="group:engineering", domain="engineering")
+        self._seed_item_direct(conn, "tree_aud_all", "All-users fact", audience="all", domain="data")
+        self._seed_item_direct(conn, "tree_aud_null", "Null-audience fact", audience=None, domain="data")
         repo = UserRepository(conn)
-        repo.create(id="tree_fin_user", email="treefin@test.com",
-                    name="Tree Finance User")
+        repo.create(id="tree_fin_user", email="treefin@test.com", name="Tree Finance User")
         TestAudienceDistribution._add_user_to_group(conn, "tree_fin_user", "finance")
         conn.close()
 
@@ -1436,11 +1511,7 @@ class TestTreeEndpoint:
             headers=_auth(token),
         )
         assert resp.status_code == 200, resp.text
-        ids_in_groups = {
-            item["id"]
-            for g in resp.json()["groups"]
-            for item in g.get("items", [])
-        }
+        ids_in_groups = {item["id"] for g in resp.json()["groups"] for item in g.get("items", [])}
         # The duplicated pair surfaces; the solo item does not.
         assert a in ids_in_groups
         assert b in ids_in_groups
@@ -1455,16 +1526,25 @@ class TestTreeEndpoint:
 
         conn = get_system_db()
         self._seed_item_direct(
-            conn, "tree_aud_null_chip", "Null aud item",
-            audience=None, domain="data",
+            conn,
+            "tree_aud_null_chip",
+            "Null aud item",
+            audience=None,
+            domain="data",
         )
         self._seed_item_direct(
-            conn, "tree_aud_all_chip", "All aud item",
-            audience="all", domain="data",
+            conn,
+            "tree_aud_all_chip",
+            "All aud item",
+            audience="all",
+            domain="data",
         )
         self._seed_item_direct(
-            conn, "tree_aud_fin_chip", "Finance aud item",
-            audience="group:finance", domain="data",
+            conn,
+            "tree_aud_fin_chip",
+            "Finance aud item",
+            audience="group:finance",
+            domain="data",
         )
         conn.close()
 
@@ -1500,15 +1580,25 @@ class TestTreeEndpoint:
 
         conn = get_system_db()
         # Two items differing on each chip dimension; only one matches both.
-        self._seed_item_direct(conn, "tree_chip_match", "Both match",
-                               status="approved", source_type="user_verification",
-                               domain="finance")
-        self._seed_item_direct(conn, "tree_chip_status_only", "Approved but wrong source",
-                               status="approved", source_type="claude_local_md",
-                               domain="finance")
-        self._seed_item_direct(conn, "tree_chip_source_only", "Right source but pending",
-                               status="pending", source_type="user_verification",
-                               domain="finance")
+        self._seed_item_direct(
+            conn, "tree_chip_match", "Both match", status="approved", source_type="user_verification", domain="finance"
+        )
+        self._seed_item_direct(
+            conn,
+            "tree_chip_status_only",
+            "Approved but wrong source",
+            status="approved",
+            source_type="claude_local_md",
+            domain="finance",
+        )
+        self._seed_item_direct(
+            conn,
+            "tree_chip_source_only",
+            "Right source but pending",
+            status="pending",
+            source_type="user_verification",
+            domain="finance",
+        )
         conn.close()
 
         c = seeded_app["client"]
@@ -1518,11 +1608,7 @@ class TestTreeEndpoint:
             headers=_auth(token),
         )
         assert resp.status_code == 200, resp.text
-        ids_in_groups = {
-            item["id"]
-            for g in resp.json()["groups"]
-            for item in g.get("items", [])
-        }
+        ids_in_groups = {item["id"] for g in resp.json()["groups"] for item in g.get("items", [])}
         assert "tree_chip_match" in ids_in_groups
         assert "tree_chip_status_only" not in ids_in_groups
         assert "tree_chip_source_only" not in ids_in_groups
@@ -1671,6 +1757,7 @@ class TestPatchAndBulkUpdate:
 
     def _read(self, seeded_app, item_id):
         from src.db import get_system_db
+
         conn = get_system_db()
         try:
             return KnowledgeRepository(conn).get_by_id(item_id)
@@ -1793,10 +1880,13 @@ class TestAuditPrefixBackCompat:
         """Legacy ``km_*`` audit rows still surface in the admin audit tab."""
         from src.db import get_system_db
         from src.repositories.audit import AuditRepository
+
         conn = get_system_db()
         # Inject a legacy-prefixed row directly.
         AuditRepository(conn).log(
-            user_id="legacy@x", action="km_approve", resource="kv_legacy",
+            user_id="legacy@x",
+            action="km_approve",
+            resource="kv_legacy",
             params={"reason": "back-compat row"},
         )
         conn.close()
@@ -1850,12 +1940,8 @@ class TestAuditPrefixBackCompat:
         assert page1.status_code == 200
         assert page2.status_code == 200
 
-        ids_page1 = [
-            (e.get("resource"), e.get("timestamp")) for e in page1.json()["entries"]
-        ]
-        ids_page2 = [
-            (e.get("resource"), e.get("timestamp")) for e in page2.json()["entries"]
-        ]
+        ids_page1 = [(e.get("resource"), e.get("timestamp")) for e in page1.json()["entries"]]
+        ids_page2 = [(e.get("resource"), e.get("timestamp")) for e in page2.json()["entries"]]
         assert len(ids_page1) == 2
         assert len(ids_page2) == 2
         # The two pages must not overlap row-for-row (offset is honored).
@@ -1874,10 +1960,6 @@ class TestAuditPrefixBackCompat:
         )
         assert page1_f.status_code == 200
         assert page2_f.status_code == 200
-        ids_page1_f = [
-            (e.get("resource"), e.get("timestamp")) for e in page1_f.json()["entries"]
-        ]
-        ids_page2_f = [
-            (e.get("resource"), e.get("timestamp")) for e in page2_f.json()["entries"]
-        ]
+        ids_page1_f = [(e.get("resource"), e.get("timestamp")) for e in page1_f.json()["entries"]]
+        ids_page2_f = [(e.get("resource"), e.get("timestamp")) for e in page2_f.json()["entries"]]
         assert set(ids_page1_f).isdisjoint(set(ids_page2_f))

@@ -78,6 +78,34 @@ def test_store_idempotent_same_content(tmp_path, monkeypatch):
     assert result1.storage_path == result2.storage_path
 
 
+def test_identical_bytes_in_two_collections_never_share_a_storage_path(tmp_path, monkeypatch):
+    """Blobs are content-addressed *within* a corpus dir, never globally —
+    the same bytes uploaded to two collections produce two files at two
+    distinct paths.
+
+    This is the invariant `corpus_files.count_by_storage_path(corpus_id,
+    storage_path)` rests on: because a `storage_path` string is reachable
+    only from rows in the corpus whose directory it lives under, a
+    corpus-scoped reference count is exact, and the unlink in
+    `_upsert_corpus_file` / `_purge_file_row` can never remove a blob another
+    collection still points at. Flattening the layout would silently make
+    that count wrong and start deleting shared blobs, so pin it here (raised
+    as a question in review on #1652)."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from pathlib import Path
+
+    from src.file_storage import store_corpus_file
+
+    data = b"the very same bytes"
+    a = asyncio.run(store_corpus_file("col_a", "doc.txt", _make_upload(data, "doc.txt")))
+    b = asyncio.run(store_corpus_file("col_b", "doc.txt", _make_upload(data, "doc.txt")))
+
+    assert a.sha256 == b.sha256, "content addressing still keys on the digest"
+    assert a.storage_path != b.storage_path, "a blob path must be reachable from exactly one corpus"
+    assert Path(a.storage_path).parent != Path(b.storage_path).parent
+    assert Path(a.storage_path).exists() and Path(b.storage_path).exists()
+
+
 def test_store_raises_on_oversize(tmp_path, monkeypatch):
     """Uploading a file exceeding MAX_UPLOAD_BYTES raises HTTPException 413."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
