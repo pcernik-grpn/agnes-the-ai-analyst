@@ -127,7 +127,9 @@ def compose_document(
 
     metrics = [
         m
-        for m in (_compose_metric(measure, quoted_fqn=quoted_fqn) for measure in raw_measures if isinstance(measure, dict))
+        for m in (
+            _compose_metric(measure, quoted_fqn=quoted_fqn) for measure in raw_measures if isinstance(measure, dict)
+        )
         if m is not None
     ]
     if not metrics:
@@ -231,30 +233,88 @@ class DatabricksMetricViewAdapter:
     """Fetches a Databricks workspace's Unity Catalog metric views and
     composes one Ossie document per metric view.
 
-    ``config`` is ``{"host", "warehouse_id", "token", "catalogs"}`` — the same
-    connection shape `resolve_databricks_settings()` already resolves per
-    configured instance (``catalogs`` may also be given as the single
-    ``"catalog"`` key, for symmetry with that resolver's return shape).
-    ``config["client"]``, when given, overrides construction (tests). This
-    adapter owns its own statement client the same way the Keboola adapter
-    owns its own Metastore client — a self-contained "hand it connection
-    config, get documents back" contract.
+    ``config`` carries only SCOPE — ``{"connection_id", "catalogs"}``, both
+    optional (``catalogs`` may also be given as the single ``"catalog"`` key,
+    for symmetry with `resolve_databricks_settings()`'s return shape).
+    Credentials are never taken from it: host, warehouse and token resolve
+    from the instance's Databricks connection exactly as every other
+    Databricks code path does, so a semantic source row never becomes a
+    second place a workspace token is stored — the same rule
+    `connectors/snowflake/semantic_ossie.py::SnowflakeSemanticAdapter` follows.
+    That is also what makes the connect wizard's "Also sync semantic views"
+    opt-in work at all: it creates this source with no credentials of its own,
+    because the connection it was checked on already holds them.
+
+    ``config["connection_id"]``, when set, pins WHICH connection — the wizard
+    writes the row it just saved, so the source is scored against that
+    connection in the cross-domain coverage report
+    (`src/semantic/coverage.py::_native_semantic_status`) instead of being
+    credited to nobody. Absent, the type's default connection is used.
+
+    ``config["client"]``, when given, overrides transport construction
+    (tests). This adapter owns its own statement client the same way the
+    Keboola adapter owns its own Metastore client.
     """
 
     def extract(self, config: Dict[str, Any]) -> List[str]:
         from connectors.databricks.client import DatabricksStatementClient
 
-        host = config.get("host")
-        token = config.get("token")
-        warehouse_id = config.get("warehouse_id")
-        if not (host and token and warehouse_id):
-            raise ValueError(
-                "DatabricksMetricViewAdapter requires config['host'], config['warehouse_id'] and config['token']"
-            )
-        catalogs = config.get("catalogs") or ([config["catalog"]] if config.get("catalog") else [])
-        if not catalogs:
-            raise ValueError("DatabricksMetricViewAdapter requires config['catalogs'] (or config['catalog'])")
+        # Imported at call time, not module scope, so a test patching the
+        # defining module reaches this lookup (same reason as the Snowflake
+        # and Keboola adapters' local imports of their own resolvers).
+        from connectors.databricks.semantic_layer import resolve_databricks_settings
 
-        client = config.get("client") or DatabricksStatementClient(host=host, token=token, warehouse_id=warehouse_id)
+        connection = None
+        connection_id = str(config.get("connection_id") or "").strip()
+        if connection_id:
+            from src.connection_resolver import resolve_connection
+
+            connection = resolve_connection("databricks", connection_id)
+            if connection is None:
+                # Falling through to the default connection here would sync a
+                # DIFFERENT workspace's metric views under this source's
+                # provenance, silently.
+                raise RuntimeError(
+                    f"this semantic source names Databricks connection {connection_id!r}, "
+                    "which no longer exists; re-point or delete the source on "
+                    "/admin/semantic-sources"
+                )
+            # `resolve_connection` looks an explicit id up by id alone, so the
+            # row it returns is not necessarily this connector's. Say so,
+            # rather than reading another connector's config and reporting the
+            # far more confusing "Databricks is not configured".
+            row_type = str(connection.get("source_type") or "").strip()
+            if row_type != "databricks":
+                raise RuntimeError(
+                    f"connection {connection_id!r} is a {row_type or 'typeless'} connection, "
+                    "not a Databricks one; re-point the source on /admin/semantic-sources"
+                )
+
+        settings = resolve_databricks_settings(connection)
+        if not settings:
+            raise RuntimeError(
+                "Databricks is not configured (a connection with host + warehouse_id + "
+                "token, or data_source.databricks.* plus the DATABRICKS_TOKEN env/vault "
+                "secret); refusing to sync metric views"
+            )
+
+        catalogs = (
+            config.get("catalogs")
+            or ([config["catalog"]] if config.get("catalog") else None)
+            or settings.get("catalogs")
+            or []
+        )
+        if not catalogs:
+            raise ValueError(
+                "no Unity Catalog to enumerate metric views from — set the connection's "
+                "catalog (or data_source.databricks.semantic_layer_catalogs), or this "
+                "source's config['catalogs']"
+            )
+
+        client = config.get("client") or DatabricksStatementClient(
+            host=settings["host"],
+            token=settings["token"],
+            warehouse_id=settings["warehouse_id"],
+        )
         documents, _counters = extract_documents(client, catalogs)
         return documents

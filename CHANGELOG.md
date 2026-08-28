@@ -405,10 +405,16 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   terms, a skill, a specialized agent, and a knowledge base — not only
   Keboola projects, and not only sync-time binding. `not_applicable` marks a
   domain no adapter can fill yet (e.g. BigQuery has no semantic-layer adapter
-  in this build) and is never counted as missing work. Which skill / agent /
-  knowledge domain is *about* a given source is the one input the report
-  cannot derive on its own — record it with `agnes semantic-model coverage
-  tag|untag` (new `resource_source_tags` table). New: `GET /api/admin/
+  in this build) and is never counted as missing work — which makes the
+  source-type→adapter map behind it load-bearing, so all three connector
+  adapters are named in it (`databricks` was absent while
+  `databricks_metric_views` was registered and wired into the connect wizard,
+  so every Databricks connection reported `not_applicable`, the one status
+  telling an admin not to bother) and a new guard pins that map against the
+  adapter registry. Which skill / agent / knowledge domain is *about* a given
+  source is the one input the report cannot derive on its own — record it
+  with `agnes semantic-model coverage tag|untag` (new `resource_source_tags`
+  table). New: `GET /api/admin/
   semantic-model/coverage` (+ `POST`/`DELETE .../coverage/tags`), `agnes
   semantic-model coverage [show|tag|untag]`, MCP `semantic_model_coverage` /
   `semantic_model_coverage_tag` / `semantic_model_coverage_untag`. The
@@ -427,9 +433,25 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   only. The Snowflake and Databricks connect wizards on `/admin/data-sources`
   now offer an "Also sync semantic views" opt-in, mirroring Keboola's
   existing one: checked, it creates (or reuses) a `connection` source for
-  that connector's adapter (`snowflake_semantic` / `databricks_metric_views`)
-  and syncs it immediately. Non-fatal either way — skipped or failed, the new
-  page is where to set it up or retry.
+  that connector's adapter (`snowflake_semantic` / `databricks_metric_views`),
+  links it to the connection it was checked on (`config.connection_id`, which
+  is what the coverage report scores against — an unlinked source is credited
+  to no connection and a working semantic layer reads as missing), and syncs
+  it immediately. Non-fatal for the connection either way — skipped or
+  failed, the new page is where to set it up or retry — but the Databricks
+  branch, which closes the wizard and navigates away, now reports a failed
+  opt-in in place instead of discarding it, since a checked box with no error
+  and no semantic layer is indistinguishable from success.
+  `DatabricksMetricViewAdapter` takes only scope from its config
+  (`catalogs`/`catalog`, plus `connection_id` to pin which workspace — a
+  stale or wrong-typed id is refused by name rather than falling back to the
+  default connection) and resolves host/warehouse/token from the Databricks
+  connection like every other Databricks code path, as the Snowflake adapter
+  next door already did. It previously **required**
+  `config['host'/'warehouse_id'/'token']` and so could never sync from the
+  wizard's credential-free source at all — and a semantic source row is the
+  wrong place for a workspace token regardless, since
+  `GET /api/admin/semantic-sources` returns configs.
 
 - **Semantic-layer health: is what exists broken, stale, or inconsistent.**
   `GET /api/admin/semantic-layer/health` (`agnes semantic-model health`, MCP

@@ -108,10 +108,17 @@ Return the document text **as produced**, never re-serialized through a YAML
 dumper. Export hands that exact text back out, so a round-trip through
 parse-and-dump would silently reorder keys and strip comments.
 
-Three adapters ship today: `native` (the source already publishes Ossie),
+Four adapters ship today: `native` (the source already publishes Ossie),
 `keboola_metastore` (composes a document from a Keboola project's metastore
-objects), and `snowflake_semantic` (composes one document per Snowflake
-semantic view).
+objects), `snowflake_semantic` (composes one document per Snowflake semantic
+view), and `databricks_metric_views` (composes one document per Unity Catalog
+metric view).
+
+Every `connection`-kind adapter must also be named by its `source_type` in
+`SEMANTIC_ADAPTER_BY_SOURCE_TYPE` (`src/semantic/coverage.py`) in the same
+change. That map is what the cross-domain coverage report reads, and a source
+type absent from it reports `not_applicable` — "no adapter exists for this" —
+which is a lie the moment one does.
 
 An adapter name that nothing is registered under is refused at registration
 (`400`, naming the adapters that do exist) rather than at the first sync.
@@ -156,6 +163,42 @@ outcome: importing gives you the catalog, the metric SQL, the lineage and
 Snowflake's own AI instructions; it does not give you local execution. Facts and
 metrics marked `PRIVATE` upstream carry that label in `custom_extensions` rather
 than being presented as ordinary public surface.
+
+### `databricks_metric_views`
+
+Register it as a `connection`-kind source. As with `snowflake_semantic`, the
+config carries only scope — never credentials, which resolve from the
+instance's Databricks connection (`resolve_databricks_settings()`) like every
+other Databricks code path, so a semantic source row never becomes a second
+place a workspace token is stored:
+
+```bash
+agnes admin semantic-source add --kind connection --name "Databricks semantics" \
+    --adapter databricks_metric_views
+```
+
+Optional scope keys in `config`: `catalogs` (a list; or the single `catalog`,
+defaulting to the connection's own catalog / `semantic_layer_catalogs`) and
+`connection_id`, which pins WHICH Databricks connection this source reads —
+the connect wizard's "Also sync semantic views" opt-in writes the row it just
+saved. A pinned connection that no longer exists, or that turns out to belong
+to another connector, fails the sync by name rather than falling back to the
+default — which would import a different workspace's metric views under this
+source's provenance.
+
+Discovery is `information_schema.tables` filtered to `METRIC_VIEW`, then
+`SHOW CREATE TABLE` for the YAML body — the same two queries the pre-Ossie
+`connectors/databricks/semantic_layer.py` sync issued. `dimensions[]` become
+dataset fields, `measures[]` become metrics, and there is no analogue to
+Keboola's relationships, constraints or glossary because the YAML declares
+none.
+
+**Every measure expression is tagged `DATABRICKS`** — the full runnable
+`SELECT MEASURE(...) FROM <metric view>`, not a bare fragment, since a metric
+view is a warehouse-side object with nothing in `table_registry` to bind
+against. `MEASURE()` is a Databricks-only aggregate, so the same
+`src/semantic/dialect.py` rule as Snowflake's applies: readable here, refused
+for local DuckDB execution, runnable through `agnes query --remote`.
 
 ## Ownership: imported models are read-only
 
@@ -249,7 +292,7 @@ glossary terms, a skill, a specialized agent, a knowledge base? Each answer is
 
 Three things about it are deliberate:
 
-- **`not_applicable` is not a gap.** Only three adapters exist (see *Adapters*
+- **`not_applicable` is not a gap.** Only four adapters exist (see *Adapters*
   above), so a BigQuery connection has no semantic-layer adapter at all.
   Reporting that as `missing`, next to a link into a create flow that does not
   exist for it, would invent work nobody can do.

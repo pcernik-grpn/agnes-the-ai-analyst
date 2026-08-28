@@ -253,6 +253,57 @@ class TestSemantic:
         assert semantic["status"] == "ok"
         assert semantic["raw"]["models"] == 1
 
+    def test_a_databricks_connection_is_scored_not_written_off(self, pg_state):
+        """`databricks_metric_views` is a registered adapter, so a Databricks
+        connection has a semantic column that CAN be filled.
+
+        It was absent from `SEMANTIC_ADAPTER_BY_SOURCE_TYPE` while the
+        adapter existed and the connect wizard offered to sync it, so every
+        Databricks connection reported "no semantic-layer adapter exists for
+        databricks yet" — the one status that tells the admin not to bother.
+        """
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-dbx", source_type="databricks", name="Lakehouse")
+
+        semantic = _domains(compute_cross_domain_coverage(), "conn-dbx")["semantic"]
+        assert semantic["status"] == "missing"
+        assert "semantic source" in semantic["detail"]
+
+    def test_a_databricks_connection_with_an_imported_model_is_ok(self, pg_state):
+        from datetime import datetime, timezone
+
+        from src.repositories import semantic_model_repo, semantic_source_repo
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-dbx", source_type="databricks", name="Lakehouse")
+        semantic_source_repo().create(
+            id="ss_dbx",
+            kind="connection",
+            name="Databricks semantics",
+            adapter="databricks_metric_views",
+            config={"connection_id": "conn-dbx"},
+        )
+        semantic_model_repo().upsert(
+            id="ossie_connection/ss_dbx/main.sales.orders_metrics",
+            slug="main.sales.orders_metrics",
+            name="main.sales.orders_metrics",
+            description=None,
+            document="version: '0.2.0.dev0'",
+            document_json={"semantic_model": [{"name": "main.sales.orders_metrics"}]},
+            spec_version="0.2.0.dev0",
+            content_hash="dbx1",
+            source="ossie_connection",
+            source_ref="ss_dbx",
+            status="valid",
+            validation_errors=None,
+            validated_at=datetime.now(timezone.utc),
+        )
+
+        semantic = _domains(compute_cross_domain_coverage(), "conn-dbx")["semantic"]
+        assert semantic["status"] == "ok"
+        assert semantic["raw"]["models"] == 1
+
     def test_a_semantic_source_recording_no_connection_is_credited_to_nobody(self, pg_state):
         """Attributing an unlinked source to every connection of its type
         would credit one project's model to its neighbour."""
