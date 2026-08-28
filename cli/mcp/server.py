@@ -1,28 +1,30 @@
-"""Agnes MCP server.
+"""Agnes stdio MCP server — INTERNAL tool channel, not an end-user surface.
 
-Runs as an stdio subprocess started by Claude Desktop.  All tools have
-full network access to the Agnes server — unlike the Bash tool sandbox,
-which blocks outbound HTTP.
+Runs as an stdio subprocess (``agnes mcp``). Two callers start it, and both
+do the wiring themselves:
 
-Usage:
-    agnes mcp                   # starts the MCP server (stdio transport)
+  * the hosted chat sandbox, once per session
+    (``app/chat/runner.py::_agnes_mcp_servers``);
+  * ``agnes global enable``, which registers it as a user-scope MCP server in
+    Claude Code (``cli/commands/global_scope.py``).
 
-Claude Desktop wires this via .claude/settings.json:
-    {
-      "mcpServers": {
-        "agnes": {
-          "command": "/path/to/agnes",
-          "args": ["mcp"],
-          "type": "stdio"
-        }
-      }
-    }
+#1707 Block 6 retired it as a *documented* path: setting it up by hand was an
+experiment, and the supported way for an external MCP client to reach Agnes
+is the server's own HTTP transports (``app/api/mcp_http.py`` /
+``mcp_streamable.py``, whose tools are defined once in
+``app/api/mcp/foundation_tools.py``). The command is therefore hidden in
+``cli/main.py`` while staying fully functional.
 
-The setup.py inside the Cowork bundle detects the agnes binary path at
-install time and writes the mcpServers block with the correct absolute path.
+**Its tool set is deliberately closed.** New tools — semantic-layer tools in
+particular — go to the HTTP foundation surface only; the exact set here is
+pinned by ``tests/test_mcp_tool_parity.py::STDIO_TOOL_NAMES``, so adding one
+is a conscious edit, not a drift. What lives here is what genuinely needs a
+local process: filesystem-touching (``pull``, ``query_local``,
+``chat_upload_file``) and the in-chat data-app authoring/preview loop.
 
-Credentials are read from ~/.config/agnes/config.yaml (server URL) and
-~/.config/agnes/token.json (PAT) — the same files written by setup.py.
+All tools have full network access to the Agnes server — unlike the Bash
+tool sandbox, which blocks outbound HTTP. Credentials are read from
+~/.config/agnes/config.yaml (server URL) and ~/.config/agnes/token.json (PAT).
 """
 
 from __future__ import annotations

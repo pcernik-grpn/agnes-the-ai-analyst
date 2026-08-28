@@ -1,25 +1,22 @@
-"""`agnes mcp` — start the Agnes MCP server (stdio transport).
+"""`agnes mcp` — MCP source connections, plus the INTERNAL stdio MCP server.
 
-The MCP server exposes Agnes data tools (catalog, schema, describe, query,
-pull) to Claude Desktop via the Model Context Protocol.  Claude Desktop
-launches this as a subprocess and communicates over stdin/stdout.
+Two unrelated things share this group, and only one of them is an end-user
+surface:
 
-Unlike the Bash tool inside Claude Desktop, MCP subprocesses run outside
-the sandbox with full network access — so tools like ``catalog`` and
-``query`` can reach the Agnes server at localhost:8000.
+* ``connect`` / ``disconnect`` / ``my-secret`` — supported, user-facing:
+  your own credential for an admin-registered MCP source (the CLI half of
+  ``/me/connections``). Documented in ``docs/api-reference.md``.
+* bare ``agnes mcp`` — **internal**: starts the stdio MCP server
+  (:mod:`cli.mcp.server`). Retired as a documented end-user path in #1707
+  Block 6; nobody should wire it up by hand. It stays fully functional
+  because two callers spawn it for you — the hosted chat sandbox
+  (``app/chat/runner.py::_agnes_mcp_servers``) starts one per session, and
+  ``agnes global enable`` registers it as a user-scope MCP server in Claude
+  Code. The remote HTTP MCP transports (``/mcp``, SSE) are the supported way
+  for an external client to reach Agnes; new tools go there, not here.
 
-Configured automatically by the Cowork bundle's setup.py, which detects the
-agnes binary path and writes it into .claude/settings.json:
-
-    {
-      "mcpServers": {
-        "agnes": {
-          "command": "/Users/you/.local/bin/agnes",
-          "args": ["mcp"],
-          "type": "stdio"
-        }
-      }
-    }
+The group is registered ``hidden=True`` in ``cli/main.py`` for that reason —
+the commands all still run and ``agnes mcp --help`` still lists them.
 """
 
 import time
@@ -32,7 +29,12 @@ from cli.client import api_delete, api_get, api_post, api_put
 from cli.config import get_server_url
 
 mcp_app = typer.Typer(
-    help="Start Agnes MCP server for Claude Desktop (stdio transport)",
+    help=(
+        "Your MCP source connections (connect / disconnect / my-secret). "
+        "Bare `agnes mcp` starts the internal stdio MCP server — spawned for you "
+        "by the hosted chat sandbox and by `agnes global enable`, not a supported "
+        "end-user surface."
+    ),
     invoke_without_command=True,
 )
 
@@ -45,12 +47,15 @@ mcp_app.add_typer(my_secret_app, name="my-secret")
 
 @mcp_app.callback(invoke_without_command=True)
 def mcp_command(ctx: typer.Context) -> None:
-    """Start the Agnes MCP server.
+    """Start the internal Agnes stdio MCP server.
 
-    Claude Desktop discovers and launches this automatically when the
-    Cowork workspace is opened.  You don't need to run it manually.
+    INTERNAL — not a supported end-user surface (#1707 Block 6). The hosted
+    chat sandbox spawns it per session, and `agnes global enable` registers
+    it as a user-scope MCP server in Claude Code; both do the wiring for you.
+    An external MCP client should connect to the server's own HTTP transports
+    instead.
 
-    For diagnostics:
+    For diagnostics only:
         agnes mcp          # starts the server; Ctrl-C to stop
     """
     if ctx.invoked_subcommand is not None:
