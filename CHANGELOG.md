@@ -205,6 +205,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   standard — that reference is accurate, not the retired synonym).
   `/admin/data-sources`' browser tab title is now "Connections" (the hero
   and nav tab stay "Data"/"Sources"). No REST route paths changed.
+- **The chat page's suggested actions moved above the composer.** "Suggested for you" used to close the empty state from under the input; it now sits between the page's lede and the composer. The chips answer "what can I even ask here", which is a question the reader has *before* they reach an empty field, not after they have already passed it — read top-down the page is now "here is what you could ask" then "ask it". The ways out (the two cards + trust line) did not move: they still close the page, because every one of them navigates away from the composer. The chips render from the same typed task model and keep the same shared column grid as the composer; they still hide the moment a conversation starts.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending
@@ -718,6 +719,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Security: config-resolution secrets are no longer valid connector-ATTACH
+  `token_env`s.** The single token-env allowlist fed two independent trust
+  boundaries: the settings resolvers that read a secret named in admin-written
+  connection config (SharePoint certificate private key, Snowflake key-pair
+  passphrase), and the `_remote_attach` gate that resolves a token_env a
+  *connector* wrote into its extract.duckdb and sends the value as
+  `ATTACH … TOKEN` to the row's own URL. Sharing the list meant a
+  malicious/compromised connector could name `SHAREPOINT_CERT_PRIVATE_KEY` (or
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) as its `token_env` and have the
+  orchestrator ship that secret to a connector-chosen host on every query. The
+  allowlist is now split per consumer class: the ATTACH gate accepts
+  data-source attach tokens only, config-driven resolvers check the new union
+  gate (`is_config_secret_env_allowed`), and a ratchet test keeps every
+  config-only secret out of the ATTACH set for good. Operators extend the
+  config-resolution side with `AGNES_CONFIG_SECRET_ENVS` (replaces the
+  config-only defaults; `AGNES_REMOTE_ATTACH_TOKEN_ENVS` keeps governing the
+  ATTACH side and still flows into the union, so existing overrides keep
+  working).
 - The group picker on `/admin/users/{id}` ("Add to group") showed only its
   first option under themes that render the custom dropdown: the section
   card's `overflow: hidden` clipped the popover at the card's bottom edge,
@@ -738,6 +757,11 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `{}`, JSON args are pretty-printed, and while a call waits on the decision
   its tool card reads "waiting for approval" instead of a contradictory
   "running…".
+- **"Reset to default" on `/admin/prompts` asks before destroying the
+  override.** One click used to replace a customer's tuned install/workspace
+  prompt with the shipped default — no confirmation, nothing recoverable. The
+  reset now goes through the design-system confirm dialog (same idiom as every
+  other destructive admin action), naming what will be lost.
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores
@@ -1027,6 +1051,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unchanged either way (anti-enumeration): the caller cannot tell from the
   answer whether the account pre-existed, was just created, or doesn't
   qualify.
+
+- **Facts ingest resolves a duplicate `doc_id` deterministically and within its declaring collection, instead of picking an arbitrary copy across ALL collections (TCRD-241).** A byte-identical SharePoint copy shares its sha-derived `doc_id` with every other copy of the same file, so more than one `corpus_file_sources` row can legally anchor the same `doc_id` — possibly in a different Collection. `FactsPgRepository.ingest_batch` previously resolved evidence with an unscoped `SELECT … WHERE source_doc_id = :doc_id LIMIT 1`, which could attach a claim to whichever collection's copy happened to sort first — mis-scoping the claim's visibility onto the wrong collection's grants and, on `full_documents` replace, leaving a stale claim behind on the copy that didn't win. Resolution is now corpus-scoped and deterministic (indexed copies preferred, `corpus_file_id` as a tiebreak): a claim resolves within the Collection its `documents[]` entry declared, then within the OTHER collections this same batch's `documents[]` touched. When this batch DID declare at least one collection but a cited `doc_id` is anchored only in some other, undeclared one, the claim is now REJECTED (`ambiguous_cross_collection_doc_id`, itemized in `claims_rejected`) rather than silently written under a collection wider than the producer's batch ever declared — a batch scoped to a restricted collection can no longer leak a claim into a more broadly-granted one. A `documents[]`-omitted batch (the documented "every doc_id already resolves" replay) has no batch-declared scope to escape and is unaffected. Replace mode now purges claims off every anchored copy within the declaring collection, not just the one resolution currently prefers.
 
 ### Removed
 
