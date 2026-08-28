@@ -538,6 +538,14 @@ from app.api.memory_mining import (
 )
 from app.api.uploads import router as admin_uploads_router
 from app.api.collections import router as collections_router  # Slice 2: file corpus upload
+
+# `app.api.agents` is gone — /api/agents was retired into /api/v1/agents
+# (Task C1.2) and the module deleted on main, so only the builder routers
+# survive this merge.
+from app.api.agent_builder import router as agent_builder_router  # builder assistant turns
+from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
+from app.api.package_builder import router as package_builder_router  # data-package builder turns
+from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
@@ -2012,7 +2020,7 @@ async def lifespan(app):
     # canary task above (started here, in the uvicorn worker process, not
     # create_app() — the --reload master must not touch the DB).
     from app.worker.kinds import register_all_kinds
-    from app.worker.runtime import default_worker_id, worker_loop
+    from app.worker.runtime import default_worker_id, selected_lanes, worker_loop
 
     # Populate the process-wide JOB_KINDS registry before the loop starts
     # claiming work — a lane slot that claims a job whose kind isn't yet
@@ -2025,6 +2033,13 @@ async def lifespan(app):
 
     _worker_task = None
     if role_enabled(Role.WORKER):
+        # Fail fast, synchronously, on a bad AGNES_WORKER_LANES token — same
+        # posture as the AGNES_ROLE check `role_enabled()` above already
+        # depends on (`app.roles.active_roles()` raises at first call).
+        # `worker_loop()` re-derives the same value once it actually starts
+        # running as a task; calling it here too means a typo'd lane crashes
+        # startup instead of merely failing an unawaited background task.
+        selected_lanes()
         _worker_task = asyncio.create_task(worker_loop(worker_id=default_worker_id()), name="worker-loop")
 
     async with streamable_session_manager_lifespan(app):
@@ -2894,6 +2909,10 @@ def create_app() -> FastAPI:
     app.include_router(memory_mining_admin_router)
     app.include_router(admin_uploads_router)
     app.include_router(collections_router)
+    app.include_router(agent_builder_router)
+    app.include_router(entity_builder_router)
+    app.include_router(package_builder_router)
+    app.include_router(mcp_builder_router)
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)

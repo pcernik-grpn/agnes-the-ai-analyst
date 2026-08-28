@@ -96,10 +96,41 @@ distribution mirror, and the api-role write conversions) map onto:
   it's a plain outbound HTTP POST with no dependency on the live
   ``ChatManager``/chat event loop, so it runs fine on a worker-only,
   gateway-less process too.
+- ``corpus-extraction``    (EXTRACTION — its own lane, spec §7.5 / §16
+  step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
+  design.md) — the producer-invocation SEAM for document extraction. Off
+  by default (``extraction.enabled: false``, ``config/instance.yaml
+  .example``). Unlike every other handler in this module, this one is
+  NOT a thin adapter over an in-process function: it resolves this
+  connection's SharePoint/tenant credentials from config/vault
+  (``connectors.sharepoint.settings.resolve_sharepoint_settings`` — the
+  SAME resolution path the SharePoint admin UI uses) and shells out to
+  the operator-configured producer (crawl -> convert -> anonymize ->
+  extract -> ingest against ``POST /api/facts/ingest``, spec §7.2) as a
+  subprocess, under a bounded timeout, with the resolved credentials passed
+  via the CHILD PROCESS ENVIRONMENT — never argv, never logged (security
+  playbook F7). That child env is NOT the full parent environment: only a
+  curated non-secret allowlist (+ any operator-opted-in
+  ``extraction.producer.env_passthrough``) plus the named SharePoint
+  credentials and the corpus id are forwarded — see
+  ``_EXTRACTION_PRODUCER_ENV_ALLOWLIST``. No other instance secret ever
+  reaches this subprocess. The producer itself
+  is a separate project the operator supplies, adopted rather than
+  ported into this repo (spec §1 "Out of scope") — see
+  ``_run_corpus_extraction`` below for exactly where that boundary is.
+  Registered UNCONDITIONALLY (its own no-op guard on
+  ``extraction.enabled`` makes an accidental claim on a process that
+  never opted into the ``extraction`` lane harmless, mirroring
+  ``webhook-deliver``'s posture above) but only ever CLAIMED by a lane
+  slot that opted into ``AGNES_WORKER_LANES=extraction`` — see
+  ``app/worker/runtime.py``'s ``selected_lanes()``.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
-function/method and does not reimplement any of its logic. Each import is
-deferred (inside the handler, not at module import time) for the same
+function/method and does not reimplement any of its logic — EXCEPT
+``corpus-extraction``, whose "existing function" is an external subprocess
+rather than an in-process call; see its own docstring for where the seam
+sits. Each import is deferred (inside the handler, not at module import
+time) for the same
 reason ``app/worker/runtime.py``'s ``_jobs_repo()`` and
 ``_sweep_stale_scratch()`` defer theirs: this module must not carry an
 import-time dependency on heavyweight subsystems (LLM clients, the
@@ -132,6 +163,15 @@ Lease/retry tuning:
   ``corporate-memory``) default to 300s — bulk git clones / LLM catalog
   refresh / filesystem walks, but bounded by their own internal
   timeouts, not multi-minute by design.
+- ``corpus-extraction``'s lease tracks its own ``extraction.timeout_s``
+  config (default 3600s) plus a margin — the producer subprocess is
+  killed at that timeout regardless (``subprocess.run(..., timeout=...)``),
+  so the lease only has to outlast it long enough for the timeout itself
+  to fire and finalize the job, same "generous ceiling, not the actual
+  bound" reasoning as ``data-refresh`` above. No retry by default: a
+  failed producer run (bad credentials, crawl error, timeout) usually
+  needs an operator to look at it, not an automatic re-run against the
+  same corpus a few minutes later.
 """
 
 from __future__ import annotations
@@ -139,8 +179,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import subprocess
+import tempfile
 
-from app.worker.registry import HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
+from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, LIGHT_LANE, JobKind, register_kind
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +202,50 @@ _DEFAULT_LIGHT_LEASE_S = 300
 # heartbeat keeps the lease alive every lease_seconds/3 while the handler
 # thread runs).
 _DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S = 900
+# Hard ceiling on one producer subprocess run (extraction.timeout_s in
+# instance.yaml overrides this) — a full crawl+convert+anonymize+extract
+# pass over a real SharePoint site can legitimately run for a while.
+_DEFAULT_EXTRACTION_TIMEOUT_S = 3600
+# The job's own lease outlives the subprocess timeout by a margin so a
+# heartbeat tick never expires the lease out from under a still-running
+# (not-yet-timed-out) producer call — same pattern as _agent_response_job
+# _timeout_seconds()'s lease_seconds below.
+_EXTRACTION_LEASE_MARGIN_S = 120
+
+# Non-secret operational env vars forwarded to the producer subprocess from
+# THIS process's own environment, when present. Deliberately a NARROW
+# allowlist, never `{**os.environ}`: `extraction.producer.command`/`.module`
+# names an EXTERNAL, admin-configurable binary — unlike the in-repo Keboola
+# extractor subprocess `app/api/sync.py` spawns (which legitimately inherits
+# the full parent env because it IS this codebase, reviewed and trusted the
+# same way the rest of the process is), a producer an admin can point
+# anywhere must not receive this instance's secrets (JWT_SECRET_KEY,
+# AGNES_VAULT_KEY, ANTHROPIC_API_KEY, POSTGRES_PASSWORD/DATABASE_URL,
+# SLACK_BOT_TOKEN, KEBOOLA_STORAGE_TOKEN, ...) just because they happen to
+# sit in os.environ. Only what a well-behaved subprocess needs to run at
+# all (PATH), plus locale/timezone/tempdir/TLS/proxy settings — nothing an
+# attacker (or a merely careless producer) could exfiltrate for profit.
+_EXTRACTION_PRODUCER_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 def _data_refresh_lease_seconds() -> int:
@@ -1048,6 +1135,241 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: How much of a failed producer's stderr to keep for the DEBUG line. Enough
+#: for a Python traceback plus context, small enough that it can never be the
+#: reason a worker dies.
+_PRODUCER_STDERR_TAIL_BYTES = 64 * 1024
+
+
+def _tail_text(fh, limit: int) -> str:
+    """Last ``limit`` bytes of an open binary file, decoded leniently.
+
+    Seeks rather than reads forward, so a multi-gigabyte producer log costs
+    one seek. ``errors="replace"`` because the cut can land mid-codepoint and
+    a diagnostic must never raise on its way to the log.
+    """
+    try:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - limit))
+        return fh.read().decode("utf-8", errors="replace")
+    except Exception:  # pragma: no cover - a diagnostic must not mask the failure it describes
+        return "<unreadable>"
+
+
+def _extraction_timeout_seconds() -> int:
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "timeout_s", default=_DEFAULT_EXTRACTION_TIMEOUT_S)
+    try:
+        return max(int(raw), 1)
+    except (TypeError, ValueError):
+        return _DEFAULT_EXTRACTION_TIMEOUT_S
+
+
+def _extraction_producer_argv() -> list[str] | None:
+    """Build the producer's argv from ``extraction.producer`` config
+    (``config/instance.yaml.example``).
+
+    ``command`` (a full command line — either a YAML list, taken verbatim,
+    or a string split with ``shlex.split``) wins when both are set;
+    ``module`` is the ``python -m <module>`` shorthand for a producer the
+    ``worker`` image installed as a package (see the Dockerfile's
+    ``EXTRACTION_PRODUCER_INSTALL`` build-arg). Returns ``None`` when
+    neither is configured — the caller turns that into a clear "not
+    configured" failure rather than a confusing subprocess error.
+    """
+    from app.instance_config import get_value
+
+    command = get_value("extraction", "producer", "command", default=None)
+    if command:
+        if isinstance(command, list):
+            return [str(c) for c in command]
+        return shlex.split(str(command))
+
+    module = get_value("extraction", "producer", "module", default=None)
+    if module:
+        import sys
+
+        return [sys.executable, "-m", str(module)]
+
+    return None
+
+
+def _extraction_producer_env_passthrough() -> list[str]:
+    """Extra env var NAMES an operator explicitly opted into forwarding to
+    the producer, beyond :data:`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`
+    (``extraction.producer.env_passthrough``, default empty). A per-name
+    opt-in, not a way back to `{**os.environ}` — only the names listed here
+    are copied, and only when they actually exist in this process's
+    ``os.environ``."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "producer", "env_passthrough", default=[])
+    if isinstance(raw, list):
+        return [str(v) for v in raw]
+    if raw:
+        return [str(raw)]
+    return []
+
+
+def _extraction_producer_env() -> dict[str, str]:
+    """The non-secret base env for the producer subprocess: the curated
+    allowlist plus whatever :func:`_extraction_producer_env_passthrough`
+    names — each copied from ``os.environ`` only when present. Callers add
+    the resolved SharePoint credentials + corpus id on top of this."""
+    names = list(_EXTRACTION_PRODUCER_ENV_ALLOWLIST) + _extraction_producer_env_passthrough()
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def _run_corpus_extraction(payload: dict) -> dict:
+    """Producer-invocation SEAM for the ``corpus-extraction`` kind (spec
+    §7.5 / §16 step 7). See the module docstring's entry for the wider
+    picture; this is the mechanics.
+
+    THIS HANDLER DOES NOT CRAWL, CONVERT, ANONYMIZE, OR EXTRACT ANYTHING
+    ITSELF — it resolves credentials, builds a command line, runs one
+    subprocess, and reports what happened. The crawl -> convert ->
+    anonymize -> extract -> ingest pipeline behind that subprocess is the
+    external producer (a separate project of the operator's, adopted per spec
+    §7.1); porting its internals into this repo is explicitly out of scope
+    (spec §1 "Out of scope") — this handler is the seam a future producer
+    integration plugs into, not a place to grow pipeline logic.
+
+    ``payload``:
+      - ``connection_id`` (required) — a ``source_connections`` row,
+        ``source_type='sharepoint'``. Credentials are resolved from ITS
+        vault slot or the server's ``SHAREPOINT_CERT_PRIVATE_KEY`` env var
+        via :func:`connectors.sharepoint.settings.resolve_sharepoint_settings`
+        — the SAME resolution the SharePoint admin UI uses
+        (``app/api/admin_sharepoint.py``). Never hardcoded, never read from
+        this payload directly.
+      - ``corpus_id`` (optional, ``scope`` accepted as an alias) — which
+        collection the producer should write into. Passed through to the
+        producer verbatim; this handler does not interpret it.
+
+    Security (playbook F7): every secret this handler resolves —
+    tenant id, client id, certificate private key — reaches the producer
+    ONLY via the child process's environment, never on argv (readable via
+    `ps`/`/proc/<pid>/cmdline`) and never logged. That child env is NOT
+    `{**os.environ}` — `extraction.producer` names an EXTERNAL,
+    admin-configurable binary, so it starts from a curated non-secret
+    allowlist (`_EXTRACTION_PRODUCER_ENV_ALLOWLIST`) plus any operator-
+    opted-in `extraction.producer.env_passthrough`, then adds only the
+    three named credentials + the corpus id. No other instance secret
+    (vault key, LLM API key, DB DSN, ...) is ever forwarded, no matter what
+    happens to be sitting in this process's own environment. The
+    producer's own stdout/stderr are logged at DEBUG only, and only on
+    failure, in case a misbehaving producer echoes something it shouldn't
+    at INFO-visible levels.
+
+    No-op guard: raises (so the job fails cleanly, not with a confusing
+    subprocess error) when ``extraction.enabled`` is false or no producer
+    command/module is configured — the same "off unless explicitly turned
+    on" posture as ``ducklake-maintenance``'s backend check, just failing
+    instead of silently returning, since a `corpus-extraction` job only
+    ever exists because something explicitly enqueued it.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
+
+    argv = _extraction_producer_argv()
+    if not argv:
+        raise RuntimeError(
+            "corpus-extraction: no producer configured — set extraction.producer.command "
+            "or extraction.producer.module in instance.yaml"
+        )
+
+    connection_id = payload.get("connection_id")
+    if not connection_id:
+        raise RuntimeError("corpus-extraction: payload missing connection_id")
+
+    from src.repositories import source_connections_repo
+
+    connection = source_connections_repo().get(connection_id)
+    if connection is None or connection.get("source_type") != "sharepoint":
+        raise RuntimeError(f"corpus-extraction: connection {connection_id!r} not found or not a sharepoint connection")
+
+    from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+
+    try:
+        settings = resolve_sharepoint_settings(connection)
+    except SharePointSettingsError as exc:
+        # Named cause, not a bare 500-class traceback — mirrors
+        # app/api/admin_sharepoint.py::_resolved_token's typed handling of
+        # the identical error.
+        raise RuntimeError(f"corpus-extraction: {exc}") from exc
+
+    corpus_id = payload.get("corpus_id") or payload.get("scope")
+
+    # Secrets go in the CHILD process env, never on argv (security playbook
+    # F7) — but NOT the full parent environment. `extraction.producer`
+    # names an EXTERNAL, admin-configurable binary, so this starts from the
+    # curated non-secret allowlist (+ any operator-opted-in
+    # `env_passthrough`) — see `_EXTRACTION_PRODUCER_ENV_ALLOWLIST`'s
+    # comment for why `{**os.environ}` would leak every instance secret
+    # (vault key, LLM API key, DB DSN, ...) to whatever the admin pointed
+    # this at — and adds only the resolved credentials and the corpus id.
+    child_env = {
+        **_extraction_producer_env(),
+        "AGNES_SHAREPOINT_TENANT_ID": settings.tenant_id,
+        "AGNES_SHAREPOINT_CLIENT_ID": settings.client_id,
+        "AGNES_SHAREPOINT_PRIVATE_KEY": settings.private_key,
+    }
+    if corpus_id:
+        child_env["AGNES_EXTRACTION_CORPUS_ID"] = str(corpus_id)
+
+    timeout_s = _extraction_timeout_seconds()
+
+    logger.info(
+        "corpus-extraction: invoking producer for connection %s (corpus=%s, timeout=%ds)",
+        connection_id,
+        corpus_id,
+        timeout_s,
+    )
+    # NOT `capture_output=True`: that holds every byte the producer writes in
+    # THIS process's memory for the whole run, and the run may legitimately
+    # last `extraction.timeout_s` (default an hour) crawling a real site. The
+    # captured text is used for exactly one thing — a DEBUG line on failure —
+    # so an hour of a chatty producer's progress output would buy a diagnostic
+    # tail at the price of OOM-killing a worker whose container memory limit is
+    # 4g by default (Devin Review on this PR). stdout goes to /dev/null (this
+    # handler never reads it — the producer reports through the ingest API, not
+    # through its own stdout), and stderr streams to a temp file from which
+    # only the last `_PRODUCER_STDERR_TAIL_BYTES` are read back on failure.
+    # Trading unbounded RSS for bounded RSS plus scratch disk is the right way
+    # round: the memory limit is what kills the worker, and the tail is the
+    # part of a stack trace anyone reads anyway.
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as stderr_buf:
+            result = subprocess.run(
+                argv,
+                env=child_env,
+                timeout=timeout_s,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_buf,
+                check=False,
+            )
+            stderr_tail = _tail_text(stderr_buf, _PRODUCER_STDERR_TAIL_BYTES) if result.returncode != 0 else ""
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"corpus-extraction: producer timed out after {timeout_s}s") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"corpus-extraction: producer command not found: {argv[0]!r}") from exc
+
+    if result.returncode != 0:
+        logger.debug("corpus-extraction: producer stderr tail (connection %s): %s", connection_id, stderr_tail)
+        raise RuntimeError(f"corpus-extraction: producer exited {result.returncode} for connection {connection_id}")
+
+    logger.info("corpus-extraction: producer completed for connection %s", connection_id)
+    return {
+        "connection_id": connection_id,
+        "corpus_id": corpus_id,
+        "returncode": result.returncode,
+    }
+
+
 def register_all_kinds() -> None:
     """Register the real job kinds. Idempotent — safe to call more than
     once (e.g. across test re-imports); ``register_kind`` replaces any
@@ -1218,6 +1540,21 @@ def register_all_kinds() -> None:
             # class as the other analytics writers, so HEAVY (concurrency 1).
             lease_seconds=_DEFAULT_LIGHT_LEASE_S,
             retry_in_seconds=300,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="corpus-extraction",
+            handler=_run_corpus_extraction,
+            lane=EXTRACTION_LANE,
+            # Tracks the producer subprocess's own timeout (extraction.timeout_s,
+            # default 3600s) plus a margin — see the module docstring's
+            # lease/retry tuning note.
+            lease_seconds=_extraction_timeout_seconds() + _EXTRACTION_LEASE_MARGIN_S,
+            # No automatic retry: a failed producer run (bad credentials,
+            # crawl error, timeout) needs an operator to look at it, not an
+            # unattended re-run against the same corpus a few minutes later.
+            retry_in_seconds=None,
         )
     )
     from app.chat.manager import get_current_chat_manager

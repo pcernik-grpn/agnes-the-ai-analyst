@@ -1249,14 +1249,76 @@ let _currentAgentId = null;
  * exist", because a session row exists the moment you click "+ New chat". */
 let _sessionHasTurns = false;
 
+/** The conversation has started: settle the agent AND raise the thread
+ * header.
+ *
+ * These were two independent decisions and they disagreed. `openSession`
+ * titled every session it opened — "Untitled chat" when there was nothing
+ * better — which put `.has-thread` on the shell and swapped the centred
+ * empty-state layout for the conversation one. But switching agent on an
+ * empty dashboard goes through `newChat()` to get a session for the new
+ * agent, so picking an agent redrew the page as a conversation that did not
+ * exist: thread header, Copy transcript, composer pushed to the foot, and
+ * the dashboard still sitting there underneath.
+ *
+ * The distinction the picker already drew is the right one everywhere — "has
+ * this conversation started", not "does a session row exist" — so the header
+ * is driven from here too, and a session with no turns keeps the empty-state
+ * layout it had before the switch. */
+function _markConversationStarted() {
+  _sessionHasTurns = true;
+  _syncAgentPicker();
+  const meta = _sessionsCache.find(s => s.id === currentChatId);
+  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+}
+
+/** The inverse: no turns, so the empty-state dashboard and the live picker,
+ * and no thread chrome for a transcript that does not exist yet. */
+function _markConversationNotStarted() {
+  _sessionHasTurns = false;
+  _syncAgentPicker();
+  setThreadTitle(null);
+}
+
 /** What to call an agent in the picker. The seeded default agent is named the
  * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
  * answer to "who am I talking to?" — show the instance brand there instead.
  * A default the owner has since RENAMED keeps its own name. */
+/** How long a name may be before the pill abbreviates it. Sized to the widest
+ *  name that fits the 9rem cap at the button's weight without ellipsis. */
+const AGENT_LABEL_MAX = 14;
+
+/** The FULL name, for the menu, the in-conversation label and the title
+ *  attribute — everywhere there is room to say it.
+ *
+ *  The default agent is "Default", not the brand. It used to render as "Agnes",
+ *  which read more naturally on its own but was the odd one out once the caller
+ *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
+ *  different kind of thing), and it disagreed with the /agents page, where the
+ *  same row is called Default. One name per agent, everywhere. */
 function _agentLabel(a, brand) {
   if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return brand;
+  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
   return a.name || "Untitled agent";
+}
+
+/** The label as the PILL shows it: initials once a name is long enough to crowd
+ *  the composer ("Finance Proposals" → "FP").
+ *
+ *  Initials, not an ellipsis, so the pill's width is stable across agents rather
+ *  than growing to the cap — the trade is that two names sharing initials look
+ *  alike in the pill. The full name is always one hover (title) or one click
+ *  (the menu, which ticks the current row) away, and the in-conversation label
+ *  spells it out, so nothing depends on reading the pill alone.
+ *
+ *  Single long word has no initials to take, so it falls back to the CSS
+ *  ellipsis rather than rendering one lonely letter. */
+function _agentPillLabel(name) {
+  const full = String(name || "").trim();
+  if (full.length <= AGENT_LABEL_MAX) return full;
+  const words = full.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return full;
+  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1288,8 +1350,13 @@ function _syncAgentPicker() {
   }
   const agent = _agentById(_currentAgentId) || _defaultAgent();
   const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  if (btnLabel) btnLabel.textContent = name;
-  btn.title = "Choose which agent to chat with";
+  const pill = _agentPillLabel(name);
+  if (btnLabel) btnLabel.textContent = pill;
+  // When the pill abbreviates, the title is the only place the full name shows
+  // on hover — so say it there rather than repeating the generic instruction.
+  btn.title = pill === name
+    ? "Choose which agent to chat with"
+    : `${name} — choose which agent to chat with`;
   btn.hidden = _sessionHasTurns;
   if (staticLabel) {
     staticLabel.textContent = name;
@@ -1315,12 +1382,13 @@ function _renderAgentMenu() {
   if (!_agentsCache.length) {
     const note = document.createElement("li");
     note.className = "cloud-chat-agent-menu-note";
-    note.textContent = "No agents yet — build one on the Agents page.";
+    // No "build one on the Agents page" instruction any more: the create row
+    // below IS that path, so the note only has to state the fact.
+    note.textContent = "No agents yet.";
     menu.appendChild(note);
-    return;
   }
   const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of _agentsCache) {
+  for (const a of (_agentsCache.length ? _agentsCache : [])) {
     const li = document.createElement("li");
     li.className = "cloud-chat-agent-menu-item";
     if (a.id === currentId) li.classList.add("is-current");
@@ -1377,6 +1445,47 @@ function _renderAgentMenu() {
     });
     menu.appendChild(li);
   }
+
+  /* …and one row that is not an agent: the way to make another.
+   *
+   * It belongs here because this menu is where the caller finds out their
+   * agents are not enough — you go looking for the one that answers this
+   * question, do not find it, and the next move should be in reach rather than
+   * back through the rail to /agents. Standard account-switcher shape: the set,
+   * then "add one".
+   *
+   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
+   * (agents.html strips the param and calls createAgent, so the server mints
+   * the row) — not a second way to create an agent, just a second door to the
+   * one that exists. An <a>, so it is a real link: middle-click and
+   * open-in-new-tab work, and it needs no JS to function.
+   *
+   * Separated from the list by a rule, because it is a different KIND of row:
+   * every item above it switches this conversation, this one leaves the page. */
+  const create = document.createElement("li");
+  create.className = "cloud-chat-agent-menu-create";
+  create.setAttribute("role", "none");
+  const link = document.createElement("a");
+  link.href = "/agents?new=1";
+  link.setAttribute("role", "menuitem");
+  link.className = "cloud-chat-agent-menu-create-link";
+  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
+  plus.setAttribute("viewBox", "0 0 24 24");
+  plus.setAttribute("fill", "none");
+  plus.setAttribute("aria-hidden", "true");
+  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  pp.setAttribute("d", "M12 5v14M5 12h14");
+  pp.setAttribute("stroke", "currentColor");
+  pp.setAttribute("stroke-width", "2");
+  pp.setAttribute("stroke-linecap", "round");
+  plus.appendChild(pp);
+  link.appendChild(plus);
+  const ctext = document.createElement("span");
+  ctext.textContent = "Create new agent";
+  link.appendChild(ctext);
+  create.appendChild(link);
+  menu.appendChild(create);
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
@@ -1387,7 +1496,23 @@ async function _refreshAgents() {
     // Re-pointed from this page's own now-deleted /api/agents (Task C1.2) —
     // /api/v1/agents absorbed its wire shape, `mine` included, in Task C1.1.
     const res = await api("/api/v1/agents");
-    _agentsCache = (res.data || []).filter(a => a.mine && a.slug);
+    // Ready agents only — a draft is unfinished by its author's own say-so,
+    // and offering one here invites a conversation with something half-built.
+    // The picker is the "who am I talking to" control, not the agent index;
+    // /agents is where drafts belong, beside the thing that finishes them.
+    //
+    // `status`/`is_default` survive the move: v1's `_serialize` starts from
+    // `dict(row)`, so both columns pass through unchanged.
+    //
+    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent
+    // is seeded `status: "ready"` and an older draft one is promoted on first
+    // touch (`AgentsRepository.get_or_create_default`), so it passes the
+    // status test on its own. This keeps it from being dropped in the window
+    // before that heal lands — a picker without the default is a one-way
+    // switch, the same dead end the on-open refresh exists to avoid.
+    _agentsCache = (res.data || []).filter(
+      a => a.mine && a.slug && (a.status === "ready" || a.is_default)
+    );
   } catch (err) {
     console.warn("chat: could not load agents for the picker", err);
   }
@@ -1492,8 +1617,7 @@ async function loadAndRenderHistory(chatId) {
     }
   } else {
     hideCapabilities();
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
     lastAssistantArticle = null;
     lastUserText = "";
     for (const m of history) {
@@ -1596,7 +1720,12 @@ async function openSession(chatId, wsUrlOverride) {
   // Sidebar cache holds the title — look it up so the header reads
   // correctly the moment the session opens, before history hydrates.
   const meta = _sessionsCache.find(s => s.id === chatId);
-  setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // A titled session is necessarily one with turns (titles are derived from
+  // the conversation), so it can raise its header right away, before history
+  // hydrates. An UNTITLED one cannot be judged yet — it is equally a thread
+  // whose title never landed and a session created a moment ago by the agent
+  // picker — so the chrome waits for `loadAndRenderHistory` to say which.
+  setThreadTitle(meta && meta.title ? meta.title : null);
   // Who this conversation runs as. Read from the sidebar row (agent_id is
   // projected by GET /api/chat/sessions) rather than a per-open round-trip;
   // newChat() refreshes that cache before calling us, so a just-created
@@ -4276,8 +4405,7 @@ async function submitUserMessage(text) {
   // session's scope/memory/model/budget are fixed at creation and cannot be
   // re-pointed mid-thread. Disabling here rather than at session creation is
   // what keeps an empty "+ New chat" from dead-ending the picker.
-  _sessionHasTurns = true;
-  _syncAgentPicker();
+  _markConversationStarted();
   const ta = $("chat-input");
   if (ta) {
     ta.value = "";
@@ -4305,17 +4433,24 @@ async function submitUserMessage(text) {
     // openSession saw a session id it had never opened and reset the turns
     // flag — flipping the settled agent label back into a live picker
     // mid-send. The session is new; the conversation is not.
-    _sessionHasTurns = true;
-    _syncAgentPicker();
+    _markConversationStarted();
   } catch (err) {
     setStatus(`Could not start chat: ${err.message}`, "error");
     showCapabilities();
+    // Step 1 cleared the composer optimistically, but no turn ever started:
+    // give the text back rather than destroying what they typed. A chat
+    // backend that is down must cost a retry, not the message — otherwise
+    // the only record of a long prompt is the user's memory of it.
+    const taFailed = $("chat-input");
+    if (taFailed && !taFailed.value) {
+      taFailed.value = text;
+      autosizeComposer();
+    }
     // The turn never started, so nothing is settled — hand the picker back
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
     // began.
-    _sessionHasTurns = false;
-    _syncAgentPicker();
+    _markConversationNotStarted();
     return;
   }
   // 3. Now ``#chat-messages`` is stable — render the user bubble and
@@ -6116,7 +6251,16 @@ function renderCoPresence(host, participants) {
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact
   // same flow as a typed message.
-  initChatDashboard({ submitPrompt: submitUserMessage, openSession });
+  // `capabilities` is the same server-rendered snapshot renderCapabilities()
+  // reads, passed in rather than re-parsed in the dashboard module so the page
+  // has exactly one parser for that blob. The dashboard uses it to decide
+  // which suggestions are honest: with no reachable tables, the four data
+  // starters ("Compare revenue trends", …) would every one of them fail.
+  initChatDashboard({
+    submitPrompt: submitUserMessage,
+    openSession,
+    capabilities: readCapabilitySnapshot(),
+  });
   // Pre-seeded question (/chat?q=… — the detail pages' "Ask Agnes" links):
   // prefill the composer and focus, but never auto-send — a GET must stay
   // side-effect free (a reload would otherwise re-create sessions).

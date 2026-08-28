@@ -58,7 +58,7 @@ from src.repositories import (
 )
 from src.repositories.store_submissions import BLOCKING_SUBMISSION_STATUSES
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from app.auth.access import is_user_admin, require_admin, required_store_entity_ids
@@ -2360,6 +2360,308 @@ async def create_entity_from_markdown(
     finally:
         _precheck_verdict_ctx.reset(ctx_tok)
     return created
+
+
+# ---------------------------------------------------------------------------
+# Compose — POST /api/store/entities/from-components
+# ---------------------------------------------------------------------------
+#
+# Every Library entity is already baked into a one-plugin tree
+# (``_bake_plugin_tree``), so a saved skill IS served to Claude Code as a
+# single-skill plugin — publishing a plugin is not a step on the way to
+# distributing a skill. What that shape cannot express is the one thing this
+# endpoint is for: "one install hands my team these five things at once."
+#
+# Before this existed the plugin type accepted nothing but a .zip the author
+# had packaged somewhere else, and there was no way to get an authored skill
+# back out of the Library to put in one — so composing was possible only for
+# authors who kept their skills on disk in the first place.
+
+
+# A composite is a convenience wrapper, not an archive format. The cap keeps a
+# runaway selection from baking a tree no reviewer will read.
+MAX_COMPONENTS = 25
+
+# What can be folded in. A plugin component would mean merging one manifest
+# into another — hook arrays, an ``.mcp.json``, a ``version`` — which is a
+# different feature with its own conflict rules, so it is refused by name
+# rather than half-supported.
+_COMPOSABLE_TYPES = {"skill", "agent"}
+
+
+class CreateFromComponentsBody(BaseModel):
+    """JSON contract for composing a plugin out of Library entities.
+
+    Deliberately the same metadata fields as ``CreateFromMarkdownBody`` — the
+    builder posts one shape or the other depending on which source the author
+    picked, and both delegate to ``create_entity`` so quota, guardrails, LLM
+    review, naming and versioning apply identically.
+    """
+
+    name: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+    # Entity ids, in the order the author picked them. Order is cosmetic (it
+    # decides nothing about the baked tree) but preserved in refusal messages
+    # so "the third one" means what the author sees.
+    components: List[str] = []
+    access: Literal["private", "everyone"] = "everyone"
+    publisher_kind: Literal["user", "organization"] = "user"
+    # Mirrors CreateFromMarkdownBody.dry_run: short-circuits before any DB
+    # write and returns the shape ``POST /entities/preview`` returns for an
+    # uploaded .zip, so the builder's Check panel renders both identically.
+    dry_run: bool = False
+
+
+def _resolve_components(component_ids: List[str], user: dict, conn) -> List[dict]:
+    """Resolve + authorize the selected entity rows, in the caller's order.
+
+    An entity the caller cannot see is 404, never 403 — the same rule
+    ``_enforce_visibility`` follows on every other asset read, so a composite
+    cannot be used to probe for the existence of someone's private skill.
+    """
+    if not component_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "no_components",
+                "hint": "Pick at least one skill or agent template from your Library.",
+            },
+        )
+    if len(component_ids) > MAX_COMPONENTS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "too_many_components",
+                "limit": MAX_COMPONENTS,
+                "given": len(component_ids),
+                "hint": f"A plugin can hold at most {MAX_COMPONENTS} items. Split it into two.",
+            },
+        )
+    repo = store_entities_repo()
+    seen: set = set()
+    rows: List[dict] = []
+    for cid in component_ids:
+        if cid in seen:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "duplicate_component", "component_id": cid},
+            )
+        seen.add(cid)
+        entity = repo.get(cid)
+        if not entity:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "component_not_found", "component_id": cid},
+            )
+        _enforce_visibility(entity, user, conn)
+        if entity.get("type") not in _COMPOSABLE_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "component_type_unsupported",
+                    "component_id": cid,
+                    "given": entity.get("type"),
+                    "hint": (
+                        "Only skills and agent templates can be folded into a plugin. "
+                        "To publish a plugin that contains another plugin, upload the "
+                        "packaged .zip instead."
+                    ),
+                },
+            )
+        rows.append(entity)
+    return rows
+
+
+def _compose_components_scratch(
+    rows: List[dict],
+    *,
+    scratch: Path,
+    name: str,
+    description: Optional[str],
+) -> None:
+    """Write the composite's ZIP-shaped tree into ``scratch``.
+
+    Each component contributes its BAKED subtree minus its own
+    ``.claude-plugin/``: that manifest describes the component as a standalone
+    plugin, and the composite gets one synthesized manifest of its own.
+
+    Baked directory names keep their ``-by-<username>`` suffix. That suffix is
+    what the component's own ``SKILL.md`` frontmatter says (``_bake_plugin_tree``
+    rewrote it there on the component's own publish), so stripping it here
+    would desync the two — and keeping it is what lets two owners' same-named
+    skills coexist inside one composite.
+
+    Caps mirror the ``.zip`` intake path's (``_safe_zip_extract``) so a
+    composite can never build a tree the intake it delegates to would then
+    refuse with a message about an archive the author never uploaded.
+    """
+    total_bytes = 0
+    total_files = 0
+    origin: dict = {}  # rel posix path -> the component row that wrote it
+    for row in rows:
+        src = _plugin_dir(row["id"])
+        if not src.is_dir():
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "component_bundle_missing",
+                    "component_id": row["id"],
+                    "component_name": row.get("name"),
+                    "hint": (
+                        "That item has no bundle on disk — it may still be under review, or its files were purged."
+                    ),
+                },
+            )
+        for f in sorted(src.rglob("*")):
+            if not f.is_file() or _is_junk_path(src, f):
+                continue
+            rel = f.relative_to(src)
+            if rel.parts and rel.parts[0] == ".claude-plugin":
+                continue
+            key = rel.as_posix()
+            prior = origin.get(key)
+            if prior is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "component_path_conflict",
+                        "path": key,
+                        "between": [prior.get("name"), row.get("name")],
+                        "hint": ("Two of the selected items ship the same file. Rename one of them, or leave it out."),
+                    },
+                )
+            total_files += 1
+            total_bytes += f.stat().st_size
+            if total_files > MAX_ZIP_ENTRIES or total_bytes > MAX_ZIP_UNCOMPRESSED:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "code": "components_too_large",
+                        "max_files": MAX_ZIP_ENTRIES,
+                        "max_bytes": MAX_ZIP_UNCOMPRESSED,
+                        "hint": "Select fewer items.",
+                    },
+                )
+            origin[key] = row
+            dest = scratch / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
+
+    if not origin:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "components_empty",
+                "hint": "The selected items contributed no files.",
+            },
+        )
+
+    # The composite's own manifest. ``name`` is the plain one — the bake step
+    # rewrites it to the suffixed value, and writing the plain one here keeps
+    # _validate_and_extract_metadata's pre-fill reporting what the author typed.
+    manifest_dir = scratch / ".claude-plugin"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "plugin.json").write_text(
+        json.dumps({"name": name, "description": description or ""}, indent=2),
+        encoding="utf-8",
+    )
+
+
+# No single ``response_model``: the create path answers with a
+# StoreEntityResponse (201) and ``dry_run`` with a PreviewResponse (200), the
+# same split ``/entities/from-markdown`` has. The declared 201 is the create
+# case; the dry-run branch returns its own 200 Response.
+@router.post("/entities/from-components", status_code=201)
+async def create_entity_from_components(
+    body: CreateFromComponentsBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),  # no resource gate: store is open-to-authed, enforced downstream
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Compose a plugin from Library entities the caller can already see.
+
+    Merges each selected entity's baked subtree into one plugin tree, zips it
+    in memory, and delegates to ``create_entity`` — so a composite is
+    indistinguishable downstream from an uploaded ``.zip`` of the same bytes,
+    and pays the same guardrail review.
+
+    ``dry_run=True`` returns a ``PreviewResponse`` (the shape the ``.zip``
+    Check path returns) and writes nothing.
+    """
+    name = body.name.strip()
+    if not _NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid_name_format")
+
+    rows = _resolve_components(body.components, user, conn)
+
+    scratch = Path(tempfile.mkdtemp(prefix="agnes_store_compose_"))
+    try:
+        _compose_components_scratch(
+            rows,
+            scratch=scratch,
+            name=name,
+            description=body.description,
+        )
+
+        if body.dry_run:
+            from src.store_guardrails.content_check import summarize_for_preview
+            from src.store_naming import humanize_name
+
+            meta = _validate_and_extract_metadata("plugin", scratch)
+            component_rows = summarize_for_preview(scratch, "plugin")
+            extracted_name = meta.get("name")
+            preview = PreviewResponse(
+                type="plugin",
+                name=extracted_name,
+                description=meta.get("description"),
+                title=humanize_name(extracted_name) if extracted_name else None,
+                field_issues=_preview_field_issues(
+                    user,
+                    final_name=name,
+                    category=body.category,
+                ),
+                components=[
+                    PreviewComponent(
+                        type=row["type"],
+                        name=row.get("name") or None,
+                        file=row["file"],
+                        description=row.get("description") or None,
+                        ok=row["ok"],
+                        issues=row["issues"],
+                    )
+                    for row in component_rows
+                ],
+            )
+            return JSONResponse(status_code=200, content=preview.model_dump())
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(scratch.rglob("*")):
+                if f.is_file():
+                    zf.write(f, f.relative_to(scratch).as_posix())
+        buf.seek(0)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    upload = UploadFile(file=buf, filename=f"{name}.zip")
+    return await create_entity(
+        background_tasks,
+        file=upload,
+        type="plugin",
+        name=name,
+        description=body.description,
+        category=body.category,
+        video_url=None,
+        title=None,
+        tagline=None,
+        photo=None,
+        docs=[],
+        access=body.access,
+        publisher_kind=body.publisher_kind,
+        user=user,
+        conn=conn,
+    )
 
 
 @router.post("/entities", response_model=StoreEntityResponse, status_code=201)

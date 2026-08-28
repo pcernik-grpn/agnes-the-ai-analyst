@@ -95,6 +95,13 @@ _SESSION_COLS = [
     "distinct_tools",
     "distinct_skills",
     "primary_model",
+    # v44 token counters — stored since the processor learned to sum
+    # message.usage, but never projected until TCRD-222 (mirrors the
+    # DuckDB sibling).
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
 ]
 
 
@@ -590,11 +597,7 @@ class UsagePgRepository:
     @staticmethod
     def _sessions_where(filters: dict) -> tuple[str, dict]:
         # anchor mirror of the DuckDB sibling (browser default: uploaded)
-        anchor_col = (
-            "COALESCE(uploaded_at, started_at)"
-            if filters.get("anchor") == "uploaded"
-            else "started_at"
-        )
+        anchor_col = "COALESCE(uploaded_at, started_at)" if filters.get("anchor") == "uploaded" else "started_at"
         where = [f"{anchor_col} >= :since"]
         params: dict = {"since": filters["since"]}
         if filters.get("username"):
@@ -664,8 +667,7 @@ class UsagePgRepository:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
-                    "SELECT session_file FROM usage_session_summary "
-                    "WHERE COALESCE(uploaded_at, started_at) >= :since"
+                    "SELECT session_file FROM usage_session_summary WHERE COALESCE(uploaded_at, started_at) >= :since"
                 ),
                 {"since": since},
             ).fetchall()
@@ -708,13 +710,19 @@ class UsagePgRepository:
             "tool_calls",
             "tool_errors",
             "primary_model",
+            # TCRD-222 — stored since v44, projected at last.
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
         )
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
                     "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
                     "user_messages, assistant_messages, tool_calls, tool_errors, "
-                    "primary_model FROM usage_session_summary WHERE session_file = :sf"
+                    "primary_model, input_tokens, output_tokens, cache_read_tokens, "
+                    "cache_creation_tokens FROM usage_session_summary WHERE session_file = :sf"
                 ),
                 {"sf": session_file},
             ).fetchone()

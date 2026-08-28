@@ -194,6 +194,15 @@
   .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
   .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* Certificate expiry status (spec: catch a silently expiring certificate
+     before auth breaks) — reuses the same success/warn/danger accent tokens
+     the health chip and pipeline strip already use. */
+  .ds-badge.badge-ok     { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .ds-badge.badge-ok::before     { background: var(--ds-accent-success-ink); }
+  .ds-badge.badge-warn   { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+  .ds-badge.badge-warn::before   { background: var(--ds-accent-warn-line); }
+  .ds-badge.badge-danger { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+  .ds-badge.badge-danger::before { background: var(--ds-accent-danger-line); }
   /* The file-source card's error-category badges are BUTTONS (they open the
      filtered drawer, spec §13.2) — normalize away the browser's default
      button chrome so a clickable badge still reads as a badge. */
@@ -724,6 +733,19 @@
   .ds-wshare-card {
     border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
     padding: 2px 14px 8px; margin-bottom: 12px; background: var(--surface, var(--ds-surface));
+  }
+  /* "New group…" closes the gap where the audience you want does not exist
+     yet. Styled as an ADD affordance, not a card: dashed, full width, quiet —
+     it belongs to the list above it rather than competing with it. */
+  .ds-wshare-newgroup {
+    display: block; width: 100%; margin-top: 10px; padding: 10px 12px;
+    border: 1px dashed var(--ds-border); border-radius: 10px;
+    background: none; color: var(--ds-text-secondary);
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .ds-wshare-newgroup:hover, .ds-wshare-newgroup:focus-visible {
+    border-style: solid; border-color: var(--ds-primary);
+    color: var(--ds-primary); background: var(--ds-primary-light);
   }
   .ds-wshare-card__hd { display: flex; align-items: center; gap: 8px; padding: 9px 0 4px; }
   .ds-wshare-card__hd b { font-size: 13.5px; color: var(--ds-text-primary); }
@@ -1499,6 +1521,9 @@
 <div id="ds-toast" class="ds-toast" role="status" aria-live="polite"></div>
 
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
+{# The Share step's "New group…" opens the SAME drawer /admin/access uses, so
+   a group is created in one place rather than in a wizard-shaped copy. #}
+<script src="{{ static_url('js/components/group_drawer.js') }}" defer></script>
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
 const API_REGISTER_TABLE = "/api/admin/register-table";
@@ -1947,6 +1972,48 @@ function _sharepointFactsHtml(row) {
       ? (cert.set_at ? `set ${_esc(new Date(cert.set_at).toLocaleDateString())}` : "set date unknown")
       : `env <code>${_esc(cert.env_name || "")}</code>`;
 
+  // Certificate METADATA — thumbprint (what the client actually presents,
+  // compared against the identity provider), subject, and an expiry badge.
+  // Derived server-side from the same stored PEM `certDetail` above already
+  // resolved; never the private key. Rendered only once the connection's
+  // settings resolved (`cert.error` already covers a settings-resolution
+  // failure above — repeating "not configured" here would be noise): a
+  // resolvable-but-unusable certificate (no CERTIFICATE block, or one that
+  // fails to parse) gets its own single honest line rather than silently
+  // vanishing (`cert.metadata_reason`).
+  let certMetaHtml = "";
+  if (!cert.error && cert.thumbprint_x5t) {
+    const tone = cert.status === "expired" ? "badge-danger" : cert.status === "expiring_soon" ? "badge-warn" : "badge-ok";
+    const expiresDate = cert.not_after ? new Date(cert.not_after).toLocaleDateString() : "unknown";
+    const daysText = cert.expires_in_days < 0 ? `expired ${Math.abs(cert.expires_in_days)}d ago` : `${cert.expires_in_days}d left`;
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The value the client actually presents (JWT x5t) — compare against the identity provider's app registration.">Thumbprint</span>
+    <span class="ds-src__fact-v">
+      <code>${_esc(cert.thumbprint_x5t)}</code>
+      <button type="button" class="btn btn-secondary" onclick="_copySharepointThumbprint(this)">Copy</button>
+    </span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Subject</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(cert.subject || "unknown")}</span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Expires</span>
+    <span class="ds-src__fact-v">
+      <span class="ds-badge ${tone}">${_esc(cert.status || "")}</span>
+      <span style="color:var(--ds-text-muted)">${_esc(expiresDate)} &middot; ${_esc(daysText)}</span>
+    </span>
+  </div>`;
+  } else if (!cert.error && cert.metadata_reason) {
+    const reasonText = cert.metadata_reason === "no_certificate_configured" ? "not configured" : "unreadable";
+    certMetaHtml = `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k">Thumbprint</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">${_esc(reasonText)}</span>
+  </div>`;
+  }
+
   const identity = fs.identity || { groups_matched: 0, collections_no_group: 0 };
   const identityTone = identity.collections_no_group ? "is-warn" : "";
   const identityText = `${identity.groups_matched} group${identity.groups_matched === 1 ? "" : "s"} matched`
@@ -1976,7 +2043,7 @@ function _sharepointFactsHtml(row) {
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Certificate</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
-  </div>
+  </div>${certMetaHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Identity matching</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
@@ -1986,6 +2053,22 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-v">${badgesHtml}</span>
   </div>
   <div class="ds-filesource-drawer" id="ds-fs-drawer-${row.id}" hidden></div>`;
+}
+
+/* Copies the certificate thumbprint an admin compares against the identity
+   provider's app registration. Reads the rendered <code> text directly
+   (already `_esc`-escaped on the way in, and a base64url thumbprint has no
+   characters that escaping would have changed) rather than threading the
+   raw value through an onclick attribute string. */
+function _copySharepointThumbprint(btn) {
+  const code = btn.previousElementSibling;
+  const text = code && code.textContent;
+  if (!text || !navigator.clipboard || typeof navigator.clipboard.writeText !== "function") return;
+  navigator.clipboard.writeText(text).then(() => {
+    const original = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  });
 }
 
 /* Segmented switch: click a badge, see that category's itemized rows below
@@ -4538,7 +4621,14 @@ async function _renderShareStep() {
       ${_wizardGroups.map(row).join("") || '<div class="ds-btray-empty">No groups on this instance yet.</div>'}
     </div>`;
   };
-  host.innerHTML = existingNote + _wizardPackages.map(card).join("");
+  // The audience you want may not exist yet. Without this the only way out of
+  // that is to abandon the wizard, go to Access, make the group, and start
+  // over — so the step that asks "who gets this?" can only be answered with
+  // groups someone thought of earlier.
+  const newGroup =
+    '<button type="button" class="ds-wshare-newgroup" id="ds-wizard-newgroup">' +
+    '<span aria-hidden="true">+</span> New group…</button>';
+  host.innerHTML = existingNote + _wizardPackages.map(card).join("") + newGroup;
 }
 
 async function _shareAndFinish() {
@@ -4928,6 +5018,26 @@ document.getElementById("ds-wizard-step-bundle").addEventListener("input", (e) =
 
 // Step 4 cards: checkbox = share with default Optional; tier segmented.
 document.getElementById("ds-share-cards").addEventListener("click", (e) => {
+  // "New group…" — make the audience without leaving the wizard.
+  //
+  // Reuses AgnesGroupDrawer, the same drawer /admin/access opens, so there is
+  // one place a group comes into existence rather than a wizard-shaped copy
+  // of it. On save the group list is re-fetched and the step re-rendered; the
+  // shares chosen so far live in `_wizardShares`, which this does not touch,
+  // so nothing already ticked is lost.
+  if (e.target.closest("#ds-wizard-newgroup")) {
+    if (!window.AgnesGroupDrawer) return;
+    window.AgnesGroupDrawer.open({
+      onSaved: async () => {
+        try {
+          const r = await fetch("/api/admin/groups", { credentials: "include" });
+          _wizardGroups = r.ok ? await r.json() : _wizardGroups;
+        } catch (err) { /* keep the list we have — the step still works */ }
+        _renderShareStep();
+      },
+    });
+    return;
+  }
   const row = e.target.closest(".ds-wshare-row");
   if (!row) return;
   const pkgLocal = row.dataset.pkg;

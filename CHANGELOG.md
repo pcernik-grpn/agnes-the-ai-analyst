@@ -11,11 +11,629 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
+- **Connecting an MCP source is a builder, and so is linking external apps.**
+  Both were the least builder-shaped surfaces in the product, and both are now
+  the two-pane shell the other four use — numbered sections with real
+  summaries, `+` pickers, one primary action.
+  - `/admin/mcp-sources/new` replaces a create modal with eleven fields plus a
+    separate page to introspect, curate tools and grant them: five steps in a
+    fixed order the admin was expected to know, across two pages, with no way
+    to find out whether the server was reachable until step three. The list
+    page is unchanged; only the create path moved.
+  - **`POST /api/admin/mcp-sources/preview-introspect`** dials a connection the
+    admin has *typed* and returns its tool list, writing nothing — the same
+    relationship to `POST /mcp-sources` that `/entities/preview` has to
+    `POST /entities`. You cannot sensibly choose which tools to grant without
+    seeing them, and the alternative was registering a disabled row first. It
+    runs the same url guard and the same introspection as the registered path.
+  - **`POST /api/admin/mcp-sources/builder/turn`** is the fourth builder turn.
+    Its sanitizer refuses two things the others need not: a `url` the admin has
+    not already typed (the model may not choose which host the instance dials),
+    and an `auth_secret_env` not shaped like a variable name (which is what
+    stops a pasted token being stored in a displayed field).
+  - `/admin/linked-apps/new` drops the two things that made the wizard
+    operator-hostile: it **detects** the source and its lister tool instead of
+    asking, and it treats the **projection map** — which response field is the
+    app's name, which is its URL — as an escape hatch shown only when a row
+    came back that the adapter's own aliases could not read, rather than as a
+    step. That map is an integration author's artifact, not an operator's.
+- **Suggested-prompt chips in the builders are the chips from the chat landing
+  screen.** Both are "things you could say next" under a composer; shipping two
+  different chips for one idea is how a product stops reading as one system.
+- **The builders lead the setup instead of waiting for it.** Every builder
+  opened with a paragraph the page hardcoded and then waited for the author to
+  describe the whole artifact in one go. Nothing modelled what was still
+  unknown, and the prompts said so outright — *"ask at most ONE question per
+  turn, and only when the answer would change the configuration."*
+  - A **declared interview** per type: an ordered list of what the thing still
+    needs, computed from the draft on every turn and handed to the model as that
+    turn's job. The panel shows it — *"2 of 5 — still to settle: the trigger,
+    the steps, a category"* — from the same predicates the prompt is built out
+    of, so the assistant and the form cannot disagree about what is missing.
+  - **The builder speaks first.** An empty message on the first turn is now the
+    opening turn, generated from the empty draft and the first open slot; a
+    later empty message is still refused.
+  - Slot thresholds match the store's own content guardrail (a description under
+    ~60 characters or a body under ~200 is rejected at Check), so the interview
+    cannot lead an author into a wall. Slots that may legitimately end empty —
+    an agent's knowledge, a package's groups — are deliberately absent: one that
+    can never be settled turns the progress line into a nag.
+  - `app/api/builder_core.py` now owns what the three turn endpoints each
+    re-implemented (transcript model, caps, stub gate, LLM call, response
+    envelope, prompt scaffolding). Each adapter keeps its own patchable fields,
+    candidates, type brief, slots and **sanitizer** — that last one
+    deliberately not generalized, since model output is untrusted input.
+- **Every builder turn now reports which engine answered it**, and the page
+  renders a scripted one as a standing notice. The stub also has its own flag
+  (`AGNES_BUILDER_STUB`) instead of being implied by `LOCAL_DEV_MODE` — which,
+  since `LOCAL_DEV_MODE` is also what provides local auto-auth, meant there was
+  no way to run a local instance with auth *and* a real turn, and every local
+  judgement about builder quality was made against a string-slicer returning the
+  identical wire shape. `TESTING=1` still forces the stub.
+- **`/admin/mcp-sources` and `/admin/linked-apps` are in the Library's + Add
+  menu.** Both are create verbs — a new capability appears in the workspace —
+  and both lived only in admin, so the menu that claims to be where you add
+  things listed four of the six things you can add. They keep the menu's
+  blast-radius grouping (an MCP source adds tool-calling reach to every agent
+  granted it) and still open their existing pages.
+- **A plugin can now be composed from items already in the Library** — the
+  builder's plugin type offers *Pick from the Library* beside *Upload a .zip*,
+  and `POST /api/store/entities/from-components` assembles the bundle
+  server-side from the selected skills and agent templates. Previously the
+  plugin type accepted nothing but a `.zip` packaged elsewhere, and there was
+  no way to get an authored skill back out of the Library to put in one — so
+  bundling was reachable only for authors who kept their skills on disk.
+  - Each component's baked subtree is merged (minus its own
+    `.claude-plugin/`, since the composite gets one synthesized manifest),
+    zipped in memory, and handed to the same `POST /entities` path — a composed
+    plugin is indistinguishable downstream from an uploaded one and pays the
+    same guardrail review. Component directory names keep their
+    `-by-<username>` suffix, which is what their own frontmatter says and what
+    lets two owners' same-named skills coexist in one composite.
+  - `dry_run: true` returns the same preview shape the `.zip` route's
+    *Check bundle* uses, so both routes report their contents identically.
+  - A component the caller cannot see is **404, never 403** — a composite must
+    not become a probe for someone else's private item. A plugin component is
+    refused by name (`component_type_unsupported`): merging two manifests is a
+    separate feature with its own conflict rules.
+  - Unlike a `.zip` — a `File`, which cannot be persisted — a composed draft is
+    only ids, so it survives a reload whole, and the "re-attach the .zip"
+    prompt is now scoped to the upload route.
+  - Copy throughout the type now says the thing the builder never did: a skill
+    saved to the Library **already installs on its own**, so a plugin is never
+    a prerequisite for shipping one — only for shipping several at once.
+- **The builder's configuration sections are cards again.** They were flattened
+  onto the panel with only a hairline between them, on the argument that six
+  white cards inside a panel that is itself a surface is two levels of
+  container for one list. True, but the cost was worse: with only a hairline a
+  section's heading, labels, hints and inputs all sit on one grey field, the
+  white input boxes become the strongest edges in the column, and nothing marks
+  where one section ends and the next begins. Both builders share the rule, so
+  `/agents` and `/skills` are fixed together, and the skills page's Type step
+  follows — flat among cards is the same mistake inverted.
+- **The `/chat` landing page introduces itself in text instead of a banner.**
+  The Knowledge Layer hero that led the page is retired: it asserted a category
+  ("Agnes is your knowledge layer") rather than saying what Agnes answers,
+  spent the page's best space on a CTA pointing away from the composer, and its
+  "Connect your tools" button was read as sending data *into* Agnes when the
+  direction is the opposite. In its place: a greeting, the "Ask Agnes
+  anything" heading, and one factual sentence about what it answers and that it
+  cites sources — then three labelled doors at the foot of the empty state
+  ("See what Agnes knows", "Take Agnes to your own tools", "How Agnes
+  works"), the middle one naming the direction the old CTA got backwards. Same
+  page for admins and members.
+- **The chat landing page stops offering what it cannot do, and gives an admin
+  one thing to do.** On an instance with no data reachable by the caller the
+  page used to say "Ask Agnes anything", suggest four data starters ("Compare
+  revenue trends", …) that would every one of them fail, and put "try:
+  summarize revenue trends" in the composer. The offer now follows the state.
+  An **admin** with nothing registered gets "Set up Agnes for your team" over
+  "It knows nothing about your company yet, so it can answer nothing", and
+  exactly one action: a *Set up Agnes* card — visually apart from its
+  neighbours, since it is a job the reader owns rather than a place to browse —
+  carrying a primary button that opens the connect wizard *on* the connector
+  this instance is configured for. Its starters become answerable ones ("How do
+  I connect our data?", "What will people be able to ask?"). A **running
+  instance** keeps the same card, reporting progress and pointing at the admin
+  overview, with governance starters in place of the data ones ("Who can see
+  what?", "What can nobody reach?"). A **member** who can reach nothing gets
+  starters aimed at the only thing they can act on ("How do I get access?")
+  rather than at data they have no grant for. Callers with data see the page
+  as before, except the three route cards move above the composer — they are
+  where you go instead of asking, so asking them to be scrolled past was
+  backwards. The "no data is registered yet" notice bar is gone: the heading
+  says it now.
+- **The `/agents` builder is now a conversation next to the configuration.**
+  Opening an agent gives two panes: a **Create** conversation on the left that
+  describes the agent in plain language, and the **Configuration** on the
+  right that it fills in — name, role, instructions, tone, greeting, and which
+  data packages / memory domains / artefact collections it is grounded in.
+  Every field stays hand-editable while the assistant is talking; the panel,
+  not the conversation, remains the source of truth. New endpoint
+  `POST /api/agents/{agent_id}/builder/turn` (owner-only) runs one turn
+  through the existing `connectors.llm` structured extractor and applies the
+  result through the ordinary `PATCH /api/agents/{id}` path, so the
+  builder-declaration → enforced-scope derivation is unchanged. The model's
+  output is treated as untrusted: unknown fields, ids outside the caller's
+  own candidate lists, and invented tones are dropped before anything is
+  written, and `status` / the four `*_mode` columns are not writable from a
+  conversation at all. With no AI credential configured the endpoint answers
+  `503 builder_llm_unavailable` and the panel stays fully usable by hand.
+- **The builder's Preview is a live chat with the agent**, replacing the
+  static mock card. It opens a real session bound to the draft agent's own
+  slug (`POST /api/chat/sessions` with `agent_slug`) and streams the answer
+  over the existing WebSocket, after flushing the pending edit so the agent
+  answers as its current configuration rather than the previous one. Answers
+  render as plain text — the page has no HTML sanitizer — with an *Open in
+  full chat* link to the same session for the full renderer. Engine failures
+  are translated into what the reader can act on instead of surfacing the
+  internal kind.
 - **SharePoint file-source connect wizard** (spec §13.2), reached as a source *type* from `/admin/data-sources` "Add source" — no new nav item. `sharepoint` joins the `source_connections` registry (tenant/client id as fields, certificate via the connection's vault secret or a server env name, never echoed — only its origin and set-date, parsed from the repos' string stamp into the `datetime` the card renders). Its own admin API — `GET .../tree` (a live Microsoft Graph folder-tree browse, one level per call: sites → drives → root children, using the resolved certificate; a missing/unresolvable certificate answers a typed `409` rather than failing the browse), `GET/POST/DELETE .../scopes` (confirm a selected site/library/folder as a scope — `{source_scope_id, display_path, anonymize, collection_id}` stored in the connection's own config, no new table; confirming creates its collection, re-confirming the same `source_scope_id` reuses it; unselecting removes only the wizard's bookkeeping row, never the collection; `group_ids` is the complete SET of groups for that collection when the field is present — listed groups are granted and any other group's grant on it is revoked, because the share step pre-ticks the grants that exist and warns the moment the last one is unticked, so an additive-only handler would show the admin a revocation that never happened — while omitting the field touches no grant at all, which is what keeps a rename or an anonymize toggle from stripping access as a side effect), and `GET .../corpus-map` (the producer handoff: a flat `{source_scope_id: collection_id}` mapping `ship_to_agnes.py --corpus-map` reads until crawling moves inside Agnes). The wizard UI runs the three steps verbatim — connect (identity + certificate), scope (the folder tree, per-row anonymize column, a note that only the extracted markdown is stored, never the original file), share (a per-collection group-badge preview that warns on any collection leaving with no group — "indexed but invisible").
+- **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
 - **Fact graph over Collections — ingest run reports + the file-source source card** (build order step 6, same `facts.enabled`/Postgres-only gate). Every `POST /api/facts/ingest` batch now also persists its run report to `facts_ingest_runs` (id, corpus ids touched, documents seen, claims written/rejected — count plus itemized detail, deferred, subjects created/deleted, review items, caller) — written AFTER the ingest transaction commits, log-and-continue on failure, so a report-write hiccup never rolls back or fails an ingest. `GET /api/facts/ingest-runs?limit=` (admin) lists them newest-first. On `/admin/data-sources`, a `sharepoint`-type connection now renders the shared `.ds-src` card with a file-source pipeline strip (crawl → extraction → facts → graph counts, plus a labeled-placeholder queue-cost estimate), a static schedule line ("external producer · hourly delta" — the crawl runs externally), a certificate row (vault/env origin and set-date, never the credential value), an identity-matching row (groups matched / collections with no group, fail-closed), and per-run error badges (rejected quotes / deferred / protocol errors) that open a drawer itemizing that category. A connection with no ingest history yet, or a DuckDB-backed instance, degrades gracefully rather than erroring; a "scope collections" heuristic (every collection this instance has ever ingested facts into) stands in until the connect wizard's own connection→collection scope mapping ships.
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
+- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **The chat sandbox now tells the agent the truth about its runtime, and
+  read-only admin commands work there.** Three coupled fixes to the same
+  confusion (an in-chat agent concluding its auth was broken and recommending
+  `agnes pull`): (1) the secret broker now replays **read-only (GET/HEAD)
+  admin routes** under the session user's own identity — `agnes admin
+  list-users` / `list-tables` work for an actual admin in chat (main-scoped
+  CLI tickets only — the MCP leg keeps the full refusal), while the
+  route's live `require_admin` still refuses non-admins and agent principals,
+  and admin **mutations** stay interactive-only (403
+  `admin_mutations_require_interactive_auth`); switchable via the new live
+  flag `chat.broker_admin_reads` / `AGNES_CHAT_BROKER_ADMIN_READS` (default
+  on). (2) `agnes auth whoami` inside a sandbox (`AGNES_SESSION_ID` set, no
+  token by design) no longer answers "Not logged in" — it verifies the
+  brokered identity live via `/api/me/effective-access` and reports it,
+  including whether read-only admin commands are available. (3) the workspace
+  prompt (`config/claude_md_template.txt`) grew a sandbox-specific "This
+  sandbox — how you run and authenticate" section and stops giving the
+  sandbox laptop-only advice (`agnes pull`/`push`/`init`/`login`, Private
+  sessions, Corporate Memory, laptop Directory Structure); the bundled
+  fallback `app/initial_workspace_default/CLAUDE.md` carries the same truths.
+  The brokered read surface leans on the repo-wide "never mutate on GET"
+  invariant as its read/write boundary, so the one admin route that broke it
+  was fixed rather than special-cased: **`/admin/chat/{chat_id}/tail-ticket`
+  is a `POST`** (it mints a live one-shot credential for the admin tail
+  WebSocket, so as a `GET` it would have been brokered — handing a chat
+  sandbox a ticket to read any other user's live session). A new guard,
+  `tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential`,
+  fails on any future admin `GET`/`HEAD` route that mints one.
+- **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
+  The endpoint dials a connection the admin has typed but not saved — with a
+  credential attached, or on `stdio` by launching a subprocess with a
+  caller-supplied command. That is the same authority its registered sibling
+  (`POST /mcp-sources/{id}/introspect`, which is audited) already has and the
+  same principal holds it, but the registered path always leaves a row behind
+  and this one leaves nothing, so the audit entry is the only trace it
+  happened. Records the transport and the url/command, never the `env` dict.
+- **BREAKING: four admin surfaces are hidden by default — Studio, News, Knowledge
+  digests, and Contribute a skill.** The admin sidebar drops all four rows (plus
+  the Studio suggestions row, which reads the same flag its route always did),
+  the rail's News item and the news + Studio command-palette entries; every one
+  of the routes redirects home, including both `/admin/contribute-skill` POSTs so
+  a stale external "Load skill to Agnes" button cannot publish past a hidden
+  page. Nothing is deleted — the pages, templates and APIs are intact and each
+  surface is one flag away: `studio.enabled` / `AGNES_STUDIO_ENABLED` (was `true`,
+  now `false`), and three new flags `features.news_enabled` /
+  `AGNES_NEWS_ENABLED`, `features.knowledge_digests_enabled` /
+  `AGNES_KNOWLEDGE_DIGESTS_ENABLED`, `features.contribute_skill_enabled` /
+  `AGNES_CONTRIBUTE_SKILL_ENABLED`. **Breaking for an instance that used Studio
+  or news without setting the flag: it turns off on upgrade** (the Library
+  builders at `/library` → "+ New" do the Studio's authoring jobs). Two gates
+  stay deliberately narrow: the digests flag hides the ADMIN PAGE only —
+  `/api/admin/knowledge-digests/*`, `agnes admin digest`, the digest scheduler
+  job and `agnes pull`'s digest delivery keep working, so an instance already
+  running digests keeps running them headlessly — and the news flag hides UI
+  only, leaving `/api/admin/news/*` and any published version untouched, so
+  turning it back on restores the surface with its content intact.
+- **The data-package drawer shows the package, not the warehouse.** Its tables
+  field rendered the *entire* registry — ~500 rows in a project › bucket tree
+  with tri-state boxes — and ticked the members somewhere inside it, so five
+  chosen tables were five ticks scattered through a hundred collapsed groups,
+  and a table the drawer's own conversation proposed landed where nobody would
+  look. The panel now carries only what is in the package (source, query mode,
+  Remove each, count on the label) plus **+ Add tables**; the tree is kept
+  verbatim and moved inside the picker, bulk tri-state boxes and all. It opens
+  the tree when there is only one project, since otherwise a single-source
+  instance opens the picker onto one collapsed heading. The panel also says how
+  many of the chosen tables actually reach a laptop
+  (`query_mode IN ('local','materialized')` and not `server_only`) rather than
+  leaving an admin to know that rule by heart. Groups get the same treatment in
+  a follow-up — that pool carries a three-state tier per row and a grant diff on
+  save.
+- **A `no_tools_registered` 409 no longer reads as "already granted".** The
+  source-wide grant (`POST /api/admin/mcp-sources/{id}/grants`) answers 409
+  `no_tools_registered` when a source has no *enabled* tool row — nothing was
+  granted, and re-enabling the tools later does not go back and grant anyone.
+  Already-granted is not a 409 there at all (200 with an `already` count), so
+  the MCP builder's blanket "409 means done" reported a failed access change as
+  success, on a state the builder can produce: turn every introspected tool off,
+  pick a group, Save. The swallow is now keyed on the error code rather than the
+  status, so that case surfaces the server's own sentence (which names the fix)
+  and Save does not redirect. Sibling checked and left alone: the linked-apps
+  builder swallows 409 from `/api/admin/grants`, whose single 409 genuinely does
+  mean the grant already exists.
+- **The MCP builder's Save now registers the tools, so the source it hands back
+  is actually callable.** A source exposes only the `tool_registry` rows that
+  are `passthrough` and enabled (`app/api/mcp/tools_generator.py`), and Save
+  wrote the source, the secret and the grants but never a tool row — so it
+  produced a registered, granted source with **zero callable tools**, while the
+  Tools panel invited the admin to "turn off anything agents should not call"
+  and counted "N of M" on. The toggles described an outcome Save did not
+  produce, in both directions. Each tool left on is now registered as a
+  resumable step before the grants (a group pointed at a source with nothing
+  callable has been given nothing), keyed on the deterministic
+  `<source>__<tool>` id the source detail page already uses so a second Save
+  cannot duplicate a row and the 409 a re-register answers reads as done. Tools
+  toggled off are simply not registered. The introspected `input_schema` — which
+  the panel's mapper had been discarding — now reaches the registry, since it is
+  how an agent learns the tool's arguments. Materialize mode still belongs to
+  the source's own page: it needs a schedule and a table this panel does not ask
+  for.
+- **`dev_preview_available` had two definitions.** `_chrome_ctx` computed it as
+  `_dev_preview_enabled()`; `/chat` also passed it to `_build_context` as
+  `is_local_dev_mode() and is_user_admin(...)`. Only the first was corrected
+  when the flag's dead clause came out, and the `/chat` half was redundant on
+  its own terms — `_dev_preview.html` is the key's only consumer and gates on
+  `session.user.is_admin` itself, so a member never saw the switch through
+  either route. The duplicate is gone; chrome owns the flag, and one fewer
+  uncached `is_user_admin()` runs per chat render.
+- **A partial `surfaces` patch from the agent builder no longer switches the
+  other surfaces off.** `surfaces` is one opaque JSON column and both writers
+  replace it wholesale — `update_agent` `json.dumps`es the patch, and the
+  `/agents` page assigns `a[k] = patch[k]` into its working copy — while the
+  builder prompt asks the model for "only the fields you are changing this
+  turn", whose honest answer for a turn about one surface is `{"mcp": true}`.
+  Read literally, that turned an owner's Slack and Telegram off as a side
+  effect of turning MCP on, and the reply said only that MCP was enabled.
+  `_sanitize_patch` now merges the proposal over the effective configuration
+  (the saved row overlaid with the page's unsaved copy) — at the sanitizer
+  because that is the one place both writers pass through, so the patch the
+  page merges is complete too. A patch that explicitly turns a surface off
+  still does, and web chat is still forced on.
+- **A group the package builder proposed never reached the panel.** `applyPatch`
+  ticked group rows by querying `[data-pdw-group]`, an attribute nothing in the
+  product emits — a row is `[data-group-id]` wrapping an unlabelled checkbox — and
+  even with the right selector there was nothing to tick, because group rows are
+  hydrated only when the admin opens the access disclosure and the builder's own
+  mode is create. Compounding it, the turn reported the groups from
+  `st.grantsOriginal`, the edit-mode baseline of already-saved grants, which is
+  empty in create mode, so the conversation kept re-proposing groups the admin had
+  already accepted. The patch now fetches the rows, matches by attribute (a group
+  id is server data and may hold a quote, so it is compared rather than
+  interpolated into a selector), and opens the access disclosure when it ticks
+  anything — a box ticked inside a collapsed `<details>` is a silent change to who
+  can reach the data. `chosenGrants()`, which Save reads, was correct throughout,
+  which is why the break was invisible: ticking by hand worked, the builder's
+  proposal did not.
+- **`POST /api/store/entities/from-components` gained a CLI and an MCP surface**
+  — `agnes store compose <name> --add <id> --add <id>` and the
+  `store_compose_plugin` tool — matching its sibling `from-markdown` rather than
+  taking a REST-only exemption.
+- **A chat send that never started no longer eats the message.** The composer
+  is cleared synchronously on submit, for immediate feedback while the runner
+  boots — but when `ensureWsReady()` then failed (chat disabled, no live
+  ChatManager, session POST refused with 503) the error line appeared over an
+  empty composer and the typed prompt was gone. The failure path now puts the
+  text back, so a chat backend that is down costs a retry rather than the
+  message. Guarded by `tests/test_chat_failed_send_keeps_draft.py`.
+- **Clicking an agent card on `/agents` opens its builder, not a chat with it.**
+  A ready agent's card used to start a conversation, which meant the one obvious
+  gesture on the page whose whole subject is the *configuration* went somewhere
+  else, and editing was left to a small `Edit` button in the card's footer. Cards
+  now behave the same in both bands — click to configure — and **Chat** is the
+  footer action on every card (draft ones already had it). Nothing became
+  unreachable: the composer's own agent picker still opens a session as any
+  agent.
+- **Fixed: the empty-instance chat landing told the reader something untrue.**
+  Its lede read "It knows nothing about your company yet, so it can answer
+  nothing", and that second clause is false — with no data registered {brand}
+  answers perfectly well from general knowledge. The same page proved it two
+  elements lower: the composer's placeholder is "Ask how to get {brand} set up…"
+  and the suggested questions are "How do I connect our data?" and "What will
+  people be able to ask?", all of which get real answers, so a reader who typed
+  one caught the page contradicting itself on their first attempt. What is
+  missing is the GROUNDING, not the answering, so the copy draws that line
+  instead: *"Nothing is connected yet, so {brand} answers from general knowledge
+  rather than your company's data. Connect where your data lives and it can
+  answer from your own numbers."* The setup card made the same overclaim
+  ("Nothing is registered yet, so nobody can ask anything") and now reads "No
+  data connected yet, so answers can't use your numbers". The guards assert the
+  scoped claim and refuse either old form.
+- **The admin zero state greets the reader like every other chat landing.** It
+  opened with an "{instance} · Admin" eyebrow where every other state opens with
+  "Good morning, {name}" — two different openers for no benefit to the reader,
+  since an admin arriving at an unconfigured instance is still a person arriving
+  at their tool. The greeting is now defined once and emitted in both intro
+  branches, so the only thing that differs between them is the heading and lede
+  that genuinely differ. The retired eyebrow's information is not lost: the
+  deployment is identified by the rail's wordmark and the footer's build stamp.
+- **The chat empty state has a vertical rhythm you can read.** Its spacing was
+  inverted: the gap between the composer block and the suggestions (18px) was
+  *smaller* than the gaps inside the intro above it (25px, 28px), so eight
+  elements sat at roughly one distance apart and the page read as a list of
+  unrelated rows rather than three sections. Spacing is now a named four-step
+  scale declared once on the empty state (`--cld-gap-tight` · `-inner` ·
+  `-block` · `-section`), with `section` the largest step by construction:
+  5px inside one line, 10px from a label to what it labels, 26px between the
+  parts of a region, 40px for the page's one real boundary. The page is TWO
+  regions rather than three sections — everything down to the suggested
+  questions is "ask" (the intro says what you can ask, the composer is where you
+  ask it, the chips are ways to fill it), then one break, then the ways out. The
+  measured result for an admin is 5 · 10 · 26 · 10 · **40** · 26 · 10, reading
+  greeting → heading → lede → cards → privacy line → *break* → composer → label →
+  chips; for a member the same steps run greeting → heading → lede → *break* →
+  composer → label → chips → **40** → cards → privacy line.
+  Three alignment faults went with it, all of the same kind — near-agreement,
+  which reads as error where either agreement or a clear difference would not:
+  - **The composer's footer row was the one left-aligned block** on a page whose
+    every other element shares one centre axis, and it sat at the midpoint with
+    540px of empty row after it. Centred.
+  - **Three near-equal measures** (composer 830px, cards 660px, chips 640px) are
+    now two. The chips and the cards share `--cld-measure`, so their left and
+    right edges land on the same pixels instead of 10px apart.
+  - **The two cards' text columns started at different insets** — one after a
+    46px progress ring, the other at its own padding — so their titles never sat
+    on a shared line and the ringed card read as the heavier of the pair. The
+    icon slot is the ring's exact size now (46px, was 40px), and the tools card
+    carries a leading mark of its own.
+- **`/agents` opens with a "New agent" card instead of a button above the
+  grid.** Making an agent lands in the same builder as opening one, so it is the
+  same kind of act and belongs in the same row — in the position the eye reaches
+  first — rather than floating over the collection as a toolbar. The dashed cell
+  is a peer of the cards beside it in size and radius and deliberately not in
+  fill, since a solid card would read as an agent that already exists. It leads
+  whichever band actually renders: Ready when there is one, Drafts otherwise, so
+  an instance whose every agent is still a draft does not lose it (an empty band
+  renders nothing at all). The zero state keeps its own "Build an agent" panel —
+  with no grid, there is no first cell for a card to be.
+- **The chat empty state is reordered, and the door-cards close the page.** The
+  three cards between the heading and the input are now two, and they sit BELOW
+  the composer and its suggested questions: greeting, heading, lede — then the
+  field, the suggestions, the two cards, the privacy line. Everything above the
+  input tells you what this is and what it answers from; the cards all navigate
+  away from it, so they come after the thing the reader came for. The page's
+  single `section` break lands between the suggestions and the cards.
+
+  The one inversion is an instance with **nothing registered**: there is nothing
+  to ground an answer in yet, so the cards (and the trust line that travels with
+  them) render above the composer, where "Add your first data" is the page's real
+  action rather than the fifth thing on it. Gated on the same condition as the
+  zero-state heading and lede, so the three cannot disagree about which state the
+  page is in. This replaces a by-AUDIENCE gate that put an admin's cards above
+  the input on every instance, configured or not.
+
+  The "Using N knowledge sources and M capabilities from your Stack" line that
+  sat under the composer is **removed** — it reported a count with no action
+  attached, in the one row between the input and its suggestions. Nothing else
+  consumed those counts, and they were not free: two `StackResolver` reads plus
+  an RBAC plugin resolve on every `/chat` render, so the helpers
+  (`_stack_knowledge_source_count` / `_stack_capability_count`) and their tests
+  went with them. Git history holds the "actual Stack, not the whole catalog"
+  reasoning if the line ever returns.
+  - **The suggestions are a row of chips**, not a four-item column: a stack of
+    full-width rows under a text field reads as results, where a wrapping row of
+    pills reads as things you could ask — and takes one line instead of four. The
+    group is held to a measure so it wraps into balanced rows. Its label reads
+    **"Suggested for you"**, which is the claim worth a line: they are derived
+    from what this caller can actually reach, not four static examples. (An
+    interim "Suggested to ask" was dropped for saying only what the chips already
+    looked like — the word that earns the line is "for you".)
+  - **An admin's setup card carries a progress ring** (`3/6`) instead of
+    reporting "3 of 6 steps done" in the text of its own link — the same fact,
+    read at a glance, with the number where the eye lands first. It is rendered
+    server-side from `admin_setup`, so unlike the rail's ring it cannot flash a
+    wrong count. On an instance with nothing registered there is no ring at all:
+    a meter reading 0/6 measures the wrong thing when the point is that there is
+    no data yet, so that state keeps its "Add your first data" button.
+  - **The member's card carries the brand orb**, not a `brain` line glyph — that
+    was a generic abstraction which at 17px read as an unrecognisable pair of
+    shapes, on the one card that speaks for {brand} itself. It renders the same
+    shared macro as the rail logo and the connect banner, so the mark still lives
+    in exactly one place, and drops the tinted chip and halo behind it: those
+    give a monochrome glyph a surface to sit on, and around a full-colour mark
+    they are a badge around a badge.
+  - **A member never sees a setup card** — they cannot set the instance up, so
+    offering them the ring would be a chore they are not allowed to finish. Their
+    slot holds the one move they do have ("See what {brand} knows" → the
+    Library), with the same anatomy rather than the admin's card with its
+    controls greyed out.
+  - **"How {brand} works" is a link beside the trust caption, not a card** — it
+    is reference reading, and a card of equal size said it was a choice
+    comparable to setting the instance up. The pair closes the page under the two
+    cards, which is what everything-consulted-rather-than-acted-on is for; the
+    gap above the cards stays the page's one section break. It is also centred at
+    last — it was a `<p>` wrapping a `<div>`,
+    so the parser closed the paragraph early, its children became block siblings
+    of the row around it, and the `justify-content: center` applied to an empty
+    element. The greeting
+    grows a time-of-day glyph, corrected from the browser clock alongside the
+    salutation so the sun and the words can never disagree.
+  - **Both cards are clickable end to end.** The setup card was the one card
+    that was not a link — a `<div>` holding an `<a>` — so it had to suppress the
+    hover its neighbours offer and left the reader a 13px line of text to aim
+    at. It is a whole-card link now, its action a `<span>`, with hover and
+    `:active` driven from the card.
+  - **Only the audience card carries the tinted surface.** That fill means "this
+    is {brand} itself"; on the tools card as well, the pair read as a band of
+    two panels with nothing distinguishing the card about your own instance from
+    the one pointing at your editor. The marker-column layout and type moved to
+    their own `.cld-door--split`, so the two stay peers in shape while differing
+    in surface.
+  - **The agent picker moved INSIDE the composer, into the trailing cluster with
+    Send**, with the Stack sentence on the row below it. Choosing an agent is
+    part of composing — the agent is bound at session creation, so the control
+    sets a property of the message about to be sent, not of the page — and the
+    trailing position is what makes that work: ahead of the "+" a longer agent
+    name moved where the placeholder began (a measured 58px jump between "Agnes"
+    and "Finance Proposals", reflowing any draft already typed), while after the
+    textarea a wider pill takes its width off the end of the field and the text
+    origin does not move at all. It matches Send's 44px height so the two read as
+    one pair, keeps its fill on hover only, and the footer row collapses entirely
+    in a live conversation now that the sentence is its only occupant.
+  - **The default agent is called "Default"**, not the brand. "Agnes" read more
+    naturally alone but was the odd one out beside the caller's own named agents,
+    and it disagreed with `/agents`, where the same row is Default. One name per
+    agent, everywhere.
+  - **A long agent name shows as initials in the pill** ("Finance Proposals" →
+    "FP") so its width is stable across agents. The full name stays reachable
+    without opening anything — the title attribute carries it, the menu spells it
+    out, and the in-conversation label is never abbreviated. A single long word
+    has no initials to take and falls back to an ellipsis.
+  - **The picker's menu offers "Create new agent"**, ruled off below the agents
+    (they switch this conversation; it leaves the page). This is where a caller
+    discovers their agents are not enough, so the next move belongs in reach
+    rather than back through the rail. It points at `/agents?new=1` — the SAME
+    create path the Agents page's own card uses, a second door to one flow rather
+    than a second flow. The menu already listed ready agents only.
+  - The Stack sentence is *about* the agent, so **its counts follow the
+    selection**: an agent whose
+    knowledge or plugins are `'selected'` is counted from the ids it actually
+    lists rather than from the owner's whole Stack, and an agent scoped to
+    nothing hides the line instead of claiming a capability it cannot reach.
+    Mixed scope modes fall to the explicit list, since overstating an agent's
+    reach is the worse error. The server still renders the owner's totals for
+    first paint, so a failed `/api/v1/agents` degrades to the old behaviour.
+    The pill also takes a **resting fill** — a light tint of the accent — since
+    at `background: transparent` with muted ink it read as a label that happened
+    to carry a caret, which is the opposite of what a control that changes the
+    answer should look like. The fill is its only device — no border, since an
+    outline around a tinted 30px pill is two devices saying one thing and closed
+    the shape into a tag. The decorative glyph before the sentence is
+    gone, because a second mark 8px from the pill made a two-item row look like
+    a toolbar of unrelated readouts. The **agent menu anchors to the picker's
+    left edge** to match, and the row **sits on the composer's own text inset**
+    rather than the page's centre axis — it describes the input, so it lines up
+    with the input's content. Its sentence starts lower case, so pill and phrase
+    read as one line ("Agnes · using 1 capability from your Stack") instead of
+    two statements side by side: it grew
+    leftward from a `right: 0` anchor, which was correct while the picker
+    trailed the row and clipped the agent names behind the sidebar the moment it
+    led it.
+  - **Hover is a lift, and only the card that needs an edge keeps one.** The
+    outline is replaced by a shadow that appears on hover — one channel, so both
+    cards answer the pointer identically whatever surface each has — and the
+    tinted card drops both its resting border and the resting shadow it had. The
+    plain card keeps a subtle border, because that is the actual rule rather than
+    a per-card choice: the tinted card is held off the page by its own fill, so
+    an outline there frames something already separated, while the plain card's
+    fill is nearly the page and without an edge it stops reading as a card. The
+    1px stays in the box as `transparent` on the tinted one, so nothing shifts
+    when either lifts. Fixes with it: the quiet
+    "Continue setup" link took the PRIMARY fill on card hover, because the
+    card-level rule outranked its own `background: none` by one class and painted
+    the text link as a dark blue blob.
+- **The chat list has one view, and the rail's conversation zone has one door.**
+  Three changes to the same surface, all rail-layout instances:
+  - **`/chats` drops the list ⇄ grid switch.** A conversation is a title you
+    read plus two facts you glance at (which agent, how long ago); a card spent
+    a whole tile saying that much, so the list is now the only projection. The
+    `.fbar-view` control, the `#ch-grid` container, the card builder in
+    `chats_page.js` and the card CSS are gone — the Library keeps its own
+    switch, where an asset has a thumbnail worth a tile.
+  - **The rail's conversation zone is ONE unlabelled list.** "Pinned" and
+    "Recent" are gone, along with the per-section disclosure — its caret, its
+    persisted open/closed flag (`agnes.rail.chatsec.*` in localStorage) and its
+    `is-collapsed` state. Two labels and three moving parts were chrome over a
+    list a handful of rows tall that already scrolls in its own box; a pinned
+    row is marked by its pin glyph, and that the feed is a slice is said by the
+    row that closes it. Pinned rows still lead, and a section still hides when
+    it is empty, which is the only conditional left in the region. The zone's
+    tab order is now New chat → the titles → View all chats. The list also moves
+    up under **New chat** (8px of air above it became 3px, the same step the nav
+    rows use between themselves): the 8px was there to let a "PINNED" label read
+    as a heading, and with no label it only detached the list from the row it
+    belongs to. The folded Chats row now cancels the flex `gap` it was still
+    charged for, in both the persisted-open and peeked states, so the two ways
+    of reaching an open rail no longer disagree by 3px.
+  - **"View all chats" is the last ROW of that list, and the Chats row is now
+    the COLLAPSED form of the zone.** The link takes the conversation row's own
+    box — same height, left edge and hover — because it is the end of the list
+    rather than a footer under it; only its ink and weight mark it apart. It
+    sits outside both `<ul>`s, since every renderer clears its list with
+    `innerHTML = ""` and would delete an `<li>` on the first fetch. The row was introduced because the
+    conversation region is text end to end and cannot survive the rail's 56px
+    glyph strip, which left an admin page with no path to `/chats` at all; but
+    at full width it sat above the very lists it led to. Both widths are now
+    served by one zone: expanded, the lists render and a quiet link closes them;
+    collapsed, `#nav-chats` stands in for the whole region and folds away again
+    (`.rail-i--collapsed-only` — height and opacity, timed off the same
+    `--rail-peek-text-*` tokens as the peek reveal, with a `prefers-reduced-motion`
+    swap) the moment the rail opens or is peeked, so the two are never on screen
+    together. The link is static markup rather than revealed by a render, which
+    is what left `/chats` unreachable on a first run last time. On an admin page
+    the fold is not applied at all: the lists are not rendered there, so the row
+    keeps its place at every width.
+- **The data-package builder is told what a table IS, not just what it is
+  called.** A turn's candidate block carried `id`, `name` and 160 characters
+  of description, so "the opportunity tables for sales" could only be
+  answered by matching names — a table whose name does not say what it holds
+  was invisible to the assistant, and the proposed package came out wrong or
+  empty. Each candidate now also carries `source_type`, `query_mode`, and the
+  names of the **metrics this instance already computes over it**, which is
+  the strongest signal available for what a table is for when its description
+  is thin. Metrics are one bulk read for the whole list, and a failed read
+  costs grounding rather than the turn. Candidates also carry whether the
+  table is *distributable* (`query_mode IN ('local','materialized')` and not
+  `server_only`, i.e. whether it reaches an analyst's laptop through
+  `agnes pull`): packaging a server-only table is still allowed —
+  `data_packages.py` does not refuse it — so the prompt states it as a fact to
+  weigh, never a prohibition, because encoding it as a rule would be wrong
+  about the API. Column-level detail is deliberately excluded: it is a read
+  per table against a list capped at 120, so schemas belong to a narrowing
+  step over a shortlist. The wire contract, the propose-never-apply rule and
+  `_sanitize_patch` as the trust boundary are unchanged.
+- **BREAKING (page behaviour): the `/agents` builder no longer auto-saves.**
+  It used to debounce-PATCH every keystroke, which meant there was never a
+  moment at which the owner had *decided* the agent was right, and no honest
+  way to offer "leave without saving". Edits — typed or made by the
+  conversation — now accumulate in an unsaved working copy and reach the
+  server only on **Save**. The header says which state you are in ("Unsaved
+  changes", Save disabled when clean).
+  - A **new** agent's header offers *Save as draft* and *Mark ready*, and no
+    Delete: the row exists server-side only because the conversation and the
+    preview address the agent by id, so it is a placeholder until saved, and
+    leaving via *← All agents* discards it (confirmation first, then a real
+    `DELETE`). A failed discard restores the row rather than leaving the list
+    denying an agent the server still has.
+  - An **existing** agent's header offers *Save*, *Revert to draft* /
+    *Mark ready*, and *Delete*. Leaving with unsaved changes asks first and
+    rolls the working copy back to the last saved state.
+  - `beforeunload` covers the ways out our own dialog cannot intercept (a nav
+    click, a reload, a closed tab).
+  - **Preview still commits.** The agent runs server-side, so it can only
+    answer as a configuration the server has; opening Preview performs the
+    same write Save does, baseline included, rather than previewing a persona
+    the agent does not have.
+- **`POST /api/agents/{agent_id}/builder/turn` accepts `apply` and `config`.**
+  `apply=false` runs the turn and returns the sanitized patch **without**
+  writing, which is what lets the page hold an unsaved working copy;
+  `config` carries that copy so the turn reasons about the configuration on
+  screen rather than the last-saved row. `config` is narrowed to the
+  `PATCHABLE` keys and only ever reaches the prompt — ids in the returned
+  patch are still gated against the caller's own RBAC-scoped candidate lists.
+  Both default to the previous behaviour (`apply=true`, no override), so
+  every existing caller is unaffected. Note the consequence for the page: the
+  panel now merges the patch client-side instead of re-rendering from the
+  applied row, so the enforced scope is re-derived at Save rather than at
+  each turn — an unsaved patch grants nothing, so nothing is enforced later
+  than it is shown.
+- **The `/agents` index separates ready agents from drafts, and a card's click
+  follows its state.** Ready agents render in a titled band above Drafts.
+  Clicking a ready card opens a conversation with that agent (what you came to
+  the page to do) and its footer carries **Edit** into the builder; clicking a
+  draft opens the builder (what you came to *it* to do) and its footer keeps
+  **Chat**. Neither route was lost in either state — marking an agent ready is
+  not a one-way door out of the builder, and a draft is still talk-to-able.
+- **The builder's two panes are an even 50/50 split.** The configuration was
+  previously capped at a third of the width, which left it a cramped sidebar
+  while the conversation had room to spare.
 - **A question about a figure on a dashboard now starts from the data app.** The workspace prompt tells Agnes to find the app the user means
   (`agnes app list`, `agnes app show <slug>`) and read its description for
   context before hunting for a definition — both are registry-only reads, so a
@@ -84,6 +702,153 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   `{}`, JSON args are pretty-printed, and while a call waits on the decision
   its tool card reads "waiting for approval" instead of a contradictory
   "running…".
+- **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
+  values.** Vertex validates the `anthropic-beta` header and refuses the whole
+  request on any value it does not recognize (the first-party API ignores
+  unknowns), and the kai-agent engine's SDK sends first-party betas like
+  `advisor-tool-2026-03-01` — so on `chat.llm.provider: vertex` every engine
+  chat turn died with `400 Unexpected value(s) … for the anthropic-beta
+  header`. The broker now filters the header in vertex mode to the values the
+  Vertex endpoint accepts (renaming where its spelling differs, e.g.
+  `advanced-tool-use-2025-11-20` → `tool-search-tool-2025-10-19`), drops the
+  rest (logged; default-deny, so a future unknown beta degrades one optional
+  feature instead of 400-ing every turn), and omits the header entirely when
+  nothing survives.
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
+- **A failed builder Preview now says why, instead of pointing at the browser
+  console.** Reported from a deployed instance: the agent builder's Preview
+  answered "The preview could not answer. The details are in the browser
+  console." — useless to the author, to the person they reported it to, and to
+  the engineer after that. Reproducing it against the scripted engine showed
+  what the copy was discarding: an `engine_error` frame carrying
+  `engine refused the turn (500): {"detail":"… KAI_HOST_JWT_SECRET is unset …
+  Set the SAME value here and on the Agnes process …"}` — a complete diagnosis,
+  thrown away because `engine_error` matched none of the recognised patterns
+  and the fallback named devtools rather than the reason. The unrecognised case
+  now puts the engine's own words on screen (unwrapping the upstream's JSON
+  `detail`, keeping the prefix that says which step failed), `kind` is read as
+  well as `message` since several frames carry the useful half in the kind, and
+  `runner_not_ready` — the 30-second engine-start timeout, usually nobody's
+  mistake on a cold instance — gets its own retryable sentence. The whole error
+  frame is logged as well, so devtools keeps everything it had.
+- **All four conversational builders now say when they are talking to the
+  scripted stand-in.** Every turn endpoint has always reported which engine
+  answered it — that is the whole point of naming the engine — but only the
+  Library and MCP-source builders rendered it; the agents and data-package
+  builders took `engine` off the wire and dropped it, so on those two a stub
+  still passed for a real model. The notice moved into the shared shell
+  (`BuilderShell.engineNotice`), replacing two near-identical copies, so a
+  builder gets it by using the shell rather than by remembering, and all four
+  word it the same. Guarded by `tests/test_every_builder_names_its_engine.py`,
+  which pins both halves — the render and the assignment — for each builder.
+- **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
+  did not type, not just a `url`.** All three name what the instance dials or
+  runs, and only `url` was guarded. `command` and `args` are the sharper pair:
+  on `stdio` transport they are what reach `StdioServerParameters` and are
+  launched as a subprocess on the server, so a patched `command` chooses the
+  binary — and `args` alone is enough, since a benign `npx` or `node` the admin
+  typed will run whatever it is handed. All three are now accepted only when
+  they read exactly as the draft already holds them, so a patch echoing the
+  panel back is harmless and a patch inventing a target is a no-op. Every one
+  stays settable the ordinary way: the panel's own inputs. This sanitizer had
+  no direct tests while its three siblings all did, which is how the gap
+  survived; it has 18 now.
+- **Saving in the MCP-source builder is resumable instead of duplicating the
+  source.** Save makes up to four calls — register the row, store the secret,
+  then one grant per group — so a failure in a later step left a registered
+  source on screen with an error, and pressing Save again re-ran the whole
+  sequence and registered a SECOND source: the only recovery from "secret
+  stored, grant failed" was a duplicate. Save now remembers the row it created
+  and resumes from the step that failed, and says so ("The source is registered
+  — press Save again to finish the rest").
+- **An already-granted group no longer fails a builder save.** Both the
+  MCP-source and link-external-apps builders grant in a batch, and a duplicate
+  grant answers `409` — which is the end state the save is asking for, not a
+  failure. Counting it as one was not cosmetic in the linked-apps builder:
+  `Promise.all` rejects on the first failure, so a single already-granted pair
+  failed the whole save, and every retry then failed identically because the
+  pairs that had succeeded were 409s too — Save became permanently unreachable.
+  Grants are now settled independently, a 409 counts as done, and a partial
+  failure names the app → group pairs that are still not granted instead of
+  reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
+  already read 409 as done; the builder that replaced it had lost that.)
+- **The local-dev audience switch is admin-gated in code, not only in its
+  comment.** Both the partial and `_chrome_ctx` stated the switch was
+  LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
+  mode, so a non-admin on a local instance got the switch. It changes what
+  renders and never any permission, so this was cosmetic rather than a leak —
+  but the claim now matches the check (`session.user.is_admin`, the same one
+  the rail uses). The flag also had a dead first clause whose condition cannot
+  be true without its second.
+- **Collapsing or expanding a section in the builder's Configuration panel no
+  longer scrolls it back to the top.** The toggle rebuilt the whole panel,
+  discarding its scroll position — so opening a section near the bottom
+  scrolled away from the thing you had just opened. Every section's body is
+  always in the DOM (`.ag-sec.collapsed` merely hides it), so the toggle now
+  flips the class in place and re-renders nothing.
+- **The `/agents` builder's Configuration panel lists what the agent HAS, not
+  everything it could have.** Data & resources and Capabilities used to render
+  the caller's entire reachable pool — every data package, memory domain and
+  marketplace plugin — as a list of toggles, which made the panel a form to
+  fill in and buried the two or three things actually attached among the
+  dozens that were not. Both sections now show only what is connected (each
+  row's action is *Remove*), with the full pool one click behind a **+** in
+  the section header that opens a searchable picker over the shared
+  `.modal-backdrop` modal. The conversation stays the primary way to attach
+  things; the picker is the by-hand path. An attached id that has since left
+  the caller's scope is still listed, marked *Unavailable*, rather than
+  silently dropped — the panel must not disagree with the agent.
+- **The builder is full-bleed instead of a card inside the page column.** It
+  broke out of the index shell's centred `--width-wide` container (via a
+  `body.ag-building` class, cleared on the way back to the list, which is
+  still a document and keeps its column), so both panes get the screen. The
+  conversation keeps a 780px measure inside its pane so prose does not stretch
+  to 1200px lines. Each section's explanatory sentence moved from the header
+  into the body, where it is read when you open the section to act rather than
+  wrapping to four lines under all six collapsed titles.
 - **A completed sign-in is now recorded in `audit_log`, for every provider.**
   `login_failed` was the only authentication event the trail carried: the
   Google, Microsoft, email magic-link and Keboola providers wrote nothing at
@@ -138,6 +903,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   destructive now (it burns the link so a refused consent cannot be re-submitted
   as an allow), so it requires the same authenticated Agnes session Allow always
   did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
@@ -147,19 +925,47 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rebuilds every other valid source, but now attributes the skip
   (`SyncOrchestrator.last_rebuild_errors`), which the scheduled sync's
   operator alert now surfaces too.
+- **A full chat host no longer locks every other user out for a week.** Paused
+  sandboxes count against `chat.docker_max_total_sandboxes` (a paused container
+  still holds its memory) but survive until `chat.paused_ttl_seconds` — 7 days
+  by default — so on an instance with a small cap a handful of parked
+  conversations filled the host and every subsequent attach failed with
+  `docker_max_total_sandboxes reached`, with no path back short of an operator
+  deleting containers by hand. The docker provider now raises a typed
+  `SandboxCapacityError`, and ChatManager answers it by destroying the
+  least-recently-paused sandbox (the paused-TTL sweep's own teardown, triggered
+  by pressure instead of by the clock — the evicted transcript is untouched and
+  respawns on its owner's next message) and retrying, up to three reclaims per
+  spawn. A session this process is actively serving is never evicted — and
+  neither is one being brought back: `_resume_live` holds a per-session lock
+  across `provider.resume()` + runner install while the session is still
+  PAUSED with a stale `sandbox_paused_at`, so both the reclaim and the
+  long-standing paused-TTL sweep now take that same lock, which closes a
+  window where either could have destroyed the sandbox of a conversation a
+  user was actively resuming. Any other spawn failure still propagates
+  untouched.
 
-- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
-  **Not fully closed:** a third copy of the same rule lives in the password
-  provider's web-form POST handler, which is the terminal consumer of the form
-  `/login/password` renders — so signing in *with a password* still lands on the
-  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
-  magic-link all route through `safe_next_path` and do return you to the app.
-  The underlying fault is that this one rule had four implementations; three of
-  them still exist.
+- **Signing in dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app — on every provider, password included.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  The password provider's web-form POST handler — the terminal consumer of the
+  form `/login/password` renders, and the reason a *password* sign-in still
+  landed on the home route while OAuth and magic-link returned you to the app —
+  held a third copy of the same rule and now calls `safe_next_path` too. All
+  four sign-in paths (OAuth, magic-link, password form, login pages) resolve
+  `next` through the one implementation that knows about app origins.
 
 ### Removed
 
 ### Internal
+- **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
+- **Local-dev audience switch on the chat landing page.** Under
+  `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
+  Admin | Admin, empty instance | Member" toggle for reviewing each landing
+  state without keeping a second account or mutating data — `?preview=member`
+  hides the admin notice, `?preview=empty` forces it on an instance that has
+  data. It fakes the render only: no repo read is bypassed, nothing is
+  written, and no authority or grant changes. Off the dev gate every value is
+  ignored outright and the toggle is not rendered, so it adds no surface to a
+  real deployment.
 
 ## [0.91.0] - 2026-08-28
 

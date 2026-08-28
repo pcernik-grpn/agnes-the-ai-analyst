@@ -382,6 +382,28 @@ auth:
 #                                    # set both at once with `instance.experience:
 #                                    # redesign` above. Env override:
 #                                    # AGNES_STACK_AUTO_MEMBERSHIP.
+#
+#   # Three surfaces the admin cleanup retired. All default false — the pages
+#   # and their APIs are intact, so setting one to true brings the surface
+#   # back exactly as it was. Env overrides: AGNES_NEWS_ENABLED,
+#   # AGNES_KNOWLEDGE_DIGESTS_ENABLED, AGNES_CONTRIBUTE_SKILL_ENABLED.
+#   news_enabled: true               # In-product news: the /admin/news editor, the
+#                                    # /news reader, the /home "What's new" strip and
+#                                    # their nav + palette entries. UI only —
+#                                    # /api/admin/news/* serves either way and a
+#                                    # published version is never dropped.
+#   knowledge_digests_enabled: true  # The /admin/knowledge-digests PAGE and its nav
+#                                    # row — the page only. The API, `agnes admin
+#                                    # digest`, the scheduler job and `agnes pull`'s
+#                                    # digest delivery all keep working while it is
+#                                    # hidden, so an instance already running digests
+#                                    # keeps running them headlessly.
+#   contribute_skill_enabled: true   # The paste-a-SKILL.md publish page
+#                                    # (/admin/contribute-skill), the landing target
+#                                    # for an external "Load skill to Agnes" button.
+#                                    # The Library's skill builder is the supported
+#                                    # path; both POST handlers are gated with the
+#                                    # page, so a stale button cannot publish past it.
 
 # --- Library & Store trust vocabulary (optional, opt-in) ---
 # Both default to false so a routine upgrade never changes what existing
@@ -1122,12 +1144,79 @@ facts:
   single_valued_edges: ["owned_by", "for_client"]
 
 
+# --- Document extraction worker lane (optional, off by default) ---
+# Runs document extraction (crawl -> convert -> anonymize -> extract ->
+# ingest against POST /api/facts/ingest) as its OWN worker lane, driven by
+# the `corpus-extraction` job kind (app/worker/kinds.py) — its own process
+# when run via the `extraction-worker` compose service / the Dockerfile's
+# `worker` build target, so a corpus re-extraction never competes with, or
+# blocks, ordinary table syncs (spec §7.5 "Extraction inside Agnes (later)",
+# §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
+# collections-design.md).
+#
+# Agnes does NOT ship the producer (crawl/convert/anonymize/extract) — this
+# block only configures HOW to invoke whatever producer command the
+# deployment provides. The producer is a separate project of your own, adopted
+# per spec §7.1; it is never vendored into this repo. A plain `docker
+# compose up` (no `--target worker` build, no EXTRACTION_PRODUCER_INSTALL
+# build-arg) has nothing to invoke here — `corpus-extraction` fails clean
+# with a config error rather than a crash until a producer is configured.
+#
+# `extraction.enabled` is a registered switch (app/switches.py) — set it
+# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
+# NOT editable from /admin/server-config (locked: requires the
+# extraction-worker deployment) — this is operator/deploy-time config, not
+# a runtime toggle. The rest of this block (`producer`, `timeout_s`) is
+# plain instance data, read directly via get_value.
+extraction:
+  enabled: false
+  producer:
+    # Full command line for the producer entrypoint, e.g.:
+    #   command: "python -m your_producer.run"
+    # OR, when the worker image installed it as a package (see the
+    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
+    #   module: your_producer.run
+    # `command` wins when both are set. Either form MAY be a YAML list
+    # instead of a string, taken verbatim (no shell-splitting needed then).
+    command: ""
+    module: ""
+    # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
+    # from this process's own environment, beyond the curated non-secret
+    # allowlist below (PATH/locale/timezone/tempdir/TLS/proxy vars). Empty
+    # by default. Only the NAMES listed here are copied — this is not a way
+    # back to forwarding the whole environment.
+    env_passthrough: []
+  # Hard ceiling on one producer run, in seconds — the subprocess is killed
+  # at this timeout and the job fails (no automatic retry: a failed
+  # producer run usually needs an operator to look at it).
+  timeout_s: 3600
+  # SECURITY: credentials are NEVER configured here. The producer's
+  # SharePoint tenant/client id + certificate are resolved from the
+  # connection's own vault slot, or the server's SHAREPOINT_CERT_PRIVATE_KEY
+  # env var — the SAME resolution connectors/sharepoint/settings.py already
+  # does for the SharePoint admin UI. They reach the producer ONLY via its
+  # child process environment (AGNES_SHAREPOINT_TENANT_ID / _CLIENT_ID /
+  # _PRIVATE_KEY / AGNES_EXTRACTION_CORPUS_ID), never on argv, never logged.
+  # That child env is NOT this server's full environment — `producer` names
+  # an EXTERNAL, admin-configurable binary, so it gets only a curated
+  # non-secret allowlist (+ any `env_passthrough` above) plus the four vars
+  # named above. No other instance secret (vault key, LLM API key, DB DSN,
+  # OAuth client secrets, ...) is ever forwarded to it.
+
+
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
-# agents, data packages, connections, and corporate memory). On by default.
-# Set to false — or export AGNES_STUDIO_ENABLED=0 (the infra/Terraform .env
-# override) — to hide the Studio nav entry and redirect /admin/studio* to home.
+# agents, data packages, connections, and corporate memory).
+#
+# OFF by default since the admin cleanup: the Library builders (/library,
+# "+ New") do the same authoring jobs, so keeping both meant two ways to do
+# one thing. Off hides the Studio nav + command-palette entries (its landing
+# page, the per-domain builders AND the suggestions moderation queue, which
+# reads this same flag), redirects /admin/studio* to home, and 403s the public
+# suggestion API. Nothing is deleted — set true here, or export
+# AGNES_STUDIO_ENABLED=1 (the infra/Terraform .env override), to restore the
+# whole surface.
 studio:
-  enabled: true
+  enabled: false
 
 
 # --- Initial Workspace Template (optional) ---

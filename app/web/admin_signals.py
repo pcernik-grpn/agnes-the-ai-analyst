@@ -178,7 +178,15 @@ def _resolve_memory_items() -> Optional[Signal]:
 
 
 def _resolve_studio_suggestions() -> Optional[Signal]:
+    from app.instance_config import get_studio_enabled
     from src.repositories import authoring_suggestions_repo
+
+    # The queue page reads this same flag and redirects home when it is off
+    # (Studio is off by DEFAULT since the admin cleanup), so a card here would
+    # be a count nobody can act on pointing at a redirect. Checked before the
+    # count, not after: on a disabled instance there is nothing to ask.
+    if not get_studio_enabled():
+        return None
 
     total = authoring_suggestions_repo().count_pending()
     if not total:
@@ -187,6 +195,36 @@ def _resolve_studio_suggestions() -> Optional[Signal]:
         count=total,
         href="/admin/studio/suggestions",
         blurb=f"authoring {_plural(total, 'suggestion is', 'suggestions are')} waiting to be replayed.",
+    )
+
+
+def _resolve_ungranted_plugins() -> Optional[Signal]:
+    """Plugins ingested but granted to no group — "indexed but invisible".
+
+    Ingesting content and granting it to nobody has no legitimate steady
+    state: every non-admin sees an absence, and nothing anywhere says why
+    (TCRD-221 — this exact silence ate ~50 minutes of a live walkthrough).
+    Admin-disabled plugins don't count (deliberately hidden, not a mistake)
+    and neither do system plugins (``mark_system`` materializes their grant
+    for every group, so they cannot be orphaned without also tripping the
+    disabled path)."""
+    from src.repositories import marketplace_plugins_repo, resource_grants_repo
+
+    granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
+    orphans = [
+        p
+        for p in marketplace_plugins_repo().list_all()
+        if not p.get("admin_disabled")
+        and not p.get("is_system")
+        and f"{p['marketplace_id']}/{p['name']}" not in granted
+    ]
+    if not orphans:
+        return None
+    return Signal(
+        count=len(orphans),
+        href="/admin/access",
+        blurb=f"{_plural(len(orphans), 'plugin is', 'plugins are')} granted to no group — nobody can see "
+        + (f"{orphans[0]['name']}." if len(orphans) == 1 else "them."),
     )
 
 
@@ -322,6 +360,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         zone=ZONE_NEEDS_YOU,
         severity="action",
         resolve=_resolve_studio_suggestions,
+    ),
+    SignalSpec(
+        key="ungranted_plugins",
+        title="Plugins nobody can see",
+        zone=ZONE_NEEDS_YOU,
+        severity="warn",
+        resolve=_resolve_ungranted_plugins,
     ),
     SignalSpec(
         key="store_lint",
