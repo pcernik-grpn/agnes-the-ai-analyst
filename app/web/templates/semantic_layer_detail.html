@@ -168,7 +168,7 @@
     {% if constraints %}
     <table class="data-table">
         <thead>
-            <tr><th>Name</th><th>Type</th><th>Rule</th><th>Severity</th><th>Metrics</th></tr>
+            <tr><th>Name</th><th>Type</th><th>Rule</th><th title="warning: recorded for reference, never blocks a query. error: blocks validate-query, but only when Type is statically checkable (currently just required_filter) and the rule is missing from the query — any other Type is advisory only regardless of severity.">Severity</th><th>Metrics</th></tr>
         </thead>
         <tbody>
             {% for c in constraints %}
