@@ -46,7 +46,7 @@ import hashlib
 import json
 import secrets
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -1864,7 +1864,16 @@ class FactsPgRepository:
         # landed through the normal upload endpoint (spec §7.2, "what the
         # producer uploads"); a document row with no matching corpus_files
         # row stays unresolved.
-        doc_id_resolution: Dict[str, str] = {}
+        #
+        # TCRD-241: a byte-identical SharePoint copy shares its sha-derived
+        # doc_id with every other copy, so `corpus_file_sources` can legally
+        # hold MORE THAN ONE row for one `source_doc_id` — possibly across
+        # different collections. `doc_id_resolution` is therefore keyed by
+        # (corpus_id, doc_id), never plain doc_id, so a duplicate declared
+        # under a second corpus in this same batch never silently overwrites
+        # the first's resolution.
+        doc_id_resolution: Dict[Tuple[str, str], str] = {}
+        doc_declared_pairs: Set[Tuple[str, str]] = set()  # {(corpus_id, doc_id)} this batch's documents[] touched
         doc_dates: Dict[str, date] = {}
         with self._engine.connect() as doc_conn:
             for raw_doc in documents:
@@ -1894,39 +1903,175 @@ class FactsPgRepository:
                             source_doc_id=doc_id,
                             source_sha256=doc.get("sha256") or None,
                         )
-                    doc_id_resolution[doc_id] = file_id
+                    # A path-only match (no `stable_id`) never gets a
+                    # `corpus_file_sources` row above — this direct write is
+                    # the ONLY resolution for that document entry, so it
+                    # must stand even when no duplicate-detection query
+                    # below would ever see it.
+                    doc_id_resolution[(corpus_id, doc_id)] = file_id
+                    doc_declared_pairs.add((corpus_id, doc_id))
                 else:
                     # Neither stable_id nor path resolved a row directly —
                     # fall back to an ALREADY-ESTABLISHED source_doc_id
-                    # mapping (a prior upload/ingest resolved this doc_id
-                    # once already) so `modified` still attaches even
-                    # though THIS row carries no fresh identity to match.
+                    # mapping WITHIN THIS document's own declared corpus (a
+                    # prior upload/ingest resolved this doc_id once already,
+                    # in this same collection) so `modified` still attaches
+                    # even though THIS row carries no fresh identity to
+                    # match. Scoped to corpus_id — a byte-identical copy
+                    # living in ANOTHER collection must never answer for
+                    # this one; that would mis-scope the claim's visibility
+                    # onto the wrong collection's grants.
                     row = doc_conn.execute(
-                        sa.text("SELECT corpus_file_id FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
-                        {"doc_id": doc_id},
+                        sa.text(
+                            "SELECT corpus_file_id FROM corpus_file_sources "
+                            "WHERE corpus_id = :corpus_id AND source_doc_id = :doc_id "
+                            "ORDER BY corpus_file_id LIMIT 1"
+                        ),
+                        {"corpus_id": corpus_id, "doc_id": doc_id},
                     ).first()
                     file_id = row[0] if row is not None else None
                     if file_id is not None:
-                        doc_id_resolution[doc_id] = file_id
+                        doc_id_resolution[(corpus_id, doc_id)] = file_id
+                        doc_declared_pairs.add((corpus_id, doc_id))
 
                 if file_id is not None:
                     parsed = _parse_document_date(doc.get("modified"))
                     if parsed is not None:
                         doc_dates[file_id] = parsed
 
+        def _copies_for(corpus_id: str, doc_id: str, conn) -> List[Dict[str, Any]]:
+            """Every ``corpus_files`` row anchored to ``(corpus_id, doc_id)``
+            via ``corpus_file_sources`` — indexed copies first, then
+            ``corpus_file_id`` as a deterministic tiebreak. More than one row
+            can legally match (TCRD-241): resolution must never depend on
+            scan order, and REPLACE mode needs the full set, not just the
+            winner."""
+            return list(
+                conn.execute(
+                    sa.text(
+                        "SELECT cfs.corpus_file_id, cf.processing_status "
+                        "FROM corpus_file_sources cfs "
+                        "JOIN corpus_files cf ON cf.id = cfs.corpus_file_id "
+                        "WHERE cfs.corpus_id = :corpus_id AND cfs.source_doc_id = :doc_id "
+                        "ORDER BY (cf.processing_status = 'indexed') DESC, cfs.corpus_file_id"
+                    ),
+                    {"corpus_id": corpus_id, "doc_id": doc_id},
+                )
+                .mappings()
+                .all()
+            )
+
+        # Where this batch's OWN documents[] entries genuinely produced MORE
+        # THAN ONE `corpus_file_sources` row for the same (corpus_id,
+        # doc_id) (TCRD-241 duplicate anchors), override the arbitrary
+        # last-array-entry pick above with a deterministic, indexed-
+        # preferred winner. A pair with zero or one row (incl. every
+        # path-only match, which never writes a `corpus_file_sources` row at
+        # all) keeps its direct resolution untouched.
+        with self._engine.connect() as conn:
+            for corpus_id, doc_id in doc_declared_pairs:
+                copies = _copies_for(corpus_id, doc_id, conn)
+                if len(copies) > 1:
+                    doc_id_resolution[(corpus_id, doc_id)] = copies[0]["corpus_file_id"]
+
+        # A claim's evidence carries only `doc_id` (no corpus) — map each
+        # declared doc_id to exactly ONE corpus for that lookup. Normally a
+        # doc_id is declared under a single corpus; on the rare case a batch
+        # legitimately declares the SAME doc_id under two different corpora,
+        # pick deterministically (smallest corpus_id) rather than whichever
+        # happened to sort last.
+        doc_id_to_corpus: Dict[str, str] = {}
+        for corpus_id, doc_id in doc_declared_pairs:
+            if doc_id not in doc_id_to_corpus or corpus_id < doc_id_to_corpus[doc_id]:
+                doc_id_to_corpus[doc_id] = corpus_id
+
+        batch_corpus_ids = sorted({corpus_id for corpus_id, _ in doc_declared_pairs})
+        # RBAC review (PR #1736, TCRD-241 follow-up): a doc_id that resolves
+        # ONLY by escaping every corpus THIS batch's `documents[]` declared
+        # is rejected, never written — see the ladder docstring below.
+        ambiguous_doc_ids: Set[str] = set()
+
         def _resolve_doc(doc_id: Optional[str], conn) -> Optional[str]:
+            """Corpus-scoped, deterministic doc_id -> corpus_file_id
+            resolution (TCRD-241). Ladder:
+
+            1. This batch's OWN `documents[]` declared (corpus_id, doc_id) —
+               indexed-preferred among any duplicate copies within it.
+            2. Not declared this batch: scan only the corpora THIS batch's
+               `documents[]` touched — a producer batch is normally scoped
+               to one collection, so an omitted-but-already-resolved doc_id
+               from the SAME crawl run is overwhelmingly likely to live
+               there too.
+            3a. This batch's `documents[]` declared at LEAST ONE corpus
+                (`batch_corpus_ids` non-empty) but this doc_id isn't
+                anchored in ANY of them: refuse to escape to some OTHER,
+                possibly more broadly-granted corpus — that would grant the
+                claim wider visibility than the producer's batch ever
+                declared (RBAC review PR #1736). A probe checks whether the
+                doc_id resolves ANYWHERE at all, purely to distinguish the
+                rejection reason (`ambiguous_cross_collection_doc_id` — it
+                exists, just outside this batch's scope) from a doc_id that
+                plain doesn't exist (`unresolved_doc_id`, existing
+                behavior) — nothing is ever written on this path.
+            3b. This batch's `documents[]` is EMPTY (no batch-declared scope
+                to escape at all) — the documented "documents may be
+                omitted when every doc_id already resolves" replay flow
+                (spec §7.2). Tier 3 here is the SOLE resolution mechanism by
+                design (dozens of existing callers depend on it), so it
+                still resolves via an unrestricted, deterministically
+                ordered global scan, unchanged from before this review.
+            """
             if not doc_id:
                 return None
-            if doc_id in doc_id_resolution:
-                return doc_id_resolution[doc_id]
+            corpus_id = doc_id_to_corpus.get(doc_id)
+            if corpus_id is not None:
+                key = (corpus_id, doc_id)
+                if key in doc_id_resolution:
+                    return doc_id_resolution[key]
+
+            if batch_corpus_ids:
+                row = conn.execute(
+                    sa.text(
+                        "SELECT cfs.corpus_id, cfs.corpus_file_id "
+                        "FROM corpus_file_sources cfs "
+                        "JOIN corpus_files cf ON cf.id = cfs.corpus_file_id "
+                        "WHERE cfs.corpus_id = ANY(:corpus_ids) AND cfs.source_doc_id = :doc_id "
+                        "ORDER BY cfs.corpus_id, (cf.processing_status = 'indexed') DESC, cfs.corpus_file_id "
+                        "LIMIT 1"
+                    ),
+                    {"corpus_ids": list(batch_corpus_ids), "doc_id": doc_id},
+                ).first()
+                if row is not None:
+                    doc_id_resolution[(row[0], doc_id)] = row[1]
+                    doc_id_to_corpus[doc_id] = row[0]
+                    return row[1]
+                # Not anchored in any corpus this batch declared. Probe
+                # (read-only, no write) whether it resolves at all, purely
+                # to pick the rejection reason — never resolve or write it.
+                probe = conn.execute(
+                    sa.text("SELECT 1 FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
+                    {"doc_id": doc_id},
+                ).first()
+                if probe is not None:
+                    ambiguous_doc_ids.add(doc_id)
+                return None
+
             row = conn.execute(
-                sa.text("SELECT corpus_file_id FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
+                sa.text(
+                    "SELECT cfs.corpus_id, cfs.corpus_file_id "
+                    "FROM corpus_file_sources cfs "
+                    "JOIN corpus_files cf ON cf.id = cfs.corpus_file_id "
+                    "WHERE cfs.source_doc_id = :doc_id "
+                    "ORDER BY cfs.corpus_id, (cf.processing_status = 'indexed') DESC, cfs.corpus_file_id "
+                    "LIMIT 1"
+                ),
                 {"doc_id": doc_id},
             ).first()
             if row is None:
                 return None
-            doc_id_resolution[doc_id] = row[0]
-            return row[0]
+            doc_id_resolution[(row[0], doc_id)] = row[1]
+            doc_id_to_corpus[doc_id] = row[0]
+            return row[1]
 
         with self._engine.connect() as ro_conn:
             # Also resolve every `full_documents` id even when it carries NO
@@ -1947,10 +2092,22 @@ class FactsPgRepository:
             raise IngestUnresolvedDocIds(sorted(unresolved))
 
         # ---- full_documents replace mode: delete ALL existing claims for
-        # each listed document BEFORE any incoming claim is written, so a
-        # subject the re-extraction no longer mentions loses its stale
-        # claim (spec §7.2, test C2).
-        replaced_file_ids = {doc_id_resolution[d] for d in full_documents if d in doc_id_resolution}
+        # EVERY corpus_file anchored to a listed doc_id WITHIN its declaring
+        # corpus (not just the one resolution currently prefers) BEFORE any
+        # incoming claim is written — so a subject the re-extraction no
+        # longer mentions loses its stale claim (spec §7.2, test C2), and a
+        # stale claim stranded on a NON-preferred duplicate copy (e.g. left
+        # over from before indexed-preference picked a different winner)
+        # never survives a replace either (TCRD-241).
+        replaced_file_ids: Set[str] = set()
+        if full_documents:
+            with self._engine.connect() as conn:
+                for d in full_documents:
+                    corpus_id = doc_id_to_corpus.get(d)
+                    if corpus_id is None:
+                        continue
+                    for copy in _copies_for(corpus_id, d, conn):
+                        replaced_file_ids.add(copy["corpus_file_id"])
         if replaced_file_ids:
             with self._engine.begin() as conn:
                 conn.execute(
@@ -2002,7 +2159,10 @@ class FactsPgRepository:
                     file_id = _resolve_doc(doc_id, conn)
                     frow = _file_row(file_id) if file_id else None
                     if file_id is None or frow is None:
-                        claims_rejected.append({"row": item_ref, "reason": "unresolved_doc_id", "doc_id": doc_id})
+                        reason = (
+                            "ambiguous_cross_collection_doc_id" if doc_id in ambiguous_doc_ids else "unresolved_doc_id"
+                        )
+                        claims_rejected.append({"row": item_ref, "reason": reason, "doc_id": doc_id})
                         continue
                     if frow.get("processing_status") != "indexed":
                         deferred.append(
@@ -2198,6 +2358,15 @@ class FactsPgRepository:
                 )
 
         subjects_deleted = self.sweep_orphans()
+
+        # TCRD-241 / RBAC review (PR #1736): a doc_id that would only have
+        # resolved by escaping every corpus this batch's `documents[]`
+        # declared is REJECTED, not written (see `_resolve_doc` tier 3a) —
+        # itemized in `claims_rejected` with reason
+        # `ambiguous_cross_collection_doc_id`, same shape as every other
+        # rejection reason. No separate top-level counter: `claims_rejected`
+        # is already the itemized source of truth (mirrors
+        # `facts_ingest_runs.claims_rejected_count`, itself `len(claims_rejected)`).
 
         return {
             "claims_written": claims_written,
