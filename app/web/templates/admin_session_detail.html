@@ -107,9 +107,27 @@
     if (s < 3600) return Math.round(s / 60) + 'm';
     return (s / 3600).toFixed(1) + 'h';
   }
-  function renderMeta(s) {
+  function fmtTokens(n) {
+    if (n == null) return '—';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  }
+  function renderMeta(s, tokens) {
+    // `tokens` is summed server-side from the transcript's own
+    // message.usage blocks (TCRD-222) — exact for the file being viewed,
+    // independent of the UsageProcessor's tick. null = the JSONL predates
+    // the usage field; render an honest dash, never a zero.
+    const tokensHtml = tokens
+      ? '<div><b>Tokens:</b> ' + escapeHtml(fmtTokens(tokens.total))
+        + ' <span title="input / output / cache read / cache creation">('
+        + escapeHtml(fmtTokens(tokens.input)) + ' in / '
+        + escapeHtml(fmtTokens(tokens.output)) + ' out / '
+        + escapeHtml(fmtTokens((tokens.cache_read || 0) + (tokens.cache_creation || 0))) + ' cache)</span></div>'
+      : '<div><b>Tokens:</b> —</div>';
     if (!s || !Object.keys(s).length) {
-      metaRoot.innerHTML = '<i>Summary not extracted yet (UsageProcessor hasn\'t run).</i>';
+      metaRoot.innerHTML = tokensHtml +
+        '<div><i>Summary not extracted yet (UsageProcessor hasn\'t run).</i></div>';
       return;
     }
     metaRoot.innerHTML =
@@ -117,7 +135,8 @@
       '<div><b>Active:</b> ' + escapeHtml(fmtDuration(s.active_seconds)) + '</div>' +
       '<div><b>Tool calls:</b> ' + escapeHtml(String(s.tool_calls ?? '—')) + '</div>' +
       '<div><b>Errors:</b> ' + escapeHtml(String(s.tool_errors ?? '—')) + '</div>' +
-      '<div><b>Model:</b> ' + escapeHtml(s.primary_model || '—') + '</div>';
+      '<div><b>Model:</b> ' + escapeHtml(s.primary_model || '—') + '</div>' +
+      tokensHtml;
   }
 
   function renderEvent(ev, idx) {
@@ -194,7 +213,7 @@
     .then(r => r.json())
     .then(d => {
       loading.remove();
-      renderMeta(d.summary);
+      renderMeta(d.summary, d.tokens);
       const events = d.events || [];
       let errorCount = 0;
       events.forEach((ev, i) => {

@@ -816,6 +816,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   destructive now (it burns the link so a refused consent cannot be re-submitted
   as an allow), so it requires the same authenticated Agnes session Allow always
   did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
