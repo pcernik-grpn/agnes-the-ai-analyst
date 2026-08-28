@@ -2102,8 +2102,23 @@ class FactsPgRepository:
         and claim, delete the now-empty ``merged_id`` row, audit-log the
         action. Both facts must share a ``type`` (entity-resolution repair,
         not a type change). Returns a snapshot — ``{canonical_id,
-        merged_id, aliases, claim_ids}`` — sufficient for :meth:`split_fact`
-        to reverse it (union of claims, both aliases, per spec EQ7)."""
+        merged_id, aliases, claim_ids, duplicate_claims}`` — sufficient for
+        :meth:`split_fact` to reverse it (union of claims, both aliases, per
+        spec EQ7).
+
+        **Shared evidence.** ``uq_claims_subject_file_quote`` is unique on
+        ``(COALESCE(fact_id, edge_id), corpus_file_id, quote_hash)``, so a
+        bare repoint explodes with an IntegrityError whenever the two facts
+        each carry a claim from the same document with the same quote —
+        which is exactly the ordinary entity-resolution case (one sentence
+        evidencing "Acme Corp" and "Acme Corporation"). Those merged-side
+        claims are therefore captured into ``duplicate_claims`` and deleted
+        before the repoint; the canonical's identical claim survives, so no
+        evidence is lost. ``split_fact`` re-creates them on the new fact from
+        that snapshot, which keeps the merge reversible — under fresh claim
+        ids, the same way ``split_fact`` already mints a new fact id rather
+        than resurrecting ``merged_id`` (ids are opaque and never reused,
+        spec §3)."""
         with self._engine.begin() as conn:
             canonical = (
                 conn.execute(sa.text("SELECT type FROM facts WHERE id = :id"), {"id": canonical_id}).mappings().first()
@@ -2124,6 +2139,40 @@ class FactsPgRepository:
                 .scalars()
                 .all()
             )
+            # Merged-side claims the canonical already holds for the SAME
+            # (document, quote): repointing them would violate
+            # uq_claims_subject_file_quote. Capture their content so the
+            # split can re-create them, then drop them — the canonical's
+            # identical claim carries the evidence forward.
+            dup_rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT id, corpus_file_id, corpus_id, file_sha256, attrs, quote, quote_hash, document_date "
+                        "FROM claims m WHERE m.fact_id = :merged AND EXISTS ("
+                        "  SELECT 1 FROM claims c WHERE c.fact_id = :canonical "
+                        "    AND c.corpus_file_id = m.corpus_file_id AND c.quote_hash = m.quote_hash)"
+                    ),
+                    {"merged": merged_id, "canonical": canonical_id},
+                )
+                .mappings()
+                .all()
+            )
+            duplicate_claims = [
+                {
+                    "corpus_file_id": r["corpus_file_id"],
+                    "corpus_id": r["corpus_id"],
+                    "file_sha256": r["file_sha256"],
+                    "attrs": _decode_jsonb(r["attrs"]) or {},
+                    "quote": r["quote"],
+                    "quote_hash": r["quote_hash"],
+                    "document_date": r["document_date"].isoformat() if r["document_date"] else None,
+                }
+                for r in dup_rows
+            ]
+            dup_ids = [r["id"] for r in dup_rows]
+            if dup_ids:
+                conn.execute(sa.text("DELETE FROM claims WHERE id = ANY(:ids)"), {"ids": dup_ids})
+
             claim_ids = (
                 conn.execute(sa.text("SELECT id FROM claims WHERE fact_id = :id"), {"id": merged_id}).scalars().all()
             )
@@ -2144,23 +2193,33 @@ class FactsPgRepository:
             "merged_id": merged_id,
             "aliases": list(aliases),
             "claim_ids": list(claim_ids),
+            "duplicate_claims": duplicate_claims,
         }
         audit_repo().log(
             user_id=merged_by,
             action="facts.merge",
             resource=f"fact/{canonical_id}",
-            params={"merged_id": merged_id, "aliases": snapshot["aliases"], "claim_ids": snapshot["claim_ids"]},
+            params={
+                "merged_id": merged_id,
+                "aliases": snapshot["aliases"],
+                "claim_ids": snapshot["claim_ids"],
+                "duplicate_claims_dropped": len(duplicate_claims),
+            },
         )
         return snapshot
 
     def split_fact(self, *, canonical_id: str, snapshot: Dict[str, Any], split_by: str) -> str:
         """Reverse a prior :meth:`merge_facts` using its returned
         ``snapshot``: mint a NEW fact of the canonical's type, repoint the
-        snapshotted aliases + claims back onto it. Returns the new fact id
-        — deliberately NOT the original ``merged_id``, since ids are opaque
-        and never reused (spec §3)."""
+        snapshotted aliases + claims back onto it, and RE-CREATE any claims
+        the merge had to drop as duplicates of the canonical's own evidence
+        (``duplicate_claims`` — see :meth:`merge_facts`). Returns the new
+        fact id — deliberately NOT the original ``merged_id``, since ids are
+        opaque and never reused (spec §3); the re-created claims get fresh
+        ids for the same reason."""
         aliases = snapshot.get("aliases") or []
         claim_ids = snapshot.get("claim_ids") or []
+        duplicate_claims = snapshot.get("duplicate_claims") or []
         with self._engine.begin() as conn:
             row = (
                 conn.execute(sa.text("SELECT type FROM facts WHERE id = :id"), {"id": canonical_id}).mappings().first()
@@ -2184,6 +2243,28 @@ class FactsPgRepository:
                     sa.text("UPDATE claims SET fact_id = :new WHERE id = ANY(:ids)"),
                     {"new": new_id, "ids": list(claim_ids)},
                 )
+            for dup in duplicate_claims:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO claims "
+                        "(id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, attrs, quote, "
+                        " quote_hash, document_date) "
+                        "VALUES (:id, :fact_id, NULL, :corpus_file_id, :corpus_id, :file_sha256, "
+                        "        CAST(:attrs AS JSONB), :quote, :quote_hash, :document_date) "
+                        "ON CONFLICT (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash) DO NOTHING"
+                    ),
+                    {
+                        "id": "c_" + secrets.token_hex(8),
+                        "fact_id": new_id,
+                        "corpus_file_id": dup["corpus_file_id"],
+                        "corpus_id": dup["corpus_id"],
+                        "file_sha256": dup.get("file_sha256") or "",
+                        "attrs": json.dumps(dup.get("attrs") or {}),
+                        "quote": dup["quote"],
+                        "quote_hash": dup["quote_hash"],
+                        "document_date": _parse_document_date(dup.get("document_date")),
+                    },
+                )
 
         from src.repositories import audit_repo
 
@@ -2191,7 +2272,12 @@ class FactsPgRepository:
             user_id=split_by,
             action="facts.split",
             resource=f"fact/{canonical_id}",
-            params={"new_id": new_id, "aliases": aliases, "claim_ids": claim_ids},
+            params={
+                "new_id": new_id,
+                "aliases": aliases,
+                "claim_ids": claim_ids,
+                "duplicate_claims_recreated": len(duplicate_claims),
+            },
         )
         return new_id
 

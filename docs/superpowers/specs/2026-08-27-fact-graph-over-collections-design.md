@@ -532,7 +532,15 @@ admin PAT; CSRF n/a (bearer). Body:
   incoming set). **A listed document's complete claim set must arrive in the
   same request** — batch limits are sized for that (≤500 documents, ≤5000
   claims per request; one document exceeding the claim cap is a protocol
-  error to surface, never to split).
+  error to surface, never to split). The delete is one statement over every
+  listed document, but the batch as a whole is deliberately **not** one
+  transaction: every validation that can reject (caps, unresolved doc ids)
+  runs before the first delete, and everything after it is idempotent — union
+  mode merges on `(subject, corpus_file_id, quote_hash)` and the orphan sweep
+  is a no-op when nothing is orphaned — so a batch interrupted by an
+  infrastructure failure converges by being re-sent, which a producer already
+  does. The window costs a document some of its facts until the retry; it
+  never serves a claim that is false.
 - A document *not* listed is in **union mode**: claims merge by
   `(subject, corpus_file_id, quote_hash)` — re-asserting is a no-op, new
   quotes accumulate.

@@ -572,6 +572,59 @@ def test_merge_facts_unions_claims_and_aliases_then_split_reverses_it(pg_env, re
         assert s["claim_count"] == 1
 
 
+def test_merge_facts_survives_shared_evidence_and_split_restores_it(pg_env, repo):
+    """`uq_claims_subject_file_quote` is unique on (subject, corpus_file_id,
+    quote_hash), so repointing the merged fact's claims explodes with an
+    IntegrityError when both facts carry a claim from the SAME document with
+    the SAME quote — the ordinary entity-resolution case, where one sentence
+    evidences two spellings of the same entity. The merge must survive that,
+    and the split must still put the duplicate back (Devin Review on #1652).
+    """
+    quote = "Acme Corp and Acme Corporation signed."
+    doc_id = _seed_ready_doc(pg_env, text=quote)
+
+    canonical_id = repo.create_fact(type="engagement", natural_key="engagement:acme-corp")
+    repo.add_alias(fact_id=canonical_id, type="engagement", natural_key="engagement:acme-corp")
+    duplicate_id = repo.create_fact(type="engagement", natural_key="engagement:acme-corporation")
+    repo.add_alias(fact_id=duplicate_id, type="engagement", natural_key="engagement:acme-corporation")
+    del doc_id
+
+    # The SAME document + the SAME quote evidences both facts.
+    for fid in (canonical_id, duplicate_id):
+        repo.add_claim(
+            fact_id=fid, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote
+        )
+    # ...plus one claim only the duplicate holds, which must repoint normally.
+    repo.add_claim(
+        fact_id=duplicate_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme Corporation is the counterparty.",
+    )
+
+    snapshot = repo.merge_facts(canonical_id=canonical_id, merged_id=duplicate_id, merged_by="admin1")
+
+    subjects = repo.search(_admin(), type="engagement")["subjects"]
+    assert len(subjects) == 1, "the merge must complete, not abort on the shared quote"
+    assert subjects[0]["id"] == canonical_id
+    # The shared quote is carried by the canonical's own claim, not duplicated.
+    assert subjects[0]["claim_count"] == 2
+    assert len(snapshot["duplicate_claims"]) == 1
+    assert snapshot["duplicate_claims"][0]["quote"] == quote
+
+    new_id = repo.split_fact(canonical_id=canonical_id, snapshot=snapshot, split_by="admin1")
+    after = {s["id"]: s for s in repo.search(_admin(), type="engagement")["subjects"]}
+    assert set(after) == {canonical_id, new_id}
+    # Both sides are back to what they held before the merge: the canonical
+    # keeps its shared-quote claim, and the split fact gets its own copy back
+    # (fresh id) plus the claim that merely repointed.
+    assert after[canonical_id]["claim_count"] == 1
+    assert after[new_id]["claim_count"] == 2
+    quotes_back = {c["quote"] for c in repo.claims(_admin(), new_id)["claims"]}
+    assert quote in quotes_back, "the duplicate claim must be restored, not lost by the merge"
+
+
 # ---------------------------------------------------------------------------
 # C5 — orphan sweep: counted, and a subject with another doc's claim survives.
 # ---------------------------------------------------------------------------
