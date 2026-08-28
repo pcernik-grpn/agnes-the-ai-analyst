@@ -192,6 +192,53 @@ class TestSemanticModelCrud:
             == 404
         )
 
+    def test_a_source_owned_model_cannot_be_deleted_through_the_api(self, seeded_app, git_backed_model):
+        c = seeded_app["client"]
+        r = c.delete(
+            f"/api/admin/semantic-models/{git_backed_model['id']}",
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 409
+        body = r.json()["detail"]
+        assert body["code"] == "source_owned"
+        assert "git" in body["message"], "the error must name where to go and edit it"
+        # never actually removed
+        assert (
+            c.get(
+                f"/api/admin/semantic-models/{git_backed_model['id']}",
+                headers=_auth(seeded_app["admin_token"]),
+            ).status_code
+            == 200
+        )
+
+    def test_creating_a_model_whose_slug_collides_with_a_source_owned_model_is_refused(
+        self, seeded_app, git_backed_model
+    ):
+        c = seeded_app["client"]
+        doc = (
+            "version: '0.2.0.dev0'\n"
+            "semantic_model:\n"
+            f"  - name: {git_backed_model['slug']}\n"
+            "    datasets:\n"
+            "      - name: orders\n"
+            "        source: db.public.orders\n"
+            "        fields: []\n"
+        )
+        r = c.post(
+            "/api/admin/semantic-models",
+            json={"document": doc},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 409
+        body = r.json()["detail"]
+        assert body["code"] == "source_owned"
+        assert "git" in body["message"], "the error must name where to go and edit it"
+        # no shadow manual/_/<slug> row was created
+        listed = c.get("/api/admin/semantic-models", headers=_auth(seeded_app["admin_token"])).json()
+        assert not any(
+            m["slug"] == git_backed_model["slug"] and m["source"] == "manual" for m in listed
+        )
+
 
 class TestSemanticSourceCrud:
     def test_create_list_get_update_delete(self, seeded_app):

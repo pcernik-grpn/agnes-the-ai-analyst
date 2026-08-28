@@ -42,7 +42,7 @@ connected.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ DOMAINS = ("semantic", "metrics", "glossary", "skill", "agent", "knowledge_base"
 #: ``source_connections.source_type``. A source type absent from this map has
 #: no adapter in this build, so its semantic column is ``not_applicable``
 #: rather than ``missing``.
-SEMANTIC_ADAPTER_BY_SOURCE_TYPE: Dict[str, str] = {
+SEMANTIC_ADAPTER_BY_SOURCE_TYPE: dict[str, str] = {
     "keboola": "keboola_metastore",
     "snowflake": "snowflake_semantic",
     "databricks": "databricks_metric_views",
@@ -71,12 +71,12 @@ SEMANTIC_ADAPTER_BY_SOURCE_TYPE: Dict[str, str] = {
 #: The three types reuse the ``app.resource_types.ResourceType`` vocabulary
 #: (and its ``resource_id`` path conventions) so a tag and a grant name the
 #: same object the same way.
-TAG_DOMAIN_BY_RESOURCE_TYPE: Dict[str, str] = {
+TAG_DOMAIN_BY_RESOURCE_TYPE: dict[str, str] = {
     "marketplace_plugin": "skill",
     "agent": "agent",
     "memory_domain": "knowledge_base",
 }
-TAG_RESOURCE_TYPE_BY_DOMAIN: Dict[str, str] = {v: k for k, v in TAG_DOMAIN_BY_RESOURCE_TYPE.items()}
+TAG_RESOURCE_TYPE_BY_DOMAIN: dict[str, str] = {v: k for k, v in TAG_DOMAIN_BY_RESOURCE_TYPE.items()}
 
 #: The synthetic row for registered tables that belong to no
 #: ``source_connections`` row (``table_registry.connection_id IS NULL``):
@@ -105,9 +105,9 @@ def _domain_result(
     status: str,
     detail: str,
     *,
-    action: Optional[Dict[str, str]] = None,
-    raw: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    action: dict[str, str] | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """One cell of the report. ``action`` is only ever set when a create flow
     genuinely exists for that source — see the module docstring."""
     return {"status": status, "detail": detail, "action": action, "raw": raw or {}}
@@ -118,7 +118,7 @@ def _domain_result(
 # ---------------------------------------------------------------------------
 
 
-def _keboola_missing_master_reason(conn: Dict[str, Any]) -> str:
+def _keboola_missing_master_reason(conn: dict[str, Any]) -> str:
     """Why a Keboola connection is absent from K0.5's enumeration.
 
     ``_enumerate_master_sources()`` skips a connection for three different
@@ -141,7 +141,7 @@ def _keboola_missing_master_reason(conn: Dict[str, Any]) -> str:
     return "owner token stored, but it cannot be read — the vault key changed since it was written"
 
 
-def _keboola_coverage_by_connection() -> Dict[str, Dict[str, Any]]:
+def _keboola_coverage_by_connection() -> dict[str, dict[str, Any]]:
     """K0.5's per-connection record, keyed by ``connection_id``.
 
     Wrapped, never rewritten: ``compute_semantic_coverage`` enumerates only
@@ -162,7 +162,7 @@ def _keboola_coverage_by_connection() -> Dict[str, Dict[str, Any]]:
     return {entry.get("connection_id"): entry for entry in report.get("sources") or [] if entry.get("connection_id")}
 
 
-def _keboola_semantic_status(conn: Dict[str, Any], entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _keboola_semantic_status(conn: dict[str, Any], entry: dict[str, Any] | None) -> dict[str, Any]:
     if entry is None:
         return _domain_result(
             STATUS_MISSING,
@@ -216,11 +216,11 @@ def _keboola_semantic_status(conn: Dict[str, Any], entry: Optional[Dict[str, Any
 
 
 def _native_semantic_status(
-    conn: Dict[str, Any],
+    conn: dict[str, Any],
     adapter: str,
-    semantic_sources: List[Dict[str, Any]],
-    semantic_models: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    semantic_sources: list[dict[str, Any]],
+    semantic_models: list[dict[str, Any]],
+) -> dict[str, Any]:
     """Semantic status for a source type served by a first-party adapter.
 
     Read straight off ``semantic_sources`` / ``semantic_models`` — no
@@ -240,7 +240,7 @@ def _native_semantic_status(
         for s in semantic_sources
         if (s.get("adapter") or "") == adapter and ((s.get("config") or {}).get("connection_id")) == conn["id"]
     ]
-    raw: Dict[str, Any] = {"semantic_sources": [{"id": s["id"], "name": s.get("name")} for s in linked]}
+    raw: dict[str, Any] = {"semantic_sources": [{"id": s["id"], "name": s.get("name")} for s in linked]}
     if not linked:
         return _domain_result(
             STATUS_MISSING,
@@ -263,11 +263,11 @@ def _native_semantic_status(
 
 
 def _semantic_status(
-    conn: Dict[str, Any],
-    keboola_coverage: Dict[str, Dict[str, Any]],
-    semantic_sources: List[Dict[str, Any]],
-    semantic_models: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    conn: dict[str, Any],
+    keboola_coverage: dict[str, dict[str, Any]],
+    semantic_sources: list[dict[str, Any]],
+    semantic_models: list[dict[str, Any]],
+) -> dict[str, Any]:
     source_type = (conn.get("source_type") or "").strip()
     adapter = SEMANTIC_ADAPTER_BY_SOURCE_TYPE.get(source_type)
     if adapter is None:
@@ -285,7 +285,7 @@ def _semantic_status(
 # ---------------------------------------------------------------------------
 
 
-def _metric_tables(metrics: List[Dict[str, Any]]) -> set[str]:
+def _metric_tables(metrics: list[dict[str, Any]]) -> set[str]:
     """Every table name any metric is bound to — ``table_name`` plus every
     entry of the multi-table ``tables`` array (a JOIN metric binds to two)."""
     bound: set[str] = set()
@@ -299,7 +299,7 @@ def _metric_tables(metrics: List[Dict[str, Any]]) -> set[str]:
     return bound
 
 
-def _metrics_status(tables: List[Dict[str, Any]], bound_tables: set[str]) -> Dict[str, Any]:
+def _metrics_status(tables: list[dict[str, Any]], bound_tables: set[str]) -> dict[str, Any]:
     if not tables:
         return _domain_result(STATUS_NOT_APPLICABLE, "no tables are registered for this source")
     covered = [t for t in tables if t.get("name") in bound_tables]
@@ -320,8 +320,8 @@ def _metrics_status(tables: List[Dict[str, Any]], bound_tables: set[str]) -> Dic
 
 
 def _semantic_source_ids_by_connection(
-    semantic_sources: List[Dict[str, Any]],
-) -> Dict[str, List[str]]:
+    semantic_sources: list[dict[str, Any]],
+) -> dict[str, list[str]]:
     """``source_connections.id`` -> the ``semantic_sources.id``s linked to it.
 
     Deliberately NOT filtered by adapter, unlike :func:`_native_semantic_status`:
@@ -330,7 +330,7 @@ def _semantic_source_ids_by_connection(
     belonging to this connection" — and a row's provenance does not stop being
     this connection's because it arrived through some other adapter.
     """
-    by_connection: Dict[str, List[str]] = {}
+    by_connection: dict[str, list[str]] = {}
     for source in semantic_sources:
         connection_id = (source.get("config") or {}).get("connection_id")
         if connection_id:
@@ -338,7 +338,7 @@ def _semantic_source_ids_by_connection(
     return by_connection
 
 
-def _glossary_status(term_count: int) -> Dict[str, Any]:
+def _glossary_status(term_count: int) -> dict[str, Any]:
     if not term_count:
         return _domain_result(
             STATUS_MISSING,
@@ -359,7 +359,7 @@ _TAG_DOMAIN_LABELS = {
 }
 
 
-def _tag_status(source_id: str, domain: str, tags: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _tag_status(source_id: str, domain: str, tags: list[dict[str, Any]]) -> dict[str, Any]:
     noun, label = _TAG_DOMAIN_LABELS[domain]
     resource_type = TAG_RESOURCE_TYPE_BY_DOMAIN[domain]
     matching = [t for t in tags if (t.get("resource_type") or "") == resource_type]
@@ -381,7 +381,7 @@ def _tag_status(source_id: str, domain: str, tags: List[Dict[str, Any]]) -> Dict
 # ---------------------------------------------------------------------------
 
 
-def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, Any]:
+def compute_cross_domain_coverage(source_id: str | None = None) -> dict[str, Any]:
     """One row per data source, one status per domain.
 
     ``source_id`` narrows the report to a single source (the CLI's
@@ -422,13 +422,13 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     # the already-fetched `connections` list (not `get_default()` per table)
     # to avoid N extra repo round-trips; mirrors `get_default()`'s own
     # `ORDER BY created_at LIMIT 1` tie-break.
-    default_conn_id_by_source_type: Dict[str, str] = {}
+    default_conn_id_by_source_type: dict[str, str] = {}
     for conn in sorted(connections, key=lambda c: c.get("created_at") or ""):
         source_type = conn.get("source_type")
         if conn.get("is_default") and source_type and source_type not in default_conn_id_by_source_type:
             default_conn_id_by_source_type[source_type] = conn["id"]
 
-    tables_by_connection: Dict[Optional[str], List[Dict[str, Any]]] = {}
+    tables_by_connection: dict[str | None, list[dict[str, Any]]] = {}
     for table in tables:
         conn_id = table.get("connection_id")
         if conn_id is None:
@@ -445,7 +445,7 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     # glossary read as having none — and those terms were counted in NO bucket
     # at all, since the synthetic local row only claims `source_ref IS NULL`.
     # Resolving both namespaces per connection is what makes the column true.
-    terms_by_ref: Dict[Optional[str], int] = {}
+    terms_by_ref: dict[str | None, int] = {}
     for term in terms:
         ref = term.get("source_ref")
         terms_by_ref[ref] = terms_by_ref.get(ref, 0) + 1
@@ -456,11 +456,11 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
 
     # Only pay for the Keboola provider's upstream round-trips when a Keboola
     # connection actually exists.
-    keboola_coverage: Dict[str, Dict[str, Any]] = {}
+    keboola_coverage: dict[str, dict[str, Any]] = {}
     if any((c.get("source_type") or "") == "keboola" for c in connections):
         keboola_coverage = _keboola_coverage_by_connection()
 
-    sources: List[Dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
     for conn in connections:
         conn_id = conn["id"]
         tags = tags_repo.list_for_source(conn_id)
@@ -492,7 +492,7 @@ def compute_cross_domain_coverage(source_id: Optional[str] = None) -> Dict[str, 
     return {"sources": sources}
 
 
-def _sync_status(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "source_id": s["id"],
@@ -505,7 +505,7 @@ def _sync_status(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def _configured_databricks_host() -> Optional[str]:
+def _configured_databricks_host() -> str | None:
     """The currently-configured Databricks workspace host, independent of
     whether a token can be resolved for it.
 
@@ -532,7 +532,7 @@ def _configured_databricks_host() -> Optional[str]:
     return host or None
 
 
-def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> List[Dict[str, Any]]:
+def _orphaned_models(models: list[dict[str, Any]], known_source_ids: set) -> list[dict[str, Any]]:
     """Models whose ``source_ref`` names no live upstream.
 
     ``source='manual'`` models are excluded on purpose: they were never fed by
@@ -559,11 +559,11 @@ def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> Lis
     Databricks host) lazily on first use and reusing it for every remaining
     model of that source, rather than re-querying per model.
     """
-    live_keboola_connection_ids: Optional[set] = None
-    live_databricks_ref: Optional[str] = None
+    live_keboola_connection_ids: set | None = None
+    live_databricks_ref: str | None = None
     databricks_host_resolved = False
 
-    def keboola_is_live(source_ref: Optional[str]) -> bool:
+    def keboola_is_live(source_ref: str | None) -> bool:
         nonlocal live_keboola_connection_ids
         if source_ref is None:
             return False
@@ -573,7 +573,7 @@ def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> Lis
             live_keboola_connection_ids = {c["id"] for c in source_connections_repo().list(source_type="keboola")}
         return source_ref in live_keboola_connection_ids
 
-    def databricks_is_live(source_ref: Optional[str]) -> bool:
+    def databricks_is_live(source_ref: str | None) -> bool:
         nonlocal live_databricks_ref, databricks_host_resolved
         if source_ref is None:
             return False
@@ -586,7 +586,7 @@ def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> Lis
                 live_databricks_ref = _source_ref_for_host(host)
         return live_databricks_ref is not None and source_ref == live_databricks_ref
 
-    checks: Dict[str, Any] = {"keboola_metastore": keboola_is_live, "databricks_metrics": databricks_is_live}
+    checks: dict[str, Any] = {"keboola_metastore": keboola_is_live, "databricks_metrics": databricks_is_live}
 
     orphans = []
     for m in models:
@@ -603,7 +603,7 @@ def _orphaned_models(models: List[Dict[str, Any]], known_source_ids: set) -> Lis
     return orphans
 
 
-def _invalid_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _invalid_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {"model_id": m["id"], "slug": m.get("slug"), "validation_errors": m.get("validation_errors")}
         for m in models
@@ -611,7 +611,7 @@ def _invalid_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def _metrics_missing_description(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _metrics_missing_description(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """A metric with no ``description`` is a measure wearing a metric's name.
 
     ``SUM(order_amount)`` is a measure; "Revenue" is a metric, and revenue
@@ -622,7 +622,7 @@ def _metrics_missing_description(metrics: List[Dict[str, Any]]) -> List[Dict[str
     return [{"metric_id": m["id"], "name": m.get("name")} for m in metrics if not (m.get("description") or "").strip()]
 
 
-def _duplicate_metric_names(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _duplicate_metric_names(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The same metric name defined more than once, with a different formula.
 
     Two rows with the same name and the SAME sql are one metric imported
@@ -631,7 +631,7 @@ def _duplicate_metric_names(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any
     agent or a dashboard picking whichever it resolves first gets a different
     number than a colleague who picked the other.
     """
-    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
     for m in metrics:
         by_name.setdefault(m.get("name") or "", []).append(m)
     findings = []
@@ -650,7 +650,7 @@ def _duplicate_metric_names(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any
     return findings
 
 
-def _dataset_names_touched(expression: Dict[str, Any], dataset_names: set) -> set:
+def _dataset_names_touched(expression: dict[str, Any], dataset_names: set) -> set:
     """Which declared dataset names appear as a ``name.column`` prefix in a
     metric's SQL — a substring heuristic, not a parser.
 
@@ -669,7 +669,7 @@ def _dataset_names_touched(expression: Dict[str, Any], dataset_names: set) -> se
     return {name for name in dataset_names if f"{name}." in text}
 
 
-def _metrics_missing_relationships(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _metrics_missing_relationships(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """A metric whose SQL spans two datasets with no declared relationship
     between them.
 
@@ -682,7 +682,7 @@ def _metrics_missing_relationships(models: List[Dict[str, Any]]) -> List[Dict[st
     only shows up in the source document a human or an importer wrote, before
     anything filtered it.
     """
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     for model in models:
         if (model.get("status") or "") != "valid" or not model.get("document_json"):
             continue
@@ -716,7 +716,7 @@ def _metrics_missing_relationships(models: List[Dict[str, Any]]) -> List[Dict[st
     return findings
 
 
-def _coverage_summary(report: Dict[str, Any]) -> Dict[str, int]:
+def _coverage_summary(report: dict[str, Any]) -> dict[str, int]:
     missing = partial = 0
     for source in report.get("sources") or []:
         for cell in (source.get("domains") or {}).values():
@@ -727,7 +727,7 @@ def _coverage_summary(report: Dict[str, Any]) -> Dict[str, int]:
     return {"missing_count": missing, "partial_count": partial}
 
 
-def compute_semantic_layer_health() -> Dict[str, Any]:
+def compute_semantic_layer_health() -> dict[str, Any]:
     """Is the semantic layer itself trustworthy right now?
 
     Cross-domain coverage (:func:`compute_cross_domain_coverage`) answers
@@ -773,11 +773,11 @@ def compute_semantic_layer_health() -> Dict[str, Any]:
 
 
 def _local_bucket(
-    local_tables: List[Dict[str, Any]],
+    local_tables: list[dict[str, Any]],
     local_terms: int,
     bound_tables: set[str],
-    semantic_models: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    semantic_models: list[dict[str, Any]],
+) -> dict[str, Any]:
     """The synthetic row for everything attached to no connection.
 
     The three tag-backed domains are ``not_applicable`` here and not by
