@@ -102,6 +102,8 @@ if [ "$WITH_CHAT" -eq 1 ]; then
 fi
 
 echo ""
-echo "  →  http://${HOST}:${PORT}/agents?new=1"
+# The Library, not one builder's deep link: "+ New" there reaches all five of
+# them, and a hardcoded /agents?new=1 goes stale every time one is added.
+echo "  →  http://${HOST}:${PORT}/library"
 echo ""
 exec .venv/bin/uvicorn app.main:app --reload --host "${HOST}" --port "${PORT}"

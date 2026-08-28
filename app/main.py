@@ -537,6 +537,7 @@ from app.api.memory_mining import (
 )
 from app.api.uploads import router as admin_uploads_router
 from app.api.collections import router as collections_router  # Slice 2: file corpus upload
+
 # `app.api.agents` is gone — /api/agents was retired into /api/v1/agents
 # (Task C1.2) and the module deleted on main, so only the builder routers
 # survive this merge.

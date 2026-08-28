@@ -58,8 +58,14 @@ class TestItIsOnEveryPage:
 
 
 class TestItStaysADevTool:
-    def test_it_renders_nothing_without_the_gate(self, partial):
-        assert "{% if dev_preview_available %}" in partial
+    def test_it_renders_nothing_without_both_halves_of_the_gate(self, partial):
+        """Local dev AND admin. The partial's own docstring claimed both from
+        the start, but only the first was ever checked: `dev_preview_available`
+        is `_dev_preview_enabled()` and nothing more, so under LOCAL_DEV_MODE a
+        non-admin got the switch. It changes only what renders, so that was
+        cosmetic rather than a leak — but a comment that overstates the gate is
+        how the next person reasons about it wrongly."""
+        assert "{% if dev_preview_available and session.user.is_admin %}" in partial
 
     def test_the_gate_is_local_dev_mode(self):
         router = ROUTER.read_text(encoding="utf-8")
@@ -151,7 +157,7 @@ class TestUseAgnesElsewhere:
         assert "rail-i--muted" not in rail[anchor:i]
 
     def test_it_uses_the_instance_brand(self, rail):
-        """"Use Agnes elsewhere" on an instance that calls itself something
+        """ "Use Agnes elsewhere" on an instance that calls itself something
         else would be the one place the rename did not reach."""
         assert "Use {{ instance_brand_short }} elsewhere" in rail
 

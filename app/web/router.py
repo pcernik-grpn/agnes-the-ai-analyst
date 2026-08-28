@@ -4900,9 +4900,18 @@ def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
         "user": _flex(user) if user else _FlexDict(),
         "dev_preview": _preview,
         # The switch is chrome, so whether to render it is chrome's business.
-        # Admin-only AND local-dev-only: it must not appear on a real
-        # deployment, and it must not offer a member a view they cannot have.
-        "dev_preview_available": bool(_preview is not None or _dev_preview_enabled()),
+        # LOCAL-DEV-ONLY here; the admin half of the rule is enforced in
+        # `_dev_preview.html`, against the `session.user.is_admin` this dict
+        # already carries — `_chrome_ctx` deliberately does not compute
+        # `is_admin` (see the docstring above: an uncached lookup on every
+        # page nobody asked for), and the partial gets the answer for free.
+        #
+        # This used to read `_preview is not None or _dev_preview_enabled()`,
+        # whose first clause cannot be true without the second —
+        # `_resolve_dev_preview` returns None unless dev mode is on — so it
+        # was dead, and it made the expression look like it had a second way
+        # to become available.
+        "dev_preview_available": _dev_preview_enabled(),
         "now": datetime.now,
         "get_flashed_messages": lambda **kw: [],
         "url_for": lambda endpoint, **kw: _url_for_shim(endpoint, **kw),

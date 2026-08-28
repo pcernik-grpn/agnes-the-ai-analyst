@@ -15,7 +15,7 @@ CHAT_JS = Path("app/web/static/js/chat.js")
 def _submit_body() -> str:
     js = CHAT_JS.read_text(encoding="utf-8")
     start = js.index("async function submitUserMessage")
-    end = js.index("renderMessage({ role: \"user\", content: text });", start)
+    end = js.index('renderMessage({ role: "user", content: text });', start)
     return js[start:end]
 
 

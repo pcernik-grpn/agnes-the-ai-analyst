@@ -597,9 +597,7 @@ class WorkdirManager:
             raise ValueError(f"preview skill path escaped the session workspace: {name!r}")
 
         target.mkdir(parents=True, exist_ok=True)
-        (target / "SKILL.md").write_text(
-            (body or "")[: self.MAX_PREVIEW_BODY_CHARS], encoding="utf-8"
-        )
+        (target / "SKILL.md").write_text((body or "")[: self.MAX_PREVIEW_BODY_CHARS], encoding="utf-8")
         # Which of these directories is the draft. The native providers mount
         # this tree and do not need to know; the kai-agent provider mounts
         # nothing and packs a tarball instead, so it reads this marker to find

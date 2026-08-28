@@ -101,7 +101,7 @@ class TestEveryCardOpensTheBuilder:
         """The route the card click used to be. Every agent stays talk-to-able,
         draft included — see the comment on `alt` in agentCard for why this is
         not gated on surfaces.web."""
-        assert "'<a class=\"ag-chat\" href=\"/chat?agent=" in agent_card
+        assert '\'<a class="ag-chat" href="/chat?agent=' in agent_card
         assert ">Edit<" not in agent_card, "the card itself is the edit route now"
 
     def test_an_agent_without_a_slug_offers_no_chat_action(self, agent_card):

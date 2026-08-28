@@ -667,17 +667,11 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
-    "/api/agents/{agent_id}/builder/turn": (
-        "the /agents builder's conversational pane — one turn of a UI "
-        "conversation whose whole product is a patch applied to the agent "
-        "row and re-rendered in the panel beside it. Every field it writes "
-        "is already reachable from CLI and MCP through the agent CRUD it "
-        "delegates to (`agnes agent …` / PATCH /api/agents/{agent_id}), so "
-        "a CLI or MCP twin would add a second, weaker way to write the same "
-        "columns rather than a missing capability. An agent asked to "
-        "configure an agent should call the CRUD directly and skip the "
-        "middle model"
-    ),
+    # `/api/agents/{agent_id}/builder/turn` is NOT here: it sits with the other
+    # four builder-turn routes further down, as `_AGENTS_BUILDER_TURN_REASON`.
+    # It used to be in both places — an inline prose entry here and the
+    # constant there — and a dict keeps the LAST value, so this one was dead
+    # text that read like the live justification.
     "/api/admin/users/{user_id}/library-preview": (
         "feeds the Simulate lens's Library-shaped preview on /admin/access — "
         "a projection of another person's /library page, meaningful only "

@@ -332,9 +332,7 @@ class AgentsRepository:
         existing = self._row_to_dict(row)
         if existing is not None:
             if (existing.get("status") or "") != "ready":
-                self.conn.execute(
-                    "UPDATE agents SET status = 'ready' WHERE id = ?", [existing["id"]]
-                )
+                self.conn.execute("UPDATE agents SET status = 'ready' WHERE id = ?", [existing["id"]])
                 existing["status"] = "ready"
             return existing
 
@@ -346,8 +344,7 @@ class AgentsRepository:
         ).fetchone()
         if stale is not None:
             self.conn.execute(
-                "UPDATE agents SET deleted_at = NULL, is_default = TRUE, "
-                "status = 'ready', updated_at = ? WHERE id = ?",
+                "UPDATE agents SET deleted_at = NULL, is_default = TRUE, status = 'ready', updated_at = ? WHERE id = ?",
                 [datetime.now(timezone.utc), stale[0]],
             )
             return self.get_by_id(stale[0])  # type: ignore[return-value]

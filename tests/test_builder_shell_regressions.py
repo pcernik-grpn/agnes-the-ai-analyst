@@ -78,7 +78,9 @@ class TestTheWorkspaceFillsTheWindow:
     def test_the_stacked_layout_can_still_scroll(self, css):
         """Pinning the shell to the viewport is right only while the panes sit
         side by side; stacked, it would trap the lower one."""
-        assert re.search(r"@media \(max-width: 900px\) \{\s*[^}]*body\.ag-building \.idx \{[^}]*height: auto", css, re.S)
+        assert re.search(
+            r"@media \(max-width: 900px\) \{\s*[^}]*body\.ag-building \.idx \{[^}]*height: auto", css, re.S
+        )
 
 
 class TestTheDrawerWearsOneHeaderAtATime:
@@ -303,16 +305,12 @@ class TestDeadPresentationFieldsAreGone:
         """Removing the controls but still posting the keys would leave a
         package quietly carrying artwork nobody can change."""
         for key in ("cover_image_url", "icon", "color"):
-            assert f'"{key}"' not in drawer and f"'{key}'" not in drawer, (
-                f"the builder still puts {key} in a payload"
-            )
+            assert f'"{key}"' not in drawer and f"'{key}'" not in drawer, f"the builder still puts {key} in a payload"
 
     def test_the_detail_page_asks_for_no_presentation(self):
         """The hero macro keeps supporting all three for its other callers;
         what must stay true is that the package page passes none of them."""
-        page = (
-            ROOT / "app" / "web" / "templates" / "catalog_package_detail.html"
-        ).read_text(encoding="utf-8")
+        page = (ROOT / "app" / "web" / "templates" / "catalog_package_detail.html").read_text(encoding="utf-8")
         hero = page[page.index("detail.hero(") :]
         hero = hero[: hero.index(") }}") + 4]
         for key in ("cover_image_url", "icon=", "color="):

@@ -430,6 +430,7 @@ values. Never commit `.env`.
 | `JIRA_CLOUD_ID` | Only for a scoped API token (gateway URL) |
 | `DESKTOP_JWT_SECRET` | HS256 secret the notifications WebSocket (`/api/notifications/ws`) validates client tokens against. Unset = every connection fails auth (fail-closed). No in-repo flow mints these tokens yet — see issue #412. |
 | `CONFIG_DIR` | Override config directory path |
+| `AGNES_BUILDER_STUB` | `1` makes the conversational builders (Library items, agents, data packages, MCP sources, linked apps) answer with a scripted stand-in instead of calling the model — for UI work with no credential configured. Every turn reports which engine answered it and the page shows a standing notice, so a stubbed builder never passes for a real one. `TESTING=1` forces it (a test must not reach the network); otherwise it is opt-in, and deliberately NOT implied by `LOCAL_DEV_MODE` — that would leave no way to run a local instance with auth AND a real turn |
 | `LOG_LEVEL` | Logging level: `debug`, `info`, `warning`, `error` |
 | `DOMAIN` | Public hostname for Caddy TLS (production profile) |
 | `AGNES_BASE_URL` | Operator-pinned public origin (see below). Wins over `SERVER_URL`. |

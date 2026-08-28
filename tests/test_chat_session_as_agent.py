@@ -618,8 +618,7 @@ class TestTheComposerCanChooseAnAgent:
         block = block[: block.index("\n}")]
         assert 'a.status === "ready"' in block, "the picker offers drafts again"
         assert "a.is_default" in block, (
-            "the default agent is filtered out with the drafts — switching away "
-            "from it would be one-way"
+            "the default agent is filtered out with the drafts — switching away from it would be one-way"
         )
 
     def test_the_settled_state_names_the_way_out(self):

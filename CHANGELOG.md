@@ -226,6 +226,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
+  The endpoint dials a connection the admin has typed but not saved — with a
+  credential attached, or on `stdio` by launching a subprocess with a
+  caller-supplied command. That is the same authority its registered sibling
+  (`POST /mcp-sources/{id}/introspect`, which is audited) already has and the
+  same principal holds it, but the registered path always leaves a row behind
+  and this one leaves nothing, so the audit entry is the only trace it
+  happened. Records the transport and the url/command, never the `env` dict.
+
 - **BREAKING: four admin surfaces are hidden by default — Studio, News, Knowledge
   digests, and Contribute a skill.** The admin sidebar drops all four rows (plus
   the Studio suggestions row, which reads the same flag its route always did),
@@ -729,6 +738,36 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   while the conversation had room to spare.
 
 ### Fixed
+- **Saving in the MCP-source builder is resumable instead of duplicating the
+  source.** Save makes up to four calls — register the row, store the secret,
+  then one grant per group — so a failure in a later step left a registered
+  source on screen with an error, and pressing Save again re-ran the whole
+  sequence and registered a SECOND source: the only recovery from "secret
+  stored, grant failed" was a duplicate. Save now remembers the row it created
+  and resumes from the step that failed, and says so ("The source is registered
+  — press Save again to finish the rest").
+
+- **An already-granted group no longer fails a builder save.** Both the
+  MCP-source and link-external-apps builders grant in a batch, and a duplicate
+  grant answers `409` — which is the end state the save is asking for, not a
+  failure. Counting it as one was not cosmetic in the linked-apps builder:
+  `Promise.all` rejects on the first failure, so a single already-granted pair
+  failed the whole save, and every retry then failed identically because the
+  pairs that had succeeded were 409s too — Save became permanently unreachable.
+  Grants are now settled independently, a 409 counts as done, and a partial
+  failure names the app → group pairs that are still not granted instead of
+  reporting "some grants failed". (The pre-builder `/admin/linked-apps` wizard
+  already read 409 as done; the builder that replaced it had lost that.)
+
+- **The local-dev audience switch is admin-gated in code, not only in its
+  comment.** Both the partial and `_chrome_ctx` stated the switch was
+  LOCAL_DEV_MODE-and-admin, but `dev_preview_available` only ever checked dev
+  mode, so a non-admin on a local instance got the switch. It changes what
+  renders and never any permission, so this was cosmetic rather than a leak —
+  but the claim now matches the check (`session.user.is_admin`, the same one
+  the rail uses). The flag also had a dead first clause whose condition cannot
+  be true without its second.
+
 - **Collapsing or expanding a section in the builder's Configuration panel no
   longer scrolls it back to the top.** The toggle rebuilt the whole panel,
   discarding its scroll position — so opening a section near the bottom

@@ -5,9 +5,13 @@
    role-switcher, which is why it says so on the panel rather than only in a
    comment someone has to go and find.
 
-   Renders only under LOCAL_DEV_MODE and only for an admin (see
-   `dev_preview_available` in `_chrome_ctx`), so it cannot appear on a real
-   deployment and cannot offer a member a view they can't have.
+   Renders only under LOCAL_DEV_MODE (`dev_preview_available` in
+   `_chrome_ctx`) and only for an admin (the `session.user.is_admin` check
+   below — the same one the rail uses two tiers up), so it cannot appear on a
+   real deployment and cannot offer a member a view they can't have. The admin
+   half is checked HERE rather than folded into the context flag because
+   `_chrome_ctx` does not compute `is_admin` on purpose; `session.user` is
+   already on the context, so the partial pays nothing for it.
 
    It is deliberately NOT part of any page's layout. Sitting inside the chat
    empty-banner it read as product chrome — something a user might think was
@@ -18,7 +22,7 @@
    No JS beyond the popover toggle: each option is a plain link and the state
    lives in the URL, so it survives the --reload restart you get while
    editing, and a mis-set state is fixed by editing the address bar. #}
-{% if dev_preview_available %}
+{% if dev_preview_available and session.user.is_admin %}
 {% set _path = request.url.path %}
 <div class="devsw" data-devsw>
   <button type="button" class="devsw-pill" data-devsw-toggle

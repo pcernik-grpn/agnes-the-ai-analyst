@@ -164,18 +164,42 @@
   /* ── Save ───────────────────────────────────────────────────────────
      The five steps, in the order they depend on each other, with the step
      named if one fails — "it didn't save" over a five-call sequence tells an
-     admin nothing about which half of it happened. */
+     admin nothing about which half of it happened.
+
+     RESUMABLE, which is the part that is easy to get wrong: three of the steps
+     run AFTER the source row exists, so a failure in one of them leaves a
+     registered source and an error on screen. If Save then re-ran the whole
+     sequence it would register a SECOND source — the admin's only recovery
+     from "stored the secret but the grant failed" would be to create a
+     duplicate. `savedId` remembers the row, so pressing Save again resumes
+     from the step that failed.
+
+     A grant that already exists answers 409, and for this sequence that is
+     success: the end state Save is asking for is "this group can reach the
+     source", and a 409 says it can. Treating it as a failure is what made the
+     retry above unreachable even once the row was correct. */
+
+  var savedId = null;
+
+  function grantGroup(sourceId, group) {
+    return postJson(SOURCES_API + '/' + encodeURIComponent(sourceId) + '/grants', { group_id: group.id })
+      .catch(function (e) {
+        if (e && e.status === 409) return null;  // already granted — the end state we wanted
+        throw e;
+      });
+  }
 
   function save() {
     if (saving || !canSave()) return;
     saving = true; saveErr = null;
     render();
-    var created = null;
     var body = Object.assign({ name: draft.name.trim(), enabled: true, scope: draft.scope },
                              connectionPayload());
-    postJson(SOURCES_API, body)
+    var step = savedId
+      ? Promise.resolve({ id: savedId })
+      : postJson(SOURCES_API, body).then(function (res) { savedId = res.id; return res; });
+    step
       .then(function (res) {
-        created = res;
         if (!draft.secret_value.trim()) return null;
         return api(SOURCES_API + '/' + encodeURIComponent(res.id) + '/secret', {
           method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -185,17 +209,17 @@
       .then(function () {
         if (!draft.groups.length) return null;
         return Promise.all(draft.groups.map(function (g) {
-          return postJson(SOURCES_API + '/' + encodeURIComponent(created.id) + '/grants',
-                          { group_id: g.id });
+          return grantGroup(savedId, g);
         })).catch(function (e) {
           throw new Error('Registered, but granting access failed: ' + e.message);
         });
       })
       .then(function () {
-        window.location.href = '/admin/mcp-sources/' + encodeURIComponent(created.id);
+        window.location.href = '/admin/mcp-sources/' + encodeURIComponent(savedId);
       })
       .catch(function (e) {
-        saveErr = e.message || 'Could not register the source.';
+        saveErr = (e.message || 'Could not register the source.') +
+                  (savedId ? ' The source is registered — press Save again to finish the rest.' : '');
         saving = false;
         render();
       });

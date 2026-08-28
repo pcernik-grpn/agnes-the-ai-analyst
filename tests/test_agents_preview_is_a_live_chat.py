@@ -40,14 +40,14 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "
 def markup() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
 
+
 @pytest.fixture(scope="module")
 def preview_js() -> str:
     """The preview SERVICE. A session, a socket and a stream of tokens is
     genuinely stateful, so it sits beside the pure shell rather than in it —
     but it is one implementation, shared by both builders."""
     return (
-        Path(__file__).resolve().parents[1]
-        / "app" / "web" / "static" / "js" / "components" / "builder_preview.js"
+        Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "components" / "builder_preview.js"
     ).read_text(encoding="utf-8")
 
 
@@ -57,8 +57,7 @@ def shell_js() -> str:
     the same thing. Assertions about what the SHELL emits read this; the
     page's own script is still `markup`."""
     return (
-        Path(__file__).resolve().parents[1]
-        / "app" / "web" / "static" / "js" / "components" / "builder_shell.js"
+        Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "components" / "builder_shell.js"
     ).read_text(encoding="utf-8")
 
 
@@ -94,9 +93,7 @@ class TestPreviewRunsARealTurn:
         the server has. Previewing therefore commits the working copy — the
         same write Save does — rather than spawning a session against the
         previous edit's persona."""
-        assert re.search(r"saveAgent\(\)\.then", markup), (
-            "openPreviewSession does not commit the working copy first"
-        )
+        assert re.search(r"saveAgent\(\)\.then", markup), "openPreviewSession does not commit the working copy first"
 
 
 class TestPreviewDoesNotPromiseWhatItCannotDo:

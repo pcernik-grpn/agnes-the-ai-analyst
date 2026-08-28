@@ -57,7 +57,12 @@
       if (!r.ok) {
         var d = j && j.detail;
         var msg = typeof d === 'string' ? d : (d && (d.hint || d.kind)) || ('HTTP ' + r.status);
-        throw new Error(msg);
+        var e = new Error(msg);
+        // The status, not just the sentence: `save()` has to tell an
+        // already-granted 409 from a real failure, and matching on the
+        // message text is how that breaks the day the wording changes.
+        e.status = r.status;
+        throw e;
       }
       return j;
     });
@@ -167,23 +172,54 @@
 
   function canSave() { return fetched && chosenApps().length > 0 && grantGroups.length > 0; }
 
+  /* Save is one grant per (app × group), and the two things that matter are
+     both about partial success.
+
+     A grant that already exists answers 409. That is the END STATE this save
+     is asking for, so it counts as done — the pre-builder wizard already read
+     it that way (it matched the message text; this reads `e.status`). Counting
+     it as a failure is not a cosmetic wrong answer: `Promise.all` rejects on
+     the first failure, so one already-granted pair failed the whole save, and
+     every retry failed identically because the successful pairs from the first
+     attempt were now 409s too. Save became permanently unreachable.
+
+     So no call is allowed to reject: each resolves to its own outcome, and
+     what the admin gets told is which pairs are still not granted, by name. */
+
+  function grantPair(pair, label) {
+    return send(GRANTS_API, 'POST', pair)
+      .then(function () { return null; })
+      .catch(function (e) {
+        if (e && e.status === 409) return null;  // already granted
+        return label + ': ' + (e.message || 'unknown error');
+      });
+  }
+
   function save() {
     if (saving || !canSave()) return;
     saving = true; saveErr = null;
     render();
-    var pairs = [];
+    var calls = [];
     chosenApps().forEach(function (a) {
       grantGroups.forEach(function (g) {
-        pairs.push({ group_id: g.id, resource_type: 'data_app', resource_id: a.id });
+        calls.push(grantPair(
+          { group_id: g.id, resource_type: 'data_app', resource_id: a.id },
+          a.name + ' → ' + g.name
+        ));
       });
     });
-    Promise.all(pairs.map(function (p) { return send(GRANTS_API, 'POST', p); }))
-      .then(function () { window.location.href = '/library?kind=data_app'; })
-      .catch(function (e) {
-        saveErr = 'Some grants failed: ' + (e.message || 'unknown error');
-        saving = false;
-        render();
-      });
+    Promise.all(calls).then(function (results) {
+      var failed = results.filter(function (r) { return r; });
+      if (!failed.length) {
+        window.location.href = '/library?kind=data_app';
+        return;
+      }
+      saveErr = 'Granted ' + (results.length - failed.length) + ' of ' + results.length +
+                '. Still not granted — ' + failed.join('; ') +
+                '. Press Save again to retry just those.';
+      saving = false;
+      render();
+    });
   }
 
   /* ── Groups picker ─────────────────────────────────────────────────── */

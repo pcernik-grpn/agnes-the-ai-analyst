@@ -40,9 +40,9 @@ def builder_css() -> str:
     """The builder workspace's rules. The schedules panel is a section BODY
     inside that workspace, so its status accents travelled with the shell when
     it was extracted out of the page's inline <style>."""
-    return (
-        Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "builder.css"
-    ).read_text(encoding="utf-8")
+    return (Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "css" / "builder.css").read_text(
+        encoding="utf-8"
+    )
 
 
 class TestPanelExists:

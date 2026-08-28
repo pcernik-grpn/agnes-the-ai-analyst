@@ -1333,9 +1333,9 @@ class TestRailChatsDestination:
         assert "height: 0" in base
         assert "visibility: hidden" in base
         # …and the icon strip is the one exception that unfolds it.
-        unfold = css.split(
-            'html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only {', 1
-        )[1].split("}", 1)[0]
+        unfold = css.split('html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only {', 1)[1].split(
+            "}", 1
+        )[0]
         assert "height: var(--rail-row-h)" in unfold
         assert "visibility: visible" in unfold
         # A peeked rail is showing the lists, so the stand-in folds again.

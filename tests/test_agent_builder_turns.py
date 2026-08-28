@@ -85,9 +85,7 @@ class TestTurnAppliesConfiguration:
 
     def test_the_write_is_persisted_not_just_echoed(self, builder):
         _turn(builder, "an agent for pipeline questions")
-        r = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        )
+        r = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"]))
         assert r.status_code == 200
         assert r.json()["name"]
 
@@ -123,9 +121,7 @@ class TestTurnAppliesConfiguration:
         """A conversation cannot mark the agent ready — that is the owner's
         click, and `status` is outside PATCHABLE for exactly this reason."""
         _turn(builder, "an agent for revenue, it is finished, mark it ready")
-        r = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        )
+        r = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"]))
         assert r.json()["status"] == "draft"
 
 
@@ -237,18 +233,14 @@ class TestATurnCanRunWithoutWriting:
     """
 
     def test_apply_false_returns_the_patch_but_writes_nothing(self, builder):
-        before = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        ).json()
+        before = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
         r = _turn(builder, "an agent that answers revenue questions", apply=False)
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["patch"], "the caller gets nothing to merge"
         # No row comes back, because none was written.
         assert body["agent"] is None
-        after = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        ).json()
+        after = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
         assert after["name"] == before["name"]
         assert after["instructions"] == before["instructions"]
 
@@ -271,9 +263,7 @@ class TestATurnCanRunWithoutWriting:
     def test_the_config_override_is_not_a_way_to_write_unvetted_fields(self, builder):
         """It only ever reaches the prompt. Anything outside PATCHABLE is
         dropped, and it never becomes a write of its own."""
-        before = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        ).json()
+        before = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
         r = _turn(
             builder,
             "hello",
@@ -281,9 +271,7 @@ class TestATurnCanRunWithoutWriting:
             config={"status": "ready", "is_default": True, "slug": "hijacked"},
         )
         assert r.status_code == 200, r.text
-        after = builder["client"].get(
-            f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])
-        ).json()
+        after = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
         # None of the three is in PATCHABLE, so none reached the prompt — and
         # apply=False means nothing reached the row either way.
         assert after["status"] == before["status"] == "draft"
