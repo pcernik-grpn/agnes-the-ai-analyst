@@ -3030,6 +3030,12 @@ KNOWN_UNTESTED = {
     # warning, and the corpus-map producer handoff are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Bounded BFS folder search (TCRD-240) over the same live tree — never
+    # Graph's own `/search`. Same "no new schema surface" reasoning as the
+    # sibling `/tree` route above; auth matrix, query-length/mode/glob
+    # validation, subtree scoping, and cap-clamping are all covered by
+    # tests/test_admin_sharepoint.py::TestTreeSearch.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree/search",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
