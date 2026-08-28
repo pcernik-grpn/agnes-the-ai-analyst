@@ -201,6 +201,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **Custom groups sit above `Admin` and `Everyone` on `/admin/access`.**
+  System led while `Everyone` was the page's default selection — the row that
+  opened on load belonged at the top — and nothing is selected on arrival any
+  more, so that reason went with it. `Admin` and `Everyone` are the two rows
+  an admin can neither rename, delete, nor (under Workspace mapping) change
+  the membership of; the groups they actually work on come first, and the
+  fixed two sit at the foot. `Everyone` also stops being hoisted above its
+  own heading, which was the same default-selection rule showing through in
+  the sort.
 - **`/admin/access` gets a measure.** The page is `container--full`, so at
   1920px the list ran 1864px wide with the name column alone taking 758px:
   a group's counts sat a thousand pixels from the group's name, and a row's

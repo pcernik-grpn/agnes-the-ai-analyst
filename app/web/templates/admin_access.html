@@ -1714,11 +1714,13 @@
   // unsorted list landed the page on Admin, whose grants are the one set that
   // changes nothing (admins reach everything anyway).
   function sortedGroups() {
-    return (overview.groups || []).slice().sort((a, b) => {
-      const ae = a.is_system && a.name === "Everyone" ? 0 : 1;
-      const be = b.is_system && b.name === "Everyone" ? 0 : 1;
-      return ae - be || String(a.name).localeCompare(String(b.name));
-    });
+    /* Alphabetical within each half; the halves themselves are ordered in
+       renderGroups (custom, then system). `Everyone` used to be hoisted to
+       the very top because it was the default selection — that is gone, and
+       hoisting it now would only pull one system row out of the block its
+       heading introduces. */
+    return (overview.groups || []).slice().sort(
+      (a, b) => String(a.name).localeCompare(String(b.name)));
   }
 
   // Group filtering is CLIENT-side, unlike the member search: groups are a
@@ -1975,11 +1977,16 @@
     const custom = groups.filter((g) => !g.is_system);
     const system = groups.filter((g) => g.is_system);
     const label = (t) => `<div class="ax-glist__label">${t}</div>`;
-    // System first: `Everyone` is the widest audience on the instance — a
-    // grant written against it reaches everybody — and it is the default
-    // selection, which should not sit below a list you have to scroll past.
+    /* Custom groups first. System led while `Everyone` was the page's
+       DEFAULT SELECTION — putting the row that opened on load at the top —
+       and nothing is selected on arrival any more, so that reason went with
+       it. What is left is that `Admin` and `Everyone` are the two rows an
+       admin can neither rename, delete, nor (under Workspace mapping)
+       change the membership of. The groups they actually work on come
+       first; the two fixed ones sit at the foot, where a list you have read
+       to the end ends. */
     host.innerHTML = (custom.length && system.length)
-      ? label("System") + system.map(row).join("") + label("Groups") + custom.map(row).join("")
+      ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
       : groups.map(row).join("");
     homeWork(selectedGroup);
   }
