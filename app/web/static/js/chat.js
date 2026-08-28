@@ -5589,6 +5589,7 @@ function renderCoPresence(host, participants) {
     updateFilesBadge(files.length);
     _filesSessionId = chatId;
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
   }
 
   // ── drawer open/close ─────────────────────────────────────────────────────
@@ -5645,7 +5646,14 @@ function renderCoPresence(host, participants) {
 
   const OUTPUTS_PREFIX = "outputs/";
   let _knownOutputs = new Set();
+  // Two different questions, and conflating them was a bug: `_filesSessionId`
+  // is which conversation the drawer is BOUND to (claimed synchronously, so
+  // the badge/row reset can happen before the listing round-trip), while
+  // `_baselineKnown` is whether `_knownOutputs` actually reflects it. A seed
+  // that failed or was superseded leaves the drawer bound but ignorant — and
+  // an ignorant baseline reports every pre-existing file as fresh.
   let _filesSessionId = null;
+  let _baselineKnown = false;
   // Bumped by every baseline write. Two fetches for the same conversation can
   // be in flight at once (the open-time seed and a turn-end poll), and they
   // can land out of order; without this, a slow seed overwrites the newer
@@ -5675,13 +5683,14 @@ function renderCoPresence(host, participants) {
     // and the drawer shut. Nothing about the conversation changed, and the
     // turn-end poll refreshes the view after every turn, so the honest
     // response to a reconnect is to do nothing at all.
-    if (detail.switching === false && _filesSessionId === chatId) return;
+    if (detail.switching === false && _filesSessionId === chatId && _baselineKnown) return;
     // Reset synchronously, before the round-trip: until it lands the badge
     // and any open drawer would otherwise still show the previous
     // conversation's count and rows, whose links carry the old chat id.
     const seq = ++_filesSeq;
     _filesSessionId = chatId;
     _knownOutputs = new Set();
+    _baselineKnown = false;
     updateFilesBadge(0);
     if (drawerOpen() && filesListEl) {
       filesListEl.replaceChildren();
@@ -5692,6 +5701,7 @@ function renderCoPresence(host, participants) {
     // flight — that one owns the state now.
     if (!ok || seq !== _filesSeq || currentChatId !== chatId) return;
     _knownOutputs = new Set(files.filter(isDeliverable).map((f) => f.path));
+    _baselineKnown = true;
     updateFilesBadge(files.length);
     if (drawerOpen()) renderFileList(chatId, files, truncated, supported);
   });
@@ -5704,7 +5714,7 @@ function renderCoPresence(host, participants) {
     // turn-end with no baseline at all, re-seed rather than treat every
     // pre-existing file as new — a spurious auto-open on someone else's old
     // files is worse than one missed.
-    if (_filesSessionId !== chatId) {
+    if (_filesSessionId !== chatId || !_baselineKnown) {
       const seq = ++_filesSeq;
       const seed = await fetchSessionFiles(chatId, { quiet: true });
       // Same ok/ownership rules as the other two writers. Nothing is
@@ -5715,6 +5725,7 @@ function renderCoPresence(host, participants) {
       if (!seed.ok || seq !== _filesSeq || currentChatId !== chatId) return;
       _filesSessionId = chatId;
       _knownOutputs = new Set(seed.files.filter(isDeliverable).map((f) => f.path));
+      _baselineKnown = true;
       updateFilesBadge(seed.files.length);
       return;
     }

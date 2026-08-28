@@ -219,6 +219,52 @@ def test_a_slow_open_seed_cannot_clobber_a_newer_turn_end_baseline():
     assert res["opened"] == 0, "the late seed must not reset the baseline the turn-end already advanced"
 
 
+def test_a_failed_open_time_seed_does_not_leave_the_drawer_claimed_but_ignorant():
+    """Binding the drawer to a conversation and knowing its deliverables are
+    two different facts, and the failure path separated them.
+
+    The session claim is made synchronously — it has to be, so the badge and
+    rows reset before the listing round-trip — but the baseline is only
+    populated once that listing succeeds. A failed seed therefore left the
+    drawer *bound* with an *empty* baseline, which made the turn-end handler
+    skip its re-seed branch and report every pre-existing `outputs/` file in
+    a resumed conversation as freshly produced.
+    """
+    res = _run_scenario(
+        """
+        currentChatId = "c1";
+        _nextFiles = () => ["outputs/last-week.pptx"];   // a resumed conversation
+        _failNext = true;
+        await fire("agnes:session-open", { chatId: "c1", switching: true });
+        await fire("agnes:turn-end");     // must re-seed, not diff against nothing
+        await fire("agnes:turn-end");     // and stay quiet after that
+        process.stdout.write(JSON.stringify({ opened }));
+        """
+    )
+    assert res["opened"] == 0, "a file from last week is not something this turn produced"
+
+
+def test_a_superseded_open_time_seed_leaves_the_newer_baseline_alone():
+    """The other way the seed can end without learning anything: a turn-end
+    overtakes it. The claim must survive (the newer writer owns it), but the
+    stale seed must neither write nor un-claim it."""
+    res = _run_scenario(
+        """
+        currentChatId = "c1";
+        _nextFiles = () => [];
+        _delayNext = 40;                                  // slow seed
+        const seeding = fire("agnes:session-open", { chatId: "c1", switching: true });
+        _nextFiles = () => ["outputs/report.docx"];
+        await fire("agnes:turn-end");                     // overtakes, opens
+        await seeding;
+        opened = 0; _drawerIsOpen = false;
+        await fire("agnes:turn-end");                     // nothing new
+        process.stdout.write(JSON.stringify({ opened }));
+        """
+    )
+    assert res["opened"] == 0, "the superseded seed must not undo the baseline that overtook it"
+
+
 def test_a_mid_turn_reconnect_does_not_absorb_the_turns_deliverable():
     """`ensureWsReady` re-enters `openSession` whenever the socket is closed,
     so `agnes:session-open` can fire *during* a turn — after the agent wrote
