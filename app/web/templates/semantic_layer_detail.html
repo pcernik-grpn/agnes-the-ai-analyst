@@ -261,12 +261,12 @@
       try { data = await r.json(); } catch (e) { /* non-JSON error body */ }
       if (!r.ok) {
         var msg = (data && data.detail && (data.detail.message || data.detail)) || ("Failed: HTTP " + r.status);
-        alert(msg);
+        await alertModal(msg);
         return;
       }
       window.location.reload();
     } catch (e) {
-      alert("Network error — please try again.");
+      await alertModal("Network error — please try again.");
     } finally {
       btn.disabled = false;
     }
@@ -274,8 +274,8 @@
 
   var detachBtn = document.getElementById("slb-detach-btn");
   if (detachBtn) {
-    detachBtn.addEventListener("click", function () {
-      if (!confirm("Detach this model? Sync will stop overwriting it until you re-attach.")) return;
+    detachBtn.addEventListener("click", async function () {
+      if (!(await confirmModal("Detach this model? Sync will stop overwriting it until you re-attach."))) return;
       handle(detachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/detach", {
         confirm_detach: true,
       });
@@ -284,8 +284,8 @@
 
   var reattachBtn = document.getElementById("slb-reattach-btn");
   if (reattachBtn) {
-    reattachBtn.addEventListener("click", function () {
-      if (!confirm("Re-attach this model? Your local edits will be replaced by the source's version at the next sync.")) return;
+    reattachBtn.addEventListener("click", async function () {
+      if (!(await confirmModal("Re-attach this model? Your local edits will be replaced by the source's version at the next sync."))) return;
       handle(reattachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/reattach", {
         confirm_reattach: true,
       });
