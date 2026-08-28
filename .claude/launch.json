@@ -37,25 +37,6 @@
       "port": 9000
     },
     {
-      "name": "agnes-capture",
-      "runtimeExecutable": "env",
-      "runtimeArgs": [
-        "LOCAL_DEV_MODE=1",
-        "TESTING=1",
-        "AGNES_FACTS_ENABLED=1",
-        "AGNES_DB_URL=postgresql+psycopg://agnes:agnes@127.0.0.1:5433/agnes",
-        "DATA_DIR=/private/tmp/claude-501/-Users-zdeneksrotyr-Sources-VsCode-component-factory-tmp-oss--claude-worktrees-macbook-performance-battery-ca2268/3b0bc681-d258-4bc0-8dfb-45d383f9b3ea/scratchpad/cap-data",
-        "AGNES_CONFIG_DIR=/private/tmp/claude-501/-Users-zdeneksrotyr-Sources-VsCode-component-factory-tmp-oss--claude-worktrees-macbook-performance-battery-ca2268/3b0bc681-d258-4bc0-8dfb-45d383f9b3ea/scratchpad/cap-data/config",
-        ".venv/bin/uvicorn",
-        "app.main:app",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "9000"
-      ],
-      "port": 9000
-    },
-    {
       "name": "kai-engine-stub",
       "runtimeExecutable": "env",
       "runtimeArgs": [
