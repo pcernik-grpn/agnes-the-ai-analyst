@@ -1206,6 +1206,7 @@ class TestStoreSmoke:
         "POST /api/store/entities/dryrun",
         "POST /api/store/entities",
         "POST /api/store/entities/from-markdown",
+        "POST /api/store/entities/from-components",
         "PUT /api/store/entities/{entity_id}",
         "POST /api/store/entities/{entity_id}/install",
         "DELETE /api/store/entities/{entity_id}/install",
@@ -1289,6 +1290,98 @@ class TestStoreSmoke:
         body = r.json()
         assert body["id"]
         assert body["type"] == "agent"
+
+    def test_entities_create_from_components(self, seeded_app_both):
+        """POST /entities/from-components — bundle published items into one plugin.
+
+        Composes from an entity created in the same test rather than a fixture
+        id: the endpoint resolves every component against the caller's own
+        visibility, so a borrowed id would pass or 404 depending on seed order.
+        """
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        body = (
+            "Step one: describe the scenario under test in plain language. "
+            "Step two: call the endpoint with a valid payload and capture the response. "
+            "Step three: assert the entity was created with status 201 and a non-empty id field."
+        )
+        made = client.post(
+            "/api/store/entities/from-markdown",
+            json={
+                "name": "smoke-compose-part",
+                "description": (
+                    "Use when smoke-testing the compose endpoint's component resolution across both backends."
+                ),
+                "category": "Other",
+                "skill_md": body,
+            },
+            headers=headers,
+        )
+        assert made.status_code == 201, made.text
+
+        r = client.post(
+            "/api/store/entities/from-components",
+            json={
+                "name": "smoke-composed-plugin",
+                "description": (
+                    "Use when smoke-testing that several published items bundle into one installable plugin."
+                ),
+                "category": "Other",
+                "components": [made.json()["id"]],
+            },
+            headers=headers,
+        )
+        assert r.status_code == 201, r.text
+        composed = r.json()
+        assert composed["id"]
+        assert composed["type"] == "plugin"
+
+
+class TestMcpBuilderSmoke:
+    """The two admin builders: their pages, and the turn that opens a conversation."""
+
+    COVERED_ROUTES = {
+        "GET /admin/mcp-sources/new",
+        "POST /api/admin/mcp-sources/builder/turn",
+        "GET /admin/linked-apps/new",
+    }
+
+    def test_builder_page_renders_for_an_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/admin/mcp-sources/new", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        assert "mcp-builder-view" in r.text
+
+    def test_linked_apps_builder_page_renders_for_an_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/admin/linked-apps/new", headers=_admin_headers(seeded_app_both))
+        assert r.status_code == 200, r.text
+        assert "la-builder-view" in r.text
+
+    def test_the_opening_turn_reports_slots_and_engine(self, seeded_app_both):
+        """An empty first message is the builder speaking first; it must come
+        back with what is still open, so the panel can show progress."""
+        r = seeded_app_both["client"].post(
+            "/api/admin/mcp-sources/builder/turn",
+            json={"message": "", "history": []},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["engine"] in ("stub", "model")
+        assert [s["key"] for s in body["slots"]] == ["endpoint", "auth", "name", "tools"]
+        assert not any(s["known"] for s in body["slots"])
+
+    def test_it_writes_nothing(self, seeded_app_both):
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        before = client.get("/api/admin/mcp-sources", headers=headers)
+        client.post(
+            "/api/admin/mcp-sources/builder/turn",
+            json={"message": "connect our CRM server", "history": []},
+            headers=headers,
+        )
+        after = client.get("/api/admin/mcp-sources", headers=headers)
+        assert before.json() == after.json(), "a builder turn registered a source"
 
 
 # ---------------------------------------------------------------------------
@@ -2245,7 +2338,7 @@ KNOWN_UNTESTED = {
     "GET /admin/chat",
     "GET /admin/chat/readiness",
     "GET /admin/chat/{chat_id}/debug",
-    "GET /admin/chat/{chat_id}/tail-ticket",
+    "POST /admin/chat/{chat_id}/tail-ticket",
     "GET /admin/corporate-memory",
     "GET /admin/database",
     "GET /admin/grants",
@@ -2435,6 +2528,14 @@ KNOWN_UNTESTED = {
     "DELETE /api/admin/mcp-sources/{source_id}/secret",
     "DELETE /api/admin/mcp-tools/{tool_id}",
     "DELETE /api/admin/mcp-tools/{tool_id}/grants/{group_id}",
+    # Dials a connection the admin typed and reports its tools. A smoke test
+    # would have to stand up an MCP server or assert on a connection error,
+    # neither of which says anything about the endpoint — its contract (build a
+    # row-shaped dict, run the SAME url guard and introspection as the
+    # registered path, write nothing) is what matters and is covered by reading
+    # it. The registered sibling {source_id}/introspect is excluded just below
+    # for the same reason.
+    "POST /api/admin/mcp-sources/preview-introspect",
     # Grant/revoke a whole MCP source at once — tested in test_keboola_chat_tools.py
     "POST /api/admin/mcp-sources/{source_id}/grants",
     "DELETE /api/admin/mcp-sources/{source_id}/grants/{group_id}",
@@ -2758,11 +2859,36 @@ KNOWN_UNTESTED = {
     # all rather than being merely untested. `/api/v1/agents*` (which
     # absorbed its wire shape in Task C1.1) is the sole surviving surface —
     # already covered elsewhere, unaffected by that deletion.
+    # Builder-assistant turn — covered by tests/test_agent_builder_turns.py
+    # (DuckDB): the sanitizer trust boundary, the apply=false / config
+    # working-copy contract, and the no-credential degradation. It has no
+    # PG-specific behaviour of its own: every write it makes goes through
+    # PUT /api/v1/agents/{agent_id}, whose backend split is already
+    # exercised by tests/db_pg/test_agents_contract.py.
+    "POST /api/agents/{agent_id}/builder/turn",
+    # One /skills builder turn. Behaviourally covered by
+    # tests/test_entity_builder_turns.py. Stateless and writes nothing — no
+    # persistence of its own for a PG smoke test to exercise.
+    "POST /api/store/entities/builder/turn",
+    # The template-preview scratch agent. Behaviourally covered by
+    # tests/test_entity_builder_turns.py; the repo-level invisibility it
+    # depends on is pinned across BOTH backends by
+    # tests/db_pg/test_agents_contract.py.
+    "POST /api/store/entities/builder/preview-agent",
+    # One data-package builder turn. Behaviourally covered by
+    # tests/test_package_builder_turns.py. Reads the registry, the group list
+    # and the metric definitions (all symmetric pairs) to build its candidate
+    # sets; writes nothing.
+    "POST /api/admin/data-packages/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
+    # Data-package builder page — the same HTML surface, hosting the drawer
+    # component in page mode. No PG-specific behaviour of its own; the
+    # package writes it performs are the /api/admin/data-packages routes.
+    "GET /admin/data-packages/new",
     # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.
@@ -3074,10 +3200,18 @@ class TestSemanticLayerSmoke:
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
 
-    def test_apply_branches_on_authority(self, seeded_app_both):
+    def test_apply_branches_on_authority(self, seeded_app_both, monkeypatch):
         """The one write surface (chat-first authoring): an admin's document
         applies directly; a non-admin's lands in the moderation queue and
-        never touches ``semantic_models`` before approval."""
+        never touches ``semantic_models`` before approval.
+
+        The non-admin half files into the STUDIO's suggestion queue, so it
+        reads ``get_studio_enabled()`` — off by default since the admin cleanup
+        retired that surface, which 403s the branch. Turned on here because the
+        branching is what this smoke covers; the disabled behavior is
+        ``tests/test_semantic_apply.py::test_non_admin_branch_respects_studio_toggle``.
+        """
+        monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
         c = seeded_app_both["client"]
         doc = _SEMANTIC_DOC.replace("smoke_model", "apply_model")
 

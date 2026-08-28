@@ -291,6 +291,9 @@ async def microsoft_callback(request: Request):
         # Issue JWT — identity-only, authorization derives from
         # user_group_members at request time (see app.auth.access).
         jwt_token = create_access_token(user["id"], user["email"])
+        from app.auth.login_audit import audit_login_success
+
+        audit_login_success(user["id"], provider="microsoft", request=request)
 
         # Redirect to the post-login target. Prefer the value stashed by
         # microsoft_login() — re-sanitize defensively in case of session

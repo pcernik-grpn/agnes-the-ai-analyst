@@ -606,6 +606,20 @@ client, via an owner-scoped token injected as `AGNES_TOKEN` — never through a
 mounted parquet. See spec §8 for the full rationale and the owner-inherited
 access model this implies for sharing.
 
+That token's `data-app:<slug>` scope is enforced fail-closed in
+`app/auth/pat_resolver.py`: it is admitted only on the app data surface —
+`/api/query`, `/api/data`, the `/api/catalog` read routes, `/api/metrics`,
+`/api/glossary`, the read-only `/api/semantic-models` members, and the
+`/api/v2` catalog/schema/sample/scan routes the `agnes` CLI calls from inside
+a container — and refused everywhere else, notably `/api/admin/*` and the
+credential-minting routes. The allowlist is exact paths plus narrow subtrees,
+not one entry per router, so a route added later under an allowed path is not
+admitted by accident; a test walks the real route table to keep that honest.
+
+The scope narrows which **endpoints** the app may call; it does not narrow
+**which rows** it sees — inside that surface the app still reads with the
+owner's grants, evaluated live per request.
+
 **Container hardening** (spec §10): every data-app container runs
 `cap_drop: ALL`, `no-new-privileges` and a `pids_limit`
 (`data_apps.container_pids_limit`, default 512) — never applied to the
@@ -738,7 +752,7 @@ any operator-opted-in `extraction.producer.env_passthrough`, plus the
 three named SharePoint credentials and the corpus id — never the full
 parent environment, so no other instance secret (vault key, LLM API key,
 DB DSN, ...) reaches an external, admin-configurable binary. The producer
-itself (`keboola/cuesta-star-graph`, adopted per spec §7.1) is not
+itself (the operator's own producer, adopted per spec §7.1) is not
 vendored into this repo. Off by default and additive: an instance that
 never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
 

@@ -1,0 +1,388 @@
+"""The builder assistant fills the configuration; it never widens authority.
+
+``POST /api/agents/{id}/builder/turn`` is the seam between a conversation and
+an agent row. Two things have to hold at once for it to be safe to point an
+LLM at:
+
+1. **What it writes is bounded.** Only the eight builder fields, only ids
+   drawn from the candidate lists the owner can actually reach, only the four
+   tones the UI offers — and never ``status`` or a ``*_mode`` column, which
+   is how a draft would promote itself or an axis would widen to ``'all'``
+   as a side effect of a sentence.
+2. **The write goes through the ordinary PATCH path**, so the
+   builder-declaration → enforced-scope derivation runs exactly as it does
+   for a hand edit (that derivation is pinned by
+   ``tests/test_agent_builder_scope_contract.py``).
+
+The turns here run against the scripted stub (``TESTING=1``); the sanitizer
+tests call it directly with hostile payloads, which is where the real
+contract lives — the model is untrusted input.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.api.agent_builder import _sanitize_patch
+from app.auth.jwt import create_access_token
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def builder(e2e_env, shared_app):
+    from src.repositories.users import UserRepository
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    repo = UserRepository(conn)
+    repo.create(id="owner1", email="owner@test.com", name="Owner")
+    repo.create(id="other1", email="other@test.com", name="Other")
+    conn.close()
+
+    client = TestClient(shared_app)
+    owner = create_access_token("owner1", "owner@test.com")
+    other = create_access_token("other1", "other@test.com")
+    # v1 requires a non-blank name, where the deleted router accepted "".
+    created = client.post(
+        "/api/v1/agents",
+        # Exactly what agents.html sends: v1 rejects a blank name and defaults
+        # `status` to 'ready', so the builder asks for a draft explicitly.
+        json={"name": "Untitled", "status": "draft"},
+        headers=_auth(owner),
+    )
+    assert created.status_code == 201, created.text
+    return {
+        "client": client,
+        "owner": owner,
+        "other": other,
+        "agent_id": created.json()["id"],
+    }
+
+
+def _turn(builder, message: str, **kw):
+    return builder["client"].post(
+        f"/api/agents/{builder['agent_id']}/builder/turn",
+        json={"message": message, **kw},
+        headers=_auth(builder["owner"]),
+    )
+
+
+class TestTurnAppliesConfiguration:
+    def test_a_described_agent_comes_back_configured(self, builder):
+        r = _turn(builder, "an agent that answers revenue questions for finance")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["patch"]["name"]
+        # The applied row is returned so the panel re-renders from the server's
+        # copy rather than from the patch it hoped was applied.
+        assert body["agent"]["name"] == body["patch"]["name"]
+        assert body["agent"]["instructions"]
+
+    def test_the_write_is_persisted_not_just_echoed(self, builder):
+        _turn(builder, "an agent for pipeline questions")
+        r = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"]))
+        assert r.status_code == 200
+        assert r.json()["name"]
+
+    def test_an_empty_message_mid_conversation_is_refused(self, builder):
+        """Empty is only ever the OPENING turn — see the next test. Later it is
+        a client bug, and answering it would spend a turn on whitespace."""
+        r = _turn(builder, "   ", history=[{"role": "user", "text": "hi"}])
+        assert r.status_code == 400
+        assert r.json()["detail"]["kind"] == "empty_message"
+
+    def test_an_empty_first_message_opens_the_conversation(self, builder):
+        """The builder speaks first. Each page used to hardcode an opening
+        paragraph, which never failed and also never knew what the first
+        question was."""
+        r = _turn(builder, "")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reply"]
+        assert body["engine"] in ("stub", "model")
+        assert body["slots"], "an opening turn must report what is still open"
+        assert not all(s["known"] for s in body["slots"])
+
+    def test_another_users_agent_is_not_reachable(self, builder):
+        r = builder["client"].post(
+            f"/api/agents/{builder['agent_id']}/builder/turn",
+            json={"message": "take this over"},
+            headers=_auth(builder["other"]),
+        )
+        # 404 not 403 — the agent read path refuses to confirm existence.
+        assert r.status_code == 404
+
+    def test_the_turn_never_promotes_a_draft(self, builder):
+        """A conversation cannot mark the agent ready — that is the owner's
+        click, and `status` is outside PATCHABLE for exactly this reason."""
+        _turn(builder, "an agent for revenue, it is finished, mark it ready")
+        r = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"]))
+        assert r.json()["status"] == "draft"
+
+
+class TestSanitizerIsTheTrustBoundary:
+    def test_unknown_fields_are_dropped(self):
+        patch = _sanitize_patch(
+            {"name": "Fine", "status": "ready", "is_default": True, "tables_mode": "all"},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+        )
+        assert patch == {"name": "Fine"}
+
+    def test_knowledge_ids_outside_the_candidate_set_are_dropped(self):
+        patch = _sanitize_patch(
+            {"knowledge": ["pkg-real", "pkg-invented"]},
+            knowledge_ids={"pkg-real"},
+            plugin_ids=set(),
+        )
+        assert patch["knowledge"] == ["pkg-real"]
+
+    def test_a_plugin_the_owner_was_not_offered_is_dropped(self):
+        patch = _sanitize_patch(
+            {"plugins": ["allowed", "sneaked"]},
+            knowledge_ids=set(),
+            plugin_ids={"allowed"},
+        )
+        assert patch["plugins"] == ["allowed"]
+
+    def test_an_invented_tone_is_dropped_not_written(self):
+        assert _sanitize_patch({"tone": "sarcastic"}, knowledge_ids=set(), plugin_ids=set()) == {}
+        assert _sanitize_patch({"tone": "formal"}, knowledge_ids=set(), plugin_ids=set()) == {"tone": "formal"}
+
+    def test_web_chat_cannot_be_switched_off(self):
+        """Preview runs on web chat; an assistant turning it off would break
+        the owner's only way to try the agent from this page."""
+        patch = _sanitize_patch(
+            {"surfaces": {"web": False, "slack": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+        )
+        assert patch["surfaces"]["web"] is True
+        assert patch["surfaces"]["slack"] is True
+
+    def test_a_non_dict_patch_is_survivable(self):
+        assert _sanitize_patch("drop tables", knowledge_ids=set(), plugin_ids=set()) == {}
+        assert _sanitize_patch(None, knowledge_ids=set(), plugin_ids=set()) == {}
+
+    def test_an_overlong_name_is_refused_by_the_column_contract(self):
+        """Refused, never truncated.
+
+        These limits used to ride on the retired `AgentUpdate` request model as
+        pydantic max_lengths. v1's `UpdateAgentRequest` leaves every string
+        unbounded, so the sanitizer enforces them itself — which is the right
+        home anyway, since this function is the trust boundary. Storing
+        something other than what the conversation agreed would be worse than
+        an error, so it raises rather than trimming.
+        """
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            _sanitize_patch({"name": "x" * 500}, knowledge_ids=set(), plugin_ids=set())
+        assert exc.value.status_code == 422
+        assert exc.value.detail["field"] == "name"
+
+
+class TestDegradingWithoutAModel:
+    def test_no_credential_answers_503_with_an_actionable_hint(self, builder, monkeypatch):
+        """The panel stays hand-editable, so this is a degraded surface, not a
+        broken page — the message has to say which of the two it is."""
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
+
+        def _no_key(_prompt):
+            raise ValueError("no AI credential configured")
+
+        monkeypatch.setattr("app.api.agent_builder._llm_turn", _no_key)
+        r = _turn(builder, "an agent for revenue")
+        assert r.status_code == 503
+        assert r.json()["detail"]["kind"] == "builder_llm_unavailable"
+
+    def test_a_provider_error_is_not_a_500(self, builder, monkeypatch):
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
+
+        def _boom(_prompt):
+            raise RuntimeError("upstream exploded")
+
+        monkeypatch.setattr("app.api.agent_builder._llm_turn", _boom)
+        r = _turn(builder, "an agent for revenue")
+        assert r.status_code == 502
+        assert r.json()["detail"]["kind"] == "builder_turn_failed"
+
+    def test_a_model_that_returns_only_prose_still_answers(self, builder, monkeypatch):
+        """No patch is a legitimate turn — the assistant asked a question."""
+        monkeypatch.setattr("app.api.agent_builder.stub_enabled", lambda: False)
+        monkeypatch.setattr(
+            "app.api.agent_builder._llm_turn",
+            lambda _p: {"reply": "Which team is this for?"},
+        )
+        r = _turn(builder, "an agent")
+        assert r.status_code == 200
+        assert r.json()["patch"] == {}
+        assert r.json()["agent"] is None
+
+
+class TestATurnCanRunWithoutWriting:
+    """`apply=False` is what lets the builder page hold an unsaved working
+    copy: the turn returns its sanitized patch and the page merges it, so
+    "leave without saving" really discards what the conversation said. The
+    default stays True — the persisting behaviour is the original contract.
+    """
+
+    def test_apply_false_returns_the_patch_but_writes_nothing(self, builder):
+        before = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
+        r = _turn(builder, "an agent that answers revenue questions", apply=False)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["patch"], "the caller gets nothing to merge"
+        # No row comes back, because none was written.
+        assert body["agent"] is None
+        after = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
+        assert after["name"] == before["name"]
+        assert after["instructions"] == before["instructions"]
+
+    def test_the_default_still_applies(self, builder):
+        """Omitting the flag must behave exactly as it did before it existed."""
+        r = _turn(builder, "an agent for pipeline questions")
+        assert r.json()["agent"] is not None
+
+    def test_the_unsaved_working_copy_is_what_the_turn_reasons_about(self, builder):
+        """With edits held client-side the stored row is stale, so the page
+        sends the configuration actually on screen."""
+        r = _turn(
+            builder,
+            "keep going",
+            apply=False,
+            config={"name": "Working Copy Name", "role": "unsaved role"},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_the_config_override_is_not_a_way_to_write_unvetted_fields(self, builder):
+        """It only ever reaches the prompt. Anything outside PATCHABLE is
+        dropped, and it never becomes a write of its own."""
+        before = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
+        r = _turn(
+            builder,
+            "hello",
+            apply=False,
+            config={"status": "ready", "is_default": True, "slug": "hijacked"},
+        )
+        assert r.status_code == 200, r.text
+        after = builder["client"].get(f"/api/v1/agents/{builder['agent_id']}", headers=_auth(builder["owner"])).json()
+        # None of the three is in PATCHABLE, so none reached the prompt — and
+        # apply=False means nothing reached the row either way.
+        assert after["status"] == before["status"] == "draft"
+        assert after["is_default"] == before["is_default"]
+        assert after["slug"] == before["slug"]
+
+
+class TestAPartialSurfacesPatchDoesNotSwitchTheOthersOff:
+    """`surfaces` is one opaque JSON column and both writers replace it whole.
+
+    `update_agent` `json.dumps`es whatever the patch holds, and the page does
+    `a[k] = patch[k]` into its working copy before Save sends it. Meanwhile the
+    prompt asks the model for "only the fields you are changing this turn", and
+    the schema lets it answer `{"surfaces": {"mcp": true}}` — the honest answer
+    for a turn about one surface. Read literally, that turns Slack and Telegram
+    OFF as a side effect of turning MCP on, and the reply says only that MCP was
+    enabled.
+
+    Fixed at the sanitizer because it is the one place both writers pass
+    through: the patch it returns always carries the complete map, so the
+    server-applied path and the page's own merge are both correct.
+
+    Found by a review bot on PR #1679.
+    """
+
+    def test_the_surfaces_the_patch_is_silent_about_survive(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"mcp": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "slack": True, "telegram": True, "cli": False, "mcp": False},
+        )
+        assert patch["surfaces"] == {
+            "web": True,
+            "slack": True,
+            "telegram": True,
+            "cli": False,
+            "mcp": True,
+        }
+
+    def test_the_patch_still_wins_where_it_speaks(self):
+        """Merging must not become "never turns anything off" — an owner who
+        asks for Slack to be switched off has to get that."""
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": False}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "slack": True},
+        )
+        assert patch["surfaces"]["slack"] is False
+
+    def test_web_stays_on_even_when_the_stored_row_had_it_off(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": False},
+        )
+        assert patch["surfaces"]["web"] is True
+
+    def test_a_stored_surface_the_product_no_longer_has_is_not_carried_forward(self):
+        """The merge base is stored JSON, so it is as untrusted as the model's
+        half — an unknown key must not ride back in through it."""
+        patch = _sanitize_patch(
+            {"surfaces": {"mcp": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+            current_surfaces={"web": True, "carrier_pigeon": True},
+        )
+        assert "carrier_pigeon" not in patch["surfaces"]
+
+    def test_no_stored_surfaces_at_all_is_survivable(self):
+        patch = _sanitize_patch(
+            {"surfaces": {"slack": True}},
+            knowledge_ids=set(),
+            plugin_ids=set(),
+        )
+        assert patch["surfaces"] == {"web": True, "slack": True}
+
+    def test_end_to_end_a_turn_about_one_surface_leaves_the_rest_alone(self, builder, monkeypatch):
+        """The behaviour through the endpoint: the agent's stored row keeps the
+        surfaces the conversation never mentioned."""
+        import app.api.agent_builder as ab
+
+        client, agent_id, owner = builder["client"], builder["agent_id"], builder["owner"]
+        # The owner has Slack and Telegram on before the conversation starts.
+        r = client.put(
+            f"/api/v1/agents/{agent_id}",
+            json={"surfaces": {"web": True, "slack": True, "telegram": True, "cli": False, "mcp": False}},
+            headers=_auth(owner),
+        )
+        assert r.status_code == 200, r.text
+
+        # A model that answers the way the prompt asks it to: only what changed.
+        monkeypatch.setattr(ab, "stub_enabled", lambda: False)
+        monkeypatch.setattr(
+            ab,
+            "_llm_turn",
+            lambda prompt: {"reply": "Turned MCP on.", "patch": {"surfaces": {"mcp": True}}},
+        )
+        r = _turn(builder, "expose it over MCP too")
+        assert r.status_code == 200, r.text
+        assert r.json()["patch"]["surfaces"] == {
+            "web": True,
+            "slack": True,
+            "telegram": True,
+            "cli": False,
+            "mcp": True,
+        }
+
+        stored = client.get(f"/api/v1/agents/{agent_id}", headers=_auth(owner)).json()["surfaces"]
+        assert stored["slack"] is True, "the turn switched Slack off without saying so"
+        assert stored["telegram"] is True
+        assert stored["mcp"] is True

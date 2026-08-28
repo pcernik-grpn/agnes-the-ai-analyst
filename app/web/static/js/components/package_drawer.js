@@ -6,7 +6,7 @@
  * two problems the drawer fixes by construction:
  *
  *   1. It was the tallest form in the admin surface (name, slug,
- *      description, lifecycle, category, icon, colour, cover image, and
+ *      description, lifecycle, category, and
  *      a group-access matrix) inside a card sized for one decision — so
  *      on a laptop its footer sat on top of its own last field.
  *   2. Only /admin/tables carried the scaffolding, so the Packages lens
@@ -26,7 +26,6 @@
  *
  * No endpoint is new here — the same three the modal used:
  *   POST /api/admin/data-packages        (create)
- *   POST /api/admin/uploads/cover-image  (cover, on pick)
  *   POST /api/admin/grants               (one per chosen group)
  *
  * Chrome: css/drawer.css (the shared drawer) + css/filter_toolbar.css
@@ -42,7 +41,6 @@
   var CONNECTIONS_API = '/api/admin/source-connections';
   var GRANTS_API = '/api/admin/grants';
   var GROUPS_API = '/api/admin/groups';
-  var COVER_API = '/api/admin/uploads/cover-image';
 
   /* Display names for the sources that group tables when no source CONNECTION
      owns them (internal tables, and the connectors that have no connection
@@ -101,6 +99,7 @@
     // global handler in _app_scripts.html, which hides overlays with an
     // inline display:none and would leave our state half-open.
     root.dataset.noEscClose = '1';
+    bindConversation(root);
     root.innerHTML =
       '<div class="ds-drawer__backdrop" data-pdw-close></div>' +
       '<div class="ds-drawer__panel" role="dialog" aria-modal="true" aria-labelledby="pdw-title">' +
@@ -146,45 +145,31 @@
       '          <p class="ds-drawer__hint">The eyebrow line above the card title in the Library.</p>' +
       '        </div>' +
       '      </div>' +
-      '      <div class="ds-drawer__row">' +
-      '        <div class="ds-drawer__field">' +
-      '          <label for="pdw-icon">Icon <span class="ds-drawer__opt">(optional)</span></label>' +
-      '          <input type="text" id="pdw-icon" autocomplete="off" maxlength="4" placeholder="📦">' +
-      '        </div>' +
-      '        <div class="ds-drawer__field">' +
-      '          <label for="pdw-color">Colour</label>' +
-      '          <div class="pdw-color">' +
-      '            <div class="cf-palette-row" data-target="pdw-color"></div>' +
-      '            <input type="color" id="pdw-color" value="#0EA5B5" class="ds-drawer__color">' +
-      '          </div>' +
-      '        </div>' +
-      '      </div>' +
-      '      <div class="ds-drawer__field">' +
-      '        <label for="pdw-cover-file">Cover image <span class="ds-drawer__opt">(optional)</span></label>' +
-      '        <div class="pdw-cover">' +
-      '          <div class="pdw-cover__preview" id="pdw-cover-preview">No image</div>' +
-      '          <div class="pdw-cover__pick">' +
-      '            <input type="file" id="pdw-cover-file" class="ds-drawer__file"' +
-      '                   accept="image/png,image/jpeg,image/gif,image/webp">' +
-      '            <input type="hidden" id="pdw-cover-url" value="">' +
-      '            <p class="ds-drawer__hint">PNG / JPEG / GIF / WebP, max 5 MiB.' +
-      '              <button type="button" class="ds-drawer__linkbtn" id="pdw-cover-clear" hidden>Remove</button></p>' +
-      '          </div>' +
-      '        </div>' +
-      '      </div>' +
+      // Icon, Colour and Cover image are GONE. Under the paper/rail redesign
+      // the resource hero draws a kind glyph (`cards.kind_glyph`), so a
+      // package's presentation is decided by its KIND rather than by three
+      // fields an admin had to fill in for every package they made. The
+      // detail page no longer paints a cover either — see
+      // catalog_package_detail.html.
       // Composition, in BOTH modes. It was edit-only on the reasoning that a
       // package being created has no id to attach a table to — but the group
       // picks below are collected the same way and applied after the POST
       // answers, so "no id yet" was never the obstacle it looked like. A
       // create that cannot choose tables makes an empty package and sends the
       // admin to a second surface to fill it.
+      // The panel shows THE PACKAGE, not the warehouse. It used to render the
+      // whole registry — ~500 rows in a project › bucket tree with tri-state
+      // boxes — with the members ticked somewhere inside it, so the five
+      // tables you had chosen were five ticks scattered through a hundred
+      // collapsed groups, and a table the conversation PROPOSED landed
+      // somewhere you would never see it. The tree itself is good and is kept
+      // verbatim — it moved inside the picker, where browsing belongs.
       '      <div class="ds-drawer__field" id="pdw-tables-field">' +
-      '        <label for="pdw-tables-search" id="pdw-tables-label">Tables in this package</label>' +
-      '        <p class="ds-drawer__hint" style="margin:0 0 8px;">Tick a table to include it.' +
+      '        <label id="pdw-tables-label">Tables in this package</label>' +
+      '        <p class="ds-drawer__hint" style="margin:0 0 8px;">What an analyst receives.' +
       '          <strong>Buckets</strong> come from the source project — they are not Agnes containers.</p>' +
-      '        <input type="text" id="pdw-tables-search" class="pdw-tables__search"' +
-      '               autocomplete="off" placeholder="Search tables…">' +
       '        <div id="pdw-tables" class="pdw-tables"></div>' +
+      '        <p class="ds-drawer__hint" id="pdw-tables-reach" hidden></p>' +
       '      </div>' +
       '      <details class="ds-drawer__disclose" id="pdw-access">' +
       '        <summary>Who gets it <span class="ds-drawer__opt">(optional)</span></summary>' +
@@ -197,6 +182,7 @@
       '      <div class="ds-drawer__err" id="pdw-err" hidden></div>' +
       '    </section>' +
       '  </div>' +
+      '  <div id="pdw-picker"></div>' +
       '  <div class="ds-drawer__foot">' +
       '    <span class="ds-drawer__foot-gap"></span>' +
       '    <button type="button" class="btn btn-secondary" data-pdw-close>Cancel</button>' +
@@ -221,20 +207,16 @@
       desc: root.querySelector('#pdw-desc'),
       status: root.querySelector('#pdw-status'),
       category: root.querySelector('#pdw-category'),
-      icon: root.querySelector('#pdw-icon'),
-      color: root.querySelector('#pdw-color'),
-      coverFile: root.querySelector('#pdw-cover-file'),
-      coverUrl: root.querySelector('#pdw-cover-url'),
-      coverPreview: root.querySelector('#pdw-cover-preview'),
-      coverClear: root.querySelector('#pdw-cover-clear'),
       access: root.querySelector('#pdw-access'),
       groups: root.querySelector('#pdw-groups'),
       tablesField: root.querySelector('#pdw-tables-field'),
       tablesLabel: root.querySelector('#pdw-tables-label'),
-      tablesSearch: root.querySelector('#pdw-tables-search'),
       tables: root.querySelector('#pdw-tables'),
+      tablesReach: root.querySelector('#pdw-tables-reach'),
+      picker: root.querySelector('#pdw-picker'),
       err: root.querySelector('#pdw-err'),
       submit: root.querySelector('#pdw-submit'),
+      foot: root.querySelector('.ds-drawer__foot'),
     };
 
     root.addEventListener('click', function (e) {
@@ -260,8 +242,6 @@
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.submit.click(); }
     });
-    els.coverFile.addEventListener('change', onCoverPicked);
-    els.coverClear.addEventListener('click', clearCover);
     els.access.addEventListener('toggle', function () {
       if (els.access.open) hydrateGroups();
     });
@@ -294,10 +274,17 @@
         });
       }
     });
-    // Re-render on search rather than filtering the DOM: the list is
-    // re-sorted (members first) as ticks change, so one renderer owns both.
-    els.tablesSearch.addEventListener('input', function () { if (st) renderTables(); });
-    els.tables.addEventListener('change', function (e) {
+    // The search lives in the picker now, so it is delegated: the modal is
+    // re-rendered on every tick and a listener bound to the input would die
+    // with it.
+    els.picker.addEventListener('input', function (e) {
+      if (!st) return;
+      if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'pdw-tables') {
+        pickerQuery = e.target.value;
+        renderPickerRows();
+      }
+    });
+    els.picker.addEventListener('change', function (e) {
       if (!st) return;
       var box = e.target.closest('input[type="checkbox"]');
       if (!box) return;
@@ -306,7 +293,7 @@
         if (box.checked) st.tablesSelected.add(id); else st.tablesSelected.delete(id);
         // Re-render so the group boxes above it re-tally — a bucket that reads
         // "all" after one of its tables was unticked is worse than no summary.
-        renderTables();
+        renderPickerRows();
         return;
       }
       if (!box.classList.contains('pdw-grp__box')) return;
@@ -317,12 +304,25 @@
       tablesUnder(box.getAttribute('data-project'), box.getAttribute('data-bucket')).forEach(function (t) {
         if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
       });
-      renderTables();
+      renderPickerRows();
     });
-    // A click on the group's checkbox must not also open/close the <details>
-    // it lives in the <summary> of.
+    els.picker.addEventListener('click', function (e) {
+      // A click on the group's checkbox must not also open/close the <details>
+      // it lives in the <summary> of.
+      if (e.target.closest('.pdw-grp__box')) { e.stopPropagation(); return; }
+      if (e.target.closest('[data-ag-pick-close]')) { closePicker(); return; }
+      // Outside the card but inside the overlay — the standard way out.
+      if (e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
+    });
+    // Remove, and the way back in, both live on the panel.
     els.tables.addEventListener('click', function (e) {
-      if (e.target.closest('.pdw-grp__box')) e.stopPropagation();
+      if (!st) return;
+      if (e.target.closest('[data-pdw-openpick]')) { openPicker(); return; }
+      var rm = e.target.closest('[data-pdw-unpick]');
+      if (rm) {
+        st.tablesSelected.delete(rm.getAttribute('data-pdw-unpick'));
+        renderTables();
+      }
     });
     els.submit.addEventListener('click', submit);
     return els;
@@ -342,6 +342,8 @@
   function applyMode(mode) {
     var editing = mode === 'edit';
     els.title.textContent = editing ? 'Edit data package' : 'New data package';
+    // The shell header carries the same title in builder mode.
+    if (els.shellTitle) els.shellTitle.textContent = els.title.textContent;
     els.sub.textContent = editing
       ? 'What analysts read before they add it.'
       : 'A package is the unit an analyst receives — tables reach them only through one.';
@@ -356,9 +358,10 @@
       ? 'Permanent — it is in this package’s URL and in every grant written against it.'
       : 'URL-safe identifier; follows the name until you edit it.';
     els.access.hidden = false;
-    // Both modes carry the list; only the label differs, because on a create
-    // there is no existing membership for "in this package" to refer to.
-    els.tablesLabel.textContent = editing ? 'Tables in this package' : 'Tables to include';
+    // One label for both modes now. It used to read "Tables to include" on a
+    // create, which was a instruction to go ticking; the panel shows what IS
+    // in the package in either mode, so the noun is the same either way.
+    els.tablesLabel.textContent = 'Tables in this package';
     els.submit.textContent = editing ? 'Save changes' : 'Create package';
   }
 
@@ -381,7 +384,7 @@
      is unticked. */
 
   function tableGroups() {
-    var q = (els.tablesSearch.value || '').trim().toLowerCase();
+    var q = (pickerQuery || '').trim().toLowerCase();
     var projects = [];
     var byProject = {};
     st.registry.forEach(function (t) {
@@ -421,25 +424,118 @@
     return (state === 'all' ? ' checked' : '') + (state === 'some' ? ' data-indeterminate="1"' : '');
   }
 
+  /* Panel state: only what is in the package. */
+  var pickerQuery = '', pickerOpen = false;
+
+  function selectedTables() {
+    if (!st) return [];
+    var byId = {};
+    st.registry.forEach(function (t) { byId[t.id] = t; });
+    var out = [];
+    st.tablesSelected.forEach(function (id) {
+      out.push(byId[id] || { id: id, name: id, source_type: '', query_mode: '', project: '' });
+    });
+    out.sort(function (a, b) { return String(a.name || a.id).localeCompare(String(b.name || b.id)); });
+    return out;
+  }
+
+  /* An admin has to know `query_mode IN ('local','materialized') AND NOT
+     server_only` to predict what a package actually delivers — see
+     app/api/data.py::_DISTRIBUTABLE_QUERY_MODES. Say it instead. */
+  function reachCount(rows) {
+    return rows.filter(function (t) {
+      return !t.server_only && (t.query_mode === 'local' || t.query_mode === 'materialized');
+    }).length;
+  }
+
   function renderTables() {
+    if (!st) return;
+    var rows = selectedTables();
+    var body;
+    if (!rows.length) {
+      // Same shape as the agent builder's empty slots (`emptySlot` in
+      // agents.html → .ag-slot): a bold line naming the state, one sentence
+      // on how to leave it, then the add row. A one-line grey sentence reads
+      // as a caption on a broken list rather than as an invitation.
+      body = '<div class="ag-slot">' +
+        '<p class="ag-slot-head">Nothing in it yet.</p>' +
+        '<p class="ag-slot-body">Say what it should carry — “our sales pipeline tables” — ' +
+        'and the builder proposes them. Or add them by hand.</p>' +
+      '</div>';
+    } else {
+      body = '<div class="ag-rows">' + rows.map(function (t) {
+        // Dedupe: for an internal table the project, the source type and the
+        // query mode are all the same word, and "internal · internal ·
+        // internal" reads as a rendering bug.
+        var seen = {};
+        var sub = [t.project, t.source_type, t.query_mode].filter(function (v) {
+          var k = String(v || '').toLowerCase();
+          if (!k || seen[k]) return false;
+          seen[k] = 1;
+          return true;
+        }).map(esc).join(' · ');
+        return '<div class="ag-row">' +
+          '<div class="ag-row-body">' +
+            '<div class="ag-row-name">' + esc(t.name || t.id) + '</div>' +
+            (sub ? '<div class="ag-row-desc">' + sub + '</div>' : '') +
+          '</div>' +
+          '<button type="button" class="ag-tglbtn ag-tglbtn--rm" data-pdw-unpick="' + esc(t.id) + '">Remove</button>' +
+        '</div>';
+      }).join('') + '</div>';
+    }
+    els.tables.innerHTML = body +
+      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>';
+    if (els.tablesLabel) {
+      var count = els.tablesLabel.querySelector('.pdw-count');
+      if (!count) {
+        count = document.createElement('span');
+        count.className = 'pdw-count';
+        els.tablesLabel.appendChild(count);
+      }
+      count.textContent = rows.length
+        ? rows.length + (rows.length === 1 ? ' table' : ' tables')
+        : 'none yet';
+    }
+    if (els.tablesReach) {
+      var reach = reachCount(rows);
+      els.tablesReach.hidden = !rows.length;
+      els.tablesReach.textContent = rows.length
+        ? (reach === rows.length
+            ? (reach === 1 ? 'This table reaches an analyst’s laptop through agnes pull.'
+                           : 'All ' + reach + ' reach an analyst’s laptop through agnes pull.')
+            : reach + ' of ' + rows.length + ' reach an analyst’s laptop through agnes pull; the rest stay server-side.')
+        : '';
+    }
+    renderPicker();
+  }
+
+  /* ── The picker ──
+     The project › bucket tree, unchanged, behind a `+`. Browsing a registry is
+     a detour from describing a package, and it should end by returning you to
+     what you were describing — the same reason /agents' ingredient picker and
+     the plugin builder's contents picker are modals. */
+  function pickerRowsHtml() {
     var projects = tableGroups();
     if (!projects.length) {
-      els.tables.innerHTML = '<p class="ds-drawer__hint">No table matches that.</p>';
-      return;
+      return '<p class="ag-emptyrows">No table matches that.</p>';
     }
-    var searching = !!(els.tablesSearch.value || '').trim();
+    var searching = !!(pickerQuery || '').trim();
     var html = projects.map(function (p) {
       var pTables = [];
       p.order.forEach(function (bk) { pTables = pTables.concat(p.buckets[bk].tables); });
       var pState = tallyState(pTables);
       // Open when searching (the match is the point), or when the group
       // already contributes to the package — a member you cannot see is a
-      // member you cannot remove.
-      var pOpen = searching || pState !== 'none';
+      // member you cannot remove. Also when it is the ONLY project: now that
+      // the tree lives behind a `+`, an instance with one source would open
+      // the picker onto a single collapsed heading and nothing to add.
+      var pOpen = searching || pState !== 'none' || projects.length === 1;
       var buckets = p.order.map(function (bk) {
         var b = p.buckets[bk];
         var bState = tallyState(b.tables);
-        var bOpen = searching || bState !== 'none';
+        // Same reasoning one level down: one project with one bucket is a flat
+        // list, and two clicks to reach it is two clicks of nothing.
+        var bOpen = searching || bState !== 'none' || (projects.length === 1 && p.order.length === 1);
         var rows = b.tables.map(function (t) {
           var on = st.tablesSelected.has(t.id);
           var sub = [t.source_type, t.query_mode].filter(Boolean).map(esc).join(' · ');
@@ -467,12 +563,68 @@
         '<span class="pdw-grp__n">' + pTables.length + '</span>' +
         '</summary>' + buckets + '</details>';
     }).join('');
-    els.tables.innerHTML = html;
+    return html;
+  }
+
+  function pickerHtml() {
+    if (!pickerOpen) return '';
+    var shown = 0, total = 0;
+    (st ? st.registry : []).forEach(function () { total++; });
+    tableGroups().forEach(function (p) {
+      p.order.forEach(function (bk) { shown += p.buckets[bk].tables.length; });
+    });
+    return BuilderShell.picker({
+      key: 'pdw-tables',
+      title: 'Add tables to this package',
+      sub: 'Everything registered on this instance. A bucket or a project ticks everything under it.',
+      searchPlaceholder: 'Search tables…',
+      query: pickerQuery,
+      shown: shown,
+      total: total,
+      rows: pickerRowsHtml(),
+      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a> first.',
+    });
+  }
+
+  function renderPicker() {
+    if (!els || !els.picker) return;
+    els.picker.innerHTML = pickerHtml();
     // `indeterminate` is a PROPERTY with no HTML attribute, so it cannot ride
     // the markup above and has to be set after the paint.
-    els.tables.querySelectorAll('[data-indeterminate]').forEach(function (b) {
+    els.picker.querySelectorAll('[data-indeterminate]').forEach(function (b) {
       b.indeterminate = true;
     });
+  }
+
+  /* Rows + count only, so the search box keeps its focus and caret. */
+  function renderPickerRows() {
+    if (!els || !els.picker) return;
+    var host = els.picker.querySelector('[data-rows="pdw-tables"]');
+    if (!host) { renderPicker(); return; }
+    host.innerHTML = pickerRowsHtml();
+    host.querySelectorAll('[data-indeterminate]').forEach(function (b) { b.indeterminate = true; });
+    var shown = 0;
+    tableGroups().forEach(function (p) {
+      p.order.forEach(function (bk) { shown += p.buckets[bk].tables.length; });
+    });
+    var cnt = els.picker.querySelector('[data-count="pdw-tables"]');
+    if (cnt) cnt.textContent = shown + ' of ' + (st ? st.registry.length : 0);
+  }
+
+  function openPicker() {
+    pickerOpen = true;
+    pickerQuery = '';
+    renderPicker();
+    var box = els.picker.querySelector('[data-ag-search="pdw-tables"]');
+    if (box) box.focus();
+  }
+
+  function closePicker() {
+    if (!pickerOpen) return;
+    pickerOpen = false;
+    // renderTables repaints the panel with whatever was picked and clears the
+    // modal host on its way through renderPicker.
+    renderTables();
   }
 
   /* Every table under a group, honouring the current search — ticking a group
@@ -514,6 +666,7 @@
         return {
           id: t.id, name: t.name || t.id, bucket: t.bucket || '',
           source_type: t.source_type || '', query_mode: t.query_mode || '',
+          server_only: !!t.server_only,
           // Project = the source connection this table came through. Tables
           // with no connection (internal, and the derived sources) fall back
           // to the source's own name, which is the truthful grouping for them.
@@ -529,7 +682,7 @@
       members.forEach(function (id) {
         if (!known.has(id)) {
           st.registry.push({ id: id, name: id, bucket: 'Ungrouped', source_type: '',
-                             query_mode: '', project: 'Other' });
+                             query_mode: '', server_only: false, project: 'Other' });
         }
       });
       renderTables();
@@ -538,12 +691,190 @@
     });
   }
 
+  /* ── Builder mode ──
+     Opened from the Library's "+ New" this is a workspace: a conversation on
+     the left proposing what the package should be, the form on the right. The
+     SAME drawer, grown — opened from the chip input on /admin/tables (where
+     you are mid-sentence assigning a table) it stays the compact in-place
+     panel it has always been. One implementation, two sizes; a second
+     authoring surface for one thing is how two of them drift apart.
+
+     The form is MOVED into the shell's configuration slot rather than
+     re-authored, so every cached node in `els` and every handler bound to it
+     keeps working untouched. */
+  var conv = [], convBusy = false, convErr = null, convDraft = '', convChips = [], convEngine = null;
+
+  function enterBuilderLayout() {
+    if (!els || els.root.classList.contains('is-builder-built')) return;
+    els.root.classList.add('is-builder-built');
+    var panel = els.root.querySelector('.ds-drawer__panel');
+    var body = els.root.querySelector('.ds-drawer__body');
+    var panes = Array.prototype.slice.call(body.children);
+
+    /* The same header every other builder has: leave on the left, the verb
+       that commits on the right. The drawer's own title bar and its footer
+       button row are the compact drawer's pattern, not this one — a workspace
+       whose primary action is parked in a footer below a scrolling form reads
+       as a dialog, and you lose it the moment the form is long enough to
+       scroll. The Create button is MOVED, not rebuilt, so `#pdw-submit` and
+       everything bound to it keeps working. */
+    var head = document.createElement('div');
+    head.innerHTML = BuilderShell.head({
+      backLabel: (st && st.backLabel) || 'Library',
+      title: 'New data package',
+      titleId: 'pdw-shell-title',
+      actionsId: 'pdw-shell-actions',
+    });
+    panel.insertBefore(head.firstChild, body);
+
+    var work = document.createElement('div');
+    work.innerHTML = BuilderShell.workspace({
+      left: '<div class="pdw-conv" id="pdw-conv"></div>',
+      cfgTitle: 'Package',
+      cfgSub: 'what it carries and who gets it, editable by hand',
+      cfgBodyId: 'pdw-cfg',
+    });
+    body.appendChild(work.firstChild);
+    var slot = body.querySelector('#pdw-cfg');
+    panes.forEach(function (node) { slot.appendChild(node); });
+    els.convHost = body.querySelector('#pdw-conv');
+
+    els.shellTitle = els.root.querySelector('#pdw-shell-title');
+  }
+
+  /* Put the commit button where the CURRENT size wants it. It is one node in
+     one DOM, so this has to happen on every open, not once at build: after a
+     builder open the button was living in the shell header, and the next
+     compact open showed a footer with nothing in it but Cancel. */
+  function placeSubmit() {
+    if (!els || !els.submit) return;
+    var actions = els.root.querySelector('#pdw-shell-actions');
+    if (st && st.builder && actions) actions.appendChild(els.submit);
+    else if (els.foot) els.foot.appendChild(els.submit);
+  }
+
+  function renderConv() {
+    if (!els || !els.convHost) return;
+    els.convHost.innerHTML =
+      // The engine, named. Every turn reports it and this builder used to
+      // discard it — see BuilderShell.engineNotice for why that is worse than
+      // not having the badge at all.
+      BuilderShell.engineNotice(convEngine) +
+      BuilderShell.conversation({
+        id: 'pdw-conv-scroll',
+        rows: [{ role: 'assistant', text: OPENING }].concat(conv),
+        busy: convBusy,
+        err: convErr,
+      }) +
+      BuilderShell.composer({
+        kind: 'create', value: convDraft, busy: convBusy,
+        placeholder: 'Describe the package you need…',
+        chips: convBusy ? [] : (convChips.length ? convChips : STARTERS),
+      });
+    var el = els.convHost.querySelector('#pdw-conv-scroll');
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+
+  var OPENING = 'Tell me what this package should carry and who it is for. ' +
+    'I will propose the tables and the groups — you review the access before anything is written.';
+  var STARTERS = ['Our sales pipeline tables', 'Everything finance needs for invoicing', 'Which tables are not in a package yet?'];
+
+  /* One turn. Proposes into the drawer; writes nothing. The reply is inserted
+     as TEXT (BuilderShell.message) — model output, no sanitizer here. */
+  function sendTurn(text) {
+    if (convBusy) return;
+    conv = conv.concat([{ role: 'user', text: text }]);
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    renderConv();
+    api(PKG_API + '/builder/turn', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: text,
+        history: conv.slice(0, -1),
+        draft: {
+          name: els.name.value || '',
+          description: els.desc.value || '',
+          tables: Array.from(st.tablesSelected),
+          // What is TICKED, not only what was already saved. `grantsOriginal`
+          // is the edit-mode baseline and is empty in create mode, so sending
+          // it meant the conversation never saw the groups on screen — and
+          // kept re-proposing ones the admin had already accepted.
+          groups: chosenGrants().map(function (g) { return g.group_id; }),
+        },
+      }),
+    }).then(function (body) {
+      conv = conv.concat([{ role: 'assistant', text: body.reply || '' }]);
+      convEngine = body.engine || null;
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      applyPatch(body.patch || {});
+    }).catch(function (err) {
+      console.error('package drawer: turn failed', err);
+      convErr = (err && err.message) || 'The assistant could not answer.';
+    }).finally(function () {
+      convBusy = false;
+      renderConv();
+    });
+  }
+
+  /* Merge a proposal into the form. Nothing is saved — Create still writes,
+     and the admin sees the tables and the access matrix first. */
+  function applyPatch(patch) {
+    if (typeof patch.name === 'string' && patch.name) {
+      els.name.value = patch.name;
+      if (!st.slugTouched) els.slug.value = slugify(patch.name);
+    }
+    if (typeof patch.description === 'string') els.desc.value = patch.description;
+    if (Array.isArray(patch.tables)) {
+      patch.tables.forEach(function (id) { st.tablesSelected.add(id); });
+      renderTables();
+    }
+    if (Array.isArray(patch.groups) && patch.groups.length) {
+      /* Two things were wrong here and each alone was enough to drop the
+         builder's proposal on the floor:
+
+         the selector named `[data-pdw-group]`, an attribute nothing emits —
+         a group row is `[data-group-id]` wrapping an unlabelled checkbox;
+
+         and in CREATE mode the rows do not exist yet at all. Groups are
+         hydrated lazily, only when the admin opens the access disclosure
+         (see hydrateGroups' note on why), so a patch arriving before that
+         had nothing to tick even with the right selector.
+
+         So: fetch the rows if they are not there, then tick, then open the
+         disclosure — a box ticked inside a collapsed <details> is a silent
+         change to who can reach the data, which is the one thing on this
+         panel that must never happen quietly. */
+      // Compared against the attribute rather than interpolated into a
+      // selector: a group id is server data and may hold a quote, which
+      // would break the selector (or worse) — and there is no CSS.escape
+      // to lean on in the browsers this ships to.
+      var wanted = {};
+      patch.groups.forEach(function (id) { wanted[String(id)] = true; });
+      Promise.resolve(hydrateGroups()).then(function () {
+        var ticked = 0;
+        els.groups.querySelectorAll('[data-group-id]').forEach(function (row) {
+          if (!wanted[row.getAttribute('data-group-id')]) return;
+          var box = row.querySelector('input[type="checkbox"]');
+          if (box && !box.checked) { box.checked = true; ticked += 1; }
+        });
+        if (ticked && els.access && !els.access.open) els.access.open = true;
+      });
+    }
+  }
+
   function open(opts) {
     opts = opts || {};
     build();
     var mode = opts.mode === 'edit' ? 'edit' : 'create';
     st = {
       mode: mode,
+      builder: !!opts.builder,
+      //: A page container to render into instead of the overlay.
+      mount: opts.mount || null,
+      // The label and the destination are one promise; taking them together
+      // stops the header saying "Library" while the button goes elsewhere.
+      backHref: opts.backHref || '/library',
+      backLabel: opts.backLabel || 'Library',
       pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
@@ -557,31 +888,59 @@
       tablesSelected: new Set(),
       restoreFocus: document.activeElement,
     };
+    // Grow into a workspace, or stay the compact in-place drawer.
+    els.root.classList.toggle('ds-drawer--builder', st.builder);
+    // Reset either way: a transcript from a previous open must not be sitting
+    // there when the drawer is next used, in either size.
+    conv = []; convBusy = false; convErr = null; convDraft = ''; convChips = []; convEngine = null;
+    if (st.builder) {
+      enterBuilderLayout();
+      renderConv();
+    } else if (els.convHost) {
+      els.convHost.innerHTML = '';
+    }
+    placeSubmit();
     var typed = opts.typed || '';
     els.name.value = typed;
     els.slug.value = slugify(typed);
     els.desc.value = '';
     els.status.value = 'prod';
     els.category.value = '';
-    els.icon.value = '';
-    els.color.value = '#0EA5B5';
-    els.color.dispatchEvent(new Event('change', { bubbles: true }));
-    // Reset the cover on every open so a picked-then-cancelled image can
-    // never ride along into the next package.
-    els.coverFile.value = '';
-    els.coverUrl.value = '';
-    renderCover('');
     els.access.open = false;
     els.groups.innerHTML = '';
     els.err.hidden = true;
     els.submit.disabled = false;
     applyMode(mode);
 
-    els.root.hidden = false;
-    els.root.classList.add('is-open');
-    document.body.style.overflow = 'hidden';
+    /* PAGE MODE. Given a `mount`, this stops being an overlay: the panel is
+       moved into the page's own container, the backdrop and the modal role go
+       away, and the body keeps its scrolling. Everything else — the fields,
+       the pickers, the requests — is identical, which is the point of doing
+       it this way rather than writing a second package form. */
+    if (st.mount) {
+      els.root.classList.add('is-page');
+      els.root.hidden = false;
+      var panel = els.root.querySelector('.ds-drawer__panel');
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-modal');
+      /* Move the ROOT, not just the panel. Every rule that dresses this thing
+         is scoped from the root (`.ds-drawer--builder .ds-drawer__head`, and
+         so on); relocating the panel alone leaves those selectors matching
+         nothing, and the drawer arrives on the page wearing its overlay
+         chrome and none of its builder chrome. */
+      if (els.root.parentNode !== st.mount) st.mount.appendChild(els.root);
+      document.body.classList.add('ag-building');
+    } else {
+      els.root.hidden = false;
+      els.root.classList.add('is-open');
+      document.body.style.overflow = 'hidden';
+    }
     els.body.scrollTop = 0;
-    els.tablesSearch.value = '';
+    // The picker's own state belongs to the drawer session, not the page: a
+    // second open must not inherit the last search or a left-open modal.
+    pickerQuery = '';
+    pickerOpen = false;
+    if (els.picker) els.picker.innerHTML = '';
     els.tables.innerHTML = '<p class="ds-drawer__hint">Loading…</p>';
     if (mode === 'edit') {
       hydratePackage(opts.pkgId);
@@ -612,21 +971,47 @@
       els.desc.value = pkg.description || '';
       els.status.value = pkg.status || 'prod';
       els.category.value = pkg.category || '';
-      els.icon.value = pkg.icon || '';
-      if (pkg.color) {
-        els.color.value = pkg.color;
-        els.color.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      els.coverUrl.value = pkg.cover_image_url || '';
-      renderCover(pkg.cover_image_url || '');
       els.submit.disabled = false;
     }).catch(function (e) {
       fail('Could not load the package: ' + e.message);
     });
   }
 
+  /* The conversation's controls. Scoped to this drawer's root so they cannot
+     collide with a builder page underneath. */
+  function bindConversation(root) {
+    root.addEventListener('click', function (e) {
+      /* The shell's back button is this drawer's close. Nothing is lost by
+         leaving — the package does not exist until Create, and there is no
+         draft store here to preserve — so it does not confirm. */
+      if (e.target.closest('[data-ag-back]')) {
+        // On a page there is nothing to close — leaving means navigating.
+        if (st && st.backHref) window.location.href = st.backHref;
+        else close();
+        return;
+      }
+      var t = e.target.closest('[data-ag-send],[data-ag-chip]');
+      if (!t) return;
+      if (t.hasAttribute('data-ag-chip')) { sendTurn(t.getAttribute('data-ag-chip')); return; }
+      var box = root.querySelector('[data-ag-comp]');
+      var text = box ? box.value.trim() : '';
+      if (text) sendTurn(text);
+    });
+    root.addEventListener('input', function (e) {
+      if (e.target.getAttribute && e.target.getAttribute('data-ag-comp')) convDraft = e.target.value;
+    });
+    root.addEventListener('keydown', function (e) {
+      if (!e.target.getAttribute || !e.target.getAttribute('data-ag-comp')) return;
+      if (e.key !== 'Enter' || e.shiftKey) return;
+      e.preventDefault();
+      var text = e.target.value.trim();
+      if (text) sendTurn(text);
+    });
+  }
+
   function close() {
     if (!els) return;
+    if (st && st.mount) return;   // a page is left by navigating, not closed
     els.root.classList.remove('is-open');
     els.root.hidden = true;
     document.body.style.overflow = '';
@@ -643,64 +1028,18 @@
     els.submit.disabled = false;
   }
 
-  /* ── Cover image ──────────────────────────────────────────────────────
-     Uploaded on pick rather than on save: the admin gets the preview and
-     any failure immediately, and the returned URL rides along on the
-     create body. */
-
-  function renderCover(url) {
-    els.coverClear.hidden = !url;
-    if (!url) { els.coverPreview.textContent = 'No image'; return; }
-    els.coverPreview.innerHTML = '<img src="' + esc(url) + '" alt="">';
-  }
-
-  function clearCover() {
-    els.coverFile.value = '';
-    els.coverUrl.value = '';
-    renderCover('');
-  }
-
-  function onCoverPicked() {
-    var file = els.coverFile.files && els.coverFile.files[0];
-    if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      clearCover();
-      fail('That image is larger than 5 MiB.');
-      return;
-    }
-    els.err.hidden = true;
-    els.coverPreview.textContent = 'Uploading…';
-    var fd = new FormData();
-    fd.append('file', file);
-    fetch(COVER_API, { method: 'POST', credentials: 'include', body: fd })
-      .then(function (r) {
-        if (!r.ok) {
-          return r.json().catch(function () { return {}; }).then(function (b) {
-            throw new Error((b && b.detail) || 'HTTP ' + r.status);
-          });
-        }
-        return r.json();
-      })
-      .then(function (body) {
-        els.coverUrl.value = body.url || '';
-        renderCover(els.coverUrl.value);
-      })
-      .catch(function (e) {
-        clearCover();
-        fail('The cover image did not upload: ' + e.message);
-      });
-  }
-
   /* ── Who gets it ──────────────────────────────────────────────────────
      Groups are lazy — most packages are created and shared later from the
      package's own page or a group's Access tab, and this is a request the
      collapsed state should not have made. */
 
+  /* Returns a promise so a caller that needs the ROWS (not just the paint)
+     can wait — `applyPatch` ticks boxes that do not exist until this lands. */
   function hydrateGroups() {
-    if (st.groupsLoaded) return;
+    if (st.groupsLoaded) return Promise.resolve();
     st.groupsLoaded = true;
     els.groups.innerHTML = '<p class="ds-drawer__empty">Loading groups…</p>';
-    api(GROUPS_API).then(function (body) {
+    return api(GROUPS_API).then(function (body) {
       var groups = Array.isArray(body) ? body : (body && body.groups) || [];
       if (!groups.length) {
         els.groups.innerHTML = '<p class="ds-drawer__empty">No groups yet — make one in '
@@ -817,18 +1156,15 @@
       els.submit.disabled = true;
       els.submit.textContent = 'Saving…';
       var pkgId = st.pkgId;
-      // `category` and `cover_image_url` honour an empty-string-clears
-      // contract server-side (see update_data_package), so an emptied field
-      // must send "" rather than null — null means "leave unchanged", which
-      // would make clearing a category impossible from here.
+      // `category` honours an empty-string-clears contract server-side (see
+      // update_data_package), so an emptied field must send "" rather than
+      // null — null means "leave unchanged", which would make clearing a
+      // category impossible from here.
       api(PKG_API + '/' + encodeURIComponent(pkgId), {
         method: 'PUT',
         body: JSON.stringify({
           name: name,
           description: els.desc.value.trim() || null,
-          icon: els.icon.value.trim() || null,
-          color: els.color.value.trim() || null,
-          cover_image_url: els.coverUrl.value || '',
           status: els.status.value || 'prod',
           category: els.category.value.trim(),
         }),
@@ -915,9 +1251,6 @@
         name: name,
         slug: slug,
         description: els.desc.value.trim() || null,
-        icon: els.icon.value.trim() || null,
-        color: els.color.value.trim() || null,
-        cover_image_url: els.coverUrl.value || null,
         status: els.status.value || 'prod',
         category: els.category.value.trim() || null,
       }),

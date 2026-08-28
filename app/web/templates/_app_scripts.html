@@ -387,7 +387,9 @@
           {# Label is "News", not the page's "What's new" heading copy —
              tests/test_web_news_page.py asserts that phrase is absent from
              /home when no version is published. #}
+          {% if can_news %}
           { label: 'News',                        hint: 'user',         href: '/news' },
+          {% endif %}
         ];
 
         let overlay = null;

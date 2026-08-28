@@ -1,0 +1,54 @@
+{# Local-dev audience switch — every page, not just /chat.
+
+   It swaps which AUDIENCE a page renders for and nothing else: the rail, the
+   nav and every permission stay the caller's own. A design preview, not a
+   role-switcher, which is why it says so on the panel rather than only in a
+   comment someone has to go and find.
+
+   Renders only under LOCAL_DEV_MODE (`dev_preview_available` in
+   `_chrome_ctx`) and only for an admin (the `session.user.is_admin` check
+   below — the same one the rail uses two tiers up), so it cannot appear on a
+   real deployment and cannot offer a member a view they can't have. The admin
+   half is checked HERE rather than folded into the context flag because
+   `_chrome_ctx` does not compute `is_admin` on purpose; `session.user` is
+   already on the context, so the partial pays nothing for it.
+
+   It is deliberately NOT part of any page's layout. Sitting inside the chat
+   empty-banner it read as product chrome — something a user might think was
+   theirs — and it could only link back to /chat, so following any link out of
+   that page silently dropped the preview. A fixed corner affordance is
+   honest about being a tool, and it can carry the current path.
+
+   No JS beyond the popover toggle: each option is a plain link and the state
+   lives in the URL, so it survives the --reload restart you get while
+   editing, and a mis-set state is fixed by editing the address bar. #}
+{% if dev_preview_available and session.user.is_admin %}
+{% set _path = request.url.path %}
+<div class="devsw" data-devsw>
+  <button type="button" class="devsw-pill" data-devsw-toggle
+          aria-expanded="false" aria-haspopup="true"
+          title="Local dev only — changes what renders, not what you can do">
+    <span class="devsw-dot" aria-hidden="true"></span>
+    <span class="devsw-now">{% if dev_preview == 'member' %}Member{% elif dev_preview == 'empty' %}Empty instance{% else %}Admin{% endif %}</span>
+    <span class="devsw-chev" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M5 8.5l7 7 7-7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+  </button>
+  <div class="devsw-menu" data-devsw-menu hidden role="menu" aria-label="Preview this page as">
+    <p class="devsw-cap">Preview this page as</p>
+    {# Each link keeps you where you are. `?preview=` is dropped rather than
+       set to a value for the real view, so the URL of the normal case stays
+       clean and shareable. #}
+    <a class="devsw-item{% if not dev_preview %} is-on{% endif %}" href="{{ _path }}" role="menuitem">
+      <span>Admin</span><small>your own view</small>
+    </a>
+    <a class="devsw-item{% if dev_preview == 'empty' %} is-on{% endif %}" href="{{ _path }}?preview=empty" role="menuitem">
+      <span>Admin, empty instance</span><small>nothing registered yet</small>
+    </a>
+    <a class="devsw-item{% if dev_preview == 'member' %} is-on{% endif %}" href="{{ _path }}?preview=member" role="menuitem">
+      <span>Member</span><small>no admin surfaces</small>
+    </a>
+    <p class="devsw-note">Render only — your data and permissions are unchanged.</p>
+  </div>
+</div>
+{% endif %}

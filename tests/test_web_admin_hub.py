@@ -182,7 +182,16 @@ class TestGridDeletionLeftNothingStranded:
         assert 'data-admin-nav-group="docs"' in body
         assert 'id="admin-nav-body-docs" hidden' in body
 
-    def test_studio_row_follows_its_instance_flag(self, seeded_app):
-        """The only conditional nav item. Studio is on by default, and the
-        grid gated it the same way — the row must not become unconditional."""
+    def test_studio_row_follows_its_instance_flag(self, seeded_app, monkeypatch):
+        """A conditional nav item — no longer the only one. Studio is OFF by
+        default since the admin cleanup, so the assertion flipped: what this
+        guards is that the row still FOLLOWS the flag in both directions rather
+        than becoming unconditional (which is how it would come back on a
+        default-off instance and link to a redirect).
+
+        The other four conditional rows are covered in
+        tests/test_retired_admin_surfaces.py."""
+        assert 'href="/admin/studio"' not in self._body(seeded_app)
+
+        monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
         assert 'href="/admin/studio"' in self._body(seeded_app)
