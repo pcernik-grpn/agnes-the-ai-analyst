@@ -25,7 +25,7 @@ from app.chat.frame_seq import stamp_frame
 from app.chat.message_parts import build_message_parts, parts_to_tool_calls
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
-from app.chat.provider import SandboxHandle, SandboxProvider
+from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
@@ -117,6 +117,13 @@ _PAUSED_SWEEP_LEASE_TTL_SEC = 90
 # row for a short moment — 120s is far beyond that window while still reaping
 # a crashed gateway's leftovers on the following tick.
 _ORPHAN_SWEEP_MIN_AGE_SEC = 120
+
+# How many times a spawn may free a slot and try again before giving up
+# (`_spawn_with_capacity_reclaim`). Each attempt reclaims exactly one
+# sandbox, so this bounds how much of a full host one attach may evict —
+# a handful covers the racing-spawns case without letting one user's
+# attach sweep every parked conversation off the box.
+_SPAWN_RECLAIM_MAX_ATTEMPTS = 3
 
 # Session routing lease (wave-2F task 1 — see app/chat/routing.py). Claimed
 # for `chat:{chat_id}` when a session becomes live in this process's
@@ -1984,7 +1991,7 @@ class ChatManager:
         # the host's installed package — there is no ``app.chat.runner``
         # module inside the sandbox.
         argv = ["python3", "/work/runner.py", "--session-id", session.id]
-        handle = await self._provider.spawn(workdir=session_dir, env=env, argv=argv)
+        handle = await self._spawn_with_capacity_reclaim(workdir=session_dir, env=env, argv=argv)
         # Provider-mediated file staging — runs for EVERY provider, including
         # the ones that mount the workspace themselves.
         await self._stage_boot_files(handle, session)
@@ -3747,6 +3754,88 @@ class ChatManager:
                 chat_id,
             )
         return reaped
+
+    async def _reclaim_paused_sandbox(self) -> bool:
+        """Free one sandbox slot by destroying the least-recently-paused one.
+
+        This is the paused-TTL sweep's teardown (destroy, clear the refs, drop
+        the in-memory entry, release the routing lease) triggered by capacity
+        pressure instead of by the clock. Everything it costs the evicted
+        session is what that sweep would have cost it anyway at
+        ``paused_ttl_seconds``: the transcript is untouched, only the parked
+        sandbox goes, and the user's next message spawns a fresh one.
+
+        Least-recently-paused first — the conversation nobody has come back to
+        is the cheapest to take. A session this process is actively serving is
+        never a candidate: its row can still carry a stale
+        ``sandbox_paused_at`` between a resume and the write that clears it,
+        so ``self._live`` is the authority on "in use", not the row.
+
+        Returns True when a slot was actually freed. Never raises.
+        """
+        try:
+            paused = self._repo.list_paused_sessions(paused_before=datetime.now(timezone.utc))
+        except Exception:
+            logger.exception("capacity reclaim: listing paused sessions failed")
+            return False
+        candidates = [s for s in (paused or []) if s.sandbox_id and s.sandbox_paused_at is not None]
+        candidates.sort(key=lambda s: s.sandbox_paused_at)
+        for session in candidates:
+            live = self._live.get(session.id)
+            if live is not None and live.state != SessionState.PAUSED:
+                continue
+            try:
+                await self._provider.destroy(sandbox_id=session.sandbox_id)
+            except Exception:
+                # Already gone is a success for our purposes — the slot is
+                # free either way, and the refs below still need clearing.
+                logger.debug("capacity reclaim: destroy failed for %s (already gone?)", session.sandbox_id)
+            try:
+                self._repo.clear_sandbox_ref(session.id)
+            except Exception:
+                # The container is gone but the row still points at it; leaving
+                # the row would make the owner's next attach try to resume a
+                # sandbox that no longer exists. Do not claim the slot.
+                logger.exception("capacity reclaim: clearing sandbox ref failed for %s", session.id)
+                return False
+            self._live.pop(session.id, None)
+            try:
+                await self._release_routing_lease(session.id)
+            except Exception:
+                logger.debug("capacity reclaim: routing lease release failed for %s", session.id)
+            logger.info(
+                "capacity reclaim: freed sandbox %s (session %s, paused since %s) to admit a new one",
+                session.sandbox_id,
+                session.id,
+                session.sandbox_paused_at,
+            )
+            return True
+        return False
+
+    async def _spawn_with_capacity_reclaim(self, *, workdir, env, argv) -> SandboxHandle:
+        """``provider.spawn``, but a full host frees a parked slot and retries.
+
+        A provider with a host-wide ceiling (the docker one) refuses to spawn
+        once that many sandboxes exist, and paused sandboxes count against it
+        while surviving until ``paused_ttl_seconds`` — 7 days by default. With
+        a small ``docker_max_total_sandboxes`` those two defaults deadlock each
+        other: a few parked conversations fill the host and every other user
+        gets a failed attach for a week, with no path back short of an operator
+        deleting containers by hand. Evicting the least-recently-paused sandbox
+        is strictly better than refusing a live user, and costs the evicted
+        session only what the TTL sweep would have cost it later anyway.
+
+        Any other spawn failure propagates untouched — a broken spawn must not
+        be answered by tearing down someone else's sandbox.
+        """
+        attempts = 0
+        while True:
+            try:
+                return await self._provider.spawn(workdir=workdir, env=env, argv=argv)
+            except SandboxCapacityError:
+                attempts += 1
+                if attempts > _SPAWN_RECLAIM_MAX_ATTEMPTS or not await self._reclaim_paused_sandbox():
+                    raise
 
     async def _idle_reaper_loop(self) -> None:
         # Startup reconciliation: containers a crashed predecessor left behind

@@ -4433,3 +4433,116 @@ def test_new_sink_gets_pending_question_replayed(manager: ChatManager):
         assert replayed and replayed[0]["request_id"] == "ques-7"
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Capacity reclaim: a full host must not lock chat out for a week
+# ---------------------------------------------------------------------------
+
+
+def _paused_session(mgr, *, sandbox_id: str, paused_ago_seconds: float, email: str = "cap@test.com"):
+    """A session parked on a sandbox — the row shape a reclaim targets."""
+    from datetime import datetime as _dt
+    from datetime import timedelta
+
+    session = mgr._repo.create_session(user_email=email, surface=Surface.WEB)
+    mgr._repo.set_sandbox_ref(session.id, sandbox_id=sandbox_id, runner_pid=123)
+    mgr._repo.set_sandbox_paused_at(session.id, _dt.now(UTC) - timedelta(seconds=paused_ago_seconds))
+    return session
+
+
+def _capacity_provider(manager, *, fail_times: int):
+    """Provider whose spawn refuses with the cap error `fail_times` times,
+    then succeeds — i.e. a host that frees a slot once something is reaped."""
+    from app.chat.provider import SandboxCapacityError
+
+    destroyed: list[str] = []
+    calls = {"spawn": 0}
+
+    async def _spawn(**_kw):
+        calls["spawn"] += 1
+        if calls["spawn"] <= fail_times:
+            raise SandboxCapacityError("docker_max_total_sandboxes reached (3/3)")
+        return FakeHandle()
+
+    async def _destroy(*, sandbox_id):
+        destroyed.append(sandbox_id)
+
+    manager._provider.spawn = _spawn
+    manager._provider.destroy = _destroy
+    return destroyed, calls
+
+
+def test_spawn_reclaims_a_paused_sandbox_when_the_host_is_at_its_cap(manager: ChatManager):
+    """#chat-cap: paused sandboxes count against docker_max_total_sandboxes but
+    live until paused_ttl_seconds (7 days). A small cap plus a few parked
+    conversations therefore locked every other user out of chat for a week,
+    with no path back short of an operator deleting containers by hand."""
+
+    async def _run():
+        parked = _paused_session(manager, sandbox_id="sbx-parked", paused_ago_seconds=3600)
+        destroyed, calls = _capacity_provider(manager, fail_times=1)
+
+        handle = await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert handle is not None
+        assert destroyed == ["sbx-parked"], "the parked sandbox should have been freed"
+        assert calls["spawn"] == 2, "spawn must be retried once the slot is free"
+        # The freed session keeps its transcript but must no longer claim a
+        # sandbox that is gone — otherwise its next attach tries to resume it.
+        assert manager._repo.get_session(parked.id).sandbox_id is None
+
+    asyncio.run(_run())
+
+
+def test_capacity_reclaim_frees_the_least_recently_paused_session(manager: ChatManager):
+    """The conversation nobody has come back to is the cheapest to evict."""
+
+    async def _run():
+        _paused_session(manager, sandbox_id="sbx-recent", paused_ago_seconds=60, email="a@test.com")
+        _paused_session(manager, sandbox_id="sbx-oldest", paused_ago_seconds=9000, email="b@test.com")
+        _paused_session(manager, sandbox_id="sbx-middle", paused_ago_seconds=1800, email="c@test.com")
+        destroyed, _ = _capacity_provider(manager, fail_times=1)
+
+        await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert destroyed == ["sbx-oldest"]
+
+    asyncio.run(_run())
+
+
+def test_capacity_error_propagates_when_there_is_nothing_to_reclaim(manager: ChatManager):
+    """A host full of ACTIVE sandboxes has no free lunch — surface the error
+    rather than evicting a conversation somebody is using."""
+
+    async def _run():
+        from app.chat.provider import SandboxCapacityError
+
+        destroyed, calls = _capacity_provider(manager, fail_times=99)
+
+        with pytest.raises(SandboxCapacityError):
+            await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert destroyed == []
+        assert calls["spawn"] == 1, "no reclaim candidate means no pointless retry"
+
+    asyncio.run(_run())
+
+
+def test_capacity_reclaim_never_evicts_a_session_being_served(manager: ChatManager):
+    """A row can carry a stale sandbox_paused_at while this process is already
+    serving it again; the in-memory state is the authority on 'in use'."""
+
+    async def _run():
+        serving = _paused_session(manager, sandbox_id="sbx-serving", paused_ago_seconds=9000)
+        manager._live[serving.id] = MagicMock(state=SessionState.ACTIVE)
+        parked = _paused_session(manager, sandbox_id="sbx-parked", paused_ago_seconds=60, email="other@test.com")
+        destroyed, _ = _capacity_provider(manager, fail_times=1)
+
+        await manager._spawn_with_capacity_reclaim(workdir=Path("/tmp"), env={}, argv=["x"])
+
+        assert destroyed == ["sbx-parked"], "the ACTIVE session must be skipped despite being older"
+        assert manager._repo.get_session(serving.id).sandbox_id == "sbx-serving"
+        assert manager._repo.get_session(parked.id).sandbox_id is None
+
+    asyncio.run(_run())
