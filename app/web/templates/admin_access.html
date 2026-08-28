@@ -799,6 +799,96 @@
   .ax-adv__more { margin-left: auto; color: var(--ds-text-link); font-weight: 600; }
   .ax-adv[open] .ax-adv__more { visibility: hidden; }
   .ax-adv__body { padding-bottom: 8px; }
+  /* ── Type scale, inside an open group ────────────────────────────────
+     It had three different things at 11px/700 — the family label, the kind
+     chip and a column header — so nothing read as a level and the reader
+     had to work out the structure from indentation that was seven deep.
+     Four levels now, each visually distinct in KIND and not only in size:
+     the family is uppercase and tracked, the row name is the only
+     medium-weight text, the kind is mono, the rest is quiet. */
+  .ax-fam { margin-top: 22px; }
+  .ax-fam__hd { align-items: baseline; padding-bottom: 6px; margin-bottom: 0; }
+  .ax-fam__nm {
+    font-size: 11px; font-weight: 700; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ds-text-primary);
+  }
+  .ax-fam__sub { font-size: 12px; color: var(--ds-text-muted); font-weight: 400; }
+  .ax-fam__n {
+    margin-left: auto; font-family: var(--ds-font-mono, ui-monospace, monospace);
+    font-size: 11px; color: var(--ds-text-muted);
+  }
+
+  /* Specificity note: the winning rule is `[data-theme="paper"] .data-table
+     th` in paper-skin.css — an attribute selector, so a plain class chain
+     cannot reach it. Scoped on `[data-theme]` (any theme, not just paper) so
+     this holds in every palette. The column header must NOT land on
+     11px/700: that is the family label's treatment, and the two reading as
+     one level is the collision this pass exists to remove. */
+  [data-theme] table.ax-rows thead th {
+    font-size: 10px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+    padding-bottom: 6px; white-space: nowrap;
+  }
+  .ax-rows td { vertical-align: middle; }
+  /* Every family is its own <table>, so each was sizing its columns from its
+     own content — "Admin control" landed at a different x in Knowledge than
+     in Capabilities, and the eye reads that as two unrelated tables rather
+     than one list with dividers. Fixed layout makes the families columns of
+     one page. */
+  .ax-rows { table-layout: fixed; width: 100%; }
+  .ax-rows .ax-chk   { width: 34px; }
+  .ax-rows .ax-kind  { width: 88px; }
+  .ax-rows .ax-acc   { width: 190px; }
+  .ax-rows .ax-reads { width: 178px; }
+  [data-theme] table.ax-rows thead th.ax-acc { text-align: left; }
+  [data-theme] table.ax-rows thead th.ax-reads { text-align: right; }
+  .ax-rows .ax-name { overflow-wrap: anywhere; }
+  /* Mono, quiet, no uppercase — so it cannot be mistaken for the family
+     label above it, which is the level it kept competing with. */
+  .ax-rows .ax-tag {
+    font-family: var(--ds-font-mono, ui-monospace, monospace);
+    font-size: 10.5px; font-weight: 400; letter-spacing: 0;
+    text-transform: none; color: var(--ds-text-muted);
+    background: var(--ds-surface-dim); border: 1px solid var(--ds-border-light);
+    padding: 1px 6px; border-radius: 3px; white-space: nowrap;
+  }
+  .ax-rows .ax-tag--own { color: var(--ds-text-link); border-color: var(--ds-text-link); }
+
+  .ax-rows .ax-name b { font-size: 13.5px; font-weight: 600; }
+  .ax-rows .ax-name .desc,
+  .ax-rows .ax-name .blk,
+  .ax-rows .ax-by-who { display: block; font-weight: 400; }
+  .ax-rows .ax-name .desc { font-size: 12px; color: var(--ds-text-muted); margin-top: 1px; }
+  .ax-rows .ax-name .blk { display: inline; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-rows .ax-by-who { font-size: 11px; color: var(--ds-text-muted); margin-top: 2px; }
+  .ax-rows .ax-reads { font-size: 12px; font-weight: 400; }
+
+  /* Oversight, not a second editor: revoke, and a way to where it is owned. */
+  .ax-own { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ax-revoke {
+    font-size: 12px; padding: 3px 10px; border-radius: var(--ds-radius-btn, 4px);
+    border: 1px solid var(--ds-border); background: var(--ds-surface);
+    color: var(--ds-text-secondary); cursor: pointer;
+  }
+  .ax-revoke:hover { border-color: var(--ds-text-link); color: var(--ds-text-link); }
+  .ax-own__edit { font-size: 11px; color: var(--ds-text-muted); white-space: nowrap; }
+  .ax-own__edit:hover { color: var(--ds-text-link); }
+
+  /* The People card became a strip. It was a full disclosure section with an
+     icon, a title, a subtitle and a chevron, wrapping one sentence — three
+     of the seven chrome levels between the group and a grant row. */
+  .ax-gs__body .dsec { border: 0; background: none; margin: 0; }
+  .ax-gs__body #ax-sec-people > summary .dsec-ico,
+  .ax-gs__body #ax-sec-people > summary .dsec-sub,
+  .ax-gs__body #ax-sec-access > summary .dsec-ico,
+  .ax-gs__body #ax-sec-access > summary .dsec-sub { display: none; }
+  .ax-gs__body #ax-sec-access > summary h3,
+  .ax-gs__body #ax-sec-people > summary h3 {
+    font-size: 11px; font-weight: 700; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+  }
+  .ax-gs__body .dsec-head { padding: 6px 0; }
+  .ax-gs__body .dsec-body { padding: 0; }
 </style>
 {% endblock %}
 
@@ -1179,6 +1269,28 @@
     const text = m.any || m[tier] || "";
     return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
   };
+
+  /* The tier control, defined ONCE. Three surfaces render it — the group
+     view's rows, the bundle view's rows, and Advanced — and three copies of
+     the same two labels is exactly how a control ends up with three names.
+     `tests/test_access_vocabulary.py` pins this to a single definition. */
+  const tierControl = (tier, granted) => `
+    <span class="fbar-seg ax-tier" ${granted ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
+      <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
+      <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
+    </span>`;
+
+  /* The type, as one word on the row. `display_name` is a plural section
+     header ("Skills, agents & plugins"); a chip in a 5rem column is not a
+     header, and the row already says which thing it is. */
+  const KIND_WORD = {
+    data_package: "package", memory_domain: "memory", memory_item: "memory",
+    semantic_model: "semantic", recipe: "recipe", collection: "collection",
+    corpus_file: "file", knowledge_digest: "digest", data_app: "app",
+    table: "table", marketplace_plugin: "plugin", store_entity: "skill",
+    agent: "agent", chat: "chat", slack_channel: "slack",
+  };
+  const kindWord = (t) => KIND_WORD[t.type_key] || t.type_display;
 
   /* Who wrote this grant. Two writers, two shapes: the admin API records an
      email, the Library's owner-sharing path records a user id. Resolve both
@@ -1566,12 +1678,7 @@
           ${i.description ? `<br><span class="desc">${esc(String(i.description).slice(0, 90))}</span>` : ""}
           ${grant && whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}
         </td>
-        <td class="ax-acc">
-          <span class="fbar-seg ax-tier" ${grant ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
-            <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available" title="available">Available</button>
-            <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required" title="required">Required</button>
-          </span>
-        </td>
+        <td class="ax-acc">${tierControl(tier, !!grant)}</td>
         <td class="ax-reads">${readsFor(t.type_key, tier)}</td>
       </tr>`;
     };
@@ -1691,13 +1798,71 @@
        registers a resource type. `overview.families` carries the section
        copy, in render order, so a family whose types are all filtered away
        still says so instead of vanishing. */
+    /* The default view is FLAT. It used to be family → type accordion →
+       block accordion → table, seven levels of chrome deep with the column
+       headers repeated once per type; the type is one word, and one word
+       does not need a container. It rides the row as a chip, which is what
+       the design draws, and the reader gets three levels: family, header,
+       row. Advanced keeps the accordions — browsing six hundred tables by
+       bucket is exactly what a tree is for. */
+    const OWNER_SHARED = new Set(["collection", "agent", "corpus_file", "data_app"]);
+    const ENTITY_PAGE = {
+      collection: (id) => `/library/d/${encodeURIComponent(id)}`,
+      corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
+      data_app: (id) => `/apps/${encodeURIComponent(id)}`,
+      agent: (id) => `/agents?agent=${encodeURIComponent(id)}`,
+      data_package: (id) => `/admin/data-packages/${encodeURIComponent(id)}`,
+      table: (id) => `/catalog/t/${encodeURIComponent(id)}`,
+    };
+
+    const flatRow = (t, i, blockName) => {
+      const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
+      const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
+      const owned = OWNER_SHARED.has(t.type_key);
+      const hrefFn = ENTITY_PAGE[t.type_key];
+      const name = esc(i.name || i.resource_id);
+      const nameHtml = hrefFn ? `<a class="ax-name__link" href="${hrefFn(i.resource_id)}">${name}</a>` : name;
+      const who = grant ? whoGranted(grant) : "";
+      /* Owner-shareable kinds are OVERSIGHT here, not a place to grant: the
+         Library's Share dialog writes the same row, and the item's own page
+         is where its sharing is edited. So a held one offers revoke and a
+         way to the item — not a checkbox that quietly competes with the
+         other editor. Ungranted ones are in Advanced, where the checkbox
+         still works and the admin has clearly gone looking. */
+      const control = owned && grant
+        ? `<span class="ax-own"><button type="button" class="ax-revoke" data-revoke>Revoke</button>
+             ${hrefFn ? `<a class="ax-own__edit" href="${hrefFn(i.resource_id)}">Shared where it lives ↗</a>` : ""}</span>`
+        : tierControl(tier, !!grant);
+      return `
+      <tr data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant ? ' class="is-granted"' : ""}>
+        <td class="ax-chk">${owned && grant ? "" : `<input type="checkbox" ${grant ? "checked" : ""} aria-label="Grant ${name}">`}</td>
+        <td class="ax-kind"><span class="ax-tag ${owned ? "ax-tag--own" : ""}">${esc(kindWord(t))}</span></td>
+        <td class="ax-name">
+          <b>${nameHtml}</b>${blockName ? `<span class="blk"> · ${esc(blockName)}</span>` : ""}${nobodyBadge(t, i)}
+          ${i.description ? `<span class="desc">${esc(String(i.description).slice(0, 96))}</span>` : ""}
+          ${who ? `<span class="ax-by-who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}
+        </td>
+        <td class="ax-acc">${control}</td>
+        <td class="ax-reads">${readsFor(t.type_key, tier)}</td>
+      </tr>`;
+    };
+
     const byFamily = new Map();
     for (const t of types) {
-      const html = typeHtml(t, "primary");
-      if (!html) continue;
+      const rows = [];
+      for (const b of (t.blocks || [])) {
+        const blockName = (b.name && b.name !== t.type_display) ? b.name : "";
+        for (const i of (b.items || [])) {
+          if (!hits(t, i)) continue;
+          if (!inHalf("primary", t, i)) continue;
+          if (onlyGranted && !grantOf(selectedGroup, t.type_key, i.resource_id)) continue;
+          rows.push(flatRow(t, i, blockName));
+        }
+      }
+      if (!rows.length) continue;
       const key = t.family || "knowledge";
       if (!byFamily.has(key)) byFamily.set(key, []);
-      byFamily.get(key).push(html);
+      byFamily.get(key).push(...rows);
     }
     const families = (overview.families || []).length
       ? overview.families
@@ -1708,13 +1873,23 @@
       // answer and a header over nothing is not part of the answer.
       if (!parts.length && narrowed) return "";
       const inner = parts.length
-        ? parts.join("")
-        : `<div class="ax-empty" style="padding-left:22px;">Nothing granted here yet.</div>`;
+        ? `<table class="data-table data-table--compact ax-rows">
+             <thead><tr>
+               <th class="ax-chk" aria-label="Granted"></th>
+               <th class="ax-kind">Kind</th>
+               <th>What the group gets</th>
+               <th class="ax-acc">Admin control</th>
+               <th class="ax-reads">What the person reads</th>
+             </tr></thead>
+             <tbody>${parts.join("")}</tbody>
+           </table>`
+        : `<div class="ax-empty">Nothing in this family yet.</div>`;
       return `
       <div class="ax-fam">
         <div class="ax-fam__hd">
           <span class="ax-fam__nm">${esc(f.display_name)}</span>
           ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
+          <span class="ax-fam__n">${parts.length}</span>
         </div>
         ${inner}
       </div>`;
@@ -2282,12 +2457,7 @@
         <td class="ax-name"><b>${esc(titleOf(g))}</b>
           <span class="blk"> · ${esc(String(g.member_count ?? 0))} ${(g.member_count ?? 0) === 1 ? "person" : "people"}</span>
           ${whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}</td>
-        <td class="ax-acc">
-          <span class="fbar-seg ax-tier" role="group" aria-label="Access tier">
-            <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>
-            <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required">Required</button>
-          </span>
-        </td>
+        <td class="ax-acc">${tierControl(tier, true)}</td>
         <td class="ax-reads">${readsFor(r.t.type_key, tier)}</td>
       </tr>`;
     };
@@ -2615,6 +2785,19 @@
         box.disabled = false;
         repaintView();
       }
+      return;
+    }
+
+    if (e.target.closest("[data-revoke]")) {
+      const grant = grantOf(rowGroup, type, rid);
+      if (!grant) return;
+      try {
+        await deleteGrant(grant);
+        toast("Revoked — the owner can share it again from the Library", true);
+      } catch (err) {
+        toast("Could not revoke: " + err.message, false);
+      }
+      repaintView();
       return;
     }
 

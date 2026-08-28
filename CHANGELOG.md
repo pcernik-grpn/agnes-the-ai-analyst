@@ -177,6 +177,30 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
 
 ### Changed
+- **The open group is three levels deep, not seven.** It rendered
+  family → type accordion → block accordion → table, with the column headers
+  repeated once per type and eight disclosures on screen; measured, there
+  were seven levels of chrome between a group and one grant row. The default
+  view is now flat — family label, one header row, rows — with the type
+  demoted to a quiet mono chip on the row, which is what it always was: one
+  word. Advanced keeps the accordions, where browsing hundreds of tables by
+  bucket is what a tree is actually for. The People and Access cards became
+  small-caps strips; every family shares one fixed column grid, so *Admin
+  control* lands at the same x in Knowledge as in Capabilities instead of
+  each table sizing itself. Type scale is four distinct levels rather than
+  three different things at 11px/700 — the family label, the kind chip and a
+  column header were previously indistinguishable, which is why nothing read
+  as a hierarchy.
+- **Owner-shareable rows are oversight, not a second editor.** Collections,
+  agents, corpus files and data apps are shared by their owners through the
+  Library's Share dialog (`app/services/library_sharing.py`), which writes
+  the same `resource_grants` row an admin writes. A held one now offers
+  **Revoke** and a link to the item's own page — *Shared where it lives* —
+  instead of a checkbox quietly competing with the other editor, and its
+  kind chip is marked. Ungranted ones stay in Advanced, where the checkbox
+  still works and the admin has clearly gone looking. The tier control is now
+  defined **once** and rendered by all three surfaces; a guard pins that, and
+  caught the third copy this change would otherwise have created.
 - **`/admin/tables` → *Manage access* stops pointing at a lever that is not
   connected.** A per-table grant no longer surfaces a table in an analyst's
   manifest — the package grant does — so arriving on `/admin/access` with

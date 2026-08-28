@@ -105,12 +105,20 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
     def test_retired_chip_labels_are_gone(self, retired):
         assert retired not in self._source()
 
-    def test_the_tier_label_appears_exactly_where_expected(self):
-        """Two segmented controls render the pair — the group view's rows and
-        the bundle view's. A third would mean a copy nobody is maintaining."""
+    def test_the_tier_control_has_exactly_one_definition(self):
+        """Three surfaces render this control — the group rows, the bundle
+        rows, and Advanced. Each keeping its own copy of the labels is
+        precisely how one control ended up with three names; this pins it to
+        a single `tierControl` definition, so a rename cannot land on two of
+        the three."""
         src = self._source()
-        assert src.count('data-tier="available"') == 2
-        assert src.count('data-tier="required"') == 2
+        assert src.count('data-tier="available"') == 1
+        assert src.count('data-tier="required"') == 1
+        assert src.count("const tierControl") == 1
+        # The definition is `const tierControl = (…) =>`, so it does not
+        # match `tierControl(` — this counts call sites only: the group
+        # rows, the bundle rows, and Advanced.
+        assert src.count("tierControl(") == 3
 
     def test_simulate_speaks_the_person_s_words(self):
         src = self._source()
