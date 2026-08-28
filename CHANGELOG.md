@@ -738,6 +738,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   while the conversation had room to spare.
 
 ### Fixed
+- **The MCP-source builder's sanitizer refuses a `command` or `args` the admin
+  did not type, not just a `url`.** All three name what the instance dials or
+  runs, and only `url` was guarded. `command` and `args` are the sharper pair:
+  on `stdio` transport they are what reach `StdioServerParameters` and are
+  launched as a subprocess on the server, so a patched `command` chooses the
+  binary — and `args` alone is enough, since a benign `npx` or `node` the admin
+  typed will run whatever it is handed. All three are now accepted only when
+  they read exactly as the draft already holds them, so a patch echoing the
+  panel back is harmless and a patch inventing a target is a no-op. Every one
+  stays settable the ordinary way: the panel's own inputs. This sanitizer had
+  no direct tests while its three siblings all did, which is how the gap
+  survived; it has 18 now.
+
 - **Saving in the MCP-source builder is resumable instead of duplicating the
   source.** Save makes up to four calls — register the row, store the secret,
   then one grant per group — so a failure in a later step left a registered

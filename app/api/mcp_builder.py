@@ -265,12 +265,23 @@ def _sanitize_patch(raw: Any, *, draft: Dict[str, Any]) -> Dict[str, Any]:
     Beyond the usual field/enum/length checks, two refusals specific to what
     this endpoint configures:
 
-    * a ``url`` the admin has not already typed is dropped — the model may not
-      choose which host the instance dials, and "correcting" a URL is the same
-      act as choosing one;
+    * **the connection target** — ``url``, ``command`` and ``args`` — is
+      dropped unless it already reads exactly as the admin typed it. The model
+      may not choose what the instance dials or runs, and "correcting" one of
+      these is the same act as choosing it. ``url`` alone carried this rule
+      first; the other two are strictly sharper and had none. On ``stdio``,
+      ``command`` and ``args`` are what reach ``StdioServerParameters`` and get
+      launched as a subprocess on the server, so a patched ``command`` chooses
+      the binary — and ``args`` alone is enough, since a benign ``npx`` or
+      ``node`` the admin typed will run whatever it is handed. That the admin
+      reviews the panel before saving is not the control being relied on here;
+      it was not enough to justify letting a model pick a host either.
     * an ``auth_secret_env`` that is not shaped like an environment variable
       name is dropped, which is what stops a pasted token being written into a
       field that is stored and displayed.
+
+    Every one of these fields stays settable the ordinary way: the panel's own
+    inputs, typed by the admin. What the conversation can do about them is ask.
     """
     if not isinstance(raw, dict):
         return {}
@@ -280,8 +291,15 @@ def _sanitize_patch(raw: Any, *, draft: Dict[str, Any]) -> Dict[str, Any]:
             continue
         value = raw[key]
         if key == "args":
+            # Part of the connection target — see the docstring. Accepted only
+            # when it is what the draft already holds, which makes a patch that
+            # echoes the panel back harmless and a patch that invents an
+            # argument list a no-op.
             if isinstance(value, list):
-                out["args"] = [v.strip() for v in value if isinstance(v, str) and v.strip()][:32]
+                cleaned = [v.strip() for v in value if isinstance(v, str) and v.strip()][:32]
+                current = [str(v).strip() for v in (draft.get("args") or []) if str(v).strip()]
+                if cleaned == current:
+                    out["args"] = cleaned
             continue
         if not isinstance(value, str):
             continue
@@ -292,7 +310,7 @@ def _sanitize_patch(raw: Any, *, draft: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if key == "scope" and value not in SCOPES:
             continue
-        if key == "url" and value and value != (draft.get("url") or "").strip():
+        if key in ("url", "command") and value and value != (draft.get(key) or "").strip():
             continue
         if key == "auth_secret_env" and value and not _ENV_NAME_RE.match(value):
             continue
