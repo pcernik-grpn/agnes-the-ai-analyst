@@ -56,11 +56,17 @@ def facets(
     result_class: Optional[str] = None,
     q: Optional[str] = None,
     source: Optional[str] = None,
+    trail: Optional[str] = Query(
+        default=None,
+        description="Narrow to one physical trail: audit | sync | llm | agent_scope. "
+        "Unset covers the unified timeline across all four — same filter the timeline accepts.",
+    ),
     include_self_reads: bool = Query(default=False),
     _user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Return the distinct facet values present in `audit_log` for the
+    """Return the distinct facet values present across the unified timeline
+    (audit_log + sync_history + llm_usage + agent_scope_snapshots) for the
     selected window, each with a count — under the SAME filters the
     timeline uses, so dropdown counts always describe rows the table can
     actually show. `include_self_reads` defaults to False: the Activity
@@ -71,17 +77,21 @@ def facets(
     """
     since = _window_since(since_minutes)
 
-    data = audit_repo().facets(
-        since=since,
-        user_id=user_id,
-        action_prefix=action_prefix,
-        resource_prefix=resource_prefix,
-        result_pattern=result_pattern,
-        result_class=result_class,
-        q=q,
-        source=source,
-        include_self_reads=include_self_reads,
-    )
+    try:
+        data = audit_repo().facets(
+            since=since,
+            user_id=user_id,
+            action_prefix=action_prefix,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            q=q,
+            source=source,
+            trail=trail,
+            include_self_reads=include_self_reads,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # The facets 'users' bucket carries ids + counts only; resolve readable
     # labels here, reproducing the old COALESCE(email, user_id).
@@ -113,28 +123,38 @@ def kpis(
     result_class: Optional[str] = None,
     q: Optional[str] = None,
     source: Optional[str] = None,
+    trail: Optional[str] = Query(
+        default=None,
+        description="Narrow to one physical trail: audit | sync | llm | agent_scope. "
+        "Unset covers the unified timeline across all four — same filter the timeline accepts.",
+    ),
     include_self_reads: bool = Query(default=False),
     _user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """KPIs for the top-bar cards — same filter surface as the timeline, so
-    the cards and the table can never tell different stories. `active_users`
-    counts people (scheduler/system actors excluded); `errors` counts
-    result_class='error'; `duration_coverage` says what fraction of rows
-    carry a measured duration (feeds the p95 card's honesty sub-label)."""
+    """KPIs for the top-bar cards — same filter surface as the (unified)
+    timeline, so the cards and the table can never tell different stories.
+    `active_users` counts people (scheduler/system actors excluded);
+    `errors` counts result_class='error'; `duration_coverage` says what
+    fraction of rows carry a measured duration (feeds the p95 card's
+    honesty sub-label)."""
     since = _window_since(since_minutes)
 
-    k = audit_repo().kpis(
-        since=since,
-        user_id=user_id,
-        action_prefix=action_prefix,
-        resource_prefix=resource_prefix,
-        result_pattern=result_pattern,
-        result_class=result_class,
-        q=q,
-        source=source,
-        include_self_reads=include_self_reads,
-    )
+    try:
+        k = audit_repo().kpis(
+            since=since,
+            user_id=user_id,
+            action_prefix=action_prefix,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            q=q,
+            source=source,
+            trail=trail,
+            include_self_reads=include_self_reads,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     total = k["events_total"]
     errors = k["errors"]
     p95 = k["p95"]
