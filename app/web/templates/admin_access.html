@@ -652,6 +652,35 @@
     box-shadow: var(--ds-shadow-md);
   }
   .ax-toast.show { display: block; }
+  /* ── Families ───────────────────────────────────────────────────────
+     Knowledge · Capabilities · Surfaces. The heading is quiet on purpose:
+     it groups the types, it does not compete with them. A family whose
+     types are all filtered out is dropped entirely (see renderResources) —
+     a header over nothing is not part of an answer. */
+  .ax-fam { margin-top: var(--ds-space-5); }
+  .ax-fam:first-child { margin-top: 0; }
+  .ax-fam__hd {
+    display: flex; align-items: baseline; gap: var(--ds-space-2);
+    flex-wrap: wrap; padding-bottom: var(--ds-space-2);
+    border-bottom: 1px solid var(--ds-border-subtle);
+    margin-bottom: var(--ds-space-2);
+  }
+  .ax-fam__nm {
+    font-size: 11px; font-weight: 700; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ds-text);
+  }
+  .ax-fam__sub { font-size: 12px; color: var(--ds-text-muted); }
+
+  /* What the row becomes in the granted person's Library. Right-aligned and
+     quiet — it is a read-out, not a control — but present on every row, so
+     the tier is always set beside the sentence it writes. */
+  .ax-reads {
+    text-align: right; white-space: nowrap;
+    font-size: 12px; color: var(--ds-text);
+  }
+  .ax-reads__off { color: var(--ds-text-subtle); }
+  .ax-reads__q { color: var(--ds-text-muted); font-style: italic; }
+  @media (max-width: 900px) { .ax-reads { display: none; } }
 </style>
 {% endblock %}
 
@@ -776,12 +805,14 @@
             <span class="dsec-act">
               <span class="ax-tip">
                 <span class="ax-tip__btn" tabindex="0" role="img"
-                      aria-label="What Optional and Automatic mean"
+                      aria-label="What Available and Required mean"
                       aria-describedby="ax-tierkey-body">i</span>
                 <span class="ax-tip__body" id="ax-tierkey-body" role="tooltip">
-                  <b>Optional</b> shows the item in members' Library — they add it
-                  themselves. <b>Automatic</b> puts it in their workspace on the next
-                  sync. Admins can always reach everything regardless of grants.
+                  The grant already gave access — everyone in this group can query it
+                  now. This only decides the copy: <b>Required</b> is permanent and
+                  always downloaded; <b>Available</b> leaves the person one choice,
+                  keep a local copy or not. Admins can always reach everything regardless
+                  of grants.
                 </span>
               </span>
             </span>
@@ -1254,6 +1285,36 @@
         ? ` <span class="ax-chip warn" style="padding:1px 8px;font-size:11px;" title="No group can see this — indexed but invisible.">&#9888; nobody</span>`
         : "";
 
+    /* What this row becomes in the granted person's Library. The admin sets
+       a tier while looking at the sentence it writes on the other end —
+       which is the only place the vocabulary can be kept honest, because
+       nothing in the repo tests language. Words are the Library's, not
+       invented here. */
+    const READS = {
+      data_package:       { required: "Required by your admin", available: "Keep a local copy" },
+      memory_domain:      { required: "Required by your admin", available: "Keep a local copy" },
+      memory_item:        { required: "Required by your admin", available: "Keep a local copy" },
+      marketplace_plugin: { required: "Installed · required",   available: "Install" },
+      store_entity:       { required: "Installed · required",   available: "Install" },
+      recipe:             { any: "Ask Agnes" },
+      data_app:           { any: "Open" },
+      agent:              { any: "Use as template" },
+      semantic_model:     { any: "shapes the answer", quiet: true },
+      collection:         { any: "citable", quiet: true },
+      corpus_file:        { any: "citable", quiet: true },
+      knowledge_digest:   { any: "citable", quiet: true },
+      table:              { any: "reached through a package", quiet: true },
+      chat:               { any: "not a Library row", quiet: true },
+      slack_channel:      { any: "not a Library row", quiet: true },
+    };
+    const readsAs = (typeKey, tier) => {
+      if (!tier) return `<span class="ax-reads__off">not granted</span>`;
+      const m = READS[typeKey];
+      if (!m) return "";
+      const text = m.any || m[tier] || "";
+      return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
+    };
+
     const itemRow = (t, i) => {
       const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
       const tier = grant ? (grant.requirement === "required" ? "required" : "available") : null;
@@ -1270,20 +1331,21 @@
         </td>
         <td class="ax-acc">
           <span class="fbar-seg ax-tier" ${grant ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
-            <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available" title="available">Optional</button>
-            <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required" title="required">Automatic</button>
+            <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available" title="available">Available</button>
+            <button type="button" class="fbar-seg__btn ${tier === "required" ? "is-active" : ""}" data-tier="required" title="required">Required</button>
           </span>
         </td>
+        <td class="ax-reads">${readsAs(t.type_key, tier)}</td>
       </tr>`;
     };
 
     const itemTable = (t, items) => `
       <table class="data-table data-table--compact">
-        <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Item</th><th class="ax-acc">Access</th></tr></thead>
+        <thead><tr><th class="ax-chk" aria-label="Granted"></th><th>Item</th><th class="ax-acc">Admin control</th><th class="ax-reads">What the person reads</th></tr></thead>
         <tbody>${items.map((i) => itemRow(t, i)).join("")}</tbody>
       </table>`;
 
-    const sections = types.map((t) => {
+    const typeHtml = (t) => {
       const nested = isNested(t);
       const blocks = (t.blocks || []).map((b) => {
         const bItems = (b.items || []).map((i) => ({ ...i, _block: b.name }));
@@ -1352,6 +1414,47 @@
       <details class="ax-sec" ${lead || narrowed ? "open" : ""}>${head(count)}
         <div class="ax-sec__body${nested ? " ax-sec__body--nested" : ""}">${body}</div>
       </details>`;
+    };
+
+    /* Types render under the family they declare — Knowledge and
+       Capabilities are the Library's own two tabs, so an admin granting a
+       thing and the person receiving it are looking at the same taxonomy.
+       Surfaces is the third: a chat and a Slack channel are where a group
+       MEETS Agnes, not something it holds, and filing them under either
+       Library tab would be a lie about what they are.
+
+       The mapping is server-side (`ResourceTypeSpec.family`); this reads it
+       rather than keeping a second copy that drifts the first time someone
+       registers a resource type. `overview.families` carries the section
+       copy, in render order, so a family whose types are all filtered away
+       still says so instead of vanishing. */
+    const byFamily = new Map();
+    for (const t of types) {
+      const html = typeHtml(t);
+      if (!html) continue;
+      const key = t.family || "knowledge";
+      if (!byFamily.has(key)) byFamily.set(key, []);
+      byFamily.get(key).push(html);
+    }
+    const families = (overview.families || []).length
+      ? overview.families
+      : [{ key: "knowledge", display_name: "Knowledge", blurb: "" }];
+    const sections = families.map((f) => {
+      const parts = byFamily.get(f.key) || [];
+      // Under a filter, an empty family is noise — the view collapsed to the
+      // answer and a header over nothing is not part of the answer.
+      if (!parts.length && narrowed) return "";
+      const inner = parts.length
+        ? parts.join("")
+        : `<div class="ax-empty" style="padding-left:22px;">Nothing granted here yet.</div>`;
+      return `
+      <div class="ax-fam">
+        <div class="ax-fam__hd">
+          <span class="ax-fam__nm">${esc(f.display_name)}</span>
+          ${f.blurb ? `<span class="ax-fam__sub">${esc(f.blurb)}</span>` : ""}
+        </div>
+        ${inner}
+      </div>`;
     }).join("");
 
     // The empty case has two causes and two different next steps: a filter
