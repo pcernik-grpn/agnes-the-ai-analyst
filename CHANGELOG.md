@@ -201,6 +201,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The Add / Share picker is built from the app's own parts.** Its family
+  sections are `.fbar-grouptoggle` — the Library's group header — so a section
+  folds here exactly as it folds there, caret driven off `aria-expanded`. It
+  gains the filter it was missing: `.fbar-seg`, the segmented control every
+  filtered surface uses, offering the kinds actually on offer with their
+  counts. The counts are taken over the whole offerable set rather than the
+  filtered remainder, so every chip keeps describing the set it filters, and
+  the control stays visible once a kind is picked — hiding it whenever one
+  kind remained was a trap that removed the way back to *All*.
 - **The fact strip inside an open group is gone.** It restated the reach and
   the grant count that the group's own row prints two words to the left, and
   carried two things the row did not: the group's purpose and its age. Those

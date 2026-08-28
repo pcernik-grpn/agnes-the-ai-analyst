@@ -1816,6 +1816,24 @@
     max-width: none;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* ── The picker uses the app's own parts ──────────────────────────────
+     Its sections are `.fbar-grouptoggle`, the Library's group header, so a
+     section folds here exactly as it folds there; its filter is `.fbar-seg`,
+     the segmented control every filtered surface uses; and its footer takes
+     `.btn-primary` / `.btn-secondary`, the classes the group drawer uses.
+     (The footer had `btn--primary`, which is not a class this app defines —
+     so those buttons had been rendering unstyled.) */
+  .ax-picker__bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .ax-picker__find { flex: 1 1 16rem; min-width: 0; }
+  .ax-picker__kinds { flex: 0 0 auto; flex-wrap: wrap; }
+  .ax-picker__kinds[hidden] { display: none; }
+
+  .ax-picker__fam { border-top: 1px solid var(--ds-border-light); }
+  .ax-picker__fam:first-child { border-top: 0; }
+  .ax-picker__fam > .fbar-grouptoggle { padding: 9px 4px; }
+  /* Folding hides the rows, never the header — the count is the reason to
+     unfold, so it has to survive the fold. */
+  .ax-picker__fam.is-shut .ax-pk-r { display: none; }
 </style>
 {% endblock %}
 
@@ -3905,7 +3923,11 @@
      bundle (opened from a bundle's + Add in the By bundle view). The same
      overlay, the same Apply, the same grant rows written either way — a
      grant has no direction, only the question you arrived with does. */
-  let pickerState = { mode: "resources", group: null, bundle: null, chosen: new Set(), q: "" };
+  let pickerState = {
+    mode: "resources", group: null, bundle: null, chosen: new Set(), q: "",
+    kind: "",                 //: "" = every kind
+    collapsed: new Set(),     //: families folded away, by key
+  };
 
   function buildPicker() {
     if (pickerEls) return pickerEls;
@@ -3924,15 +3946,18 @@
       '    <button type="button" class="ds-drawer__x" data-pk-close aria-label="Close">&times;</button>' +
       '  </div>' +
       '  <div class="ds-drawer__body">' +
-      '    <div class="fbar__search ax-picker__find">' +
-      '      <input type="search" data-pk="q" placeholder="Search everything grantable…" aria-label="Search what to add">' +
+      '    <div class="ax-picker__bar">' +
+      '      <div class="fbar__search ax-picker__find">' +
+      '        <input type="search" data-pk="q" placeholder="Search everything grantable…" aria-label="Search what to add">' +
+      '      </div>' +
+      '      <span class="fbar-seg ax-picker__kinds" data-pk="kinds" role="group" aria-label="Filter by kind"></span>' +
       '    </div>' +
       '    <div class="ax-picker__list" data-pk="list"></div>' +
       '  </div>' +
       '  <div class="ds-drawer__foot">' +
       '    <span class="ax-picker__count" data-pk="count">Nothing selected</span>' +
-      '    <button type="button" class="btn" data-pk-close>Cancel</button>' +
-      '    <button type="button" class="btn btn--primary" data-pk-apply disabled>Apply</button>' +
+      '    <button type="button" class="btn btn-secondary" data-pk-close>Cancel</button>' +
+      '    <button type="button" class="btn btn-primary" data-pk-apply disabled>Apply</button>' +
       '  </div>' +
       '</div>';
     document.body.appendChild(root);
@@ -3948,6 +3973,20 @@
     root.addEventListener("click", async (e) => {
       if (e.target.closest("[data-pk-close]")) { closePicker(); return; }
       if (e.target.closest("[data-pk-apply]")) { await applyPicker(); return; }
+      const fam = e.target.closest("[data-pk-fam]");
+      if (fam) {
+        const key = fam.dataset.pkFam;
+        if (pickerState.collapsed.has(key)) pickerState.collapsed.delete(key);
+        else pickerState.collapsed.add(key);
+        paintPicker();
+        return;
+      }
+      const kindBtn = e.target.closest("[data-pk-kind]");
+      if (kindBtn) {
+        pickerState.kind = kindBtn.dataset.pkKind || "";
+        paintPicker();
+        return;
+      }
       const row = e.target.closest("[data-pk-item]");
       if (row) {
         const key = row.dataset.pkItem;
@@ -3984,6 +4023,7 @@
           if (grantOf(pickerState.group, t.type_key, i.resource_id)) continue;
           const hay = `${i.name || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
+          if (pickerState.kind && t.type_key !== pickerState.kind) continue;
           const fam = t.family || "knowledge";
           if (!out.has(fam)) out.set(fam, []);
           out.get(fam).push({ t, i, block: (b.name && b.name !== t.type_display) ? b.name : "" });
@@ -4007,12 +4047,18 @@
       els.list.innerHTML = families.map((f) => {
         const rows = cands.get(f.key) || [];
         if (!rows.length) return "";
+        /* The Library's own group toggle, so a section folds here exactly as
+           it folds there — caret driven off `aria-expanded`, the component
+           owning layout and this page owning only the vocabulary inside it. */
+        const shut = pickerState.collapsed.has(f.key);
         return `
-        <div class="ax-picker__fam">
-          <div class="ax-fam__hd">
-            <span class="ax-fam__nm">${esc(f.display_name)}</span>
-            <span class="ax-fam__n">${rows.length}</span>
-          </div>
+        <div class="ax-picker__fam${shut ? " is-shut" : ""}">
+          <button type="button" class="fbar-grouptoggle" data-pk-fam="${esc(f.key)}"
+                  aria-expanded="${shut ? "false" : "true"}">
+            <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="fbar-group__title">${esc(f.display_name)}</span>
+            <span class="fbar-group__n">${rows.length}</span>
+          </button>
           ${rows.map(({ t, i, block }) => {
             const key = `${t.type_key}:${i.resource_id}`;
             const on = pickerState.chosen.has(key);
@@ -4028,6 +4074,38 @@
         </div>`;
       }).join("");
     }
+    /* The filter offers the kinds that are actually in front of you, with
+       their counts — a filter listing kinds this group could never be
+       offered is a filter that lies about the set. */
+    /* Counted over everything the group could be offered, not over what the
+       current filter left behind — otherwise every chip reads "0" except the
+       one that is active, and the filter stops describing the set it filters. */
+    const kinds = new Map();
+    const wasKind = pickerState.kind;
+    pickerState.kind = "";
+    for (const list of pickerCandidates().values()) {
+      for (const { t } of list) kinds.set(t.type_key, (kinds.get(t.type_key) || 0) + 1);
+    }
+    pickerState.kind = wasKind;
+    const kindsEl = els.root.querySelector('[data-pk="kinds"]');
+    if (kindsEl) {
+      const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
+      const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
+      kindsEl.innerHTML = [
+        `<button type="button" class="fbar-seg__btn${pickerState.kind ? "" : " is-active"}" data-pk-kind="">All</button>`,
+        ...[...kinds.keys()]
+          .sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
+          .map((k) => `<button type="button" class="fbar-seg__btn${pickerState.kind === k ? " is-active" : ""}"
+                          data-pk-kind="${esc(k)}">${esc(label.get(k) || k)}
+                          <span class="fbar-seg__n">${kinds.get(k)}</span></button>`),
+      ].join("");
+      /* Hidden only when there is nothing to choose between AND nothing is
+         chosen. Hiding it whenever one kind remains was a trap: picking a
+         kind leaves one kind in the set, so the control removed itself and
+         took the way back to All with it. */
+      kindsEl.hidden = !pickerState.kind && kinds.size < 2;
+    }
+
     const n = pickerState.chosen.size;
     els.count.textContent = n ? `${n} selected` : "Nothing selected";
     els.apply.disabled = !n;
@@ -4073,7 +4151,8 @@
 
   function openBundlePicker(typeKey, resourceId, label) {
     const els = buildPicker();
-    pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId }, chosen: new Set(), q: "" };
+    pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId },
+                    chosen: new Set(), q: "", kind: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search groups…";
     els.root.querySelector("#pk-title").textContent = `Share ${label}`;
@@ -4087,7 +4166,12 @@
   function openPicker(groupId) {
     const els = buildPicker();
     const g = (overview.groups || []).find((x) => x.id === groupId);
-    pickerState = { mode: "resources", group: groupId, bundle: null, chosen: new Set(), q: "" };
+    // Every field, every time: the two views reset this wholesale, and a
+    // literal that forgets `kind` or `collapsed` leaves the painter reading
+    // `.has` off undefined — which is a blank drawer, not an error anyone
+    // sees.
+    pickerState = { mode: "resources", group: groupId, bundle: null,
+                    chosen: new Set(), q: "", kind: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search everything grantable…";
     els.root.querySelector("#pk-title").textContent = "Add to this group";
