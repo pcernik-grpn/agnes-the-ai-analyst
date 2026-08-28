@@ -3168,10 +3168,18 @@ class TestSemanticLayerSmoke:
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
 
-    def test_apply_branches_on_authority(self, seeded_app_both):
+    def test_apply_branches_on_authority(self, seeded_app_both, monkeypatch):
         """The one write surface (chat-first authoring): an admin's document
         applies directly; a non-admin's lands in the moderation queue and
-        never touches ``semantic_models`` before approval."""
+        never touches ``semantic_models`` before approval.
+
+        The non-admin half files into the STUDIO's suggestion queue, so it
+        reads ``get_studio_enabled()`` — off by default since the admin cleanup
+        retired that surface, which 403s the branch. Turned on here because the
+        branching is what this smoke covers; the disabled behavior is
+        ``tests/test_semantic_apply.py::test_non_admin_branch_respects_studio_toggle``.
+        """
+        monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
         c = seeded_app_both["client"]
         doc = _SEMANTIC_DOC.replace("smoke_model", "apply_model")
 
