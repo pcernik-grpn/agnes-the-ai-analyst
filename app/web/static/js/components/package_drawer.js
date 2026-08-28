@@ -795,7 +795,11 @@
           name: els.name.value || '',
           description: els.desc.value || '',
           tables: Array.from(st.tablesSelected),
-          groups: Array.from(st.grantsOriginal.keys()),
+          // What is TICKED, not only what was already saved. `grantsOriginal`
+          // is the edit-mode baseline and is empty in create mode, so sending
+          // it meant the conversation never saw the groups on screen — and
+          // kept re-proposing ones the admin had already accepted.
+          groups: chosenGrants().map(function (g) { return g.group_id; }),
         },
       }),
     }).then(function (body) {
@@ -824,10 +828,36 @@
       patch.tables.forEach(function (id) { st.tablesSelected.add(id); });
       renderTables();
     }
-    if (Array.isArray(patch.groups)) {
-      patch.groups.forEach(function (id) {
-        var box = els.root.querySelector('[data-pdw-group="' + id + '"]');
-        if (box && !box.checked) { box.checked = true; }
+    if (Array.isArray(patch.groups) && patch.groups.length) {
+      /* Two things were wrong here and each alone was enough to drop the
+         builder's proposal on the floor:
+
+         the selector named `[data-pdw-group]`, an attribute nothing emits —
+         a group row is `[data-group-id]` wrapping an unlabelled checkbox;
+
+         and in CREATE mode the rows do not exist yet at all. Groups are
+         hydrated lazily, only when the admin opens the access disclosure
+         (see hydrateGroups' note on why), so a patch arriving before that
+         had nothing to tick even with the right selector.
+
+         So: fetch the rows if they are not there, then tick, then open the
+         disclosure — a box ticked inside a collapsed <details> is a silent
+         change to who can reach the data, which is the one thing on this
+         panel that must never happen quietly. */
+      // Compared against the attribute rather than interpolated into a
+      // selector: a group id is server data and may hold a quote, which
+      // would break the selector (or worse) — and there is no CSS.escape
+      // to lean on in the browsers this ships to.
+      var wanted = {};
+      patch.groups.forEach(function (id) { wanted[String(id)] = true; });
+      Promise.resolve(hydrateGroups()).then(function () {
+        var ticked = 0;
+        els.groups.querySelectorAll('[data-group-id]').forEach(function (row) {
+          if (!wanted[row.getAttribute('data-group-id')]) return;
+          var box = row.querySelector('input[type="checkbox"]');
+          if (box && !box.checked) { box.checked = true; ticked += 1; }
+        });
+        if (ticked && els.access && !els.access.open) els.access.open = true;
       });
     }
   }
@@ -1003,11 +1033,13 @@
      package's own page or a group's Access tab, and this is a request the
      collapsed state should not have made. */
 
+  /* Returns a promise so a caller that needs the ROWS (not just the paint)
+     can wait — `applyPatch` ticks boxes that do not exist until this lands. */
   function hydrateGroups() {
-    if (st.groupsLoaded) return;
+    if (st.groupsLoaded) return Promise.resolve();
     st.groupsLoaded = true;
     els.groups.innerHTML = '<p class="ds-drawer__empty">Loading groups…</p>';
-    api(GROUPS_API).then(function (body) {
+    return api(GROUPS_API).then(function (body) {
       var groups = Array.isArray(body) ? body : (body && body.groups) || [];
       if (!groups.length) {
         els.groups.innerHTML = '<p class="ds-drawer__empty">No groups yet — make one in '

@@ -404,6 +404,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **A group the package builder proposed never reached the panel.** `applyPatch`
+  ticked group rows by querying `[data-pdw-group]`, an attribute nothing in the
+  product emits — a row is `[data-group-id]` wrapping an unlabelled checkbox — and
+  even with the right selector there was nothing to tick, because group rows are
+  hydrated only when the admin opens the access disclosure and the builder's own
+  mode is create. Compounding it, the turn reported the groups from
+  `st.grantsOriginal`, the edit-mode baseline of already-saved grants, which is
+  empty in create mode, so the conversation kept re-proposing groups the admin had
+  already accepted. The patch now fetches the rows, matches by attribute (a group
+  id is server data and may hold a quote, so it is compared rather than
+  interpolated into a selector), and opens the access disclosure when it ticks
+  anything — a box ticked inside a collapsed `<details>` is a silent change to who
+  can reach the data. `chosenGrants()`, which Save reads, was correct throughout,
+  which is why the break was invisible: ticking by hand worked, the builder's
+  proposal did not.
 - **`POST /api/store/entities/from-components` gained a CLI and an MCP surface**
   — `agnes store compose <name> --add <id> --add <id>` and the
   `store_compose_plugin` tool — matching its sibling `from-markdown` rather than
