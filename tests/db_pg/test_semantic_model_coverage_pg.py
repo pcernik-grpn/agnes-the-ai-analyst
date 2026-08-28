@@ -47,7 +47,7 @@ def pg_state(pg_engine, tmp_path, monkeypatch):
     return pg_engine
 
 
-def _connection(conn_id: str, *, source_type: str, name: str) -> str:
+def _connection(conn_id: str, *, source_type: str, name: str, is_default: bool = False) -> str:
     from src.repositories import source_connections_repo
 
     source_connections_repo().create(
@@ -55,7 +55,7 @@ def _connection(conn_id: str, *, source_type: str, name: str) -> str:
         name=name,
         source_type=source_type,
         config={},
-        is_default=False,
+        is_default=is_default,
         created_by="test",
     )
     return conn_id
@@ -130,6 +130,23 @@ class TestMetrics:
         _connection("conn-a", source_type="bigquery", name="Warehouse")
 
         assert _domains(compute_cross_domain_coverage(), "conn-a")["metrics"]["status"] == "not_applicable"
+
+    def test_a_null_connection_id_falls_back_to_the_source_types_default_connection(self, pg_state):
+        """Regression: every Snowflake table-registration path (CLI, web UI)
+        left ``connection_id`` NULL, so such a table used to land in the
+        synthetic "no connection" bucket -- a real, populated Snowflake
+        connection reported ``not_applicable``/no tables even though it had
+        registered tables. NULL now falls back to the source_type's default
+        connection, mirroring
+        ``src/connection_resolver.py::resolve_connection``."""
+        from src.semantic.coverage import compute_cross_domain_coverage
+
+        _connection("conn-sf", source_type="snowflake", name="Warehouse", is_default=True)
+        _table("orders", connection_id=None, source_type="snowflake")
+        _metric("revenue/orders", table_name="orders")
+
+        domains = _domains(compute_cross_domain_coverage(), "conn-sf")
+        assert domains["metrics"]["status"] == "ok"
 
     def test_a_join_metric_covers_both_of_its_tables(self, pg_state):
         """A metric binds through ``table_name`` OR the multi-table ``tables``

@@ -118,6 +118,25 @@ class TestResolveDatasetTable:
         resolved = resolve_dataset_table({"source": "RAW.ORDERS"}, "manual")
         assert resolved == "raw_orders"
 
+    def test_snowflake_shaped_source_resolves_case_insensitively(self, system_db):
+        """Snowflake composes a dataset's `source` from its information-schema
+        identifiers, which come back UPPERCASE unless the underlying object
+        was created quoted (`connectors/snowflake/semantic_ossie.py::
+        _compose_dataset`); a table registered with lowercase `bucket`/
+        `source_table` must still resolve against an uppercase document
+        identifier for the very same table."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="raw", source_table="orders")
+        resolved = resolve_dataset_table({"source": "ESHOP_DEMO.RAW.ORDERS"}, "manual")
+        assert resolved == "raw_orders"
+
+    def test_snowflake_shaped_source_resolves_case_insensitively_reverse(self, system_db):
+        """Same case-folding, opposite direction: a table registered with
+        UPPERCASE `bucket`/`source_table` must resolve against a lowercase
+        document identifier."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="RAW", source_table="ORDERS")
+        resolved = resolve_dataset_table({"source": "eshop_demo.raw.orders"}, "manual")
+        assert resolved == "raw_orders"
+
     def test_literal_match_still_wins_over_generic_fallback(self, system_db):
         """Regression guard: an existing Agnes-native `dataset.source` that
         already matches a `table_registry.id`/`.name` literally must resolve
@@ -215,6 +234,29 @@ class TestTablesWithoutSemanticCoverage:
         registered with the matching `(bucket, source_table)`, not reported
         as uncovered forever."""
         _register("raw_orders", "raw_orders", source_type="snowflake", bucket="RAW", source_table="ORDERS")
+        _upsert_model(
+            slug="eshop",
+            source="manual",
+            source_ref=None,
+            document={
+                "semantic_model": [
+                    {
+                        "name": "eshop",
+                        "datasets": [{"name": "orders", "source": "ESHOP_DEMO.RAW.ORDERS", "fields": []}],
+                    }
+                ]
+            },
+        )
+        ids = {r["id"] for r in tables_without_semantic_coverage()}
+        assert "raw_orders" not in ids
+
+    def test_table_with_case_mismatched_snowflake_dataset_is_covered(self, system_db):
+        """The bug this task fixes: a table registered with lowercase
+        `bucket`/`source_table` (an admin's own convention) must still be
+        recognized as covered by a Snowflake document, whose composed
+        `dataset.source` is uppercase — not reported as uncovered forever
+        because the two sides disagree only in case."""
+        _register("raw_orders", "raw_orders", source_type="snowflake", bucket="raw", source_table="orders")
         _upsert_model(
             slug="eshop",
             source="manual",

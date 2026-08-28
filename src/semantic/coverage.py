@@ -406,9 +406,29 @@ def compute_cross_domain_coverage(source_id: str | None = None) -> dict[str, Any
     terms = glossary_repo().list(limit=100_000)
 
     bound_tables = _metric_tables(metrics)
+
+    # Registration paths for some source types (e.g. Snowflake, before this
+    # fix) can leave `connection_id` NULL on a table that nonetheless has a
+    # real connection backing its source_type — the same fallback
+    # `src/connection_resolver.py::resolve_connection` uses at query time
+    # (NULL -> the source_type's default connection). Without it, every
+    # such table lands in the synthetic "no connection" bucket below and a
+    # real, populated connection incorrectly reports no tables. Built from
+    # the already-fetched `connections` list (not `get_default()` per table)
+    # to avoid N extra repo round-trips; mirrors `get_default()`'s own
+    # `ORDER BY created_at LIMIT 1` tie-break.
+    default_conn_id_by_source_type: dict[str, str] = {}
+    for conn in sorted(connections, key=lambda c: c.get("created_at") or ""):
+        source_type = conn.get("source_type")
+        if conn.get("is_default") and source_type and source_type not in default_conn_id_by_source_type:
+            default_conn_id_by_source_type[source_type] = conn["id"]
+
     tables_by_connection: dict[str | None, list[dict[str, Any]]] = {}
     for table in tables:
-        tables_by_connection.setdefault(table.get("connection_id"), []).append(table)
+        conn_id = table.get("connection_id")
+        if conn_id is None:
+            conn_id = default_conn_id_by_source_type.get(table.get("source_type"))
+        tables_by_connection.setdefault(conn_id, []).append(table)
 
     # `glossary_terms.source_ref` carries TWO namespaces, and reading it as one
     # made this column lie. The Keboola metastore sync stamps the
@@ -480,8 +500,35 @@ def _sync_status(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _configured_databricks_host() -> str | None:
+    """The currently-configured Databricks workspace host, independent of
+    whether a token can be resolved for it.
+
+    :func:`connectors.databricks.semantic_layer.resolve_databricks_settings`
+    returns ``None`` whenever the token isn't resolvable (env var unset,
+    vault unreachable) — correct for the sync path, which cannot do anything
+    without a token, but wrong for a liveness check: a health-report process
+    that simply lacks Databricks credentials would then flag every live
+    ``databricks_metrics`` model as orphaned, reviving the exact false-orphan
+    bug this module exists to fix. Liveness only needs the host, so this
+    mirrors the same row-first / else-legacy-instance-config order without
+    ever touching the token or warehouse id.
+    """
+    from src.connection_resolver import resolve_source_connection
+
+    connection = resolve_source_connection("databricks")
+    if connection is not None:
+        host = str((connection.get("config") or {}).get("host") or "").strip()
+        return host or None
+
+    from app.instance_config import get_value
+
+    host = str(get_value("data_source", "databricks", "host", default="") or "").strip()
+    return host or None
+
+
 def _orphaned_models(models: list[dict[str, Any]], known_source_ids: set) -> list[dict[str, Any]]:
-    """Models whose ``source_ref`` names no live ``semantic_sources`` row.
+    """Models whose ``source_ref`` names no live upstream.
 
     ``source='manual'`` models are excluded on purpose: they were never fed by
     a source and have no ``source_ref`` to go stale, so including them would
@@ -490,12 +537,65 @@ def _orphaned_models(models: list[dict[str, Any]], known_source_ids: set) -> lis
     models it fed (K0.12) — this is the source-agnostic successor to the
     retired page's Keboola-only "orphaned" count (see the module docstring),
     over the canonical document instead of the flat projections.
+
+    "Live" does not mean the same thing for every ``source``: only documents
+    synced through the registered semantic-source flow (git/upload/
+    connection) ever get a ``semantic_sources`` row at all. ``keboola_
+    metastore`` and ``databricks_metrics`` (see each connector's module
+    docstring) stamp ``source_ref`` with something else entirely — a
+    ``source_connections.id`` and a warehouse hostname, respectively — so
+    checking either against ``known_source_ids`` always misses and flags
+    every model those two providers ever produce. The two closures below
+    dispatch each ``source`` to the check that matches what it actually
+    stamps — the same branching shape as
+    :func:`src.semantic.projection.resolve_dataset_table`, a different
+    question over the same ``source`` dispatch — each resolving its shared,
+    per-report state (the live Keboola connection ids; the configured
+    Databricks host) lazily on first use and reusing it for every remaining
+    model of that source, rather than re-querying per model.
     """
-    return [
-        {"model_id": m["id"], "slug": m.get("slug"), "source": m.get("source"), "source_ref": m.get("source_ref")}
-        for m in models
-        if (m.get("source") or "manual") != "manual" and m.get("source_ref") not in known_source_ids
-    ]
+    live_keboola_connection_ids: set | None = None
+    live_databricks_ref: str | None = None
+    databricks_host_resolved = False
+
+    def keboola_is_live(source_ref: str | None) -> bool:
+        nonlocal live_keboola_connection_ids
+        if source_ref is None:
+            return False
+        if live_keboola_connection_ids is None:
+            from src.repositories import source_connections_repo
+
+            live_keboola_connection_ids = {c["id"] for c in source_connections_repo().list(source_type="keboola")}
+        return source_ref in live_keboola_connection_ids
+
+    def databricks_is_live(source_ref: str | None) -> bool:
+        nonlocal live_databricks_ref, databricks_host_resolved
+        if source_ref is None:
+            return False
+        if not databricks_host_resolved:
+            databricks_host_resolved = True
+            host = _configured_databricks_host()
+            if host:
+                from connectors.databricks.semantic_layer import _source_ref_for_host
+
+                live_databricks_ref = _source_ref_for_host(host)
+        return live_databricks_ref is not None and source_ref == live_databricks_ref
+
+    checks: dict[str, Any] = {"keboola_metastore": keboola_is_live, "databricks_metrics": databricks_is_live}
+
+    orphans = []
+    for m in models:
+        source = m.get("source") or "manual"
+        if source == "manual":
+            continue
+        source_ref = m.get("source_ref")
+        check = checks.get(source)
+        is_live = check(source_ref) if check is not None else source_ref in known_source_ids
+        if not is_live:
+            orphans.append(
+                {"model_id": m["id"], "slug": m.get("slug"), "source": m.get("source"), "source_ref": source_ref}
+            )
+    return orphans
 
 
 def _invalid_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:

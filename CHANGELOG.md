@@ -699,6 +699,68 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   provenance history. The four mutating endpoints now share one
   `_is_source_owned` predicate instead of duplicating the check.
 
+- The generic (non-Keboola) semantic-layer table resolver
+  (`src/semantic/projection.py::_generic_table_lookup`/
+  `_resolve_generic_table_row`) now case-folds both sides of the
+  `(bucket, source_table)` comparison. A Snowflake document composes its
+  dataset identifiers from information-schema names, which come back
+  UPPERCASE unless the underlying object was created quoted; a table
+  registered with a different case (an admin's own convention, or Keboola's
+  lowercase norm) silently failed to bind, leaving `agnes semantic-model
+  coverage`/`/admin/semantic-layer` reporting the table uncovered and its
+  metrics unbound even after a correctly-shaped identifier matched in every
+  other respect.
+
+- **Snowflake table registrations were never linking `connection_id`**, so
+  `compute_cross_domain_coverage` bucketed every Snowflake table under the
+  synthetic "no connection" group and a Snowflake connection with registered
+  tables still reported `not_applicable`/no tables. The CLI (`agnes admin
+  register-table` / `update-table`) and the `/admin/tables` register modal
+  now send `--connection-id` / a connection picker for Snowflake, matching
+  the Keboola flow. `PUT /api/admin/registry/{id}` also newly accepts
+  `connection_id`, so an existing NULL row can be re-pinned without delete +
+  recreate. `compute_cross_domain_coverage` additionally falls back a NULL
+  `connection_id` to its source_type's default connection (same rule
+  `src/connection_resolver.py::resolve_connection` uses at query time),
+  reducing blast radius for any other source type hitting the same gap.
+
+- Semantic-layer health's `orphaned_models` check no longer flags every
+  Keboola- and legacy-Databricks-sourced model as disconnected. It compared
+  every non-manual model's `source_ref` against `semantic_sources.id`, but
+  the Keboola metastore sync stamps `source_ref` with the `source_connections.id`
+  it synced from, and the legacy Databricks metrics sync stamps it with the
+  warehouse hostname — neither ever writes a `semantic_sources` row, so the
+  check always missed. It now dispatches per model `source` to the liveness
+  check that matches what that provider actually stamps (a live
+  `source_connections` row for Keboola, the currently-configured workspace
+  host for Databricks), falling back to the `semantic_sources` check for
+  everything else.
+
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
 - Chat table-header enhancement (`chat.js`) no longer reinserts a markdown
   table header's text into `innerHTML` unescaped — a stored-XSS sink. Header
   labels now render via `textContent`, keeping the static sort markup trusted.

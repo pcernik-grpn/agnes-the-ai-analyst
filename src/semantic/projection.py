@@ -123,12 +123,17 @@ def _generic_table_lookup() -> dict[tuple[str, str], str]:
     (which is scoped to ``source_type == "keboola"`` and normalizes
     ``source_table`` against a Keboola-only wizard quirk).
 
-    ``--bucket``/``--source-table`` (``cli/commands/admin.py``) are already
-    source-type-agnostic labels: a Snowflake/Databricks row registered as
-    ``--bucket RAW --source-table ORDERS`` stores exactly that — a schema
-    name and a bare table name, no normalization needed. Built fresh once
-    per :func:`project_document` call, same cost posture as the Keboola
-    lookup it sits alongside.
+    Keys are case-folded: ``--bucket``/``--source-table``
+    (``cli/commands/admin.py``) are source-type-agnostic labels stored
+    verbatim at registration time, but a Snowflake dataset's ``source`` is
+    composed from its information-schema identifiers
+    (``connectors/snowflake/semantic_ossie.py::_compose_dataset``), which
+    Snowflake emits UPPERCASE unless the object was created quoted. A
+    registered row and the document's identifier can disagree in case for
+    the very same table, so the comparison must fold both sides rather than
+    assume either preserves a particular case. Built fresh once per
+    :func:`project_document` call, same cost posture as the Keboola lookup
+    it sits alongside.
     """
     from src.repositories import table_registry_repo
 
@@ -138,7 +143,7 @@ def _generic_table_lookup() -> dict[tuple[str, str], str]:
         source_table = row.get("source_table")
         name = row.get("name")
         if bucket and source_table and name:
-            lookup.setdefault((bucket, source_table), name)
+            lookup.setdefault((bucket.casefold(), source_table.casefold()), name)
     return lookup
 
 
@@ -156,6 +161,8 @@ def _resolve_generic_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
     ``bucket="RAW"``, ``source_table="ORDERS"``, ignoring the leading
     ``ESHOP_DEMO`` database/catalog segment. A 1-segment identifier (no dot
     at all) never matches, mirroring :func:`resolve_table_name`'s own guard.
+    The split segments are case-folded before the lookup, matching
+    :func:`_generic_table_lookup`'s case-folded keys.
     """
     from src.repositories import table_registry_repo
 
@@ -163,7 +170,7 @@ def _resolve_generic_table_row(table_ref: str, lookup: dict) -> Optional[dict]:
     if len(parts) < 2:
         return None
     bucket, source_table = parts[-2], parts[-1]
-    name = lookup.get((bucket, source_table))
+    name = lookup.get((bucket.casefold(), source_table.casefold()))
     if not name:
         return None
     return table_registry_repo().get_by_name(name)

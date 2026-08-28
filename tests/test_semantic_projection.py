@@ -345,6 +345,22 @@ class TestTableBinding:
         assert row["sql"].startswith("SELECT ")
         assert "SUM(amount)" in row["sql"]
 
+    def test_a_case_mismatched_snowflake_binding_still_resolves(self, system_db):
+        """Snowflake's information-schema identifiers come back UPPERCASE
+        unless the object was created quoted, but a table can be registered
+        with any case an admin chose — the generic path must fold case on
+        both sides rather than require them to already agree."""
+        _register_table("snowflake", "raw", "orders", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.ORDERS"}, table_id="ESHOP_DEMO.RAW.ORDERS"),
+            source="manual",
+            source_ref=None,
+        )
+
+        row = _only_metric(source="manual", source_ref=None)
+        assert row["table_name"] == "snowflake_orders"
+
     def test_a_keboola_shaped_binding_still_resolves_when_other_tables_are_registered(self, system_db):
         """Regression guard: registering a non-Keboola table alongside a
         Keboola one must not change the Keboola path's own resolution."""

@@ -273,6 +273,14 @@ def register_table(
         "--dry-run",
         help="Run validation + (BQ) source-side check without writing to the registry",
     ),
+    connection_id: str = typer.Option(
+        None,
+        "--connection-id",
+        help=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type."
+        ),
+    ),
 ):
     """Register a single table.
 
@@ -374,6 +382,8 @@ def register_table(
         payload["source_query"] = source_query
     if sync_schedule:
         payload["sync_schedule"] = sync_schedule
+    if connection_id is not None:
+        payload["connection_id"] = connection_id
 
     # v26 sync-strategy support fields. Always send sync_strategy (it has a
     # default). Send the rest only when the operator set them — empty/None
@@ -785,6 +795,14 @@ def update_table(
             "grant analysts access to the table."
         ),
     ),
+    connection_id: str = typer.Option(
+        None,
+        "--connection-id",
+        help=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type."
+        ),
+    ),
 ):
     """Update a registered table.
 
@@ -849,13 +867,15 @@ def update_table(
         payload["access_policy_note"] = policy_note
     if policy_mapping is not None:
         payload["policy_mapping"] = policy_mapping
+    if connection_id is not None:
+        payload["connection_id"] = connection_id
 
     if not payload:
         typer.echo(
             "No fields supplied. Pass at least one of --name, --bucket, "
             "--source-table, --query-mode, --query, --description, "
             "--sync-schedule, --source-type, --server-only, --policy, "
-            "--policy-note, --policy-mapping.",
+            "--policy-note, --policy-mapping, --connection-id.",
             err=True,
         )
         raise typer.Exit(2)
