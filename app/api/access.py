@@ -207,6 +207,13 @@ async def access_overview(
             # page was reloaded from a different endpoint. Same default the
             # single-grant response uses.
             "requirement": r.get("requirement") or "available",
+            # WHO wrote the grant. Both writers record it — the admin API
+            # stores an email, `library_sharing` (an owner sharing from the
+            # Library) stores a user id — so the page can say where a row
+            # came from instead of presenting every grant as if an admin
+            # made it. The two shapes are resolved client-side against the
+            # user list; neither is assumed to be the other.
+            "assigned_by": r.get("assigned_by"),
         }
         for r in grants_repo.list_all()
     ]

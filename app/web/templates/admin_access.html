@@ -780,6 +780,10 @@
   .ax-nobody__hint { color: var(--ds-text-muted); }
   .ax-nobody__more { margin-left: auto; color: var(--ds-text-link); font-weight: 600; }
   .ax-nobody[open] .ax-nobody__more { visibility: hidden; }
+  /* Where a row came from. Not decoration: a grant an owner wrote from the
+     Library and one an admin wrote here are the same row in the same table,
+     and only this line says which hand made it. */
+  .ax-by-who { font-size: 11px; color: var(--ds-text-muted); }
 </style>
 {% endblock %}
 
@@ -1161,6 +1165,23 @@
     return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
   };
 
+  /* Who wrote this grant. Two writers, two shapes: the admin API records an
+     email, the Library's owner-sharing path records a user id. Resolve both
+     against the user list and fall back to whatever is stored — a raw value
+     the admin can still recognise beats an empty cell.
+
+     What this deliberately does NOT do is classify the writer as "admin" or
+     "owner". One column cannot carry that: an admin can share from the
+     Library, and an owner's grant and an admin's grant are the same row.
+     Naming the person is true; naming their role would be a guess. */
+  function whoGranted(grant) {
+    const raw = grant && grant.assigned_by;
+    if (!raw) return "";
+    const hit = (users || []).find((u) => u.id === raw || u.email === raw);
+    if (hit) return hit.name || hit.email || raw;
+    return String(raw).includes("@") ? String(raw).split("@")[0] : raw;
+  }
+
   /* The three numbers a collapsed row is worth reading for. Derived from the
      same grants payload the checkboxes read, so a count can never disagree
      with the rows underneath it. */
@@ -1528,6 +1549,7 @@
         <td class="ax-name">
           <b>${nameHtml}</b>${!isNested(t) && i._block && i._block !== t.type_display ? `<span class="blk"> · ${esc(i._block)}</span>` : ""}${nobodyBadge(t, i)}
           ${i.description ? `<br><span class="desc">${esc(String(i.description).slice(0, 90))}</span>` : ""}
+          ${grant && whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}
         </td>
         <td class="ax-acc">
           <span class="fbar-seg ax-tier" ${grant ? "" : 'aria-disabled="true"'} role="group" aria-label="Access tier">
@@ -2200,7 +2222,8 @@
       <tr data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}" class="is-granted">
         <td class="ax-chk"><input type="checkbox" checked aria-label="Revoke from ${esc(titleOf(g))}"></td>
         <td class="ax-name"><b>${esc(titleOf(g))}</b>
-          <span class="blk"> · ${esc(String(g.member_count ?? 0))} ${(g.member_count ?? 0) === 1 ? "person" : "people"}</span></td>
+          <span class="blk"> · ${esc(String(g.member_count ?? 0))} ${(g.member_count ?? 0) === 1 ? "person" : "people"}</span>
+          ${whoGranted(grant) ? `<br><span class="ax-by-who">granted by ${esc(whoGranted(grant))}</span>` : ""}</td>
         <td class="ax-acc">
           <span class="fbar-seg ax-tier" role="group" aria-label="Access tier">
             <button type="button" class="fbar-seg__btn ${tier === "available" ? "is-active" : ""}" data-tier="available">Available</button>

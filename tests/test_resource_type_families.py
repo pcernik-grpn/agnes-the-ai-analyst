@@ -126,3 +126,33 @@ class TestAccessOverviewCarriesFamilies:
         assert [f["key"] for f in families] == [f.value for f in RESOURCE_FAMILIES]
         for f in families:
             assert f["display_name"].strip() and f["blurb"].strip()
+
+
+class TestGrantsCarryTheirWriter:
+    """A row should be able to say where it came from.
+
+    Both writers record `assigned_by` — the admin API an email, the Library's
+    owner-sharing path a user id — but the snapshot the page reads dropped
+    the column, so every grant looked equally like an admin's doing.
+    """
+
+    def test_overview_grants_expose_assigned_by(self, seeded_app):
+        c = seeded_app["client"]
+        hdr = _auth(seeded_app["admin_token"])
+        made = c.post(
+            "/api/admin/grants",
+            headers=hdr,
+            json={
+                "group_id": c.get("/api/admin/access-overview", headers=hdr).json()["groups"][0]["id"],
+                "resource_type": "chat",
+                "resource_id": "chat",
+                "requirement": "available",
+            },
+        )
+        assert made.status_code in (200, 201), made.text
+
+        grants = c.get("/api/admin/access-overview", headers=hdr).json()["grants"]
+        assert grants, "no grants in the snapshot"
+        assert all("assigned_by" in g for g in grants)
+        mine = [g for g in grants if g["resource_type"] == "chat"]
+        assert mine and mine[0]["assigned_by"], "the writer was not recorded"
