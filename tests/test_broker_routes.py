@@ -292,6 +292,55 @@ def test_admin_read_switch_off_refuses_even_get(broker_app, e2e_env, monkeypatch
     assert r.json().get("detail") == "admin_mutations_require_interactive_auth"
 
 
+def test_no_admin_get_route_mints_a_credential(broker_app):
+    """The brokered admin-READ surface is safe only because "never mutate on
+    GET" holds: `_replay` lets every GET/HEAD admin route through and leans on
+    the method as the read/write boundary. A GET that MINTS something breaks
+    that premise, and breaks it in the worst direction — the chat sandbox runs
+    an agent any document it reads can prompt-inject, so a brokered GET that
+    returns a credential is an exfiltration path, not a theoretical one.
+
+    `GET /admin/chat/{chat_id}/tail-ticket` was exactly that: it minted a live
+    one-shot ticket for `/admin/chat/{chat_id}/tail`, the WebSocket that tails
+    ANY user's session. It is a POST now. This guard is for the next one.
+    """
+    import inspect
+    import re
+
+    from app.api.broker import _ADMIN_READ_METHODS, _ADMIN_PATH_PREFIX, _route_requires_admin
+
+    # Anything that hands a caller a fresh bearer-ish secret. Deliberately
+    # narrow: a CSRF token minted for a rendered form is not this (it is
+    # inert without the session cookie it is bound to).
+    MINTS = re.compile(r"_issue_\w*ticket|_mint_(?!web_csrf)\w+|\bmint_\w*(?:jwt|token|ticket)|create_access_token")
+
+    offenders = []
+    for route in broker_app.routes:
+        methods = getattr(route, "methods", set()) or set()
+        readable = _ADMIN_READ_METHODS & {str(m).upper() for m in methods}
+        if not readable:
+            continue
+        path = getattr(route, "path", "")
+        if not (path.startswith(_ADMIN_PATH_PREFIX) or _route_requires_admin(broker_app, "GET", path)):
+            continue
+        fn = getattr(route, "endpoint", None)
+        if fn is None:
+            continue
+        try:
+            body = inspect.getsource(fn)
+        except (OSError, TypeError):  # pragma: no cover — C/builtin endpoint
+            continue
+        found = MINTS.findall(body)
+        if found:
+            offenders.append(f"{sorted(readable)} {path} -> {sorted(set(found))}")
+
+    assert not offenders, (
+        "these admin routes mint a credential on a READ method, which the "
+        "brokered admin-read surface in app/api/broker.py would hand to a chat "
+        "sandbox; make them POST:\n  " + "\n  ".join(offenders)
+    )
+
+
 def test_anthropic_route_accepts_subpath(broker_app):
     """The Anthropic proxy must match sub-paths — the SDK appends
     ``/v1/messages`` to its base URL, so the real request arrives at

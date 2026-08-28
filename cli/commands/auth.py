@@ -270,7 +270,12 @@ def _whoami_sandbox() -> None:
         typer.echo(f"Warning: server verification returned HTTP {resp.status_code}", err=True)
         raise typer.Exit(1)
     payload = resp.json()
-    typer.echo(f"Email: {email}")
+    # Still the environment's value: /api/me/effective-access answers is_admin
+    # + grants, not an identity, so nothing here confirmed the ADDRESS. Say so
+    # — this command exists because the sandbox was misinforming the agent
+    # about its own identity, and an unqualified line would be the same fault
+    # one level down.
+    typer.echo(f"Email: {email} (from sandbox environment)")
     typer.echo(f"Server: {get_server_url()}")
     typer.echo("Auth: brokered session identity (chat sandbox) — per-request credential, no local token")
     if payload.get("is_admin"):
