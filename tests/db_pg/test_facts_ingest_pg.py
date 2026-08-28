@@ -1062,11 +1062,16 @@ def test_dup_doc_id_indexed_copy_preferred_over_pending_not_deferred(pg_env, rep
     assert report["deferred"] == []
 
 
-def test_dup_doc_id_global_fallback_counter_surfaces_ambiguous_resolution(pg_env, repo):
-    """A claim's doc_id has NO `documents[]` entry in THIS batch, and the
-    corpora this batch's `documents[]` DID declare don't contain it either --
-    resolution falls through to the unrestricted global scan, and the run
-    report must surface that count rather than resolve it silently."""
+def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_rejected(pg_env, repo):
+    """RBAC review (PR #1736): a claim's doc_id has NO `documents[]` entry
+    in THIS batch, and the corpora this batch's `documents[]` DID declare
+    don't contain it either -- it must be REJECTED (typed
+    `ambiguous_cross_collection_doc_id`), never silently written under
+    whatever OTHER, possibly more broadly-granted collection the global
+    scan would have found it in. A caller granted only that other
+    collection must see nothing -- proof nothing was ever written there."""
+    from src.repositories import users_repo
+
     corpus_b = "col_b"
     doc_a = _seed_ready_doc(pg_env, file_id="cf_a5", doc_id="doc_in_a", text="Acme renewed the contract.")
     _seed_collection(collection_id=corpus_b)
@@ -1078,8 +1083,42 @@ def test_dup_doc_id_global_fallback_counter_surfaces_ambiguous_resolution(pg_env
         documents=[{"doc_id": "doc_in_b", "corpus_id": corpus_b}],
         nodes=[_node("engagement:global5", doc_a, "Acme renewed the contract.")],
     )
+    assert report["claims_written"] == 0
+    assert report["subjects_created"] == 1  # the node itself still resolves/creates
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "ambiguous_cross_collection_doc_id"
+    assert report["claims_rejected"][0]["doc_id"] == "doc_in_a"
+
+    users_repo().create(id="dana", email="dana@test.com", name="Dana")
+    _make_group_with_grant(pg_env, group_name="group-a-broad", collection_id=CORPUS_A, member_user_id="dana")
+    dana_view = repo.search({"id": "dana", "email": "dana@test.com"}, type="engagement")
+    assert dana_view["subjects"] == []  # nothing was ever written under col_a either
+
+
+def test_dup_doc_id_tier2_hit_resolves_within_another_batch_declared_corpus(pg_env, repo):
+    """Multi-corpus batch: an UNDECLARED doc_id (no `documents[]` entry of
+    its own) resolves inside one of the OTHER corpora this SAME batch's
+    `documents[]` declared. Corpus-safe (never escapes to a collection the
+    batch never mentioned at all) -- must resolve normally, not reject."""
+    corpus_b = "col_b"
+    _seed_ready_doc(pg_env, file_id="cf_t2_x", doc_id="doc_t2_x", text="X content.")
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_t2_y")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_t2_y", text="Y content.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_t2_y", source_doc_id="doc_t2_y")
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_t2_z")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_t2_z", text="Z content lives in corpus B.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_t2_z", source_doc_id="doc_t2_z")
+
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "doc_t2_x", "corpus_id": CORPUS_A, "stable_id": "cf_t2_x"},
+            {"doc_id": "doc_t2_y", "corpus_id": corpus_b, "stable_id": "cf_t2_y"},
+        ],
+        nodes=[_node("engagement:t2z", "doc_t2_z", "Z content lives in corpus B.")],
+    )
     assert report["claims_written"] == 1
-    assert report.get("claims_resolved_global", 0) >= 1
+    assert report["claims_rejected"] == []
 
 
 def test_document_typed_edge_endpoints_are_untouched_by_doc_id_file_resolution(pg_env, repo):
@@ -1113,7 +1152,6 @@ def test_document_typed_edge_endpoints_are_untouched_by_doc_id_file_resolution(p
     assert report["deferred"] == []
     assert report["subjects_created"] == 2  # both document-entity facts minted fresh
     assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
-    assert report.get("claims_resolved_global", 0) == 0  # no evidence, so no doc_id file resolution ran at all
 
 
 # ===========================================================================

@@ -1923,7 +1923,10 @@ class FactsPgRepository:
                 doc_id_to_corpus[doc_id] = corpus_id
 
         batch_corpus_ids = sorted({corpus_id for corpus_id, _ in doc_declared_pairs})
-        globally_resolved_doc_ids: Set[str] = set()
+        # RBAC review (PR #1736, TCRD-241 follow-up): a doc_id that resolves
+        # ONLY by escaping every corpus THIS batch's `documents[]` declared
+        # is rejected, never written — see the ladder docstring below.
+        ambiguous_doc_ids: Set[str] = set()
 
         def _resolve_doc(doc_id: Optional[str], conn) -> Optional[str]:
             """Corpus-scoped, deterministic doc_id -> corpus_file_id
@@ -1936,11 +1939,24 @@ class FactsPgRepository:
                to one collection, so an omitted-but-already-resolved doc_id
                from the SAME crawl run is overwhelmingly likely to live
                there too.
-            3. Still nothing: fall back to an unrestricted global scan
-               (deterministic ORDER BY corpus_id, corpus_file_id) and
-               remember it — the run report surfaces how many claims leaned
-               on this ambiguous cross-collection path instead of resolving
-               it silently.
+            3a. This batch's `documents[]` declared at LEAST ONE corpus
+                (`batch_corpus_ids` non-empty) but this doc_id isn't
+                anchored in ANY of them: refuse to escape to some OTHER,
+                possibly more broadly-granted corpus — that would grant the
+                claim wider visibility than the producer's batch ever
+                declared (RBAC review PR #1736). A probe checks whether the
+                doc_id resolves ANYWHERE at all, purely to distinguish the
+                rejection reason (`ambiguous_cross_collection_doc_id` — it
+                exists, just outside this batch's scope) from a doc_id that
+                plain doesn't exist (`unresolved_doc_id`, existing
+                behavior) — nothing is ever written on this path.
+            3b. This batch's `documents[]` is EMPTY (no batch-declared scope
+                to escape at all) — the documented "documents may be
+                omitted when every doc_id already resolves" replay flow
+                (spec §7.2). Tier 3 here is the SOLE resolution mechanism by
+                design (dozens of existing callers depend on it), so it
+                still resolves via an unrestricted, deterministically
+                ordered global scan, unchanged from before this review.
             """
             if not doc_id:
                 return None
@@ -1966,6 +1982,16 @@ class FactsPgRepository:
                     doc_id_resolution[(row[0], doc_id)] = row[1]
                     doc_id_to_corpus[doc_id] = row[0]
                     return row[1]
+                # Not anchored in any corpus this batch declared. Probe
+                # (read-only, no write) whether it resolves at all, purely
+                # to pick the rejection reason — never resolve or write it.
+                probe = conn.execute(
+                    sa.text("SELECT 1 FROM corpus_file_sources WHERE source_doc_id = :doc_id LIMIT 1"),
+                    {"doc_id": doc_id},
+                ).first()
+                if probe is not None:
+                    ambiguous_doc_ids.add(doc_id)
+                return None
 
             row = conn.execute(
                 sa.text(
@@ -1982,7 +2008,6 @@ class FactsPgRepository:
                 return None
             doc_id_resolution[(row[0], doc_id)] = row[1]
             doc_id_to_corpus[doc_id] = row[0]
-            globally_resolved_doc_ids.add(doc_id)
             return row[1]
 
         with self._engine.connect() as ro_conn:
@@ -2071,7 +2096,10 @@ class FactsPgRepository:
                     file_id = _resolve_doc(doc_id, conn)
                     frow = _file_row(file_id) if file_id else None
                     if file_id is None or frow is None:
-                        claims_rejected.append({"row": item_ref, "reason": "unresolved_doc_id", "doc_id": doc_id})
+                        reason = (
+                            "ambiguous_cross_collection_doc_id" if doc_id in ambiguous_doc_ids else "unresolved_doc_id"
+                        )
+                        claims_rejected.append({"row": item_ref, "reason": reason, "doc_id": doc_id})
                         continue
                     if frow.get("processing_status") != "indexed":
                         deferred.append(
@@ -2268,12 +2296,14 @@ class FactsPgRepository:
 
         subjects_deleted = self.sweep_orphans()
 
-        # TCRD-241: claims whose doc_id resolved through the unrestricted
-        # global fallback (tier 3 of `_resolve_doc`) — i.e. outside every
-        # corpus this batch's `documents[]` declared. A non-zero count means
-        # SOME evidence leaned on an ambiguous cross-collection resolution;
-        # surfaced rather than resolved silently.
-        claims_resolved_global = sum(per_doc_claims.get(d, 0) for d in globally_resolved_doc_ids)
+        # TCRD-241 / RBAC review (PR #1736): a doc_id that would only have
+        # resolved by escaping every corpus this batch's `documents[]`
+        # declared is REJECTED, not written (see `_resolve_doc` tier 3a) —
+        # itemized in `claims_rejected` with reason
+        # `ambiguous_cross_collection_doc_id`, same shape as every other
+        # rejection reason. No separate top-level counter: `claims_rejected`
+        # is already the itemized source of truth (mirrors
+        # `facts_ingest_runs.claims_rejected_count`, itself `len(claims_rejected)`).
 
         return {
             "claims_written": claims_written,
@@ -2283,7 +2313,6 @@ class FactsPgRepository:
             "subjects_deleted": subjects_deleted,
             "corrections_active": corrections_active,
             "review_items": review_items,
-            "claims_resolved_global": claims_resolved_global,
         }
 
     # ------------------------------------------------------------------
