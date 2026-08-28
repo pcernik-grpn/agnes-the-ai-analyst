@@ -134,37 +134,76 @@ DATA_APP_PREVIEW_SCOPE_PREFIX = "data-app-preview:"
 # load-bearing and pinned by a test.
 DATA_APP_SERVICE_SCOPE_PREFIX = "data-app:"
 
-# The API surface a hosted data app may reach. Sourced from what the design
-# spec documents an app needs — `/api/query` for SQL, `/api/data/...` for
-# parquet, catalog endpoints for discovery — plus the definition lookups the
-# CLI performs on an app's behalf (`agnes catalog --metrics` hits
-# `/api/metrics`; CLAUDE.md requires looking up a canonical metric definition
-# before computing one).
+# The API surface a hosted data app may reach.
 #
-# Deliberately absent: `/api/admin/*` and every credential-minting route
-# (`/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token`,
-# `/api/cli-auth/rescope-surface`). Those made this a privilege-escalation
-# rather than merely a wide credential: the service token is minted WITHOUT
-# expiry (`omit_exp=True` / `expires_at=None`), so reaching a minting route
-# let it launder itself into a further durable credential.
+# Split into exact paths and subtrees ON PURPOSE. One entry per router would
+# be shorter, but it admits every route that router will ever grow: an
+# earlier draft of this gate listed a bare `/api/query` + `/api/semantic-
+# models` and thereby handed apps `POST /api/query/hybrid` (the admin-only
+# BigQuery+local join) and `POST /api/semantic-models/apply` (create-or-
+# replace of a semantic model by slug, when the owner is an Admin) for free.
+# The allowlist matches paths, not handlers, so it cannot tell a read from a
+# write on its own — the narrowness has to be written down here, and
+# `tests/test_data_app_service_scope.py::test_the_admitted_route_set_is_pinned`
+# walks the real route table so a newly-added route under one of these can
+# never be admitted silently.
 #
-# Match is exact-or-child (`/api/query` and `/api/query/hybrid`, never
-# `/api/queryevil`), so entries carry no trailing slash. Bare `/api/metrics`
-# admits `/api/metrics/...` but never `/api/admin/metrics`.
-_DATA_APP_ALLOWED_PREFIXES = (
-    "/api/query",
-    "/api/data",
-    "/api/catalog",
-    "/api/metrics",
-    "/api/glossary",
-    "/api/semantic-models",
+# Deliberately absent: `/api/admin/*`; `POST /cli/auth/rescope-surface`
+# (admin-gated but PAT-requiring, and it mints a fresh 90-day `surface='all'`
+# PAT — the one real credential-laundering path this scope was open to,
+# since the service token itself is minted WITHOUT expiry); and the
+# `require_session_token` minting routes (`/auth/tokens`,
+# `/api/user/cowork-bundle`, `/api/mcp-connect/token`), which already refuse
+# any PAT-typed credential regardless of scope. Those last three are covered
+# here as defence in depth, not because this gate is what closes them.
+
+# Exact paths — no children admitted.
+_DATA_APP_ALLOWED_EXACT = frozenset(
+    {
+        "/api/query",  # SQL; NOT /api/query/hybrid
+        "/api/catalog/tables",
+        # Semantic layer, read-only members only. Never `/apply`, and the
+        # `{slug}.yaml` document download is left out until an app needs it —
+        # a subtree entry here would re-admit `/apply`.
+        "/api/semantic-models/context",
+        "/api/semantic-models/schema",
+        "/api/semantic-models/search",
+        "/api/semantic-models/validate-query",
+        # v2 — what the `agnes` CLI actually calls. The spec sanctions
+        # installing the CLI inside an app, and CLAUDE.md's discovery
+        # protocol (`agnes catalog` / `schema` / `describe` / `snapshot
+        # create`) is backed entirely by `/api/v2/*`. NOT
+        # `/api/v2/metadata-cache/refresh` (admin) or `/api/v2/marketplace/*`.
+        "/api/v2/catalog",
+        "/api/v2/scan",
+        "/api/v2/scan/estimate",
+        "/api/v2/metadata-cache/status",
+    }
+)
+
+# Subtrees — the entry itself and anything below it. Used only where the
+# route carries a path parameter, so an exact list is impossible.
+_DATA_APP_ALLOWED_SUBTREES = (
+    "/api/data",  # /{table_id}/download, /{table_id}/check-access
+    "/api/catalog/profile",  # /{table_name}, /{table_name}/refresh
+    "/api/catalog/metrics",  # /{metric_path:path}
+    "/api/metrics",  # bare + /{metric_id:path}
+    "/api/glossary",  # bare + /search + /{glossary_id:path}
+    "/api/v2/schema",  # /{table_id}
+    "/api/v2/sample",  # /{table_id}
 )
 
 
-def _path_is_allowed(path: str, allowed: tuple[str, ...]) -> bool:
-    """Exact-or-child match. `startswith` alone would let `/api/queryevil`
-    ride in on `/api/query`."""
-    return any(path == p or path.startswith(p + "/") for p in allowed)
+def _data_app_path_allowed(path: str) -> bool:
+    """Is `path` on the hosted-app data surface?
+
+    Subtrees match exact-or-child: plain `startswith` would let
+    `/api/queryevil` ride in on `/api/query` and `/api/data-apps` on
+    `/api/data`.
+    """
+    if path in _DATA_APP_ALLOWED_EXACT:
+        return True
+    return any(path == p or path.startswith(p + "/") for p in _DATA_APP_ALLOWED_SUBTREES)
 
 
 def _client_ip(request: Optional[Request]) -> Optional[str]:
@@ -232,7 +271,7 @@ def resolve_token_to_user(
         # Today that means MCP-over-HTTP and the git smart-HTTP surfaces; a
         # hosted app is a REST client by design.
         path = request.url.path if request is not None else ""
-        if not _path_is_allowed(path, _DATA_APP_ALLOWED_PREFIXES):
+        if not _data_app_path_allowed(path):
             # Log the refused path: this failure is otherwise invisible from
             # the outside — the container stays healthy and the app renders,
             # only its API calls 401 — so an operator needs to see WHICH

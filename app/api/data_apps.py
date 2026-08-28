@@ -568,14 +568,13 @@ def _mint_service_token(slug: str, owner: dict) -> tuple[str, str]:
     and return the new token id.
 
     The `scope: "data-app:<slug>"` claim is ENFORCED: `app/auth/pat_resolver.py`
-    admits it only on `_DATA_APP_ALLOWED_PREFIXES` — the data surface this
-    spec documents an app needs (`/api/query`, `/api/data/...`, catalog and
-    definition lookups) — and fail-closed refuses it everywhere else. That
-    matters most for the credential-minting routes: this token is minted
-    WITHOUT expiry (see `omit_exp` below), so before the gate existed, code
-    running in the container (including an externally-cloned, less-trusted
-    repo) could launder it into a further durable credential, and reach
-    `/api/admin/*` whenever the owner was an Admin.
+    admits it only on the data surface an app actually uses (see
+    `_DATA_APP_ALLOWED_EXACT` / `_DATA_APP_ALLOWED_SUBTREES` there) and
+    fail-closed refuses it everywhere else. Before that gate existed, code
+    running in the container — including an externally-cloned, less-trusted
+    repo — reached `/api/admin/*` whenever the owner was an Admin, and could
+    call `POST /cli/auth/rescope-surface` to trade this token (minted WITHOUT
+    expiry, see `omit_exp` below) for a fresh 90-day full-surface PAT.
 
     What the gate does NOT change: within that surface the app still reads
     with the OWNER's grants, evaluated live per request. That is the

@@ -68,25 +68,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   Agnes with (`AGNES_TOKEN`, minted by `_mint_service_token`) carried a scope
   claim that no code path read — so it was functionally a full-privilege PAT
   for the app's owner, usable against the whole REST API by anything running
-  in the container, including an externally-cloned, less-trusted repo. Because
-  this token is deliberately minted **without expiry**, that included the
-  credential-minting routes: it could launder itself into a further durable
-  credential that survives revoking it, and reach `/api/admin/*` whenever the
-  owner was an Admin. `app/auth/pat_resolver.py` now admits the scope only on
-  a fail-closed path allowlist (`_DATA_APP_ALLOWED_PREFIXES`) covering the
-  surface the design spec documents an app needs — `/api/query`, `/api/data`,
-  `/api/catalog`, `/api/metrics`, `/api/glossary`, `/api/semantic-models` —
-  matched exact-or-child so `/api/metrics` never admits `/api/admin/metrics`.
-  This mirrors how agent PATs are already gated; the two sibling scopes
-  (`data-app-git:`, `data-app-preview:`) keep their per-surface booleans and
-  are unaffected. **Upgrade note:** an app calling anything outside that list
-  now gets a 401 where it previously succeeded — including MCP-over-HTTP,
-  which passes no request path and is therefore fail-closed. Each refusal logs
-  a warning naming the scope and the refused path, because this failure is
-  otherwise invisible from the outside (the container stays healthy and the
-  app renders; only its API calls fail). Unchanged: within the allowed
-  surface an app still reads with the **owner's** grants, evaluated live —
-  sharing an app remains an act of publication.
+  in the container, including an externally-cloned, less-trusted repo. Two
+  concrete consequences: `/api/admin/*` was reachable whenever the app owner
+  was an Admin, and `POST /cli/auth/rescope-surface` — admin-gated, but it
+  *requires* a PAT and mints a fresh 90-day `surface='all'` one — let a token
+  that is itself minted **without expiry** launder itself into a further
+  durable credential. (The `require_session_token` minting routes —
+  `/auth/tokens`, `/api/user/cowork-bundle`, `/api/mcp-connect/token` — were
+  already closed to it: that guard rejects any PAT-typed credential
+  regardless of scope.) `app/auth/pat_resolver.py` now admits the scope only
+  on a fail-closed allowlist of the surface a hosted app actually uses:
+  `/api/query` (not `/api/query/hybrid`), `/api/data/…`, the `/api/catalog`
+  read routes, `/api/metrics`, `/api/glossary`, the read-only
+  `/api/semantic-models` members (not `/apply`), and the `/api/v2` catalog,
+  schema, sample and scan routes the `agnes` CLI calls from inside an app.
+  Entries are exact paths plus narrow subtrees rather than one per router,
+  because a per-router prefix silently admits every route that router later
+  grows; `tests/…::test_the_admitted_route_set_is_pinned` walks the real
+  route table so a new route under an allowed path can never be admitted
+  without a deliberate decision. The two sibling scopes (`data-app-git:`,
+  `data-app-preview:`) keep their per-surface booleans and are unaffected.
+  **Upgrade note:** an app calling anything outside that list now gets a 401
+  where it previously succeeded — including MCP-over-HTTP, which passes no
+  request path and is therefore fail-closed. Each refusal logs a warning
+  naming the scope and the refused path, because this failure is otherwise
+  invisible from the outside (the container stays healthy and the app
+  renders; only its API calls fail). Unchanged: within the allowed surface an
+  app still reads with the **owner's** grants, evaluated live — sharing an
+  app remains an act of publication.
 - **Admin and workspace pages now use the plain page header.** 25 templates that
   are lists, tables or editors switch from the bordered gradient hero panel to the
   plain title + lede that `/library`, `/agents` and `/chats` already render, via the
