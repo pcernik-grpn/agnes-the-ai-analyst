@@ -976,6 +976,18 @@ async def login_page(request: Request):
             providers.append({"name": "microsoft", "display_name": "Microsoft", "icon": "microsoft"})
     except Exception:
         pass
+    try:
+        from app.auth.providers.sso import login_offering as sso_login_offering
+
+        # One DB read answers availability AND the admin-configured button
+        # label; the allowlist check runs first so an excluded provider
+        # never costs the read.
+        if provider_allowed("sso"):
+            _sso_label = sso_login_offering()
+            if _sso_label:
+                providers.append({"name": "sso", "display_name": _sso_label, "icon": "sso"})
+    except Exception:
+        pass
 
     # Convert to login_buttons format expected by template
     login_buttons = []
@@ -1014,6 +1026,20 @@ async def login_page(request: Request):
                 _url += f"?next={quote(next_path, safe='')}"
             login_buttons.append(
                 {"url": _url, "text": "Sign in with Microsoft", "css_class": "btn-primary", "icon_html": ""}
+            )
+        elif p["name"] == "sso":
+            _url = "/auth/sso/login"
+            if next_path:
+                _url += f"?next={quote(next_path, safe='')}"
+            # display_name is admin-entered; Jinja autoescape on the template
+            # side renders it inert.
+            login_buttons.append(
+                {
+                    "url": _url,
+                    "text": f"Sign in with {p['display_name']}",
+                    "css_class": "btn-primary",
+                    "icon_html": "",
+                }
             )
 
     keboola_expected_project = ""

@@ -1262,6 +1262,18 @@ async def lifespan(app):
     except Exception:
         logger.exception("Google auth startup check crashed (non-fatal)")
 
+    # External SSO: an enabled config means a THIRD PARTY's tenant may assert
+    # identities for the permitted domains — always announced; an enabled row
+    # whose secret no longer decrypts is a loud error (the login button
+    # silently disappeared). Same wiring as the Microsoft/Google checks.
+    try:
+        from app.auth.providers.sso import startup_warnings as sso_startup_warnings
+
+        for warning in sso_startup_warnings():
+            logger.warning("External SSO auth check: %s", warning)
+    except Exception:
+        logger.exception("External SSO auth startup check crashed (non-fatal)")
+
     # Bring the Postgres schema to the app's expected Alembic head. The
     # DuckDB ladder self-migrates on every connect (src/db.py); Postgres
     # now mirrors that at startup — when the DB is behind, the pending
@@ -2810,6 +2822,7 @@ def create_app() -> FastAPI:
     from app.auth.providers.email import router as email_auth_router
     from app.auth.providers.keboola import router as keboola_auth_router
     from app.auth.providers.microsoft import router as microsoft_auth_router
+    from app.auth.providers.sso import router as sso_auth_router
 
     # API routers
     app.include_router(auth_router)
@@ -2818,6 +2831,7 @@ def create_app() -> FastAPI:
     app.include_router(email_auth_router)  # Always register, check availability per-request
     app.include_router(keboola_auth_router)  # Always register, availability + allowlist per-request
     app.include_router(microsoft_auth_router)  # Always register, availability + allowlist per-request
+    app.include_router(sso_auth_router)  # Always register; inline per-route gating (test mode must stay reachable)
     from app.api.keboola_login_projects import router as keboola_login_projects_router
 
     app.include_router(keboola_login_projects_router)  # select-mode project import (same allowlist gate)
