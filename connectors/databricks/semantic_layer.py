@@ -76,13 +76,13 @@ def _resolve_row_token(connection: dict[str, Any], token_env: str) -> str:
     if not token_env:
         return ""
 
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(token_env):
+    if not is_config_secret_env_allowed(token_env):
         logger.warning(
-            "databricks connection %s: token_env %r is not on the remote-attach "
+            "databricks connection %s: token_env %r is not on the config-secret "
             "allowlist; refusing to read it (add it to "
-            "AGNES_REMOTE_ATTACH_TOKEN_ENVS or use a vault secret)",
+            "AGNES_CONFIG_SECRET_ENVS or use a vault secret)",
             connection.get("id"),
             token_env,
         )
@@ -150,12 +150,12 @@ def _resolve_databricks_from_instance_config() -> dict[str, Any] | None:
     catalog = get_value("data_source", "databricks", "catalog", default="") or ""
     token_env = get_value("data_source", "databricks", "token_env", default="DATABRICKS_TOKEN") or "DATABRICKS_TOKEN"
 
-    from src.orchestrator_security import is_token_env_allowed
+    from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_token_env_allowed(token_env):
+    if not is_config_secret_env_allowed(token_env):
         logger.warning(
-            "databricks: token_env %r is not on the remote-attach allowlist; "
-            "refusing to read it (add it to AGNES_REMOTE_ATTACH_TOKEN_ENVS or "
+            "databricks: token_env %r is not on the config-secret allowlist; "
+            "refusing to read it (add it to AGNES_CONFIG_SECRET_ENVS or "
             "use a vault secret)",
             token_env,
         )
