@@ -470,14 +470,20 @@ class TestLibraryDraftsBand:
         assert 'id="lib-drafts-rows"' in text
         assert '<div class="lib-drafts" id="lib-drafts" hidden>' in text
         # NOT a `.lib-group`: drafts must never join the united inventory list,
-        # whose rows are account-scoped and survive a device switch. Anchor the
-        # ordering on the item-count row, which renders whether or not this
-        # fixture's user actually has any sections.
+        # whose rows are account-scoped and survive a device switch.
+        #
+        # The inventory starts at the list when the Library has rows and at the
+        # empty state when it does not, so the ordering anchors on whichever
+        # shows. (It used to anchor on the item count, which now lives up in the
+        # page header and sits ABOVE the drafts band.)
         assert 'class="lib-drafts"' in text
-        assert "lib-group" not in text[text.index('id="lib-drafts"') : text.index('id="lib-item-count"')]
-        assert text.index('id="lib-drafts"') < text.index('id="lib-item-count"'), (
-            "drafts band must sit above the inventory, not inside it"
+        drafts_at = text.index('id="lib-drafts"')
+        inventory_at = min(
+            (text.index(m) for m in ('<div class="lib-list">', 'class="lib-empty"') if m in text),
+            default=len(text),
         )
+        assert drafts_at < inventory_at, "drafts band must sit above the inventory, not inside it"
+        assert "lib-group" not in text[drafts_at:inventory_at]
 
     def test_drafts_band_states_the_durability_limit(self, seeded_app):
         """Placement in the Library implies account-scoped durability that

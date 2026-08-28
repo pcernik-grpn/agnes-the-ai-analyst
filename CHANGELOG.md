@@ -175,6 +175,49 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. This ships the Agnes-side seam only — the producer itself is a separate project the operator supplies, adopted rather than vendored into this repo.
 
 ### Changed
+- **The Library is two tabs, and every row's button says what it does.**
+  `/library` was one flat list answering two different questions — *what does
+  this organization know* and *what can my agent do* — and a single control
+  label, "Add to stack", sat on rows whose click posted to four different
+  endpoints meaning four different things.
+  - **Knowledge / Capabilities tabs**, deep-linkable as `?tab=`. Knowledge
+    holds documents, governed data, memory, recipes and apps; Capabilities
+    holds skills, plugins and agent templates. A detail page's `?section=`
+    back link selects the tab that owns the section, so returning from an item
+    can no longer land on a page where that item is filtered out. The tabs are
+    the shared `FilterToolbar` segmented control reading `data-tab` off each
+    row, so switching tabs shares one code path with search, the facets and the
+    empty-section hiding.
+  - **Data apps are their own band** rather than a trailing block inside
+    Artefacts, whose hint had to call an app a file the caller had uploaded.
+  - **Per-kind action verbs.** `Install` / `Installed` for skills, plugins and
+    agent templates (they post to `/install` and were never stack members —
+    `/api/stack` accepts only `data_package` and `memory_domain`);
+    `Keep a local copy` / `Local copy` for governed data, because
+    `features.stack_auto_membership` has been default-on since Wave 0, so the
+    grant already *is* the membership and the only remaining choice is what
+    `agnes pull` downloads — the wording `StackResolver.browse()` already used
+    internally. A granted row now states its tier — `Required by your admin`,
+    `Granted to your group` — instead of claiming a membership the caller could
+    neither create nor drop, with the reason available only in a tooltip. The
+    grid card no longer overwrites the row's label with the stack vocabulary,
+    so table and card cannot drift.
+  - **`+ Add` follows the tab** — sources on Knowledge (data package, connect a
+    source, link an external app, upload), builders on Capabilities (skill,
+    plugin, agent template, MCP source). The blast-radius headings survive
+    inside each half. The menu is bounded to the room below its button, so its
+    last entries stay reachable.
+  - **One page header instead of four stacked bands.** Title, item count,
+    controls and tabs are a single band; the applied-filter chips moved down
+    beside the list they describe, left-aligned on the rows' own edge. The
+    Library used to spend its first screen not listing anything — title,
+    banner, tabs, toolbar, count row, five bands before row one. The group
+    bands keep the viewport top, which is the thing worth pinning on a long
+    list; the header itself does not pin, because a header carrying all of that
+    runs ~270px and leaves a band no room to travel in. The shared floating
+    dock (`.fbar-dock`) is untouched and still `/chats`'s.
+  - **Bands open on arrival**, and an empty tab says so in its own words rather
+    than offering a "Clear filters" button for filters that are not applied.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending
