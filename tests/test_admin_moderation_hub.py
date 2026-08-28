@@ -128,3 +128,14 @@ def test_empty_state_when_nothing_awaiting(web_client, monkeypatch):
     r = web_client.get("/admin/store", cookies=admin_cookies)
     assert r.status_code == 200
     assert "No verification requests waiting." in r.text
+
+
+def test_agent_share_requests_zone_disabled_on_duckdb_backend(web_client):
+    """Track C6's approval queue is PG-only (A3 ratchet) — on this DuckDB-
+    backed fixture the zone must say so rather than 501ing the whole page
+    or silently pretending there's nothing waiting."""
+    _, admin_cookies = _create_admin(web_client)
+    r = web_client.get("/admin/store", cookies=admin_cookies)
+    assert r.status_code == 200
+    assert "Pending agent shares" in r.text
+    assert "requires a Postgres app-state backend" in r.text

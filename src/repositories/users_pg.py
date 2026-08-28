@@ -311,6 +311,25 @@ class UsersPgRepository:
                 {"name": name, "now": now, "user_id": user_id},
             )
 
+    def revoke_sessions(self, user_id: str) -> None:
+        """Bump the ``session_revoked_before`` floor to now (issue #1676).
+
+        Called by ``POST /auth/logout`` — every ``typ="session"`` JWT for
+        this user whose ``iat`` predates this write is refused by
+        ``app.auth.pat_resolver.resolve_token_to_user`` on its next use, even
+        though its signature and ``exp`` are both still valid. Deliberately
+        per-USER (every live session for the account), not per-``jti``: the
+        resolver already loads the user row on every authenticated request
+        to check ``active``, so comparing against a column on that same row
+        costs no additional query — the DuckDB sibling has no such column
+        (PG-only, A3 ratchet) and is a documented no-op."""
+        now = datetime.now(timezone.utc)
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE users SET session_revoked_before = :now, updated_at = :now WHERE id = :user_id"),
+                {"now": now, "user_id": user_id},
+            )
+
     def delete(self, user_id: str) -> None:
         with self._engine.begin() as conn:
             conn.execute(

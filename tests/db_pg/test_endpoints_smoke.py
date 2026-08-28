@@ -2427,6 +2427,14 @@ KNOWN_UNTESTED = {
     # tests/test_web_nav_cowork.py.
     "GET /how-it-works",
     "GET /install",
+    # Logout (#1675): GET renders the CSRF confirm form, POST validates the
+    # double-submit token, revokes server-side and clears the cookie. Both
+    # verbs are covered behaviourally in tests/test_web_logout.py, and the
+    # revocation half is contract-tested on BOTH backends in
+    # tests/db_pg/test_session_revocation.py — richer than this harness's
+    # status-code sweep can express.
+    "GET /auth/logout",
+    "POST /auth/logout",
     "GET /login",
     "GET /login/email",
     "GET /login/password",
@@ -2903,6 +2911,13 @@ KNOWN_UNTESTED = {
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
+    # Agent-sharing approval queue (Track C6, PG-only). Covered end to end
+    # (queue/approve/reject, C2.3 runtime honoring an approved grant, admin
+    # RBAC, moderation-hub UI wiring, DuckDB typed-501 fail-clean) by
+    # tests/db_pg/test_agent_share_approval_pg.py + the repo-level tests in
+    # tests/db_pg/test_share_requests_pg.py; not duplicated here.
+    "GET /api/admin/share-requests",
+    "PATCH /api/admin/share-requests/{request_id}",
     # Skill builder index page (HTML surface, no PG-specific behaviour).
     "GET /skills",
     # Data-package builder page — the same HTML surface, hosting the drawer
@@ -3030,6 +3045,12 @@ KNOWN_UNTESTED = {
     # warning, and the corpus-map producer handoff are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Bounded BFS folder search (TCRD-240) over the same live tree — never
+    # Graph's own `/search`. Same "no new schema surface" reasoning as the
+    # sibling `/tree` route above; auth matrix, query-length/mode/glob
+    # validation, subtree scoping, and cap-clamping are all covered by
+    # tests/test_admin_sharepoint.py::TestTreeSearch.
+    "GET /api/admin/sharepoint/connections/{connection_id}/tree/search",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",

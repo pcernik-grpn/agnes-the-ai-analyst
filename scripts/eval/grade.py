@@ -331,14 +331,34 @@ def llm_assist_grade(
     method matching the Anthropic SDK) so tests never need a network call.
     Always returns `llm_assisted=True` -- callers must not merge this
     into a human-graded round without labeling it, per the module
-    docstring."""
-    rubric = rubric or _RUBRIC
-    if client is None:
-        import anthropic
+    docstring.
 
-        client = anthropic.Anthropic(api_key=os.environ[api_key_env])
+    Credential resolution when `client` is omitted mirrors every other
+    non-extractor call-site (`app/chat/auto_title.py`, `src/ingest/vision.py`):
+    a static key at `api_key_env` wins when present; otherwise, an
+    `ai.provider: vertex` instance.yaml block (or its env-var fallback) builds
+    a raw `AnthropicVertex`-shaped client instead, so this offline grading
+    pipeline runs on a Vertex-only instance too."""
+    rubric = rubric or _RUBRIC
+    effective_model = model
+    if client is None:
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            from connectors.llm.factory import vertex_config_or_none
+
+            vertex = vertex_config_or_none()
+            if vertex is not None:
+                from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
+
+                project_id, region = vertex
+                client = create_vertex_client(project_id=project_id, region=region)
+                effective_model = to_vertex_model_id(model)
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=os.environ[api_key_env])
     response = client.messages.create(
-        model=model,
+        model=effective_model,
         max_tokens=1024,
         messages=[{"role": "user", "content": _llm_grading_prompt(prompt, record, rubric)}],
     )

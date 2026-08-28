@@ -164,6 +164,27 @@ def _resolve_store_submissions() -> Optional[Signal]:
     )
 
 
+def _resolve_agent_share_requests() -> Optional[Signal]:
+    """Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    DuckDB-backed instance the feature simply doesn't exist here (not
+    "broken"), so this returns `None` BEFORE calling the repo rather than
+    letting `RequiresPostgresBackend` degrade the row to "could not be
+    checked" forever — same posture as `_resolve_studio_suggestions`'s
+    feature-flag early-return."""
+    from src.repositories import share_requests_repo, use_pg
+
+    if not use_pg():
+        return None
+    _, total = share_requests_repo().list_for_admin(status=["pending"], limit=1)
+    if not total:
+        return None
+    return Signal(
+        count=total,
+        href="/admin/store",
+        blurb=f"agent {_plural(total, 'share needs', 'shares need')} approval.",
+    )
+
+
 def _resolve_memory_items() -> Optional[Signal]:
     from src.repositories import knowledge_repo
 
@@ -346,6 +367,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         zone=ZONE_NEEDS_YOU,
         severity="action",
         resolve=_resolve_store_submissions,
+    ),
+    SignalSpec(
+        key="agent_share_requests",
+        title="Agent shares to approve",
+        zone=ZONE_NEEDS_YOU,
+        severity="action",
+        resolve=_resolve_agent_share_requests,
     ),
     SignalSpec(
         key="memory_items",

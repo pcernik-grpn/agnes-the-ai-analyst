@@ -312,6 +312,90 @@ def _recording_smtp(sent: list):
     return FakeSMTP
 
 
+class TestEmailMagicLinkJitProvisioning:
+    """Issue #1683: a magic-link request for an address with no account yet
+    rendered the normal "Check Your Email" success page but sent nothing —
+    the person waits for a link that will never arrive. JIT-provision the
+    account, mirroring the Google/Microsoft OAuth gate (``auth.allowed_domain``),
+    so a first-time request from an allowed domain gets a real account and a
+    real link, while the *visible* response never differs by whether the
+    account existed before the request.
+    """
+
+    def test_unknown_allowed_domain_is_provisioned_and_mailed(self, client, monkeypatch):
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["test.com"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        sent: list = []
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp(sent))
+
+        assert users_repo().get_by_email_ci("newbie@test.com") is None
+
+        resp = client.post("/auth/email/send-link", json={"email": "newbie@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert len(sent) == 1, "no mail sent to the newly-provisioned account"
+
+        user = users_repo().get_by_email_ci("newbie@test.com")
+        assert user is not None, "no account provisioned for an allowed-domain address"
+
+    def test_response_is_identical_for_known_and_newly_provisioned_accounts(self, client, monkeypatch):
+        """The whole point of anti-enumeration: the caller cannot tell, from
+        the response, whether the account pre-existed or was just created."""
+        from app.auth.providers import email as email_mod
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["test.com"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp([]))
+
+        known = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        new = client.post("/auth/email/send-link", json={"email": "brandnew@test.com"})
+        assert known.status_code == new.status_code == 200
+        assert known.content == new.content
+
+    def test_unknown_address_outside_allowlist_gets_no_account(self, client, monkeypatch):
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["other.example"])
+        resp = client.post("/auth/email/send-link", json={"email": "nobody@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert users_repo().get_by_email_ci("nobody@test.com") is None
+
+    def test_empty_allowlist_keeps_existing_users_only_behavior(self, client, monkeypatch):
+        """No ``auth.allowed_domain`` configured (today's default): unknown
+        addresses get no account, exactly as before this fix — an operator
+        who never opted into an allowlist sees no behavior change."""
+        from app.auth.providers import email as email_mod
+        from src.repositories import users_repo
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: [])
+        resp = client.post("/auth/email/send-link", json={"email": "nobody@test.com"})
+        assert resp.status_code == 200
+        assert resp.json() == {"message": "If this email is registered, you will receive a login link."}
+        assert users_repo().get_by_email_ci("nobody@test.com") is None
+
+    def test_known_account_still_works_unaffected(self, client, monkeypatch):
+        """A pre-existing account is untouched by the allow-rule — it must
+        still receive its link even against an allowlist it doesn't match."""
+        from app.auth.providers import email as email_mod
+
+        monkeypatch.setattr(email_mod, "get_allowed_domains", lambda: ["other.example"])
+        monkeypatch.delenv("LOCAL_DEV_MODE", raising=False)
+        monkeypatch.setenv("SMTP_HOST", "smtp.test.invalid")
+        sent: list = []
+        monkeypatch.setattr("smtplib.SMTP", _recording_smtp(sent))
+
+        resp = client.post("/auth/email/send-link", json={"email": "ml@test.com"})
+        assert resp.status_code == 200
+        assert len(sent) == 1
+
+
 class TestEmailSendFailureIsSurfaced:
     """A configured mail transport that fails to deliver must not answer 200.
 
