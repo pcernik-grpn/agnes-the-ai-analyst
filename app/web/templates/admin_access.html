@@ -1162,22 +1162,35 @@
     box-shadow: inset 0 0 0 1px var(--ds-border);
     justify-self: start; white-space: nowrap;
   }
-  /* The kind colour is carried by INK and a hairline, never by a `-soft`
-     fill. Those tints are defined light-only while `--ds-kind-*` flips in
-     dark mode, so a soft fill would put flipped (light) ink on a light tint
-     — about 1:1 contrast. `tests/test_design_system_contract.py::
-     test_light_only_soft_tint_never_backs_theme_flipping_ink` catches
-     exactly this, and caught it here. The chip keeps the theme-aware sunken
-     surface underneath in both themes. */
-  .ax-r__kd[data-kind="data"]    { color: var(--ds-kind-data);    box-shadow: inset 0 0 0 1px var(--ds-kind-data); }
-  .ax-r__kd[data-kind="memory"]  { color: var(--ds-kind-memory);  box-shadow: inset 0 0 0 1px var(--ds-kind-memory); }
-  .ax-r__kd[data-kind="recipe"]  { color: var(--ds-kind-recipe);  box-shadow: inset 0 0 0 1px var(--ds-kind-recipe); }
-  .ax-r__kd[data-kind="library"] { color: var(--ds-kind-library); box-shadow: inset 0 0 0 1px var(--ds-kind-library); }
-  .ax-r__kd[data-kind="file"]    { color: var(--ds-kind-file);    box-shadow: inset 0 0 0 1px var(--ds-kind-file); }
-  .ax-r__kd[data-kind="app"]     { color: var(--ds-kind-app);     box-shadow: inset 0 0 0 1px var(--ds-kind-app); }
-  .ax-r__kd[data-kind="plugin"]  { color: var(--ds-kind-plugin);  box-shadow: inset 0 0 0 1px var(--ds-kind-plugin); }
-  .ax-r__kd[data-kind="skill"]   { color: var(--ds-kind-skill);   box-shadow: inset 0 0 0 1px var(--ds-kind-skill); }
-  .ax-r__kd[data-kind="agent"]   { color: var(--ds-kind-agent);   box-shadow: inset 0 0 0 1px var(--ds-kind-agent); }
+  /* ── Kind, the same colour it wears everywhere else ───────────────────
+     Each kind resolves ONE variable, exactly as the detail hero does
+     (`macros/_detail.html` sets `--kind: var(--ds-kind-{kind})`) and as the
+     Library's bands do (`--lib-kind`). A package is the same colour in the
+     admin table, in the Library list and on its own page, so a type is
+     recognisable before its label is read.
+
+     The tile is mixed from that ink into the CURRENT surface rather than
+     taken from `--ds-kind-*-soft`: those tints are defined light-only while
+     the ink flips in dark mode, so the paired token would put light ink on a
+     light tile. `color-mix` against `--ds-surface` is theme-safe by
+     construction — it is how `design-tokens.css` derives the `-soft` values
+     in the first place. (The Library reaches the `-soft` tokens through an
+     inline `style` attribute, which the contrast guard cannot see; matching
+     the look without borrowing the hazard.) */
+  .ax-r__kd[data-kind="data"]    { --kind: var(--ds-kind-data); }
+  .ax-r__kd[data-kind="memory"]  { --kind: var(--ds-kind-memory); }
+  .ax-r__kd[data-kind="recipe"]  { --kind: var(--ds-kind-recipe); }
+  .ax-r__kd[data-kind="library"] { --kind: var(--ds-kind-library); }
+  .ax-r__kd[data-kind="file"]    { --kind: var(--ds-kind-file); }
+  .ax-r__kd[data-kind="app"]     { --kind: var(--ds-kind-app); }
+  .ax-r__kd[data-kind="plugin"]  { --kind: var(--ds-kind-plugin); }
+  .ax-r__kd[data-kind="skill"]   { --kind: var(--ds-kind-skill); }
+  .ax-r__kd[data-kind="agent"]   { --kind: var(--ds-kind-agent); }
+  .ax-r__kd[data-kind] {
+    color: var(--kind);
+    background: color-mix(in srgb, var(--kind) 12%, var(--ds-surface));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--kind) 22%, transparent);
+  }
 
   /* Reads — a quiet label over a solid value, right-aligned so the column
      has an edge to scan down. */
@@ -1469,6 +1482,40 @@
     border-top: 0; border-bottom: 1px solid var(--ds-border-light);
   }
   .ax-gs--bb .ax-add { margin-top: 4px; }
+  /* ══ Same table, wherever it is ════════════════════════════════════════
+     The Library's list and this one are the same object at different
+     scales — a set of typed things, grouped, with a header band per group.
+     They were drawn differently: the Library uses the shared `.data-table`
+     header treatment (dim fill, 11px/700 uppercase, muted ink) and a 3px
+     accent on each band's leading edge; this page had its own smaller,
+     lighter header and no accent. Borrow the Library's, so the two read as
+     one product. ── */
+
+  /* Column header: the shared primitive's treatment, in a grid rather than
+     a <thead> — same fill, size, weight and ink as every other table. */
+  [data-theme] .ax-colhd {
+    background: var(--ds-surface-dim);
+    color: var(--ds-text-muted);
+    font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 7px 10px 7px 8px; border-bottom: 0;
+  }
+
+  /* The category band carries a leading accent, the way a Library group
+     does. Families have no kind colour of their own, so it is drawn in ink
+     — the band's job here is to separate, not to classify; the kind colour
+     stays on the row's chip where it identifies one thing. */
+  .ax-fam__hd {
+    box-shadow: inset 3px 0 0 var(--ds-text-muted);
+    padding-left: 10px; margin-top: 2px;
+  }
+  .ax-fam:first-of-type .ax-fam__hd { margin-top: 0; }
+  .ax-fam__n { color: var(--ds-text-secondary); font-weight: 600; }
+
+  /* Rows sit inside the band's indent, so a row visibly belongs to the
+     category above it rather than to the table at large. */
+  .ax-r { padding-left: 10px; }
+  .ax-colhd > :first-child { padding-left: 0; }
 </style>
 {% endblock %}
 

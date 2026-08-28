@@ -201,6 +201,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **A kind is the same colour in the admin table as in the Library.** Each row's
+  kind chip resolves one variable — `--kind: var(--ds-kind-<kind>)` — exactly as
+  the detail hero (`macros/_detail.html`) and the Library's bands (`--lib-kind`)
+  do, off the same canonical map the Library groups by (`_SECTION_KINDS`), so a
+  package is one colour wherever it appears. The tile is mixed from that ink into
+  the **current** surface rather than taken from `--ds-kind-*-soft`: those tints
+  are defined light-only while the ink flips, so the paired token would put light
+  ink on a light tile — the Library reaches them through an inline `style`
+  attribute, which the contrast guard cannot see. The table furniture matches too:
+  the column header takes the shared `.data-table` header treatment (dim fill,
+  11px/700 uppercase, muted ink) and each category band carries a 3px leading
+  accent the way a Library group does, with rows indented inside it so a row
+  belongs to the band above it.
 - **By group and By bundle are one list component.** They sat on the same
   page looking like two products: a group was a collapsible row with counts
   on the right, a bundle a permanently-open block with a table beneath it.
