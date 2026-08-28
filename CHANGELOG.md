@@ -776,16 +776,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   just Bash.** The sandbox's `PreToolUse` gate matched `Bash` only, so every
   mutating MCP tool the in-chat agent can call — deleting a data-app draft,
   deploying one, `pull` — executed without the approve/deny round-trip its own
-  contract asks for. Approval is now routed from each tool's own behaviour
-  annotation (`readOnlyHint`) rather than its name, so it covers future tools
-  by construction: a read-only tool still runs unasked, and everything else —
-  including a tool with no annotation the runner knows, such as a per-caller
+  contract asks for. Approval now follows each tool's own behaviour annotation
+  (`readOnlyHint`) rather than its name, so it covers future tools by
+  construction: a read-only tool still runs unasked, and everything else —
+  including a tool the runner has no annotation for, such as a per-caller
   passthrough tool or one from a workspace-configured MCP server — raises the
-  same approval card, showing the call's arguments. Fail-closed posture is
-  preserved end to end: on an SDK too old to arm the gate safely, mutating MCP
-  tools are DENIED with an actionable message rather than silently allowed, and
-  "allow for session" remembers the exact tool + arguments approved, never the
-  tool as a family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
+  same approval card, showing the call's arguments. The one user-visible
+  change in the shipped tool set: `agnes_data_app_preview` now asks before it
+  runs (it mints a scoped preview grant); the two pure render directives
+  beside it, `agnes_data_app_refresh` and `agnes_data_app_close`, are now
+  correctly annotated read-only on both MCP surfaces and do not ask. The
+  workspace policy hook also runs for MCP calls now, so an operator `deny` on
+  an MCP tool is enforced instead of being downgraded to a card the user can
+  click past, and the same mutations reached through the CLI
+  (`agnes app create|deploy|stop|delete|draft …`) are `ask`-flagged in the
+  bundled sandbox hook so the Bash route raises the same card. "Allow for
+  session" remembers the exact tool + arguments approved, never the tool as a
+  family. Read-only built-in tools (`Read`/`Grep`/…) are unaffected.
+  Fail-closed, scoped honestly: on the `docker` provider, on an SDK whose hook
+  matcher cannot block safely, mutating MCP tools are DENIED with an actionable
+  message rather than silently allowed, and an internal error in the gate
+  denies too — but on an SDK with no `PreToolUse` hook support at all nothing
+  can be registered and tool calls run ungated (logged loudly). The `kai-agent`
+  provider is unaffected; its engine raises its own approvals.
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser

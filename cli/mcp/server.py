@@ -863,7 +863,15 @@ def agnes_data_app_preview(slug: str, url: str = "") -> dict:
     return {"render": "data_app_preview", "slug": slug, "url": url}
 
 
-@tool(read_only=False, idempotent=True)
+# Read-only, and honestly so: the two tools below return a render directive
+# and make no server call at all — nothing in Agnes changes when they run.
+# The flag is load-bearing beyond the directory submissions: a client that
+# confirms non-read-only calls (the cloud-chat approval gate does) would
+# raise a card for each, and the authoring skill prescribes several per turn
+# — which in an UNATTENDED agent-API session, where every card resolves to a
+# deny, breaks the preview loop outright. `agnes_data_app_preview` keeps
+# `read_only=False`: it mints a scoped preview grant server-side.
+@tool(read_only=True, idempotent=True)
 def agnes_data_app_refresh(slug: str) -> dict:
     """Force-reload the in-chat preview pane for a hosted data app.
 
@@ -879,7 +887,7 @@ def agnes_data_app_refresh(slug: str) -> dict:
     return {"render": "data_app_preview_refresh", "slug": slug}
 
 
-@tool(read_only=False, destructive=True)
+@tool(read_only=True, idempotent=True)
 def agnes_data_app_close(slug: str) -> dict:
     """Tear down the in-chat preview pane for a hosted data app.
 

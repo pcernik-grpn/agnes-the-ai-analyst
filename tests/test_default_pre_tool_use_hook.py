@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HOOK = Path("app/initial_workspace_default/.claude/hooks/pre_tool_use.py")
 
 
@@ -62,6 +64,39 @@ def test_prompts_for_admin_grant():
         }
     )
     assert out.get("permissionDecision") == "ask"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "agnes app create --slug demo --repo x",
+        "agnes app deploy demo --mode dev",
+        "agnes app stop demo",
+        "agnes app delete demo",
+        "agnes app draft create demo",
+        "agnes app draft delete demo demo-draft",
+        "agnes app git-credential demo",
+        "agnes app set-description demo 'new text'",
+    ],
+)
+def test_prompts_for_data_app_mutations(command):
+    """The same mutations the chat approval gate raises a card for over MCP
+    (`data_app_deploy`, `data_app_delete_draft`, …) are one Bash call away
+    through the CLI. Without a matching `ask` here, the gate is a front door
+    with the back door open."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") == "ask", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["agnes app list", "agnes app show demo", "agnes app logs demo", "agnes app open demo"],
+)
+def test_read_only_data_app_commands_run_unasked(command):
+    """Reads must not cost a click — the MCP twins (`data_apps_list`,
+    `data_app_get`, `data_app_logs`) are annotated read-only."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") in (None, "allow"), command
 
 
 SETTINGS = Path("app/initial_workspace_default/.claude/settings.json")

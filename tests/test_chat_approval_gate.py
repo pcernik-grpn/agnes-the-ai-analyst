@@ -865,3 +865,139 @@ def test_mcp_matcher_is_still_registered_when_hookmatcher_takes_no_timeout():
     assert gate._enabled is False, "the gate must fail closed when it cannot block safely"
     patterns = [m.matcher for m in matchers]
     assert "Bash" in patterns and any(p and p.startswith("mcp__") for p in patterns), patterns
+
+
+# ── Review fixes on the MCP routing ───────────────────────────────────────
+
+
+def test_file_hook_deny_is_honoured_for_an_mcp_tool(tmp_path):
+    """An operator's `deny` must be ENFORCED for MCP tools, not downgraded.
+
+    Routing MCP calls straight to the annotation check skipped the workspace
+    hook entirely, so an operator who denied an MCP tool got an approval card
+    the user could click past — a silent downgrade of a deny to an ask.
+    """
+
+    async def _run():
+        hook = tmp_path / "deny_mcp.py"
+        hook.write_text(
+            "import json, sys\n"
+            "p = json.loads(sys.stdin.read() or '{}')\n"
+            "if str(p.get('tool_name', '')).startswith('mcp__'):\n"
+            "    print(json.dumps({'permissionDecision': 'deny', "
+            "'permissionDecisionReason': 'blocked by policy'}))\n"
+            "else:\n"
+            "    print(json.dumps({'permissionDecision': 'allow'}))\n"
+        )
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, hook, timeout_seconds=5)
+        out = await gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "d"}), None, {})
+        assert _decision_of(out) == "deny"
+        assert "blocked by policy" in out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert emitted == [], "a deny must not cost the user a card"
+        # A read-only tool the operator denied is denied too: the annotation
+        # decides whether to ASK, never whether to override a policy deny.
+        assert _decision_of(await gate.check(_mcp("mcp__agnes__catalog"), None, {})) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_file_hook_allow_does_not_bypass_the_mcp_annotation_route(tmp_path):
+    """The bundled hook answers `allow` for every non-Bash tool, so `allow`
+    is "no opinion" here — it must not switch the annotation gate off."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "d"}), None, {}))
+        for _ in range(200):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        req = _await_request(emitted)
+        assert req["tool"] == "mcp__agnes__data_app_deploy"
+        gate.resolve(req["request_id"], "deny")
+        assert _decision_of(await task) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_preview_render_directives_run_without_approval(tmp_path):
+    """`agnes_data_app_refresh` / `agnes_data_app_close` are pure render
+    directives — no server round-trip, nothing changes — and the authoring
+    skill calls them many times per turn. An approval card on each one
+    breaks the preview loop outright in an UNATTENDED agent-API session,
+    where every card resolves to a deny."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        for tool in ("mcp__agnes__agnes_data_app_refresh", "mcp__agnes__agnes_data_app_close"):
+            assert await gate.check(_mcp(tool, {"slug": "demo"}), None, {}) == {}
+        assert emitted == []
+
+    asyncio.run(_run())
+
+
+def test_preview_itself_still_asks(tmp_path):
+    """`agnes_data_app_preview` mints a scoped preview grant server-side, so
+    it stays a write and keeps its card."""
+
+    async def _run():
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        task = asyncio.create_task(
+            gate.check(_mcp("mcp__agnes__agnes_data_app_preview", {"slug": "demo"}), None, {})
+        )
+        for _ in range(200):
+            if emitted:
+                break
+            await asyncio.sleep(0.01)
+        req = _await_request(emitted)
+        assert req["tool"] == "mcp__agnes__agnes_data_app_preview"
+        gate.resolve(req["request_id"], "deny")
+        assert _decision_of(await task) == "deny"
+
+    asyncio.run(_run())
+
+
+def test_an_internal_gate_error_fails_closed_for_a_mutating_tool(tmp_path):
+    """A raise inside the gate reaches the SDK boundary, where an errored
+    hook is effectively fail-OPEN — the tool runs. Catch it here and deny
+    anything the gate is responsible for gating."""
+
+    async def _run():
+        def _boom(payload):
+            raise RuntimeError("gate is broken")
+
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        gate.run_file_hook = _boom  # type: ignore[method-assign]
+
+        out = await gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "d"}), None, {})
+        assert _decision_of(out) == "deny"
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "approval gate" in reason.lower() and "gate is broken" in reason
+        # Bash rides the same guard.
+        assert _decision_of(await gate.check(_bash("anything"), None, {})) == "deny"
+        # …and a read-only MCP tool is NOT punished for the gate's own bug.
+        assert await gate.check(_mcp("mcp__agnes__catalog"), None, {}) == {}
+
+    asyncio.run(_run())
+
+
+def test_an_internal_gate_error_in_the_round_trip_denies(tmp_path):
+    """The guard covers the round-trip too, not just the file-hook call."""
+
+    async def _run():
+        async def _boom(**_kwargs):
+            raise RuntimeError("emit failed")
+
+        emitted: list[dict] = []
+        gate = ApprovalGate(emitted.append, _write_hook(tmp_path), timeout_seconds=5)
+        gate._round_trip = _boom  # type: ignore[method-assign]
+        out = await gate.check(_mcp("mcp__agnes__data_app_deploy", {"slug": "d"}), None, {})
+        assert _decision_of(out) == "deny"
+        assert "emit failed" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    asyncio.run(_run())
