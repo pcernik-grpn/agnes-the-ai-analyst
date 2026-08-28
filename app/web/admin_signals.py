@@ -164,6 +164,27 @@ def _resolve_store_submissions() -> Optional[Signal]:
     )
 
 
+def _resolve_agent_share_requests() -> Optional[Signal]:
+    """Track C6 — agent-sharing approval queue. PG-only (A3 ratchet): on a
+    DuckDB-backed instance the feature simply doesn't exist here (not
+    "broken"), so this returns `None` BEFORE calling the repo rather than
+    letting `RequiresPostgresBackend` degrade the row to "could not be
+    checked" forever — same posture as `_resolve_studio_suggestions`'s
+    feature-flag early-return."""
+    from src.repositories import share_requests_repo, use_pg
+
+    if not use_pg():
+        return None
+    _, total = share_requests_repo().list_for_admin(status=["pending"], limit=1)
+    if not total:
+        return None
+    return Signal(
+        count=total,
+        href="/admin/store",
+        blurb=f"agent {_plural(total, 'share needs', 'shares need')} approval.",
+    )
+
+
 def _resolve_memory_items() -> Optional[Signal]:
     from src.repositories import knowledge_repo
 
@@ -195,6 +216,36 @@ def _resolve_studio_suggestions() -> Optional[Signal]:
         count=total,
         href="/admin/studio/suggestions",
         blurb=f"authoring {_plural(total, 'suggestion is', 'suggestions are')} waiting to be replayed.",
+    )
+
+
+def _resolve_ungranted_plugins() -> Optional[Signal]:
+    """Plugins ingested but granted to no group — "indexed but invisible".
+
+    Ingesting content and granting it to nobody has no legitimate steady
+    state: every non-admin sees an absence, and nothing anywhere says why
+    (TCRD-221 — this exact silence ate ~50 minutes of a live walkthrough).
+    Admin-disabled plugins don't count (deliberately hidden, not a mistake)
+    and neither do system plugins (``mark_system`` materializes their grant
+    for every group, so they cannot be orphaned without also tripping the
+    disabled path)."""
+    from src.repositories import marketplace_plugins_repo, resource_grants_repo
+
+    granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
+    orphans = [
+        p
+        for p in marketplace_plugins_repo().list_all()
+        if not p.get("admin_disabled")
+        and not p.get("is_system")
+        and f"{p['marketplace_id']}/{p['name']}" not in granted
+    ]
+    if not orphans:
+        return None
+    return Signal(
+        count=len(orphans),
+        href="/admin/access",
+        blurb=f"{_plural(len(orphans), 'plugin is', 'plugins are')} granted to no group — nobody can see "
+        + (f"{orphans[0]['name']}." if len(orphans) == 1 else "them."),
     )
 
 
@@ -318,6 +369,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         resolve=_resolve_store_submissions,
     ),
     SignalSpec(
+        key="agent_share_requests",
+        title="Agent shares to approve",
+        zone=ZONE_NEEDS_YOU,
+        severity="action",
+        resolve=_resolve_agent_share_requests,
+    ),
+    SignalSpec(
         key="memory_items",
         title="Memory items pending",
         zone=ZONE_NEEDS_YOU,
@@ -330,6 +388,13 @@ ADMIN_SIGNALS: list[SignalSpec] = [
         zone=ZONE_NEEDS_YOU,
         severity="action",
         resolve=_resolve_studio_suggestions,
+    ),
+    SignalSpec(
+        key="ungranted_plugins",
+        title="Plugins nobody can see",
+        zone=ZONE_NEEDS_YOU,
+        severity="warn",
+        resolve=_resolve_ungranted_plugins,
     ),
     SignalSpec(
         key="store_lint",

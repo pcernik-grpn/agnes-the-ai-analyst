@@ -11,6 +11,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **External SSO sign-in — runtime-configured Entra ID OIDC** (design doc `docs/superpowers/specs/2026-08-28-external-sso-login-design.md`). A new optional `sso` provider slot lets users of an *external* organization's Entra tenant sign in alongside every existing login method: an admin configures it at runtime (web panel on `/admin/server-config` or `agnes admin sso …` — tenant ID, client ID, a write-only Fernet-encrypted client secret, a **mandatory, explicit** email-domain allowlist that is deliberately not inherited from `auth.allowed_domain`, and the login-button label) and changes apply on the next login attempt, no restart. Every sign-in captures the validated token's `oid`/`tid` into the new PG-only `user_external_identities` table (subject binding beats email attach; same-tenant conflicts refuse with admin-findable diagnostics; stale bindings self-heal after a tenant re-point), exposed via `GET /api/me/external-identity`, the profile page's *Linked identity* line, `agnes whoami`, and the paginated admin identities list with per-user unlink. Ships with a side-effect-free admin **test sign-in** (`/auth/sso/login?mode=test`, works pre-enable), a server-side discovery probe, startup-warning announcements, and a last-login-door guard (`422 last_login_door`) so disabling or deleting the config can never lock the instance out. Postgres app-state backend required (typed `501` on DuckDB); operator doc: `docs/auth-sso-entra.md`.
 - **Agent profiles run on the embedded kai-agent engine — the agent API no longer refuses `chat.provider: kai-agent`.** The three artifacts the native workdir seam materializes for an agent session now ride the engine's workspace tarball (`GET /api/kai/workspace`): the persona `CLAUDE.md` (data-access rails appended, replacing the rendered Workspace Prompt exactly as `WorkdirManager._materialize_profile` does natively — override mode included), the identity skill (minted without the remember-tool recipe, which is uncallable from the engine sandbox), and the active memories at `.claude/agent-memory.md`, rendered by the same helper the native seam writes through (`agent_profile.render_memories`) so the two sandboxes cannot drift. A scope-limited agent's tool calls are no longer refused (`403 mcp_not_available_to_scoped_agent` is gone): `/api/kai/mcp` mints and registers the same `agent_session` token the native broker replay uses, so `resolve_token_to_user` rebuilds owner-grants ∩ agent-scope live per request (`AgentPrincipal`) — narrowing an agent or revoking a grant takes effect on the next tool call, and the mint's token cache now keys on the identity *shape* so flipping an agent to `'selected'` mid-conversation can never keep serving the owner token. The same narrowed path covers an all-'all' agent whose session user is not its owner (Slack channel binding), and the flattened marketplace overlay in the tarball is intersection-filtered for restricted sessions — a scoped agent's `AgentPrincipal`, a co-session's live participant `SessionPrincipal` — rather than shipping the caller's (or stored owner's) whole stack. An agent session without a persona now gets the session user's rendered Workspace Prompt (native parity) instead of the unfiltered bundled text. With both halves in place, `POST /api/v1/agents/{slug}/sessions` drops its `503 agent_sessions_unavailable_on_provider` guard — the agent API, `agnes chat <slug>`, one-shot `/responses`, schedules, webhooks and Slack agent bindings all run on the engine provider with the right persona and the right authority. Still engine-side gaps, documented in docs/cloud-chat.md: co-drive keeps failing closed (`mcp_not_available_to_co_session`), and agent memory *writes* have no engine channel (`memory_write_mode` is effectively read-only there).
 - **Connecting an MCP source is a builder, and so is linking external apps.**
   Both were the least builder-shaped surfaces in the product, and both are now
@@ -170,9 +171,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   are translated into what the reader can act on instead of surfacing the
   internal kind.
 - **SharePoint file-source connect wizard** (spec §13.2), reached as a source *type* from `/admin/data-sources` "Add source" — no new nav item. `sharepoint` joins the `source_connections` registry (tenant/client id as fields, certificate via the connection's vault secret or a server env name, never echoed — only its origin and set-date, parsed from the repos' string stamp into the `datetime` the card renders). Its own admin API — `GET .../tree` (a live Microsoft Graph folder-tree browse, one level per call: sites → drives → root children, using the resolved certificate; a missing/unresolvable certificate answers a typed `409` rather than failing the browse), `GET/POST/DELETE .../scopes` (confirm a selected site/library/folder as a scope — `{source_scope_id, display_path, anonymize, collection_id}` stored in the connection's own config, no new table; confirming creates its collection, re-confirming the same `source_scope_id` reuses it; unselecting removes only the wizard's bookkeeping row, never the collection; `group_ids` is the complete SET of groups for that collection when the field is present — listed groups are granted and any other group's grant on it is revoked, because the share step pre-ticks the grants that exist and warns the moment the last one is unticked, so an additive-only handler would show the admin a revocation that never happened — while omitting the field touches no grant at all, which is what keeps a rename or an anonymize toggle from stripping access as a side effect), and `GET .../corpus-map` (the producer handoff: a flat `{source_scope_id: collection_id}` mapping `ship_to_agnes.py --corpus-map` reads until crawling moves inside Agnes). The wizard UI runs the three steps verbatim — connect (identity + certificate), scope (the folder tree, per-row anonymize column, a note that only the extracted markdown is stored, never the original file), share (a per-collection group-badge preview that warns on any collection leaving with no group — "indexed but invisible").
+- **SharePoint connect wizard: subfolder browsing, an instant client filter, and a bounded server-side search** (TCRD-240). `GET .../tree` now takes an `item_id` (with `drive_id`) to browse an arbitrary folder's children — the wizard's step-2 tree can drill past the drive root to any depth, not just sites → drives → root children; `item_id` is structurally validated before it ever reaches a Graph URL path segment. A new `GET .../tree/search` does a bounded breadth-first folder search over the same live tree (never Microsoft Graph's own `/search`, which is known to under-return under app-only auth) — `q` (min 2 chars), `mode` (`prefix`/`contains`/`glob`, case- and NFC-composition-insensitive), an optional `drive_id`+`item_id` subtree root (neither given searches every drive of every reachable site), and `max_depth`/`max_visited` caps (defaults 5/500, clamped rather than rejected at 10/2000) — the response's `truncated` flag is `true` whenever a cap is what stopped the walk, never a silently partial result. In the wizard: a text input above the tree instantly narrows/highlights whatever is already loaded (case- and diacritics-insensitive, no round trip), and a search box with a mode picker lists matching folders with a "Select all (N)" control — each checked result is an ordinary scope confirm, so bulk selection is just N ordinary confirms through the existing `POST .../scopes` contract, never a new bulk endpoint.
+- **SharePoint certificate metadata** — `GET /api/admin/sharepoint/connections/{id}/certificate` and the source card's Certificate row now show the thumbprint the connection's client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t` value — compare it against the identity provider's app registration) plus the conventional uppercase-hex SHA-1 fingerprint, subject/issuer, and a derived `ok`/`expiring_soon` (≤30 days)/`expired` status with days remaining. Derived at request time from the certificate half of the connection's already-stored PEM — no new storage, never the private key; no certificate configured or an unparseable one renders a clean "not configured"/"unreadable" line instead of an error. Catches two real failure modes: a registered certificate that doesn't match what the connection presents (opaque provider auth error), and one expiring silently.
 - **Fact graph over Collections — ingest run reports + the file-source source card** (build order step 6, same `facts.enabled`/Postgres-only gate). Every `POST /api/facts/ingest` batch now also persists its run report to `facts_ingest_runs` (id, corpus ids touched, documents seen, claims written/rejected — count plus itemized detail, deferred, subjects created/deleted, review items, caller) — written AFTER the ingest transaction commits, log-and-continue on failure, so a report-write hiccup never rolls back or fails an ingest. `GET /api/facts/ingest-runs?limit=` (admin) lists them newest-first. On `/admin/data-sources`, a `sharepoint`-type connection now renders the shared `.ds-src` card with a file-source pipeline strip (crawl → extraction → facts → graph counts, plus a labeled-placeholder queue-cost estimate), a static schedule line ("external producer · hourly delta" — the crawl runs externally), a certificate row (vault/env origin and set-date, never the credential value), an identity-matching row (groups matched / collections with no group, fail-closed), and per-run error badges (rejected quotes / deferred / protocol errors) that open a drawer itemizing that category. A connection with no ingest history yet, or a DuckDB-backed instance, degrades gracefully rather than erroring; a "scope collections" heuristic (every collection this instance has ever ingested facts into) stands in until the connect wizard's own connection→collection scope mapping ships.
 - **`/admin/ontology` — the ontology builder** (`facts.enabled`, Postgres-only; reachable only via a link on `/admin/semantic-layer`, no new navigation). The shared builder shell — Create/Preview left, numbered sections right (source · entity types · relationship types · document sample · dry-run output · freeze summary) — where Save is the only write: section edits and paste/file import both fill a persisted, per-admin draft (`ontology_drafts`, PG-only) and are never applied on their own. Save reuses `translate_ontology` server-side, validates the result against the vendored Ossie schema, and posts it through the exact same path `import_ontology.py --server` calls (`POST /api/admin/semantic-models`, `source='manual'`). `POST /api/admin/ontology/dry-run` runs the draft's current (possibly-unsaved) types against ONE picked document's already-extracted text through the server-side LLM plumbing (`connectors.llm`, same `ai:`/env resolution as corporate-memory digests) and returns proposed facts/edges alongside a not-captured block; answers a typed `501` when no LLM key is configured. The freeze summary's cost line is an explicitly labeled placeholder estimate, not real LLM pricing. DuckDB-backed instances see an explanatory empty state instead of a dead-end builder.
-- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. This ships the Agnes-side seam only — the producer itself is a separate project the operator supplies, adopted rather than vendored into this repo.
+- **Microsoft Entra ID group sync**, mirroring Google Workspace sync — off by default (`auth.microsoft.group_sync_enabled` / `AGNES_MICROSOFT_GROUP_SYNC_ENABLED`). On sign-in, Agnes calls Microsoft Graph `GET /me/memberOf` with the delegated OAuth token, pages through `@odata.nextLink`, filters to `#microsoft.graph.group` entries, and replaces the user's `source='microsoft_sync'` rows in `user_group_members` (admin/system-seed/other-provider rows untouched). Turning the switch on also widens the requested OAuth scope to the delegated Graph permission `GroupMember.Read.All`, which needs its own admin-consent grant in the Entra app registration and a restart (see `docs/auth-microsoft-oauth.md`); the sync gate itself is read live, so a stale token scope fails soft rather than failing the login. `AGNES_MICROSOFT_GROUP_PREFIX` (env-only, mirrors `AGNES_GOOGLE_GROUP_PREFIX`) narrows which fetched groups are mirrored and, when set, refuses sign-in (`/login?error=microsoft_not_in_allowed_group`) for a user whose non-empty group fetch matched none of it — any other sync failure (feature off, empty fetch, Graph error) never blocks login.
+- **The SharePoint per-scope `anonymize` flag is now real** (spec §9/§9.2 anonymize-in-front pipeline). The `corpus-extraction` job handler hands the producer an `AGNES_EXTRACTION_ANONYMIZE_SCOPES` JSON map (`{source_scope_id: collection_id}`, only the anonymize-marked scopes) plus a per-instance `AGNES_ANONYMIZATION_HMAC_KEY` (new `instance.yaml` `extraction.anonymization.hmac_key_env`, default env name `AGNES_ANONYMIZATION_HMAC_KEY`, resolved through its own narrow allowlist — deliberately separate from the connector-ATTACH `token_env` allowlist, so this key can never be referenced by a connector-written `_remote_attach` row) — both env-only, never argv, and never resolved/forwarded at all when no scope needs them. A connection with an anonymize-marked scope and no resolvable key fails the job clean rather than running the producer without one. `POST /api/facts/ingest` additionally accepts an optional `anonymization: {declared, scopes: {corpus_id: {docs_anonymized, docs_skipped}}}` block, persisted into the run report (`facts_ingest_runs`, PG-only, new nullable-free `anonymization` JSONB column) but never echoed into the ingest's own response. New [`docs/anonymization.md`](docs/anonymization.md) documents the contract and its limits (Agnes records the producer's declaration; it cannot independently verify content was anonymized).
+- **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. The producer's stdout is discarded and its stderr streamed to a temp file with only a 64 KiB tail read back for the failure log, rather than buffering a potentially hour-long run's entire output in the worker's own memory to serve one DEBUG line. This ships the Agnes-side seam only — the producer itself (`keboola/cuesta-star-graph`) is adopted, not vendored into this repo.
+- **Agent sharing now needs admin approval, on a Postgres app-state backend (Track C6).** Building an agent stays open to any authenticated user, but when a NON-ADMIN owner shares one with a new group (`PUT /api/sharing/agent/{id}`), the grant is no longer written immediately — it's queued in a new `share_requests` table and the endpoint answers `202` (not `200`) with `pending_group_ids` naming what's awaiting a decision. An admin reviews the queue from a new "Pending agent shares" zone on `/admin/store` (also surfaced as a count on the `/admin` dashboard) or via `GET /api/admin/share-requests` + `PATCH .../{id}` (`{"decision": "approve"|"reject"}`); approving writes the exact same `resource_grants` row an admin-curated `/admin/access` grant would, so the shared-agent runtime honors it immediately. An admin actor sharing an agent, and any un-share, both stay instant exactly as before — only a non-admin's NEW agent share is gated. The queue (`share_requests`, A3 ratchet) is Postgres-only; on a DuckDB-backed instance the approval step simply isn't active — a non-admin share falls back to the pre-C6 instant grant rather than regressing to a hard failure — while the admin `/api/admin/share-requests*` surface itself answers a clean `501` there (nothing to review).
+- **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
 - **The Library is two tabs, and every row's button says what it does.**
@@ -229,6 +236,26 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
     utilities that tint when on, and "+ Add" is the only filled control.
   - **Bands open on arrival**, and an empty tab says so in its own words rather
     than offering a "Clear filters" button for filters that are not applied.
+- **The SharePoint wizard and source card no longer render "anonymized" from the checkbox alone.** `anonymize=true` on a scope is a *request*; the badge only reads "anonymized" (ok tone) once the latest persisted ingest run actually *declares* that collection anonymized (`anonymization_declared`, new field on `GET /connections/{id}/scopes`) — otherwise it reads "anonymization requested" (warn tone). Applies to the connect wizard's step-2 tree badge, the step-3 share preview, and a new "Anonymization" row on the `/admin/data-sources` source card.
+- **Vocabulary pass (D5, v1): the same concept now has one name across UI,
+  CLI and MCP help text — the old name keeps working as a deprecated
+  alias.** `agnes connectors`/`agnes connector` → **`agnes tools`**
+  (optional MCP tool connectors — Asana, Atlassian, … — were colliding with
+  "Connector" = data source used throughout the docs); `agnes stack
+  artefacts` → **`agnes stack collections`**, and its `corpus_id` argument
+  is now documented as a collection id ("Collection" is the established
+  canonical name for a file corpus — see `agnes collections` — the
+  `stack_artefact_*` MCP tool descriptions now lead with "collection" too).
+  `agnes agent`'s help text drops "agent profile" in favor of "agent"; the
+  agent builder's schedules panel says "agents are disabled" instead of
+  "agent profiles are disabled". The semantic-model CLI (`agnes admin
+  semantic-model`, `agnes semantic-model apply`) drops "Ossie document" in
+  favor of "semantic model document" (`agnes semantic-model schema`, which
+  prints the actual vendored Apache Ossie JSON Schema, keeps naming the
+  standard — that reference is accurate, not the retired synonym).
+  `/admin/data-sources`' browser tab title is now "Connections" (the hero
+  and nav tab stay "Data"/"Sources"). No REST route paths changed.
+- **The chat page's suggested actions moved above the composer.** "Suggested for you" used to close the empty state from under the input; it now sits between the page's lede and the composer. The chips answer "what can I even ask here", which is a question the reader has *before* they reach an empty field, not after they have already passed it — read top-down the page is now "here is what you could ask" then "ask it". The ways out (the two cards + trust line) did not move: they still close the page, because every one of them navigates away from the composer. The chips render from the same typed task model and keep the same shared column grid as the composer; they still hide the moment a conversation starts.
 - **The chat sandbox now tells the agent the truth about its runtime, and
   read-only admin commands work there.** Three coupled fixes to the same
   confusion (an in-chat agent concluding its auth was broken and recommending
@@ -300,6 +327,35 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   leaving an admin to know that rule by heart. Groups get the same treatment in
   a follow-up — that pool carries a three-state tier per row and a grant diff on
   save.
+- **A `no_tools_registered` 409 no longer reads as "already granted".** The
+  source-wide grant (`POST /api/admin/mcp-sources/{id}/grants`) answers 409
+  `no_tools_registered` when a source has no *enabled* tool row — nothing was
+  granted, and re-enabling the tools later does not go back and grant anyone.
+  Already-granted is not a 409 there at all (200 with an `already` count), so
+  the MCP builder's blanket "409 means done" reported a failed access change as
+  success, on a state the builder can produce: turn every introspected tool off,
+  pick a group, Save. The swallow is now keyed on the error code rather than the
+  status, so that case surfaces the server's own sentence (which names the fix)
+  and Save does not redirect. Sibling checked and left alone: the linked-apps
+  builder swallows 409 from `/api/admin/grants`, whose single 409 genuinely does
+  mean the grant already exists.
+- **The MCP builder's Save now registers the tools, so the source it hands back
+  is actually callable.** A source exposes only the `tool_registry` rows that
+  are `passthrough` and enabled (`app/api/mcp/tools_generator.py`), and Save
+  wrote the source, the secret and the grants but never a tool row — so it
+  produced a registered, granted source with **zero callable tools**, while the
+  Tools panel invited the admin to "turn off anything agents should not call"
+  and counted "N of M" on. The toggles described an outcome Save did not
+  produce, in both directions. Each tool left on is now registered as a
+  resumable step before the grants (a group pointed at a source with nothing
+  callable has been given nothing), keyed on the deterministic
+  `<source>__<tool>` id the source detail page already uses so a second Save
+  cannot duplicate a row and the 409 a re-register answers reads as done. Tools
+  toggled off are simply not registered. The introspected `input_schema` — which
+  the panel's mapper had been discarding — now reaches the registry, since it is
+  how an agent learns the tool's arguments. Materialize mode still belongs to
+  the source's own page: it needs a schedule and a table this panel does not ask
+  for.
 - **`dev_preview_available` had two definitions.** `_chrome_ctx` computed it as
   `_dev_preview_enabled()`; `/chat` also passed it to `_build_context` as
   `is_local_dev_mode() and is_user_admin(...)`. Only the first was corrected
@@ -713,6 +769,49 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sort by).
 
 ### Fixed
+- **Security: config-resolution secrets are no longer valid connector-ATTACH
+  `token_env`s.** The single token-env allowlist fed two independent trust
+  boundaries: the settings resolvers that read a secret named in admin-written
+  connection config (SharePoint certificate private key, Snowflake key-pair
+  passphrase), and the `_remote_attach` gate that resolves a token_env a
+  *connector* wrote into its extract.duckdb and sends the value as
+  `ATTACH … TOKEN` to the row's own URL. Sharing the list meant a
+  malicious/compromised connector could name `SHAREPOINT_CERT_PRIVATE_KEY` (or
+  `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`) as its `token_env` and have the
+  orchestrator ship that secret to a connector-chosen host on every query. The
+  allowlist is now split per consumer class: the ATTACH gate accepts
+  data-source attach tokens only, config-driven resolvers check the new union
+  gate (`is_config_secret_env_allowed`), and a ratchet test keeps every
+  config-only secret out of the ATTACH set for good. Operators extend the
+  config-resolution side with `AGNES_CONFIG_SECRET_ENVS` (replaces the
+  config-only defaults; `AGNES_REMOTE_ATTACH_TOKEN_ENVS` keeps governing the
+  ATTACH side and still flows into the union, so existing overrides keep
+  working).
+- The group picker on `/admin/users/{id}` ("Add to group") showed only its
+  first option under themes that render the custom dropdown: the section
+  card's `overflow: hidden` clipped the popover at the card's bottom edge,
+  leaving every option past it invisible with no scroll or affordance. The
+  card's clip now yields while a dropdown menu inside it is open
+  (`section_card.css`), which fixes every ds-dropdown near the bottom of any
+  section card, not just this picker.
+- **MCP foundation-tool errors now carry the server's remedy, and the chat
+  approval card says what it is approving.** Every foundation tool used a bare
+  `raise_for_status()`, so a 4xx surfaced to the model as a generic
+  `Client error '400 Bad Request' for url …` while the response's `detail` —
+  the actionable part, e.g. `invalid_category` with the list of valid
+  categories — was discarded; the shared helper now appends it, letting the
+  model self-correct instead of dead-ending. The chat approval card now names
+  the tool being approved in its title (it previously said only "Approval
+  required", forcing the reader to infer the tool from a neighbouring card),
+  a no-args engine tool call no longer renders a code block containing just
+  `{}`, JSON args are pretty-printed, and while a call waits on the decision
+  its tool card reads "waiting for approval" instead of a contradictory
+  "running…".
+- **"Reset to default" on `/admin/prompts` asks before destroying the
+  override.** One click used to replace a customer's tuned install/workspace
+  prompt with the shipped default — no confirmation, nothing recoverable. The
+  reset now goes through the design-system confirm dialog (same idiom as every
+  other destructive admin action), naming what will be lost.
 - **Vertex mode: chat turns no longer 400 on first-party-only `anthropic-beta`
   values.** Vertex validates the `anthropic-beta` header and refuses the whole
   request on any value it does not recognize (the first-party API ignores
@@ -725,6 +824,50 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   rest (logged; default-deny, so a future unknown beta degrades one optional
   feature instead of 400-ing every turn), and omits the header entirely when
   nothing survives.
+- **Content granted to nobody is now visible as a problem instead of an
+  absence.** A plugin ingested but granted to no group looked identical to a
+  plugin that didn't exist — every non-admin saw nothing, and no surface told
+  the admin that content existed yet reached no one. The `/admin` dashboard's
+  "needs you" zone gains a "Plugins nobody can see" signal (admin-disabled and
+  system plugins excluded — the first is deliberately hidden, the second has
+  its grants materialized for every group), and `/admin/access` extends the
+  collections' "⚠ nobody" badge to marketplace-plugin rows, derived from the
+  same grants payload the checkboxes read so the two can never disagree.
+- **A stale "last sync failed" on a bundled marketplace row now clears itself.**
+  The failure stamped by a pre-guard "Sync now" click could never clear: the
+  nightly sync deliberately skips built-in rows, so nothing ever ran, succeeded,
+  or removed the stamp. The boot re-seed of both bundled rows (built-in and
+  contributed) now nulls the stale `last_error` — without fabricating a sync
+  timestamp — via a new `clear_sync_error` on both registry backends, and the
+  admin table's sync-state cell stops rendering `failed`/`never` for bundled
+  rows entirely (an em-dash with an explanatory tooltip, matching the URL
+  cell's `bundled` pill), since those states describe a git sync that can
+  never run against a row with no remote.
+- **"Sync now" on a built-in marketplace no longer deletes its content.**
+  `sync_marketplaces()` (the nightly pass) always skipped `is_builtin=TRUE`
+  rows, but the per-row path — the admin table's "Sync now" button and
+  `agnes admin marketplace sync <slug>` — did not, and handed the row's
+  `builtin://` sentinel URL to git. Git resolved the scheme to a
+  `git-remote-builtin` helper that does not exist, so the clone always failed
+  (`git: 'remote-builtin' is not a git command`) — but only *after* the clone
+  path had already `rmtree`'d the target directory, because a baked tree has
+  no `.git`. One click therefore wiped the seeded content (`agnes-builtin`
+  came back on the next boot re-seed; the contributed marketplace, whose whole
+  contract is durability across restarts and syncs, did not) and stamped a
+  `last_error` that no later sync would ever clear, leaving the row
+  permanently red in `/admin/marketplaces` and `"error"` in the
+  marketplace-health report. `sync_one()` now refuses a built-in row before
+  touching the filesystem or the registry (`MarketplaceNotSyncable` → `409`,
+  no audit row, no `last_error`), and `/admin/marketplaces` drops the button
+  for those rows — surfaced via a new `is_builtin` field on the marketplace
+  response — showing a `bundled` pill in place of the non-actionable sentinel
+  URL. `DELETE /api/marketplaces/{id}` gains the same guard (`409`): deleting a
+  built-in row is a no-op the next boot re-seed undoes for `agnes-builtin`, and
+  with `purge=true` it destroyed the contributed marketplace's locally written
+  skills for good — the same content-losing shape, one endpoint over. Retiring
+  built-in content is what the per-plugin disable is for, which the refusal now
+  names.
+
 - **A failed builder Preview now says why, instead of pointing at the browser
   console.** Reported from a deployed instance: the agent builder's Preview
   answered "The preview could not answer. The details are in the browser
@@ -870,6 +1013,44 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   destructive now (it burns the link so a refused consent cannot be re-submitted
   as an allow), so it requires the same authenticated Agnes session Allow always
   did — previously the deny branch ran before the session check.
+- **A session's token spend is now visible in the admin session viewer.**
+  The processor has summed per-session tokens into `usage_session_summary`
+  since v44 and every assistant turn in a session JSONL carries
+  `message.usage` — yet no admin surface projected either, so "what did this
+  prompt cost" was unanswerable from the product (the walkthrough could see a
+  session's tool calls but not one token number). The session detail page
+  gains a Tokens line (total plus in/out/cache breakdown), summed server-side
+  from the transcript's own usage blocks — exact for the file being viewed
+  and independent of whether the UsageProcessor has ticked yet; a JSONL that
+  predates the usage field shows an honest "—", never a zero. The session
+  repositories' projections (`_SESSION_COLS`, `get_session_summary`) now
+  carry the four stored token counters on both backends, so the sessions
+  list payload has them too.
+- **Logout now actually ends the session** (#1675, #1676). The user-menu
+  "Logout" item used to be a plain `GET /login` link — no route existed for
+  it, so it never cleared the 30-day `access_token` cookie or invalidated
+  anything; the app happily reopened on the next visit. `GET /auth/logout`
+  now renders a confirm form (mutating on a GET is forbidden by this repo's
+  CSRF rules) and `POST /auth/logout` — gated by the same double-submit
+  `web_csrf` token every other state-changing web form uses — clears the
+  cookie with the exact attributes it was set with (`path`, `domain`,
+  `samesite`, `secure`) and revokes the session server-side, so a copy of
+  the token captured before logout (a synced browser profile, host malware,
+  a shared machine) stops working too, not only the browser that clicked
+  Logout. Revocation is a new `users.session_revoked_before` timestamp
+  floor compared against each `typ="session"` JWT's `iat` on every
+  authenticated request — it rides the user row `pat_resolver` already
+  loads to check `active`, so it costs no extra query on this hot path.
+  **Postgres-only** (schema-freeze ratchet, A3): a DuckDB-backed instance
+  clears the cookie on logout but has no column to persist the revocation
+  floor against, so a token copied out before logout stays valid on that
+  backend until its own `exp` — same as before this fix, not a regression.
+  Deploying this column does not itself invalidate any existing session
+  (the floor starts unset); only a future `POST /auth/logout` click revokes
+  anything, and revoking one session revokes every other live session for
+  that account too (a per-user floor, not a per-session one — the
+  narrower, per-token design was rejected on the same per-request cost
+  grounds `pat_resolver`'s PAT chain already documents).
 - A data source whose name is not a valid SQL identifier (e.g. a hyphenated
   name) was silently skipped during rebuild and the rebuild still reported
   success — the caller had no way to tell the source was rejected from
@@ -899,18 +1080,56 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   user was actively resuming. Any other spawn failure still propagates
   untouched.
 
-- **`/login` and `/login/password` dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app after OAuth.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
-  **Not fully closed:** a third copy of the same rule lives in the password
-  provider's web-form POST handler, which is the terminal consumer of the form
-  `/login/password` renders — so signing in *with a password* still lands on the
-  home route rather than back in the app. OAuth (Google, Microsoft, Keboola) and
-  magic-link all route through `safe_next_path` and do return you to the app.
-  The underlying fault is that this one rule had four implementations; three of
-  them still exist.
+- **Signing in dropped `next` when it pointed at a hosted data app's own origin, sending a signed-out visitor back to the home route instead of into the app — on every provider, password included.** Both routes had their own hand-rolled copy of the open-redirect rule predating `app/auth/_common.py::safe_next_path`'s `_is_own_data_app_origin` exception, so an absolute app-origin `next` was blanked before the provider links were built. Both now call `safe_next_path` like `/login/email` already did.
+  The password provider's web-form POST handler — the terminal consumer of the
+  form `/login/password` renders, and the reason a *password* sign-in still
+  landed on the home route while OAuth and magic-link returned you to the app —
+  held a third copy of the same rule and now calls `safe_next_path` too. All
+  four sign-in paths (OAuth, magic-link, password form, login pages) resolve
+  `next` through the one implementation that knows about app origins.
+- **Magic-link login now JIT-provisions first-time accounts on an allowed
+  domain, instead of silently sending nothing.** Requesting a sign-in link
+  for an address with no account used to render the normal "Check Your
+  Email" page but never deliver a mail — the person waited for a link that
+  would never arrive, with no way to tell whether they mistyped, aren't
+  invited, or the system is broken (#1683). A first-time request now creates
+  the account (mirroring the Google/Microsoft OAuth callbacks' existing
+  `ensure_user` provisioning) when the address's domain matches
+  `auth.allowed_domain`, then mints and sends a real link; addresses outside
+  the allowlist — or on an instance that never configured one — keep the
+  prior existing-users-only silence. The visible response and its shape are
+  unchanged either way (anti-enumeration): the caller cannot tell from the
+  answer whether the account pre-existed, was just created, or doesn't
+  qualify.
+
+- **Facts ingest resolves a duplicate `doc_id` deterministically and within its declaring collection, instead of picking an arbitrary copy across ALL collections (TCRD-241).** A byte-identical SharePoint copy shares its sha-derived `doc_id` with every other copy of the same file, so more than one `corpus_file_sources` row can legally anchor the same `doc_id` — possibly in a different Collection. `FactsPgRepository.ingest_batch` previously resolved evidence with an unscoped `SELECT … WHERE source_doc_id = :doc_id LIMIT 1`, which could attach a claim to whichever collection's copy happened to sort first — mis-scoping the claim's visibility onto the wrong collection's grants and, on `full_documents` replace, leaving a stale claim behind on the copy that didn't win. Resolution is now corpus-scoped and deterministic (indexed copies preferred, `corpus_file_id` as a tiebreak): a claim resolves within the Collection its `documents[]` entry declared, then within the OTHER collections this same batch's `documents[]` touched. When this batch DID declare at least one collection but a cited `doc_id` is anchored only in some other, undeclared one, the claim is now REJECTED (`ambiguous_cross_collection_doc_id`, itemized in `claims_rejected`) rather than silently written under a collection wider than the producer's batch ever declared — a batch scoped to a restricted collection can no longer leak a claim into a more broadly-granted one. A `documents[]`-omitted batch (the documented "every doc_id already resolves" replay) has no batch-declared scope to escape and is unaffected. Replace mode now purges claims off every anchored copy within the declaring collection, not just the one resolution currently prefers.
 
 ### Removed
 
 ### Internal
+- **`test-pg` splits across 4 jobs instead of 2, roughly halving every CI
+  cycle's critical path.** Measured over four consecutive `integration` runs,
+  the eight main shards finished in 11-17 min while both `test-pg` jobs sat at
+  26-34 min — so every run in the repo waited on `test-pg` no matter how fast
+  the rest was. Widening the split is close to free: a job's step timings show
+  **26.3 of its 27 minutes is the pytest run itself** (checkout, setup-python
+  and uv are cached to ~0.1 min), and the committed `.test_durations` cut four
+  ways balances at 11.2 min per group, predicting ~13 min wall. The published
+  check names change from `test-pg (1..2)` to `test-pg (1..4)`;
+  `CONTRIBUTING.md`'s "confirm the check names are present" note is updated to
+  match, and the `test` aggregator needs no change because it depends on the
+  matrix result, not on individual groups.
+- **Every pull request runs the test suite, whatever branch it targets
+  (#1636).** `ci.yml`'s `pull_request` trigger was filtered to `main` and
+  `integration`, so a PR into a stack base — `mf/semantic-layer-v0`, a
+  `claude/*` branch — fired no workflow at all and showed a **green rollup
+  that asserted nothing**, which reads exactly like a passing run. The
+  semantic-layer stack took four PRs that way, over a base sitting at two
+  alembic heads with nothing to report it. The filter is gone rather than
+  extended with stack-base names: a naming convention nobody enforces fails
+  silently the first time someone picks a name outside it. `CONTRIBUTING.md`
+  now states the invariant and how to check for it (confirm the check NAMES
+  are present — "no red" is not "tested").
 - **Live Databricks test suite + an in-process schedules E2E (Track E5).** `tests/test_live_databricks.py` mirrors `tests/test_live_bigquery.py` — `-m live`, autouse env-gated skip fixture, no wiring into CI — and exercises the Databricks connector's three untested-live paths against a real workspace: `materialize_query`, `execute_select`/`execute_scan_to_arrow`, and the semantic-layer's metric-view discovery (`_list_metric_views` + `SHOW CREATE TABLE ... $$<yaml>$$`), asserting the two vendor-specific `information_schema`/YAML-shape assumptions `connectors/databricks/semantic_ossie.py` makes. `tests/test_schedules_e2e.py` (marked `slow`, runs in normal CI, no external creds) closes the "no test proves a schedule fires" gap: it binds the app to a real loopback socket and drives `services/scheduler/__main__.py`'s actual `_run_job`/`_call_api` HTTP path against it, proving one real scheduler tick claims a due agent schedule and enqueues its job end-to-end.
 - **Local-dev audience switch on the chat landing page.** Under
   `LOCAL_DEV_MODE`, an admin viewing `/chat` gets a small "Dev preview:
@@ -921,6 +1140,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   written, and no authority or grant changes. Off the dev gate every value is
   ignored outright and the toggle is not rendered, so it adds no surface to a
   real deployment.
+- **Vertex sweep of the remaining direct-Anthropic call sites (TCRD-242).**
+  Chat, vision ingest, and the guardrails reviewer were already Vertex-capable
+  through `connectors/llm/factory.py`; the offline eval harness's
+  `--llm-assist` grading pass (`scripts/eval/grade.py::llm_assist_grade`) was
+  the one remaining consumer that hard-required `ANTHROPIC_API_KEY` — it now
+  falls back to a raw `AnthropicVertex` client via
+  `connectors.llm.factory.vertex_config_or_none` /
+  `connectors.llm.vertex_provider.create_vertex_client` when no static key is
+  set, the same non-extractor pattern `app/chat/auto_title.py` and
+  `src/ingest/vision.py` already use. The agent-as-API runtime
+  (`POST /api/v1/agents/{slug}/responses`) needed no change — it spawns a
+  headless chat session through the same `ChatManager`/`app/api/broker.py`
+  path live chat uses, which already honors `chat.llm.provider: vertex`
+  end-to-end including pinned-model and budget enforcement against a
+  Vertex-shaped model path. The A0 "bare Anthropic API, no tools" eval arm
+  (`scripts/eval/arms.py::AnthropicArm`) is deliberately left on the
+  first-party API — its entire methodological point is measuring the vendor's
+  hosted baseline, independent of Agnes's own provider routing.
 
 ## [0.91.0] - 2026-08-28
 

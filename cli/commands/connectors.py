@@ -1,10 +1,16 @@
-"""``agnes connectors`` — discover and read connector setup prompts.
+"""``agnes tools`` — discover and read connector setup prompts.
 
 The install prompt references connectors by name instead of inlining every
-SKILL.md body: ``agnes connectors list`` shows what this instance offers
+SKILL.md body: ``agnes tools list`` shows what this instance offers
 (seed-derived manifest, RBAC-free — the manifest is instance-wide), and
-``agnes connectors show <slug>`` prints the full inline setup prompt for
+``agnes tools show <slug>`` prints the full inline setup prompt for
 one connector, ready to follow in a Claude Code session.
+
+``connectors``/``connector`` remain as deprecated aliases (registered in
+``cli/main.py``) — this module named the group after the underlying
+concept it lists (optional MCP *tool* connectors, e.g. Asana, Atlassian),
+which collided with "Connector" = data source (Keboola/BigQuery/…) used
+throughout the docs. `tools` is now canonical.
 
 Server surface: ``GET /api/connectors/manifest`` and
 ``GET /api/connectors/{slug}/prompt`` (``app/api/connectors.py``).
@@ -48,7 +54,7 @@ def list_connectors(
     # Origin labeling (command-UX standard): say where the manifest came
     # from — the operator's Initial Workspace Template or the bundled seed.
     typer.echo(f"source: {body.get('source', 'unknown')}")
-    typer.echo("Set one up with: agnes connectors show <slug>")
+    typer.echo("Set one up with: agnes tools show <slug>")
 
 
 @connectors_app.command("show")

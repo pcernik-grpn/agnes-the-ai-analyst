@@ -626,6 +626,18 @@ _LIBRARY_SHARING_REASON = (
     "so a second CLI/MCP vocabulary for it would duplicate the admin one."
 )
 
+_SHARE_REQUESTS_ADMIN_REASON = (
+    "Track C6 agent-sharing approval queue — web-only, same reasoning as "
+    "_LIBRARY_SHARING_REASON above: the underlying write is the exact same "
+    "`resource_grants` row the admin `agnes admin grant …` CLI already "
+    "mints, so approve/reject here only decides a QUEUED instance of that "
+    "same grant. The queue itself has no analyst-facing use — it exists "
+    "purely so an admin can review a non-admin owner's agent-share request, "
+    "a decision made from the admin moderation hub (`/admin/store`), never "
+    "scripted. No CLI/MCP vocabulary is warranted for either the list or "
+    "the approve/reject verbs."
+)
+
 _DATA_APPS_PREVIEW_GRANT_REASON = (
     "preview-grant mints the in-chat iframe cookie for the web chat surface; chat-only, no CLI/MCP analogue (spec §7)"
 )
@@ -667,6 +679,54 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/sso/config": (
+        "external SSO login config (design 2026-08-28) — CLI-reachable via "
+        "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
+        "the PUT/DELETE reconfigure which external tenant this instance "
+        "trusts to assert identities (the 'admin credential-provisioning "
+        "writes' standing exemption in CONTRIBUTING.md), and the GET "
+        "enumerates the instance's auth posture (the 'operator "
+        "security-posture diagnostics' standing exemption)"
+    ),
+    "/api/admin/sso/client-secret": (
+        "external SSO client secret (write-only vault write) — CLI-reachable "
+        "via `agnes admin sso set-secret|clear-secret`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that stores "
+        "the credential a third-party tenant authenticates with is a "
+        "privilege-escalation seam, not a convenience"
+    ),
+    "/api/admin/sso/test-config": (
+        "external SSO discovery probe — CLI-reachable via `agnes admin sso "
+        "test`, deliberately never MCP-exposed per the 'admin "
+        "credential-provisioning writes' standing exemption in "
+        "CONTRIBUTING.md (it validates the same credential-trust config the "
+        "writes provision, against the live tenant)"
+    ),
+    "/api/admin/sso/identities": (
+        "linked external identities list — CLI-reachable via `agnes admin "
+        "sso identities`, deliberately never MCP-exposed (own reasoning, "
+        "not a standing-exemption citation): a per-user roster of which "
+        "external principal can authenticate as whom (emails + subject "
+        "GUIDs) is admin recovery tooling, and handing it to an "
+        "agent-invokable tool would give a prompt-injected session a "
+        "one-call identity map of the instance; it is not analyst tooling"
+    ),
+    "/api/admin/sso/identities/{user_id}": (
+        "admin unlink of one external identity — CLI-reachable via `agnes "
+        "admin sso unlink`, deliberately never MCP-exposed: unlinking "
+        "re-opens first-login email attach for that user (an auth-trust "
+        "mutation), and is admin recovery tooling, not analyst tooling"
+    ),
+    "/api/me/external-identity": (
+        "the caller's own external-identity linkage — CLI-reachable via the "
+        "`agnes whoami` linked-identity line, deliberately never MCP-exposed "
+        "(own reasoning, not a standing-exemption citation: the operator-"
+        "diagnostics clause covers instance-wide posture, and this is "
+        "self-scoped): it reveals which external principal can authenticate "
+        "as the caller (`oid`/`tid`) — auth-linkage reconnaissance a "
+        "prompt-injected chat session has no analyst-tooling reason to hold"
+    ),
     # `/api/agents/{agent_id}/builder/turn` is NOT here: it sits with the other
     # four builder-turn routes further down, as `_AGENTS_BUILDER_TURN_REASON`.
     # It used to be in both places — an inline prose entry here and the
@@ -747,6 +807,8 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,
+    "/api/admin/share-requests": _SHARE_REQUESTS_ADMIN_REASON,
+    "/api/admin/share-requests/{request_id}": _SHARE_REQUESTS_ADMIN_REASON,
     "/api/me/elevation": (
         "admin elevation consent gate — sets the browser-session cookie the "
         "elevation middleware reads; structurally a web-browser surface (the "
@@ -930,8 +992,13 @@ _EXEMPT: dict[str, str] = {
     # eventual document surface is `agnes facts …`, already triple-surface
     # in _COHORT above).
     "/api/admin/sharepoint/connections/{connection_id}/tree": (
-        "live Graph folder-tree browse (sites -> drives -> root children, one level "
-        "per call) for the wizard's step-2 scope picker — admin-only, no analyst "
+        "live Graph folder-tree browse (sites -> drives -> root children -> "
+        "arbitrary-depth subfolder children, TCRD-240) for the wizard's step-2 "
+        "scope picker — admin-only, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/tree/search": (
+        "bounded BFS folder search (TCRD-240) over the same live tree — admin-only "
+        "display primitive feeding the wizard's step-2 search box, no analyst "
         "CLI/MCP analogue"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/scopes": (
@@ -942,6 +1009,11 @@ _EXEMPT: dict[str, str] = {
         "producer handoff: the flat {source_scope_id: collection_id} mapping "
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/certificate": (
+        "read-only certificate metadata (thumbprint/subject/issuer/expiry) for the "
+        "wizard's source card, derived at request time from the connection's own "
+        "stored PEM — admin-only display primitive, no analyst CLI/MCP analogue"
     ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the

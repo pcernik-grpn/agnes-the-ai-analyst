@@ -860,6 +860,17 @@
         "title": "Body_import_metrics_api_admin_metrics_import_post",
         "type": "object"
       },
+      "Body_logout_submit_auth_logout_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          }
+        },
+        "title": "Body_logout_submit_auth_logout_post",
+        "type": "object"
+      },
       "Body_password_login_web_auth_password_login_web_post": {
         "properties": {
           "email": {
@@ -4158,9 +4169,57 @@
         "title": "FactsCorrectionRequest",
         "type": "object"
       },
-      "FactsIngestRequest": {
-        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.",
+      "FactsIngestAnonymizationReport": {
+        "description": "OPTIONAL producer declaration that (some of) this batch went through\nthe anonymize-in-front pipeline (spec \u00a79: source -> crawl -> convert ->\nanonymize -> Agnes) before ingestion. Additive to the wire contract \u2014 a\nproducer that never anonymizes omits this field entirely.\n\n``scopes`` is keyed by ``corpus_id`` (the collection id, matching the\nconnect wizard's own scope-row shape); a key that does not resolve to a\nreal collection is KEPT, not rejected \u2014 this is a self-reported tally,\nnot a join against ``file_corpora`` (spec \u00a79.2's \"current limits\": Agnes\nrecords the declaration, it cannot verify the content was anonymized).",
         "properties": {
+          "declared": {
+            "default": false,
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "scopes": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FactsIngestAnonymizationScope"
+            },
+            "title": "Scopes",
+            "type": "object"
+          }
+        },
+        "title": "FactsIngestAnonymizationReport",
+        "type": "object"
+      },
+      "FactsIngestAnonymizationScope": {
+        "description": "One corpus's anonymization tally within this batch (spec \u00a79.2). A\nself-reported COUNT, never independently verified by Agnes \u2014 see\n``docs/anonymization.md``'s \"current limits\".",
+        "properties": {
+          "docs_anonymized": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Anonymized",
+            "type": "integer"
+          },
+          "docs_skipped": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Docs Skipped",
+            "type": "integer"
+          }
+        },
+        "title": "FactsIngestAnonymizationScope",
+        "type": "object"
+      },
+      "FactsIngestRequest": {
+        "description": "Wire format accepted verbatim (spec \u00a77.0/\u00a77.2) \u2014 ``documents`` are the\ncrawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/\n``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.\nDeliberately plain ``Dict[str, Any]`` items rather than a strict nested\nschema \u2014 the producer contract explicitly tolerates unknown fields\n(underscore-prefixed crawler internals are stripped server-side, not\nrejected), so a rigid Pydantic model would reject valid producer input\non every crawler-side field addition.\n\n``anonymization`` is the one exception: a small, OPTIONAL, strictly\ntyped block (spec \u00a79.2) \u2014 malformed input there is a real protocol\nerror (422), not tolerated crawler noise.",
+        "properties": {
+          "anonymization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactsIngestAnonymizationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "documents": {
             "items": {
               "additionalProperties": true,
@@ -5796,6 +5855,11 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "is_builtin": {
+            "default": false,
+            "title": "Is Builtin",
+            "type": "boolean"
           },
           "last_commit_sha": {
             "anyOf": [
@@ -9170,6 +9234,19 @@
         "title": "SetupTokenItem",
         "type": "object"
       },
+      "ShareRequestDecisionRequest": {
+        "properties": {
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "ShareRequestDecisionRequest",
+        "type": "object"
+      },
       "ShareStateResponse": {
         "properties": {
           "group_ids": {
@@ -9177,6 +9254,13 @@
               "type": "string"
             },
             "title": "Group Ids",
+            "type": "array"
+          },
+          "pending_group_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pending Group Ids",
             "type": "array"
           },
           "resource_id": {
@@ -9320,6 +9404,55 @@
           "mode"
         ],
         "title": "SourceRequest",
+        "type": "object"
+      },
+      "SsoConfigBody": {
+        "properties": {
+          "allowed_email_domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Email Domains",
+            "type": "array"
+          },
+          "client_id": {
+            "title": "Client Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "client_id",
+          "display_name",
+          "allowed_email_domains"
+        ],
+        "title": "SsoConfigBody",
+        "type": "object"
+      },
+      "SsoSecretBody": {
+        "properties": {
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "SsoSecretBody",
         "type": "object"
       },
       "StoreEntityListResponse": {
@@ -28875,9 +29008,234 @@
         ]
       }
     },
+    "/api/admin/share-requests": {
+      "get": {
+        "description": "Comma-separated ``status`` (``pending``/``approved``/``rejected``),\ne.g. ``?status=pending``. Omitted returns every decision, newest first \u2014\nthe queue is also the audit trail of past approve/reject calls.",
+        "operationId": "list_share_requests_api_admin_share_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "skip",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Skip",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Share Requests",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/share-requests/{request_id}": {
+      "patch": {
+        "operationId": "decide_share_request_api_admin_share_requests__request_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequestDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decide Share Request",
+        "tags": [
+          "share-requests"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/certificate": {
+      "get": {
+        "description": "Read-only certificate metadata for the connection's already-stored\nPEM \u2014 thumbprint (the ``x5t`` value the client actually presents, plus\nthe conventional uppercase-hex fingerprint), subject/issuer, validity\nwindow, and a derived ``ok``/``expiring_soon``/``expired`` status. Two\nreal failure modes this closes: a registered certificate that does not\nmatch what the connection actually presents (opaque provider auth\nerror), and a certificate expiring silently (crawl/sync fails with no\nwarning).\n\nNever the private key \u2014 only :func:`connectors.sharepoint.graph_client.\ncertificate_metadata`'s CERTIFICATE-block parse reaches the response.\nNo certificate configured, or a certificate that fails to resolve or\nparse, is a typed absence (``certificate: null`` plus ``reason``) \u2014\nnever a 500.",
+        "operationId": "certificate_api_admin_sharepoint_connections__connection_id__certificate_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Certificate",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
-        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.",
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the flat\n``{source_scope_id: collection_id}`` mapping the external crawl pipeline\nreads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside\nAgnes. Not wrapped in an envelope key \u2014 the producer consumes this\nverbatim as the mapping itself.\n\nDeliberately does NOT carry ``anonymize`` \u2014 that would break this\nendpoint's flat, backward-compatible shape. A producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).",
         "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
         "parameters": [
           {
@@ -29139,7 +29497,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/tree": {
       "get": {
-        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). Both -> the drive's root children. Exactly\n\"sites -> drives -> root children, one level per call\" (spec \u00a713.2) \u2014\nthere is no deeper recursive browse; a folder's own children are not\nfetched until the admin picks it.",
+        "description": "One level of the live SharePoint folder tree.\n\nNo ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's\ndocument libraries (drives). ``drive_id`` -> the drive's root children.\n``drive_id`` + ``item_id`` -> that folder's own children (TCRD-240:\nsubfolder browsing at any depth \u2014 ``item_id`` is the previous call's own\nitem id, never a path, and is structurally validated before it reaches\na Graph URL).",
         "operationId": "browse_tree_api_admin_sharepoint_connections__connection_id__tree_get",
         "parameters": [
           {
@@ -29181,6 +29539,22 @@
                 }
               ],
               "title": "Drive Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "item_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Id"
             }
           },
           {
@@ -29227,6 +29601,146 @@
           }
         },
         "summary": "Browse Tree",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/tree/search": {
+      "get": {
+        "description": "Bounded breadth-first folder search (TCRD-240) \u2014 the server-side\nstand-in for Graph's own ``/search``, which silently under-returns\nunder app-only auth (``connectors.sharepoint.graph_client`` module\ndocstring). Never a single call: it walks ``.../root/children`` and\n``.../items/{id}/children`` the same way the tree browser does, capped\nby ``max_depth``/``max_visited`` \u2014 CLAMPED to their caps rather than\nrejected, so asking for more than the server allows still returns the\nbest bounded answer instead of a 422.\n\nRoot: ``drive_id`` + ``item_id`` scopes to that folder's subtree;\n``drive_id`` alone scopes to the whole drive; neither given searches\nevery drive of every reachable site. ``item_id`` without ``drive_id``\nis rejected \u2014 there is no drive to resolve it against.\n\nResponse: ``{matches: [{item_id, drive_id, display_path}], visited,\ntruncated}``. ``truncated`` is ``True`` whenever a cap is what stopped\nthe walk \u2014 never a silently partial result.",
+        "operationId": "search_tree_api_admin_sharepoint_connections__connection_id__tree_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 2,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "prefix",
+              "enum": [
+                "prefix",
+                "contains",
+                "glob"
+              ],
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "item_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Item Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_depth",
+            "required": false,
+            "schema": {
+              "default": 5,
+              "title": "Max Depth",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_visited",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Max Visited",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Tree",
         "tags": [
           "admin"
         ]
@@ -30118,6 +30632,463 @@
         "summary": "Test Connection",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/api/admin/sso/client-secret": {
+      "delete": {
+        "description": "Clear the stored secret (the provider becomes unavailable).",
+        "operationId": "clear_sso_client_secret_api_admin_sso_client_secret_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Store (or rotate) the client secret. Write-only.",
+        "operationId": "set_sso_client_secret_api_admin_sso_client_secret_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoSecretBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Sso Client Secret",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/config": {
+      "delete": {
+        "description": "Delete the config row + secret. KEEPS ``user_external_identities``\nrows \u2014 they are historically true links, inert unless the same tenant is\nconfigured again; purgeable per-user via the identities endpoint.",
+        "operationId": "delete_sso_config_api_admin_sso_config_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "get": {
+        "description": "Config status for the admin panel. Never returns the secret.",
+        "operationId": "get_sso_config_api_admin_sso_config_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      },
+      "put": {
+        "description": "Upsert the singleton config. Validates the tenant via the imported\nsingle-tenant validator; ``enabled=true`` additionally requires a stored,\ndecryptable secret (and the always-required non-empty domain list).",
+        "operationId": "put_sso_config_api_admin_sso_config_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoConfigBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Sso Config",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities": {
+      "get": {
+        "description": "Paginated list of linked external identities, newest link first.",
+        "operationId": "list_sso_identities_api_admin_sso_identities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sso Identities",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/identities/{user_id}": {
+      "delete": {
+        "description": "Admin unlink \u2014 hard delete of the identity row; the recovery tool for\na mis-attach. Does not touch the user row itself.",
+        "operationId": "unlink_sso_identity_api_admin_sso_identities__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Sso Identity",
+        "tags": [
+          "admin-sso"
+        ]
+      }
+    },
+    "/api/admin/sso/test-config": {
+      "post": {
+        "description": "Server-side reachability probe: tenant validation, secret presence +\ndecryptability, then the tenant's OIDC discovery document. No SSRF\nsurface: fixed host, tenant validated and quoted into a single path\nsegment (the ``microsoft.py`` discovery-URL pattern).",
+        "operationId": "test_sso_config_api_admin_sso_test_config_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Sso Config",
+        "tags": [
+          "admin-sso"
         ]
       }
     },
@@ -37593,7 +38564,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. Everything else \u2014 the verbatim\ngate, deferred-vs-rejected, union vs `full_documents` replace, alias/\nedge resolution, correction re-attachment, the post-ingest orphan\nsweep \u2014 happens in :meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.",
+        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written, claims_rejected:\n[{row, reason}], deferred: [...], subjects_created, subjects_deleted,\ncorrections_active: [...], review_items: [...]}``.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -41787,6 +42758,60 @@
           }
         },
         "summary": "Post Elevation",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/external-identity": {
+      "get": {
+        "description": "The calling user's linked external identity (design 2026-08-28).\n\nLive repo lookup, deliberately NOT a JWT claim: link state must stay\nrevocable (an admin unlink takes effect on the next call, not after a\n30-day stateless token expires). None of the returned fields is a\nsecret \u2014 the ``subject`` is the Entra directory object ID the admin\nidentities list shows too. Postgres-only feature: on a DuckDB-backed\ninstance the repo factory raises ``RequiresPostgresBackend`` and the\napp-wide handler answers the typed 501.",
+        "operationId": "get_external_identity_api_me_external_identity_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get External Identity",
         "tags": [
           "me"
         ]
@@ -46433,7 +47458,7 @@
         ]
       },
       "put": {
-        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.",
+        "description": "Set which groups a Library item is shared with (idempotent).\n\n``group_ids: []`` makes the item private again. Grants to groups outside\nthe caller's shareable set are preserved \u2014 see ``set_shares``.\n\nTrack C6: for an approval-gated type (``agent``) shared by a non-admin\nactor, a newly-requested group is queued instead of granted \u2014 this is\nNOT an error, so the status is ``202`` (queued) rather than ``200``,\nand ``pending_group_ids`` names what's awaiting an admin decision.",
         "operationId": "put_share_state_api_sharing__resource_type___resource_id__put",
         "parameters": [
           {
@@ -53999,6 +55024,113 @@
         ]
       }
     },
+    "/auth/logout": {
+      "get": {
+        "description": "Logout CONFIRMATION page (no state change) \u2014 issue #1675.\n\nThe Logout menu item used to be a plain ``GET`` link to ``/login``,\nwhich neither cleared the ``access_token`` cookie nor ended the session\n\u2014 it just LOOKED like sign-out (the app happily reopened on the next\nvisit). Ending a session is a mutation, so it cannot happen on a GET\n(security playbook #10, F2); this route only renders a confirm form\nwith a double-submit CSRF token. The actual cookie-clear + server-side\nrevocation is :func:`logout_submit` (POST) \u2014 same GET-confirms /\nPOST-mutates shape this codebase already uses for :func:`slack_bind` /\n:func:`slack_bind_confirm`.\n\nAn already-signed-out visitor has nothing to confirm \u2014 straight to\n``/login``.",
+        "operationId": "logout_page_auth_logout_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Page",
+        "tags": [
+          "web"
+        ]
+      },
+      "post": {
+        "description": "End the session \u2014 clear the cookie AND revoke it server-side.\n\nIssue #1675 (clear the browser's ``access_token`` cookie) and #1676\n(revoke the token so a copy captured before logout \u2014 a synced browser\nprofile, host malware, a shared machine \u2014 stops working too, not only\nthe browser that clicked Logout) land together: a client-side-only fix\nleaves every other copy of the token valid for the rest of its 30-day\n``exp``.\n\nRequires the double-submit ``web_csrf`` token minted by the GET\nconfirmation above (F2) \u2014 a state-changing action reachable from a menu\nitem on every page must not fire on ambient cookie auth alone, the same\nreasoning the F2 security review applied to :func:`slack_bind_confirm`.",
+        "operationId": "logout_submit_auth_logout_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_logout_submit_auth_logout_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Submit",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/auth/microsoft/callback": {
       "get": {
         "description": "Handle Microsoft Entra ID OAuth callback.",
@@ -54582,6 +55714,102 @@
           }
         },
         "summary": "Refresh Groups",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/callback": {
+      "get": {
+        "description": "Code exchange -> claims -> identity -> bind -> JWT cookie.\n\nThe test-mode leg (this flow's ``state`` matches the stashed test state)\nre-verifies the CURRENT session user is an admin, completes the exchange,\nand renders the result page \u2014 without ``ensure_user``, without an\nidentity row, without a cookie.",
+        "operationId": "sso_callback_auth_sso_callback_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sso/login": {
+      "get": {
+        "description": "Redirect to the configured tenant's Entra authorize endpoint.\n\n``?mode=test`` (admin-only, works pre-enable and outside the allowlist)\nstashes THIS flow's OAuth ``state`` so the callback renders the\nside-effect-free result page instead of signing anyone in \u2014 a concurrent\nnormal sign-in carries a different ``state`` and follows the normal path\nuntouched.",
+        "operationId": "sso_login_auth_sso_login_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Login",
         "tags": [
           "auth"
         ]

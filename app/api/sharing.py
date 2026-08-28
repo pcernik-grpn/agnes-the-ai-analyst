@@ -23,6 +23,18 @@ the app's SLUG — grants on that type are slug-keyed, see
 ``app.api.data_apps._can_view``). Skills are excluded on purpose — an
 approved store entity is already visible to every authenticated user, so a
 grant row on one would be read by nothing.
+
+Track C6 — agent-sharing approval queue: when a non-admin actor shares an
+``agent`` with a NEW group, the grant is not written immediately. It is
+queued in ``share_requests`` for an admin to approve/reject
+(``GET/POST /api/admin/share-requests*``, ``app/services/library_sharing.py
+::set_shares``) — a user may build agents freely, but sharing one needs
+admin sign-off. The PUT response is ``202`` (not ``200``) exactly when this
+call queued at least one new request, and ``pending_group_ids`` always lists
+every outstanding request on the resource, decided or not resolved yet, so
+a page reload still shows "pending approval". Admin actors (or an
+un-sharing-only call) always take the immediate path and answer ``200``,
+matching every other resource type.
 """
 
 from __future__ import annotations
@@ -30,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from app.auth.access import is_user_admin
@@ -40,6 +52,7 @@ from app.services.library_sharing import (
     SHAREABLE_TYPES,
     current_share_group_ids,
     is_shareable,
+    pending_share_group_ids,
     resolve_owner,
     set_shares,
     share_targets,
@@ -62,6 +75,10 @@ class ShareStateResponse(BaseModel):
     resource_id: str
     visibility: str = Field(description="private | shared | workspace")
     group_ids: List[str] = Field(default_factory=list)
+    # Track C6: groups an owner requested but that await admin approval —
+    # always empty for resource types outside the approval-gated set
+    # (currently only `agent`). A group here is NOT in `group_ids` yet.
+    pending_group_ids: List[str] = Field(default_factory=list)
 
 
 class SetSharesRequest(BaseModel):
@@ -109,6 +126,7 @@ async def get_share_state(
         "resource_id": resource_id,
         "visibility": visibility_for(resource_type, resource_id),
         "group_ids": sorted(current_share_group_ids(resource_type, resource_id)),
+        "pending_group_ids": sorted(pending_share_group_ids(resource_type, resource_id)),
     }
 
 
@@ -117,12 +135,18 @@ async def put_share_state(
     resource_type: str,
     resource_id: str,
     payload: SetSharesRequest,
+    response: Response,
     user: dict = Depends(get_current_user),
 ):
     """Set which groups a Library item is shared with (idempotent).
 
     ``group_ids: []`` makes the item private again. Grants to groups outside
     the caller's shareable set are preserved — see ``set_shares``.
+
+    Track C6: for an approval-gated type (``agent``) shared by a non-admin
+    actor, a newly-requested group is queued instead of granted — this is
+    NOT an error, so the status is ``202`` (queued) rather than ``200``,
+    and ``pending_group_ids`` names what's awaiting an admin decision.
     """
     _require_owned(resource_type, resource_id, user)
     admin = is_user_admin(user["id"])
@@ -139,23 +163,29 @@ async def put_share_state(
         # share into. 403 (not 404) — the item itself is theirs.
         raise HTTPException(status_code=403, detail=str(e)) from e
     logger.info(
-        "sharing: %s %s/%s -> %s (added=%s removed=%s) by %s",
+        "sharing: %s %s/%s -> %s (added=%s removed=%s queued=%s) by %s",
         SHAREABLE_TYPES.get(resource_type, resource_type),
         resource_type,
         resource_id,
         result["visibility"],
         result["added"],
         result["removed"],
+        result["queued_group_ids"],
         user["id"],
     )
     # Onboarding step "Add or share something" — the SHARE half. Only when the
     # item actually ends up shared: turning sharing back off (group_ids: []) puts
-    # it at "private", which is the opposite of the milestone.
+    # it at "private", which is the opposite of the milestone. A queued-only
+    # request also leaves visibility at "private" (nothing is granted yet),
+    # so it correctly does NOT trip this milestone until an admin approves.
     if result["visibility"] != "private":
         mark_journey(user.get("id"), catalog_discovered=True)
+    if result["queued_group_ids"]:
+        response.status_code = 202
     return {
         "resource_type": resource_type,
         "resource_id": resource_id,
         "visibility": result["visibility"],
         "group_ids": result["group_ids"],
+        "pending_group_ids": result["pending_group_ids"],
     }

@@ -1169,15 +1169,34 @@ client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
 - /api/admin/sharepoint/connections/{connection_id}/tree
+- /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
+- /api/admin/sharepoint/connections/{connection_id}/certificate
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
-libraries; both → the drive's root children) using the connection's resolved
-certificate. A missing/unresolvable certificate is a typed `409
-sharepoint_cert_unresolved` (surface absence rather than fail the crawl); a
-rejected/failed Graph call is a typed `502 sharepoint_graph_error`.
+libraries; `drive_id` → the drive's root children; `drive_id` + `item_id` →
+that folder's own children, at any depth — TCRD-240) using the connection's
+resolved certificate. `item_id` is structurally validated before it ever
+reaches a Graph URL path segment, and is rejected (`422
+item_id_requires_drive_id`) without a `drive_id`. A missing/unresolvable
+certificate is a typed `409 sharepoint_cert_unresolved` (surface absence
+rather than fail the crawl); a rejected/failed Graph call is a typed `502
+sharepoint_graph_error`.
+
+`GET …/tree/search` (TCRD-240) is a bounded breadth-first folder search over
+the same live tree — Graph's own `/search` is known to silently under-return
+under app-only auth, so this module never calls it. Params: `q` (required,
+`min_length=2`), `mode` (`prefix` default, `contains`, or `glob` —
+`fnmatch` syntax, case/composition-insensitive; a malformed glob, defined as
+unbalanced `[`/`]`, is a typed `422 invalid_search_pattern`), an optional
+`drive_id` + `item_id` subtree root (neither given searches every drive of
+every reachable site; `item_id` without `drive_id` is `422`), and
+`max_depth`/`max_visited` (defaults `5`/`500`, CLAMPED to caps `10`/`2000`
+rather than rejected). Response: `{matches: [{item_id, drive_id,
+display_path}], visited, truncated}` — `truncated` is `true` whenever a cap
+is what stopped the walk, never a silently partial result.
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
@@ -1195,6 +1214,19 @@ exclusion — without touching its already-created collection.
 `GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
 collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
 crawling moves inside Agnes.
+
+`GET …/certificate` returns read-only certificate metadata — the thumbprint
+the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
+header value) plus the conventional uppercase-hex SHA-1 fingerprint
+(`thumbprint_sha1_hex`), `subject`/`issuer`, `not_before`/`not_after`, and a
+derived `expires_in_days` (may be negative) / `status`
+(`ok`/`expiring_soon` at ≤30 days/`expired`) — derived at request time from
+the connection's already-stored PEM, no new schema. Catches two real
+failure modes: a registered certificate that doesn't match what the
+connection presents (opaque provider auth error), and a certificate
+expiring silently. Never returns the private key. No certificate configured
+or an unparseable one is a typed absence — `{"certificate": null, "reason":
+"..."}` — not an error status.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
@@ -1249,6 +1281,22 @@ Admin-only, write-only vault for datasource secrets (`KEBOOLA_STORAGE_TOKEN`, `B
 
 - /api/admin/slack-secrets
 - /api/admin/slack-secrets/{name}
+
+### `/api/admin/sso` — External SSO login (runtime-configured Entra ID OIDC)
+
+Singleton runtime config for the optional external-identity login (`sso`
+provider slot): tenant/client IDs, a write-only Fernet-encrypted client
+secret, the mandatory email-domain allowlist, button label and enable flag,
+plus the captured external-identity bindings. `PUT`/`DELETE` on the config
+and secret are guarded by the last-login-door rule (422 `last_login_door`
+when the operation would leave no usable sign-in method). Postgres app-state
+backend required (typed 501 on DuckDB). See `docs/auth-sso-entra.md`.
+
+- /api/admin/sso/config
+- /api/admin/sso/client-secret
+- /api/admin/sso/test-config
+- /api/admin/sso/identities
+- /api/admin/sso/identities/{user_id}
 
 ### `/api/admin/db` — Database state and migration
 
@@ -1489,8 +1537,52 @@ Shareable resource types are `collection` and `agent` — skills are excluded
 because an approved store entity is already readable by every authenticated
 user.
 
+**Track C6 — agent-sharing needs admin approval (Postgres-backed instances).**
+A user may build agents freely, but when a NON-ADMIN actor shares an `agent`
+with a group it has not already reached, the grant is not written
+immediately: it is queued in `share_requests` and `PUT /api/sharing/agent/{id}`
+answers `202` (not `200`), with `pending_group_ids` naming what's awaiting a
+decision. An admin actor (regardless of who owns the agent) and any un-share
+(revoking a group) both stay instant and answer `200`, matching every other
+resource type. `GET /api/sharing/agent/{id}` always echoes the current
+`pending_group_ids` so a page reload still shows "pending approval". The
+queue (`share_requests`) is Postgres-only (A3 ratchet) — see
+`/api/admin/share-requests` below — but sharing itself never regresses: on a
+DuckDB-backed instance the approval step simply isn't active, so a
+non-admin's agent share falls back to the pre-C6 instant grant instead of a
+`501`. Only the admin queue endpoints answer `501` there.
+
 - /api/sharing/groups
 - /api/sharing/{resource_type}/{resource_id}
+
+### `/api/admin/share-requests` — Agent-sharing approval queue (Track C6, PG-only)
+
+Every route requires admin. `GET` lists queued requests, optionally filtered by
+comma-separated `status` (`pending`/`approved`/`rejected`; omitted returns every
+decision, newest first — the queue doubles as its own audit trail). Each row
+carries resolved display fields (`resource_name`, `requested_group_name`,
+`requested_by_email`) alongside the raw ids. `PATCH /api/admin/share-requests/{id}`
+takes `{"decision": "approve" | "reject"}` — the decision rides in the body
+rather than a verb path segment, the same shape as
+`PATCH /api/v1/agents/{agent_id}/memories/{memory_id}`'s `{"action": ...}`
+(`tests/test_api_design_rules.py::test_no_new_verbs_in_path` forbids a new
+verb segment in a path). `decision: "approve"` writes the grant via the same
+`resource_grants_repo().ensure_grant` the admin-curated `/admin/access` layer
+uses — an approved share reaches the grantee through the identical mechanism
+the shared-agent runtime already honors — and marks the request `approved`
+with `decided_by`/`decided_at`. `decision: "reject"` leaves no grant and marks
+it `rejected`. An unrecognized `decision` is `400`. The PATCH is a clean `404`
+on an unknown id OR a request that was already decided (an atomic
+`WHERE status = 'pending'` guard — a double-click can never double-write the
+grant or flip an already-decided verdict). Every decision writes an
+`audit_log` row (`share_request.approved` / `share_request.rejected`).
+PG-only (A3 ratchet): on a DuckDB-backed instance every route here answers
+`501 requires_postgres_backend`. Web-only by design — see the triple-surface
+ratchet's `_SHARE_REQUESTS_ADMIN_REASON` for why no CLI/MCP vocabulary was
+added.
+
+- /api/admin/share-requests
+- /api/admin/share-requests/{request_id}
 
 ### `/api/collections` — File collections (bring-your-files)
 
@@ -1921,6 +2013,7 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 - /api/me/display-name
 - /api/me/effective-access
 - /api/me/elevation
+- /api/me/external-identity
 - /api/me/home-stats
 - /api/me/onboarded
 - /api/me/stats/queries

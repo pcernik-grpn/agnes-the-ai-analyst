@@ -182,6 +182,228 @@ class TestTreeCertResolution:
         assert r.json()["detail"]["error"] == "sharepoint_graph_error"
 
 
+class TestSubfolderBrowsing:
+    """TCRD-240: `?item_id=` lets the wizard browse below the drive root at
+    any depth — the pre-existing contract stopped at "sites -> drives ->
+    root children"."""
+
+    def _connect(self, seeded_app, monkeypatch, name="subfolder-conn"):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        return c, _create_connection(c, seeded_app["admin_token"], name=name)
+
+    def test_item_id_browses_that_folders_children(self, seeded_app, monkeypatch):
+        from connectors.sharepoint import graph_client as gc
+
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            assert request.url.path == "/v1.0/drives/d1/items/f1/children"
+            return httpx.Response(
+                200, json={"value": [{"id": "f1x", "name": "Subfolder", "folder": {"childCount": 0}}]}
+            )
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "f1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["level"] == "items"
+        assert body["item_id"] == "f1"
+        assert body["items"] == [{"id": "f1x", "name": "Subfolder", "is_folder": True, "child_count": 0}]
+
+    def test_item_id_without_drive_id_is_422(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(f"{BASE}/{conn_id}/tree", params={"item_id": "f1"}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "item_id_requires_drive_id"
+
+    def test_malformed_item_id_is_422_not_a_500(self, seeded_app, monkeypatch):
+        """Structural validation before it ever reaches a Graph URL path
+        segment — a `/` in item_id must never build a different request."""
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree",
+            params={"drive_id": "d1", "item_id": "../root"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_item_id"
+
+
+class TestTreeSearch:
+    """TCRD-240: `GET .../tree/search` — bounded BFS folder search, never
+    Graph's own `/search` (module docstring in `graph_client`)."""
+
+    def _connect(self, seeded_app, monkeypatch, name="search-conn"):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        return c, _create_connection(c, seeded_app["admin_token"], name=name)
+
+    def _install_tree(self, monkeypatch):
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            if path == "/v1.0/drives/d1/root/children":
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {"id": "c1", "name": "Contracts", "folder": {"childCount": 1}},
+                            {"id": "i1", "name": "Invoices", "folder": {"childCount": 0}},
+                        ]
+                    },
+                )
+            if path == "/v1.0/drives/d1/items/c1/children":
+                return httpx.Response(
+                    200, json={"value": [{"id": "c1x", "name": "Contracts 2026", "folder": {"childCount": 0}}]}
+                )
+            # Leaf folders (Invoices, and Contracts 2026 itself — a folder
+            # with childCount 0 is still walked one level to confirm it is
+            # empty) — every folder the BFS reaches needs a route, even a
+            # childless one.
+            if path in ("/v1.0/drives/d1/items/i1/children", "/v1.0/drives/d1/items/c1x/children"):
+                return httpx.Response(200, json={"value": []})
+            raise AssertionError(f"unexpected path: {path}")
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(
+            f"{BASE}/nope/tree/search", params={"q": "ab"}, headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/tree/search", params={"q": "ab"})
+        assert r.status_code == 401
+
+    def test_unknown_connection_is_404(self, seeded_app):
+        r = seeded_app["client"].get(
+            f"{BASE}/does-not-exist/tree/search", params={"q": "ab"}, headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_query_shorter_than_two_chars_is_422(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(f"{BASE}/{conn_id}/tree/search", params={"q": "a"}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 422
+
+    def test_finds_matches_within_the_given_drive_and_reports_no_truncation(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["truncated"] is False
+        paths = sorted(m["display_path"] for m in body["matches"])
+        assert paths == ["Contracts", "Contracts / Contracts 2026"]
+        assert all(m["drive_id"] == "d1" for m in body["matches"])
+
+    def test_default_mode_is_prefix(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "Con", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        paths = sorted(m["display_path"] for m in r.json()["matches"])
+        assert paths == ["Contracts", "Contracts / Contracts 2026"]
+
+    def test_glob_mode(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "Contracts*", "mode": "glob", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        paths = sorted(m["display_path"] for m in r.json()["matches"])
+        assert paths == ["Contracts", "Contracts / Contracts 2026"]
+
+    def test_invalid_mode_is_422(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "ab", "mode": "fuzzy", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422
+
+    def test_malformed_glob_is_422(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "Contracts[2026", "mode": "glob", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_search_pattern"
+
+    def test_item_id_without_drive_id_is_422(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "ab", "item_id": "c1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "item_id_requires_drive_id"
+
+    def test_malformed_drive_id_is_422_not_a_500(self, seeded_app, monkeypatch):
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "ab", "drive_id": "not/a/valid/id"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_drive_id"
+
+    def test_max_depth_and_max_visited_are_clamped_not_rejected(self, seeded_app, monkeypatch):
+        """Asking for more than the server allows still returns a bounded
+        200 — never a 422 for an out-of-range cap."""
+        c, conn_id = self._connect(seeded_app, monkeypatch)
+        self._install_tree(monkeypatch)
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "contract", "mode": "contains", "drive_id": "d1", "max_depth": 999, "max_visited": 999999},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+
+    def test_missing_certificate_is_a_typed_409(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("SHAREPOINT_CERT_PRIVATE_KEY", raising=False)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="search-no-cert")
+        r = c.get(
+            f"{BASE}/{conn_id}/tree/search",
+            params={"q": "ab", "drive_id": "d1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_cert_unresolved"
+
+
 class TestScopeConfirmationIdempotency:
     def test_confirming_same_scope_twice_reuses_the_collection(self, seeded_app):
         c = seeded_app["client"]
@@ -253,6 +475,104 @@ class TestScopeConfirmationIdempotency:
         assert r1.status_code == 201, r1.text
         assert r2.status_code == 201, r2.text
         assert r1.json()["collection_id"] != r2.json()["collection_id"]
+
+
+class TestAnonymizationDeclaredField:
+    """The wizard's honest badge state (spec §9.2/§13.2): `anonymize` is the
+    admin's checkbox (a wish); `anonymization_declared` is whether the LAST
+    persisted ingest run actually declared this collection anonymized. The
+    two must never collapse into one boolean — a badge reading "anonymized"
+    from the checkbox alone is exactly the bug this field exists to fix."""
+
+    def test_requested_but_not_yet_declared_by_default(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        assert confirmed.json()["anonymize"] is True
+        assert confirmed.json()["anonymization_declared"] is False
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.json()["items"][0]["anonymization_declared"] is False
+
+    def test_declared_once_the_latest_run_reports_the_collection(self, seeded_app, monkeypatch):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-2")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon2", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        class _FakeRunsRepo:
+            def list_recent(self, limit=1):
+                return [{"anonymization": {"declared": True, "scopes": {collection_id: {"docs_anonymized": 3}}}}]
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", lambda: _FakeRunsRepo())
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        row = listed.json()["items"][0]
+        assert row["anonymize"] is True
+        assert row["anonymization_declared"] is True
+
+    def test_non_anonymize_scope_never_reads_declared_true(self, seeded_app, monkeypatch):
+        """A collection appearing in a run's declared set does not flip
+        `anonymization_declared` for a scope that was never marked
+        `anonymize` — the field means "requested AND declared", never
+        "declared alone"."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-3")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:plain", "display_path": "Public", "anonymize": False},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        class _FakeRunsRepo:
+            def list_recent(self, limit=1):
+                return [{"anonymization": {"declared": True, "scopes": {collection_id: {"docs_anonymized": 3}}}}]
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", lambda: _FakeRunsRepo())
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        row = listed.json()["items"][0]
+        assert row["anonymize"] is False
+        assert row["anonymization_declared"] is False
+
+    def test_run_report_lookup_failure_degrades_to_not_declared(self, seeded_app, monkeypatch):
+        """`facts_ingest_runs_repo()` raising (PG-only repo on a
+        DuckDB-backed instance, per the A3 ratchet) must never 500 the
+        wizard's scope listing — it degrades to "nothing declared yet"."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="anon-conn-4")
+
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:anon4", "display_path": "Contracts", "anonymize": True},
+            headers=_auth(token),
+        )
+
+        def _boom():
+            raise RuntimeError("requires_postgres_backend")
+
+        monkeypatch.setattr("src.repositories.facts_ingest_runs_repo", _boom)
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.status_code == 200
+        assert listed.json()["items"][0]["anonymization_declared"] is False
 
 
 class TestScopeRemoval:
@@ -421,6 +741,76 @@ class TestNoGroupWarning:
         )
         assert r.status_code == 400
         assert r.json()["detail"]["error"] == "invalid_group_id"
+
+
+class TestCertificateMetadata:
+    """`GET /connections/{id}/certificate` — read-only certificate metadata
+    for the source card / an admin's own comparison against the identity
+    provider, derived at request time from the connection's already-stored
+    PEM. See `connectors.sharepoint.graph_client.certificate_metadata` for
+    the derivation itself; this class covers the endpoint's plumbing:
+    auth gating, connection resolution, and the typed-absence paths."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/certificate", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/certificate")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_returns_metadata_for_a_configured_certificate(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["reason"] is None
+        cert = body["certificate"]
+        assert cert["subject"] == "CN=agnes-test"
+        assert cert["issuer"] == "CN=agnes-test"
+        assert cert["thumbprint_x5t"]
+        assert len(cert["thumbprint_sha1_hex"]) == 40
+        assert cert["status"] in ("ok", "expiring_soon", "expired")
+        assert isinstance(cert["expires_in_days"], int)
+
+    def test_response_never_contains_private_key_material(self, seeded_app, monkeypatch):
+        """HARD CONSTRAINT: metadata only, never the private key — even
+        though the stored PEM is a combined cert+key bundle."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-nokey-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert "PRIVATE KEY" not in r.text
+        assert "BEGIN CERTIFICATE" not in r.text
+
+    def test_no_certificate_configured_is_a_clean_200_not_a_500(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("SHAREPOINT_CERT_PRIVATE_KEY", raising=False)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-missing-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["certificate"] is None
+        assert body["reason"]
+
+    def test_unparseable_certificate_is_a_clean_200_not_a_500(self, seeded_app, monkeypatch):
+        monkeypatch.setenv(
+            "SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN CERTIFICATE-----\nbm90LXJlYWw=\n-----END CERTIFICATE-----\n"
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="cert-meta-garbage-conn")
+        r = c.get(f"{BASE}/{conn_id}/certificate", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["certificate"] is None
+        assert body["reason"].startswith("certificate_unparseable")
 
 
 class TestCorpusMap:

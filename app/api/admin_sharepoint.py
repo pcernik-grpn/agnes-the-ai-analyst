@@ -6,8 +6,15 @@ Surface (all gated by ``Depends(require_admin)``):
   GET    /api/admin/sharepoint/connections/{id}/tree        — one level of the live
                                                                 Graph folder tree
                                                                 (sites -> drives -> root
-                                                                children); ``?site_id=``/
-                                                                ``?drive_id=`` pick the level.
+                                                                children -> arbitrary-depth
+                                                                subfolder children);
+                                                                ``?site_id=``/``?drive_id=``/
+                                                                ``?item_id=`` pick the level
+                                                                (TCRD-240).
+  GET    /api/admin/sharepoint/connections/{id}/tree/search  — bounded BFS folder search
+                                                                (``?q=``, ``?mode=``) over the
+                                                                same tree — never Graph's own
+                                                                ``/search`` (TCRD-240).
   GET    /api/admin/sharepoint/connections/{id}/scopes       — list the connection's
                                                                 confirmed scope rows,
                                                                 enriched with collection +
@@ -26,7 +33,26 @@ Surface (all gated by ``Depends(require_admin)``):
   GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the flat
                                                                 ``{source_scope_id: collection_id}``
                                                                 mapping ``ship_to_agnes.py
-                                                                --corpus-map`` consumes.
+                                                                --corpus-map`` consumes. Per-scope
+                                                                ``anonymize`` is NOT in this shape
+                                                                (kept flat/backward-compatible) —
+                                                                a producer that needs it reads the
+                                                                sibling ``GET .../scopes`` endpoint
+                                                                instead (each row already carries
+                                                                ``anonymize``). Agnes's own
+                                                                ``corpus-extraction`` job handler
+                                                                (``app/worker/kinds.py``) builds an
+                                                                anonymize-scoped mapping the same
+                                                                way, for the same reason: this
+                                                                endpoint's contract does not move.
+  GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
+                                                                (thumbprint, subject/issuer, expiry)
+                                                                derived at request time from the
+                                                                connection's already-stored PEM.
+                                                                Never the private key. ``certificate:
+                                                                null`` (plus ``reason``) when no
+                                                                certificate is configured or it
+                                                                cannot be parsed — never a 500.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -47,19 +73,24 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
 from app.resource_types import ResourceType
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
+    build_folder_matcher,
+    certificate_metadata,
     get_app_token,
     list_drives,
+    list_item_children,
     list_root_children,
     list_sites,
+    search_folders,
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
@@ -105,6 +136,24 @@ def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
     return row
 
 
+# Graph drive/site/item ids observed in practice are base64url-ish
+# (letters, digits, `-`/`_`) with an occasional `!`, `.`, `,` or `:` (site
+# ids compose a hostname, a GUID and a GUID with commas; some drive ids use
+# `!`). Never a `/` — the one character that would let a value escape its
+# own URL path segment.
+_GRAPH_ID_RE = re.compile(r"^[A-Za-z0-9!_.,:=-]+$")
+
+
+def _validate_graph_id(value: str, field: str) -> None:
+    """Structural validation for an id headed straight into a Graph URL path
+    segment (``item_id``, and the search endpoint's ``drive_id``) — never
+    build the request path from an unchecked value (security playbook:
+    "validate ... paths built from untrusted names"). A typed 422, not a
+    500 from a Graph call that silently misrouted."""
+    if not value or not _GRAPH_ID_RE.match(value):
+        raise HTTPException(status_code=422, detail={"error": f"invalid_{field}", "message": f"malformed {field}"})
+
+
 def _scopes(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     scopes = (row.get("config") or {}).get("scopes")
     return list(scopes) if isinstance(scopes, list) else []
@@ -139,13 +188,51 @@ def _group_ids_for_collection(collection_id: str) -> List[str]:
     return [g["group_id"] for g in grants if g.get("resource_id") == collection_id]
 
 
-def _scope_out(scope: Dict[str, Any]) -> Dict[str, Any]:
+def _latest_run_anonymized_corpus_ids() -> set:
+    """Which collection ids the LATEST persisted ``facts_ingest_runs`` row
+    declares it anonymized (spec §9.2 — the producer's own declaration, see
+    ``app/api/facts.py``'s ``FactsIngestAnonymizationReport``). This is what
+    turns "requested" (the wizard's checkbox, below) into "anonymized" —
+    never rendering the latter from the checkbox alone (spec §13.2: "on a
+    collection detail it is a state plus a named batch task, never a
+    toggle").
+
+    Best-effort: ``facts_ingest_runs_repo()`` is PG-only (A3 ratchet) and
+    may not exist yet on a DuckDB-backed instance, or there may be no runs
+    yet — either degrades to "nothing declared yet", never a 500 on the
+    wizard's own scope listing (a badge that cannot prove itself should
+    read as unproven, not crash the page that shows it).
+    """
+    try:
+        from src.repositories import facts_ingest_runs_repo
+
+        runs = facts_ingest_runs_repo().list_recent(limit=1)
+    except Exception:
+        return set()
+    if not runs:
+        return set()
+    anonymization = runs[0].get("anonymization") or {}
+    scopes = anonymization.get("scopes")
+    return set(scopes.keys()) if isinstance(scopes, dict) else set()
+
+
+def _scope_out(scope: Dict[str, Any], declared_corpus_ids: Optional[set] = None) -> Dict[str, Any]:
     collection = file_corpora_repo().get(scope.get("collection_id") or "")
     group_ids = _group_ids_for_collection(scope.get("collection_id") or "")
+    if declared_corpus_ids is None:
+        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
+    anonymize = bool(scope.get("anonymize"))
     return {
         "source_scope_id": scope.get("source_scope_id"),
         "display_path": scope.get("display_path"),
-        "anonymize": bool(scope.get("anonymize")),
+        "anonymize": anonymize,
+        # The checkbox above only RECORDS an admin's intent — this field is
+        # the honest other half: whether the producer's LAST ingest run
+        # actually declared this collection anonymized. `anonymize=true,
+        # anonymization_declared=false` is "anonymization requested"; both
+        # true is "anonymized". Never collapse the two (see module docstring
+        # note + docs/anonymization.md's badge semantics).
+        "anonymization_declared": anonymize and (scope.get("collection_id") in declared_corpus_ids),
         "collection_id": scope.get("collection_id"),
         "collection": (
             {"id": collection["id"], "slug": collection["slug"], "name": collection["name"]} if collection else None
@@ -166,8 +253,6 @@ def no_group_warning(group_ids: List[str]) -> bool:
 
 
 def _slugify(text: str) -> str:
-    import re
-
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:80].strip("-") or "sharepoint"
 
 
@@ -206,27 +291,100 @@ async def browse_tree(
     connection_id: str,
     site_id: Optional[str] = None,
     drive_id: Optional[str] = None,
+    item_id: Optional[str] = None,
     _user: dict = Depends(require_admin),
 ):
     """One level of the live SharePoint folder tree.
 
     No ``site_id`` -> the reachable sites. ``site_id`` alone -> that site's
-    document libraries (drives). Both -> the drive's root children. Exactly
-    "sites -> drives -> root children, one level per call" (spec §13.2) —
-    there is no deeper recursive browse; a folder's own children are not
-    fetched until the admin picks it.
+    document libraries (drives). ``drive_id`` -> the drive's root children.
+    ``drive_id`` + ``item_id`` -> that folder's own children (TCRD-240:
+    subfolder browsing at any depth — ``item_id`` is the previous call's own
+    item id, never a path, and is structurally validated before it reaches
+    a Graph URL).
     """
+    if item_id is not None:
+        if not drive_id:
+            raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
+        _validate_graph_id(item_id, "item_id")
     row = _sharepoint_connection_or_404(connection_id)
     token = await _resolved_token(row)
     try:
         if drive_id:
-            items = await list_root_children(token, drive_id)
-            return {"level": "items", "site_id": site_id, "drive_id": drive_id, "items": items}
+            items = await (
+                list_item_children(token, drive_id, item_id) if item_id else list_root_children(token, drive_id)
+            )
+            return {"level": "items", "site_id": site_id, "drive_id": drive_id, "item_id": item_id, "items": items}
         if site_id:
             items = await list_drives(token, site_id)
             return {"level": "drives", "site_id": site_id, "items": items}
         items = await list_sites(token)
         return {"level": "sites", "items": items}
+    except SharePointGraphError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "sharepoint_graph_error", "message": str(exc)},
+        ) from exc
+
+
+_SEARCH_MAX_DEPTH_CAP = 10
+_SEARCH_MAX_VISITED_CAP = 2000
+
+
+@router.get("/connections/{connection_id}/tree/search")
+async def search_tree(
+    connection_id: str,
+    q: str = Query(..., min_length=2),
+    mode: Literal["prefix", "contains", "glob"] = "prefix",
+    drive_id: Optional[str] = None,
+    item_id: Optional[str] = None,
+    max_depth: int = 5,
+    max_visited: int = 500,
+    _user: dict = Depends(require_admin),
+):
+    """Bounded breadth-first folder search (TCRD-240) — the server-side
+    stand-in for Graph's own ``/search``, which silently under-returns
+    under app-only auth (``connectors.sharepoint.graph_client`` module
+    docstring). Never a single call: it walks ``.../root/children`` and
+    ``.../items/{id}/children`` the same way the tree browser does, capped
+    by ``max_depth``/``max_visited`` — CLAMPED to their caps rather than
+    rejected, so asking for more than the server allows still returns the
+    best bounded answer instead of a 422.
+
+    Root: ``drive_id`` + ``item_id`` scopes to that folder's subtree;
+    ``drive_id`` alone scopes to the whole drive; neither given searches
+    every drive of every reachable site. ``item_id`` without ``drive_id``
+    is rejected — there is no drive to resolve it against.
+
+    Response: ``{matches: [{item_id, drive_id, display_path}], visited,
+    truncated}``. ``truncated`` is ``True`` whenever a cap is what stopped
+    the walk — never a silently partial result.
+    """
+    if item_id and not drive_id:
+        raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
+    if drive_id:
+        _validate_graph_id(drive_id, "drive_id")
+    if item_id:
+        _validate_graph_id(item_id, "item_id")
+
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        matcher = build_folder_matcher(q, mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_search_pattern", "message": str(exc)}) from exc
+
+    token = await _resolved_token(row)
+    clamped_depth = max(1, min(max_depth, _SEARCH_MAX_DEPTH_CAP))
+    clamped_visited = max(1, min(max_visited, _SEARCH_MAX_VISITED_CAP))
+    try:
+        return await search_folders(
+            token,
+            matcher=matcher,
+            drive_id=drive_id,
+            item_id=item_id,
+            max_depth=clamped_depth,
+            max_visited=clamped_visited,
+        )
     except SharePointGraphError as exc:
         raise HTTPException(
             status_code=502,
@@ -242,7 +400,8 @@ async def list_scopes(
     """The wizard's step-2/3 source of truth: every confirmed scope row,
     enriched with its collection and current group grants."""
     row = _sharepoint_connection_or_404(connection_id)
-    return {"items": [_scope_out(s) for s in _scopes(row)]}
+    declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
+    return {"items": [_scope_out(s, declared) for s in _scopes(row)]}
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
@@ -356,6 +515,41 @@ async def corpus_map(
     ``{source_scope_id: collection_id}`` mapping the external crawl pipeline
     reads via ``ship_to_agnes.py --corpus-map`` until crawling moves inside
     Agnes. Not wrapped in an envelope key — the producer consumes this
-    verbatim as the mapping itself."""
+    verbatim as the mapping itself.
+
+    Deliberately does NOT carry ``anonymize`` — that would break this
+    endpoint's flat, backward-compatible shape. A producer that needs to
+    know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
+    row already carries ``anonymize``); Agnes's own ``corpus-extraction``
+    job handler does the equivalent lookup internally
+    (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
     row = _sharepoint_connection_or_404(connection_id)
     return {s["source_scope_id"]: s["collection_id"] for s in _scopes(row) if s.get("source_scope_id")}
+
+
+@router.get("/connections/{connection_id}/certificate")
+async def certificate(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Read-only certificate metadata for the connection's already-stored
+    PEM — thumbprint (the ``x5t`` value the client actually presents, plus
+    the conventional uppercase-hex fingerprint), subject/issuer, validity
+    window, and a derived ``ok``/``expiring_soon``/``expired`` status. Two
+    real failure modes this closes: a registered certificate that does not
+    match what the connection actually presents (opaque provider auth
+    error), and a certificate expiring silently (crawl/sync fails with no
+    warning).
+
+    Never the private key — only :func:`connectors.sharepoint.graph_client.
+    certificate_metadata`'s CERTIFICATE-block parse reaches the response.
+    No certificate configured, or a certificate that fails to resolve or
+    parse, is a typed absence (``certificate: null`` plus ``reason``) —
+    never a 500.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        settings = resolve_sharepoint_settings(row)
+    except SharePointSettingsError as exc:
+        return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
+    return certificate_metadata(settings.private_key)

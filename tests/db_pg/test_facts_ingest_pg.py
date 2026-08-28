@@ -922,6 +922,238 @@ def test_single_valued_edges_config_override_narrows_the_default_set(pg_env, rep
     assert not any(ri["kind"] == "single_valued_conflict" for ri in report["review_items"])
 
 
+# ---------------------------------------------------------------------------
+# TCRD-241 — duplicate doc_id resolution. Byte-identical SharePoint copies
+# share a sha-derived doc_id: two (or more) `corpus_file_sources` rows can
+# legally share one `source_doc_id`, possibly across different collections.
+# Resolution must be corpus-scoped and deterministic, never an arbitrary
+# cross-collection pick.
+# ---------------------------------------------------------------------------
+
+
+def _make_group_with_grant(pg_engine, *, group_name: str, collection_id: str, member_user_id: str) -> None:
+    from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo
+
+    grp = user_groups_repo().create(name=group_name, description="test", created_by="test-fixture")
+    user_group_members_repo().add_member(member_user_id, grp["id"], source="admin", added_by="test-fixture")
+    resource_grants_repo().create(grp["id"], "collection", collection_id, "test-fixture", "required")
+
+
+def test_dup_doc_id_two_collections_claim_scoped_to_declaring_corpus_visibility(pg_env, repo):
+    """The SAME doc_id anchors a file in both col_a and col_b. The claim is
+    declared under col_a (documents[] carries corpus_id=col_a) -- it must
+    land on col_a's file and be visible ONLY through col_a's grants, never
+    col_b's, even though the resolution had a same-doc_id row to pick from
+    in col_b too."""
+    from src.repositories import users_repo
+
+    corpus_b = "col_b"
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=corpus_b, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a_dup")
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_b_dup")
+    text = "Acme Corp signed the dup-doc engagement."
+    _seed_chunk(corpus_id=CORPUS_A, file_id="cf_a_dup", text=text)
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_b_dup", text=text)
+    _seed_source_mapping(corpus_id=CORPUS_A, file_id="cf_a_dup", source_doc_id="dupdoc", stable_id="a-path")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_b_dup", source_doc_id="dupdoc", stable_id="b-path")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "dupdoc", "corpus_id": CORPUS_A, "stable_id": "a-path"}],
+        nodes=[_node("engagement:dup", "dupdoc", "Acme Corp signed the dup-doc engagement.")],
+    )
+    assert report["claims_written"] == 1
+
+    users_repo().create(id="bob", email="bob@test.com", name="Bob")
+    _make_group_with_grant(pg_env, group_name="group-b", collection_id=corpus_b, member_user_id="bob")
+    bob_view = repo.search({"id": "bob", "email": "bob@test.com"}, type="engagement")
+    assert bob_view["subjects"] == []  # col_b grant must not surface the col_a claim
+
+    admin_view = repo.search(_admin(), type="engagement")
+    ids = {s["id"] for s in admin_view["subjects"]}
+    assert len(ids) == 1  # admin sees it via col_a
+
+
+def test_dup_doc_id_two_copies_one_corpus_one_batch_is_deterministic_across_replays(pg_env, repo):
+    """Both copies of a doc_id anchored in the SAME collection, both declared
+    in one `documents[]` batch. Resolution must pick ONE deterministic
+    winner -- replaying the identical batch must be a true no-op (a
+    non-deterministic pick would sometimes land the replay's claim on the
+    OTHER copy, inflating claim_count)."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_1", status="indexed")
+    _seed_corpus_file(file_id="cf_2", status="indexed")
+    text = "Acme Corp is the client of record."
+    _seed_chunk(file_id="cf_1", text=text)
+    _seed_chunk(file_id="cf_2", text=text)
+    _seed_source_mapping(file_id="cf_1", source_doc_id="dupdoc", stable_id="path1")
+    _seed_source_mapping(file_id="cf_2", source_doc_id="dupdoc", stable_id="path2")
+
+    batch = {
+        "documents": [
+            {"doc_id": "dupdoc", "corpus_id": CORPUS_A, "stable_id": "path1"},
+            {"doc_id": "dupdoc", "corpus_id": CORPUS_A, "stable_id": "path2"},
+        ],
+        "nodes": [_node("engagement:dup2", "dupdoc", "Acme Corp is the client of record.")],
+    }
+    r1 = repo.ingest_batch(**batch)
+    assert r1["claims_written"] == 1
+
+    r2 = repo.ingest_batch(**batch)
+    assert r2["claims_written"] == 0  # same winner picked again -> ON CONFLICT no-op
+
+    result = repo.search(_admin(), type="engagement")
+    assert len(result["subjects"]) == 1
+    assert result["subjects"][0]["claim_count"] == 1  # not doubled across the two copies
+
+
+def test_dup_doc_id_replace_mode_purges_claims_on_every_anchored_copy(pg_env, repo):
+    """`full_documents` replace mode must clear claims off EVERY corpus_file
+    anchored to the doc_id within its corpus -- not just the copy this
+    ingest's own resolution happens to pick. A stale claim directly attached
+    to the non-preferred copy (simulating an earlier extraction that anchored
+    there) must not survive a replace."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_x1", status="indexed")
+    _seed_corpus_file(file_id="cf_x2", status="indexed")
+    text = "Acme Corp is the client."
+    _seed_chunk(file_id="cf_x1", text=text)
+    _seed_chunk(file_id="cf_x2", text=text)
+    _seed_source_mapping(file_id="cf_x1", source_doc_id="dupdoc3", stable_id="x1")
+    _seed_source_mapping(file_id="cf_x2", source_doc_id="dupdoc3", stable_id="x2")
+
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:acme-dup3")
+    repo.add_alias(fact_id=fact_id, type="engagement", natural_key="engagement:acme-dup3")
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id="cf_x2",  # a stale claim on the OTHER copy
+        corpus_id=CORPUS_A,
+        file_sha256="",
+        quote="Acme Corp is the client.",
+    )
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "dupdoc3", "corpus_id": CORPUS_A, "stable_id": "x1"}],
+        full_documents=["dupdoc3"],
+        nodes=[_node("engagement:acme-dup3", "dupdoc3", "Acme Corp is the client.")],
+    )
+    assert report["claims_written"] == 1
+
+    claims = repo.claims(_admin(), fact_id)
+    assert len(claims["claims"]) == 1  # the stale one on cf_x2 was purged, not just the resolved copy
+
+
+def test_dup_doc_id_indexed_copy_preferred_over_pending_not_deferred(pg_env, repo):
+    """Two copies anchor the same doc_id in one corpus: one still
+    `processing`, one `indexed`. Resolution must prefer the indexed copy so
+    the claim attaches instead of being deferred on the OTHER copy's
+    not-yet-indexed status."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_pending_dup", status="processing")
+    _seed_corpus_file(file_id="cf_indexed_dup", status="indexed")
+    text = "The pilot renews annually."
+    _seed_chunk(file_id="cf_pending_dup", text=text)
+    _seed_chunk(file_id="cf_indexed_dup", text=text)
+    _seed_source_mapping(file_id="cf_pending_dup", source_doc_id="dupdoc4", stable_id="p1")
+    _seed_source_mapping(file_id="cf_indexed_dup", source_doc_id="dupdoc4", stable_id="p2")
+
+    report = repo.ingest_batch(nodes=[_node("engagement:dup4", "dupdoc4", "The pilot renews annually.")])
+    assert report["claims_written"] == 1
+    assert report["deferred"] == []
+
+
+def test_dup_doc_id_undeclared_doc_id_resolving_only_outside_batch_corpora_is_rejected(pg_env, repo):
+    """RBAC review (PR #1736): a claim's doc_id has NO `documents[]` entry
+    in THIS batch, and the corpora this batch's `documents[]` DID declare
+    don't contain it either -- it must be REJECTED (typed
+    `ambiguous_cross_collection_doc_id`), never silently written under
+    whatever OTHER, possibly more broadly-granted collection the global
+    scan would have found it in. A caller granted only that other
+    collection must see nothing -- proof nothing was ever written there."""
+    from src.repositories import users_repo
+
+    corpus_b = "col_b"
+    doc_a = _seed_ready_doc(pg_env, file_id="cf_a5", doc_id="doc_in_a", text="Acme renewed the contract.")
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_b5")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_b5", text="Unrelated content in another collection.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_b5", source_doc_id="doc_in_b")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "doc_in_b", "corpus_id": corpus_b}],
+        nodes=[_node("engagement:global5", doc_a, "Acme renewed the contract.")],
+    )
+    assert report["claims_written"] == 0
+    assert report["subjects_created"] == 1  # the node itself still resolves/creates
+    assert len(report["claims_rejected"]) == 1
+    assert report["claims_rejected"][0]["reason"] == "ambiguous_cross_collection_doc_id"
+    assert report["claims_rejected"][0]["doc_id"] == "doc_in_a"
+
+    users_repo().create(id="dana", email="dana@test.com", name="Dana")
+    _make_group_with_grant(pg_env, group_name="group-a-broad", collection_id=CORPUS_A, member_user_id="dana")
+    dana_view = repo.search({"id": "dana", "email": "dana@test.com"}, type="engagement")
+    assert dana_view["subjects"] == []  # nothing was ever written under col_a either
+
+
+def test_dup_doc_id_tier2_hit_resolves_within_another_batch_declared_corpus(pg_env, repo):
+    """Multi-corpus batch: an UNDECLARED doc_id (no `documents[]` entry of
+    its own) resolves inside one of the OTHER corpora this SAME batch's
+    `documents[]` declared. Corpus-safe (never escapes to a collection the
+    batch never mentioned at all) -- must resolve normally, not reject."""
+    corpus_b = "col_b"
+    _seed_ready_doc(pg_env, file_id="cf_t2_x", doc_id="doc_t2_x", text="X content.")
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_t2_y")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_t2_y", text="Y content.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_t2_y", source_doc_id="doc_t2_y")
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_t2_z")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_t2_z", text="Z content lives in corpus B.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_t2_z", source_doc_id="doc_t2_z")
+
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "doc_t2_x", "corpus_id": CORPUS_A, "stable_id": "cf_t2_x"},
+            {"doc_id": "doc_t2_y", "corpus_id": corpus_b, "stable_id": "cf_t2_y"},
+        ],
+        nodes=[_node("engagement:t2z", "doc_t2_z", "Z content lives in corpus B.")],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+
+def test_document_typed_edge_endpoints_are_untouched_by_doc_id_file_resolution(pg_env, repo):
+    """`document:<doc_id>` edge endpoints (e.g. a `possible_duplicate_of`
+    edge the producer emits between two near-duplicate files) resolve via
+    the GENERIC node-alias mechanism (`_resolve_alias` / `fact_aliases`,
+    keyed on the literal `natural_key` string) -- a completely different
+    code path from the `documents[]`/`corpus_file_sources`-driven doc_id ->
+    corpus_file_id resolution this module fixes for EVIDENCE (TCRD-241).
+
+    Proof: this edge resolves successfully even though (a) NEITHER endpoint
+    doc_id is declared in `documents[]` this batch, and (b) one of them has
+    copies anchored in TWO different corpora -- if endpoint resolution ran
+    through the same corpus-scoped/global-fallback ladder as evidence, a
+    doc_id absent from `documents[]` would need at least a corpus_file_
+    sources row to resolve at all; `_resolve_alias` needs neither. This
+    also means an endpoint doc_id that has NO corpus_files row anywhere
+    (`document:doc_edge_2` below) still resolves -- endpoint resolution
+    never verifies the doc_id names a real file."""
+    corpus_b = "col_b"
+    _seed_ready_doc(pg_env, file_id="cf_edge_a", doc_id="doc_edge_1", text="Copy one text.")
+    _seed_collection(collection_id=corpus_b)
+    _seed_corpus_file(corpus_id=corpus_b, file_id="cf_edge_b")
+    _seed_chunk(corpus_id=corpus_b, file_id="cf_edge_b", text="Copy one text.")
+    _seed_source_mapping(corpus_id=corpus_b, file_id="cf_edge_b", source_doc_id="doc_edge_1")
+
+    report = repo.ingest_batch(
+        edges=[{"src": "document:doc_edge_1", "type": "possible_duplicate_of", "dst": "document:doc_edge_2"}]
+    )
+    assert report["claims_rejected"] == []
+    assert report["deferred"] == []
+    assert report["subjects_created"] == 2  # both document-entity facts minted fresh
+    assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
+
+
 # ===========================================================================
 # HTTP round-trips — real Postgres backend via build_seeded_client("pg", ...).
 # ===========================================================================
@@ -1075,6 +1307,60 @@ def test_http_happy_path_upload_then_ingest_then_search_finds_the_subject(tmp_pa
     assert run["claims_rejected_count"] == 0
     assert run["subjects_created"] == 1
     assert run["caller"] == "admin@test.com"
+    # No `anonymization` block was sent — the persisted run report still
+    # carries the field, defaulted to `{}` (spec §9.2's "never null").
+    assert run["anonymization"] == {}
+
+
+def test_http_anonymization_block_persists_into_the_run_report(tmp_path, monkeypatch, pg_engine):
+    """Spec §9.2: an OPTIONAL producer declaration rides into the persisted
+    run report (never the direct ingest response) so
+    `GET /api/facts/ingest-runs` and the source card can distinguish
+    "requested" from "declared"."""
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "Anon E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-anon", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-anon",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-anon", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+        "anonymization": {
+            "declared": True,
+            "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}},
+        },
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.status_code == 200, ingest_resp.text
+    # The direct response is still the plain run report — anonymization is
+    # NOT echoed there, only persisted.
+    assert "anonymization" not in ingest_resp.json()
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    run = runs_resp.json()["runs"][0]
+    assert run["anonymization"] == {
+        "declared": True,
+        "scopes": {corpus_id: {"docs_anonymized": 1, "docs_skipped": 0}},
+    }
 
 
 def test_http_verbatim_gate_rejects_a_fabricated_quote(tmp_path, monkeypatch, pg_engine):

@@ -512,6 +512,7 @@ from app.api.admin_contributed_skills import router as admin_contributed_skills_
 from app.api.admin_datasource_secrets import router as admin_datasource_secrets_router
 from app.api.admin_sharepoint import router as admin_sharepoint_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
+from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
 from app.api.admin_source_discovery import router as source_discovery_admin_router
 from app.api.mcp_passthrough import router as mcp_passthrough_router
@@ -549,6 +550,7 @@ from app.api.mcp_builder import router as mcp_builder_router  # MCP-source build
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
+from app.api.share_requests_admin import router as share_requests_admin_router  # C6: agent-share approval queue
 from app.api.knowledge_search import router as knowledge_search_router  # K2: unified search
 from app.api.stack import router as stack_router
 from app.api.stack_views import router as stack_views_router
@@ -1268,6 +1270,18 @@ async def lifespan(app):
             logger.warning("Google auth check: %s", warning)
     except Exception:
         logger.exception("Google auth startup check crashed (non-fatal)")
+
+    # External SSO: an enabled config means a THIRD PARTY's tenant may assert
+    # identities for the permitted domains — always announced; an enabled row
+    # whose secret no longer decrypts is a loud error (the login button
+    # silently disappeared). Same wiring as the Microsoft/Google checks.
+    try:
+        from app.auth.providers.sso import startup_warnings as sso_startup_warnings
+
+        for warning in sso_startup_warnings():
+            logger.warning("External SSO auth check: %s", warning)
+    except Exception:
+        logger.exception("External SSO auth startup check crashed (non-fatal)")
 
     # Bring the Postgres schema to the app's expected Alembic head. The
     # DuckDB ladder self-migrates on every connect (src/db.py); Postgres
@@ -2824,6 +2838,7 @@ def create_app() -> FastAPI:
     from app.auth.providers.email import router as email_auth_router
     from app.auth.providers.keboola import router as keboola_auth_router
     from app.auth.providers.microsoft import router as microsoft_auth_router
+    from app.auth.providers.sso import router as sso_auth_router
 
     # API routers
     app.include_router(auth_router)
@@ -2832,6 +2847,7 @@ def create_app() -> FastAPI:
     app.include_router(email_auth_router)  # Always register, check availability per-request
     app.include_router(keboola_auth_router)  # Always register, availability + allowlist per-request
     app.include_router(microsoft_auth_router)  # Always register, availability + allowlist per-request
+    app.include_router(sso_auth_router)  # Always register; inline per-route gating (test mode must stay reachable)
     from app.api.keboola_login_projects import router as keboola_login_projects_router
 
     app.include_router(keboola_login_projects_router)  # select-mode project import (same allowlist gate)
@@ -2890,6 +2906,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_mcp_router)
     app.include_router(admin_datasource_secrets_router)
     app.include_router(admin_slack_secrets_router)
+    app.include_router(admin_sso_router)
     app.include_router(source_connections_admin_router)
     app.include_router(admin_sharepoint_router)
     app.include_router(source_discovery_admin_router)
@@ -2916,6 +2933,7 @@ def create_app() -> FastAPI:
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)
+    app.include_router(share_requests_admin_router)
     app.include_router(knowledge_search_router)
     app.include_router(stack_router)
     app.include_router(stack_views_router)

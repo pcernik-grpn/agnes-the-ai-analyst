@@ -14,6 +14,7 @@ import os
 import shutil
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import jsonschema
@@ -346,6 +347,83 @@ def test_llm_assist_grade_is_labeled_and_never_silent():
     assert row.llm_assisted is True
     assert row.grader.startswith("llm:")
     assert row.composite == 75.0  # same worked-example scores as the Rubric sheet
+
+
+def _fake_grading_response_kwargs() -> tuple[type, list]:
+    """A `_FakeMessages.create` that records its call kwargs and returns a
+    valid grading payload -- shared by the two llm_assist_grade construction
+    tests below (injected client vs. vertex auto-construction)."""
+    captured_calls: list = []
+
+    class _FakeBlock:
+        type = "text"
+        text = json.dumps(
+            {
+                "gate": "PASS",
+                "gate_detail": None,
+                "correctness": 1,
+                "completeness": 2,
+                "precision": 2,
+                "grounding": 1,
+                "disambiguation": 1,
+                "actionability": 2,
+                "consistency": 2,
+                "failure_reason": None,
+                "routed_to": None,
+            }
+        )
+
+    class _FakeResponse:
+        content = [_FakeBlock()]
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            captured_calls.append(kwargs)
+            return _FakeResponse()
+
+    class _FakeVertexClient:
+        messages = _FakeMessages()
+
+    return _FakeVertexClient, captured_calls
+
+
+def test_llm_assist_grade_builds_vertex_client_when_no_api_key(monkeypatch):
+    """No ANTHROPIC_API_KEY + ai.provider: vertex configured -> grade.py
+    builds a raw AnthropicVertex-shaped client via connectors.llm.factory /
+    connectors.llm.vertex_provider (the same non-extractor pattern
+    app/chat/auto_title.py and src/ingest/vision.py already use), instead
+    of raising KeyError on the missing env var."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    prompts = load_prompts_by_id()
+    prompt = prompts["X1"]
+    record = RunRecord(
+        round="R1",
+        arm="A0",
+        prompt_id="X1",
+        run_index=1,
+        persona=None,
+        source="api",
+        transcript=[],
+        started_at="2026-08-27T00:00:00Z",
+        completed_at=None,
+        tokens=TokenCounts(input_tokens=100, output_tokens=50),
+        turns=1,
+        answer="Some answer.",
+    )
+
+    fake_client_cls, captured_calls = _fake_grading_response_kwargs()
+
+    with (
+        patch("connectors.llm.factory.vertex_config_or_none", return_value=("proj", "global")),
+        patch("connectors.llm.vertex_provider.create_vertex_client") as mock_create_client,
+    ):
+        mock_create_client.return_value = fake_client_cls()
+        row = grade.llm_assist_grade(record, prompt)
+
+    mock_create_client.assert_called_once_with(project_id="proj", region="global")
+    assert len(captured_calls) == 1
+    assert row.llm_assisted is True
+    assert row.composite == 75.0
 
 
 # ---------------------------------------------------------------------------
