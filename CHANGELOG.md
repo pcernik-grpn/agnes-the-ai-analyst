@@ -54,6 +54,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   kai engine stub gained matching routes and a `deliverable` scenario.
 
 ### Changed
+- **Admin and workspace pages now use the plain page header.** 25 templates that
+  are lists, tables or editors switch from the bordered gradient hero panel to the
+  plain title + lede that `/library`, `/agents` and `/chats` already render, via the
+  existing `page_hero_plain` opt-in in `_page_hero.html` — no new CSS or components.
+  This closes the most visible reason admin read as an older product than the rest of
+  the app. The hero is kept on `mcp_connect` and `admin_session_detail`, which
+  introduce themselves rather than being workspace pages, and eyebrows are retained
+  everywhere: they carry the admin grouping (Agent Experience, Users & Access).
 - **BREAKING: Databricks Unity Catalog metric views now flow through the
   semantic-source adapter contract, like Snowflake — no more direct
   `metric_definitions` writer.** A new `databricks_semantic` adapter
