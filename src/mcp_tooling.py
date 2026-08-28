@@ -109,6 +109,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "data_app_logs": "Get Data App Logs",
     "fact_neighbors": "Get Fact Neighbors",
     "fact_claims": "Get Fact Claims",
+    "activity": "Get Activity Timeline",
 }
 
 

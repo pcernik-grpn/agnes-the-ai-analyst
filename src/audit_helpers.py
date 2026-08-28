@@ -51,6 +51,12 @@ RESULT_CLASS_CASE_SQL = (
 
 RESULT_CLASSES = ("success", "error", "denied", "none", "other")
 
+# The physical trail tables folded into the unified Activity Center timeline
+# (``AuditRepository.query_unified`` / ``AuditPgRepository.query_unified``,
+# E3 slice 2). ``chat_messages`` is deliberately NOT in this list — customer
+# data in transcripts, no admin viewer by design (see docs/observability.md).
+UNIFIED_TRAILS = ("audit", "sync", "llm", "agent_scope")
+
 
 def classify_result(value: "str | None") -> str:
     """Python mirror of RESULT_CLASS_CASE_SQL (kept in lockstep by tests)."""

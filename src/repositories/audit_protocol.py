@@ -72,6 +72,38 @@ class AuditRepositoryProtocol(Protocol):
         """
         ...
 
+    def query_unified(
+        self,
+        *,
+        trail: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        user_id: Optional[str] = None,
+        action: Optional[str] = None,
+        action_prefix: Optional[str] = None,
+        action_in: Optional[List[str]] = None,
+        resource: Optional[str] = None,
+        resource_prefix: Optional[str] = None,
+        result_pattern: Optional[str] = None,
+        result_class: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        q: Optional[str] = None,
+        source: Optional[str] = None,
+        include_self_reads: bool = True,
+        cursor: Optional[Tuple[datetime, str]] = None,
+        limit: int = 100,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[datetime, str]]]:
+        """The Activity Center timeline, widened across every trail (E3
+        slice 2): a UNION ALL of audit_log + sync_history + llm_usage +
+        agent_scope_snapshots (never chat_messages — privacy decision),
+        each mapped into the SAME row shape :meth:`query` returns, plus a
+        literal ``trail`` column. Same filter/cursor/ordering contract as
+        :meth:`query`; ``trail`` narrows to one physical trail (``"audit"``,
+        ``"sync"``, ``"llm"``, ``"agent_scope"``) — unknown values raise
+        ``ValueError``.
+        """
+        ...
+
     def query_actions(
         self,
         actions: List[str],
@@ -127,11 +159,15 @@ class AuditRepositoryProtocol(Protocol):
         *,
         since: datetime,
         limit: int = 50,
+        trail: Optional[str] = None,
         **filters: Any,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Distinct facet buckets (users/actions/results/result_classes/
-        resources/sources) under the SAME filter kwargs as :meth:`query`,
-        so dropdown counts always describe rows the timeline can show.
+        resources/sources) over the unified timeline (audit_log +
+        sync_history + llm_usage + agent_scope_snapshots), under the SAME
+        filter kwargs as :meth:`query_unified` — including ``trail`` to
+        narrow to one physical trail — so dropdown counts always describe
+        rows the (now-unified) timeline can show.
 
         Source classification is rule-based (``AUDIT_SOURCE_CASE_SQL``) —
         no caller-supplied scheduler action list.
@@ -142,9 +178,11 @@ class AuditRepositoryProtocol(Protocol):
         self,
         *,
         since: datetime,
+        trail: Optional[str] = None,
         **filters: Any,
     ) -> Dict[str, Any]:
-        """Headline KPIs under the same filter kwargs as :meth:`query`:
+        """Headline KPIs over the unified timeline, under the same filter
+        kwargs as :meth:`query_unified` (including ``trail``):
         events_total, active_users (people — scheduler/system excluded),
         errors (result_class='error'), p95, duration_coverage."""
         ...
