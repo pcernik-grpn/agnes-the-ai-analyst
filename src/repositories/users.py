@@ -459,6 +459,19 @@ class UserRepository:
             [name, now, user_id],
         )
 
+    def revoke_sessions(self, user_id: str) -> None:
+        """Documented no-op on DuckDB (A3 ratchet — see
+        ``migrations/versions/0079_session_revoked_before.py``).
+
+        The PG sibling persists a ``session_revoked_before`` floor that
+        ``app.auth.pat_resolver.resolve_token_to_user`` compares every
+        ``typ="session"`` token's ``iat`` against. DuckDB's ``users`` table
+        has no such column — kept here only for call-site symmetry (``POST
+        /auth/logout`` calls ``users_repo().revoke_sessions(...)`` on either
+        backend without branching), same pattern as
+        ``LlmUsageRepository.insert_batch``'s ``caller_user_id`` no-op."""
+        return None
+
     def delete(self, user_id: str) -> None:
         """Delete user + cascade their group memberships."""
         self.conn.execute(
