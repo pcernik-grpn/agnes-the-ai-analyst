@@ -214,6 +214,9 @@ async def keboola_callback(request: Request):
                 logger.warning("Keboola login provisioning failed; login proceeds", exc_info=True)
 
         jwt_token = create_access_token(user["id"], user["email"])
+        from app.auth.login_audit import audit_login_success
+
+        audit_login_success(user["id"], provider="keboola", request=request)
         target = safe_next_path(request.session.pop("login_next", None))
 
         from app.auth.public_url import cookie_secure

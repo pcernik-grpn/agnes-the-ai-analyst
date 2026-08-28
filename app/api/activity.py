@@ -2,7 +2,12 @@
 
 Three endpoints under /api/admin/activity, all gated by require_admin:
 
-    GET /api/admin/activity            unified timeline (audit_log + sync_history)
+    GET /api/admin/activity            unified timeline — audit_log +
+                                        sync_history + llm_usage +
+                                        agent_scope_snapshots (E3 slice 2;
+                                        never chat_messages, privacy
+                                        decision). `trail=` narrows to one
+                                        physical trail, e.g. `trail=audit`.
     GET /api/admin/activity/health     health pulse (cached 30s server-side)
     GET /api/admin/activity/sync       per-table recent sync feed
 
@@ -19,7 +24,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.access import require_admin
 from src.observability.posthog_client import get_posthog
@@ -31,6 +36,7 @@ from src.repositories import (
     usage_repo,
     users_repo,
 )
+
 router = APIRouter(prefix="/api/admin/activity", tags=["activity"])
 
 _HEALTH_CACHE: dict = {"data": None, "expires_at": None}
@@ -92,6 +98,11 @@ def activity_timeline(
     result_class: Optional[str] = None,
     q: Optional[str] = None,
     source: Optional[str] = None,
+    trail: Optional[str] = Query(
+        default=None,
+        description="Narrow to one physical trail: audit | sync | llm | agent_scope. "
+        "Unset returns the unified timeline across all four.",
+    ),
     include_self_reads: bool = Query(default=False),
     cursor_ts: Optional[datetime] = None,
     cursor_id: Optional[str] = None,
@@ -101,20 +112,24 @@ def activity_timeline(
     since = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
     cursor = (cursor_ts, cursor_id) if cursor_ts and cursor_id else None
 
-    rows, next_cursor = audit_repo().query(
-        since=since,
-        user_id=user_id,
-        action_prefix=action_prefix,
-        resource=resource,
-        resource_prefix=resource_prefix,
-        result_pattern=result_pattern,
-        result_class=result_class,
-        q=q,
-        source=source,
-        include_self_reads=include_self_reads,
-        cursor=cursor,
-        limit=limit,
-    )
+    try:
+        rows, next_cursor = audit_repo().query_unified(
+            trail=trail,
+            since=since,
+            user_id=user_id,
+            action_prefix=action_prefix,
+            resource=resource,
+            resource_prefix=resource_prefix,
+            result_pattern=result_pattern,
+            result_class=result_class,
+            q=q,
+            source=source,
+            include_self_reads=include_self_reads,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Enrich rows with users.email + users.name so the UI can render a
     # readable label (`name <email>`) instead of an opaque UUID. One small
@@ -128,19 +143,25 @@ def activity_timeline(
             r["user_email"] = extra.get("email")
             r["user_name"] = extra.get("name")
 
-    _audit_read(user, "timeline", {
-        "since_minutes": since_minutes,
-        "user_id": user_id, "action_prefix": action_prefix,
-        "resource": resource, "resource_prefix": resource_prefix,
-        "result_pattern": result_pattern, "result_class": result_class,
-        "source": source, "q": q,
-    })
+    _audit_read(
+        user,
+        "timeline",
+        {
+            "since_minutes": since_minutes,
+            "user_id": user_id,
+            "action_prefix": action_prefix,
+            "resource": resource,
+            "resource_prefix": resource_prefix,
+            "result_pattern": result_pattern,
+            "result_class": result_class,
+            "source": source,
+            "trail": trail,
+            "q": q,
+        },
+    )
     return {
         "rows": rows,
-        "next_cursor": (
-            {"ts": next_cursor[0].isoformat(), "id": next_cursor[1]}
-            if next_cursor else None
-        ),
+        "next_cursor": ({"ts": next_cursor[0].isoformat(), "id": next_cursor[1]} if next_cursor else None),
         "filter": {
             "since_minutes": since_minutes,
             "user_id": user_id,
@@ -150,6 +171,7 @@ def activity_timeline(
             "result_pattern": result_pattern,
             "result_class": result_class,
             "source": source,
+            "trail": trail,
             "include_self_reads": include_self_reads,
             "q": q,
         },
@@ -258,16 +280,21 @@ def _compute_health(now: datetime) -> dict:
     diag_value = "0"
 
     fields = [
-        {"key": "scheduler",          "value": scheduler_value, "raw": scheduler_age_s, "color": scheduler_color},
-        {"key": "sync_24h",           "value": sync_value,      "raw": {"ok": ok, "fail": fail}, "color": sync_color},
-        {"key": "active_users_today", "value": str(active),     "raw": active, "color": "green"},
-        {"key": "memory_pipeline",    "value": mem_value,       "raw": None, "color": mem_color},
-        {"key": "session_ingest",     "value": ingest_value,    "raw": ingest_gap, "color": ingest_color},
-        {"key": "diagnose_warnings",  "value": diag_value,      "raw": 0, "color": diag_color},
+        {"key": "scheduler", "value": scheduler_value, "raw": scheduler_age_s, "color": scheduler_color},
+        {"key": "sync_24h", "value": sync_value, "raw": {"ok": ok, "fail": fail}, "color": sync_color},
+        {"key": "active_users_today", "value": str(active), "raw": active, "color": "green"},
+        {"key": "memory_pipeline", "value": mem_value, "raw": None, "color": mem_color},
+        {"key": "session_ingest", "value": ingest_value, "raw": ingest_gap, "color": ingest_color},
+        {"key": "diagnose_warnings", "value": diag_value, "raw": 0, "color": diag_color},
     ]
 
-    overall = "red" if any(f["color"] == "red" for f in fields) else \
-              "yellow" if any(f["color"] == "yellow" for f in fields) else "green"
+    overall = (
+        "red"
+        if any(f["color"] == "red" for f in fields)
+        else "yellow"
+        if any(f["color"] == "yellow" for f in fields)
+        else "green"
+    )
 
     sentence = _build_sentence(fields, overall)
     return {"status": overall, "fields": fields, "sentence": sentence}
