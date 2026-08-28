@@ -2661,7 +2661,10 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   background: var(--ds-surface);
   border-left: 1px solid var(--ds-border);
   box-shadow: var(--ds-shadow-lg);
-  overflow-y: auto;
+  /* The LIST is the scroll container (it flexes to the full remaining
+     height); the drawer itself never scrolls, so the head and the footer
+     stay put. */
+  overflow: hidden;
 }
 .cloud-chat-files-drawer[hidden] { display: none; }
 /* Where there is room, the open drawer PUSHES the conversation instead of
@@ -2674,26 +2677,42 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 .cloud-chat-files-drawer-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-1);
+  /* style-custom.css styles the bare `header` tag (20px padding, 24px
+     margin, a full-width border-bottom) for page-level headers — inside
+     the drawer that painted a stray divider with a double gap under it.
+     The drawer's own flex gap is the only spacing this head needs. */
+  padding: 0;
+  margin: 0;
+  border-bottom: none;
 }
 .cloud-chat-files-drawer-title {
   margin: 0;
+  /* Title takes the slack so the refresh + close buttons cluster right. */
+  flex: 1 1 auto;
   font-size: var(--text-md);
   font-weight: var(--font-semibold);
   color: var(--ds-text-primary);
 }
 .cloud-chat-files-drawer-close {
   flex: 0 0 auto;
+  /* Fixed square so the refresh (svg) and close (glyph) buttons render the
+     same size instead of each sizing to its own content. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
   border: none;
   background: transparent;
   color: var(--ds-text-muted);
   font-size: var(--text-sm);
   line-height: 1;
-  padding: var(--space-2);
+  padding: 0;
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
+.cloud-chat-files-drawer-close svg { width: 15px; height: 15px; }
 .cloud-chat-files-drawer-close:hover {
   background: var(--ds-surface-dim);
   color: var(--ds-text-primary);
@@ -2709,12 +2728,6 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   line-height: 1.5;
 }
 .cloud-chat-files-drawer-desc a { color: var(--ds-primary); }
-.cloud-chat-files-drawer-foot {
-  margin-top: auto;
-  display: flex;
-  justify-content: flex-end;
-  padding-top: var(--space-2);
-}
 
 /* Count on the header button — how many files the drawer would show. */
 .cloud-chat-files-badge {
@@ -2743,13 +2756,20 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 .cloud-chat-files-list {
   list-style: none;
   margin: 0;
-  padding: 0;
+  /* Room for the cards' focus rings/hover shadows to render uncut. */
+  padding: 2px;
   display: flex;
   flex-direction: column;
-  max-height: 46vh;
+  gap: var(--space-2);
+  /* Fill whatever height the drawer has left after head + description —
+     a fixed max-height left the bottom half of the panel empty while the
+     list scrolled inside a short box. min-height: 0 is what lets a flex
+     child actually shrink-and-scroll instead of overflowing the drawer.
+     The cards carry their own borders, so a short list is followed by
+     plain drawer background instead of a large empty framed box. */
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
-  border: 1px solid var(--ds-border);
-  border-radius: var(--ds-radius-md, 8px);
 }
 .cloud-chat-files-list:empty { display: none; }
 /* File chips in the transcript — the primary way a deliverable is handed
@@ -2847,47 +2867,95 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   outline-offset: var(--ds-focus-outline-offset);
 }
 
-/* Drawer rows keep the full inventory. In a 380px panel the actions no longer
-   sit BESIDE the name — the path wrapped to three lines and squeezed the
-   buttons — they sit under it, on their own line. */
+/* Drawer rows: icon actions are compact enough to sit beside the name even
+   at the panel's 380px width; the meta column ellipsizes on one line. */
 .cloud-chat-files-row {
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: var(--space-2);
+  align-items: center;
+  gap: var(--space-3);
   padding: var(--space-3);
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-md, 8px);
+  background: var(--ds-surface);
+  transition: box-shadow 0.12s ease, border-color 0.12s ease;
 }
-.cloud-chat-files-row + .cloud-chat-files-row {
-  border-top: 1px solid var(--ds-border);
+.cloud-chat-files-row:hover {
+  border-color: var(--ds-border-strong, var(--ds-border));
+  box-shadow: var(--ds-shadow-sm);
+}
+/* Extension tile — gives every row an anchor the eye can scan down, the way
+   a file manager does. Tokens only; the tile stays neutral in both themes. */
+.cloud-chat-files-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--ds-radius-md, 8px);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-secondary);
+  font-size: 10px;
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 .cloud-chat-files-meta {
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1 1 auto;
 }
 .cloud-chat-files-name {
   font-size: var(--text-sm);
   font-weight: 600;
   color: var(--ds-text);
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .cloud-chat-files-hint {
   font-size: var(--text-xs);
   color: var(--ds-text-secondary);
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .cloud-chat-files-actions {
   display: flex;
-  gap: var(--space-2);
+  gap: var(--space-1);
   flex-shrink: 0;
   justify-content: flex-end;
 }
+/* Compact icon actions — two text buttons next to every row squeezed the
+   name into a sliver at the drawer's 380px width. */
 .cloud-chat-files-btn {
-  font-size: var(--text-xs);
-  padding: var(--space-1) var(--space-2);
-  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: var(--ds-radius-sm, 6px);
+  background: transparent;
+  color: var(--ds-text-secondary);
+  cursor: pointer;
 }
+.cloud-chat-files-btn:hover {
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+}
+.cloud-chat-files-btn:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+.cloud-chat-files-btn[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+.cloud-chat-files-btn svg { width: 15px; height: 15px; }
 
 /* Store dialog: type tiles (mirrors store_upload.html .type-tiles) */
 .cloud-chat-store-tiles {
