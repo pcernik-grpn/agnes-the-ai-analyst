@@ -22,13 +22,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
-from scripts.eval.arms import ChatSurface
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.eval.arms import ChatSurface  # noqa: E402
 
 
 def main() -> None:
