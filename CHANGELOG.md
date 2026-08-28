@@ -175,6 +175,34 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **Document extraction as its own worker lane** (spec §7.5 "Extraction inside Agnes (later)", build order step 7). A third `extraction` lane joins heavy/light in `app/worker/registry.py`; which lanes a process spawns is now selectable per-process via `AGNES_WORKER_LANES` (comma-separated, unset = heavy+light exactly as before — extraction is opt-in, never spawned by default). The `corpus-extraction` job kind (its own lane, no automatic retry) is the producer-invocation seam: it resolves a SharePoint connection's credentials the same way the admin UI does (vault-first, then the server's `SHAREPOINT_CERT_PRIVATE_KEY`), then shells out to the operator-configured `extraction.producer.command`/`.module` (new `instance.yaml` block, gated by the new `extraction` switch/`AGNES_EXTRACTION_ENABLED`, off by default) under a bounded timeout. The child process env is a curated non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus any operator-opted-in `extraction.producer.env_passthrough`, plus the resolved SharePoint credentials and corpus id — never the full parent environment, so no other instance secret (vault key, LLM API key, DB DSN, ...) is forwarded to this external, admin-configurable binary. A new `worker` Dockerfile build target (with an `EXTRACTION_PRODUCER_INSTALL` build-arg extension point for bundling a producer's runtime deps) and a new `extraction-worker` compose service (profile-gated, `AGNES_WORKER_LANES=extraction`) let extraction run in its own container so a long-running re-extraction can never block a table sync. This ships the Agnes-side seam only — the producer itself is a separate project the operator supplies, adopted rather than vendored into this repo.
 
 ### Changed
+- **The chat sandbox now tells the agent the truth about its runtime, and
+  read-only admin commands work there.** Three coupled fixes to the same
+  confusion (an in-chat agent concluding its auth was broken and recommending
+  `agnes pull`): (1) the secret broker now replays **read-only (GET/HEAD)
+  admin routes** under the session user's own identity — `agnes admin
+  list-users` / `list-tables` work for an actual admin in chat (main-scoped
+  CLI tickets only — the MCP leg keeps the full refusal), while the
+  route's live `require_admin` still refuses non-admins and agent principals,
+  and admin **mutations** stay interactive-only (403
+  `admin_mutations_require_interactive_auth`); switchable via the new live
+  flag `chat.broker_admin_reads` / `AGNES_CHAT_BROKER_ADMIN_READS` (default
+  on). (2) `agnes auth whoami` inside a sandbox (`AGNES_SESSION_ID` set, no
+  token by design) no longer answers "Not logged in" — it verifies the
+  brokered identity live via `/api/me/effective-access` and reports it,
+  including whether read-only admin commands are available. (3) the workspace
+  prompt (`config/claude_md_template.txt`) grew a sandbox-specific "This
+  sandbox — how you run and authenticate" section and stops giving the
+  sandbox laptop-only advice (`agnes pull`/`push`/`init`/`login`, Private
+  sessions, Corporate Memory, laptop Directory Structure); the bundled
+  fallback `app/initial_workspace_default/CLAUDE.md` carries the same truths.
+  The brokered read surface leans on the repo-wide "never mutate on GET"
+  invariant as its read/write boundary, so the one admin route that broke it
+  was fixed rather than special-cased: **`/admin/chat/{chat_id}/tail-ticket`
+  is a `POST`** (it mints a live one-shot credential for the admin tail
+  WebSocket, so as a `GET` it would have been brokered — handing a chat
+  sandbox a ticket to read any other user's live session). A new guard,
+  `tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential`,
+  fails on any future admin `GET`/`HEAD` route that mints one.
 - **`POST /api/admin/mcp-sources/preview-introspect` writes an audit entry.**
   The endpoint dials a connection the admin has typed but not saved — with a
   credential attached, or on `stdio` by launching a subprocess with a

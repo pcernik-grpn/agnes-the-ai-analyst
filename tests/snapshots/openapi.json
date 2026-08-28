@@ -12329,7 +12329,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.89.1"
+    "version": "0.91.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -12998,9 +12998,9 @@
       }
     },
     "/admin/chat/{chat_id}/tail-ticket": {
-      "get": {
-        "description": "Issue a short-TTL one-shot ticket for the tail WebSocket.\n\nThe WebSocket itself can't carry the admin's session cookie/Authorization\nreliably across browsers (Safari in particular strips cookies on WS\nupgrades from `fetch`), so we mint a ticket here under the normal admin\nauth flow and the JS hands it to the WS as a query parameter.",
-        "operationId": "tail_ticket_admin_chat__chat_id__tail_ticket_get",
+      "post": {
+        "description": "Issue a short-TTL one-shot ticket for the tail WebSocket.\n\nThe WebSocket itself can't carry the admin's session cookie/Authorization\nreliably across browsers (Safari in particular strips cookies on WS\nupgrades from `fetch`), so we mint a ticket here under the normal admin\nauth flow and the JS hands it to the WS as a query parameter.\n\nPOST, not GET, for two reasons that are the same reason: minting a\ncredential is a state change, and the brokered admin-READ surface\n(``app/api/broker.py``) replays every ``GET``/``HEAD`` admin route under\nthe caller's resolved identity precisely BECAUSE \"never mutate on GET\" is\nsupposed to hold. As a GET this route was the counterexample \u2014 a chat\nsandbox could ask the broker for it and get back a live ticket for\n``/admin/chat/{any_chat_id}/tail``, i.e. read another user's live session.\nThe sandbox runs an agent that any document it reads can prompt-inject, so\nthat is a real path, not a theoretical one. Guarded by\n``tests/test_broker_routes.py::test_no_admin_get_route_mints_a_credential``.",
+        "operationId": "tail_ticket_admin_chat__chat_id__tail_ticket_post",
         "parameters": [
           {
             "in": "path",
@@ -13034,7 +13034,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": true,
-                  "title": "Response Tail Ticket Admin Chat  Chat Id  Tail Ticket Get",
+                  "title": "Response Tail Ticket Admin Chat  Chat Id  Tail Ticket Post",
                   "type": "object"
                 }
               }

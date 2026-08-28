@@ -14,15 +14,34 @@ is no data without first running `agnes catalog`.
 2. `agnes schema <table>` — column names and types.
 3. `agnes describe <table> -n 5` — a few sample rows, to see real values.
 4. Run a query:
-   - `agnes query "<SQL>"` — runs against your local synced copy.
-   - `agnes query --remote "<SQL>"` — runs server-side and returns rows with no
-     download. Use this when nothing has been pulled locally yet, or for large
-     tables — it queries the same RBAC-filtered views without copying data down.
+   - `agnes query "<SQL>"` — runs locally when data is synced, otherwise
+     transparently server-side (stderr prints a `[scope]` note). In this
+     sandbox nothing is synced, so it runs server-side — that is normal, not
+     an error, and `agnes status` reporting `Tables: 0` is the expected state.
+   - `agnes query --remote "<SQL>"` — explicit server-side execution. Same
+     RBAC-filtered views, no data copied down; prefer it for large tables.
 
 Each table's `query_mode` (shown by `agnes catalog`) tells you whether it is
 local (synced) or remote. Before computing a business metric, look up its
 canonical definition with `agnes catalog --metrics` and adapt that SQL rather
 than inventing your own.
+
+## How you are authenticated
+
+This sandbox holds no credential — no token file, no `agnes login`. Every
+`agnes` CLI call is re-authenticated per request by the Agnes server under the
+chat user's own identity, with their real permissions (RBAC applies live).
+`agnes auth whoami` reports this brokered identity; a 401/403 from a command
+is a permissions answer for this account, never a sign you should log in.
+Do not run `agnes login`, `agnes init`, `agnes pull` or `agnes push` here —
+they target an analyst's own laptop workspace.
+
+Admin commands: read-only ones (`agnes admin list-users`, `agnes admin
+list-tables`, …) work when the chat user's account is an admin. Admin
+**mutations** (register-table, grants, config writes) are always refused from
+a sandbox with `admin_mutations_require_interactive_auth` — by design. When
+one is needed, tell the user exactly what to do in the `/admin` web UI
+instead of retrying.
 
 ## Numbers that come from a dashboard or an app
 
@@ -187,8 +206,9 @@ you can add to your stack:
    add (the `IN STACK` column shows what is already subscribed).
 2. `agnes stack add <type> <id>` — subscribe to an available one, e.g.
    `agnes stack add data_package sales`.
-3. `agnes pull` — download the newly-subscribed tables so they appear in
-   `agnes catalog`.
+3. The newly-subscribed tables appear in `agnes catalog` right away and are
+   queryable immediately — `agnes query` runs server-side in this sandbox, so
+   no `agnes pull` is needed (that is a laptop-workspace command).
 
 ## Safety
 
