@@ -1060,6 +1060,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   written, and no authority or grant changes. Off the dev gate every value is
   ignored outright and the toggle is not rendered, so it adds no surface to a
   real deployment.
+- **Vertex sweep of the remaining direct-Anthropic call sites (TCRD-242).**
+  Chat, vision ingest, and the guardrails reviewer were already Vertex-capable
+  through `connectors/llm/factory.py`; the offline eval harness's
+  `--llm-assist` grading pass (`scripts/eval/grade.py::llm_assist_grade`) was
+  the one remaining consumer that hard-required `ANTHROPIC_API_KEY` — it now
+  falls back to a raw `AnthropicVertex` client via
+  `connectors.llm.factory.vertex_config_or_none` /
+  `connectors.llm.vertex_provider.create_vertex_client` when no static key is
+  set, the same non-extractor pattern `app/chat/auto_title.py` and
+  `src/ingest/vision.py` already use. The agent-as-API runtime
+  (`POST /api/v1/agents/{slug}/responses`) needed no change — it spawns a
+  headless chat session through the same `ChatManager`/`app/api/broker.py`
+  path live chat uses, which already honors `chat.llm.provider: vertex`
+  end-to-end including pinned-model and budget enforcement against a
+  Vertex-shaped model path. The A0 "bare Anthropic API, no tools" eval arm
+  (`scripts/eval/arms.py::AnthropicArm`) is deliberately left on the
+  first-party API — its entire methodological point is measuring the vendor's
+  hosted baseline, independent of Agnes's own provider routing.
 
 ## [0.91.0] - 2026-08-28
 
