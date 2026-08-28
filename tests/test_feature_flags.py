@@ -160,6 +160,36 @@ class TestFeatureFlagsRegistry:
         for flag in ic.FEATURE_FLAGS:
             assert flag.description
 
+    def test_facts_operator_text_does_not_deny_shipped_surfaces(self):
+        """The `facts` flag ships the read surface across REST/CLI/MCP and the
+        REST write surface, but the operator-facing copy is written in three
+        places — the `/admin/server-config` field hint, the switch registry
+        description, and the docs/feature-flags.md row — and two of them still
+        said ingest and the CLI/MCP wrappers were "a separate follow-up". An
+        operator reading that is told a shipped capability does not exist
+        (Devin Review on #1652).
+
+        Asserted as a coherence check across all three, not a spelling check
+        on one: each must name the write surface, and none may describe part
+        of the feature as not-yet-available.
+        """
+        from pathlib import Path
+
+        from app.api.admin import _KNOWN_FIELDS
+        from app.switches import SWITCHES
+
+        hint = _KNOWN_FIELDS["facts"]["enabled"]["hint"]
+        switch_desc = next(s for s in SWITCHES if s.name == "facts").description
+        row = next(
+            ln
+            for ln in (Path(__file__).resolve().parents[1] / "docs/feature-flags.md").read_text().splitlines()
+            if ln.startswith("| `facts` |")
+        )
+
+        for label, text in (("admin hint", hint), ("switch description", switch_desc), ("docs row", row)):
+            assert "ingest" in text, f"{label} never mentions the shipped write surface"
+            assert "follow-up" not in text, f"{label} still calls a shipped surface a follow-up: {text!r}"
+
 
 # --- Behavior preservation: get_studio_enabled / get_guardrails_enabled ------
 

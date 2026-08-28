@@ -761,9 +761,11 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "from Collections documents, each claim carrying its evidencing "
                 "document, verbatim quote and date. Gates the whole /api/facts* router "
                 "(404 when off). Postgres-only (A3 ratchet) — a DuckDB-backed instance "
-                "answers a typed 501 regardless of this flag. New feature — off by "
-                "default, and currently a READ surface only; ingest is a separate "
-                "follow-up."
+                "answers a typed 501 regardless of this flag. Covers both the read "
+                "surface (search/neighbors/claims — any authenticated caller, over "
+                "REST, `agnes facts` and the MCP foundation tools) and the write "
+                "surface (ingest + corrections, scheduler-token-or-admin, REST only "
+                "by design). New feature — off by default."
             ),
         },
         "visibility_mode": {
