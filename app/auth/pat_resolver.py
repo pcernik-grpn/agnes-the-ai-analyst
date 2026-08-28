@@ -410,7 +410,7 @@ def resolve_token_to_user(
 
         # Issue #1676: server-side session revocation. `session_revoked_before`
         # (PG-only column — A3 ratchet, see
-        # migrations/versions/0079_session_revoked_before.py) is a
+        # migrations/versions/0082_session_revoked_before.py) is a
         # per-user timestamp floor: a `typ="session"` token whose `iat`
         # predates it is refused here even though its signature and `exp`
         # are both still fine. `POST /auth/logout` bumps it to "now" via

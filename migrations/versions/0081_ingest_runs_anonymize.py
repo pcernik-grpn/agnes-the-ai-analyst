@@ -19,8 +19,8 @@ Nullable-free JSONB with a `'{}'::jsonb` default, same pattern as every
 other list/dict column on this table — a producer that never anonymizes
 omits the field entirely and every existing row backfills to `{}`.
 
-Revision ID: 0080_ingest_runs_anonymize
-Revises: 0079_sso_login
+Revision ID: 0081_ingest_runs_anonymize
+Revises: 0080_share_requests
 Create Date: 2026-08-28
 
 Note: the revision id is deliberately SHORTER than the migration's subject
@@ -38,8 +38,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision: str = "0080_ingest_runs_anonymize"
-down_revision: Union[str, None] = "0079_sso_login"
+revision: str = "0081_ingest_runs_anonymize"
+down_revision: Union[str, None] = "0080_share_requests"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

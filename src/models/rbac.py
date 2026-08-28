@@ -57,7 +57,7 @@ class User(Base):
     # passwords). Cleared when the user sets their own password.
     must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     # Issue #1676: server-side session revocation, PG-only (A3 ratchet — see
-    # migrations/versions/0079_session_revoked_before.py). A `typ="session"`
+    # migrations/versions/0082_session_revoked_before.py). A `typ="session"`
     # JWT whose `iat` predates this timestamp is refused by
     # `app.auth.pat_resolver.resolve_token_to_user` even though its signature
     # and `exp` are still valid — the mechanism `POST /auth/logout` uses to end

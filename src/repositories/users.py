@@ -461,7 +461,7 @@ class UserRepository:
 
     def revoke_sessions(self, user_id: str) -> None:
         """Documented no-op on DuckDB (A3 ratchet — see
-        ``migrations/versions/0079_session_revoked_before.py``).
+        ``migrations/versions/0082_session_revoked_before.py``).
 
         The PG sibling persists a ``session_revoked_before`` floor that
         ``app.auth.pat_resolver.resolve_token_to_user`` compares every

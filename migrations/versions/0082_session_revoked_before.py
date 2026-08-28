@@ -30,8 +30,8 @@ No backfill: NULL means "no floor set", so every session that already exists
 at deploy time keeps working until its own `exp` — this migration does not
 itself log anyone out.
 
-Revision ID: 0079_session_revoked_before
-Revises: 0078_facts_ingest_runs
+Revision ID: 0082_session_revoked_before
+Revises: 0081_ingest_runs_anonymize
 Create Date: 2026-08-28
 """
 
@@ -42,8 +42,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0079_session_revoked_before"
-down_revision: Union[str, None] = "0078_facts_ingest_runs"
+revision: str = "0082_session_revoked_before"
+down_revision: Union[str, None] = "0081_ingest_runs_anonymize"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
