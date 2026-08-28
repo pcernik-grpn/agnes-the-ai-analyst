@@ -339,16 +339,12 @@
     });
   }
 
+  // One projection, so one place to write the state — the card mirror this used
+  // to keep in step went with the grid view.
   function setRowSelected(row, on) {
     row.classList.toggle("is-selected", on);
     var box = row.querySelector(".ch-check");
     if (box) box.checked = on;
-    var card = document.querySelector('.ch-card[data-item-id="' + row.dataset.itemId + '"]');
-    if (card) {
-      card.classList.toggle("is-selected", on);
-      var cardBox = card.querySelector(".ch-card__check");
-      if (cardBox) cardBox.checked = on;
-    }
   }
 
   function clearSelection() {
@@ -616,84 +612,6 @@
   // AgnesTime is deferred and may land after this file runs.
   window.addEventListener("load", hydrateWhen);
 
-  // ---- Grid card projection -------------------------------------------
-  // Built FROM the row, so the list stays the single source of truth and the
-  // grid inherits filtering, sorting, selection and every in-place update for
-  // free. Anatomy:
-  //
-  //   ┌──────────────────────────┐
-  //   │ 📌 title (2 lines)    [x]│  pin flag · title · select box
-  //   │ Agent · 2d ago           │  one metadata line
-  //   │ [Archived] [Shared]      │  state pills, collapsed when none
-  //   └──────────────────────────┘
-  function buildCard(row) {
-    var card = document.createElement("article");
-    card.className = "fbar-card ch-card";
-    card.dataset.itemId = row.dataset.itemId || "";
-    if (row.classList.contains("is-selected")) card.classList.add("is-selected");
-
-    var head = document.createElement("div");
-    head.className = "ch-card__head";
-    if (row.dataset.pinned === "1") {
-      var pin = document.createElement("span");
-      pin.className = "ch-card__pin";
-      pin.setAttribute("aria-hidden", "true");
-      pin.innerHTML = PIN_SVG; // static constant, no interpolation
-      head.appendChild(pin);
-    }
-    var title = document.createElement("h3");
-    title.className = "ch-card__title";
-    var link = document.createElement("a");
-    link.href = row.dataset.href || "#";
-    link.textContent = row.dataset.title || "Untitled chat";
-    title.appendChild(link);
-    head.appendChild(title);
-    if (row.dataset.owned === "1") {
-      var check = document.createElement("input");
-      check.type = "checkbox";
-      check.className = "ch-card__check";
-      check.checked = row.classList.contains("is-selected");
-      check.setAttribute("aria-label", "Select " + (row.dataset.title || "chat"));
-      check.addEventListener("change", function () {
-        setRowSelected(row, check.checked);
-        syncSelection();
-      });
-      head.appendChild(check);
-    }
-    card.appendChild(head);
-
-    var meta = document.createElement("div");
-    meta.className = "ch-card__meta";
-    var whenEl = row.querySelector("time[data-chat-when]");
-    meta.textContent = [row.dataset.agentLabel || "", whenEl ? whenEl.textContent : ""]
-      .filter(Boolean)
-      .join(" · ");
-    card.appendChild(meta);
-
-    // Clone the row's own pills rather than re-deriving them from data
-    // attributes: that is how the two views come to disagree about the same
-    // conversation.
-    var pills = row.querySelectorAll(".ch-pill");
-    if (pills.length) {
-      var wrap = document.createElement("div");
-      wrap.className = "ch-card__pills";
-      pills.forEach(function (p) {
-        wrap.appendChild(p.cloneNode(true));
-      });
-      card.appendChild(wrap);
-    }
-    // The same "⋮" the row carries — a card is a different drawing of a
-    // conversation, not a read-only one.
-    var trigger = menuTriggerFor(row);
-    if (trigger) {
-      var menuHost = document.createElement("span");
-      menuHost.className = "ch-card__menu";
-      menuHost.appendChild(trigger);
-      card.appendChild(menuHost);
-    }
-    return card;
-  }
-
   // ---- Toolbar ---------------------------------------------------------
   if (listEl && window.FilterToolbar) {
     toolbar = window.FilterToolbar.init({
@@ -727,13 +645,13 @@
       },
       count: { el: "#ch-count", noun: "chat" },
       noResults: "#ch-noresults",
-      view: {
-        buttons: ".fbar-view__btn",
-        tableWrap: "#ch-list",
-        grid: "#ch-grid",
-        storageKey: "chats-view",
-        card: buildCard,
-      },
+      // No `view` block: this page has ONE view. The list is the only
+      // projection, so there is no grid to keep in sync and no card builder —
+      // `filter_toolbar.js` treats `view` as optional and skips the whole
+      // switch. `#ch-list` needs no hiding when a filter empties it either:
+      // `.ch-list` is bare flex rows with no border, header or background, so
+      // with every row hidden it collapses to nothing and the no-results panel
+      // stands alone on its own.
       onApply: function () {
         // The row menu is a shared component holding a module-level reference to
         // the trigger it was opened from. A re-projection rebuilds every card,

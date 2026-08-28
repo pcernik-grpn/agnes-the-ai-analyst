@@ -1,5 +1,18 @@
 """API tests for the authoring_suggestions queue (v77)."""
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def studio_on(monkeypatch):
+    """The suggestion API is part of the Studio surface, which is OFF by
+    default since the admin cleanup retired it (a disabled instance 403s the
+    submit endpoint). These tests are about the queue's behavior when the
+    surface is exposed, so they turn it on; the one test that asserts the
+    disabled 403 patches `get_studio_enabled` directly and still wins.
+    """
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}

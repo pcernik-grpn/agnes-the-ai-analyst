@@ -1,0 +1,79 @@
+{% extends "base_index.html" %}
+{# Author a data package, in the builder shell /agents and /skills use.
+
+   This page owns almost nothing. The fields, the table picker, the group
+   grants and every request they make belong to package_drawer.js — the same
+   component /admin/tables opens as a compact drawer while you are mid-sentence
+   assigning a table. Rendering it into a page instead of an overlay is one
+   option on `open()`, so there is ONE implementation of what a package is.
+
+   The difference is where each belongs: a drawer opens over the lens you are
+   standing on and hands it back, which is right when creating the package is
+   a detour. This is not a detour — you came here to build the thing — so it
+   looks like the other two places you come to build a thing. #}
+
+{% block title %}New data package — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
+{# The drawer's OWN controls — the table tree, the group grant rows and their
+   Optional/Automatic toggles. Without this they render as native checkboxes
+   and unstyled buttons: the markup is package_drawer.js's, so its sheet has
+   to come with it wherever it is mounted. #}
+<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
+{# package_drawer.css only TWEAKS `.fbar-seg` — its own header says the base
+   lives in filter_toolbar.css, along with `.fbar-select`. Without this the
+   Optional/Automatic tier control renders as two default browser buttons. #}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+{# ...and `.cf-palette-row` / the shared card bits come from stack_card.css,
+   the third sheet that header names. #}
+<link rel="stylesheet" href="{{ static_url('css/stack_card.css') }}">
+{# The category picker is a ds-dropdown; unstyled it falls back to a bare
+   <select> beside its own chevron. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+{# The builder workspace: two panes, the shell header, the full-bleed
+   breakout. Shared with the other builders — see builder.css. #}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{% endblock %}
+
+{% block page_head %}
+{# Deliberately empty. `body.ag-building` collapses this band the moment the
+   builder mounts, exactly as it does on /agents — the shell header carries
+   the title and the actions, so a page heading above it would be a second
+   title for the same thing. #}
+{% endblock %}
+
+{% block page_surface %}
+<div id="pkg-builder-view" class="ag-builder-mount"></div>
+{% endblock %}
+
+{% block scripts %}
+{# Not deferred: the builder mounts on boot, so BuilderShell has to exist
+   before the script below runs. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+{# The category picker initialises itself from this; without it the drawer
+   renders the branded dropdown's markup with nothing driving it. #}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}"></script>
+<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
+<script>
+  (function () {
+    'use strict';
+    var mount = document.getElementById('pkg-builder-view');
+    if (!mount || !window.AgnesPackageDrawer) return;
+    window.AgnesPackageDrawer.open({
+      builder: true,
+      mount: mount,
+      // Leaving goes back to where packages live, not to whatever page the
+      // drawer was last opened over.
+      backHref: '/library',
+      backLabel: 'Library',
+      onCreated: function (pkg) {
+        window.location.href = pkg && pkg.id
+          ? '/admin/data-packages/' + encodeURIComponent(pkg.id)
+          : '/admin/data-packages';
+      },
+    });
+  })();
+</script>
+{% endblock %}

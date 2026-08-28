@@ -165,6 +165,9 @@ async def google_callback(request: Request):
         # Issue JWT — identity-only, authorization derives from
         # user_group_members at request time (see app.auth.access).
         jwt_token = create_access_token(user["id"], user["email"])
+        from app.auth.login_audit import audit_login_success
+
+        audit_login_success(user["id"], provider="google", request=request)
 
         # Redirect to the post-login target. Prefer the value stashed by
         # google_login() — re-sanitize defensively in case of session tampering.

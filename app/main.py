@@ -538,6 +538,14 @@ from app.api.memory_mining import (
 )
 from app.api.uploads import router as admin_uploads_router
 from app.api.collections import router as collections_router  # Slice 2: file corpus upload
+
+# `app.api.agents` is gone — /api/agents was retired into /api/v1/agents
+# (Task C1.2) and the module deleted on main, so only the builder routers
+# survive this merge.
+from app.api.agent_builder import router as agent_builder_router  # builder assistant turns
+from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
+from app.api.package_builder import router as package_builder_router  # data-package builder turns
+from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
@@ -2896,6 +2904,10 @@ def create_app() -> FastAPI:
     app.include_router(memory_mining_admin_router)
     app.include_router(admin_uploads_router)
     app.include_router(collections_router)
+    app.include_router(agent_builder_router)
+    app.include_router(entity_builder_router)
+    app.include_router(package_builder_router)
+    app.include_router(mcp_builder_router)
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)

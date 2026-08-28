@@ -12,6 +12,16 @@ import uuid
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def news_on(monkeypatch):
+    """The news surface is OFF by default since the admin cleanup — /news and
+    /admin/news redirect home and /home skips the strip. Every test here is
+    about what those pages render when the surface IS exposed, so they turn it
+    on. The gating itself is covered by tests/test_retired_admin_surfaces.py.
+    """
+    monkeypatch.setenv("AGNES_NEWS_ENABLED", "1")
+
+
 @pytest.fixture
 def fresh_db(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
@@ -33,6 +43,7 @@ def _user_session(conn, email: str = "u@example.com"):
 def _client_with_session(conn):
     from fastapi.testclient import TestClient
     from app.main import app
+
     _, token = _user_session(conn)
     c = TestClient(app)
     c.cookies.set("access_token", token)
@@ -41,6 +52,7 @@ def _client_with_session(conn):
 
 def _publish(conn, *, intro: str, content: str):
     from src.repositories.news_template import NewsTemplateRepository
+
     repo = NewsTemplateRepository(conn)
     repo.save_draft(intro=intro, content=content, by="alice@x")
     repo.publish_draft(by="alice@x")
@@ -48,6 +60,7 @@ def _publish(conn, *, intro: str, content: str):
 
 def test_news_page_empty_state(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
         c = _client_with_session(conn)
@@ -61,9 +74,10 @@ def test_news_page_empty_state(fresh_db):
 
 def test_news_page_renders_published_content(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
-        _publish(conn, intro="<p>Big release intro</p>", content="<h1>Hello</h1><div class=\"callout\">ok</div>")
+        _publish(conn, intro="<p>Big release intro</p>", content='<h1>Hello</h1><div class="callout">ok</div>')
         c = _client_with_session(conn)
     finally:
         conn.close()
@@ -78,6 +92,7 @@ def test_news_page_renders_published_content(fresh_db):
 def test_news_page_redirects_anon(fresh_db):
     from fastapi.testclient import TestClient
     from app.main import app
+
     c = TestClient(app)
     r = c.get("/news", follow_redirects=False)
     # Either 302 to login OR 401 — both are acceptable for the auth gate.
@@ -86,6 +101,7 @@ def test_news_page_redirects_anon(fresh_db):
 
 def test_home_renders_news_section_when_intro_present(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
         _publish(conn, intro="<p>Bottom-of-home perex</p>", content="<p>full body</p>")
@@ -102,6 +118,7 @@ def test_home_renders_news_section_when_intro_present(fresh_db):
 
 def test_home_omits_news_section_when_no_intro(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
         c = _client_with_session(conn)
@@ -139,8 +156,7 @@ def _admin_client(conn):
     group = conn.execute("SELECT id FROM user_groups WHERE name = 'Admin'").fetchone()
     assert group, "Admin system group should be seeded by bootstrap"
     conn.execute(
-        "INSERT INTO user_group_members (user_id, group_id, source, added_by) "
-        "VALUES (?, ?, 'admin', 'test')",
+        "INSERT INTO user_group_members (user_id, group_id, source, added_by) VALUES (?, ?, 'admin', 'test')",
         [uid, group[0]],
     )
     c = TestClient(app)
@@ -150,6 +166,7 @@ def _admin_client(conn):
 
 def test_news_page_body_class_is_server_rendered(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
         c = _client_with_session(conn)
@@ -166,6 +183,7 @@ def test_news_page_body_class_is_server_rendered(fresh_db):
 
 def test_admin_news_body_class_is_server_rendered(fresh_db):
     from src.db import get_system_db, close_system_db
+
     conn = get_system_db()
     try:
         c = _admin_client(conn)

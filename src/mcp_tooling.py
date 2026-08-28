@@ -96,6 +96,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "stack_artefacts_candidates": "List Artefact Candidates",
     "admin_config_surface": "Get Config Surface",
     "admin_register_table": "Register Source Table",
+    "store_compose_plugin": "Publish A Plugin Bundling Existing Items",
     "admin_semantic_layer_coverage": "Get Semantic Layer Coverage",
     "admin_semantic_coverage": "List Uncovered Semantic Tables",
     "semantic_model_coverage": "Get Cross-Domain Coverage",

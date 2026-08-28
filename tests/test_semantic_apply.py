@@ -12,6 +12,22 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def studio_on(monkeypatch):
+    """The non-admin branch of ``apply`` files into the Studio's suggestion
+    queue, so it reads ``get_studio_enabled()`` — and Studio is OFF by default
+    since the admin cleanup retired it, which 403s that branch.
+
+    These tests are about the queue's behavior when the surface is exposed, so
+    they turn it on. ``test_non_admin_branch_respects_studio_toggle`` below
+    asserts the opposite and still wins: it patches the resolver on the module
+    itself, which no env var can outrank.
+    """
+    monkeypatch.setenv("AGNES_STUDIO_ENABLED", "1")
+
 
 DOC = (
     "version: '0.2.0.dev0'\n"

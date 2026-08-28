@@ -10,6 +10,23 @@ coverage lives in tests/test_me_debug.py.
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def contribute_skill_on(monkeypatch):
+    """Several cases here use `/admin/contribute-skill` as their example of a
+    state-changing HTML form POST, and that page is hidden by default since the
+    admin cleanup retired it (both POSTs redirect home ahead of the CSRF check,
+    by design — a stale external button must not publish past a hidden page).
+
+    The subject of these tests is the double-submit pair, not the page, so they
+    expose the page rather than move to a different form. `tests/
+    test_retired_admin_surfaces.py` owns the hidden behavior.
+    """
+    monkeypatch.setenv("AGNES_CONTRIBUTE_SKILL_ENABLED", "1")
+
+
 # Stateless double-submit: any matching cookie/field pair passes, so tests
 # supply the pair directly instead of scraping it from a prior GET.
 _CSRF = "test-csrf-token-0123456789abcdef"
