@@ -411,14 +411,19 @@ def reprocess_usage(
 def prune_usage(
     user: dict = Depends(require_admin),
 ):
-    """Delete usage_events older than USAGE_EVENTS_RETENTION_DAYS.
+    """Delete usage_events older than the configured retention window.
 
-    Default retention: env var unset or ``0`` → no pruning (forever).
-    Daily rollup tables untouched — they're tiny and lossy-by-design.
+    Window source: ``USAGE_EVENTS_RETENTION_DAYS`` env var (back-compat), or
+    ``retention.usage_events_days`` in instance.yaml (Track E3 Slice 1) —
+    see ``app.instance_config.get_usage_events_retention_days``. Default
+    retention: unset or ``0`` → no pruning (forever). Daily rollup tables
+    untouched — they're tiny and lossy-by-design.
     """
-    retention = int(os.environ.get("USAGE_EVENTS_RETENTION_DAYS", "0") or 0)
+    from app.instance_config import get_usage_events_retention_days
+
+    retention = get_usage_events_retention_days()
     if retention <= 0:
-        return {"status": "skipped", "reason": "USAGE_EVENTS_RETENTION_DAYS unset or 0"}
+        return {"status": "skipped", "reason": "usage_events retention window unset or 0"}
     try:
         deleted = usage_repo().delete_older_than(retention)
         after = usage_repo().count_events()

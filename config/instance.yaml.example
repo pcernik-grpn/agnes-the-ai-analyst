@@ -341,10 +341,30 @@ auth:
 # audit:
 #   # How many days to keep `audit_log` rows before the daily audit-prune
 #   # scheduler job deletes them. Set to 0 to keep rows forever. Default 365.
-#   # Only `audit_log` has a retention policy today — see docs/observability.md
-#   # for the other audit/observability trails (chat, sessions, usage, sync,
-#   # llm_usage, agent-runtime forensics).
 #   retention_days: 365
+
+# --- Per-trail retention (optional, Track E3 Slice 1) ---
+# Opt-in day windows for the other unbounded audit/activity trails. EVERY
+# key below defaults to 0 = keep forever = the daily retention-prune
+# scheduler job is a no-op for that trail — nothing is deleted unless you
+# set a window explicitly. See docs/observability.md for the full trail
+# inventory (chat transcripts and CLI session JSONLs still have no
+# retention policy — deliberately out of scope).
+# retention:
+#   sync_history_days: 0              # sync_history rows, by synced_at. Never
+#                                      # touches sync_state (current per-table
+#                                      # state, not a trail).
+#   llm_usage_days: 0                 # llm_usage rows (per-call token ledger), by created_at.
+#   agent_scope_snapshots_days: 0     # agent_scope_snapshots rows, by created_at.
+#                                      # Never touches the live agents table.
+#   usage_events_days: 0              # usage_events rows, by occurred_at. The
+#                                      # USAGE_EVENTS_RETENTION_DAYS env var wins
+#                                      # over this key when both are set
+#                                      # (back-compat). Pruned by its own
+#                                      # standalone POST /api/admin/usage/prune
+#                                      # job (agnes admin usage prune), not the
+#                                      # retention-prune sweep below. Daily
+#                                      # rollup tables are never touched.
 
 # --- Feature flags (optional) ---
 # See docs/feature-flags.md for the full inventory and resolution order.

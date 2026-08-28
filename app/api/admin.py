@@ -8628,6 +8628,55 @@ async def run_audit_prune(
     return {"ok": True, "details": result}
 
 
+# ---------------------------------------------------------------------------
+# Track E3 Slice 1: scheduled retention pruning of the other unbounded
+# audit/activity trails (sync_history, llm_usage, agent_scope_snapshots)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run-retention-prune")
+async def run_retention_prune(
+    user: dict = Depends(require_admin),
+):
+    """Trigger the opt-in retention sweep for ``sync_history``,
+    ``llm_usage``, and ``agent_scope_snapshots``.
+
+    Wraps :func:`src.audit_retention.run_retention_sweep`. The scheduler
+    service hits this endpoint daily (under ``SCHEDULER_API_TOKEN``, same as
+    ``run-audit-prune``); admins can also run it on demand.
+
+    Every trail's window comes from ``retention.<trail>_days`` in
+    ``instance.yaml`` and defaults to 0 (keep forever) — nothing is pruned
+    until an admin explicitly sets a window. ``audit_log`` has its own
+    standalone job (``run-audit-prune`` above, unchanged); ``usage_events``
+    keeps its own standalone job (``POST /api/admin/usage/prune``) — see
+    ``src/audit_retention.py``'s module docstring for why those two aren't
+    folded into this sweep.
+    """
+    from app.instance_config import (
+        get_agent_scope_snapshots_retention_days,
+        get_llm_usage_retention_days,
+        get_sync_history_retention_days,
+    )
+    from src.audit_retention import run_retention_sweep
+
+    windows = {
+        "sync_history": get_sync_history_retention_days(),
+        "llm_usage": get_llm_usage_retention_days(),
+        "agent_scope_snapshots": get_agent_scope_snapshots_retention_days(),
+    }
+    result = run_retention_sweep(windows)
+
+    audit_repo().log(
+        user_id=user.get("id"),
+        client_kind=client_kind_from_user(user),
+        action="run_retention_prune",
+        resource="job:retention-prune",
+        params={"windows": windows, **result},
+    )
+    return {"ok": True, "details": result}
+
+
 @router.post("/run-reap-stuck-reviews")
 async def run_reap_stuck_reviews(
     user: dict = Depends(require_admin),

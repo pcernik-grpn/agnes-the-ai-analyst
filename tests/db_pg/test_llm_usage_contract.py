@@ -403,3 +403,68 @@ def test_usage_breakdown_by_caller_duckdb_returns_single_unattributed_bucket(tmp
     assert breakdown[0]["caller_user_id"] is None
     assert breakdown[0]["total_tokens"] == repo.usage_breakdown_for_month("a1", ym)["total_tokens"]
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Track E3 Slice 1: prune_older_than — opt-in llm_usage retention
+# ---------------------------------------------------------------------------
+
+
+def _backdate(repo, row_id: str, ts) -> None:
+    """Rewrite one row's `created_at` directly — `insert_batch` always
+    stamps `now()` via the column default, so the prune tests need an
+    implementation-specific path to plant an old row (same reasoning as
+    test_audit_contract.py's `_backdate` helper). Detects the backend off
+    the repo object itself (DuckDB repos carry `.conn`, PG repos carry
+    `._engine`) since this fixture yields only the repo, not a backend tag."""
+    if hasattr(repo, "conn"):
+        repo.conn.execute("UPDATE llm_usage SET created_at = ? WHERE id = ?", [ts, row_id])
+    else:
+        import sqlalchemy as sa
+
+        with repo._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE llm_usage SET created_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": row_id},
+            )
+
+
+def _insert_one(repo, row_id: str, **overrides) -> None:
+    row = {
+        "id": row_id,
+        "agent_id": "a1",
+        "user_id": "u1",
+        "session_id": "c1",
+        "model": "claude-sonnet-5",
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    row.update(overrides)
+    repo.insert_batch([row])
+
+
+def test_prune_older_than_deletes_only_old_rows(repo):
+    from datetime import timedelta
+
+    _insert_one(repo, "old-row")
+    _insert_one(repo, "new-row")
+    _backdate(repo, "old-row", datetime.now(timezone.utc) - timedelta(days=400))
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 1
+    remaining_ids = {r["id"] for r in repo.list_for_agent("a1", limit=10)}
+    assert "old-row" not in remaining_ids
+    assert "new-row" in remaining_ids
+
+
+def test_prune_older_than_returns_zero_when_nothing_qualifies(repo):
+    _insert_one(repo, "recent-1")
+    _insert_one(repo, "recent-2")
+
+    pruned = repo.prune_older_than(365)
+
+    assert pruned == 0
+    assert len(repo.list_for_agent("a1", limit=10)) == 2
