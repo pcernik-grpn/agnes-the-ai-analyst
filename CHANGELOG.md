@@ -201,6 +201,13 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A store submission's author is now notified when it gets a terminal decision.** Approve (async LLM verdict), block (async LLM verdict), admin override, and admin hard-delete each publish an in-app notification (`publish_notification`, `kind: "store_submission"`) to the submitter carrying the decision, the submission/plugin name, and — where one exists — the admin's reason. The synchronous immediate-approval path (guardrails disabled) is intentionally excluded, since that submitter already holds the API response; intermediate states (`pending_llm`, rescan, retry) stay silent. A dropped notification is logged and never fails the admin action or background review task that reached the decision.
 
 ### Changed
+- **The People roster loses its header row, and the add actions move above the
+  column header.** An address, a name, a provenance line and a Remove button do
+  not need labelling — a header over four self-evident columns is chrome on a
+  list that is usually two rows long. And a column header labels the *rows*: an
+  action is not one of them, it makes one, so *Add to this group* and *Share
+  with another group* lead the table rather than sitting between the header and
+  the rows it describes.
 - **By bundle is grouped, not alphabetical.** A flat A–Z list interleaved a
   plugin, a package, a memory domain and a collection — four different kinds
   of decision — so the reader re-sorted them mentally on every pass. It now

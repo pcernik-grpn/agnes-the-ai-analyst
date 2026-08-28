@@ -369,7 +369,14 @@ class TestTheGroupItself:
         body = self._body(seeded_app)
         assert 'id="ax-sec-people"' in body
         assert 'id="ax-people-sum"' in body
-        assert "How they got here" in body
+        # The column LABEL is gone — an address, a name, a provenance line
+        # and a Remove button do not need labelling, and a header over four
+        # obvious columns is chrome on a list that is usually two rows long.
+        # What the test is actually about is that each row still says how the
+        # person got there, which is the roster's whole job.
+        assert '"added by admin"' in body
+        assert '"synced from Google"' in body
+        assert '"system-managed"' in body
         # The avatar row and its disclosure are gone, not merely collapsed.
         assert "ax-faces" not in body
         assert "Show all " not in body

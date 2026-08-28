@@ -1772,6 +1772,10 @@
   }
   .ax-kindrun__c { font-family: var(--ds-font-mono); font-size: 10px; font-weight: 400; }
   .ax-fam .ax-kindrun:first-child { padding-top: 6px; }
+  /* The action leads the table, so it carries the table's top edge rather
+     than a divider between itself and the header below it. */
+  .ax-table > .ax-add:first-child { border-bottom: 0; padding-bottom: 6px; }
+  .ax-table > .ax-add:first-child + .ax-colhd { border-top: 0; }
 </style>
 {% endblock %}
 
@@ -2671,7 +2675,9 @@
 
     // The empty case has two causes and two different next steps: a filter
     // that matched nothing, or a group that simply holds nothing yet.
-    const table = sections ? `<div class="ax-table">${colhd}${addRow}${sections}</div>` : "";
+    /* Action first, then the header, then the rows: the header labels the
+       ROWS, and the action is not one of them — it makes one. */
+    const table = sections ? `<div class="ax-table">${addRow}${colhd}${sections}</div>` : "";
     const painted = table || (fq
       ? `<div class="ax-empty">Nothing matches “${esc(resourceFilter)}”.
          <button type="button" class="ax-linkbtn" data-clear-rfind>Show everything</button></div>`
@@ -2868,7 +2874,10 @@
     }).join("");
     return `
       <table class="data-table data-table--compact">
-        <thead><tr><th>Email</th><th>Name</th><th>How they got here</th><th style="text-align:right">Actions</th></tr></thead>
+        {# No header row. An address, a name, how they got here and a Remove
+           button do not need labelling — the content says what each column
+           is, and a header over four obvious columns is a row of chrome on a
+           list that is usually two rows long. #}
         <tbody>${rows}</tbody>
       </table>`;
   }
@@ -3399,11 +3408,11 @@
                header, the action as its first row, and no rows under it —
                rather than a button floating beside an empty sentence. */
             return `<div class="ax-table">
+                      ${share}
                       <div class="ax-colhd">
                         <span>Group</span><span>Who that reaches</span>
                         <span>Admin control</span><span class="ax-colhd__u">What the person reads</span>
                       </div>
-                      ${share}
                       ${r.held.map((grant) => groupRow(r, grant)).join("")}
                     </div>`;
           })()}
